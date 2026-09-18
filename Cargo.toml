@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nanograd", "crates/gpt2"]
+members = ["crates/nanograd", "crates/llm"]
 
 [workspace.package]
 edition = "2021"

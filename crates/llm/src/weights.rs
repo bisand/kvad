@@ -1,0 +1,222 @@
+//! Fetching models from the HuggingFace Hub and reading their weights.
+//!
+//! # safetensors
+//!
+//! The format is deliberately boring, which is the point — the older `.bin`
+//! format was a pickled Python object graph, i.e. arbitrary code execution on
+//! load. A safetensors file is:
+//!
+//! ```text
+//! [8 bytes: header length, little-endian u64]
+//! [header: JSON mapping tensor name -> {dtype, shape, byte offsets}]
+//! [the raw tensor bytes, back to back]
+//! ```
+//!
+//! So loading is: parse a small JSON blob, then slice into a memory map.
+//!
+//! Models above a few GB are split into shards, with a
+//! `model.safetensors.index.json` mapping each tensor name to the file holding
+//! it. [`Checkpoint`] hides that: open all the shards, build one name index,
+//! and look tensors up without caring where they live.
+
+use crate::tensor::Tensor;
+use safetensors::{Dtype, SafeTensors};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+pub struct ModelFiles {
+    pub weights: Vec<PathBuf>,
+    pub tokenizer: PathBuf,
+    pub config: PathBuf,
+    /// Holds the chat template, when the model has one.
+    pub tokenizer_config: Option<PathBuf>,
+    pub generation_config: Option<PathBuf>,
+}
+
+/// Download (or reuse from the local cache) everything needed to run `repo_id`.
+pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
+    let (owner, name) = repo_id
+        .split_once('/')
+        .ok_or_else(|| format!("expected a repo id like `openai-community/gpt2`, got `{repo_id}`"))?;
+
+    let client = hf_hub::HFClientSync::new()?;
+    let repo = client.model(owner, name);
+
+    let get = |filename: &str| -> Res<PathBuf> {
+        eprintln!("  fetching {repo_id}/{filename}");
+        Ok(repo.download_file().filename(filename.to_string()).send()?)
+    };
+    let try_get = |filename: &str| -> Option<PathBuf> {
+        repo.download_file().filename(filename.to_string()).send().ok()
+    };
+
+    // Single file, or a shard index naming several.
+    let weights = match try_get("model.safetensors") {
+        Some(single) => vec![single],
+        None => {
+            let index = get("model.safetensors.index.json")?;
+            let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index)?)?;
+            let map = json
+                .get("weight_map")
+                .and_then(|m| m.as_object())
+                .ok_or("shard index has no weight_map")?;
+
+            // Many tensor names point at the same handful of files.
+            let mut shards: Vec<String> =
+                map.values().filter_map(|v| v.as_str().map(String::from)).collect();
+            shards.sort();
+            shards.dedup();
+            eprintln!("  checkpoint is split across {} shards", shards.len());
+            shards.iter().map(|s| get(s)).collect::<Res<Vec<_>>>()?
+        }
+    };
+
+    Ok(ModelFiles {
+        weights,
+        tokenizer: get("tokenizer.json")?,
+        config: get("config.json")?,
+        tokenizer_config: try_get("tokenizer_config.json"),
+        generation_config: try_get("generation_config.json"),
+    })
+}
+
+/// One or more safetensors files, presented as a single namespace.
+pub struct Checkpoint {
+    maps: Vec<memmap2::Mmap>,
+    /// tensor name -> which shard holds it
+    index: HashMap<String, usize>,
+}
+
+impl Checkpoint {
+    pub fn open(paths: &[PathBuf]) -> Res<Self> {
+        let mut maps = Vec::with_capacity(paths.len());
+        for path in paths {
+            let file = std::fs::File::open(path)?;
+            // SAFETY: we only ever read, and these are read-only cache entries.
+            // A concurrent writer truncating the file would be undefined
+            // behaviour, which is the standard caveat on every mmap.
+            maps.push(unsafe { memmap2::Mmap::map(&file)? });
+        }
+
+        // Parse each header once and remember where every tensor lives.
+        let mut index = HashMap::new();
+        for (i, map) in maps.iter().enumerate() {
+            let st = SafeTensors::deserialize(map)?;
+            for name in st.names() {
+                index.insert(name.to_string(), i);
+            }
+        }
+        Ok(Checkpoint { maps, index })
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.index.keys().map(|s| s.as_str())
+    }
+
+    /// Look a tensor up, converting to `f32`.
+    ///
+    /// Checkpoints disagree about prefixes — GPT-2 saves `wte.weight` or
+    /// `transformer.wte.weight` depending on which Python class wrote it — so
+    /// a few spellings are tried before giving up.
+    pub fn try_get(&self, name: &str) -> Option<Tensor> {
+        let candidates = [
+            name.to_string(),
+            format!("transformer.{name}"),
+            format!("model.{name}"),
+        ];
+        let key = candidates.iter().find(|c| self.index.contains_key(*c))?;
+        let st = SafeTensors::deserialize(&self.maps[self.index[key]]).ok()?;
+        let view = st.tensor(key).ok()?;
+
+        let shape = view.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => return None,
+        };
+        Some(Tensor::new(rows, cols, decode(view.data(), view.dtype())?))
+    }
+
+    pub fn get(&self, name: &str) -> Res<Tensor> {
+        self.try_get(name)
+            .ok_or_else(|| format!("tensor `{name}` not found in checkpoint").into())
+    }
+
+    /// For 1-D tensors, where the shape is noise.
+    pub fn get_flat(&self, name: &str) -> Res<Vec<f32>> {
+        Ok(self.get(name)?.data)
+    }
+
+    pub fn try_get_flat(&self, name: &str) -> Option<Vec<f32>> {
+        self.try_get(name).map(|t| t.data)
+    }
+}
+
+fn decode(bytes: &[u8], dtype: Dtype) -> Option<Vec<f32>> {
+    Some(match dtype {
+        Dtype::F32 => bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        // Half precision: widen on load. bf16 is just f32 with the bottom 16
+        // bits chopped off, which is why it is so cheap to convert and so
+        // popular for training -- it keeps f32's exponent range, and range is
+        // what gradients need.
+        Dtype::BF16 => bytes
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
+        Dtype::F16 => bytes
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        _ => return None,
+    })
+}
+
+/// IEEE 754 half -> single precision.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) as u32;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x3ff) as u32;
+    let bits = match exp {
+        0 if mant == 0 => sign << 31,
+        0 => {
+            // Subnormal: there is no implicit leading 1, and the value is
+            // `mant * 2^-24`. f32 has the range to store it as a normal
+            // number, so renormalise: find the top set bit, make it the
+            // implicit 1, and shift the rest into the fraction field.
+            let top = 31 - mant.leading_zeros();
+            let exp = 127 - 24 + top;
+            let frac = (mant << (23 - top)) & 0x7f_ffff;
+            (sign << 31) | (exp << 23) | frac
+        }
+        31 => (sign << 31) | (0xff << 23) | (mant << 13),
+        _ => (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// Read a JSON file into a `serde_json::Value`.
+pub fn read_json(path: &Path) -> Res<serde_json::Value> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::f16_to_f32;
+
+    #[test]
+    fn half_precision_conversion() {
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xbc00), -1.0);
+        assert_eq!(f16_to_f32(0x4000), 2.0);
+        assert!((f16_to_f32(0x3555) - 0.333_251).abs() < 1e-5);
+        assert!(f16_to_f32(0x7c00).is_infinite());
+        // Smallest positive subnormal: 2^-24.
+        assert!((f16_to_f32(0x0001) - 5.960_464_5e-8).abs() < 1e-12);
+    }
+}

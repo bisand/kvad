@@ -61,21 +61,33 @@ impl Model {
         // copies of the weights.
         let w = |name: &str| -> Res<Weight> { Ok(Weight::quantize(ckpt.get(name)?, precision)) };
 
+        // The projection matrices additionally get transposed on the way in.
+        // GPT-2's checkpoint stores them `[in, out]` for a `Conv1D`; flipping
+        // them to `[out, in]` lets them share the one matmul kernel with
+        // Llama, integer path included.
+        //
+        // The embedding tables are deliberately *not* transposed: `wte` is
+        // already `[vocab, n_embd]`, which is both the layout row lookup wants
+        // and the layout the tied output head wants.
+        let wt = |name: &str| -> Res<Weight> {
+            Ok(Weight::quantize(ckpt.get(name)?.transposed(), precision))
+        };
+
         let mut blocks = Vec::with_capacity(spec.n_layer);
         for i in 0..spec.n_layer {
             let p = |s: &str| format!("h.{i}.{s}");
             blocks.push(Block {
                 ln1_g: ckpt.get_flat(&p("ln_1.weight"))?,
                 ln1_b: ckpt.get_flat(&p("ln_1.bias"))?,
-                attn_w: w(&p("attn.c_attn.weight"))?,
+                attn_w: wt(&p("attn.c_attn.weight"))?,
                 attn_b: ckpt.get_flat(&p("attn.c_attn.bias"))?,
-                attn_proj_w: w(&p("attn.c_proj.weight"))?,
+                attn_proj_w: wt(&p("attn.c_proj.weight"))?,
                 attn_proj_b: ckpt.get_flat(&p("attn.c_proj.bias"))?,
                 ln2_g: ckpt.get_flat(&p("ln_2.weight"))?,
                 ln2_b: ckpt.get_flat(&p("ln_2.bias"))?,
-                fc_w: w(&p("mlp.c_fc.weight"))?,
+                fc_w: wt(&p("mlp.c_fc.weight"))?,
                 fc_b: ckpt.get_flat(&p("mlp.c_fc.bias"))?,
-                proj_w: w(&p("mlp.c_proj.weight"))?,
+                proj_w: wt(&p("mlp.c_proj.weight"))?,
                 proj_b: ckpt.get_flat(&p("mlp.c_proj.bias"))?,
             });
         }
@@ -135,22 +147,22 @@ impl Transformer for Model {
             // ---- Attention sub-block -------------------------------------
             let h = layer_norm(&x, &block.ln1_g, &block.ln1_b, spec.eps);
             // One matmul produces query, key and value back to back.
-            let qkv = block.attn_w.matvec(&h, Some(&block.attn_b));
+            let qkv = block.attn_w.matvec_bt(&h, Some(&block.attn_b));
             let (q, kv) = qkv.split_at(spec.n_embd);
             let (k, v) = kv.split_at(spec.n_embd);
 
             cache.push(l, k, v);
             let attn = attend(spec, q, cache.keys(l), cache.values(l), pos + 1);
-            let attn = block.attn_proj_w.matvec(&attn, Some(&block.attn_proj_b));
+            let attn = block.attn_proj_w.matvec_bt(&attn, Some(&block.attn_proj_b));
             for (xi, a) in x.iter_mut().zip(attn.iter()) {
                 *xi += a; // residual
             }
 
             // ---- MLP sub-block -------------------------------------------
             let h = layer_norm(&x, &block.ln2_g, &block.ln2_b, spec.eps);
-            let mut hidden = block.fc_w.matvec(&h, Some(&block.fc_b));
+            let mut hidden = block.fc_w.matvec_bt(&h, Some(&block.fc_b));
             gelu_inplace(&mut hidden);
-            let mlp = block.proj_w.matvec(&hidden, Some(&block.proj_b));
+            let mlp = block.proj_w.matvec_bt(&hidden, Some(&block.proj_b));
             for (xi, m) in x.iter_mut().zip(mlp.iter()) {
                 *xi += m; // residual
             }
@@ -159,6 +171,6 @@ impl Transformer for Model {
         cache.len += 1;
 
         let x = layer_norm(&x, &self.lnf_g, &self.lnf_b, spec.eps);
-        self.wte.matvec_bt(&x)
+        self.wte.matvec_bt(&x, None)
     }
 }

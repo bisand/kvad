@@ -10,12 +10,10 @@ use llm::tensor::Tensor;
 use nanograd::rng::Rng;
 use std::time::Instant;
 
-fn bench(label: &str, rows: usize, cols: usize, transposed: bool) {
+fn bench(label: &str, rows: usize, cols: usize) {
     let mut rng = Rng::new(42);
     let t = Tensor::new(rows, cols, (0..rows * cols).map(|_| rng.normal() * 0.05).collect());
-    let x: Vec<f32> = (0..if transposed { cols } else { rows })
-        .map(|_| rng.normal())
-        .collect();
+    let x: Vec<f32> = (0..cols).map(|_| rng.normal()).collect();
 
     println!("\n{label}  [{rows} x {cols}]");
     let mut baseline = 0.0f64;
@@ -24,22 +22,24 @@ fn bench(label: &str, rows: usize, cols: usize, transposed: bool) {
         let bytes = w.bytes();
 
         // Warm up, then time enough iterations to be meaningful.
-        let run = |w: &Weight| {
-            if transposed {
-                w.matvec_bt(&x)
-            } else {
-                w.matvec(&x, None)
-            }
-        };
+        let run = |w: &Weight| w.matvec_bt(&x, None);
         for _ in 0..3 {
             std::hint::black_box(run(&w));
         }
+
+        // Calibrate the iteration count so every round takes roughly the same
+        // wall time regardless of matrix size. A fixed count makes small
+        // matrices finish in a few milliseconds, which is short enough for
+        // background load to dominate the measurement.
+        let probe = Instant::now();
+        std::hint::black_box(run(&w));
+        let one = probe.elapsed().as_secs_f64().max(1e-9);
+        let iters = ((0.1 / one) as usize).clamp(20, 20_000);
 
         // Best of several rounds rather than a single average. A shared
         // machine produces occasional slow rounds from scheduling and clock
         // changes; those only ever add time, so the minimum is the most stable
         // estimate of what the code actually costs.
-        let iters = 50;
         let mut per_call = f64::MAX;
         for _ in 0..5 {
             let t0 = Instant::now();
@@ -67,9 +67,9 @@ fn bench(label: &str, rows: usize, cols: usize, transposed: bool) {
 fn main() {
     println!("threads: {}", rayon::current_num_threads());
     // The output head: by far the largest single matmul per token.
-    bench("lm_head (matvec_bt)", 151936, 896, true);
+    bench("qwen lm_head", 151936, 896);
     // A representative MLP matrix.
-    bench("mlp.down (matvec_bt)", 896, 4864, true);
-    // GPT-2 layout, for the other kernel.
-    bench("gpt2 c_fc (matvec)", 768, 3072, false);
+    bench("qwen mlp.down", 896, 4864);
+    // GPT-2's widening MLP, in the transposed layout it is now stored in.
+    bench("gpt2 c_fc", 3072, 768);
 }

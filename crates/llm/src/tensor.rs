@@ -27,42 +27,25 @@ impl Tensor {
     pub fn row(&self, r: usize) -> &[f32] {
         &self.data[r * self.cols..(r + 1) * self.cols]
     }
-}
 
-/// `y = x @ w + b`, where `x` is a single vector of length `w.rows`.
-///
-/// Generating one token at a time means every matmul in the model is really a
-/// matrix-*vector* product, which is memory-bandwidth bound rather than
-/// compute bound: for each output we read a whole column of weights and do one
-/// multiply-add. That is why LLM inference speed tracks memory bandwidth, and
-/// why quantisation (fewer bytes per weight) speeds things up so much.
-///
-/// We split the output range across threads so each thread reads a contiguous
-/// slice of every weight row.
-pub fn matvec(x: &[f32], w: &Tensor, bias: Option<&[f32]>) -> Vec<f32> {
-    assert_eq!(x.len(), w.rows, "matvec shape mismatch");
-    let n = w.cols;
-    let mut out = match bias {
-        Some(b) => b.to_vec(),
-        None => vec![0.0; n],
-    };
-
-    // Chunk size chosen so each thread's working set stays in L2.
-    let chunk = (n / rayon::current_num_threads().max(1)).max(64);
-    out.par_chunks_mut(chunk).enumerate().for_each(|(ci, out_chunk)| {
-        let j0 = ci * chunk;
-        let width = out_chunk.len();
-        for (i, &xi) in x.iter().enumerate() {
-            if xi == 0.0 {
-                continue;
-            }
-            let w_row = &w.data[i * n + j0..i * n + j0 + width];
-            for j in 0..width {
-                out_chunk[j] += xi * w_row[j];
+    /// Swap the axes, producing `[cols, rows]`.
+    ///
+    /// Used once per GPT-2 weight at load time. Its checkpoint was written for
+    /// a `Conv1D` layer, which stores `[in, out]`; everything else in the
+    /// world uses `nn.Linear`'s `[out, in]`. Normalising at load costs one
+    /// pass over each matrix and means the whole engine has exactly one matmul
+    /// kernel — which in turn means GPT-2 gets the quantised integer path for
+    /// free.
+    pub fn transposed(&self) -> Tensor {
+        let mut data = vec![0.0f32; self.data.len()];
+        for r in 0..self.rows {
+            let row = self.row(r);
+            for c in 0..self.cols {
+                data[c * self.rows + r] = row[c];
             }
         }
-    });
-    out
+        Tensor { rows: self.cols, cols: self.rows, data }
+    }
 }
 
 /// `y = x @ wᵀ`, where `w` is `[out_features, in_features]`.
@@ -253,11 +236,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matvec_matches_hand_computation() {
-        // x = [1, 2]; w = [[1, 2, 3], [4, 5, 6]]  ->  [9, 12, 15]
+    fn transpose_swaps_axes_and_is_its_own_inverse() {
+        let t = Tensor::new(2, 3, vec![1., 2., 3., 4., 5., 6.]);
+        let tt = t.transposed();
+        assert_eq!((tt.rows, tt.cols), (3, 2));
+        assert_eq!(tt.data, vec![1., 4., 2., 5., 3., 6.]);
+        assert_eq!(tt.transposed().data, t.data);
+    }
+
+    #[test]
+    fn transpose_turns_matvec_into_matvec_bt() {
+        // The identity GPT-2 relies on: x @ W == x @ (Wᵀ)ᵀ.
         let w = Tensor::new(2, 3, vec![1., 2., 3., 4., 5., 6.]);
-        assert_eq!(matvec(&[1.0, 2.0], &w, None), vec![9.0, 12.0, 15.0]);
-        assert_eq!(matvec(&[1.0, 2.0], &w, Some(&[1., 1., 1.])), vec![10.0, 13.0, 16.0]);
+        let x = [1.0f32, 2.0];
+        assert_eq!(matvec_bt(&x, &w.transposed()), vec![9.0, 12.0, 15.0]);
     }
 
     #[test]

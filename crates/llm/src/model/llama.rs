@@ -16,10 +16,11 @@
 //! There is one more difference, invisible in any diagram: GPT-2's checkpoint
 //! was written for a `Conv1D` layer, which stores weights as
 //! `[in_features, out_features]`. Everything here uses `nn.Linear`, which
-//! stores them the other way round — so these matmuls are all
-//! [`matvec_bt`], and GPT-2's are [`matvec`]. Mixing the two up produces
-//! fluent nonsense rather than an error, which is why the counting test in the
-//! README exists.
+//! stores them the other way round. Rather than carry two matmul kernels, the
+//! GPT-2 loader transposes its projection matrices on the way in, so both
+//! architectures run the same code — and GPT-2 gets the quantised integer
+//! path for free. Mixing the two layouts up produces fluent nonsense rather
+//! than an error, which is why the counting test in the README exists.
 
 use super::{attend, KvCache, Spec, Transformer};
 use crate::quant::{Precision, Weight};
@@ -34,13 +35,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// they cost parameters and buy nothing once you have normalisation. Qwen2 is
 /// the exception: it keeps biases on Q, K and V but nowhere else.
 fn linear(x: &[f32], w: &Weight, bias: Option<&Vec<f32>>) -> Vec<f32> {
-    let mut y = w.matvec_bt(x);
-    if let Some(b) = bias {
-        for (v, bi) in y.iter_mut().zip(b.iter()) {
-            *v += bi;
-        }
-    }
-    y
+    w.matvec_bt(x, bias.map(|b| b.as_slice()))
 }
 
 pub struct Block {
@@ -207,6 +202,6 @@ impl Transformer for Model {
         cache.len += 1;
 
         let x = rms_norm(&x, &self.final_norm, spec.eps);
-        self.lm_head.as_ref().unwrap_or(&self.embed).matvec_bt(&x)
+        self.lm_head.as_ref().unwrap_or(&self.embed).matvec_bt(&x, None)
     }
 }

@@ -163,52 +163,89 @@ Measured on Qwen2.5-0.5B (494M parameters, M5 Pro, 18 threads):
 
 | | weights | tok/s | `first 8 primes` |
 |---|---|---|---|
-| f32 | 1976 MB | 28.8 | `2, 3, 5, 7, 11, 13, 17, 19` |
-| q8 | 556 MB (3.6x) | 38.5 (1.34x) | `2, 3, 5, 7, 11, 13, 17, 19` |
-| q4 | 309 MB (6.4x) | 37.5 (1.30x) | `3, 5, 7, 11, 13, 17, 19, 23` |
+| f32 | 1976 MB | ~23 | `2, 3, 5, 7, 11, 13, 17, 19` |
+| q8 | 556 MB (3.6x) | ~35 (1.5x) | `2, 3, 5, 7, 11, 13, 17, 19` |
+| q4 | 309 MB (6.4x) | ~34 (1.5x) | `11, 13, 17, 19, 23, 29, 31, 37` |
 
-**q8 is free; q4 is not.** q8 reproduced f32 exactly on every test. q4 broke all
-three — it drops the 2 above, turns `17 + 25 = 42` into `40` on SmolLM2, and
-sends GPT-2 into `"The reference is a reference is a reference"`. Still fluent,
-still confident, quietly wrong. Half-billion-parameter models have less
-redundancy to spare than the 7B+ models where q4 is usually judged.
+**q8 is free; q4 is not.** q8 reproduced f32 exactly on every test — including
+with the activations quantised as well. q4 broke all three: it misses the
+sequence start above, turns `17 + 25 = 42` into `40` on SmolLM2, and sends
+GPT-2 into `"The jury's jury's jury's"`. Still fluent, still confident, quietly
+wrong. Half-billion-parameter models have less redundancy to spare than the
+7B+ models where q4 is usually judged.
 
 ```bash
 cargo run --release -p llm --example bench_matvec
 ```
 
-The kernel benchmark is where the interesting part is, because it shows the
-speedup is *not* where the arithmetic says it should be. On the output head:
+The kernel benchmark is where the interesting part is. On the output head
+(151936 x 896, the largest single matmul per token):
 
-| | ms/call | GB/s | vs f32 |
-|---|---|---|---|
-| f32 | 3.94 | 138 | 1.00x |
-| q8 | 1.76 | 87 | 2.24x |
-| q4 | 1.92 | 44 | 2.05x |
+| | ms/call | vs f32 |
+|---|---|---|
+| f32 | 4.0 | 1.00x |
+| q8 + quantised activations | 0.83 | **4.9x** |
+| q4 + quantised activations | 0.90–1.6 | 2.4–4.5x |
 
-f32 achieves 138 GB/s and is genuinely memory-bound — there is nothing to fix
-there. The quantised kernels move a third or a sixth of the bytes but only
-reach 87 and 44 GB/s, so they are **compute**-bound: unpacking costs more than
-the memory it saves. Reading fewer bytes only helps until it doesn't.
+The 4.9x comes from quantising the *activations* too, which turns the inner
+loop into an integer dot product. On this machine that compiles to exactly what
+you would hope for — six instructions per 32 weights:
 
-Three fixes got this from roughly 1x to 2x, and each is a general lesson:
+```asm
+ldp     q2, q3, [x10], #0x20   ; 32 weight bytes
+movi.2d v4, #0
+sdot.4s v4, v3, v1             ; 16 int8 multiply-accumulates
+sdot.4s v4, v2, v0             ; 16 more
+addv.4s s0, v4                 ; horizontal sum
+```
 
-- **Keep the accumulator in registers.** The first version of the GPT-2-layout
-  kernel read and wrote all 32 outputs on every input row: 256 bytes of output
-  traffic per 32 bytes of weights. Quantising made it *slower than f32*
-  (0.90x). Hoisting the accumulator out of the row loop fixed it.
-- **Use more than one accumulator.** Floating-point addition is not
-  associative, so the compiler cannot reorder a single `sum +=` chain; the loop
-  runs at the latency of an FMA rather than its throughput. Four independent
-  lanes let it vectorise.
-- **Check what your inner loop doesn't depend on.** The 4-bit path subtracts an
-  offset that needs the sum of the activations per block — which depends only on
-  the input, not the row. Computing it inside the row loop repeated it 151,936
-  times per call and nearly doubled the work.
+Getting there took four fixes, each a general lesson:
 
-The remaining gap to 3.6x needs the activations quantised too, so the dot
-product becomes integer and can use the CPU's SIMD int8 instructions. That is
-how llama.cpp gets its numbers, and it is the obvious next step here.
+- **Keep the accumulator in registers.** The first kernel read and wrote all 32
+  outputs on every input row: 256 bytes of output traffic per 32 bytes of
+  weights. Quantising made it *slower than f32* (0.90x).
+- **Use more than one accumulator.** Float addition is not associative, so the
+  compiler cannot reorder a `sum +=` chain; the loop runs at FMA latency rather
+  than throughput. Integer addition *is* associative — one reason the integer
+  path is easier to vectorise.
+- **Check what the inner loop doesn't depend on.** The 4-bit offset correction
+  needs a per-block sum of the activations, which depends only on the input.
+  Computing it inside the row loop repeated it 151,936 times per call.
+- **Never mix floats into an integer reduction.** This was the big one. With
+  the per-block scaling inline, the loop compiled to scalar loads — no `sdot`
+  at all, despite the same expression vectorising perfectly as a standalone
+  function. Splitting it into an integer pass and a scaling pass was worth
+  roughly 2x on its own. Worth knowing that a correct, innocuous-looking line
+  can silently cost you the vector units.
+
+### Two kernels, chosen by size
+
+There is a crossover. The integer path wins big on a matrix streamed from main
+memory and *loses* on one that fits in cache — a cache-resident matmul is not
+bandwidth-bound, so shrinking the weights buys nothing and the extra work is
+pure overhead. Measured here: 4.9x on the 153 MB output head, but below 1x on a
+5 MB MLP matrix. So `matvec_bt` dispatches on weight size, and
+`INTEGER_PATH_MIN_BYTES` is the (empirical, cache-dependent) threshold.
+
+### What it is worth end to end
+
+| | f32 | q8 |
+|---|---|---|
+| Qwen2.5-0.5B | ~23 tok/s | ~35 tok/s |
+| GPT-2-medium | ~35 tok/s | ~49 tok/s |
+
+**A 4.9x kernel bought about 1.4x overall.** That gap is the whole lesson in
+optimisation: the output head is one matmul out of 169 per token, and
+everything else — the cache-resident per-layer matrices, attention, the norms,
+the softmax — did not get faster. Amdahl's law, measured rather than quoted.
+
+These were taken with a loaded machine (the f32 baseline itself varied between
+19.7 and 25.2 tok/s), so treat them as approximate. The kernel numbers are far
+more repeatable than the end-to-end ones.
+
+And note what q4 does *not* buy: it is no faster than q8 — unpacking nibbles
+costs more than the halved bytes save — while being much less accurate. Its
+only advantage is memory.
 
 ### Verifying you got it right
 
@@ -257,11 +294,12 @@ state management — good Rust, no ML. Build it last.
 
 ## Where to go next
 
-**4. Quantise the activations too.** Weights are done; the kernels are now
-compute-bound rather than memory-bound (see above). Quantising `x` per block as
-well turns the inner dot product into integer arithmetic, which ARM's `sdot`
-and x86's VNNI do several lanes at a time. This is the step that separates 2x
-from the 3.6x the byte counts promise.
+**4. Use the wider integer instructions.** The `i8` dot products use `sdot`
+(4 lanes). ARM's `i8mm` extension adds `smmla`, an 8x wider matrix-multiply
+step, and is available on this machine behind `-C target-cpu=native`. Making
+the small matrices worth quantising at all is the other half of the problem —
+they are cache-resident, so they need fewer instructions rather than fewer
+bytes.
 
 **5. Serialise quantised weights.** Quantisation currently happens on every
 load, which means still reading the full f32 checkpoint off disk. Writing the

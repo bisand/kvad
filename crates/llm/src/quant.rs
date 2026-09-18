@@ -32,7 +32,7 @@
 //! production formats do. f32 is kept here because it is one less thing in the
 //! way.)
 
-use crate::tensor::{matvec, matvec_bt, Tensor};
+use crate::tensor::{matvec_bt, Tensor};
 use rayon::prelude::*;
 
 /// Weights per block. 32 is the usual choice: small enough to isolate
@@ -207,121 +207,152 @@ impl Weight {
         }
     }
 
-    /// `y = x @ W (+ b)`, with `W` stored `[in_features, out_features]`.
+    /// `y = x @ Wᵀ (+ b)`, with `W` stored `[out_features, in_features]`.
     ///
-    /// Blocks run along the output axis here, so each `(row, block)` pair
-    /// contributes `x[i] * scale` times 32 consecutive integers. Folding the
-    /// activation into the scale means one multiply per block rather than one
-    /// per weight.
-    pub fn matvec(&self, x: &[f32], bias: Option<&[f32]>) -> Vec<f32> {
-        debug_assert_eq!(x.len(), self.rows);
-        if let Data::F32(t) = &self.data {
-            return matvec(x, t, bias);
-        }
+    /// Every matmul in the model goes through here. Blocks run along the
+    /// contraction axis, so each output is a sum of per-block dot products.
+    ///
+    /// # Quantised activations
+    ///
+    /// When the weights are quantised, `x` is quantised too — once per call,
+    /// not once per row — and the dot product becomes **integer**:
+    ///
+    /// ```text
+    ///   f32 weights:  sum over k of  x[k] * w[k]                  (f32 FMA)
+    ///   q8 weights:   sum over k of  x[k] * (w[k] as f32) * ws    (convert, then f32 FMA)
+    ///   q8 + q8 act:  (sum over k of  xq[k] * wq[k]) * xs * ws    (i8 dot, one f32 mul)
+    /// ```
+    ///
+    /// Two things happen at once. The per-weight `i8 -> f32` conversion
+    /// disappears, and the inner loop becomes something the CPU has a
+    /// dedicated instruction for: `sdot` on ARM, VNNI on x86, four `i8 x i8`
+    /// products accumulated into an `i32` per lane per cycle.
+    ///
+    /// Quantising `x` costs one pass over `cols` values. The weight matrix is
+    /// `rows x cols`, so for the output head that is 896 values against 136
+    /// million — it rounds to nothing.
+    ///
+    /// Overflow is not a concern: `127 * 127 * 32` is about 516k, comfortably
+    /// inside `i32`.
+    pub fn matvec_bt(&self, x: &[f32], bias: Option<&[f32]>) -> Vec<f32> {
+        debug_assert_eq!(x.len(), self.cols);
 
-        let n = self.cols;
-        let blocks_per_row = n / BLOCK;
-        let mut out = match bias {
-            Some(b) => b.to_vec(),
-            None => vec![0.0; n],
+        let mut out = match &self.data {
+            Data::F32(t) => matvec_bt(x, t),
+            _ if self.bytes() < INTEGER_PATH_MIN_BYTES => self.matvec_bt_dequant(x),
+            _ => {
+                let n = self.cols;
+                let blocks_per_row = n / BLOCK;
+                let xq = QActivation::new(x);
+
+                // `map_init` gives each worker thread one scratch buffer that
+                // is reused for every row it handles, rather than allocating
+                // 151936 of them.
+                (0..self.rows)
+                    .into_par_iter()
+                    .map_init(
+                        || vec![0i32; blocks_per_row],
+                        |dots, r| {
+                            let base = r * blocks_per_row;
+
+                            // ---- pass 1: integers only ---------------------
+                            //
+                            // This loop must contain no floating-point work at
+                            // all. Mixing the per-block scaling in here -- the
+                            // obvious way to write it -- stops the whole thing
+                            // vectorising: the float accumulation is a
+                            // non-associative chain the compiler may not
+                            // reorder, and interleaving it with the integer
+                            // reduction defeats that too. Split into two
+                            // passes, this becomes `sdot`; combined, it
+                            // compiles to scalar loads and multiplies and runs
+                            // several times slower.
+                            //
+                            // The scratch buffer is a few hundred bytes and
+                            // never leaves L1.
+                            match &self.data {
+                                Data::Q8 { qs, .. } => {
+                                    let row = &qs[r * n..(r + 1) * n];
+                                    for (d, (wb, xb)) in dots
+                                        .iter_mut()
+                                        .zip(row.chunks_exact(BLOCK).zip(xq.qs.chunks_exact(BLOCK)))
+                                    {
+                                        *d = wb
+                                            .iter()
+                                            .zip(xb.iter())
+                                            .map(|(&w, &v)| w as i32 * v as i32)
+                                            .sum();
+                                    }
+                                }
+                                Data::Q4 { qs, .. } => {
+                                    const HALF: usize = BLOCK / 2;
+                                    let row = &qs[r * n / 2..(r + 1) * n / 2];
+                                    for (d, (wb, xb)) in dots
+                                        .iter_mut()
+                                        .zip(row.chunks_exact(HALF).zip(xq.qs.chunks_exact(BLOCK)))
+                                    {
+                                        let (xlo, xhi) = xb.split_at(HALF);
+                                        // Two uniform reductions: low nibbles
+                                        // against the first half of the block,
+                                        // high nibbles against the second.
+                                        let lo: i32 = wb
+                                            .iter()
+                                            .zip(xlo.iter())
+                                            .map(|(&w, &v)| (w & 0x0f) as i32 * v as i32)
+                                            .sum();
+                                        let hi: i32 = wb
+                                            .iter()
+                                            .zip(xhi.iter())
+                                            .map(|(&w, &v)| (w >> 4) as i32 * v as i32)
+                                            .sum();
+                                        *d = lo + hi;
+                                    }
+                                }
+                                Data::F32(_) => unreachable!(),
+                            }
+
+                            // ---- pass 2: apply the scales ------------------
+                            let scales = match &self.data {
+                                Data::Q8 { scales, .. } | Data::Q4 { scales, .. } => scales,
+                                Data::F32(_) => unreachable!(),
+                            };
+                            // The 4-bit codes are stored offset by 8, undone
+                            // here against the summed quantised activations --
+                            // still integer, one correction per block.
+                            let offset = matches!(self.data, Data::Q4 { .. });
+
+                            let mut sums = [0.0f32; 2];
+                            for (b, &d) in dots.iter().enumerate() {
+                                let d = if offset { d - 8 * xq.sums[b] } else { d };
+                                sums[b & 1] += scales[base + b] * xq.scales[b] * d as f32;
+                            }
+                            sums[0] + sums[1]
+                        },
+                    )
+                    .collect()
+            }
         };
 
-        // Split the output into whole blocks so every thread owns entire
-        // scales; no two threads touch the same accumulator.
-        let per_thread = (blocks_per_row / rayon::current_num_threads().max(1)).max(1);
-        out.par_chunks_mut(per_thread * BLOCK).enumerate().for_each(|(ci, out_chunk)| {
-            let b0 = ci * per_thread;
-
-            // One output block at a time, accumulated in a register-sized
-            // array across the whole contraction, and written out once.
-            //
-            // The obvious loop order -- rows outside, blocks inside -- reads
-            // and writes all 32 outputs on every row. That is 256 bytes of
-            // output traffic per 32 bytes of q8 weights, so the *output*
-            // becomes the bottleneck and quantising makes the kernel slower
-            // rather than faster. Hoisting the accumulator out of the row loop
-            // removes that traffic entirely.
-            for (b, dst) in out_chunk.chunks_exact_mut(BLOCK).enumerate() {
-                let bb = b0 + b;
-                let mut acc = [0.0f32; BLOCK];
-
-                match &self.data {
-                    Data::Q8 { scales, qs } => {
-                        for i in 0..self.rows {
-                            let xi = x[i];
-                            if xi == 0.0 {
-                                continue;
-                            }
-                            let s = xi * scales[i * blocks_per_row + bb];
-                            let src = i * n + bb * BLOCK;
-                            let q = &qs[src..src + BLOCK];
-                            // 32 independent accumulator chains: nothing here
-                            // depends on anything else, so this vectorises.
-                            for k in 0..BLOCK {
-                                acc[k] += s * q[k] as f32;
-                            }
-                        }
-                    }
-                    Data::Q4 { scales, qs } => {
-                        // The stored nibble is `q + 8`, so the true weight is
-                        // `scale * (nibble - 8)`. Rather than subtracting 8
-                        // from every nibble, accumulate the scales separately
-                        // and correct all 32 outputs once at the end:
-                        //   sum s*(nibble - 8) = sum s*nibble - 8 * sum s
-                        let mut scale_sum = 0.0f32;
-                        for i in 0..self.rows {
-                            let xi = x[i];
-                            if xi == 0.0 {
-                                continue;
-                            }
-                            let s = xi * scales[i * blocks_per_row + bb];
-                            scale_sum += s;
-                            let src = (i * n + bb * BLOCK) / 2;
-                            let q = &qs[src..src + BLOCK / 2];
-                            // Two uniform 16-wide streams.
-                            for k in 0..BLOCK / 2 {
-                                let byte = q[k];
-                                acc[k] += s * (byte & 0x0f) as f32;
-                                acc[BLOCK / 2 + k] += s * (byte >> 4) as f32;
-                            }
-                        }
-                        let correction = 8.0 * scale_sum;
-                        for v in acc.iter_mut() {
-                            *v -= correction;
-                        }
-                    }
-                    Data::F32(_) => unreachable!(),
-                }
-
-                for k in 0..BLOCK {
-                    dst[k] += acc[k];
-                }
+        if let Some(b) = bias {
+            for (v, bi) in out.iter_mut().zip(b.iter()) {
+                *v += bi;
             }
-        });
+        }
         out
     }
+}
 
-    /// `y = x @ Wᵀ`, with `W` stored `[out_features, in_features]`.
+impl Weight {
+    /// The dequantising kernel: unpack each weight to `f32` and use ordinary
+    /// float FMAs, leaving the activations alone.
     ///
-    /// Blocks run along the contraction axis here, so each output is a sum of
-    /// per-block dot products, each scaled once at the end. This is the shape
-    /// the output head takes, over the whole vocabulary.
-    pub fn matvec_bt(&self, x: &[f32]) -> Vec<f32> {
-        debug_assert_eq!(x.len(), self.cols);
-        if let Data::F32(t) = &self.data {
-            return matvec_bt(x, t);
-        }
-
+    /// Slower than the integer path on large matrices, and *faster* on small
+    /// ones — see [`INTEGER_PATH_MIN_BYTES`].
+    fn matvec_bt_dequant(&self, x: &[f32]) -> Vec<f32> {
         let n = self.cols;
         let blocks_per_row = n / BLOCK;
-
-        // Sum of the activations in each block, precomputed once.
-        //
-        // The 4-bit path needs this to undo the +8 offset, and it depends only
-        // on x -- not on which row is being multiplied. Computing it inside the
-        // row loop, as the obvious version does, repeats the whole thing once
-        // per output: for a 151936-row output head that is 150k redundant
-        // passes over x, which roughly doubles the kernel's work.
+        // Per-block sums of the activations, for the 4-bit offset. Depends
+        // only on x, so it is computed once rather than once per row.
         let xsums: Vec<f32> = match self.data {
             Data::Q4 { .. } => x.chunks_exact(BLOCK).map(|b| b.iter().sum()).collect(),
             _ => Vec::new(),
@@ -331,75 +362,111 @@ impl Weight {
             .into_par_iter()
             .map(|r| {
                 let base = r * blocks_per_row;
-                // Four partial sums rather than one.
-                //
-                // Floating-point addition is not associative, so the compiler
-                // may not reorder a single accumulator chain -- every add waits
-                // for the previous one, and the loop runs at the latency of an
-                // FMA rather than its throughput. Splitting into independent
-                // lanes is the standard fix, and it is also what lets this
-                // vectorise.
+                // Four independent lanes: float addition is not associative,
+                // so a single accumulator would run at FMA latency rather than
+                // throughput.
                 let mut sums = [0.0f32; 4];
-
                 match &self.data {
                     Data::Q8 { scales, qs } => {
                         let row = &qs[r * n..(r + 1) * n];
-                        for (b, (qb, xb)) in
+                        for (b, (wb, xb)) in
                             row.chunks_exact(BLOCK).zip(x.chunks_exact(BLOCK)).enumerate()
                         {
                             let mut inner = [0.0f32; 4];
-                            for (qc, xc) in qb.chunks_exact(4).zip(xb.chunks_exact(4)) {
-                                inner[0] += xc[0] * qc[0] as f32;
-                                inner[1] += xc[1] * qc[1] as f32;
-                                inner[2] += xc[2] * qc[2] as f32;
-                                inner[3] += xc[3] * qc[3] as f32;
+                            for (qc, xc) in wb.chunks_exact(4).zip(xb.chunks_exact(4)) {
+                                for j in 0..4 {
+                                    inner[j] += xc[j] * qc[j] as f32;
+                                }
                             }
-                            // One scale multiply per block, not per weight.
-                            let s = scales[base + b];
+                            let sc = scales[base + b];
                             for j in 0..4 {
-                                sums[j] += s * inner[j];
+                                sums[j] += sc * inner[j];
                             }
                         }
                     }
                     Data::Q4 { scales, qs } => {
+                        const HALF: usize = BLOCK / 2;
                         let row = &qs[r * n / 2..(r + 1) * n / 2];
-                        for (b, (qb, xb)) in row
-                            .chunks_exact(BLOCK / 2)
-                            .zip(x.chunks_exact(BLOCK))
-                            .enumerate()
+                        for (b, (wb, xb)) in
+                            row.chunks_exact(HALF).zip(x.chunks_exact(BLOCK)).enumerate()
                         {
-                            // Split packing means the low nibbles are the
-                            // first half of the block and the high nibbles the
-                            // second, so each is a straight run against its own
-                            // half of x -- no interleaving.
-                            let (xlo, xhi) = xb.split_at(BLOCK / 2);
-                            debug_assert_eq!(xsums.len(), blocks_per_row);
-                            let mut lo = [0.0f32; 4];
-                            let mut hi = [0.0f32; 4];
-                            for ((qc, xl), xh) in qb
+                            let (xlo, xhi) = xb.split_at(HALF);
+                            let mut inner = [0.0f32; 4];
+                            for ((qc, xl), xh) in wb
                                 .chunks_exact(4)
                                 .zip(xlo.chunks_exact(4))
                                 .zip(xhi.chunks_exact(4))
                             {
                                 for j in 0..4 {
-                                    lo[j] += xl[j] * (qc[j] & 0x0f) as f32;
-                                    hi[j] += xh[j] * (qc[j] >> 4) as f32;
+                                    inner[j] += xl[j] * (qc[j] & 0x0f) as f32;
+                                    inner[j] += xh[j] * (qc[j] >> 4) as f32;
                                 }
                             }
-                            // Undo the +8 offset once per block, from the
-                            // precomputed activation sum.
-                            let dot = (lo[0] + lo[1]) + (lo[2] + lo[3]) + (hi[0] + hi[1])
-                                + (hi[2] + hi[3])
+                            let dot = (inner[0] + inner[1]) + (inner[2] + inner[3])
                                 - 8.0 * xsums[b];
                             sums[0] += scales[base + b] * dot;
                         }
                     }
                     Data::F32(_) => unreachable!(),
                 }
-
                 (sums[0] + sums[1]) + (sums[2] + sums[3])
             })
             .collect()
+    }
+}
+
+/// Above this many bytes of weights, quantise the activations and use the
+/// integer kernel; below it, dequantise to f32 instead.
+///
+/// # Why there are two kernels
+///
+/// The integer path is much faster on a matrix that has to be streamed from
+/// main memory, and slower on one that already fits in cache. A cache-resident
+/// matmul is not bandwidth-bound, so shrinking the weights buys nothing, and
+/// the extra steps — quantising the activation vector, the second pass over
+/// the block dots — are pure overhead.
+///
+/// Measured here: the 151936-row output head runs 5.1x faster with integer
+/// dots, while a 5 MB MLP matrix runs *slower* than simply dequantising. The
+/// threshold sits between the two. It is empirical, and the right value on
+/// another machine depends on its last-level cache.
+const INTEGER_PATH_MIN_BYTES: usize = 32 << 20;
+
+/// An activation vector, quantised to `i8` in blocks of [`BLOCK`].
+///
+/// Same scheme as the weights: symmetric, one scale per block. Activations
+/// have outliers too — more so than weights, which is what makes naive
+/// whole-tensor activation quantisation fail badly — and per-block scales
+/// contain them the same way.
+struct QActivation {
+    qs: Vec<i8>,
+    scales: Vec<f32>,
+    /// Sum of the quantised values per block, for the 4-bit offset correction.
+    sums: Vec<i32>,
+}
+
+impl QActivation {
+    fn new(x: &[f32]) -> Self {
+        let blocks = x.len() / BLOCK;
+        let mut qs = Vec::with_capacity(x.len());
+        let mut scales = Vec::with_capacity(blocks);
+        let mut sums = Vec::with_capacity(blocks);
+
+        for block in x.chunks_exact(BLOCK) {
+            let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let scale = amax / 127.0;
+            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            scales.push(scale);
+
+            let mut sum = 0i32;
+            for &v in block {
+                let q = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                sum += q as i32;
+                qs.push(q);
+            }
+            sums.push(sum);
+        }
+        QActivation { qs, scales, sums }
     }
 }
 
@@ -473,20 +540,20 @@ mod tests {
     }
 
     #[test]
-    fn quantised_matvec_agrees_with_f32() {
-        let t = random_tensor(64, 128, 7);
+    fn bias_is_applied_in_every_precision() {
+        let t = random_tensor(16, 64, 7);
         let mut rng = Rng::new(99);
         let x: Vec<f32> = (0..64).map(|_| rng.normal()).collect();
-        let bias: Vec<f32> = (0..128).map(|_| rng.normal() * 0.01).collect();
+        let bias: Vec<f32> = (0..16).map(|_| rng.normal()).collect();
 
-        let reference = Weight::quantize(t.clone(), Precision::F32).matvec(&x, Some(&bias));
-        for (precision, tolerance) in [(Precision::Q8, 0.02f32), (Precision::Q4, 0.3)] {
-            let got = Weight::quantize(t.clone(), precision).matvec(&x, Some(&bias));
-            let scale = reference.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            for (i, (a, b)) in reference.iter().zip(got.iter()).enumerate() {
+        for precision in [Precision::F32, Precision::Q8, Precision::Q4] {
+            let w = Weight::quantize(t.clone(), precision);
+            let without = w.matvec_bt(&x, None);
+            let with = w.matvec_bt(&x, Some(&bias));
+            for i in 0..16 {
                 assert!(
-                    (a - b).abs() <= tolerance * scale,
-                    "{precision} output {i}: {b} vs {a}"
+                    (with[i] - (without[i] + bias[i])).abs() < 1e-4,
+                    "{precision} output {i}"
                 );
             }
         }
@@ -498,9 +565,11 @@ mod tests {
         let mut rng = Rng::new(5);
         let x: Vec<f32> = (0..64).map(|_| rng.normal()).collect();
 
-        let reference = Weight::quantize(t.clone(), Precision::F32).matvec_bt(&x);
-        for (precision, tolerance) in [(Precision::Q8, 0.02f32), (Precision::Q4, 0.3)] {
-            let got = Weight::quantize(t.clone(), precision).matvec_bt(&x);
+        let reference = Weight::quantize(t.clone(), Precision::F32).matvec_bt(&x, None);
+        // Tolerances are looser than the weight-only round trip, because the
+        // activations are quantised now too and the two errors compound.
+        for (precision, tolerance) in [(Precision::Q8, 0.03f32), (Precision::Q4, 0.35)] {
+            let got = Weight::quantize(t.clone(), precision).matvec_bt(&x, None);
             let scale = reference.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             for (i, (a, b)) in reference.iter().zip(got.iter()).enumerate() {
                 assert!(

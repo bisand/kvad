@@ -168,13 +168,28 @@ impl Llm {
         let mut stats =
             Stats { prompt_tokens: prompt_ids.len(), cached_tokens: reuse, ..Default::default() };
 
-        // Prefill: push the prompt through to populate the cache. Only the
-        // logits from the final token matter -- the earlier ones predict
-        // tokens we already have.
+        // Prefill: push the prompt through to populate the cache, in batches.
+        // Only the logits from the final token matter -- the earlier ones
+        // predict tokens we already have.
+        //
+        // Chunked rather than all at once: a long prompt would otherwise
+        // allocate activation buffers proportional to its whole length, and
+        // the weight reuse that makes batching worthwhile has already
+        // saturated well before then.
+        // Tunable so its effect can be measured rather than assumed; 1 gives
+        // the old token-at-a-time behaviour.
+        let chunk = std::env::var("LLM_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(64);
         let t0 = Instant::now();
         let mut logits = Vec::new();
-        for &id in &prompt_ids[reuse..] {
-            logits = self.model.forward(id, cache);
+        let mut fed = reuse;
+        while fed < prompt_ids.len() {
+            let end = (fed + chunk).min(prompt_ids.len());
+            logits = self.model.forward_batch(&prompt_ids[fed..end], cache);
+            fed = end;
         }
         stats.prefill_secs = t0.elapsed().as_secs_f32();
 

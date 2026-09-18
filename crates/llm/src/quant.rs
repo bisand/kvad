@@ -432,6 +432,302 @@ impl Weight {
 /// another machine depends on its last-level cache.
 const INTEGER_PATH_MIN_BYTES: usize = 32 << 20;
 
+// ---------------------------------------------------------------------------
+// Batched matmul: the prefill path
+// ---------------------------------------------------------------------------
+
+/// A batch of `m` activation vectors, quantised per block.
+///
+/// `packed` additionally holds the rows interleaved in pairs, which is the
+/// operand shape `SMMLA` wants. It is built only when that kernel will run.
+struct QActBatch {
+    qs: Vec<i8>,
+    scales: Vec<f32>,
+    sums: Vec<i32>,
+    packed: Vec<i8>,
+}
+
+impl QActBatch {
+    fn new(xs: &[f32], m: usize, cols: usize, pack: bool) -> Self {
+        let blocks = cols / BLOCK;
+        let mut qs = vec![0i8; m * cols];
+        let mut scales = vec![0.0f32; m * blocks];
+        let mut sums = vec![0i32; m * blocks];
+
+        for i in 0..m {
+            for (b, block) in xs[i * cols..(i + 1) * cols].chunks_exact(BLOCK).enumerate() {
+                let amax = block.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+                let scale = amax / 127.0;
+                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                scales[i * blocks + b] = scale;
+
+                let mut sum = 0i32;
+                for (k, &v) in block.iter().enumerate() {
+                    let q = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                    sum += q as i32;
+                    qs[i * cols + b * BLOCK + k] = q;
+                }
+                sums[i * blocks + b] = sum;
+            }
+        }
+
+        // Interleave row 2p with row 2p+1 in runs of 8, which is exactly one
+        // SMMLA operand. Cheap: the batch is a few dozen rows, against weight
+        // matrices of tens of thousands.
+        let mut packed = Vec::new();
+        if pack {
+            packed = vec![0i8; (m / 2) * 2 * cols];
+            for pr in 0..m / 2 {
+                for b in 0..blocks {
+                    for g in 0..BLOCK / 8 {
+                        let dst = ((pr * blocks + b) * (BLOCK / 8) + g) * 16;
+                        let src = b * BLOCK + g * 8;
+                        packed[dst..dst + 8]
+                            .copy_from_slice(&qs[(2 * pr) * cols + src..(2 * pr) * cols + src + 8]);
+                        packed[dst + 8..dst + 16].copy_from_slice(
+                            &qs[(2 * pr + 1) * cols + src..(2 * pr + 1) * cols + src + 8],
+                        );
+                    }
+                }
+            }
+        }
+        QActBatch { qs, scales, sums, packed }
+    }
+}
+
+impl Weight {
+    /// `Y = X @ Wᵀ (+ b)` for a whole batch: `xs` is `[m, cols]`, the result is
+    /// `[m, rows]`.
+    ///
+    /// # Why batching matters more than the instruction
+    ///
+    /// Running `m` tokens one at a time reads the entire weight matrix `m`
+    /// times. Running them together reads it once and reuses each weight `m`
+    /// times, which turns a memory-bound operation into a compute-bound one.
+    /// That is the bulk of the win here; `SMMLA` is a bonus on top, and only
+    /// applies once the operation is a real matrix-matrix product.
+    pub fn matmul_bt(&self, xs: &[f32], m: usize, bias: Option<&[f32]>) -> Vec<f32> {
+        self.matmul_bt_with(xs, m, bias, true)
+    }
+
+    /// As [`Weight::matmul_bt`], with the `SMMLA` kernel selectable.
+    ///
+    /// Passing `false` forces the portable path, which is how the tests check
+    /// the hand-written assembly against something independent.
+    pub fn matmul_bt_with(
+        &self,
+        xs: &[f32],
+        m: usize,
+        bias: Option<&[f32]>,
+        allow_smmla: bool,
+    ) -> Vec<f32> {
+        debug_assert_eq!(xs.len(), m * self.cols);
+        if m == 1 {
+            return self.matvec_bt(xs, bias);
+        }
+        // f32 weights gain nothing here beyond the per-row path.
+        if let Data::F32(_) = self.data {
+            let mut out = Vec::with_capacity(m * self.rows);
+            for i in 0..m {
+                out.extend(self.matvec_bt(&xs[i * self.cols..(i + 1) * self.cols], bias));
+            }
+            return out;
+        }
+
+        let (n, rows) = (self.cols, self.rows);
+        let blocks = n / BLOCK;
+        let use_smmla =
+            allow_smmla && crate::simd::has_i8mm() && matches!(self.data, Data::Q8 { .. }) && m >= 2;
+        let act = QActBatch::new(xs, m, n, use_smmla);
+
+        // Computed transposed — `[rows, m]` — so each thread owns a contiguous
+        // run of output rows and reads each weight row exactly once.
+        let mut out_t = vec![0.0f32; rows * m];
+        out_t
+            .par_chunks_mut(2 * m)
+            .enumerate()
+            .for_each_init(
+                || vec![0i32; blocks],
+                |scratch, (rp, chunk)| {
+                let r0 = rp * 2;
+                let have_pair = chunk.len() == 2 * m;
+
+                if use_smmla && have_pair {
+                    // SAFETY: `use_smmla` checked the CPU feature, and the
+                    // index arithmetic below stays inside `qs` / `packed`,
+                    // whose sizes are fixed by `rows`, `cols` and `m`.
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        self.smmla_row_pair(&act, r0, m, blocks, chunk);
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    unreachable!();
+                    return;
+                }
+
+                // Fallback: one row at a time, in the same two passes as
+                // `matvec_bt` -- integers first, scaling second. Folding the
+                // scaling into the integer loop stops it vectorising, and the
+                // portable path would then be compared against scalar code
+                // rather than against SDOT.
+                for (local, dst) in chunk.chunks_exact_mut(m).enumerate() {
+                    let r = r0 + local;
+                    for i in 0..m {
+                        dst[i] = self.row_dot(&act, r, i, blocks, scratch);
+                    }
+                }
+                },
+            );
+
+        // Transpose into the per-token layout callers want, applying the bias
+        // on the way through.
+        let mut out = vec![0.0f32; m * rows];
+        for r in 0..rows {
+            let add = bias.map_or(0.0, |b| b[r]);
+            for i in 0..m {
+                out[i * rows + r] = out_t[r * m + i] + add;
+            }
+        }
+        out
+    }
+
+    /// One output element: weight row `r` against activation row `i`.
+    ///
+    /// Two passes, for the reason given in [`Weight::matvec_bt`]: the integer
+    /// reduction only vectorises if no floating-point work is interleaved
+    /// with it.
+    fn row_dot(
+        &self,
+        act: &QActBatch,
+        r: usize,
+        i: usize,
+        blocks: usize,
+        scratch: &mut [i32],
+    ) -> f32 {
+        let n = self.cols;
+
+        // ---- pass 1: integers only ----
+        match &self.data {
+            Data::Q8 { qs, .. } => {
+                let wrow = &qs[r * n..(r + 1) * n];
+                let arow = &act.qs[i * n..(i + 1) * n];
+                for (d, (wb, ab)) in scratch
+                    .iter_mut()
+                    .zip(wrow.chunks_exact(BLOCK).zip(arow.chunks_exact(BLOCK)))
+                {
+                    *d = wb.iter().zip(ab.iter()).map(|(&w, &v)| w as i32 * v as i32).sum();
+                }
+            }
+            Data::Q4 { qs, .. } => {
+                const HALF: usize = BLOCK / 2;
+                let wrow = &qs[r * n / 2..(r + 1) * n / 2];
+                let arow = &act.qs[i * n..(i + 1) * n];
+                for (d, (wb, ab)) in scratch
+                    .iter_mut()
+                    .zip(wrow.chunks_exact(HALF).zip(arow.chunks_exact(BLOCK)))
+                {
+                    let (alo, ahi) = ab.split_at(HALF);
+                    let lo: i32 =
+                        wb.iter().zip(alo.iter()).map(|(&w, &v)| (w & 0x0f) as i32 * v as i32).sum();
+                    let hi: i32 =
+                        wb.iter().zip(ahi.iter()).map(|(&w, &v)| (w >> 4) as i32 * v as i32).sum();
+                    *d = lo + hi;
+                }
+            }
+            Data::F32(_) => unreachable!(),
+        }
+
+        // ---- pass 2: apply the scales ----
+        let scales = match &self.data {
+            Data::Q8 { scales, .. } | Data::Q4 { scales, .. } => scales,
+            Data::F32(_) => unreachable!(),
+        };
+        let offset = matches!(self.data, Data::Q4 { .. });
+        let (wbase, abase) = (r * blocks, i * blocks);
+
+        let mut total = [0.0f32; 2];
+        for (b, &d) in scratch.iter().enumerate() {
+            let d = if offset { d - 8 * act.sums[abase + b] } else { d };
+            total[b & 1] += scales[wbase + b] * act.scales[abase + b] * d as f32;
+        }
+        total[0] + total[1]
+    }
+
+    /// Two output rows at once, via `SMMLA`.
+    ///
+    /// Each instruction handles a 2x2 tile: weight rows `r0`/`r0+1` against
+    /// activation rows `2p`/`2p+1`. Four independent accumulators cover the 32
+    /// weights of one quantisation block — with a single accumulator the chain
+    /// is latency-bound and the whole thing runs *slower* than `SDOT`.
+    ///
+    /// # Safety
+    /// Requires `i8mm`; `dst` must be `2 * m` long.
+    ///
+    /// The `target_feature` attribute is load-bearing, not decoration. A
+    /// `#[target_feature]` function can only be inlined into a caller that
+    /// declares at least the same features — so without it here, every single
+    /// `smmla` becomes a real function call and the kernel runs several times
+    /// slower than the plain `SDOT` path it was meant to beat. Nothing warns
+    /// about this; it just quietly loses.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "i8mm")]
+    unsafe fn smmla_row_pair(
+        &self,
+        act: &QActBatch,
+        r0: usize,
+        m: usize,
+        blocks: usize,
+        dst: &mut [f32],
+    ) {
+        use crate::simd::*;
+        let Data::Q8 { scales, qs } = &self.data else { unreachable!() };
+        let n = self.cols;
+        let w0 = qs.as_ptr().add(r0 * n);
+        let w1 = qs.as_ptr().add((r0 + 1) * n);
+        let (ws0, ws1) = (r0 * blocks, (r0 + 1) * blocks);
+
+        dst.fill(0.0);
+        for pr in 0..m / 2 {
+            let (i0, i1) = (2 * pr, 2 * pr + 1);
+            let (mut acc00, mut acc01, mut acc10, mut acc11) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+
+            for b in 0..blocks {
+                let mut lanes4 = [zero(); BLOCK / 8];
+                for (g, a) in lanes4.iter_mut().enumerate() {
+                    let off = b * BLOCK + g * 8;
+                    let wv = combine_rows(w0.add(off), w1.add(off));
+                    let bv = load16(
+                        act.packed.as_ptr().add(((pr * blocks + b) * (BLOCK / 8) + g) * 16),
+                    );
+                    *a = smmla(*a, wv, bv);
+                }
+                let total = add4(add4(lanes4[0], lanes4[1]), add4(lanes4[2], lanes4[3]));
+                // [w0·x0, w0·x1, w1·x0, w1·x1]
+                let l = lanes(total);
+                let (xs0, xs1) =
+                    (act.scales[i0 * blocks + b], act.scales[i1 * blocks + b]);
+                let (a0, a1) = (scales[ws0 + b], scales[ws1 + b]);
+                acc00 += a0 * xs0 * l[0] as f32;
+                acc01 += a0 * xs1 * l[1] as f32;
+                acc10 += a1 * xs0 * l[2] as f32;
+                acc11 += a1 * xs1 * l[3] as f32;
+            }
+            dst[i0] = acc00;
+            dst[i1] = acc01;
+            dst[m + i0] = acc10;
+            dst[m + i1] = acc11;
+        }
+
+        // Odd batch: the last activation row has no partner.
+        if m % 2 == 1 {
+            let i = m - 1;
+            let mut scratch = vec![0i32; blocks];
+            dst[i] = self.row_dot(act, r0, i, blocks, &mut scratch);
+            dst[m + i] = self.row_dot(act, r0 + 1, i, blocks, &mut scratch);
+        }
+    }
+}
+
 /// An activation vector, quantised to `i8` in blocks of [`BLOCK`].
 ///
 /// Same scheme as the weights: symmetric, one scale per block. Activations
@@ -589,6 +885,67 @@ mod tests {
         assert_eq!(Weight::quantize(t.clone(), Precision::Q8).bytes(), n + n / BLOCK * 4);
         // 4 bits of payload + the same scale = 5 bits.
         assert_eq!(Weight::quantize(t, Precision::Q4).bytes(), n / 2 + n / BLOCK * 4);
+    }
+
+    /// The hand-written SMMLA kernel must agree with the portable one.
+    ///
+    /// Nothing else checks that assembly: a swapped result lane or a mismatched
+    /// scale produces numbers that look entirely plausible. Both paths quantise
+    /// identically, so agreement here should be near-exact rather than
+    /// approximate.
+    #[test]
+    fn smmla_kernel_matches_the_portable_path() {
+        let mut rng = Rng::new(31337);
+        // Odd batch sizes and an odd row count exercise the leftover handling.
+        for m in [2usize, 3, 8, 9, 16] {
+            let t = random_tensor(71, 128, 5);
+            let xs: Vec<f32> = (0..m * 128).map(|_| rng.normal()).collect();
+            let bias: Vec<f32> = (0..71).map(|_| rng.normal() * 0.1).collect();
+            let w = Weight::quantize(t, Precision::Q8);
+
+            let fast = w.matmul_bt_with(&xs, m, Some(&bias), true);
+            let slow = w.matmul_bt_with(&xs, m, Some(&bias), false);
+            for (i, (a, b)) in slow.iter().zip(fast.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "m={m} element {i}: smmla {b} vs portable {a}"
+                );
+            }
+        }
+    }
+
+    /// Batching must not change the answer beyond quantisation noise.
+    ///
+    /// The tolerance is loose on purpose: below the size threshold a single
+    /// row takes the dequantising kernel, which leaves the activations in f32,
+    /// while the batched path quantises them. The two genuinely differ by
+    /// about a percent — that is the cost of activation quantisation, not a
+    /// bug.
+    #[test]
+    fn batched_matmul_agrees_with_row_by_row() {
+        let mut rng = Rng::new(4242);
+        for m in [1usize, 2, 5] {
+            let t = random_tensor(70, 128, 5);
+            let xs: Vec<f32> = (0..m * 128).map(|_| rng.normal()).collect();
+
+            for (precision, tol) in
+                [(Precision::F32, 1e-4f32), (Precision::Q8, 0.05), (Precision::Q4, 0.4)]
+            {
+                let w = Weight::quantize(t.clone(), precision);
+                let batched = w.matmul_bt(&xs, m, None);
+                for i in 0..m {
+                    let single = w.matvec_bt(&xs[i * 128..(i + 1) * 128], None);
+                    let scale = single.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+                    for r in 0..70 {
+                        let (a, b) = (single[r], batched[i * 70 + r]);
+                        assert!(
+                            (a - b).abs() <= tol * scale.max(1e-3),
+                            "{precision} m={m} row {i} out {r}: batched {b} vs single {a}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

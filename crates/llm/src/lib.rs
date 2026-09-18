@@ -19,6 +19,7 @@ pub mod hub;
 pub mod model;
 pub mod quant;
 pub mod runtime;
+pub mod simd;
 pub mod sampler;
 pub mod tensor;
 pub mod weights;

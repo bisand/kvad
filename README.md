@@ -110,7 +110,9 @@ Read in this order:
    simpler. Then **[`model/llama.rs`](crates/llm/src/model/llama.rs)**, written
    to be read as a diff against it.
 5. **[`quant.rs`](crates/llm/src/quant.rs)** — block-wise int8/int4 weights
-   and the kernels that consume them.
+   and the kernels that consume them, then
+   **[`simd.rs`](crates/llm/src/simd.rs)** for the one instruction the compiler
+   will not reach on its own.
 6. **[`sampler.rs`](crates/llm/src/sampler.rs)**, then
    **[`chat.rs`](crates/llm/src/chat.rs)**.
 
@@ -247,6 +249,78 @@ And note what q4 does *not* buy: it is no faster than q8 — unpacking nibbles
 costs more than the halved bytes save — while being much less accurate. Its
 only advantage is memory.
 
+### Batched prefill, and i8mm
+
+A prompt used to go through the model one token at a time, re-reading every
+weight matrix once per token. Feeding tokens through together reads each weight
+once and reuses it across the batch — a memory-bound operation becomes a
+compute-bound one. `forward_batch` does that, in chunks of 64.
+
+Causal masking comes for free, which is the neat part: push all the batch's
+keys and values into the cache first, then let query `i` attend over exactly
+`pos0 + i + 1` positions. No mask anywhere. (Every tutorial's triangular matrix
+is only needed when you *don't* have a KV cache to be careful with.)
+
+Once prefill is a real matrix-matrix product, ARM's `i8mm` extension applies.
+`SMMLA` multiplies a 2x8 block of `i8` by an 8x2 block and accumulates a 2x2
+`i32` result — 32 multiply-accumulates in one instruction, twice `SDOT`'s 16.
+
+**But look at the shape it wants: two independent activation rows.** Generating
+one token at a time gives you exactly one, so half the result lanes would be
+duplicates and the useful throughput collapses back to `SDOT`'s. `i8mm` cannot
+help decoding. Only prefill.
+
+Prefill, 654 tokens, Qwen2.5-0.5B, q8:
+
+| | time | |
+|---|---|---|
+| one token at a time (`LLM_PREFILL_CHUNK=1`) | 18.04 s | |
+| batched, `SDOT` (`LLM_NO_I8MM=1`) | 2.80 s | **6.4x** from batching |
+| batched, `SMMLA` | 2.20 s | **1.27x** more from i8mm |
+
+8.2x overall, and 26.5 ms/token becomes 3.3 ms/token. Decoding is untouched —
+it is still a matrix-vector product, and still the same speed.
+
+`i8mm` is worth more than 1.27x on a single core: 2.04x at
+`RAYON_NUM_THREADS=1`. With all 18 threads running, memory bandwidth becomes
+the limit again and a faster instruction has less to offer. Both knobs above
+are environment variables precisely so this is measurable rather than asserted.
+
+Rust exposes `SMMLA` only through an unstable intrinsic, so
+[`simd.rs`](crates/llm/src/simd.rs) emits it with inline assembly — stable, and
+four lines. Availability is detected at runtime, so one binary still runs on
+CPUs without it.
+
+### The bug worth stealing
+
+The first version of the `SMMLA` kernel was **slower than the `SDOT` path it
+was meant to beat** — 65% slower on one core. The cause was one missing
+attribute:
+
+```rust
+#[target_feature(enable = "i8mm")]   // <- this line
+unsafe fn smmla_row_pair(...)
+```
+
+A `#[target_feature]` function can only be inlined into a caller declaring at
+least the same features. Without it, every single `smmla` became a real
+function call. It compiles, it is correct, it is tested, and it quietly throws
+away everything the instruction was for.
+
+Two measurement traps on the way there, both of which produced confident wrong
+answers:
+
+- The first comparison said `SMMLA` was **2.01x faster**. It was being compared
+  against a fallback that had floats mixed into its integer loop, so the
+  baseline was scalar code rather than `SDOT`. Fixing the baseline turned the
+  result into a 7% *loss*.
+- An isolated benchmark with a single accumulator said `SMMLA` was **2.4x
+  slower** — that loop was latency-bound on its own accumulator chain. Four
+  independent chains turned it into a 1.39x win.
+
+Three different numbers for the same instruction, all measured, none of them
+right until the last one. Worth remembering before quoting a speedup.
+
 ### Verifying you got it right
 
 ```bash
@@ -294,32 +368,25 @@ state management — good Rust, no ML. Build it last.
 
 ## Where to go next
 
-**4. Use the wider integer instructions.** The `i8` dot products use `sdot`
-(4 lanes). ARM's `i8mm` extension adds `smmla`, an 8x wider matrix-multiply
-step, and is available on this machine behind `-C target-cpu=native`. Making
-the small matrices worth quantising at all is the other half of the problem —
-they are cache-resident, so they need fewer instructions rather than fewer
-bytes.
-
-**5. Serialise quantised weights.** Quantisation currently happens on every
+**4. Serialise quantised weights.** Quantisation currently happens on every
 load, which means still reading the full f32 checkpoint off disk. Writing the
 blocks out once would make startup and disk footprint match the memory win.
 
-**6. Batch the prompt.** Prefill currently walks the prompt one token at a time.
-Processing it as one matrix is several times faster — and needs an explicit
-triangular causal mask, which the KV-cache path gets for free. Classic first bug.
+**5. A real f32 GEMM.** Batched prefill only helps the quantised paths; with
+f32 weights `matmul_bt` still loops row by row, which is why f32 prefill is
+unchanged at 26.5 ms/token. The same blocking would apply.
 
-**7. GPU, via [`candle`](https://github.com/huggingface/candle).** HuggingFace's
+**6. GPU, via [`candle`](https://github.com/huggingface/candle).** HuggingFace's
 Rust framework, Metal backend. You will recognise every operation because you
 wrote them by hand first. 48 GB of unified memory holds a quantised 30B model.
 
-**8. Train your own.** A character-level transformer, 10–30M parameters, on a
+**7. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Needs backprop through attention, layernorm and softmax, plus
 Adam. The gradient check from crate 1 is how you will debug it — extend
 `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
-**9. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
+**8. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike
 full fine-tuning it fits on a laptop.
 

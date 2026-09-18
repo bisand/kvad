@@ -64,12 +64,52 @@ fn bench(label: &str, rows: usize, cols: usize) {
     }
 }
 
+/// The prefill shape: one weight matrix against a batch of activations.
+fn bench_batch(label: &str, rows: usize, cols: usize, m: usize) {
+    let mut rng = Rng::new(7);
+    let t = Tensor::new(rows, cols, (0..rows * cols).map(|_| rng.normal() * 0.05).collect());
+    let xs: Vec<f32> = (0..m * cols).map(|_| rng.normal()).collect();
+
+    println!("\n{label}  [{rows} x {cols}] x {m} tokens");
+    let w = Weight::quantize(t, Precision::Q8);
+    for (name, allow) in [("q8 sdot", false), ("q8 smmla", true)] {
+        let run = || w.matmul_bt_with(&xs, m, None, allow);
+        for _ in 0..2 {
+            std::hint::black_box(run());
+        }
+        let probe = Instant::now();
+        std::hint::black_box(run());
+        let one = probe.elapsed().as_secs_f64().max(1e-9);
+        let iters = ((0.1 / one) as usize).clamp(5, 5_000);
+
+        let mut per_call = f64::MAX;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(run());
+            }
+            per_call = per_call.min(t0.elapsed().as_secs_f64() / iters as f64);
+        }
+        let gmac = (m * rows * cols) as f64 / per_call / 1e9;
+        println!("  {name:<10} {:>7.2} ms/call  {:>7.1} GMAC/s", per_call * 1e3, gmac);
+    }
+    if !llm::simd::has_i8mm() {
+        println!("  (i8mm unavailable or disabled — both rows are the same kernel)");
+    }
+}
+
 fn main() {
     println!("threads: {}", rayon::current_num_threads());
+    println!("i8mm:    {}", llm::simd::has_i8mm());
     // The output head: by far the largest single matmul per token.
     bench("qwen lm_head", 151936, 896);
     // A representative MLP matrix.
     bench("qwen mlp.down", 896, 4864);
     // GPT-2's widening MLP, in the transposed layout it is now stored in.
     bench("gpt2 c_fc", 3072, 768);
+
+    // Prefill: the same matrices, but against a batch. This is the only place
+    // SMMLA applies, because it needs two independent activation rows.
+    bench_batch("qwen mlp.down", 896, 4864, 64);
+    bench_batch("qwen q_proj", 896, 896, 64);
 }

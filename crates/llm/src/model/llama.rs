@@ -152,6 +152,73 @@ impl Transformer for Model {
             + per_block * self.blocks.len()
     }
 
+    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        let spec = &self.spec;
+        let (m, e) = (tokens.len(), spec.n_embd);
+        let qdim = spec.n_head * spec.head_dim;
+        let kvdim = spec.kv_dim();
+        let pos0 = cache.len;
+        assert!(pos0 + m <= spec.n_ctx, "context window of {} tokens is full", spec.n_ctx);
+
+        // No position embedding: position arrives inside attention, as RoPE.
+        let mut xs = vec![0.0f32; m * e];
+        for (i, &t) in tokens.iter().enumerate() {
+            xs[i * e..(i + 1) * e].copy_from_slice(&self.embed.row(t as usize));
+        }
+
+        let mut hs = vec![0.0f32; m * e];
+        for (l, block) in self.blocks.iter().enumerate() {
+            // ---- Attention sub-block -------------------------------------
+            for i in 0..m {
+                hs[i * e..(i + 1) * e]
+                    .copy_from_slice(&rms_norm(&xs[i * e..(i + 1) * e], &block.attn_norm, spec.eps));
+            }
+            let mut q = block.q_w.matmul_bt(&hs, m, block.q_b.as_deref());
+            let mut k = block.k_w.matmul_bt(&hs, m, block.k_b.as_deref());
+            let v = block.v_w.matmul_bt(&hs, m, block.v_b.as_deref());
+
+            // Each row rotates by its own absolute position.
+            for i in 0..m {
+                self.apply_rope(&mut q[i * qdim..(i + 1) * qdim], pos0 + i);
+                self.apply_rope(&mut k[i * kvdim..(i + 1) * kvdim], pos0 + i);
+                cache.push(l, &k[i * kvdim..(i + 1) * kvdim], &v[i * kvdim..(i + 1) * kvdim]);
+            }
+
+            let mut attn = vec![0.0f32; m * qdim];
+            for i in 0..m {
+                attn[i * qdim..(i + 1) * qdim].copy_from_slice(&attend(
+                    spec,
+                    &q[i * qdim..(i + 1) * qdim],
+                    cache.keys(l),
+                    cache.values(l),
+                    pos0 + i + 1,
+                ));
+            }
+            let proj = block.o_w.matmul_bt(&attn, m, None);
+            for (x, a) in xs.iter_mut().zip(proj.iter()) {
+                *x += a;
+            }
+
+            // ---- MLP sub-block -------------------------------------------
+            for i in 0..m {
+                hs[i * e..(i + 1) * e]
+                    .copy_from_slice(&rms_norm(&xs[i * e..(i + 1) * e], &block.mlp_norm, spec.eps));
+            }
+            let mut gate = block.gate_w.matmul_bt(&hs, m, None);
+            let up = block.up_w.matmul_bt(&hs, m, None);
+            swiglu_inplace(&mut gate, &up);
+            let mlp = block.down_w.matmul_bt(&gate, m, None);
+            for (x, val) in xs.iter_mut().zip(mlp.iter()) {
+                *x += val;
+            }
+        }
+
+        cache.len += m;
+
+        let last = rms_norm(&xs[(m - 1) * e..m * e], &self.final_norm, spec.eps);
+        self.lm_head.as_ref().unwrap_or(&self.embed).matvec_bt(&last, None)
+    }
+
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32> {
         let spec = &self.spec;
         let pos = cache.len;

@@ -186,6 +186,28 @@ pub trait Transformer: Send + Sync {
     fn spec(&self) -> &Spec;
     /// Run one token and return logits over the vocabulary.
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32>;
+
+    /// Run several tokens in one pass, returning logits for the **last** one.
+    ///
+    /// This is prefill. Feeding the prompt a token at a time re-reads every
+    /// weight matrix once per token; feeding them together reads each weight
+    /// once and reuses it across the batch, which is the difference between a
+    /// memory-bound and a compute-bound operation.
+    ///
+    /// Causal masking comes for free. All the batch's keys and values go into
+    /// the cache first, then query `i` attends over exactly `pos0 + i + 1`
+    /// positions — so it never sees a token that comes after it, without an
+    /// explicit mask anywhere.
+    ///
+    /// The default is the equivalent loop, which is also what the batched
+    /// implementations are tested against.
+    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        let mut logits = Vec::new();
+        for &t in tokens {
+            logits = self.forward(t, cache);
+        }
+        logits
+    }
     fn param_count(&self) -> usize;
     /// Bytes the weight matrices occupy in memory, after quantisation.
     fn memory_bytes(&self) -> usize;

@@ -130,6 +130,70 @@ impl Transformer for Model {
         self.wte.bytes() + self.wpe.bytes() + per_block * self.blocks.len()
     }
 
+    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        let spec = &self.spec;
+        let (m, e) = (tokens.len(), spec.n_embd);
+        let pos0 = cache.len;
+        assert!(pos0 + m <= spec.n_ctx, "context window of {} tokens is full", spec.n_ctx);
+
+        // Token embedding plus position embedding, one row per token.
+        let mut xs = vec![0.0f32; m * e];
+        for (i, &t) in tokens.iter().enumerate() {
+            let tok = self.wte.row(t as usize);
+            let pos = self.wpe.row(pos0 + i);
+            for j in 0..e {
+                xs[i * e + j] = tok[j] + pos[j];
+            }
+        }
+
+        let mut hs = vec![0.0f32; m * e];
+        for (l, block) in self.blocks.iter().enumerate() {
+            // ---- Attention sub-block -------------------------------------
+            for i in 0..m {
+                hs[i * e..(i + 1) * e]
+                    .copy_from_slice(&layer_norm(&xs[i * e..(i + 1) * e], &block.ln1_g, &block.ln1_b, spec.eps));
+            }
+            let qkv = block.attn_w.matmul_bt(&hs, m, Some(&block.attn_b));
+
+            // Every key and value first, so the cache is complete before any
+            // query reads it.
+            for i in 0..m {
+                let row = &qkv[i * 3 * e..(i + 1) * 3 * e];
+                cache.push(l, &row[e..2 * e], &row[2 * e..3 * e]);
+            }
+
+            let mut attn = vec![0.0f32; m * e];
+            for i in 0..m {
+                let q = &qkv[i * 3 * e..i * 3 * e + e];
+                attn[i * e..(i + 1) * e]
+                    .copy_from_slice(&attend(spec, q, cache.keys(l), cache.values(l), pos0 + i + 1));
+            }
+            let proj = block.attn_proj_w.matmul_bt(&attn, m, Some(&block.attn_proj_b));
+            for (x, a) in xs.iter_mut().zip(proj.iter()) {
+                *x += a;
+            }
+
+            // ---- MLP sub-block -------------------------------------------
+            for i in 0..m {
+                hs[i * e..(i + 1) * e]
+                    .copy_from_slice(&layer_norm(&xs[i * e..(i + 1) * e], &block.ln2_g, &block.ln2_b, spec.eps));
+            }
+            let mut hidden = block.fc_w.matmul_bt(&hs, m, Some(&block.fc_b));
+            gelu_inplace(&mut hidden);
+            let mlp = block.proj_w.matmul_bt(&hidden, m, Some(&block.proj_b));
+            for (x, v) in xs.iter_mut().zip(mlp.iter()) {
+                *x += v;
+            }
+        }
+
+        cache.len += m;
+
+        // Only the last position predicts anything we need, so the output head
+        // stays a matrix-vector product.
+        let last = layer_norm(&xs[(m - 1) * e..m * e], &self.lnf_g, &self.lnf_b, spec.eps);
+        self.wte.matvec_bt(&last, None)
+    }
+
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32> {
         let spec = &self.spec;
         let pos = cache.len;

@@ -15,6 +15,7 @@
 //! 5. [`chat`]    — why an instruction-tuned model needs exact marker tokens.
 
 pub mod chat;
+pub mod hub;
 pub mod model;
 pub mod runtime;
 pub mod sampler;

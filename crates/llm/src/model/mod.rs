@@ -42,6 +42,31 @@ pub enum Arch {
     Llama,
 }
 
+impl Arch {
+    /// Map a HuggingFace `model_type` (or `architectures[0]`) onto an
+    /// implementation, or `None` if we cannot run it.
+    ///
+    /// Used both when loading a checkpoint and when searching the Hub, so the
+    /// search can say up front which results are actually runnable.
+    pub fn from_model_type(model_type: &str) -> Option<Arch> {
+        let t = model_type.to_ascii_lowercase();
+        match t.as_str() {
+            t if t.contains("gpt2") => Some(Arch::Gpt2),
+            // These all share one implementation. If you hit an unsupported
+            // model_type, checking whether it is Llama-shaped is usually a
+            // matter of looking for rms_norm_eps and rope_theta in its config.
+            t if t.contains("llama")
+                || t.contains("qwen2")
+                || t.contains("mistral")
+                || t.contains("smollm") =>
+            {
+                Some(Arch::Llama)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for Arch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -110,27 +135,13 @@ impl Spec {
             })
             .ok_or("config.json has neither model_type nor architectures")?;
 
-        let arch = match model_type.as_str() {
-            t if t.contains("gpt2") => Arch::Gpt2,
-            // These all share one implementation. If you hit an unsupported
-            // model_type, checking whether it is Llama-shaped is usually a
-            // matter of looking for rms_norm_eps and rope_theta in its config.
-            t if t.contains("llama")
-                || t.contains("qwen2")
-                || t.contains("mistral")
-                || t.contains("smollm") =>
-            {
-                Arch::Llama
-            }
-            other => {
-                return Err(format!(
-                    "unsupported architecture `{other}`.\n\
-                     This engine implements two: gpt2 and llama (which covers \
-                     Llama 2/3, Mistral, Qwen2/2.5, SmolLM2, TinyLlama)."
-                )
-                .into())
-            }
-        };
+        let arch = Arch::from_model_type(&model_type).ok_or_else(|| {
+            format!(
+                "unsupported architecture `{model_type}`.\n\
+                 This engine implements two: gpt2 and llama (which covers \
+                 Llama 2/3, Mistral, Qwen2/2.5, SmolLM2, TinyLlama)."
+            )
+        })?;
 
         let n_embd = num(&["n_embd", "hidden_size"]).ok_or("config: no hidden size")?;
         let n_head = num(&["n_head", "num_attention_heads"]).ok_or("config: no head count")?;

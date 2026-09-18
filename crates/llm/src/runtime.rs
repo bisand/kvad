@@ -27,6 +27,8 @@ pub struct Llm {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
     pub prompt_tokens: usize,
+    /// Prompt tokens served from an existing KV cache rather than recomputed.
+    pub cached_tokens: usize,
     pub generated_tokens: usize,
     pub prefill_secs: f32,
     pub decode_secs: f32,
@@ -40,7 +42,12 @@ impl Stats {
 
 impl Llm {
     pub fn load(repo_id: &str) -> Res<Self> {
-        let files = weights::fetch(repo_id)?;
+        Self::load_with(repo_id, &mut |msg| eprintln!("  {msg}"))
+    }
+
+    pub fn load_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<Self> {
+        let files = weights::fetch_with(repo_id, progress)?;
+        progress("reading weights");
         let spec = Spec::from_json(&files.config)?;
         let model = model::load(&files.weights, spec.clone())?;
         let tokenizer = Tokenizer::from_file(&files.tokenizer).map_err(|e| e.to_string())?;
@@ -104,8 +111,20 @@ impl Llm {
         KvCache::new(&self.spec)
     }
 
+    /// How many leading tokens two sequences share.
+    ///
+    /// Used with [`KvCache::truncate`] to reuse the cache across chat turns.
+    pub fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+        a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+    }
+
     /// Generate from `prompt_ids`, calling `on_token` with each new fragment of
     /// text as it appears.
+    ///
+    /// If `cache` is non-empty its contents are taken to be the first
+    /// `cache.len` tokens of `prompt_ids`, and only the remainder is prefilled.
+    /// Callers reusing a cache across turns must therefore truncate it to the
+    /// common prefix first; see [`Llm::common_prefix`].
     ///
     /// Returning `false` from `on_token` stops generation — that is how the
     /// TUI implements its interrupt key.
@@ -116,19 +135,26 @@ impl Llm {
         sampler: &mut Sampler,
         max_tokens: usize,
         mut on_token: impl FnMut(&str) -> bool,
-    ) -> Res<Stats> {
+    ) -> Res<(Stats, Vec<u32>)> {
         if prompt_ids.is_empty() {
             return Err("prompt encoded to zero tokens".into());
         }
 
-        let mut stats = Stats { prompt_tokens: prompt_ids.len(), ..Default::default() };
+        // Anything already cached is a prefix we can skip. Always leave at
+        // least one token to process, or there would be no logits to sample
+        // the next token from.
+        let reuse = cache.len.min(prompt_ids.len().saturating_sub(1));
+        cache.truncate(reuse);
+
+        let mut stats =
+            Stats { prompt_tokens: prompt_ids.len(), cached_tokens: reuse, ..Default::default() };
 
         // Prefill: push the prompt through to populate the cache. Only the
         // logits from the final token matter -- the earlier ones predict
         // tokens we already have.
         let t0 = Instant::now();
         let mut logits = Vec::new();
-        for &id in prompt_ids {
+        for &id in &prompt_ids[reuse..] {
             logits = self.model.forward(id, cache);
         }
         stats.prefill_secs = t0.elapsed().as_secs_f32();
@@ -158,6 +184,28 @@ impl Llm {
         }
         stats.decode_secs = t1.elapsed().as_secs_f32();
 
-        Ok(stats)
+        // `ids` is now exactly what the cache holds, which is what a caller
+        // reusing the cache next turn needs in order to find the shared prefix.
+        Ok((stats, ids))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Llm;
+
+    #[test]
+    fn common_prefix_finds_the_shared_history() {
+        // In a chat, turn N's tokens begin with all of turn N-1's, so the
+        // shared prefix is the entire conversation so far.
+        let previous = [1u32, 2, 3, 4, 5];
+        let next = [1u32, 2, 3, 4, 5, 9, 9, 9];
+        assert_eq!(Llm::common_prefix(&previous, &next), 5);
+
+        // A cleared or edited history diverges early and most of the cache
+        // has to be thrown away.
+        assert_eq!(Llm::common_prefix(&previous, &[1, 2, 7, 8]), 2);
+        assert_eq!(Llm::common_prefix(&previous, &[9]), 0);
+        assert_eq!(Llm::common_prefix(&[], &next), 0);
     }
 }

@@ -408,7 +408,7 @@ fn run(args: Args) -> Res<()> {
 
     let mut cache = llm.new_cache();
     let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
-    let stats = llm.generate(&ids, &mut cache, &mut sampler, args.max_tokens, |piece| {
+    let (stats, _) = llm.generate(&ids, &mut cache, &mut sampler, args.max_tokens, |piece| {
         print!("{piece}");
         let _ = std::io::stdout().flush();
         true
@@ -468,7 +468,7 @@ fn chat(args: Args) -> Res<()> {
         // Keeping the cache across turns is the fix, and is what the TUI does.
         let mut cache = llm.new_cache();
         let mut reply = String::new();
-        let stats = llm.generate(&ids, &mut cache, &mut sampler, args.max_tokens, |piece| {
+        let (stats, _) = llm.generate(&ids, &mut cache, &mut sampler, args.max_tokens, |piece| {
             print!("{piece}");
             let _ = std::io::stdout().flush();
             reply.push_str(piece);

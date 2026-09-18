@@ -35,8 +35,17 @@ pub struct ModelFiles {
     pub generation_config: Option<PathBuf>,
 }
 
-/// Download (or reuse from the local cache) everything needed to run `repo_id`.
+/// Download (or reuse from the local cache) everything needed to run `repo_id`,
+/// reporting progress to stderr.
 pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
+    fetch_with(repo_id, &mut |msg| eprintln!("  {msg}"))
+}
+
+/// As [`fetch`], but progress goes to a callback.
+///
+/// The TUI needs this: anything written straight to stderr lands on top of the
+/// rendered frame and corrupts the display.
+pub fn fetch_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<ModelFiles> {
     let (owner, name) = repo_id
         .split_once('/')
         .ok_or_else(|| format!("expected a repo id like `openai-community/gpt2`, got `{repo_id}`"))?;
@@ -44,8 +53,10 @@ pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
     let client = hf_hub::HFClientSync::new()?;
     let repo = client.model(owner, name);
 
+    let repo = &repo;
+    let progress = std::cell::RefCell::new(progress);
     let get = |filename: &str| -> Res<PathBuf> {
-        eprintln!("  fetching {repo_id}/{filename}");
+        (progress.borrow_mut())(&format!("fetching {filename}"));
         Ok(repo.download_file().filename(filename.to_string()).send()?)
     };
     let try_get = |filename: &str| -> Option<PathBuf> {
@@ -68,7 +79,7 @@ pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
                 map.values().filter_map(|v| v.as_str().map(String::from)).collect();
             shards.sort();
             shards.dedup();
-            eprintln!("  checkpoint is split across {} shards", shards.len());
+            (progress.borrow_mut())(&format!("checkpoint is split across {} shards", shards.len()));
             shards.iter().map(|s| get(s)).collect::<Res<Vec<_>>>()?
         }
     };

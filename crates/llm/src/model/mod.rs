@@ -227,6 +227,25 @@ impl KvCache {
         &self.v[layer]
     }
 
+    /// Drop everything after `len` positions.
+    ///
+    /// This is what makes *prefix caching* possible. Two turns of a
+    /// conversation share a long common prefix — the entire history — so
+    /// rather than rebuilding the cache from scratch each turn, keep the part
+    /// that still matches and recompute only the tail. On a long chat this is
+    /// the difference between re-reading the whole transcript every time and
+    /// processing just the new message.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        for (k, v) in self.k.iter_mut().zip(self.v.iter_mut()) {
+            k.truncate(len * self.kv_dim);
+            v.truncate(len * self.kv_dim);
+        }
+        self.len = len;
+    }
+
     pub fn clear(&mut self) {
         for (k, v) in self.k.iter_mut().zip(self.v.iter_mut()) {
             k.clear();
@@ -317,4 +336,60 @@ pub fn load(weight_paths: &[std::path::PathBuf], spec: Spec) -> Res<Box<dyn Tran
         Arch::Gpt2 => Box::new(gpt2::Model::load(&ckpt, spec)?),
         Arch::Llama => Box::new(llama::Model::load(&ckpt, spec)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_spec() -> Spec {
+        Spec {
+            arch: Arch::Llama,
+            n_layer: 2,
+            n_head: 4,
+            n_kv_head: 2,
+            n_embd: 8,
+            head_dim: 2,
+            n_ctx: 16,
+            vocab_size: 32,
+            eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_embeddings: true,
+        }
+    }
+
+    #[test]
+    fn grouped_query_attention_shrinks_the_cache() {
+        let spec = test_spec();
+        // 4 query heads over 2 KV heads: each KV head serves two queries, so
+        // only half as much has to be stored per position.
+        assert_eq!(spec.group_size(), 2);
+        assert_eq!(spec.kv_dim(), 4);
+        assert_eq!(spec.kv_dim() * 2, spec.n_head * spec.head_dim);
+    }
+
+    #[test]
+    fn cache_truncation_keeps_the_prefix_intact() {
+        let spec = test_spec();
+        let mut cache = KvCache::new(&spec);
+        for pos in 0..5 {
+            let k: Vec<f32> = (0..spec.kv_dim()).map(|i| (pos * 10 + i) as f32).collect();
+            cache.push(0, &k, &k);
+            cache.push(1, &k, &k);
+            cache.len += 1;
+        }
+        assert_eq!(cache.len, 5);
+        assert_eq!(cache.keys(0).len(), 5 * spec.kv_dim());
+
+        cache.truncate(3);
+        assert_eq!(cache.len, 3);
+        assert_eq!(cache.keys(0).len(), 3 * spec.kv_dim());
+        assert_eq!(cache.keys(1).len(), 3 * spec.kv_dim());
+        // Position 2 must still hold exactly what it held before.
+        assert_eq!(cache.keys(0)[2 * spec.kv_dim()], 20.0);
+
+        // Truncating upwards is a no-op, not an extension.
+        cache.truncate(99);
+        assert_eq!(cache.len, 3);
+    }
 }

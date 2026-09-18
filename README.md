@@ -3,154 +3,220 @@
 Learning how neural networks and language models work by building them in Rust,
 from the arithmetic up.
 
-Two crates, meant to be read in order:
+Three crates, meant to be read in order:
 
 | Crate | What it is | Dependencies |
 |---|---|---|
 | [`nanograd`](crates/nanograd) | A neural network and backpropagation, from scratch. Trains on MNIST. | **none** |
-| [`gpt2`](crates/gpt2) | GPT-2 inference from scratch. Real HuggingFace weights in, text out. | model download, tokenizer, safetensors |
+| [`llm`](crates/llm) | Transformer inference from scratch. Two architectures, real HuggingFace weights. | hub client, tokenizer, safetensors |
+| [`llm-tui`](crates/tui) | Terminal app: browse, download, activate, chat. | ratatui |
 
-Neither uses an ML framework. Every matrix multiply, every derivative and every
-attention head is code in this repo.
+No ML framework anywhere. Every matrix multiply, every derivative, every
+attention head and every rotation is code in this repo.
 
 ## Quick start
 
 ```bash
 ./scripts/get-mnist.sh
-cargo test                                  # includes a gradient check
+cargo test                                      # includes a gradient check
 cargo run --release -p nanograd --bin train_mnist
-cargo run --release -p gpt2 -- --prompt "The first time I saw the sea,"
+cargo run --release -p llm -- run --prompt "Why is the sky blue?"
+cargo run --release -p llm-tui
 ```
 
-Verified output on an M5 Pro:
+Verified on an M5 Pro:
 
 ```
 epoch  1  loss 0.2085  test accuracy 96.32%  (2.1s)
-epoch  5  loss 0.0347  test accuracy 97.89%  (10.6s)
 epoch 10  loss 0.0072  test accuracy 97.98%  (21.0s)
 ```
 
 ```
-The first time I saw the sea, it looked like a huge, large, black blob,
-like a very large, extremely huge blob, and it was about 20 feet long."
-[prefill 8 tokens in 0.14s, generated 60 tokens in 1.25s = 48.2 tok/s]
+llama · 30 layers · 9 heads (3 KV heads, 3x grouped) · 576 embd · 8192 ctx
+134.5M parameters · instruction-tuned
+
+The sky appears blue because of the way our eyes detect light. [...]
+[prefill 41 tokens in 1.10s · generated 56 in 1.62s = 34.6 tok/s]
 ```
 
 ---
 
 ## Crate 1: `nanograd` — where the learning actually happens
 
-Read in this order:
+Zero dependencies. Read in this order:
 
 1. **[`matrix.rs`](crates/nanograd/src/matrix.rs)** — three matrix products.
-   `A@B` for the forward pass, `Aᵀ@B` for weight gradients, `A@Bᵀ` for input
-   gradients. That is the entire "tensor library".
+   `A@B` forward, `Aᵀ@B` for weight gradients, `A@Bᵀ` for input gradients.
 2. **[`nn.rs`](crates/nanograd/src/nn.rs)** — the important one. Every layer
-   implements two methods: `forward(x) -> y`, and `backward(dL/dy) -> dL/dx`.
-   Chaining the second one backwards through the network *is* backpropagation.
+   implements `forward(x) -> y` and `backward(dL/dy) -> dL/dx`. Chaining the
+   second one backwards *is* backpropagation.
 3. **[`bin/train_mnist.rs`](crates/nanograd/src/bin/train_mnist.rs)** — the
-   training loop, which is four lines: predict, score, blame, adjust.
+   training loop: predict, score, blame, adjust.
 
 ### The test worth running first
 
 ```bash
-cargo test -p nanograd analytic_gradient_matches_numerical -- --nocapture
+cargo test -p nanograd analytic_gradient_matches_numerical
 ```
 
-It nudges a single weight by ±0.001, measures how the loss actually moves, and
-checks that against what `backward()` claimed the gradient was. A subtly wrong
-gradient — one missing transpose, one sign error — still trains, just badly, so
-this is the only thing that will tell you your calculus is right.
+It nudges one weight by ±0.001, measures how the loss actually moves, and checks
+that against what `backward()` claimed. A subtly wrong gradient still trains,
+just badly — this is the only thing that catches it.
 
 ### Things to try
 
-- `--hidden 16` — how small can the hidden layer get before accuracy collapses?
-- `--lr 0.5` — watch the loss diverge. Then `--lr 0.0001` and watch it crawl.
-- `--momentum 0` — see how much of the convergence speed was momentum.
-- Look at the last 10 epochs above: training loss keeps falling while test
-  accuracy flatlines. That gap is overfitting, live.
+- `--hidden 16` — how small before accuracy collapses?
+- `--lr 0.5` — watch it diverge. `--lr 0.0001` — watch it crawl.
+- `--momentum 0` — see how much of the speed was momentum.
+- Note that training loss keeps falling after epoch 5 while test accuracy
+  flatlines. That gap is overfitting, live.
+
+**Momentum is a multiplier on your learning rate.** At steady state the velocity
+converges to `lr·g/(1−μ)`, so `--lr 0.1 --momentum 0.9` really steps at ~1.0.
+That is why the default is 0.02: at 0.1 this model plateaus at 95%, at 0.02 it
+reaches 98%.
 
 ---
 
-## Crate 2: `gpt2` — the same ideas, at scale
+## Crate 2: `llm` — the same ideas, at scale
+
+The examples below assume the binaries are on your `PATH`:
 
 ```bash
-cargo run --release -p gpt2 -- --prompt "Once upon a time" --temperature 0.9
-cargo run --release -p gpt2 -- --greedy --prompt "1, 2, 3, 4, 5, 6,"
-cargo run --release -p gpt2 -- --model openai-community/gpt2-medium --greedy \
-    --prompt "The planets of the solar system, in order, are"
+cargo install --path crates/llm --path crates/tui
 ```
 
-Weights download once into `~/.cache/huggingface` (124M params ≈ 500 MB).
+Otherwise prefix each one with `cargo run --release -p llm --` (or `-p llm-tui`).
+
+```bash
+llm search smollm                 # find models; says which we can run
+llm pull HuggingFaceTB/SmolLM2-360M-Instruct
+llm ls                            # what is downloaded, and how big
+llm use  Qwen/Qwen2.5-0.5B-Instruct
+llm run  --prompt "Explain backpropagation in one sentence."
+llm chat --system "You are terse."
+llm info --model openai-community/gpt2-medium   # config only, no weights
+```
 
 Read in this order:
 
-1. **[`tensor.rs`](crates/gpt2/src/tensor.rs)** — matmul, layernorm, GELU,
-   softmax. Five functions; a transformer needs nothing else to run forwards.
-2. **[`weights.rs`](crates/gpt2/src/weights.rs)** — the safetensors format,
-   which is a length, a JSON header, and raw floats.
-3. **[`model.rs`](crates/gpt2/src/model.rs)** — the architecture. Start with
-   the diagram at the top of the file.
-4. **[`sampler.rs`](crates/gpt2/src/sampler.rs)** — temperature, top-k, top-p.
+1. **[`tensor.rs`](crates/llm/src/tensor.rs)** — matmul, LayerNorm, GELU,
+   softmax, then RMSNorm, SwiGLU and RoPE. Nine functions, two architectures.
+2. **[`weights.rs`](crates/llm/src/weights.rs)** — safetensors is a length, a
+   JSON header, and raw floats. Plus shard indexes and bf16 widening.
+3. **[`model/mod.rs`](crates/llm/src/model/mod.rs)** — the skeleton both
+   architectures share, including attention itself.
+4. **[`model/gpt2.rs`](crates/llm/src/model/gpt2.rs)** — read first, it is
+   simpler. Then **[`model/llama.rs`](crates/llm/src/model/llama.rs)**, written
+   to be read as a diff against it.
+5. **[`sampler.rs`](crates/llm/src/sampler.rs)**, then
+   **[`chat.rs`](crates/llm/src/chat.rs)**.
 
-### The four ideas in `model.rs`
+### Five years of architecture progress, as a table
 
-- **The residual stream.** Blocks do `x = x + f(x)`, never `x = f(x)`. The
-  vector `x` is a running total that every layer reads and adds to.
-- **Attention is the only place tokens see each other.** The MLP — two thirds
-  of the parameters — processes each position in total isolation.
-- **The KV cache.** Generating token N without one means recomputing the whole
-  prefix: O(N²) for the sequence instead of O(N). This is also why memory use
-  climbs as you fill the context window (`Cache::max_bytes` prints it).
-- **Every matmul is really a matrix-*vector* product**, because you generate
-  one token at a time. That makes inference memory-bandwidth bound, which is
-  why quantisation speeds it up and why GPU VRAM bandwidth is the number that
-  matters.
+| GPT-2 (2019) | Llama family (2023+) | Why |
+|---|---|---|
+| learned position rows (`wpe`) | RoPE: rotate Q and K by angle ∝ position | no hard context ceiling; position becomes *relative* for free |
+| LayerNorm (centre, scale, bias) | RMSNorm (scale only) | the centring was never load-bearing |
+| GELU MLP, 2 matrices | SwiGLU, 3 matrices | a learned gate per channel |
+| multi-head attention | grouped-query attention | KV cache shrinks by the group factor |
+| one fused QKV matrix | three projections | Q and KV now have different widths |
+
+What did *not* change: the residual stream, the alternation of attention and
+MLP, tied embeddings, the causal mask, scaled dot-product attention. `attend()`
+in `model/mod.rs` is shared verbatim between the two — grouped-query attention
+is just a smaller `kv_dim`, and GPT-2 is the `n_kv_head == n_head` case.
+
+And the detail worth sitting with: **SmolLM2-135M is smaller than GPT-2-medium
+and holds a conversation, while GPT-2 cannot.** The architecture changes above
+are real but marginal. Nearly all of that gap is training data and
+post-training. Running both in the same binary makes the point better than any
+benchmark.
+
+### Base models versus instruction-tuned
+
+GPT-2 is a **base** model: pure next-token prediction, no instruction tuning.
+Ask it a question and it writes more questions, because that is what its
+training data looked like. `llm ls` and `llm search` label which is which, and
+`llm chat` warns you.
+
+An instruction-tuned model only behaves like an assistant when wrapped in the
+exact marker tokens it was trained on. Those live as a **Jinja template** in
+`tokenizer_config.json`, one per model, and they genuinely differ — so
+[`chat.rs`](crates/llm/src/chat.rs) renders the model's own template rather than
+hardcoding one. "The model is dumb" is very often "the template is wrong".
 
 ### Verifying you got it right
 
-`--greedy --prompt "1, 2, 3, 4, 5, 6,"` should continue `7, 8, 9, 10, ...`.
-If any transpose or head-split is wrong, the output degrades to plausible-looking
-noise rather than failing loudly. Counting is a sharp test.
+```bash
+llm run --model openai-community/gpt2 --greedy --prompt "1, 2, 3, 4, 5, 6,"
+llm run --model Qwen/Qwen2.5-0.5B-Instruct --greedy \
+    --prompt "List the first 8 prime numbers, comma separated."
+```
+
+The first continues `7, 8, 9, ... 16`. The second answers
+`2, 3, 5, 7, 11, 13, 17, 19`. A wrong transpose, a wrong RoPE convention or a
+mishandled bias degrades output to *plausible-looking noise* rather than failing
+loudly, so arithmetic is the sharp test. The GPT-2 one is also the regression
+test for the Llama refactor.
+
+---
+
+## Crate 3: `llm-tui` — the app
+
+```bash
+cargo run --release -p llm-tui
+```
+
+`/` search · `↑↓` select · `enter` download and load · `d` delete · `tab` switch
+to chat · `esc` interrupt generation.
+
+Three concerns on three threads: the UI loop only draws and reads keys, the
+engine thread downloads and generates, and `rayon` fans each matmul across cores
+underneath. They talk over channels — except cancellation, which a channel
+cannot express because the worker is busy inside `generate`, so that is a shared
+`AtomicBool` the per-token callback checks.
+
+The chat keeps its KV cache **across turns**. Each turn it re-encodes the
+conversation, finds the common prefix with what is already cached
+(`Llm::common_prefix`), truncates to there, and prefills only the new message.
+The status bar reports how many tokens that saved — `[33.3 tok/s · 96 cached]`.
+Without it, turn *N* re-reads the entire transcript.
+
+This crate is the least educational of the three. It is `ratatui` plumbing and
+state management — good Rust, no ML. Build it last.
 
 ---
 
 ## Where to go next
 
-Roughly in order of difficulty. Each is a crate you can add to this workspace.
+**4. Quantise.** Weights to int8 or int4, dequantised on the fly. Generating one
+token at a time makes every matmul a matrix-*vector* product, so inference is
+memory-bandwidth bound: moving a quarter of the bytes is most of a 4x speedup.
+Qwen2.5-0.5B in f32 is 1 GB; at int4 it is ~140 MB.
 
-**3. Make inference fast.**
-Quantise the weights to int8 or int4 and dequantise on the fly. GPT-2 in f32 is
-500 MB; at int4 it is ~60 MB and noticeably faster, because you are moving a
-fraction of the bytes. Then process the whole prompt as a batch instead of token
-by token — you will need an explicit causal mask, which is the classic first bug.
+**5. Batch the prompt.** Prefill currently walks the prompt one token at a time.
+Processing it as one matrix is several times faster — and needs an explicit
+triangular causal mask, which the KV-cache path gets for free. Classic first bug.
 
-**4. Move to the GPU with [`candle`](https://github.com/huggingface/candle).**
-HuggingFace's Rust ML framework, with a Metal backend for your Mac. Port the
-model and compare — you will recognise every operation, because you wrote them
-all by hand first. This is also the point where modern models (Llama, Qwen,
-Mistral) become practical; your 48 GB of unified memory will hold a quantised
-30B model.
+**6. GPU, via [`candle`](https://github.com/huggingface/candle).** HuggingFace's
+Rust framework, Metal backend. You will recognise every operation because you
+wrote them by hand first. 48 GB of unified memory holds a quantised 30B model.
 
-**5. Train your own language model.**
-A character-level transformer, 10–30M parameters, on a corpus you choose. You
-need backprop through attention and layernorm, plus the Adam optimiser. The
-gradient check from crate 1 is how you will debug it. Either extend `nanograd`
-(hard, and the most educational thing on this list) or use
-[`burn`](https://github.com/tracel-ai/burn), which has autodiff and a Metal
-backend. Hours of training on your hardware, not days.
+**7. Train your own.** A character-level transformer, 10–30M parameters, on a
+corpus you pick. Needs backprop through attention, layernorm and softmax, plus
+Adam. The gradient check from crate 1 is how you will debug it — extend
+`nanograd` (hard, most educational) or use
+[`burn`](https://github.com/tracel-ai/burn).
 
-**6. Fine-tune with LoRA.**
-Freeze a pretrained model and train two small low-rank matrices per weight
-matrix instead. This is what "custom model" means in practice — and it is
-tractable on a laptop in a way that full fine-tuning is not.
+**8. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
+per weight matrix. This is what "custom model" means in practice, and unlike
+full fine-tuning it fits on a laptop.
 
 ### Worth reading alongside
 
-- Karpathy, *Let's build GPT: from scratch, in code, spelled out* — the video
-  companion to crate 2.
+- Karpathy, *Let's build GPT: from scratch, in code, spelled out*.
 - *The Illustrated Transformer*, Jay Alammar — the diagrams.
-- Vaswani et al., *Attention Is All You Need* (2017) — short, and readable once
-  you have implemented it.
-- Radford et al., *Language Models are Unsupervised Multitask Learners* (2019) —
-  the GPT-2 paper, i.e. the model in crate 2.
+- Vaswani et al., *Attention Is All You Need* (2017).
+- Su et al., *RoFormer* (2021) — where RoPE comes from.
+- Ainslie et al., *GQA* (2023) — grouped-query attention.

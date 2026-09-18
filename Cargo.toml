@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/nanograd", "crates/gpt2"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+
+# Release-ish profile for `cargo run` too. Numerical code is 20-50x slower
+# in debug builds, which makes "is my backprop wrong?" impossible to tell
+# apart from "is my machine slow?".
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

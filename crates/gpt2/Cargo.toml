@@ -1,0 +1,15 @@
+[package]
+name = "gpt2"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "GPT-2 inference implemented from scratch: safetensors in, text out."
+
+[dependencies]
+hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
+memmap2 = "0.9.11"
+nanograd = { version = "0.1.0", path = "../nanograd" }
+rayon = "1.10.0"
+safetensors = "0.8"
+serde_json = "1.0.151"
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }

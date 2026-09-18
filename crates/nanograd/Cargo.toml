@@ -1,0 +1,10 @@
+[package]
+name = "nanograd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "A neural network and backpropagation implemented from scratch, with zero dependencies."
+
+# No dependencies. Deliberately. Every float that moves in this crate
+# moves because of code in this crate.
+[dependencies]

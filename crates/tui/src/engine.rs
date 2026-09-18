@@ -17,6 +17,7 @@
 use llm::chat::Message;
 use llm::hub::{self, HubModel, LocalModel};
 use llm::model::KvCache;
+use llm::quant::Precision;
 use llm::runtime::{Llm, Stats};
 use llm::sampler::Sampler;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +26,7 @@ use std::sync::Arc;
 
 pub enum Cmd {
     Search(String),
-    Load(String),
+    Load { repo: String, precision: Precision },
     Chat(Vec<Message>),
     RefreshLocal,
     Delete(String),
@@ -36,7 +37,14 @@ pub enum Evt {
     Status(String),
     SearchResults(Vec<HubModel>),
     Local(Vec<LocalModel>),
-    Loaded { repo: String, summary: String, params: usize, instruct: bool },
+    Loaded {
+        repo: String,
+        summary: String,
+        params: usize,
+        instruct: bool,
+        precision: Precision,
+        weight_bytes: usize,
+    },
     /// A fragment of the assistant's reply.
     Token(String),
     Done(Stats),
@@ -127,7 +135,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 None => say(&format!("{id} is not in the cache")),
             },
 
-            Cmd::Load(repo) => {
+            Cmd::Load { repo, precision } => {
                 // Drop the previous model before loading the next one, or two
                 // sets of weights are briefly resident at once.
                 session = None;
@@ -136,13 +144,15 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 let mut progress = |msg: &str| {
                     let _ = tx.send(Evt::Status(format!("{repo}: {msg}")));
                 };
-                match Llm::load_with(&repo, &mut progress) {
+                match Llm::load_with(&repo, precision, &mut progress) {
                     Ok(llm) => {
                         let _ = tx.send(Evt::Loaded {
                             repo: repo.clone(),
                             summary: llm.spec.summary(),
                             params: llm.param_count,
                             instruct: llm.is_instruct(),
+                            precision: llm.precision,
+                            weight_bytes: llm.weight_bytes,
                         });
                         let _ = hub::State::set_active(&repo);
                         let cache = llm.new_cache();

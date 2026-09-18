@@ -15,6 +15,7 @@
 use llm::chat::Message;
 use llm::hub::{self, State};
 use llm::model::{KvCache, Spec};
+use llm::quant::Precision;
 use llm::runtime::Llm;
 use llm::sampler::Sampler;
 use llm::weights;
@@ -39,6 +40,7 @@ struct Args {
     top_k: usize,
     top_p: f32,
     seed: u64,
+    quant: Precision,
 }
 
 impl Default for Args {
@@ -54,6 +56,7 @@ impl Default for Args {
             top_k: 40,
             top_p: 0.95,
             seed: 7,
+            quant: Precision::F32,
         }
     }
 }
@@ -79,6 +82,7 @@ fn usage() -> ! {
            --top-k N           keep the N best candidates (default 40)\n  \
            --top-p F           nucleus threshold (default 0.95)\n  \
            --seed N            sampling seed (default 7)\n  \
+           --quant f32|q8|q4   quantise weights on load (default f32)\n  \
            --greedy            shorthand for --temperature 0"
     );
     std::process::exit(2);
@@ -140,6 +144,12 @@ fn parse_args() -> Args {
             "--top-k" => a.top_k = num() as usize,
             "--top-p" => a.top_p = num() as f32,
             "--seed" => a.seed = num() as u64,
+            "--quant" => {
+                a.quant = Precision::parse(&value).unwrap_or_else(|| {
+                    eprintln!("--quant expects f32, q8 or q4, got `{value}`");
+                    std::process::exit(2);
+                })
+            }
             _ => {
                 eprintln!("unknown flag {flag}");
                 usage();
@@ -163,12 +173,17 @@ fn load(args: &Args) -> Res<Llm> {
     let repo = resolve_model(args);
     eprintln!("model: {repo}");
     let t0 = std::time::Instant::now();
-    let llm = Llm::load(&repo)?;
+    let llm = Llm::load(&repo, args.quant)?;
     eprintln!("  {}", llm.spec.summary());
     eprintln!(
-        "  {:.1}M parameters in {:.1}s · KV cache at full context {:.0} MB · {}",
+        "  {:.1}M parameters · weights {:.0} MB ({}) · loaded in {:.1}s",
         llm.param_count as f64 / 1e6,
+        llm.weight_bytes as f64 / 1e6,
+        llm.precision,
         t0.elapsed().as_secs_f32(),
+    );
+    eprintln!(
+        "  KV cache at full context {:.0} MB · {}",
         KvCache::max_bytes(&llm.spec) as f64 / 1e6,
         if llm.is_instruct() { "instruction-tuned" } else { "base model (completion only)" }
     );

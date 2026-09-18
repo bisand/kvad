@@ -187,6 +187,8 @@ pub trait Transformer: Send + Sync {
     /// Run one token and return logits over the vocabulary.
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32>;
     fn param_count(&self) -> usize;
+    /// Bytes the weight matrices occupy in memory, after quantisation.
+    fn memory_bytes(&self) -> usize;
 }
 
 /// Per-layer key and value history.
@@ -330,11 +332,15 @@ pub fn attend(spec: &Spec, q: &[f32], k_cache: &[f32], v_cache: &[f32], n_positi
 }
 
 /// Open a checkpoint and build whichever architecture its config describes.
-pub fn load(weight_paths: &[std::path::PathBuf], spec: Spec) -> Res<Box<dyn Transformer>> {
+pub fn load(
+    weight_paths: &[std::path::PathBuf],
+    spec: Spec,
+    precision: crate::quant::Precision,
+) -> Res<Box<dyn Transformer>> {
     let ckpt = Checkpoint::open(weight_paths)?;
     Ok(match spec.arch {
-        Arch::Gpt2 => Box::new(gpt2::Model::load(&ckpt, spec)?),
-        Arch::Llama => Box::new(llama::Model::load(&ckpt, spec)?),
+        Arch::Gpt2 => Box::new(gpt2::Model::load(&ckpt, spec, precision)?),
+        Arch::Llama => Box::new(llama::Model::load(&ckpt, spec, precision)?),
     })
 }
 

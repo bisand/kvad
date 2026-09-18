@@ -9,6 +9,7 @@ use crate::engine::{Cmd, Engine, Evt};
 use llm::chat::Message;
 use llm::hub::{self, HubModel, LocalModel};
 use llm::model::Arch;
+use llm::quant::Precision;
 use llm::runtime::Stats;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -37,6 +38,8 @@ pub struct Active {
     pub summary: String,
     pub params: usize,
     pub instruct: bool,
+    pub precision: Precision,
+    pub weight_bytes: usize,
 }
 
 pub struct App {
@@ -58,6 +61,9 @@ pub struct App {
     pub scroll: u16,
 
     pub active: Option<Active>,
+    /// Precision the *next* load will use. Changing it does not touch the
+    /// model already in memory — quantisation happens at load time.
+    pub precision: Precision,
     pub busy: bool,
     pub status: String,
     pub error: Option<String>,
@@ -81,6 +87,7 @@ impl App {
             streaming: None,
             scroll: 0,
             active: None,
+            precision: Precision::F32,
             busy: false,
             status: "press / to search the Hub, or pick a downloaded model".into(),
             error: None,
@@ -158,9 +165,10 @@ impl App {
                     self.selected = self.selected.min(self.local.len().saturating_sub(1));
                 }
             }
-            Evt::Loaded { repo, summary, params, instruct } => {
+            Evt::Loaded { repo, summary, params, instruct, precision, weight_bytes } => {
                 self.status = format!("loaded {repo}");
-                self.active = Some(Active { repo, summary, params, instruct });
+                self.active =
+                    Some(Active { repo, summary, params, instruct, precision, weight_bytes });
                 self.busy = false;
                 self.messages.clear();
                 self.tab = Tab::Chat;
@@ -258,6 +266,17 @@ impl App {
                 engine.send(Cmd::RefreshLocal);
             }
             K::Char('r') => engine.send(Cmd::RefreshLocal),
+            K::Char('p') => {
+                // Cycle the precision used for the next load. q8 is usually
+                // indistinguishable from f32 and half again as fast; q4 halves
+                // the memory again but visibly degrades small models.
+                self.precision = match self.precision {
+                    Precision::F32 => Precision::Q8,
+                    Precision::Q8 => Precision::Q4,
+                    Precision::Q4 => Precision::F32,
+                };
+                self.status = format!("next load will use {}", self.precision);
+            }
             K::Char('d') => {
                 if let Some(e) = self.selected_entry() {
                     if e.local {
@@ -278,8 +297,8 @@ impl App {
                     return;
                 }
                 self.busy = true;
-                self.status = format!("loading {}", entry.id);
-                engine.send(Cmd::Load(entry.id));
+                self.status = format!("loading {} as {}", entry.id, self.precision);
+                engine.send(Cmd::Load { repo: entry.id, precision: self.precision });
             }
             _ => {}
         }

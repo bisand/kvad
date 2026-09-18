@@ -39,12 +39,14 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
     };
     let right = match &app.active {
         Some(a) => format!(
-            "{} · {:.0}M · {} ",
+            "{} · {:.0}M · {} {:.0}MB · {} ",
             a.repo,
             a.params as f64 / 1e6,
+            a.precision,
+            a.weight_bytes as f64 / 1e6,
             if a.instruct { "chat" } else { "completion" }
         ),
-        None => "no model loaded ".into(),
+        None => format!("no model loaded · next: {} ", app.precision),
     };
 
     let line = Line::from(vec![
@@ -246,6 +248,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
             ("↑↓", "select"),
             ("enter", "load"),
             ("d", "delete"),
+            ("p", "precision"),
             ("l", "local"),
             ("tab", "chat"),
             ("q", "quit"),
@@ -356,6 +359,8 @@ mod tests {
             summary: "llama · 30 layers".into(),
             params: 134_515_008,
             instruct: true,
+            precision: llm::quant::Precision::Q8,
+            weight_bytes: 151_329_384,
         });
         app.messages.push(Message::user("why is the sky blue?"));
         app.streaming = Some("Because shorter wavelengths".into());
@@ -378,6 +383,8 @@ mod tests {
             summary: "gpt2 · 12 layers".into(),
             params: 124_000_000,
             instruct: false,
+            precision: llm::quant::Precision::F32,
+            weight_bytes: 496_000_000,
         });
         let out = render(&app, 100, 24);
         assert!(out.contains("continues text"), "{out}");

@@ -17,6 +17,7 @@
 pub mod chat;
 pub mod hub;
 pub mod model;
+pub mod quant;
 pub mod runtime;
 pub mod sampler;
 pub mod tensor;

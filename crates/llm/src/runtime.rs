@@ -5,6 +5,7 @@
 
 use crate::chat::{ChatTemplate, Message};
 use crate::model::{self, KvCache, Spec, Transformer};
+use crate::quant::Precision;
 use crate::sampler::Sampler;
 use crate::weights;
 use std::time::Instant;
@@ -21,6 +22,9 @@ pub struct Llm {
     /// Token ids that end generation. Usually one; Llama 3 has two.
     pub eos: Vec<u32>,
     pub param_count: usize,
+    pub precision: Precision,
+    /// Bytes the weights occupy in memory.
+    pub weight_bytes: usize,
 }
 
 /// Progress and timing for one generation run.
@@ -41,15 +45,19 @@ impl Stats {
 }
 
 impl Llm {
-    pub fn load(repo_id: &str) -> Res<Self> {
-        Self::load_with(repo_id, &mut |msg| eprintln!("  {msg}"))
+    pub fn load(repo_id: &str, precision: Precision) -> Res<Self> {
+        Self::load_with(repo_id, precision, &mut |msg| eprintln!("  {msg}"))
     }
 
-    pub fn load_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<Self> {
+    pub fn load_with(
+        repo_id: &str,
+        precision: Precision,
+        progress: &mut dyn FnMut(&str),
+    ) -> Res<Self> {
         let files = weights::fetch_with(repo_id, progress)?;
-        progress("reading weights");
+        progress(&format!("reading weights ({precision})"));
         let spec = Spec::from_json(&files.config)?;
-        let model = model::load(&files.weights, spec.clone())?;
+        let model = model::load(&files.weights, spec.clone(), precision)?;
         let tokenizer = Tokenizer::from_file(&files.tokenizer).map_err(|e| e.to_string())?;
 
         let chat = match &files.tokenizer_config {
@@ -80,7 +88,18 @@ impl Llm {
         eos.dedup();
 
         let param_count = model.param_count();
-        Ok(Llm { repo: repo_id.to_string(), spec, model, tokenizer, chat, eos, param_count })
+        let weight_bytes = model.memory_bytes();
+        Ok(Llm {
+            repo: repo_id.to_string(),
+            spec,
+            model,
+            tokenizer,
+            chat,
+            eos,
+            param_count,
+            precision,
+            weight_bytes,
+        })
     }
 
     pub fn is_instruct(&self) -> bool {

@@ -109,7 +109,9 @@ Read in this order:
 4. **[`model/gpt2.rs`](crates/llm/src/model/gpt2.rs)** — read first, it is
    simpler. Then **[`model/llama.rs`](crates/llm/src/model/llama.rs)**, written
    to be read as a diff against it.
-5. **[`sampler.rs`](crates/llm/src/sampler.rs)**, then
+5. **[`quant.rs`](crates/llm/src/quant.rs)** — block-wise int8/int4 weights
+   and the kernels that consume them.
+6. **[`sampler.rs`](crates/llm/src/sampler.rs)**, then
    **[`chat.rs`](crates/llm/src/chat.rs)**.
 
 ### Five years of architecture progress, as a table
@@ -146,6 +148,68 @@ exact marker tokens it was trained on. Those live as a **Jinja template** in
 [`chat.rs`](crates/llm/src/chat.rs) renders the model's own template rather than
 hardcoding one. "The model is dumb" is very often "the template is wrong".
 
+### Quantisation
+
+```bash
+llm run --quant q8 --model Qwen/Qwen2.5-0.5B-Instruct --prompt "..."
+```
+
+`--quant q8|q4` quantises the weight matrices as they load. Each row is chopped
+into blocks of 32 with its own scale, so a single outlier only ruins its own 32
+neighbours instead of flattening the whole tensor — which is what per-tensor
+scaling does, and why it fails.
+
+Measured on Qwen2.5-0.5B (494M parameters, M5 Pro, 18 threads):
+
+| | weights | tok/s | `first 8 primes` |
+|---|---|---|---|
+| f32 | 1976 MB | 28.8 | `2, 3, 5, 7, 11, 13, 17, 19` |
+| q8 | 556 MB (3.6x) | 38.5 (1.34x) | `2, 3, 5, 7, 11, 13, 17, 19` |
+| q4 | 309 MB (6.4x) | 37.5 (1.30x) | `3, 5, 7, 11, 13, 17, 19, 23` |
+
+**q8 is free; q4 is not.** q8 reproduced f32 exactly on every test. q4 broke all
+three — it drops the 2 above, turns `17 + 25 = 42` into `40` on SmolLM2, and
+sends GPT-2 into `"The reference is a reference is a reference"`. Still fluent,
+still confident, quietly wrong. Half-billion-parameter models have less
+redundancy to spare than the 7B+ models where q4 is usually judged.
+
+```bash
+cargo run --release -p llm --example bench_matvec
+```
+
+The kernel benchmark is where the interesting part is, because it shows the
+speedup is *not* where the arithmetic says it should be. On the output head:
+
+| | ms/call | GB/s | vs f32 |
+|---|---|---|---|
+| f32 | 3.94 | 138 | 1.00x |
+| q8 | 1.76 | 87 | 2.24x |
+| q4 | 1.92 | 44 | 2.05x |
+
+f32 achieves 138 GB/s and is genuinely memory-bound — there is nothing to fix
+there. The quantised kernels move a third or a sixth of the bytes but only
+reach 87 and 44 GB/s, so they are **compute**-bound: unpacking costs more than
+the memory it saves. Reading fewer bytes only helps until it doesn't.
+
+Three fixes got this from roughly 1x to 2x, and each is a general lesson:
+
+- **Keep the accumulator in registers.** The first version of the GPT-2-layout
+  kernel read and wrote all 32 outputs on every input row: 256 bytes of output
+  traffic per 32 bytes of weights. Quantising made it *slower than f32*
+  (0.90x). Hoisting the accumulator out of the row loop fixed it.
+- **Use more than one accumulator.** Floating-point addition is not
+  associative, so the compiler cannot reorder a single `sum +=` chain; the loop
+  runs at the latency of an FMA rather than its throughput. Four independent
+  lanes let it vectorise.
+- **Check what your inner loop doesn't depend on.** The 4-bit path subtracts an
+  offset that needs the sum of the activations per block — which depends only on
+  the input, not the row. Computing it inside the row loop repeated it 151,936
+  times per call and nearly doubled the work.
+
+The remaining gap to 3.6x needs the activations quantised too, so the dot
+product becomes integer and can use the CPU's SIMD int8 instructions. That is
+how llama.cpp gets its numbers, and it is the obvious next step here.
+
 ### Verifying you got it right
 
 ```bash
@@ -158,7 +222,7 @@ The first continues `7, 8, 9, ... 16`. The second answers
 `2, 3, 5, 7, 11, 13, 17, 19`. A wrong transpose, a wrong RoPE convention or a
 mishandled bias degrades output to *plausible-looking noise* rather than failing
 loudly, so arithmetic is the sharp test. The GPT-2 one is also the regression
-test for the Llama refactor.
+test for the Llama refactor, and both are the acceptance test for `--quant q8`.
 
 ---
 
@@ -168,8 +232,11 @@ test for the Llama refactor.
 cargo run --release -p llm-tui
 ```
 
-`/` search · `↑↓` select · `enter` download and load · `d` delete · `tab` switch
-to chat · `esc` interrupt generation.
+`/` search · `↑↓` select · `enter` download and load · `p` cycle precision ·
+`d` delete · `tab` switch to chat · `esc` interrupt generation.
+
+`p` is the quickest way to feel the quantisation trade-off: load a model at
+f32, ask it something arithmetic, then reload at q4 and ask again.
 
 Three concerns on three threads: the UI loop only draws and reads keys, the
 engine thread downloads and generates, and `rayon` fans each matmul across cores
@@ -190,26 +257,31 @@ state management — good Rust, no ML. Build it last.
 
 ## Where to go next
 
-**4. Quantise.** Weights to int8 or int4, dequantised on the fly. Generating one
-token at a time makes every matmul a matrix-*vector* product, so inference is
-memory-bandwidth bound: moving a quarter of the bytes is most of a 4x speedup.
-Qwen2.5-0.5B in f32 is 1 GB; at int4 it is ~140 MB.
+**4. Quantise the activations too.** Weights are done; the kernels are now
+compute-bound rather than memory-bound (see above). Quantising `x` per block as
+well turns the inner dot product into integer arithmetic, which ARM's `sdot`
+and x86's VNNI do several lanes at a time. This is the step that separates 2x
+from the 3.6x the byte counts promise.
 
-**5. Batch the prompt.** Prefill currently walks the prompt one token at a time.
+**5. Serialise quantised weights.** Quantisation currently happens on every
+load, which means still reading the full f32 checkpoint off disk. Writing the
+blocks out once would make startup and disk footprint match the memory win.
+
+**6. Batch the prompt.** Prefill currently walks the prompt one token at a time.
 Processing it as one matrix is several times faster — and needs an explicit
 triangular causal mask, which the KV-cache path gets for free. Classic first bug.
 
-**6. GPU, via [`candle`](https://github.com/huggingface/candle).** HuggingFace's
+**7. GPU, via [`candle`](https://github.com/huggingface/candle).** HuggingFace's
 Rust framework, Metal backend. You will recognise every operation because you
 wrote them by hand first. 48 GB of unified memory holds a quantised 30B model.
 
-**7. Train your own.** A character-level transformer, 10–30M parameters, on a
+**8. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Needs backprop through attention, layernorm and softmax, plus
 Adam. The gradient check from crate 1 is how you will debug it — extend
 `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
-**8. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
+**9. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike
 full fine-tuning it fits on a laptop.
 

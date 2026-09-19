@@ -93,6 +93,10 @@ Zero dependencies. Read in this order:
    second one backwards *is* backpropagation.
 3. **[`bin/train_mnist.rs`](crates/nanograd/src/bin/train_mnist.rs)** — the
    training loop: predict, score, blame, adjust.
+4. **[`attention.rs`](crates/nanograd/src/attention.rs)** — causal
+   self-attention, forward and backward. Read it after the rest: it is three
+   `Linear` layers and two of the products from step 1, and the only new
+   derivative in it is the softmax's.
 
 ### The test worth running first
 
@@ -103,6 +107,14 @@ cargo test -p nanograd analytic_gradient_matches_numerical
 It nudges one weight by ±0.001, measures how the loss actually moves, and checks
 that against what `backward()` claimed. A subtly wrong gradient still trains,
 just badly — this is the only thing that catches it.
+
+Attention has its own, which checks every weight of all four projections and
+the gradient handed back to the layer below. With correct derivatives the
+analytic and numerical gradients differ by about 0.0007; drop the row average
+from the softmax derivative, forget the `1/sqrt(d)` on the way back, or miss the
+transpose in `dK`, and that becomes 0.2 to 0.8. Two more tests pin the causal
+mask from both sides: the future cannot change the past's output, and the past's
+loss cannot blame the future's input.
 
 ### Things to try
 
@@ -757,10 +769,11 @@ story, the serving track is what the second half of the mission actually costs.
 ### Finishing the story
 
 **1. Train your own.** A character-level transformer, 10–30M parameters, on a
-corpus you pick. Needs backprop through attention, layernorm and softmax, plus
-Adam. The gradient check from crate 1 is how you will debug it — extend
-`nanograd` (hard, most educational) or use
-[`burn`](https://github.com/tracel-ai/burn).
+corpus you pick. Backprop through attention is done
+([`attention.rs`](crates/nanograd/src/attention.rs)); still needed are an
+embedding, layernorm, the residual wiring of a block, and Adam. The gradient
+check from crate 1 is how you will debug each one — extend `nanograd` (hard,
+most educational) or use [`burn`](https://github.com/tracel-ai/burn).
 
 **2. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike

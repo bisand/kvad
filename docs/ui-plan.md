@@ -374,9 +374,12 @@ rather than pretending otherwise.
 **What the first real run found.** SmolLM2-135M-Instruct, 3 rounds, 64 tokens:
 q4 decoded at 149.5 tok/s (range 149.3–150.2) against q8's 114.6 (97.2–118.3),
 and the ranges do not overlap, so the difference is real. But q8 reached its
-first token in 30 ms against q4's 41 — prefill is compute-bound, and
-dequantising costs there. The same split shows in scoring, where q4 took twice
-as long as q8 for the same 519 tokens. On a two-case suite, q8 continued "The
+first token in 30 ms against q4's 41, and scoring took q4 twice as long as q8
+for the same 519 tokens. Chased down afterwards: `matmul_bt_with` gates the
+batched `SMMLA` kernel on `Data::Q8`, so q4 prefill takes the row-at-a-time
+fallback. Both paths are integer and neither dequantises, so this is a missing
+kernel rather than a cost of quantisation — which is the opposite of what the
+first reading of the number assumed. On a two-case suite, q8 continued "The
 capital of France is" with " Paris" and q4 with " the capital of the country
 of France"; on held-out prose q8 scored 2.03 perplexity against q4's 2.26, and
 on the same text shuffled, 514.8 against 568.1. Quantisation costs accuracy in

@@ -1509,10 +1509,13 @@ And with nothing else running, q4 against q8 at 64 tokens, three rounds each:
 | q4 | 149.5 tok/s | 149.3–150.2 | 41 ms |
 | q8 | 114.6 tok/s | 97.2–118.3 | 30 ms |
 
-q4 decodes faster and reaches its first token *slower*: decoding is bound by
-memory traffic, where fewer bits win, and prefill is bound by arithmetic, where
-dequantising costs. The same split shows in scoring, where q4 took twice as
-long as q8 for the same 519 tokens.
+q4 decodes faster and reaches its first token *slower*, and the same split
+shows in scoring, where q4 took twice as long as q8 for the same 519 tokens.
+Decoding is bound by memory traffic, where fewer bits win. Prefill is bound by
+arithmetic — and q8 has a batched `SMMLA` kernel there while q4 does not, so it
+falls back to a row at a time. Both are integer; neither dequantises. The gap
+is a kernel nobody has written, not a price quantisation charges, and finding
+that out took one benchmark run on a page built for the purpose.
 
 ### The playground is where the logits stop being abstract
 
@@ -1565,6 +1568,9 @@ on itself: it scanned its own source and found the string it searches *with*.
 
 Two tracks, one per job. They are independent: the learning track finishes the
 story, the serving track is what the second half of the mission actually costs.
+[`kvad-serve`](#crate-5-kvad-serve--the-server-and-the-web-ui) now sits under
+both — it trains models and scores them, and it is where the batching work will
+have to show that it worked.
 
 ### Finishing the story
 
@@ -1591,15 +1597,26 @@ stands between the two crates any more, nor between the two commands:
 you will debug each one — extend `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
+Step 1 also has better tooling than it did. A run is a job on the server now,
+with its loss curve drawn as it falls and the samples it writes at each
+checkpoint beside it, and there is a perplexity number to put on the result —
+so "did that corpus help?" is a measurement rather than a squint at some
+generated text.
+
 **2. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike
 full fine-tuning it fits on a laptop.
 
 ### Becoming a server
 
-In rough dependency order. Step 3, removing the per-matmul floor, is
-[done](#the-floor-under-everything) — it was the one blocking everything else,
-and CPU decode went from 35 to 112 tok/s.
+In rough dependency order. Two things are already done, and they are done for
+different reasons.
+
+Removing the [per-matmul floor](#the-floor-under-everything) was the one
+blocking everything else: CPU decode went from 35 to 112 tok/s, and until it
+was fixed every other optimisation was measuring rayon's scheduler rather than
+the arithmetic. Step 5, the server, was built out of order — why is under its
+own number below. The rest:
 
 **3. A paged KV cache.** Today it is a `Vec<f32>` per layer that grows by
 appending, which is 805 MB at Qwen's full context and cannot be shared between
@@ -1609,11 +1626,28 @@ everything below. It is also the next thing the profiler will be pointed at:
 at 112 tok/s the cache is a larger share of each token than it was at 35.
 Quantising it is a second, separate win.
 
+This one now has a gauge. The dashboard reports the cache twice over — what it
+holds at this moment, and what the same conversation would cost at full context
+— because the two are wildly different numbers and only one of them is obvious.
+A 7B model at a 4096-token context is 960 KB *per token*: four gigabytes of
+cache for one conversation, against 360 MB for all of SmolLM2's eight thousand.
+That gap is the problem this step exists to solve, and you can now watch it
+rather than read about it.
+
 **4. Continuous batching.** Half the machinery exists: `forward_batch` already
 runs many positions through one set of weights, which is the whole reason
 prefill is fast. Serving needs the same thing across *different sequences* at
 different positions, which means per-sequence positions in RoPE and attention,
 and admitting new requests between steps instead of between batches.
+
+The seam is written and waiting. `kvad-serve`'s scheduler owns the engine
+thread and everything queues behind it; when batching lands it replaces the
+inside of that queue and nothing above it changes. What is *not* written is the
+measurement: the benchmark page runs one stream at a time, which is exactly the
+thing batching does not improve. Generating concurrent load, and reporting
+throughput against latency rather than tokens a second, is part of this step
+rather than a separate one — and without it this repo would have no way to show
+that the hardest change in it had worked.
 
 **5. `kvad-serve`.** [Done](#crate-5-kvad-serve--the-server-and-the-web-ui) —
 an OpenAI-compatible endpoint, and a web UI around it. It was meant to be last
@@ -1628,6 +1662,20 @@ with any grace, and it says so rather than queuing quietly.
 **6. Then the hardware.** Real CUDA kernels, flash attention, speculative
 decoding. This is the stretch where legibility and speed start to fight, and
 the point at which this README owes an honest account of the trade.
+
+**And a missing kernel, which the benchmark page turned up.** q4 decodes faster
+than q8 — 149 against 115 tok/s on SmolLM2-135M — and reaches its first token
+*slower*, 41 ms against 30. Scoring a held-out file, which is nearly all
+prefill, took q4 twice as long as q8.
+
+Not a cost of quantisation: both paths are integer, and neither dequantises to
+floats. It is one line in `matmul_bt_with`, which gates the batched `SMMLA`
+kernel on `Data::Q8`. q4 has no such kernel and falls back to a row at a time,
+unpacking nibbles as it goes — so prefill at q4 is the portable path while q8
+gets [the i8mm one](#batched-prefill-and-i8mm).
+Whether a q4 `SMMLA` pays depends on whether unpacking into the operand shape
+that kernel wants costs less than the kernel saves, and nobody has tried. It is
+the smallest unclaimed win on this list.
 
 ### Worth reading alongside
 

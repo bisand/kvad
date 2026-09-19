@@ -27,7 +27,7 @@ use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use kvad::chat::Message;
-use kvad::runtime::Stats;
+use kvad::runtime::{Chosen, Stats};
 use kvad::service::Sampling;
 use serde_json::json;
 
@@ -279,7 +279,10 @@ fn streamed(
         let mut opened = false;
         while let Some(piece) = pieces.recv().await {
             let event = match piece {
-                Piece::Token(text) => {
+                // A `Chose` is a token that also says what it was chosen
+                // from. Chat never asks for that — it is the playground's
+                // request — so the two are the same thing here.
+                Piece::Token(text) | Piece::Chose(Chosen { text, .. }) => {
                     let first = !std::mem::replace(&mut opened, true);
                     let delta = match first {
                         true => json!({ "role": "assistant", "content": text }),
@@ -339,7 +342,7 @@ async fn whole(
     let mut text = String::new();
     while let Some(piece) = pieces.recv().await {
         match piece {
-            Piece::Token(t) => text.push_str(&t),
+            Piece::Token(t) | Piece::Chose(Chosen { text: t, .. }) => text.push_str(&t),
             Piece::Failed(why) => {
                 metrics.record("POST", ROUTE, 500, started.elapsed());
                 return Err(Fail::internal(why));

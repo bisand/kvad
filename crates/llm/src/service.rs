@@ -31,7 +31,7 @@
 use crate::chat::Message;
 use crate::hub::{self, HubModel, LocalModel};
 use crate::quant::Precision;
-use crate::runtime::{Llm, Stats};
+use crate::runtime::{Chosen, Llm, Perplexity, Stats, Token};
 use crate::sampler::Sampler;
 use crate::weights::{Fetch, Watcher};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +49,27 @@ pub enum Cmd {
     /// give the memory back without being told what to spend it on next.
     Unload,
     Chat { messages: Vec<Message>, sampling: Sampling },
+    /// Continue a prompt, with no chat template anywhere near it.
+    ///
+    /// The base-model view of a model, which for an instruct model is a
+    /// different and more revealing thing than talking to it.
+    Complete {
+        prompt: String,
+        sampling: Sampling,
+        /// How many candidates to report per token; 0 for none.
+        explain: usize,
+        /// Drop the KV cache before starting.
+        ///
+        /// Matters for measurement rather than for output: the same prompt
+        /// twice in a row would otherwise be prefilled from the first run's
+        /// cache and report a time to first token that no first run would
+        /// ever see. A benchmark sets this; a person typing does not.
+        fresh: bool,
+    },
+    /// How the loaded model's tokenizer splits a text.
+    Tokenize(String),
+    /// Score a text the model did not write.
+    Perplexity { text: String, window: usize },
     RefreshLocal,
     Delete(String),
 }
@@ -156,7 +177,15 @@ pub enum Evt {
     Unloaded(String),
     /// A fragment of the assistant's reply.
     Token(String),
+    /// The same fragment, with the candidates it was chosen from. Sent
+    /// instead of [`Evt::Token`] when a request asked to be shown the
+    /// choice.
+    Chose(Chosen),
     Done(Stats),
+    Tokens(Vec<Token>),
+    /// Progress through a text being scored, in tokens.
+    Scoring { done: usize, total: usize },
+    Scored(Perplexity),
     Error(String),
 }
 
@@ -328,17 +357,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                     say("no model loaded");
                     continue;
                 };
-                cancel.store(false, Ordering::Relaxed);
-
-                // The knobs are this request's; the generator is the
-                // session's, unless this request asked for one of its own.
-                s.sampler.temperature = sampling.temperature;
-                s.sampler.top_k = sampling.top_k;
-                s.sampler.top_p = sampling.top_p;
-                if let Some(seed) = sampling.seed {
-                    s.sampler.reseed(seed);
-                }
-
+                aim(s, &sampling);
                 let ids = match s.llm.encode_chat(&messages) {
                     Ok(ids) => ids,
                     Err(e) => {
@@ -346,25 +365,116 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                         continue;
                     }
                 };
-
                 // The session reuses whatever of the previous turn's cache
                 // still matches, so a chat prefills only the newest message.
+                run(s, &ids, &sampling, 0, &tx, &cancel);
+            }
+
+            Cmd::Complete { prompt, sampling, explain, fresh } => {
+                let Some(s) = session.as_mut() else {
+                    say("no model loaded");
+                    continue;
+                };
+                aim(s, &sampling);
+                if fresh {
+                    if let Err(e) = s.llm.reset() {
+                        fail(e);
+                        continue;
+                    }
+                }
+                // No template: the prompt is the text, which is what makes
+                // this a different view of the model rather than a second
+                // chat window.
+                let ids = match s.llm.encode(&prompt) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        fail(e);
+                        continue;
+                    }
+                };
+                run(s, &ids, &sampling, explain, &tx, &cancel);
+            }
+
+            Cmd::Tokenize(text) => match session.as_ref() {
+                None => say("no model loaded"),
+                Some(s) => match s.llm.tokenize(&text) {
+                    Ok(tokens) => {
+                        let _ = tx.send(Evt::Tokens(tokens));
+                    }
+                    Err(e) => fail(e),
+                },
+            },
+
+            Cmd::Perplexity { text, window } => {
+                let Some(s) = session.as_mut() else {
+                    say("no model loaded");
+                    continue;
+                };
+                cancel.store(false, Ordering::Relaxed);
                 let tx2 = tx.clone();
                 let cancel2 = Arc::clone(&cancel);
-                let result = s.llm.generate(&ids, &mut s.sampler, sampling.max_tokens, |piece| {
-                    if cancel2.load(Ordering::Relaxed) {
-                        return false;
-                    }
-                    tx2.send(Evt::Token(piece.to_string())).is_ok()
+                let scored = s.llm.perplexity(&text, window, |done, total| {
+                    let _ = tx2.send(Evt::Scoring { done, total });
+                    !cancel2.load(Ordering::Relaxed)
                 });
-
-                match result {
-                    Ok((stats, _)) => {
-                        let _ = tx.send(Evt::Done(stats));
+                match scored {
+                    Ok(p) => {
+                        let _ = tx.send(Evt::Scored(p));
                     }
                     Err(e) => fail(e),
                 }
             }
+        }
+    }
+}
+
+/// Point the session's sampler at what this request asked for.
+///
+/// The knobs are the request's; the generator is the session's, unless the
+/// request asked for one of its own.
+fn aim(s: &mut Loaded, sampling: &Sampling) {
+    s.sampler.temperature = sampling.temperature;
+    s.sampler.top_k = sampling.top_k;
+    s.sampler.top_p = sampling.top_p;
+    if let Some(seed) = sampling.seed {
+        s.sampler.reseed(seed);
+    }
+}
+
+/// Generate from token ids, forwarding every piece down the channel.
+///
+/// Shared by chat and raw completion, which differ only in how the ids were
+/// arrived at — and that difference belongs above this line, not inside the
+/// loop.
+fn run(
+    s: &mut Loaded,
+    ids: &[u32],
+    sampling: &Sampling,
+    explain: usize,
+    tx: &Sender<Evt>,
+    cancel: &Arc<AtomicBool>,
+) {
+    cancel.store(false, Ordering::Relaxed);
+    let tx2 = tx.clone();
+    let cancel2 = Arc::clone(cancel);
+    let result =
+        s.llm.generate_explained(ids, &mut s.sampler, sampling.max_tokens, explain, |chosen| {
+            if cancel2.load(Ordering::Relaxed) {
+                return false;
+            }
+            let evt = match explain {
+                0 => Evt::Token(chosen.text.clone()),
+                _ => Evt::Chose(chosen.clone()),
+            };
+            tx2.send(evt).is_ok()
+        });
+
+    match result {
+        Ok((stats, _)) => {
+            let _ = tx.send(Evt::Done(stats));
+        }
+        Err(e) => {
+            let _ = tx.send(Evt::Error(e.to_string()));
         }
     }
 }

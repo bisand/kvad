@@ -40,6 +40,69 @@ pub type SessionFactory<'a> = &'a mut dyn FnMut(
     &mut dyn FnMut(&str),
 ) -> Res<Box<dyn Session>>;
 
+/// One generated token, and what it was chosen from.
+#[derive(Debug, Clone)]
+pub struct Chosen {
+    pub id: u32,
+    /// The new text this token added, which for byte-level BPE is sometimes
+    /// nothing and sometimes several characters at once.
+    pub text: String,
+    /// The candidates, best first. Empty unless the caller asked for them.
+    pub top: Vec<Candidate>,
+}
+
+/// A token the model considered.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub id: u32,
+    pub text: String,
+    /// The model's own probability, over the whole vocabulary.
+    pub prob: f32,
+    /// Whether the sampler's top-k and top-p left it in play.
+    pub kept: bool,
+    pub chosen: bool,
+}
+
+/// One token as the tokenizer sees it.
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub id: u32,
+    /// The vocabulary entry, `Ġthe` and all.
+    pub token: String,
+    /// The text it covers, cut from the input.
+    pub piece: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// What a model scored on a text it did not write.
+#[derive(Debug, Clone, Copy)]
+pub struct Perplexity {
+    /// Tokens the text encoded to.
+    pub tokens: usize,
+    /// Tokens that were actually graded: all but the first of each window.
+    pub scored: usize,
+    pub windows: usize,
+    pub window: usize,
+    /// Mean negative log-likelihood, in nats.
+    pub nats: f64,
+    pub perplexity: f64,
+    /// The same number as compression: bits needed per token.
+    pub bits_per_token: f64,
+    pub stopped: bool,
+}
+
+/// Log of the probability this row of logits gives `target`.
+///
+/// The stable form: subtract the maximum before exponentiating, or a logit of
+/// 90 overflows `f32` and the answer is a NaN that propagates into every
+/// score after it.
+fn log_prob(logits: &[f32], target: u32) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
+    (logits[target as usize] - max) - sum.ln()
+}
+
 /// Progress and timing for one generation run.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -204,6 +267,28 @@ impl Llm {
         max_tokens: usize,
         mut on_token: impl FnMut(&str) -> bool,
     ) -> Res<(Stats, Vec<u32>)> {
+        self.generate_explained(prompt_ids, sampler, max_tokens, 0, |c| on_token(&c.text))
+    }
+
+    /// As [`Llm::generate`], reporting what each token was chosen *from*.
+    ///
+    /// `explain` is how many candidates to report per step; 0 is
+    /// [`Llm::generate`] and costs nothing extra. Anything above it costs one
+    /// sort and one softmax over the vocabulary per token — tens of
+    /// microseconds against tens of milliseconds of matmul, so the numbers
+    /// this produces are not numbers about a slower engine.
+    ///
+    /// This is the whole of the playground's top-k view: the logits were
+    /// always there, and generation was simply throwing away everything except
+    /// the argument's winner.
+    pub fn generate_explained(
+        &mut self,
+        prompt_ids: &[u32],
+        sampler: &mut Sampler,
+        max_tokens: usize,
+        explain: usize,
+        mut on_token: impl FnMut(&Chosen) -> bool,
+    ) -> Res<(Stats, Vec<u32>)> {
         if prompt_ids.is_empty() {
             return Err("prompt encoded to zero tokens".into());
         }
@@ -227,7 +312,10 @@ impl Llm {
 
         let t1 = Instant::now();
         for _ in 0..budget {
-            let next = sampler.sample(&logits);
+            let (next, top) = match explain {
+                0 => (sampler.sample(&logits), Vec::new()),
+                k => sampler.sample_explained(&logits, k),
+            };
             if self.eos.contains(&next) {
                 break;
             }
@@ -239,7 +327,14 @@ impl Llm {
             // one at a time would emit replacement characters mid-word.
             let text = self.decode(&ids)?;
             let previous = self.decode(&ids[..ids.len() - 1])?;
-            if !on_token(&text[previous.len()..]) {
+            let chosen = Chosen {
+                id: next,
+                text: text[previous.len()..].to_string(),
+                // Resolved here rather than by the caller, because the
+                // tokenizer is here and an id means nothing without it.
+                top: top.into_iter().map(|r| self.candidate(r)).collect(),
+            };
+            if !on_token(&chosen) {
                 break;
             }
 
@@ -249,6 +344,128 @@ impl Llm {
 
         self.cached_ids = ids.clone();
         Ok((stats, ids))
+    }
+
+    fn candidate(&self, r: crate::sampler::Ranked) -> Candidate {
+        Candidate {
+            // A single id can be half a UTF-8 character, which decodes to a
+            // replacement char. That is the truth about byte-level BPE and
+            // showing it is better than hiding it.
+            text: self.decode(&[r.id]).unwrap_or_default(),
+            id: r.id,
+            prob: r.prob,
+            kept: r.kept,
+            chosen: r.chosen,
+        }
+    }
+
+    /// How the tokenizer splits a piece of text.
+    ///
+    /// `piece` is the substring the token covers, taken from the offsets, so
+    /// what is shown is the reader's own text cut up rather than a rendering
+    /// of vocabulary entries. `token` is the vocabulary entry itself, which is
+    /// where the `Ġ` and `Ċ` of byte-level BPE live — the two disagree, and
+    /// seeing how is most of the point of an inspector.
+    pub fn tokenize(&self, text: &str) -> Res<Vec<Token>> {
+        let enc = self.tokenizer.encode(text, false).map_err(|e| e.to_string())?;
+        let offsets = enc.get_offsets();
+        Ok(enc
+            .get_ids()
+            .iter()
+            .zip(enc.get_tokens())
+            .enumerate()
+            .map(|(i, (&id, token))| {
+                let (start, end) = offsets.get(i).copied().unwrap_or((0, 0));
+                Token {
+                    id,
+                    token: token.clone(),
+                    piece: text.get(start..end).unwrap_or("").to_string(),
+                    start,
+                    end,
+                }
+            })
+            .collect())
+    }
+
+    /// How surprised this model is by a text it did not write.
+    ///
+    /// Perplexity is the exponential of the mean negative log-likelihood the
+    /// model assigns to each actual next token: "on average, how many equally
+    /// likely tokens was it choosing between?". Lower is better, 1.0 would be
+    /// certainty, and the vocabulary size is what a model that had learnt
+    /// nothing would score.
+    ///
+    /// Scored in windows rather than in one pass, because a file is usually
+    /// longer than the context. Each window starts with an empty cache, and
+    /// its **first token is not scored** — nothing precedes it, so there is no
+    /// prediction to grade. That makes the number slightly pessimistic
+    /// compared to a sliding window with overlap, and it makes it comparable
+    /// between models, which is what it is for.
+    ///
+    /// `on_window` is called after each window with the tokens scored so far
+    /// and the total; returning false stops, and what was measured up to that
+    /// point comes back with `stopped` set.
+    pub fn perplexity(
+        &mut self,
+        text: &str,
+        window: usize,
+        mut on_window: impl FnMut(usize, usize) -> bool,
+    ) -> Res<Perplexity> {
+        let ids = self.encode(text)?;
+        if ids.len() < 2 {
+            return Err("there is not enough text here to score: two tokens at least".into());
+        }
+        let window = window.clamp(2, self.spec.n_ctx);
+        let vocab = self.spec.vocab_size;
+
+        let mut nats = 0.0f64;
+        let mut scored = 0usize;
+        let mut windows = 0usize;
+        let mut stopped = false;
+
+        for part in ids.chunks(window) {
+            if part.len() < 2 {
+                // A last window holding one token has nothing to grade.
+                break;
+            }
+            // Every window is independent, so the cache from the last one
+            // would be a prefix this text never had.
+            self.reset()?;
+            let logits = self.session.forward_all(part)?;
+            if logits.len() != part.len() * vocab {
+                return Err(format!(
+                    "the backend returned {} logits for {} tokens of a {vocab}-token vocabulary",
+                    logits.len(),
+                    part.len()
+                )
+                .into());
+            }
+            for i in 0..part.len() - 1 {
+                nats += -log_prob(&logits[i * vocab..(i + 1) * vocab], part[i + 1]) as f64;
+                scored += 1;
+            }
+            windows += 1;
+            if !on_window(scored, ids.len()) {
+                stopped = true;
+                break;
+            }
+        }
+
+        // The cache now holds a stretch of somebody's test set, which is not
+        // a prefix of anyone's next conversation.
+        self.reset()?;
+
+        let mean = nats / scored.max(1) as f64;
+        Ok(Perplexity {
+            tokens: ids.len(),
+            scored,
+            windows,
+            window,
+            nats: mean,
+            perplexity: mean.exp(),
+            bits_per_token: mean / std::f64::consts::LN_2,
+            stopped,
+        })
     }
 }
 

@@ -23,7 +23,7 @@
 //! generation. Only loading, unloading and generating are serialised.
 
 use kvad::chat::Message;
-use kvad::runtime::Stats;
+use kvad::runtime::{Chosen, Perplexity, Stats, Token};
 use kvad::service::{Backend, Cmd, Engine, Evt, Loader, Sampling};
 use kvad::weights::Fetch;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -65,6 +65,9 @@ pub enum Progress {
 #[derive(Debug, Clone)]
 pub enum Piece {
     Token(String),
+    /// The same fragment, with the candidates behind it, for a request that
+    /// asked to see the choice.
+    Chose(Chosen),
     Done(Stats),
     Failed(String),
 }
@@ -75,6 +78,15 @@ enum Job {
     Load { repo: String, backend: Backend, progress: tokio_mpsc::Sender<Progress>, done: Answer<Loaded> },
     Unload { done: Answer<Option<String>> },
     Chat { messages: Vec<Message>, sampling: Sampling, out: tokio_mpsc::Sender<Piece> },
+    Complete {
+        prompt: String,
+        sampling: Sampling,
+        explain: usize,
+        fresh: bool,
+        out: tokio_mpsc::Sender<Piece>,
+    },
+    Tokenize { text: String, done: Answer<Vec<Token>> },
+    Score { text: String, window: usize, progress: tokio_mpsc::Sender<(usize, usize)>, done: Answer<Perplexity> },
 }
 
 pub struct Scheduler {
@@ -185,6 +197,48 @@ impl Scheduler {
         self.submit(Job::Chat { messages, sampling, out })?;
         Ok(rx)
     }
+
+    /// Continue a prompt, with no chat template involved.
+    ///
+    /// `explain` is how many candidates to report per token, and `fresh`
+    /// drops the KV cache first — see [`kvad::service::Cmd::Complete`] for why
+    /// that is a measurement question rather than an output one.
+    pub fn complete(
+        &self,
+        prompt: String,
+        sampling: Sampling,
+        explain: usize,
+        fresh: bool,
+    ) -> Result<tokio_mpsc::Receiver<Piece>, String> {
+        let (out, rx) = tokio_mpsc::channel(64);
+        self.submit(Job::Complete { prompt, sampling, explain, fresh, out })?;
+        Ok(rx)
+    }
+
+    /// How the loaded model's tokenizer splits a text.
+    ///
+    /// Engine work, although it is only a tokenizer: the tokenizer belongs to
+    /// the loaded model and the loaded model lives on that thread. So this
+    /// queues behind a generation, which is a millisecond of work waiting on
+    /// thirty seconds of somebody else's — and the alternative is a second
+    /// copy of the tokenizer that can disagree with the first.
+    pub async fn tokenize(&self, text: String) -> Result<Vec<Token>, String> {
+        let (done, wait) = oneshot::channel();
+        self.submit(Job::Tokenize { text, done })?;
+        wait.await.map_err(|_| "the engine stopped before it answered".to_string())?
+    }
+
+    /// Score a text the model did not write.
+    pub async fn score(
+        &self,
+        text: String,
+        window: usize,
+        progress: tokio_mpsc::Sender<(usize, usize)>,
+    ) -> Result<Perplexity, String> {
+        let (done, wait) = oneshot::channel();
+        self.submit(Job::Score { text, window, progress, done })?;
+        wait.await.map_err(|_| "the engine stopped before it answered".to_string())?
+    }
 }
 
 /// The scheduler thread: one job at a time, in the order they arrived.
@@ -231,6 +285,25 @@ fn run(
                     // everything it generated.
                     cached.store(stats.prompt_tokens + stats.generated_tokens, Ordering::Relaxed);
                 }
+            }
+
+            Job::Complete { prompt, sampling, explain, fresh, out } => {
+                engine.send(Cmd::Complete { prompt, sampling, explain, fresh });
+                if let Some(stats) = drain_chat(&engine.rx, &out) {
+                    cached.store(stats.prompt_tokens + stats.generated_tokens, Ordering::Relaxed);
+                }
+            }
+
+            Job::Tokenize { text, done } => {
+                engine.send(Cmd::Tokenize(text));
+                let _ = done.send(drain_tokens(&engine.rx));
+            }
+
+            Job::Score { text, window, progress, done } => {
+                engine.send(Cmd::Perplexity { text, window });
+                let _ = done.send(drain_score(&engine.rx, &progress));
+                // Scoring ends by clearing the cache, so nothing is held.
+                cached.store(0, Ordering::Relaxed);
             }
         }
 
@@ -295,11 +368,43 @@ fn drain_unload(rx: &Receiver<Evt>) -> Result<Option<String>, String> {
     }
 }
 
+fn drain_tokens(rx: &Receiver<Evt>) -> Result<Vec<Token>, String> {
+    loop {
+        match rx.recv() {
+            Ok(Evt::Tokens(tokens)) => return Ok(tokens),
+            Ok(Evt::Error(e)) => return Err(e),
+            // What the engine says when nothing is loaded.
+            Ok(Evt::Status(message)) => return Err(message),
+            Ok(_) => {}
+            Err(_) => return Err("the engine thread has stopped".into()),
+        }
+    }
+}
+
+fn drain_score(
+    rx: &Receiver<Evt>,
+    progress: &tokio_mpsc::Sender<(usize, usize)>,
+) -> Result<Perplexity, String> {
+    loop {
+        match rx.recv() {
+            Ok(Evt::Scored(p)) => return Ok(p),
+            Ok(Evt::Scoring { done, total }) => {
+                let _ = progress.try_send((done, total));
+            }
+            Ok(Evt::Error(e)) => return Err(e),
+            Ok(Evt::Status(message)) => return Err(message),
+            Ok(_) => {}
+            Err(_) => return Err("the engine thread has stopped".into()),
+        }
+    }
+}
+
 /// Forward a generation's tokens, and return the statistics it ended with.
 fn drain_chat(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Piece>) -> Option<Stats> {
     loop {
         let piece = match rx.recv() {
             Ok(Evt::Token(text)) => Piece::Token(text),
+            Ok(Evt::Chose(chosen)) => Piece::Chose(chosen),
             Ok(Evt::Done(stats)) => Piece::Done(stats),
             Ok(Evt::Error(e)) => Piece::Failed(e),
             // Sent when no model is loaded, which for a chat is a refusal
@@ -309,7 +414,7 @@ fn drain_chat(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Piece>) -> Option<Sta
             Err(_) => Piece::Failed("the engine thread has stopped".into()),
         };
         let ended = match &piece {
-            Piece::Token(_) => None,
+            Piece::Token(_) | Piece::Chose(_) => None,
             Piece::Done(stats) => Some(Some(*stats)),
             Piece::Failed(_) => Some(None),
         };

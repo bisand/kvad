@@ -77,6 +77,48 @@ pub struct Sample {
     pub text: String,
 }
 
+/// One case of a prompt suite, run against one variant.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Case {
+    pub variant: String,
+    pub idx: i64,
+    pub prompt: String,
+    pub expect: String,
+    pub got: String,
+    pub passed: bool,
+    pub decode_per_sec: Option<f64>,
+    pub generated_tokens: Option<i64>,
+}
+
+/// What one variant scored on a held-out text.
+///
+/// Read back as well as written: a perplexity run keeps its scores in the
+/// job's result rather than in rows of its own, because one number per
+/// variant is the whole of it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Scored {
+    pub variant: String,
+    pub tokens: usize,
+    pub scored: usize,
+    pub perplexity: f64,
+    pub bits_per_token: f64,
+    pub took_secs: f64,
+}
+
+/// One timed generation in a benchmark.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Timing {
+    pub variant: String,
+    pub round: i64,
+    pub decode_per_sec: f64,
+    pub prefill_per_sec: f64,
+    pub ttft_millis: f64,
+    pub generated_tokens: i64,
+    /// What it wrote, for a side-by-side comparison. Absent when the run is a
+    /// measurement rather than a comparison.
+    pub text: Option<String>,
+}
+
 /// Something that happened, as a watcher sees it.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -85,6 +127,11 @@ pub enum Update {
     Download { file: String, bytes: u64, total: u64 },
     Metric(Metric),
     Sample(Sample),
+    /// Work done out of work to do, in whatever units the job counts in.
+    Progress { done: usize, total: usize },
+    Case(Case),
+    Scored(Scored),
+    Timing(Timing),
     /// How fast this machine turned out to be, sent once and early, while
     /// there is still time to do something about the answer.
     Pace { chars_per_sec: f64, remaining_secs: f64 },
@@ -98,7 +145,7 @@ struct Live {
 }
 
 pub struct Jobs {
-    db: Db,
+    pub db: Db,
     live: Mutex<HashMap<i64, Live>>,
 }
 
@@ -184,21 +231,89 @@ impl Jobs {
         })
     }
 
+    /// The verdicts an eval run has reached so far.
+    pub fn cases(&self, id: i64) -> Res<Vec<Case>> {
+        self.db.with(|c| {
+            let mut q = c.prepare(
+                "SELECT variant, idx, prompt, expect, got, passed, decode_per_sec,
+                        generated_tokens
+                 FROM eval_results WHERE job = ?1 ORDER BY variant, idx",
+            )?;
+            let rows = q
+                .query_map([id], |r| {
+                    Ok(Case {
+                        variant: r.get(0)?,
+                        idx: r.get(1)?,
+                        prompt: r.get(2)?,
+                        expect: r.get(3)?,
+                        got: r.get(4)?,
+                        passed: r.get::<_, i64>(5)? != 0,
+                        decode_per_sec: r.get(6)?,
+                        generated_tokens: r.get(7)?,
+                    })
+                })?
+                .collect();
+            rows
+        })
+    }
+
+    /// The samples a benchmark has taken so far.
+    pub fn timings(&self, id: i64) -> Res<Vec<Timing>> {
+        self.db.with(|c| {
+            let mut q = c.prepare(
+                "SELECT variant, round, decode_per_sec, prefill_per_sec, ttft_millis,
+                        generated_tokens, text
+                 FROM bench_samples WHERE job = ?1 ORDER BY round, variant",
+            )?;
+            let rows = q
+                .query_map([id], |r| {
+                    Ok(Timing {
+                        variant: r.get(0)?,
+                        round: r.get(1)?,
+                        decode_per_sec: r.get(2)?,
+                        prefill_per_sec: r.get(3)?,
+                        ttft_millis: r.get(4)?,
+                        generated_tokens: r.get(5)?,
+                        text: r.get(6)?,
+                    })
+                })?
+                .collect();
+            rows
+        })
+    }
+
     /// Is a training run going? The one thing that is not allowed twice.
     pub fn training(&self) -> bool {
+        self.live_kind(&["train"]).is_some()
+    }
+
+    /// A live job of one of these kinds, named, or `None`.
+    ///
+    /// Used to refuse the second of two things that would fight over the same
+    /// hardware: two training runs, or a benchmark started while anything
+    /// else is on the machine. The answer names what is in the way, because
+    /// "busy" without a subject is a message nobody can act on.
+    pub fn live_kind(&self, kinds: &[&str]) -> Option<String> {
+        let list: Vec<String> = kinds.iter().map(|k| format!("'{k}'")).collect();
         self.db
             .with(|c| {
                 c.query_row(
-                    "SELECT count(*) FROM jobs WHERE kind = 'train' AND state IN ('queued','running')",
+                    &format!(
+                        "SELECT kind, label FROM jobs
+                         WHERE kind IN ({}) AND state IN ('queued','running')
+                         ORDER BY id LIMIT 1",
+                        list.join(", ")
+                    ),
                     [],
-                    |r| r.get::<_, i64>(0),
+                    |r| Ok(format!("{} ({})", r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
                 )
+                .optional()
             })
-            .map(|n| n > 0)
-            .unwrap_or(false)
+            .ok()
+            .flatten()
     }
 
-    fn create(&self, kind: &str, label: &str, params: &serde_json::Value, owner: Option<i64>) -> Res<i64> {
+    pub fn create(&self, kind: &str, label: &str, params: &serde_json::Value, owner: Option<i64>) -> Res<i64> {
         self.db.with(|c| {
             c.execute(
                 "INSERT INTO jobs (kind, state, label, params, owner)
@@ -211,7 +326,7 @@ impl Jobs {
         })
     }
 
-    fn finish(&self, id: i64, state: &str, error: Option<String>, result: Option<serde_json::Value>) {
+    pub fn finish(&self, id: i64, state: &str, error: Option<String>, result: Option<serde_json::Value>) {
         let _ = self.db.with(|c| {
             c.execute(
                 "UPDATE jobs SET state = ?2, error = ?3, result = ?4, ended_at = datetime('now')
@@ -246,7 +361,7 @@ impl Jobs {
         }
     }
 
-    fn register(&self, id: i64) -> (Arc<AtomicBool>, broadcast::Sender<Update>) {
+    pub fn register(&self, id: i64) -> (Arc<AtomicBool>, broadcast::Sender<Update>) {
         // 256: a training run sends a handful of updates a minute and a
         // download a few a second. A watcher that falls this far behind is
         // one that has stopped reading, and `broadcast` drops the oldest for
@@ -259,7 +374,7 @@ impl Jobs {
     }
 }
 
-fn row(r: &rusqlite::Row) -> rusqlite::Result<Job> {
+pub fn row(r: &rusqlite::Row) -> rusqlite::Result<Job> {
     let json = |s: Option<String>| s.and_then(|s| serde_json::from_str(&s).ok());
     Ok(Job {
         id: r.get("id")?,
@@ -489,6 +604,8 @@ fn from_fetch(f: kvad::weights::Fetch) -> Option<Update> {
 pub fn history(jobs: &Jobs, id: i64) -> Res<Vec<Update>> {
     let mut updates: Vec<Update> = jobs.metrics(id)?.into_iter().map(Update::Metric).collect();
     updates.extend(jobs.samples(id)?.into_iter().map(Update::Sample));
+    updates.extend(jobs.cases(id)?.into_iter().map(Update::Case));
+    updates.extend(jobs.timings(id)?.into_iter().map(Update::Timing));
     Ok(updates)
 }
 

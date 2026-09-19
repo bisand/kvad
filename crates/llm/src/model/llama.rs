@@ -111,46 +111,13 @@ impl Model {
             self.rope.apply(head, pos);
         }
     }
-}
-
-impl Transformer for Model {
-    fn spec(&self) -> &Spec {
-        &self.spec
-    }
-
-    fn param_count(&self) -> usize {
-        let per_block = self.blocks.first().map_or(0, |b| {
-            b.q_w.param_count()
-                + b.k_w.param_count()
-                + b.v_w.param_count()
-                + b.o_w.param_count()
-                + b.gate_w.param_count()
-                + b.up_w.param_count()
-                + b.down_w.param_count()
-                + b.attn_norm.len()
-                + b.mlp_norm.len()
-        });
-        self.embed.param_count()
-            + self.lm_head.as_ref().map_or(0, |h| h.param_count())
-            + per_block * self.blocks.len()
-    }
-
-    fn memory_bytes(&self) -> usize {
-        let per_block: usize = self.blocks.first().map_or(0, |b| {
-            b.q_w.bytes()
-                + b.k_w.bytes()
-                + b.v_w.bytes()
-                + b.o_w.bytes()
-                + b.gate_w.bytes()
-                + b.up_w.bytes()
-                + b.down_w.bytes()
-        });
-        self.embed.bytes()
-            + self.lm_head.as_ref().map_or(0, |h| h.bytes())
-            + per_block * self.blocks.len()
-    }
-
-    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+    /// Every block, over a batch of tokens, leaving the residual stream as
+    /// it is — no output head.
+    ///
+    /// Split out because the two callers want different slices of the same
+    /// work: generation needs the last position's logits, scoring needs all
+    /// of them, and the thirty layers in between are identical.
+    fn run_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
         let spec = &self.spec;
         let (m, e) = (tokens.len(), spec.n_embd);
         let qdim = spec.n_head * spec.head_dim;
@@ -212,9 +179,69 @@ impl Transformer for Model {
         }
 
         cache.len += m;
+        xs
+    }
+}
 
-        let last = rms_norm(&xs[(m - 1) * e..m * e], &self.final_norm, spec.eps);
+impl Transformer for Model {
+    fn spec(&self) -> &Spec {
+        &self.spec
+    }
+
+    fn param_count(&self) -> usize {
+        let per_block = self.blocks.first().map_or(0, |b| {
+            b.q_w.param_count()
+                + b.k_w.param_count()
+                + b.v_w.param_count()
+                + b.o_w.param_count()
+                + b.gate_w.param_count()
+                + b.up_w.param_count()
+                + b.down_w.param_count()
+                + b.attn_norm.len()
+                + b.mlp_norm.len()
+        });
+        self.embed.param_count()
+            + self.lm_head.as_ref().map_or(0, |h| h.param_count())
+            + per_block * self.blocks.len()
+    }
+
+    fn memory_bytes(&self) -> usize {
+        let per_block: usize = self.blocks.first().map_or(0, |b| {
+            b.q_w.bytes()
+                + b.k_w.bytes()
+                + b.v_w.bytes()
+                + b.o_w.bytes()
+                + b.gate_w.bytes()
+                + b.up_w.bytes()
+                + b.down_w.bytes()
+        });
+        self.embed.bytes()
+            + self.lm_head.as_ref().map_or(0, |h| h.bytes())
+            + per_block * self.blocks.len()
+    }
+
+    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        let (m, e) = (tokens.len(), self.spec.n_embd);
+        let xs = self.run_batch(tokens, cache);
+        let last = rms_norm(&xs[(m - 1) * e..m * e], &self.final_norm, self.spec.eps);
         self.lm_head.as_ref().unwrap_or(&self.embed).matvec_bt(&last, None)
+    }
+
+    /// Logits for **every** position, not just the last.
+    ///
+    /// The residual stream already holds all of them; what `forward_batch`
+    /// throws away is the output head applied to the other rows. Scoring text
+    /// — perplexity — needs exactly those, and running the head over `m` rows
+    /// as one matmul costs a fraction of the `m` forward passes the default
+    /// implementation would do instead.
+    fn forward_batch_all(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        let (m, e) = (tokens.len(), self.spec.n_embd);
+        let mut xs = self.run_batch(tokens, cache);
+        for i in 0..m {
+            let normed = rms_norm(&xs[i * e..(i + 1) * e], &self.final_norm, self.spec.eps);
+            xs[i * e..(i + 1) * e].copy_from_slice(&normed);
+        }
+        self.lm_head.as_ref().unwrap_or(&self.embed).matmul_bt(&xs, m, None)
     }
 
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32> {

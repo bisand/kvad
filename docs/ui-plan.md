@@ -325,7 +325,64 @@ measured the moment the headers went out, which is the moment before all the
 work. Completions are now timed end to end; every other streaming route is
 still timed to its first byte, and the page says so.
 
-**Phase 6 — playground, evals and benchmarks.**
+**Phase 6 — playground, evals and benchmarks. Done.**
+
+Three pages that measure the model instead of talking to it, and one fact
+that shapes all three: **the engine holds one model at a time**, so every
+comparison is a sequence — load, measure, load the next — and the code says so
+rather than pretending otherwise.
+
+- **The playground is nearly free**, which is the argument for having it. The
+  logits were always computed and generation was throwing away everything
+  except the winner; the tokeniser had already cut the prompt up and nobody
+  was shown the pieces. `generate_explained` reports the candidates behind
+  each token at the cost of one sort and one softmax — tens of microseconds
+  against tens of milliseconds of matmul.
+- **The probabilities shown are the model's, not the sampler's.** A plain
+  softmax over every logit at temperature 1, so the numbers do not move when
+  somebody drags the temperature slider; what the sampler did is a separate
+  mark saying whether top-k and top-p left that token in play. Both halves are
+  needed and they answer different questions.
+- **Perplexity needed a new thing from the engine.** `forward_batch` returns
+  logits for the last position only, because that is all generation wants;
+  scoring wants all of them. `forward_batch_all` runs the output head over the
+  whole batch as one matmul, which measured about 430 tokens a second against
+  114 for decoding — the same arithmetic, a quarter of the memory traffic. It
+  is checked against `nanograd`'s own logits at every position, which is the
+  same second-implementation argument the checkpoint test rests on.
+- **A round visits every variant once**, and a run is several rounds. The
+  alternative — five of A then five of B — blames the model for anything that
+  changed about the machine in between, and this project has already published
+  three wrong numbers that way. The price is a model load per variant per
+  round, and that price is the honest one.
+- **Every timed generation starts from an empty KV cache.** The same prompt
+  twice would otherwise be prefilled out of the first run's cache and report a
+  time to first token no first run would ever see.
+- **Everything is seeded**, and suites decode greedily. Two variants that
+  differ only in their random draw are not a comparison, and a regression test
+  that fails one time in five is not a test.
+- **The idle check is a refusal, not a footnote.** A benchmark will not start
+  while a training run, an eval or another benchmark is going, and the refusal
+  names what is in the way.
+
+**What the first real run found.** SmolLM2-135M-Instruct, 3 rounds, 64 tokens:
+q4 decoded at 149.5 tok/s (range 149.3–150.2) against q8's 114.6 (97.2–118.3),
+and the ranges do not overlap, so the difference is real. But q8 reached its
+first token in 30 ms against q4's 41 — prefill is compute-bound, and
+dequantising costs there. The same split shows in scoring, where q4 took twice
+as long as q8 for the same 519 tokens. On a two-case suite, q8 continued "The
+capital of France is" with " Paris" and q4 with " the capital of the country
+of France"; on held-out prose q8 scored 2.03 perplexity against q4's 2.26, and
+on the same text shuffled, 514.8 against 568.1. Quantisation costs accuracy in
+every one of those, measured rather than assumed.
+
+**Migration 006 rebuilds the jobs table** to widen its `kind` check, and that
+is a `DROP TABLE` — which with foreign keys enforced would run every
+`ON DELETE CASCADE` first and take every training metric on the machine with
+it. The pragma cannot be set from inside a migration, because it is a no-op in
+a transaction and every migration runs in one, so the runner turns enforcement
+off around each. There is a test that upgrades a database with rows in it.
+
 
 **Phase 7 — polish.** An OpenAPI docs page, `kvad serve` as a subcommand, a
 README chapter, and a release build with the embedded UI.
@@ -333,7 +390,10 @@ README chapter, and a release build with the embedded UI.
 ## Testing
 
 - API tests run against a tiny `nanograd`-trained model, as the journey test
-  does, so CI needs no downloads.
+  does, so CI needs no downloads. Built in Phase 6: `compare.rs` trains a
+  two-layer GPT on "the cat sat on the mat", saves it, and runs a real prompt
+  suite, a real benchmark and a real perplexity job against it through the
+  real scheduler — three tests, 0.7 seconds, no network.
 - Auth gets the mutation treatment: for each mode, remove the check and confirm
   a test fails.
 

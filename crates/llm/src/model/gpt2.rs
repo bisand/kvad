@@ -116,45 +116,14 @@ impl Model {
     fn head(&self, x: &[f32]) -> Vec<f32> {
         self.lm_head.as_ref().unwrap_or(&self.wte).matvec_bt(x, self.lm_head_b.as_deref())
     }
-}
 
-impl Transformer for Model {
-    fn spec(&self) -> &Spec {
-        &self.spec
-    }
-
-    fn param_count(&self) -> usize {
-        let per_block = self.blocks.first().map_or(0, |b| {
-            b.attn_w.param_count()
-                + b.attn_b.len()
-                + b.attn_proj_w.param_count()
-                + b.attn_proj_b.len()
-                + b.fc_w.param_count()
-                + b.fc_b.len()
-                + b.proj_w.param_count()
-                + b.proj_b.len()
-                + 4 * self.spec.n_embd
-        });
-        self.wte.param_count()
-            + self.wpe.param_count()
-            + self.lm_head.as_ref().map_or(0, |h| h.param_count())
-            + self.lm_head_b.as_ref().map_or(0, |b| b.len())
-            + self.lnf_g.len()
-            + self.lnf_b.len()
-            + per_block * self.blocks.len()
-    }
-
-    fn memory_bytes(&self) -> usize {
-        let per_block: usize = self.blocks.first().map_or(0, |b| {
-            b.attn_w.bytes() + b.attn_proj_w.bytes() + b.fc_w.bytes() + b.proj_w.bytes()
-        });
-        self.wte.bytes()
-            + self.wpe.bytes()
-            + self.lm_head.as_ref().map_or(0, |h| h.bytes())
-            + per_block * self.blocks.len()
-    }
-
-    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+    /// Every block, over a batch of tokens, leaving the residual stream as
+    /// it is — no output head.
+    ///
+    /// Split out because the two callers want different slices of the same
+    /// work: generation needs the last position's logits, scoring needs all
+    /// of them, and the twelve layers in between are identical.
+    fn run_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
         let spec = &self.spec;
         let (m, e) = (tokens.len(), spec.n_embd);
         let pos0 = cache.len;
@@ -211,11 +180,74 @@ impl Transformer for Model {
         }
 
         cache.len += m;
+        xs
+    }
+}
 
-        // Only the last position predicts anything we need, so the output head
-        // stays a matrix-vector product.
-        let last = layer_norm(&xs[(m - 1) * e..m * e], &self.lnf_g, &self.lnf_b, spec.eps);
+impl Transformer for Model {
+    fn spec(&self) -> &Spec {
+        &self.spec
+    }
+
+    fn param_count(&self) -> usize {
+        let per_block = self.blocks.first().map_or(0, |b| {
+            b.attn_w.param_count()
+                + b.attn_b.len()
+                + b.attn_proj_w.param_count()
+                + b.attn_proj_b.len()
+                + b.fc_w.param_count()
+                + b.fc_b.len()
+                + b.proj_w.param_count()
+                + b.proj_b.len()
+                + 4 * self.spec.n_embd
+        });
+        self.wte.param_count()
+            + self.wpe.param_count()
+            + self.lm_head.as_ref().map_or(0, |h| h.param_count())
+            + self.lm_head_b.as_ref().map_or(0, |b| b.len())
+            + self.lnf_g.len()
+            + self.lnf_b.len()
+            + per_block * self.blocks.len()
+    }
+
+    fn memory_bytes(&self) -> usize {
+        let per_block: usize = self.blocks.first().map_or(0, |b| {
+            b.attn_w.bytes() + b.attn_proj_w.bytes() + b.fc_w.bytes() + b.proj_w.bytes()
+        });
+        self.wte.bytes()
+            + self.wpe.bytes()
+            + self.lm_head.as_ref().map_or(0, |h| h.bytes())
+            + per_block * self.blocks.len()
+    }
+
+    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        let (m, e) = (tokens.len(), self.spec.n_embd);
+        let xs = self.run_batch(tokens, cache);
+        // Only the last position predicts anything generation needs, so the
+        // output head stays a matrix-vector product.
+        let last = layer_norm(&xs[(m - 1) * e..m * e], &self.lnf_g, &self.lnf_b, self.spec.eps);
         self.head(&last)
+    }
+
+    /// Logits for **every** position, not just the last.
+    ///
+    /// The residual stream already holds all of them; what `forward_batch`
+    /// throws away is the output head applied to the other rows. Scoring text
+    /// — perplexity — needs exactly those, and running the head over `m` rows
+    /// as one matmul costs a fraction of the `m` forward passes the default
+    /// implementation would do instead.
+    fn forward_batch_all(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        let (m, e) = (tokens.len(), self.spec.n_embd);
+        let mut xs = self.run_batch(tokens, cache);
+        for i in 0..m {
+            let normed =
+                layer_norm(&xs[i * e..(i + 1) * e], &self.lnf_g, &self.lnf_b, self.spec.eps);
+            xs[i * e..(i + 1) * e].copy_from_slice(&normed);
+        }
+        self.lm_head
+            .as_ref()
+            .unwrap_or(&self.wte)
+            .matmul_bt(&xs, m, self.lm_head_b.as_deref())
     }
 
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32> {

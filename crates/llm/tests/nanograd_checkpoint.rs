@@ -94,6 +94,18 @@ fn the_engine_computes_what_nanograd_computes() {
     let gap = gap(ours.row(IDS.len() - 1), &theirs);
     assert!(gap < 1e-5, "prompt: logits differ by {gap:e} of their size");
 
+    // The scoring path, which keeps every row rather than the last. It is the
+    // same batch through the same blocks with the output head run over all of
+    // it, so every position must match what `nanograd` computed — and unlike
+    // the two checks above, this one compares the whole matrix.
+    let all = engine.forward_batch_all(&tokens, &mut KvCache::new(&spec));
+    assert_eq!(all.len(), IDS.len() * spec.vocab_size);
+    for i in 0..IDS.len() {
+        let row = &all[i * spec.vocab_size..(i + 1) * spec.vocab_size];
+        let off = crate::gap(ours.row(i), row);
+        assert!(off < 1e-5, "scoring position {i}: logits differ by {off:e} of their size");
+    }
+
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -153,6 +165,40 @@ fn a_trained_model_runs_from_its_directory() {
     let (stats, ids) = llm.generate(&ids, &mut Sampler::new(0.0, 0, 1.0, 0), count, |_| true).unwrap();
     assert_eq!(stats.generated_tokens, count);
     assert_eq!(llm.decode(&ids).unwrap(), ours);
+
+    // Scoring, on a model whose whole world is one sentence. Its own text
+    // should surprise it far less than a rearrangement of the same
+    // characters — which is the only way to compare, since a character
+    // tokeniser has no token for anything it was not trained on.
+    let learnt = llm.perplexity(&text, 32, |_, _| true).unwrap();
+    let shuffled = llm.perplexity(&"tam. eht no tas tac eht ".repeat(40), 32, |_, _| true).unwrap();
+    assert!(learnt.scored > 0 && learnt.windows > 1);
+    assert!(
+        learnt.perplexity < shuffled.perplexity / 2.0,
+        "the sentence it was trained on scored {:.2} and nonsense scored {:.2}",
+        learnt.perplexity,
+        shuffled.perplexity
+    );
+    // Perplexity is the exponential of the mean surprise, and bits are the
+    // same number in another base. If those three ever disagree, one of them
+    // is being computed twice.
+    assert!((learnt.perplexity - learnt.nats.exp()).abs() < 1e-9);
+    assert!((learnt.bits_per_token * std::f64::consts::LN_2 - learnt.nats).abs() < 1e-9);
+    // Every window but its first token, and no window is scored twice.
+    assert_eq!(learnt.scored, learnt.tokens - learnt.windows);
+
+    // And a model that has learnt one sentence cannot be surprised by much:
+    // under two nats is generous for a vocabulary this small.
+    assert!(learnt.perplexity < 2.0, "{}", learnt.perplexity);
+
+    // The tokeniser inspector, on the same model. A character tokeniser makes
+    // this easy to check: one token per character, in order, covering the
+    // whole string.
+    let split = llm.tokenize("the cat").unwrap();
+    assert_eq!(split.len(), 7);
+    assert_eq!(split.iter().map(|t| t.piece.as_str()).collect::<String>(), "the cat");
+    assert_eq!((split[0].start, split[0].end), (0, 1));
+    assert_eq!(split[3].piece, " ");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -210,6 +210,15 @@ impl App {
                 self.last_stats = Some(stats);
                 self.busy = false;
             }
+            // Raw completion, the tokeniser inspector and scoring are things
+            // the web UI asks for and this one has no command to send. Taking
+            // the text of a `Chose` keeps the terminal honest if that ever
+            // changes; the rest is nothing a terminal would draw.
+            Evt::Chose(chosen) => {
+                self.streaming.get_or_insert_with(String::new).push_str(&chosen.text);
+                self.scroll = u16::MAX;
+            }
+            Evt::Tokens(_) | Evt::Scoring { .. } | Evt::Scored(_) => {}
         }
     }
 

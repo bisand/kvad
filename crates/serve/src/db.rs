@@ -45,6 +45,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("003-users", include_str!("migrations/003-users.sql")),
     ("004-jobs", include_str!("migrations/004-jobs.sql")),
     ("005-requests", include_str!("migrations/005-requests.sql")),
+    ("006-evals", include_str!("migrations/006-evals.sql")),
 ];
 
 #[derive(Clone)]
@@ -149,8 +150,19 @@ fn migrate(conn: &Connection) -> Res<()> {
     for (i, (name, sql)) in MIGRATIONS.iter().enumerate().skip(at as usize) {
         let version = i as u32 + 1;
         tracing::info!("applying migration {name}");
-        conn.execute_batch(&format!("BEGIN; {sql}; PRAGMA user_version = {version}; COMMIT;"))
-            .map_err(|e| format!("migration {name} failed: {e}"))?;
+        // Foreign keys off for the duration, which is what SQLite's own
+        // "making other kinds of table schema changes" procedure requires: a
+        // table is altered by building a new one, copying the rows and
+        // dropping the old, and `DROP TABLE` with enforcement on runs every
+        // ON DELETE CASCADE pointing at it first. It has to be set out here
+        // rather than in the `.sql` file, because the pragma is a no-op
+        // inside a transaction and every migration runs inside one.
+        conn.pragma_update(None, "foreign_keys", false)?;
+        let applied = conn
+            .execute_batch(&format!("BEGIN; {sql}; PRAGMA user_version = {version}; COMMIT;"))
+            .map_err(|e| format!("migration {name} failed: {e}"));
+        conn.pragma_update(None, "foreign_keys", true)?;
+        applied?;
     }
     Ok(())
 }
@@ -158,6 +170,79 @@ fn migrate(conn: &Connection) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Migration 006 rebuilds the jobs table to widen its `kind` check, and
+    /// a rebuild is a `DROP TABLE` — which, with foreign keys enforced, would
+    /// take every training metric and sample on the machine with it. This is
+    /// the upgrade an existing installation makes, run against rows.
+    #[test]
+    fn widening_the_kinds_of_job_keeps_the_jobs_and_their_charts() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+
+        // Everything up to the migration under test.
+        let before: Vec<_> = MIGRATIONS.iter().take_while(|(n, _)| *n != "006-evals").collect();
+        assert_eq!(before.len() + 1, MIGRATIONS.len(), "006 is no longer the last migration");
+        for (i, (_, sql)) in before.iter().enumerate() {
+            conn.execute_batch(&format!(
+                "BEGIN; {sql}; PRAGMA user_version = {}; COMMIT;",
+                i + 1
+            ))
+            .unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO jobs (id, kind, state, label, params) VALUES (7, 'train', 'done', 'x', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO train_metrics (job, step, train_loss, val_loss, chars_per_sec, elapsed_secs)
+             VALUES (7, 100, 2.0, 1.9, 500.0, 3.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO train_samples (job, step, text) VALUES (7, 100, 'hi')", [])
+            .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (kind, label): (String, String) = conn
+            .query_row("SELECT kind, label FROM jobs WHERE id = 7", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((kind.as_str(), label.as_str()), ("train", "x"));
+        let metrics: i64 =
+            conn.query_row("SELECT count(*) FROM train_metrics WHERE job = 7", [], |r| r.get(0))
+                .unwrap();
+        let samples: i64 =
+            conn.query_row("SELECT count(*) FROM train_samples WHERE job = 7", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!((metrics, samples), (1, 1), "the rebuild cascaded through the chart");
+
+        // The point of the rebuild: kinds the old check refused.
+        conn.execute(
+            "INSERT INTO jobs (kind, state, label, params) VALUES ('bench', 'running', 'b', '{}')",
+            [],
+        )
+        .unwrap();
+        // And the check is still a check.
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs (kind, state, label, params) VALUES ('nonsense', 'running', 'n', '{}')",
+                [],
+            )
+            .is_err());
+
+        // Deleting a job must still take its chart, which needs the foreign
+        // keys the migration turned off to have come back on.
+        conn.execute("DELETE FROM jobs WHERE id = 7", []).unwrap();
+        let left: i64 =
+            conn.query_row("SELECT count(*) FROM train_metrics WHERE job = 7", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(left, 0, "foreign keys did not come back on after the migration");
+    }
 
     #[test]
     fn a_fresh_database_runs_every_migration_and_stops_there() {

@@ -36,7 +36,7 @@ export const PAGES = [
   {
     path: "/playground",
     label: "Playground",
-    phase: 6,
+    phase: null,
     blurb: "Raw completion, two models side by side, and what the tokeniser saw.",
     icon: "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z",
   },
@@ -57,14 +57,14 @@ export const PAGES = [
   {
     path: "/evals",
     label: "Evals",
-    phase: 6,
+    phase: null,
     blurb: "Perplexity on held-out text, and prompt suites as regression tests.",
     icon: "M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11",
   },
   {
     path: "/benchmarks",
     label: "Benchmarks",
-    phase: 6,
+    phase: null,
     blurb: "Interleaved A/B, five runs, median and range — the protocol, as a button.",
     icon: "M12 20v-6M6 20v-4M18 20V8M3 20h18",
   },

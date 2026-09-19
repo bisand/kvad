@@ -216,6 +216,23 @@ pub trait Transformer: Send + Sync {
         }
         logits
     }
+    /// As [`Transformer::forward_batch`], returning logits for **every**
+    /// position: `tokens.len()` rows of `vocab_size`.
+    ///
+    /// This is what scoring text needs. Generation only ever wants the last
+    /// row, so the fast path throws the rest away; perplexity wants all of
+    /// them, and getting them from `m` separate forward passes would cost `m`
+    /// times the memory traffic for the same arithmetic.
+    ///
+    /// The default is that slow, correct loop, which is also what the batched
+    /// implementations are tested against.
+    fn forward_batch_all(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        let mut all = Vec::new();
+        for &t in tokens {
+            all.extend(self.forward(t, cache));
+        }
+        all
+    }
     fn param_count(&self) -> usize;
     /// Bytes the weight matrices occupy in memory, after quantisation.
     fn memory_bytes(&self) -> usize;
@@ -447,6 +464,20 @@ pub trait Session: Send {
     fn label(&self) -> String;
     fn param_count(&self) -> usize;
     fn weight_bytes(&self) -> usize;
+
+    /// Run `tokens` and return logits for **every** one of them, in order.
+    ///
+    /// Scoring text needs a distribution per position; generation needs only
+    /// the last. The default here is the one-token-at-a-time loop, which is
+    /// correct on any backend and slow on all of them — a session that can do
+    /// better says so by overriding it.
+    fn forward_all(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
+        let mut all = Vec::new();
+        for &t in tokens {
+            all.extend(self.forward(&[t])?);
+        }
+        Ok(all)
+    }
 }
 
 /// The hand-written engine, as a [`Session`].
@@ -555,6 +586,21 @@ impl Session for CpuSession {
                 logits = model.forward_batch(part, cache);
             }
             logits
+        }))
+    }
+
+    fn forward_all(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
+        let CpuSession { model, cache, chunk, pool, .. } = self;
+        // The same chunking as `forward`, and for the same reason; the only
+        // difference is which rows of the result survive. A chunk's worth of
+        // logits is `chunk × vocab` floats, which is why the chunk stays
+        // small rather than being the whole file.
+        Ok(pool.install(|| {
+            let mut all = Vec::new();
+            for part in tokens.chunks(*chunk) {
+                all.extend(model.forward_batch_all(part, cache));
+            }
+            all
         }))
     }
 

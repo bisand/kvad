@@ -43,7 +43,8 @@ Numbers to measure against (M5 Pro, 6 fast + 12 slow cores, default model of
 190,200 on 16. Validation loss on the 50 KB README bottoms near 1.9 around step
 1250 and then overfits.
 
-As of writing the repository has **no git remote**; nothing has been pushed.
+The repository is public at https://github.com/bisand/kvad, `master` tracking
+`origin/master`. Push only when asked. It has no LICENSE file.
 
 ## Task 1: `kvad train`
 

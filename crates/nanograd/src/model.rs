@@ -171,6 +171,10 @@ impl Gpt {
         all
     }
 
+    pub fn config(&self) -> GptConfig {
+        self.config
+    }
+
     pub fn param_count(&mut self) -> usize {
         self.params().iter().map(|p| p.value.len()).sum()
     }

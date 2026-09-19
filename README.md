@@ -61,6 +61,7 @@ measurement in this repo keeps pointing at.
 ./scripts/get-mnist.sh
 cargo test                                      # includes a gradient check
 cargo run --release -p nanograd --bin train_mnist
+cargo run --release -p nanograd --bin train_text -- --data README.md
 cargo run --release -p kvad -- run --prompt "Why is the sky blue?"
 cargo run --release -p kvad-gpu -- run --prompt "Why is the sky blue?"
 cargo run --release -p kvad-tui
@@ -129,6 +130,14 @@ Zero dependencies. Read in this order:
    and consistency, and `lr` comes to mean "how far a parameter may move per
    step". It lives outside the layers — they own parameters and gradients, it
    owns its running averages — and reaches them through `params()`.
+10. **[`text.rs`](crates/nanograd/src/text.rs)** and
+    **[`bin/train_text.rs`](crates/nanograd/src/bin/train_text.rs)** — from a
+    text file to a model that writes. Nobody labels this data: the target at
+    every position is the character that comes next, so one window of text is
+    a whole batch of examples and a megabyte holds a million windows. Then
+    generation, which is only "predict, draw, append, ask again" — and which
+    recomputes every earlier position for every new character, the waste the
+    KV cache in crate 2 exists to remove.
 
 ### The test worth running first
 
@@ -221,6 +230,69 @@ the test that tells AdamW from Adam with L2 folded into the gradient.
 converges to `lr·g/(1−μ)`, so `--lr 0.1 --momentum 0.9` really steps at ~1.0.
 That is why the default is 0.02: at 0.1 this model plateaus at 95%, at 0.02 it
 reaches 98%.
+
+### Training a GPT on a text file
+
+```bash
+./scripts/get-text.sh        # tiny Shakespeare, 1.1 MB; or bring your own
+cargo run --release -p nanograd --bin train_text
+cargo run --release -p nanograd --bin train_text -- --data README.md
+```
+
+Any plain text works. The numbers below are from the second command — this
+README, 50 KB, as the entire training set — because it was the text to hand.
+Defaults: 2 layers, 4 heads, `d_model` 64, context 64, 117,221 parameters,
+about 22,000 characters a second on one core of an M5 Pro, 91 seconds for 2000
+steps.
+
+```
+loss to beat: 4.615 knowing nothing, 3.378 knowing only letter frequencies
+
+step   250  train loss 2.924  validation loss 2.767
+thatrir po the, the man as ivilt nth  ate  tasar at<(d wcat rach, isthath 0
+
+step  1250  train loss 1.666  validation loss 1.909
+quantisation not shat mak is it — sare prop is behad line changed that it
+
+step  2000  train loss 1.334  validation loss 2.261
+> measured gather step is all, and the same scomentum onhere that of
+```
+
+The two numbers at the top are what make the rest readable. `ln(vocab)` is a
+model that knows nothing; the second is one that knows which characters are
+common and nothing about their order. Everything below that was learned from
+order: first that letters come in word-sized runs, then which runs, then
+markdown. By the end it has opinions about quantisation.
+
+It is also overfitting, in plain sight. Validation loss bottoms out near step
+1250 and climbs from there while training loss keeps falling — 45 KB is little
+enough to start memorising. The validation set is the *end* of the text rather
+than a random sample, because windows overlap: sample at random and nearly every
+validation window shares most of its characters with a training window, and the
+number measures memory.
+
+**AdamW earns its place here, which it did not on the toy problem.** Same
+model, same text, 750 steps, each optimiser at the best of the learning rates
+tried for it (AdamW: 0.001–0.03, best 0.003; SGD with momentum: 0.01–1.0, best
+0.1, diverging to NaN at 1.0). Validation loss over four seeds: AdamW 2.18–2.47,
+mean 2.26; SGD 2.56–2.65, mean 2.59. AdamW is ahead on every seed, though one
+of its four is a good deal worse than the others, which a learning-rate warm-up
+would probably fix and which has not been tried.
+
+**A mistake no training run can reveal.** A batch here is a loop — the model
+takes one sequence at a time and gradients accumulate — so each window's
+gradient has to be divided by the batch size. Forget to, and the gradient is a
+sum rather than a mean: `batch` times too large. Under SGD that is a learning
+rate `batch` times too high and you would notice. Under Adam it is *nothing*,
+because cancelling the size of the gradient is the whole point of Adam; the
+model trains identically. It stays wrong, waiting for the day someone changes
+the optimiser. The test for it uses a text with exactly one possible window, so
+that a batch of three must produce the same gradient as a batch of one.
+
+Things to try: `--layers 1` or `--d-model 32`, to see how little is needed to
+learn spelling; `--context 8`, to see what a model that cannot see a whole word
+writes; `--temperature 0.2` against `1.5`; and `--steps 6000` on a small file,
+to watch the validation loss leave.
 
 ---
 
@@ -980,10 +1052,14 @@ RMSNorm ([`norm.rs`](crates/nanograd/src/norm.rs)), and the embedding
 them together with GELU and residual connections
 ([`block.rs`](crates/nanograd/src/block.rs)) are done, and so is the GPT that
 stacks them ([`model.rs`](crates/nanograd/src/model.rs)): gradient-checked end
-to end, and able to memorise a sequence, as is AdamW
-([`optim.rs`](crates/nanograd/src/optim.rs)). It has never seen a text file.
-Still needed are a training loop that reads one, and sampling from the result;
-Llama's SwiGLU and RoPE are not written. The gradient check from crate 1 is how
+to end, and able to memorise a sequence, as are AdamW
+([`optim.rs`](crates/nanograd/src/optim.rs)) and a training loop over a text
+file with sampling ([`text.rs`](crates/nanograd/src/text.rs)). So this step
+works, at 117 thousand parameters rather than 10 million. What stands between
+the two is speed — one core, one sequence at a time, about 22,000 characters a
+second — and saving the result: a trained model is lost when the process exits,
+and nothing yet writes weights that the `kvad` engine could load. Llama's
+SwiGLU and RoPE are not written. The gradient check from crate 1 is how
 you will debug each one — extend `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 

@@ -14,6 +14,7 @@
 //! 7. [`block`]  — the residual connection, and the transformer block made of two.
 //! 8. [`model`]  — all of it assembled into a GPT that predicts the next token.
 //! 9. [`optim`]  — AdamW, and why SGD is not enough for a transformer.
+//! 10. [`text`]  — from a text file to training windows, and from a model to text.
 //!
 //! Then run `cargo test -p nanograd`: the gradient check in `nn` verifies the
 //! hand-derived derivatives against numerically measured ones.
@@ -30,3 +31,4 @@ pub mod nn;
 pub mod norm;
 pub mod optim;
 pub mod rng;
+pub mod text;

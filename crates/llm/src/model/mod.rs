@@ -27,7 +27,7 @@ pub mod gpt2;
 pub mod llama;
 
 use crate::tensor::softmax_inplace;
-use crate::weights::{read_json, Checkpoint};
+use crate::weights::read_json;
 use rayon::prelude::*;
 use std::path::Path;
 
@@ -359,19 +359,6 @@ pub fn attend(spec: &Spec, q: &[f32], k_cache: &[f32], v_cache: &[f32], n_positi
         .collect();
 
     heads.concat()
-}
-
-/// Open a checkpoint and build whichever architecture its config describes.
-pub fn load(
-    weight_paths: &[std::path::PathBuf],
-    spec: Spec,
-    precision: crate::quant::Precision,
-) -> Res<Box<dyn Transformer>> {
-    let ckpt = Checkpoint::open(weight_paths)?;
-    Ok(match spec.arch {
-        Arch::Gpt2 => Box::new(gpt2::Model::load(&ckpt, spec, precision)?),
-        Arch::Llama => Box::new(llama::Model::load(&ckpt, spec, precision)?),
-    })
 }
 
 #[cfg(test)]

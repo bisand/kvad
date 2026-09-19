@@ -4,7 +4,8 @@
 //! This is the API the CLI and the TUI both drive.
 
 use crate::chat::{ChatTemplate, Message};
-use crate::model::{self, CpuSession, Session, Spec};
+use crate::model::{CpuSession, Session, Spec};
+use crate::qcache;
 use crate::quant::Precision;
 use crate::sampler::Sampler;
 use crate::weights;
@@ -33,7 +34,11 @@ pub struct Llm {
 ///
 /// The `llm` crate cannot depend on the GPU crate — the dependency runs the
 /// other way — so choosing a backend is the caller's job.
-pub type SessionFactory<'a> = &'a mut dyn FnMut(&weights::ModelFiles, &Spec) -> Res<Box<dyn Session>>;
+pub type SessionFactory<'a> = &'a mut dyn FnMut(
+    &weights::ModelFiles,
+    &Spec,
+    &mut dyn FnMut(&str),
+) -> Res<Box<dyn Session>>;
 
 /// Progress and timing for one generation run.
 #[derive(Debug, Default, Clone, Copy)]
@@ -62,8 +67,9 @@ impl Llm {
         precision: Precision,
         progress: &mut dyn FnMut(&str),
     ) -> Res<Self> {
-        Self::load_custom(repo_id, progress, &mut |files, spec| {
-            let model = model::load(&files.weights, spec.clone(), precision)?;
+        let repo = repo_id.to_string();
+        Self::load_custom(repo_id, progress, &mut |files, spec, progress| {
+            let model = qcache::load(&repo, files, spec, precision, progress)?;
             Ok(Box::new(CpuSession::new(model, precision)))
         })
     }
@@ -77,7 +83,9 @@ impl Llm {
         let files = weights::fetch_with(repo_id, progress)?;
         progress("reading weights");
         let spec = Spec::from_json(&files.config)?;
-        let session = build(&files, &spec)?;
+        let session = build(&files, &spec, progress)?;
+
+        progress("reading tokenizer");
         let tokenizer = Tokenizer::from_file(&files.tokenizer).map_err(|e| e.to_string())?;
 
         let chat = match &files.tokenizer_config {

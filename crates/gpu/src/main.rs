@@ -142,7 +142,7 @@ fn load(args: &Args) -> Res<Llm> {
 
     eprintln!("model: {repo}");
     let t0 = std::time::Instant::now();
-    let llm = Llm::load_custom(&repo, &mut |m| eprintln!("  {m}"), &mut |files, spec| {
+    let llm = Llm::load_custom(&repo, &mut |m| eprintln!("  {m}"), &mut |files, spec, _| {
         if spec.arch != Arch::Llama {
             return Err(format!(
                 "the GPU backend implements the Llama family only; `{}` is {}.\n\

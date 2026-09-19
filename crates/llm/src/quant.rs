@@ -32,8 +32,11 @@
 //! production formats do. f32 is kept here because it is one less thing in the
 //! way.)
 
+use crate::qcache::Store;
 use crate::tensor::{gemm_bt, matvec_bt, Tensor};
 use rayon::prelude::*;
+
+type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// Weights per block. 32 is the usual choice: small enough to isolate
 /// outliers, large enough that the per-block scale is not itself the cost.
@@ -67,12 +70,40 @@ impl std::fmt::Display for Precision {
     }
 }
 
+/// The arrays a weight is made of.
+///
+/// [`Store`] rather than `Vec` because these may be windows onto a
+/// memory-mapped cache file instead of memory this process filled in — see
+/// [`crate::qcache`]. It derefs to a slice, so every kernel below is written
+/// as if these were still plain `Vec`s.
 enum Data {
     F32(Tensor),
     /// One `i8` per weight, one `f32` scale per block.
-    Q8 { scales: Vec<f32>, qs: Vec<i8> },
+    Q8 { scales: Store<f32>, qs: Store<i8> },
     /// Two 4-bit values per byte, one `f32` scale per block.
-    Q4 { scales: Vec<f32>, qs: Vec<u8> },
+    Q4 { scales: Store<f32>, qs: Store<u8> },
+}
+
+/// The shape checks a quantised weight has to satisfy: one scale per block,
+/// and `per_byte` weights packed into each stored byte.
+fn check(rows: usize, cols: usize, scales: usize, qs: usize, per_byte: usize) -> Res<()> {
+    let n = rows * cols;
+    if cols % BLOCK != 0 || scales != n / BLOCK || qs != n / per_byte {
+        return Err(format!(
+            "{rows}x{cols} needs {} scales and {} bytes, got {scales} and {qs}",
+            n / BLOCK,
+            n / per_byte
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// A borrowed view of those arrays, for writing a weight out.
+pub enum Parts<'a> {
+    F32(&'a [f32]),
+    Q8 { scales: &'a [f32], qs: &'a [i8] },
+    Q4 { scales: &'a [f32], qs: &'a [u8] },
 }
 
 /// A weight matrix, in whichever precision it was loaded at.
@@ -112,6 +143,7 @@ impl Weight {
                     scales.push(scale);
                     qs.extend(block.iter().map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8));
                 }
+                let (scales, qs) = (Store::Owned(scales), Store::Owned(qs));
                 Weight { rows, cols, data: Data::Q8 { scales, qs } }
             }
             Precision::Q4 => {
@@ -159,9 +191,37 @@ impl Weight {
                         qs.push((a & 0x0f) | ((b & 0x0f) << 4));
                     }
                 }
+                let (scales, qs) = (Store::Owned(scales), Store::Owned(qs));
                 Weight { rows, cols, data: Data::Q4 { scales, qs } }
             }
             Precision::F32 => unreachable!(),
+        }
+    }
+
+    /// Rebuild a weight from arrays that are already quantised.
+    ///
+    /// The counterpart to [`Weight::quantize`]: no rounding happens here, and
+    /// the checks are the ones the file format cannot make for itself.
+    pub fn from_q8(rows: usize, cols: usize, scales: Store<f32>, qs: Store<i8>) -> Res<Weight> {
+        check(rows, cols, scales.len(), qs.len(), 1)?;
+        Ok(Weight { rows, cols, data: Data::Q8 { scales, qs } })
+    }
+
+    pub fn from_q4(rows: usize, cols: usize, scales: Store<f32>, qs: Store<u8>) -> Res<Weight> {
+        check(rows, cols, scales.len(), qs.len(), 2)?;
+        Ok(Weight { rows, cols, data: Data::Q4 { scales, qs } })
+    }
+
+    pub fn from_f32(t: Tensor) -> Weight {
+        Weight { rows: t.rows, cols: t.cols, data: Data::F32(t) }
+    }
+
+    /// The arrays behind this weight, ready to be written to disk.
+    pub fn parts(&self) -> Parts<'_> {
+        match &self.data {
+            Data::F32(t) => Parts::F32(&t.data),
+            Data::Q8 { scales, qs } => Parts::Q8 { scales, qs },
+            Data::Q4 { scales, qs } => Parts::Q4 { scales, qs },
         }
     }
 

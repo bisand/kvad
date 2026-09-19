@@ -12,9 +12,9 @@
 //! learned vector per slot in the context window.
 
 use super::{attend, KvCache, Spec, Transformer};
-use crate::quant::{Precision, Weight};
+use crate::qcache::Source;
+use crate::quant::Weight;
 use crate::tensor::{gelu_inplace, layer_norm};
-use crate::weights::Checkpoint;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -55,49 +55,44 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn load(ckpt: &Checkpoint, spec: Spec, precision: Precision) -> Res<Self> {
-        // Quantise each matrix as it is read, so the f32 copy is transient and
-        // peak memory is the quantised model plus one tensor, not two full
-        // copies of the weights.
-        let w = |name: &str| -> Res<Weight> { Ok(Weight::quantize(ckpt.get(name)?, precision)) };
-
-        // The projection matrices additionally get transposed on the way in.
-        // GPT-2's checkpoint stores them `[in, out]` for a `Conv1D`; flipping
-        // them to `[out, in]` lets them share the one matmul kernel with
-        // Llama, integer path included.
-        //
-        // The embedding tables are deliberately *not* transposed: `wte` is
-        // already `[vocab, n_embd]`, which is both the layout row lookup wants
-        // and the layout the tied output head wants.
-        let wt = |name: &str| -> Res<Weight> {
-            Ok(Weight::quantize(ckpt.get(name)?.transposed(), precision))
-        };
-
+    /// Each matrix is quantised as it is read, so the f32 copy is transient
+    /// and peak memory is the quantised model plus one tensor, not two full
+    /// copies of the weights.
+    ///
+    /// `matrix_t` additionally transposes on the way in. GPT-2's checkpoint
+    /// stores the projections `[in, out]` for a `Conv1D`; flipping them to
+    /// `[out, in]` lets them share the one matmul kernel with Llama, integer
+    /// path included.
+    ///
+    /// The embedding tables are deliberately *not* transposed: `wte` is
+    /// already `[vocab, n_embd]`, which is both the layout row lookup wants
+    /// and the layout the tied output head wants.
+    pub fn load(src: &dyn Source, spec: Spec) -> Res<Self> {
         let mut blocks = Vec::with_capacity(spec.n_layer);
         for i in 0..spec.n_layer {
             let p = |s: &str| format!("h.{i}.{s}");
             blocks.push(Block {
-                ln1_g: ckpt.get_flat(&p("ln_1.weight"))?,
-                ln1_b: ckpt.get_flat(&p("ln_1.bias"))?,
-                attn_w: wt(&p("attn.c_attn.weight"))?,
-                attn_b: ckpt.get_flat(&p("attn.c_attn.bias"))?,
-                attn_proj_w: wt(&p("attn.c_proj.weight"))?,
-                attn_proj_b: ckpt.get_flat(&p("attn.c_proj.bias"))?,
-                ln2_g: ckpt.get_flat(&p("ln_2.weight"))?,
-                ln2_b: ckpt.get_flat(&p("ln_2.bias"))?,
-                fc_w: wt(&p("mlp.c_fc.weight"))?,
-                fc_b: ckpt.get_flat(&p("mlp.c_fc.bias"))?,
-                proj_w: wt(&p("mlp.c_proj.weight"))?,
-                proj_b: ckpt.get_flat(&p("mlp.c_proj.bias"))?,
+                ln1_g: src.vector(&p("ln_1.weight"))?,
+                ln1_b: src.vector(&p("ln_1.bias"))?,
+                attn_w: src.matrix_t(&p("attn.c_attn.weight"))?,
+                attn_b: src.vector(&p("attn.c_attn.bias"))?,
+                attn_proj_w: src.matrix_t(&p("attn.c_proj.weight"))?,
+                attn_proj_b: src.vector(&p("attn.c_proj.bias"))?,
+                ln2_g: src.vector(&p("ln_2.weight"))?,
+                ln2_b: src.vector(&p("ln_2.bias"))?,
+                fc_w: src.matrix_t(&p("mlp.c_fc.weight"))?,
+                fc_b: src.vector(&p("mlp.c_fc.bias"))?,
+                proj_w: src.matrix_t(&p("mlp.c_proj.weight"))?,
+                proj_b: src.vector(&p("mlp.c_proj.bias"))?,
             });
         }
 
         Ok(Model {
-            wte: w("wte.weight")?,
-            wpe: w("wpe.weight")?,
+            wte: src.matrix("wte.weight")?,
+            wpe: src.matrix("wpe.weight")?,
             blocks,
-            lnf_g: ckpt.get_flat("ln_f.weight")?,
-            lnf_b: ckpt.get_flat("ln_f.bias")?,
+            lnf_g: src.vector("ln_f.weight")?,
+            lnf_b: src.vector("ln_f.bias")?,
             spec,
         })
     }

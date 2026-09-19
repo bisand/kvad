@@ -3,7 +3,7 @@
 Learning how neural networks and language models work by building them in Rust,
 from the arithmetic up.
 
-Three crates, meant to be read in order:
+Four crates, meant to be read in order:
 
 | Crate | What it is | Dependencies |
 |---|---|---|
@@ -99,6 +99,7 @@ llm use  Qwen/Qwen2.5-0.5B-Instruct
 llm run  --prompt "Explain backpropagation in one sentence."
 llm chat --system "You are terse."
 llm info --model openai-community/gpt2-medium   # config only, no weights
+llm cache                         # pre-quantised weight files
 ```
 
 Read in this order:
@@ -115,7 +116,9 @@ Read in this order:
 5. **[`quant.rs`](crates/llm/src/quant.rs)** — block-wise int8/int4 weights
    and the kernels that consume them, then
    **[`simd.rs`](crates/llm/src/simd.rs)** for the one instruction the compiler
-   will not reach on its own.
+   will not reach on its own, and
+   **[`qcache.rs`](crates/llm/src/qcache.rs)** for doing that work once
+   instead of once per load.
 6. **[`sampler.rs`](crates/llm/src/sampler.rs)**, then
    **[`chat.rs`](crates/llm/src/chat.rs)**.
 
@@ -422,6 +425,74 @@ mishandled bias degrades output to *plausible-looking noise* rather than failing
 loudly, so arithmetic is the sharp test. The GPT-2 one is also the regression
 test for the Llama refactor, and both are the acceptance test for `--quant q8`.
 
+### Doing the quantising once
+
+Every `--quant q8` load re-derived the same 494 million codes from the same
+bf16 checkpoint and threw them away on exit. [`qcache.rs`](crates/llm/src/qcache.rs)
+writes them out instead, and maps the file back on later loads:
+
+```bash
+llm run --quant q8 --prompt hi      # first: "quantising to q8 (first load)"
+llm run --quant q8 --prompt hi      # after: "mapping q8 weights (556 MB)"
+llm cache                           # what has been written, and where
+llm cache clear                     # it is all derived data; delete freely
+```
+
+| model | quantise | map | |
+|---|---|---|---|
+| SmolLM2-135M q8 | 0.30 s | 8 ms | 37x |
+| Qwen2.5-0.5B q8 | 1.17 s | 20 ms | 58x |
+| Qwen2.5-0.5B q4 | 1.11 s | 24 ms | 46x |
+| GPT-2-medium q8 | 1.85 s | 2 ms | 925x |
+
+The ratios are silly because the denominator is *nothing happening*. `mmap`
+does not read the file; it wires the pages into the address space and returns.
+The bytes arrive later, on demand, faulted in from the page cache they are
+already sitting in. Startup stops scaling with model size, because startup
+stops doing work — a 7B model maps in the same 2 ms as a 355M one.
+
+That property is why the weights are stored in the layout the kernels already
+want. A format that needed a fix-up pass — endian swapping, unpacking, even
+just a `Vec` copy — would give most of it back.
+
+**What it cost in the code.** `Weight` could no longer assume it owns its
+arrays, so `Vec<i8>` became `Store<i8>`: either a `Vec` or a window onto a
+mapping, `Deref`ing to a slice either way. Every kernel in `quant.rs` is
+untouched — they all took `&[i8]` and still do. The loaders lost their
+`Checkpoint` and gained a `Source` trait with two implementations, which is
+also where GPT-2's transpose went: the cache stores post-transpose matrices,
+so `matrix_t` is a property of the *checkpoint*, and the mapped source ignores
+the distinction.
+
+**The interesting hazard is staleness, not speed.** A cache that can serve
+bytes written under different rules is worse than no cache at all — and this
+is not hypothetical here. The q4 scale fix two sections up changed every
+4-bit code in every file; had this existed then, the old weights would have
+gone on quietly answering `17 + 25 = 40` long after the bug was fixed. So the
+header records a format version, the precision, the model's shape, and the
+source checkpoint's file sizes, and anything that does not match is rebuilt
+with a line saying why.
+
+**Where the time goes now.** With the quantising gone, the load breakdown is
+worth reading:
+
+```
+  [ 0.752s] reading weights          <- 0.75 s of hf-hub resolving five files
+  [ 0.752s] mapping q8 weights (556 MB)
+  [ 0.772s] reading tokenizer        <- 20 ms, nearly all of it RoPE tables
+```
+
+Those 20 ms are not the weights. Qwen precomputes a sin/cos table for 32768
+positions at load (`Rope::new`, 12.6 ms measured on its own); the rest is the
+tokenizer. The dominant cost is now the Hub client resolving file paths —
+0.75 s, the same whether the model is 135M or 7B, and the same offline.
+Which is the usual shape of these things: remove the obvious cost and the
+bottleneck moves somewhere you were not looking.
+
+The GPU backend does not use this. candle's `quantize_onto` takes about 0.2 s
+for the same model — fast enough not to be worth a second format, and its
+natural on-disk form would be GGUF rather than ours.
+
 ---
 
 ## Crate 3: `llm-gpu` — the same model, handed to a framework
@@ -584,21 +655,17 @@ state management — good Rust, no ML. Build it last.
 
 ## Where to go next
 
-**4. Serialise quantised weights.** Quantisation currently happens on every
-load, which means still reading the full f32 checkpoint off disk. Writing the
-blocks out once would make startup and disk footprint match the memory win.
-
-**5. A quantised embedding table.** The GPU's memory win stops at 1.6x because
+**4. A quantised embedding table.** The GPU's memory win stops at 1.6x because
 the embedding stays dense. Storing it quantised and dequantising one row per
 token would close most of the rest.
 
-**6. Train your own.** A character-level transformer, 10–30M parameters, on a
+**5. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Needs backprop through attention, layernorm and softmax, plus
 Adam. The gradient check from crate 1 is how you will debug it — extend
 `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
-**7. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
+**6. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike
 full fine-tuning it fits on a laptop.
 

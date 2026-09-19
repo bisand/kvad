@@ -13,10 +13,13 @@
 //!    diff against it).
 //! 4. [`sampler`] — logits in, one token out.
 //! 5. [`chat`]    — why an instruction-tuned model needs exact marker tokens.
+//! 6. [`quant`]   — making the weights smaller, and the kernels that read
+//!    them, then [`qcache`] — doing that work once instead of every load.
 
 pub mod chat;
 pub mod hub;
 pub mod model;
+pub mod qcache;
 pub mod quant;
 pub mod runtime;
 pub mod simd;

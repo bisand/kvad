@@ -5,6 +5,7 @@
 //!     llm ls                list downloaded models
 //!     llm use REPO          set the default model
 //!     llm rm REPO           delete a model from the cache
+//!     llm cache [REPO]      list (or delete) pre-quantised weight files
 //!     llm info [--model R]  read the config without downloading weights
 //!     llm run  [--model R] [--prompt TEXT]
 //!     llm chat [--model R] [--system TEXT]
@@ -15,6 +16,7 @@
 use llm::chat::Message;
 use llm::hub::{self, State};
 use llm::model::{KvCache, Spec};
+use llm::qcache;
 use llm::quant::Precision;
 use llm::runtime::Llm;
 use llm::sampler::Sampler;
@@ -70,6 +72,7 @@ fn usage() -> ! {
            ls                  list downloaded models\n  \
            use REPO            set the default model\n  \
            rm REPO             delete a model from the cache\n  \
+           cache [REPO|clear]  list or delete pre-quantised weight files\n  \
            info                show a model's config without downloading weights\n  \
            run                 one-shot completion\n  \
            chat                interactive conversation\n\n\
@@ -104,7 +107,7 @@ fn parse_args() -> Args {
     }
 
     // Subcommands that take a bare positional argument.
-    if matches!(a.command.as_str(), "search" | "pull" | "use" | "rm") {
+    if matches!(a.command.as_str(), "search" | "pull" | "use" | "rm" | "cache") {
         let mut words = Vec::new();
         while let Some(w) = argv.get(i) {
             if w.starts_with("--") {
@@ -172,8 +175,12 @@ fn resolve_model(args: &Args) -> String {
 fn load(args: &Args) -> Res<Llm> {
     let repo = resolve_model(args);
     eprintln!("model: {repo}");
+    // Timestamped progress, because the interesting question about a load is
+    // not how long it took but which part of it took that long.
     let t0 = std::time::Instant::now();
-    let llm = Llm::load(&repo, args.quant)?;
+    let llm = Llm::load_with(&repo, args.quant, &mut |msg| {
+        eprintln!("  [{:>6.3}s] {msg}", t0.elapsed().as_secs_f32())
+    })?;
     eprintln!("  {}", llm.spec.summary());
     eprintln!(
         "  {:.1}M parameters · weights {:.0} MB ({}) · loaded in {:.1}s",
@@ -220,6 +227,7 @@ fn main() -> Res<()> {
         "ls" => list_local(),
         "use" => use_model(args),
         "rm" => remove(args),
+        "cache" => cache(args),
         "run" => run(args),
         "chat" => chat(args),
         other => {
@@ -378,11 +386,57 @@ fn remove(args: Args) -> Res<()> {
     }
 
     std::fs::remove_dir_all(&local.path)?;
+    // The quantised copies are derived from what just went; leaving them
+    // would be a cache with nothing behind it.
+    match qcache::forget(&local.id) {
+        0 => {}
+        n => println!("also deleted {n} pre-quantised file(s)"),
+    }
     if State::active().as_deref() == Some(local.id.as_str()) {
         State::clear()?;
         println!("(was the active model; cleared)");
     }
     println!("deleted {}", local.id);
+    Ok(())
+}
+
+/// `llm cache` — what has been pre-quantised, and how to get rid of it.
+///
+/// These files are pure derived data: deleting one costs a few seconds on the
+/// next load of that model and nothing else, which is why there is no
+/// confirmation prompt here and there is one on `llm rm`.
+fn cache(args: Args) -> Res<()> {
+    match args.target.as_deref() {
+        Some("clear") => {
+            let n = qcache::entries()
+                .into_iter()
+                .filter(|(path, ..)| std::fs::remove_file(path).is_ok())
+                .count();
+            println!("deleted {n} file(s)");
+            return Ok(());
+        }
+        Some(repo) => {
+            println!("deleted {} file(s) for {repo}", qcache::forget(repo));
+            return Ok(());
+        }
+        None => {}
+    }
+
+    let entries = qcache::entries();
+    if entries.is_empty() {
+        println!("nothing pre-quantised yet.");
+        println!("the first `llm run --quant q8` writes a file here; later runs map it.");
+    } else {
+        println!("{:<46} {:<6} {:>10}", "MODEL", "QUANT", "SIZE");
+        let mut total = 0;
+        for (_, repo, precision, bytes) in &entries {
+            let size = hub::human_bytes(*bytes);
+            println!("{:<46} {:<6} {:>10}", truncate(repo, 45), precision, size);
+            total += bytes;
+        }
+        println!("\n{} file(s), {}", entries.len(), hub::human_bytes(total));
+    }
+    println!("cache: {}", qcache::cache_root().display());
     Ok(())
 }
 

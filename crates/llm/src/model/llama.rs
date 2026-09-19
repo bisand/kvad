@@ -23,9 +23,9 @@
 //! than an error, which is why the counting test in the README exists.
 
 use super::{attend, KvCache, Spec, Transformer};
-use crate::quant::{Precision, Weight};
+use crate::qcache::Source;
+use crate::quant::Weight;
 use crate::tensor::{rms_norm, swiglu_inplace, Rope};
-use crate::weights::Checkpoint;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -68,38 +68,36 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn load(ckpt: &Checkpoint, spec: Spec, precision: Precision) -> Res<Self> {
-        let w = |name: &str| -> Res<Weight> { Ok(Weight::quantize(ckpt.get(name)?, precision)) };
-
+    pub fn load(src: &dyn Source, spec: Spec) -> Res<Self> {
         let mut blocks = Vec::with_capacity(spec.n_layer);
         for i in 0..spec.n_layer {
             let p = |s: &str| format!("layers.{i}.{s}");
             blocks.push(Block {
-                attn_norm: ckpt.get_flat(&p("input_layernorm.weight"))?,
-                q_w: w(&p("self_attn.q_proj.weight"))?,
-                q_b: ckpt.try_get_flat(&p("self_attn.q_proj.bias")),
-                k_w: w(&p("self_attn.k_proj.weight"))?,
-                k_b: ckpt.try_get_flat(&p("self_attn.k_proj.bias")),
-                v_w: w(&p("self_attn.v_proj.weight"))?,
-                v_b: ckpt.try_get_flat(&p("self_attn.v_proj.bias")),
-                o_w: w(&p("self_attn.o_proj.weight"))?,
-                mlp_norm: ckpt.get_flat(&p("post_attention_layernorm.weight"))?,
-                gate_w: w(&p("mlp.gate_proj.weight"))?,
-                up_w: w(&p("mlp.up_proj.weight"))?,
-                down_w: w(&p("mlp.down_proj.weight"))?,
+                attn_norm: src.vector(&p("input_layernorm.weight"))?,
+                q_w: src.matrix(&p("self_attn.q_proj.weight"))?,
+                q_b: src.try_vector(&p("self_attn.q_proj.bias")),
+                k_w: src.matrix(&p("self_attn.k_proj.weight"))?,
+                k_b: src.try_vector(&p("self_attn.k_proj.bias")),
+                v_w: src.matrix(&p("self_attn.v_proj.weight"))?,
+                v_b: src.try_vector(&p("self_attn.v_proj.bias")),
+                o_w: src.matrix(&p("self_attn.o_proj.weight"))?,
+                mlp_norm: src.vector(&p("post_attention_layernorm.weight"))?,
+                gate_w: src.matrix(&p("mlp.gate_proj.weight"))?,
+                up_w: src.matrix(&p("mlp.up_proj.weight"))?,
+                down_w: src.matrix(&p("mlp.down_proj.weight"))?,
             });
         }
 
         let lm_head = match spec.tie_embeddings {
             true => None,
-            false => ckpt.try_get("lm_head.weight").map(|t| Weight::quantize(t, precision)),
+            false => src.try_matrix("lm_head.weight"),
         };
 
         Ok(Model {
-            embed: w("embed_tokens.weight")?,
+            embed: src.matrix("embed_tokens.weight")?,
             lm_head,
             blocks,
-            final_norm: ckpt.get_flat("norm.weight")?,
+            final_norm: src.vector("norm.weight")?,
             // Precompute every rotation angle once. Cheap: two floats per
             // position per coordinate pair.
             rope: Rope::new(spec.head_dim, spec.n_ctx, spec.rope_theta),

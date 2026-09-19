@@ -201,7 +201,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                         };
                         // The GPU backend covers the Llama family only; the
                         // error names the alternative rather than just failing.
-                        Llm::load_custom(&repo, &mut progress, &mut |files, spec| {
+                        Llm::load_custom(&repo, &mut progress, &mut |files, spec, _| {
                             if spec.arch != llm::model::Arch::Llama {
                                 return Err(format!(
                                     "the GPU backend implements the Llama family only; this model is {}. Press p to pick a CPU backend.",

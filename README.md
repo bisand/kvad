@@ -38,10 +38,11 @@ honest to be measured against.
 ### Where this actually stands
 
 Kvad runs one sequence at a time. On an M5 Pro, Qwen2.5-0.5B decodes at
-**193 tok/s** on Metal at q8 and 35 tok/s on the CPU engine, and prefills 640
-tokens in 0.18 s. It has weight and activation quantisation, an i8mm integer
-kernel, a tiled f32 GEMM, batched prefill, prefix caching across chat turns, and
-a memory-mapped cache of pre-quantised weights.
+**191 tok/s** on Metal at q8 and **112 tok/s** on the hand-written CPU engine —
+which is also, for now, what this machine's GPU does in bf16. It has weight and
+activation quantisation, an i8mm integer kernel, a tiled f32 GEMM, batched
+prefill, prefix caching across chat turns, and a memory-mapped cache of
+pre-quantised weights.
 
 It has none of what makes a *server* fast: no continuous batching, no paged KV
 cache, no HTTP API, no kernels of its own on CUDA, no speculative decoding. The
@@ -115,6 +116,11 @@ Zero dependencies. Read in this order:
    the branch does to the gradient, `dy` also reaches the layer below untouched.
    One test makes it concrete — 24 layers that each pass back about a tenth of
    their gradient deliver 3e-22 of it in a chain, and 1.5 of it with the `x +`.
+8. **[`model.rs`](crates/nanograd/src/model.rs)** — a GPT. Token and position
+   embeddings, a stack of blocks, a final norm, a head. Almost no new code,
+   because almost nothing is new; what is new is why positions are needed at
+   all, and how a model should be initialised so that it starts out ignorant
+   rather than confidently wrong.
 
 ### The test worth running first
 
@@ -163,6 +169,25 @@ gradient is exactly zero, and the check was comparing rounding noise with
 rounding noise. Move that bias by 5.0 and the output moves by 1e-6. GPT-2 ships
 one in every layer. (RoPE rotates the keys after the bias is added, which makes
 it matter again; Qwen has one for that reason.)
+
+The assembled model has tests of a different kind, because its bugs are of a
+different kind — not wrong calculus but forgotten wiring.
+
+*A fresh model should know nothing.* Predicting every token equally costs
+`ln(vocab)`, and that is what the first loss should be. With the He
+initialisation that suits the MNIST network it is 0.92 higher, averaged over 40
+seeds: almost a nat of confidence with nothing behind it, which training must
+first undo. With GPT-2's N(0, 0.02) it is 0.003 higher.
+
+*Every tensor must actually train.* `step` and `zero_grad` are forwarded by
+hand through each composite layer, and a forgotten line is silent — that tensor
+just never moves, and the model trains around it. A model whose position
+embedding never updated still memorised its test sequence. So one test takes a
+step and requires every tensor to have moved.
+
+*It can memorise one sequence.* Loss 2.41 to 0.0001 in 100 steps. The oldest
+sanity check there is, and the first time forward, backward and the optimiser
+all have to agree, through every layer at once.
 
 ### Things to try
 
@@ -313,13 +338,15 @@ cargo run --release -p kvad --example bench_matvec
 The kernel benchmark is where the interesting part is. On the output head
 (151936 x 896, the largest single matmul per token):
 
-| | ms/call | vs f32 |
-|---|---|---|
-| f32 | 4.0 | 1.00x |
-| q8 + quantised activations | 0.83 | **4.9x** |
-| q4 + quantised activations | 0.90–1.6 | 2.4–4.5x |
+| | ms/call | GB/s | vs f32 |
+|---|---|---|---|
+| f32 | 2.69 | 202 | 1.00x |
+| q8 + quantised activations | 0.91 | 169 | **2.96x** |
+| q4 + quantised activations | 1.28 | 67 | 2.11x |
 
-The 4.9x comes from quantising the *activations* too, which turns the inner
+That is close to the ceiling: 545 MB in 2.69 ms is 202 GB/s, and the q8 version
+moves a third of the bytes at nearly the same rate. The speedup comes from
+quantising the *activations* too, which turns the inner
 loop into an integer dot product. On this machine that compiles to exactly what
 you would hope for — six instructions per 32 weights:
 
@@ -350,34 +377,54 @@ Getting there took four fixes, each a general lesson:
   roughly 2x on its own. Worth knowing that a correct, innocuous-looking line
   can silently cost you the vector units.
 
-### Two kernels, chosen by size
+### One kernel, after a threshold that measured the wrong thing
 
-There is a crossover. The integer path wins big on a matrix streamed from main
-memory and *loses* on one that fits in cache — a cache-resident matmul is not
-bandwidth-bound, so shrinking the weights buys nothing and the extra work is
-pure overhead. Measured here: 4.9x on the 153 MB output head, but below 1x on a
-5 MB MLP matrix. So `matvec_bt` dispatches on weight size, and
-`INTEGER_PATH_MIN_BYTES` is the (empirical, cache-dependent) threshold.
+There used to be two kernels here, chosen by weight size. The integer path
+ran 4.9x faster on the 153 MB output head and *slower* on a 5 MB MLP matrix,
+so `matvec_bt` dispatched on `INTEGER_PATH_MIN_BYTES` and the explanation
+wrote itself: a cache-resident matmul is not bandwidth-bound, so shrinking the
+weights buys nothing and the unpacking is pure overhead.
+
+Plausible, and wrong. The benchmark called the kernels from the main thread,
+which is not a rayon worker, so every call paid a flat ~0.17 ms of cold-path
+dispatch — invisible beside a 153 MB matmul, and the entire runtime of a 5 MB
+one. The tell was sitting in the output the whole time:
+
+```
+qwen mlp.down  [896 x 4864]
+  f32       17 MB     0.17 ms/call
+  q8         5 MB     0.17 ms/call
+  q4         3 MB     0.17 ms/call
+```
+
+Six times the bytes, the same time, three times over. That is not a kernel
+being bandwidth-bound; that is a kernel that is not being measured at all.
+With the harness fixed to run inside a pool ([`bench_matvec`](crates/llm/examples/bench_matvec.rs)),
+the same matrix drops to 0.09 ms and the integer path wins at every size —
+1.13x to 1.70x end to end across three models and both precisions, nothing
+slower. So the threshold is gone and there is one kernel. The dequantising one
+survives as the baseline the integer path is measured against, behind
+`KVAD_DEQUANT=1`.
 
 ### What it is worth end to end
 
-| | f32 | q8 |
-|---|---|---|
-| Qwen2.5-0.5B | ~34 tok/s | ~38 tok/s |
-| GPT-2-medium | ~35 tok/s | ~49 tok/s |
+| | f32 | q8 | |
+|---|---|---|---|
+| Qwen2.5-0.5B | 64 tok/s | 112 tok/s | 1.75x |
+| SmolLM2-135M | 165 tok/s | 194 tok/s | 1.18x |
+| GPT-2-medium | 67 tok/s | 125 tok/s | 1.86x |
 
-**A 4.9x kernel bought well under 1.4x overall.** That gap is the whole lesson in
-optimisation: the output head is one matmul out of 169 per token, and
-everything else — the cache-resident per-layer matrices, attention, the norms,
-the softmax — did not get faster. Amdahl's law, measured rather than quoted.
+Quantisation buys most of what the byte counts say it should, which is worth
+stating because for most of this project's life it bought nothing at all —
+every one of those f32 and q8 numbers used to be about 35 tok/s, whatever the
+model and whatever the precision. [Removing the floor](#the-floor-under-everything)
+is what let the kernels through; before that, the honest summary of this
+section was "a 4.9x kernel bought under 1.4x overall", and the Amdahl's-law
+moral drawn from it was measuring a scheduler.
 
-These were taken with a loaded machine (the f32 baseline itself varied between
-19.7 and 25.2 tok/s), so treat them as approximate. The kernel numbers are far
-more repeatable than the end-to-end ones.
-
-And note what q4 does *not* buy: it is no faster than q8 — unpacking nibbles
-costs more than the halved bytes save — while being much less accurate. Its
-only advantage is memory.
+And note what q4 still does *not* buy: at 91 tok/s it is *slower* than q8's
+112 — unpacking nibbles costs more than the halved bytes save — while being
+much less accurate. Its only advantage is memory.
 
 ### Batched prefill, and i8mm
 
@@ -400,28 +447,31 @@ one token at a time gives you exactly one, so half the result lanes would be
 duplicates and the useful throughput collapses back to `SDOT`'s. `i8mm` cannot
 help decoding. Only prefill.
 
-Prefill, 654 tokens, Qwen2.5-0.5B, q8:
+Prefill, 640 tokens, Qwen2.5-0.5B, q8:
 
 | | time | |
 |---|---|---|
-| one token at a time (`KVAD_PREFILL_CHUNK=1`) | 18.7 s | |
-| batched f32 GEMM | 2.81 s | **6.6x** from batching |
-| batched q8, `SDOT` (`KVAD_NO_I8MM=1`) | 2.72 s | |
-| batched q8, `SMMLA` | 2.18 s | **1.25x** more from i8mm |
+| one token at a time (`KVAD_PREFILL_CHUNK=1`) | 6.20 s | |
+| batched f32 GEMM | 1.93 s | **3.2x** from batching |
+| batched q8, `SDOT` (`KVAD_NO_I8MM=1`) | 1.81 s | |
+| batched q8, `SMMLA` | 1.20 s | **1.51x** more from i8mm |
 
-Prefill drops from ~28 ms/token to ~3.3 ms/token. Decoding is untouched — it is
-still a matrix-vector product, and still the same speed.
+Prefill drops from ~9.7 ms/token to ~1.9 ms/token.
 
-Note where f32 lands: **2.81 s against q8's 2.72 s.** Once the weights are
+Note where f32 lands: **1.93 s against q8's 1.81 s.** Once the weights are
 reused across a batch, prefill is compute-bound, and quantisation is an
 answer to a memory problem. On the smaller `q_proj` matrix the f32 GEMM is
 actually *faster* than the q8 `SDOT` path, because unpacking and rescaling cost
-more than the bytes they save. Quantisation is a decode optimisation.
+more than the bytes they save. Quantisation is mostly a decode optimisation.
 
-`i8mm` is worth more than 1.27x on a single core: 2.04x at
-`RAYON_NUM_THREADS=1`. With all 18 threads running, memory bandwidth becomes
-the limit again and a faster instruction has less to offer. Both knobs above
-are environment variables precisely so this is measurable rather than asserted.
+`i8mm` is worth more on a single core than across the pool, because with every
+thread running memory bandwidth becomes the limit again and a faster
+instruction has less to offer. Both knobs above are environment variables
+precisely so this is measurable rather than asserted.
+
+(Every figure in this table used to be two to three times larger — the
+token-at-a-time row was 18.7 s. Batching was never the only thing making
+prefill slow; see [the floor](#the-floor-under-everything).)
 
 Rust exposes `SMMLA` only through an unstable intrinsic, so
 [`simd.rs`](crates/llm/src/simd.rs) emits it with inline assembly — stable, and
@@ -591,6 +641,85 @@ The GPU backend does not use this. candle's `quantize_onto` takes about 0.2 s
 for the same model — fast enough not to be worth a second format, and its
 natural on-disk form would be GGUF rather than ours.
 
+### The floor under everything
+
+For most of this project, CPU decode ran at about 35 tok/s. Not approximately
+— *exactly* that, whatever you changed:
+
+| | f32 | q8 | q4 |
+|---|---|---|---|
+| Qwen2.5-0.5B (1976 / 556 / 309 MB) | 34 | 35 | 36 |
+| SmolLM2-135M, a quarter the size | ~35 | ~35 | ~35 |
+
+Six times the bytes, the same speed. A model a quarter the size, the same
+speed. Every kernel in this chapter — the `sdot` integer path, the SMMLA
+tile, the tiled GEMM — measured faster in isolation and changed nothing here.
+The explanations on offer were all plausible (a fixed cost per matmul; more
+layers in the smaller model) and none of them were checked.
+
+Six seconds with a sampling profiler ended it. Top of stack:
+
+```
+swtch_pri (kernel yield)                12776
+the actual matvec kernel                 5186
+__psynch_cvwait                          3652
+__workq_kernreturn                       1585
+```
+
+One fifth of the CPU was doing arithmetic. And the main thread's stack was the
+same every time:
+
+```
+matvec_bt -> Registry::in_worker_cold -> LockLatch::wait_and_reset
+          -> pthread_cond_wait
+```
+
+**`in_worker_cold`.** A `par_iter()` called from a thread that is not a pool
+worker cannot push onto a worker's deque; it has to inject the job into a
+shared queue, wake the workers, and block the caller on a condition variable
+until they are done. Two kernel transitions and a scheduler round trip. Fine
+once. Decoding one token runs 169 matmuls, so it happened 169 times per token,
+each one costing more than the arithmetic it was waiting for.
+
+Three changes, measured one at a time:
+
+| | | |
+|---|---|---|
+| `pool.install()` around the forward pass | 35 → 70 | caller blocks once per *token*, not per matmul |
+| one job per thread instead of a split tree | 70 → 90 | no adaptive `join` tree, no steals between leaves, no `collect` |
+| size the pool for big.LITTLE | — | 18 threads was slower than 11; see below |
+| delete the integer/dequant threshold | 90 → 112 | [it measured this same bug](#one-kernel-after-a-threshold-that-measured-the-wrong-thing) |
+
+**3.2x on q8, and the anomalies went with it.** SmolLM2-135M now decodes at
+194 tok/s against Qwen-494M's 112, which is what a quarter the parameters
+should look like. Quantisation now buys 1.75x where it used to buy nothing.
+Prefill of 640 tokens went from 2.15 s to 1.16 s without being touched.
+
+#### Not all cores are worth using
+
+The pool is deliberately smaller than the machine. This host reports 18
+logical CPUs, of which six are performance cores and twelve are efficiency
+cores. Rayon splits a matmul into equal pieces regardless, and a parallel
+section ends when its *slowest* piece does — so the E-cores set the pace of
+every one of those 169 barriers:
+
+| threads | 4 | 6 | 8 | 10 | 12 | 14 | 15 | 16 | 18 |
+|---|---|---|---|---|---|---|---|---|---|
+| tok/s | 36 | 46 | 54 | 61 | 65 | 69 | 70 | 68 | 52 |
+
+Using the whole machine is the worst setting above four threads. The default
+is now the performance cores plus two thirds of the efficiency cores, and
+`KVAD_THREADS` overrides it.
+
+#### What this cost in credibility
+
+Three things in this README had to be rewritten because of one bug: the
+integer/dequant threshold, the "Amdahl's law" moral drawn from a 4.9x kernel
+buying 1.4x, and the claim that SmolLM2's layer count explained its speed.
+All three were reasonable stories told about a number that was really a
+scheduler. The profiler took six seconds and would have found it at any point
+in the previous four chapters.
+
 ---
 
 ## Crate 3: `kvad-gpu` — the same model, handed to a framework
@@ -627,22 +756,23 @@ Two differences are worth noticing because they run *against* the framework:
 
 | | CPU (q8) | Metal (bf16) | |
 |---|---|---|---|
-| Qwen2.5-0.5B, decode | 35 tok/s | 115 tok/s | 3.3x |
-| SmolLM2-135M, decode | ~35 tok/s | ~168 tok/s | 4.7x |
-| Qwen2.5-0.5B, prefill (640 tokens) | 2.15 s | 0.18 s | **12x** |
+| Qwen2.5-0.5B, decode | 112 tok/s | 113 tok/s | 1.0x |
+| SmolLM2-135M, decode | 194 tok/s | ~168 tok/s | 0.9x |
+| Qwen2.5-0.5B, prefill (640 tokens) | 1.16 s | 0.19 s | **6.1x** |
 
-**The GPU wins far more on prefill than on decode**, and that is the same
-distinction as everywhere else in this repo. Prefill is compute-bound, which is
-what a GPU is for. Decode is memory-bound, and there the CPU is carrying int8
-weights (556 MB) against the GPU's bf16 (1260 MB) — quantisation claws back
-most of a hardware generation.
+**The GPU wins on prefill and, at this model size, not at all on decode.**
+That is the same distinction as everywhere else in this repo. Prefill is
+compute-bound, which is what a GPU is for. Decode is memory-bound, and there
+the CPU is carrying int8 weights (556 MB) against the GPU's bf16 (1260 MB) —
+quantisation claws back a whole hardware generation, and on the smaller model
+the CPU is ahead.
 
-The other oddity in that table: SmolLM2-135M decodes no faster than Qwen-494M on
-the CPU, despite being a quarter the size. It has *more* layers (30 vs 24), and
-our CPU decode has a fixed cost per matmul — a rayon dispatch and an
-allocation — that does not shrink with the matrix. At this size that overhead,
-not arithmetic, sets the speed. The GPU, which scales with actual work, shows
-the expected 4.7x instead.
+That row used to read 35 tok/s and 3.3x, and the smaller model used to be
+*slower* on the CPU than the larger one. Both were
+[a scheduling bug](#the-floor-under-everything), not a property of the
+hardware. It is the same lesson as the rest of the repo, learned the
+expensive way: the number you are explaining may not be a number about the
+thing you think it is about.
 
 Metal `f32` runs at about two thirds of bf16's rate, for exactly double the
 memory. `bf16` is the default because it is also what the checkpoints ship as.
@@ -667,18 +797,19 @@ All six backends, Qwen2.5-0.5B, decode:
 
 | backend | weights | tok/s |
 |---|---|---|
-| cpu f32 | 1976 MB | 34 |
-| cpu q8 | 556 MB | 35 |
-| cpu q4 | 309 MB | 36 |
-| metal bf16 | 1260 MB | 115 |
-| **metal q8** | **525 MB** | **193** |
-| metal q4 | 278 MB | 236 |
+| cpu f32 | 1976 MB | 64 |
+| cpu q8 | 556 MB | 112 |
+| cpu q4 | 309 MB | 91 |
+| metal bf16 | 1260 MB | 113 |
+| **metal q8** | **525 MB** | **191** |
+| metal q4 | 278 MB | 228 |
 
-Quantisation is worth **1.7x** on the GPU (115 → 193 tok/s) where it was worth
-nothing on the CPU. Our CPU decode never became bandwidth-bound in the first
-place: it has a fixed per-matmul cost — a rayon dispatch and an allocation —
-that sets the speed at this model size, so shrinking the weights changed
-nothing. The GPU has no such floor, so the bytes actually matter.
+Quantisation is worth **1.7x** on both now — 113 → 191 on the GPU, 64 → 112 on
+the CPU. It used to be worth nothing on the CPU, and the explanation given here
+(a per-matmul cost that the bytes could not touch) was correct about the
+mechanism and wrong about the conclusion: that cost was
+[removable](#the-floor-under-everything), not inherent. With it gone, both
+backends are bandwidth-bound in decode and behave the same way.
 
 And then prefill, where it stops being free — eventually:
 
@@ -692,10 +823,15 @@ And then prefill, where it stops being free — eventually:
 There is a crossover, at around 1300 tokens on this machine. A short prompt is
 still narrow enough that reading the weights dominates, so smaller weights win;
 a long one turns every matmul into real work over a wide batch, and then the
-dequantisation is pure overhead. Same principle as
-[the two CPU kernels](#two-kernels-chosen-by-size), one bottleneck moving under
-a different axis: there it was the size of the *matrix*, here it is the size of
-the *batch*.
+dequantisation is pure overhead. The bottleneck moves with the batch size, and
+the point where it crosses is a property of this GPU rather than of
+quantisation.
+
+(The CPU engine once claimed a similar crossover against *matrix* size, and
+that one turned out not to exist —
+[it was measuring a scheduler](#one-kernel-after-a-threshold-that-measured-the-wrong-thing).
+This one is measured across four prompt lengths with five runs each, which is
+the standard the other claim failed.)
 
 > **Correction.** An earlier version of this section claimed a flat "1.6x
 > slower on prefill" from a single pair of measurements at 654 tokens (0.24 s
@@ -822,11 +958,12 @@ corpus you pick. Backprop through attention
 RMSNorm ([`norm.rs`](crates/nanograd/src/norm.rs)), and the embedding
 ([`embedding.rs`](crates/nanograd/src/embedding.rs)), and the block that wires
 them together with GELU and residual connections
-([`block.rs`](crates/nanograd/src/block.rs)) are done — a GPT-2-shaped block,
-gradient-checked end to end. Llama's SwiGLU and RoPE are not written. Still
-needed are a model that stacks blocks between an embedding and an output head,
-Adam, and a training loop over a text file. The gradient check from crate 1 is
-how you will debug each one — extend `nanograd` (hard, most educational) or use
+([`block.rs`](crates/nanograd/src/block.rs)) are done, and so is the GPT that
+stacks them ([`model.rs`](crates/nanograd/src/model.rs)): gradient-checked end
+to end, and able to memorise a sequence. It has never seen a text file. Still
+needed are Adam, a training loop that reads one, and sampling from the result;
+Llama's SwiGLU and RoPE are not written. The gradient check from crate 1 is how
+you will debug each one — extend `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
 **2. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
@@ -835,35 +972,29 @@ full fine-tuning it fits on a laptop.
 
 ### Becoming a server
 
-In rough dependency order. The first one is not optional: without it the
-kernels already written stay invisible.
+In rough dependency order. Step 3, removing the per-matmul floor, is
+[done](#the-floor-under-everything) — it was the one blocking everything else,
+and CPU decode went from 35 to 112 tok/s.
 
-**3. Remove the per-matmul floor.** CPU decode runs at ~35 tok/s whether the
-weights are 1976 MB, 556 MB or 309 MB, and SmolLM2-135M is no faster than
-Qwen-494M despite being a quarter the size and having *more* layers. Both say
-the same thing: a fixed cost per matmul — a rayon dispatch and an allocation —
-sets the speed, not bandwidth and not arithmetic. It is why `sdot`, SMMLA and
-the tiled GEMM all measure well in isolation and vanish end to end, while the
-same quantisation is worth 1.7x on the GPU. Reusable output buffers, coarser
-work units, and one parallel region per layer rather than per matmul.
-
-**4. A paged KV cache.** Today it is a `Vec<f32>` per layer that grows by
+**3. A paged KV cache.** Today it is a `Vec<f32>` per layer that grows by
 appending, which is 805 MB at Qwen's full context and cannot be shared between
 sequences or reclaimed in pieces. Paging it into fixed blocks is what makes
 several conversations fit in the memory of one, and it is a prerequisite for
-everything below. Quantising it is a second, separate win.
+everything below. It is also the next thing the profiler will be pointed at:
+at 112 tok/s the cache is a larger share of each token than it was at 35.
+Quantising it is a second, separate win.
 
-**5. Continuous batching.** Half the machinery exists: `forward_batch` already
+**4. Continuous batching.** Half the machinery exists: `forward_batch` already
 runs many positions through one set of weights, which is the whole reason
 prefill is fast. Serving needs the same thing across *different sequences* at
 different positions, which means per-sequence positions in RoPE and attention,
 and admitting new requests between steps instead of between batches.
 
-**6. `kvad-serve`.** An OpenAI-compatible HTTP endpoint, so the thing can be
+**5. `kvad-serve`.** An OpenAI-compatible HTTP endpoint, so the thing can be
 pointed at by something that already exists. Deliberately last: a server around
 a single-sequence engine measures nothing interesting.
 
-**7. Then the hardware.** Real CUDA kernels, flash attention, speculative
+**6. Then the hardware.** Real CUDA kernels, flash attention, speculative
 decoding. This is the stretch where legibility and speed start to fight, and
 the point at which this README owes an honest account of the trade.
 

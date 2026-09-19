@@ -3,8 +3,24 @@
 *Kvad* — Old Norse for a composed, recited poem: what a skald performs from
 memory, one line at a time.
 
-Learning how neural networks and language models work by building them in Rust,
-from the arithmetic up.
+An LLM engine in Rust, written from the arithmetic up, with two jobs.
+
+**Explain how this works.** Every matrix multiply, every derivative, every
+attention head and every rotation is code in this repo, with the reasoning for
+each constant next to it. Read the crates in order and you will have built a
+transformer rather than configured one.
+
+**Be worth running.** The target is vLLM and SGLang. Not as a gesture — as the
+bar this has to clear before it is a real alternative rather than a nice
+explanation.
+
+Those sound opposed and mostly are not. Almost everything that makes inference
+fast is arithmetic you can read: block-wise quantisation, an integer dot
+product, a tiled GEMM, a cache you do not recompute. The unreadable part of a
+fast engine tends to be the last stretch — hand-tuned CUDA, a dozen code paths
+per operator — and the stretch before it is where the lessons are. Where
+legibility and speed genuinely conflict, this repo says which it chose and
+measures what it cost.
 
 Four crates, meant to be read in order:
 
@@ -15,9 +31,28 @@ Four crates, meant to be read in order:
 | [`kvad-gpu`](crates/gpu) | The same Llama forward pass on the GPU, in candle. | candle (Metal/CUDA) |
 | [`kvad-tui`](crates/tui) | Terminal app: browse, download, activate, chat. | ratatui |
 
-The first two use no ML framework at all: every matrix multiply, every
-derivative, every attention head and every rotation is code in this repo. The
-third is the same model handed to one, so the two can be compared.
+The first two use no ML framework at all. The third is the same model handed to
+one, so the two can be compared — and so the hand-written version has something
+honest to be measured against.
+
+### Where this actually stands
+
+Kvad runs one sequence at a time. On an M5 Pro, Qwen2.5-0.5B decodes at
+**193 tok/s** on Metal at q8 and 35 tok/s on the CPU engine, and prefills 640
+tokens in 0.18 s. It has weight and activation quantisation, an i8mm integer
+kernel, a tiled f32 GEMM, batched prefill, prefix caching across chat turns, and
+a memory-mapped cache of pre-quantised weights.
+
+It has none of what makes a *server* fast: no continuous batching, no paged KV
+cache, no HTTP API, no kernels of its own on CUDA, no speculative decoding. The
+KV cache is a `Vec<f32>` per layer that grows by appending, and 805 MB of it at
+Qwen's full context. Nothing here has been benchmarked against vLLM or SGLang,
+because a single-sequence engine and a serving engine do not yet have a number
+in common.
+
+So the second job is a direction, not a claim. [The roadmap](#where-to-go-next)
+says what would have to become true first, starting with the one thing every
+measurement in this repo keeps pointing at.
 
 ## Quick start
 
@@ -716,6 +751,11 @@ state management — good Rust, no ML. Build it last.
 
 ## Where to go next
 
+Two tracks, one per job. They are independent: the learning track finishes the
+story, the serving track is what the second half of the mission actually costs.
+
+### Finishing the story
+
 **1. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Needs backprop through attention, layernorm and softmax, plus
 Adam. The gradient check from crate 1 is how you will debug it — extend
@@ -726,6 +766,40 @@ Adam. The gradient check from crate 1 is how you will debug it — extend
 per weight matrix. This is what "custom model" means in practice, and unlike
 full fine-tuning it fits on a laptop.
 
+### Becoming a server
+
+In rough dependency order. The first one is not optional: without it the
+kernels already written stay invisible.
+
+**3. Remove the per-matmul floor.** CPU decode runs at ~35 tok/s whether the
+weights are 1976 MB, 556 MB or 309 MB, and SmolLM2-135M is no faster than
+Qwen-494M despite being a quarter the size and having *more* layers. Both say
+the same thing: a fixed cost per matmul — a rayon dispatch and an allocation —
+sets the speed, not bandwidth and not arithmetic. It is why `sdot`, SMMLA and
+the tiled GEMM all measure well in isolation and vanish end to end, while the
+same quantisation is worth 1.7x on the GPU. Reusable output buffers, coarser
+work units, and one parallel region per layer rather than per matmul.
+
+**4. A paged KV cache.** Today it is a `Vec<f32>` per layer that grows by
+appending, which is 805 MB at Qwen's full context and cannot be shared between
+sequences or reclaimed in pieces. Paging it into fixed blocks is what makes
+several conversations fit in the memory of one, and it is a prerequisite for
+everything below. Quantising it is a second, separate win.
+
+**5. Continuous batching.** Half the machinery exists: `forward_batch` already
+runs many positions through one set of weights, which is the whole reason
+prefill is fast. Serving needs the same thing across *different sequences* at
+different positions, which means per-sequence positions in RoPE and attention,
+and admitting new requests between steps instead of between batches.
+
+**6. `kvad-serve`.** An OpenAI-compatible HTTP endpoint, so the thing can be
+pointed at by something that already exists. Deliberately last: a server around
+a single-sequence engine measures nothing interesting.
+
+**7. Then the hardware.** Real CUDA kernels, flash attention, speculative
+decoding. This is the stretch where legibility and speed start to fight, and
+the point at which this README owes an honest account of the trade.
+
 ### Worth reading alongside
 
 - Karpathy, *Let's build GPT: from scratch, in code, spelled out*.
@@ -733,3 +807,10 @@ full fine-tuning it fits on a laptop.
 - Vaswani et al., *Attention Is All You Need* (2017).
 - Su et al., *RoFormer* (2021) — where RoPE comes from.
 - Ainslie et al., *GQA* (2023) — grouped-query attention.
+
+And for the serving track:
+
+- Kwon et al., *Efficient Memory Management for Large Language Model Serving
+  with PagedAttention* (2023) — the vLLM paper, and step 4 above.
+- Yu et al., *Orca* (2022) — where continuous batching comes from.
+- Dao et al., *FlashAttention* (2022).

@@ -47,6 +47,41 @@
 //! takes the decay out of the gradient and applies it to the weight directly.
 //! Only to matrices, though — a bias is not where overfitting lives, and a
 //! norm's gain belongs at 1, not 0.
+//!
+//! # Two things around the outside
+//!
+//! [`Schedule`] and clipping are not part of Adam. They are here because they
+//! are about the same sentence — how far a weight moves this step — and
+//! because they exist to patch the two places Adam is at its weakest.
+//!
+//! **Warm-up** patches the beginning. Read the bias-correction paragraph again
+//! and notice what it promises: the very first step moves every parameter by
+//! the full `lr`, in the direction of a gradient estimated from one batch.
+//! Step two moves it again by nearly `lr`, on an estimate of `v` made of two
+//! samples. Adam is at its most confident exactly when it knows least, and the
+//! damage is done in the first dozen steps, before anything can correct it —
+//! which is why it shows up as *some seeds being worse than others* rather
+//! than as a run that visibly diverges. Warm-up simply forbids the early
+//! steps: the rate climbs from nothing over the first `warmup` steps, by which
+//! time `v` is an average of something.
+//!
+//! **Cosine decay** patches the end. A rate large enough to cross the
+//! landscape is too large to settle anywhere in it, so a run at a constant
+//! rate spends its last steps bouncing around a minimum rather than in it.
+//! Decaying to a fraction of the peak lets it land.
+//!
+//! **Gradient clipping** patches neither; it is insurance. If the whole
+//! gradient, every tensor laid end to end, is longer than `clip`, every
+//! element is scaled by the same factor to make it exactly that long. The
+//! direction is untouched and only the size changes, so a batch that happened
+//! to contain something strange cannot throw the model somewhere it will take
+//! a hundred steps to walk back from. Under Adam this does less than it does
+//! under SGD — Adam cancels the size of the gradient anyway — but it still
+//! catches the case Adam cannot, which is a single step where `m` and `v` are
+//! both dominated by one freak batch.
+//!
+//! Whether any of it helps *here* was measured rather than assumed, and the
+//! answer is in the README.
 
 use crate::nn::Param;
 
@@ -59,6 +94,9 @@ pub struct AdamW {
     /// Keeps the division finite for a parameter whose gradient is zero.
     pub eps: f32,
     pub weight_decay: f32,
+    /// The longest the whole gradient may be before it is scaled down.
+    /// `None` leaves it alone. See [`grad_norm`].
+    pub clip: Option<f32>,
     /// Steps taken so far, for the bias correction.
     t: i32,
     /// One `m` and one `v` per parameter tensor, in the order `params()` gives
@@ -69,7 +107,17 @@ pub struct AdamW {
 
 impl AdamW {
     pub fn new(lr: f32) -> Self {
-        AdamW { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, weight_decay: 0.01, t: 0, m: Vec::new(), v: Vec::new() }
+        AdamW {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.01,
+            clip: None,
+            t: 0,
+            m: Vec::new(),
+            v: Vec::new(),
+        }
     }
 
     /// Apply the gradients in `params` to the values in `params`.
@@ -87,12 +135,21 @@ impl AdamW {
         let m_correction = 1.0 - self.beta1.powi(self.t);
         let v_correction = 1.0 - self.beta2.powi(self.t);
 
+        // One number for the whole model, so the direction is untouched. The
+        // gradients themselves are left as they are and the factor is applied
+        // as they are read: the same arithmetic, one pass fewer, and whoever
+        // looks at `p.grad` afterwards sees what backward actually computed.
+        let scale = match self.clip {
+            Some(max) => (max / grad_norm(&params)).min(1.0),
+            None => 1.0,
+        };
+
         for ((p, m), v) in params.into_iter().zip(self.m.iter_mut()).zip(self.v.iter_mut()) {
             assert_eq!(p.value.len(), m.len(), "{} changed size", p.name);
             let decay = if is_matrix(&p.name) { self.lr * self.weight_decay } else { 0.0 };
 
             for i in 0..p.value.len() {
-                let g = p.grad[i];
+                let g = p.grad[i] * scale;
                 m[i] = self.beta1 * m[i] + (1.0 - self.beta1) * g;
                 v[i] = self.beta2 * v[i] + (1.0 - self.beta2) * g * g;
 
@@ -104,6 +161,70 @@ impl AdamW {
                 p.value[i] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
             }
         }
+    }
+}
+
+/// The length of the whole gradient: every tensor laid end to end, and the
+/// square root of the sum of the squares.
+///
+/// Summed in `f64`. There are a hundred thousand squares here and five
+/// million in the largest preset, and adding a hundred thousand small `f32`
+/// values one at a time loses the small ones to the running total — the same
+/// reason [`crate::matrix`] keeps eight running sums. Measured, on a hundred
+/// thousand gradients of 1e-3: `f64` gives 0.3162278, which is right, and
+/// `f32` gives 0.3160589.
+///
+/// It is a plain left-to-right sum, and the obvious thing was tried: this is
+/// a chain of additions each waiting on the one before, which is the exact
+/// shape of the problem eight running sums fixed in `matmul_a_bt`. Eight
+/// running sums here moved clipping's cost from 13.9% of the default model's
+/// training throughput to 12.3%, which is inside the run-to-run noise of
+/// those measurements, so the simpler code stayed. The cost is the extra
+/// pass over the gradients, not the order it adds them in.
+pub fn grad_norm(params: &[Param<'_>]) -> f32 {
+    let total: f64 = params.iter().flat_map(|p| p.grad.iter()).map(|&g| (g as f64) * (g as f64)).sum();
+    total.sqrt() as f32
+}
+
+/// The learning rate as a function of the step: up from nothing, then down.
+///
+/// ```text
+///   peak |      ______
+///        |     /      `--.__
+///        |    /              `--.__
+///        |   /                      `-._
+///   0    |__/                            `--  peak * decay_to
+///        0  warmup                        steps
+/// ```
+///
+/// The rise is a straight line and the fall is half a cosine. Neither shape
+/// is special: what matters is that the first steps are small and the last
+/// ones smaller. The cosine is what GPT-2 and everything after it used, so it
+/// is the one to recognise.
+#[derive(Clone, Copy, Debug)]
+pub struct Schedule {
+    /// The rate at the top of the ramp — what `--lr` means.
+    pub peak: f32,
+    /// Steps spent climbing to it. 0 starts at the top, which is what every
+    /// run in this repository did before this was written.
+    pub warmup: usize,
+    /// The fraction of `peak` left at the last step. 1.0 is a flat line, and
+    /// is exactly that: the cosine below is constant when the floor is 1.
+    pub decay_to: f32,
+}
+
+impl Schedule {
+    /// The rate for `step`, counting from 1, in a run of `steps`.
+    pub fn at(&self, step: usize, steps: usize) -> f32 {
+        if step <= self.warmup {
+            // From peak/warmup up to peak, so no step is ever a zero-length
+            // one: a step of nothing is a step wasted.
+            return self.peak * step as f32 / self.warmup.max(1) as f32;
+        }
+        let left = steps.saturating_sub(self.warmup).max(1);
+        let progress = ((step - self.warmup) as f32 / left as f32).min(1.0);
+        let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
+        self.peak * (self.decay_to + (1.0 - self.decay_to) * cosine)
     }
 }
 
@@ -279,6 +400,123 @@ mod tests {
         let [x, y] = adam.values[0][..] else { unreachable!() };
         assert!(x.abs() < 0.05 && y.abs() < 0.05, "Adam ended at ({x}, {y})");
         assert!(plain[1] > 0.999, "SGD got y to {}", plain[1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The schedule, and clipping
+    // -----------------------------------------------------------------------
+
+    /// The shape of the picture in the doc comment: from nothing up to the
+    /// peak, then down to the floor, with no step left out and no jump where
+    /// the two meet.
+    #[test]
+    fn the_rate_climbs_to_the_peak_and_falls_to_the_floor() {
+        let s = Schedule { peak: 0.01, warmup: 100, decay_to: 0.1 };
+        let at = |step| s.at(step, 1000);
+
+        // Not zero, ever: a step of nothing is a step wasted.
+        assert!((at(1) - 0.0001).abs() < 1e-9);
+        assert!((at(50) - 0.005).abs() < 1e-9);
+        assert!((at(100) - 0.01).abs() < 1e-9, "the ramp has to end exactly at the peak, not near it");
+        // Halfway down the cosine is halfway between peak and floor.
+        assert!((at(550) - 0.01 * 0.55).abs() < 1e-6);
+        assert!((at(1000) - 0.001).abs() < 1e-6, "the last step is the floor");
+
+        // Continuous where the ramp meets the curve: the joint is one step
+        // wide, not a cliff.
+        assert!((at(100) - at(101)).abs() < 0.01 * 0.01, "{} then {}", at(100), at(101));
+        // Monotone up, then monotone down.
+        assert!((1..100).all(|i| at(i) < at(i + 1)));
+        assert!((100..1000).all(|i| at(i) > at(i + 1)));
+
+        // A floor of 1 is a flat line, exactly -- which is how "no schedule"
+        // is spelled, so it had better be exact.
+        let flat = Schedule { peak: 0.01, warmup: 0, decay_to: 1.0 };
+        assert!((1..=1000).all(|i| flat.at(i, 1000) == 0.01));
+
+        // A run too short to finish warming up just never gets to the top.
+        let s = Schedule { peak: 0.01, warmup: 100, decay_to: 0.1 };
+        assert!((s.at(3, 3) - 0.0003).abs() < 1e-9);
+        // And past the end it stays at the floor rather than carrying on
+        // round the cosine, which it does if nobody clamps it: at step 5000
+        // of 1000 the unclamped curve is back up at 0.0047.
+        assert_eq!(s.at(5000, 1000), s.at(1000, 1000));
+        assert!((s.at(5000, 1000) - 0.001).abs() < 1e-6);
+    }
+
+    /// A warm-up left unset is a tenth of the run, however long the run is,
+    /// and one longer than the run is the whole of it.
+    #[test]
+    fn an_unset_warmup_is_a_tenth_of_the_run() {
+        use crate::text::Training;
+        let with = |steps, warmup| Training { steps, warmup, ..Training::default() }.schedule().warmup;
+        assert_eq!(with(2000, None), 200);
+        assert_eq!(with(750, None), 75);
+        assert_eq!(with(2000, Some(0)), 0);
+        assert_eq!(with(2000, Some(500)), 500);
+        assert_eq!(with(100, Some(500)), 100, "a warm-up cannot outlast its run");
+    }
+
+    /// The length of every gradient laid end to end, summed in `f64` because
+    /// a hundred thousand small squares added to a large running total in
+    /// `f32` stop arriving.
+    #[test]
+    fn the_gradient_norm_is_the_length_of_all_of_it() {
+        let mut toy = Toy::new(&["a.weight", "b.bias"], &[0.0; 2]);
+        toy.grads[0] = vec![3.0, 4.0];
+        toy.grads[1] = vec![12.0, 0.0];
+        // sqrt(9 + 16 + 144) = 13.
+        assert!((grad_norm(&toy.params()) - 13.0).abs() < 1e-6);
+
+        // A hundred thousand copies of 1e-3: the true norm is sqrt(1e5)*1e-3
+        // = 0.3162278. Summed left to right in f32 it comes out 0.3160589,
+        // short by 1.7e-4, which this tolerance of 1e-6 refuses.
+        let mut big = Toy::new(&["a.weight"], &vec![0.0; 100_000]);
+        big.grads[0] = vec![1e-3; 100_000];
+        let norm = grad_norm(&big.params());
+        assert!((norm - 0.316_227_77).abs() < 1e-6, "{norm}");
+    }
+
+    /// Clipping scales every gradient by one number, so the direction of the
+    /// step is untouched and only its size changes. Below the threshold it
+    /// must do nothing whatever.
+    #[test]
+    fn clipping_shortens_the_gradient_without_turning_it() {
+        // Norm 5, clipped to 1: every element a fifth of what it was, so a
+        // step identical to one taken from the fifths themselves.
+        let mut clipped = Toy::new(&["w.bias"], &[0.0; 2]);
+        clipped.grads[0] = vec![3.0, 4.0];
+        let mut opt = AdamW { clip: Some(1.0), ..no_decay(0.01) };
+        opt.step(clipped.params());
+
+        let mut scaled = Toy::new(&["w.bias"], &[0.0; 2]);
+        scaled.grads[0] = vec![0.6, 0.8];
+        let mut plain = no_decay(0.01);
+        plain.step(scaled.params());
+        assert_eq!(clipped.values[0], scaled.values[0]);
+
+        // The gradients themselves are left as backward computed them.
+        assert_eq!(clipped.grads[0], vec![3.0, 4.0]);
+
+        // Under the threshold, clipping changes nothing at all -- not even
+        // in the last bit, which is what makes `--clip 0` and a clip that
+        // never fires the same run.
+        let run = |clip: Option<f32>| {
+            let mut toy = Toy::new(&["w.bias"], &[0.0; 2]);
+            let mut opt = AdamW { clip, ..no_decay(0.01) };
+            for _ in 0..20 {
+                toy.grads[0] = vec![0.3, 0.4];
+                opt.step(toy.params());
+            }
+            toy.values[0].clone()
+        };
+        assert_eq!(run(Some(1.0)), run(None));
+        assert_ne!(run(Some(0.1)), run(None));
+
+        // A gradient of exactly nothing divides by zero if nobody is careful.
+        let mut zero = Toy::new(&["w.bias"], &[1.0, 1.0]);
+        AdamW { clip: Some(1.0), ..no_decay(0.01) }.step(zero.params());
+        assert!(zero.values[0].iter().all(|v| v.is_finite()), "{:?}", zero.values[0]);
     }
 
     /// The optimiser and the model, together: the same memorisation check the

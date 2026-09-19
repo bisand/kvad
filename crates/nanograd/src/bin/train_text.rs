@@ -13,8 +13,16 @@
 //!     train_text --load out/shakespeare --steps 500 --save out/more   # train on
 //!
 //! Options: --data PATH --steps N --batch N --context N --d-model N --heads N
-//!          --layers N --lr F --eval-every N --sample N --temperature F
-//!          --prompt TEXT --seed N --save DIR --load DIR --threads N
+//!          --layers N --lr F --warmup N --decay-to F --clip F --eval-every N
+//!          --sample N --temperature F --prompt TEXT --seed N --save DIR
+//!          --load DIR --threads N
+//!
+//! `--lr` is the *peak* rate: `--warmup N` climbs to it over the first N
+//! steps and `--decay-to F` falls to F times it by the last, over a cosine.
+//! `--warmup 0 --decay-to 1` is a flat rate, which is what this binary did
+//! before the schedule existed. `--clip 0` turns gradient clipping off.
+//! See `optim::Schedule` for what each is for, and the README for what each
+//! measured.
 //!
 //! Training uses every core unless told otherwise. `--threads 1` is the plain
 //! loop in `text::train_step`; more is `text::Replicas`. A run is reproducible
@@ -98,6 +106,10 @@ fn parse_args() -> Args {
             "--heads" => a.heads = parse(i) as usize,
             "--layers" => a.layers = parse(i) as usize,
             "--lr" => a.training.lr = parse(i) as f32,
+            "--warmup" => a.training.warmup = Some(parse(i) as usize),
+            "--decay-to" => a.training.decay_to = parse(i) as f32,
+            // Zero is not a clip anyone would want, so it means "none".
+            "--clip" => a.training.clip = Some(parse(i) as f32).filter(|&c| c > 0.0),
             "--eval-every" => a.training.eval_every = parse(i) as usize,
             "--sample" => a.sample = parse(i) as usize,
             "--temperature" => a.temperature = parse(i) as f32,
@@ -190,7 +202,16 @@ fn main() -> std::io::Result<()> {
     let cfg = &args.training;
     let threads = cfg.threads.min(cfg.batch);
     println!("model: {}", model.summary());
-    println!("hyperparams: steps={} batch={} lr={} threads={threads}", cfg.steps, cfg.batch, cfg.lr);
+    let schedule = cfg.schedule();
+    println!(
+        "hyperparams: steps={} batch={} lr={} warmup={} decay-to={} clip={} threads={threads}",
+        cfg.steps,
+        cfg.batch,
+        cfg.lr,
+        schedule.warmup,
+        cfg.decay_to,
+        cfg.clip.map_or("none".to_string(), |c| c.to_string())
+    );
 
     // Two numbers to hold the loss against. A model that knows nothing scores
     // the first; one that knows only which characters are common scores the

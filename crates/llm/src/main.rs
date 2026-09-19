@@ -60,6 +60,9 @@ struct Args {
     eval_every: Option<usize>,
     threads: Option<usize>,
     sample: Option<usize>,
+    warmup: Option<usize>,
+    decay_to: Option<f32>,
+    clip: Option<f32>,
 }
 
 impl Default for Args {
@@ -86,6 +89,9 @@ impl Default for Args {
             eval_every: None,
             threads: None,
             sample: None,
+            warmup: None,
+            decay_to: None,
+            clip: None,
         }
     }
 }
@@ -123,7 +129,10 @@ fn usage() -> ! {
            --size NAME         model shape: {sizes} (default {default_size})\n  \
            --steps N           training steps (default 2000)\n  \
            --batch N           windows per step (default 16)\n  \
-           --lr F              learning rate (default 0.003)\n  \
+           --lr F              peak learning rate (default 0.003)\n  \
+           --warmup N          steps spent climbing to it (default: a tenth of the run)\n  \
+           --decay-to F        fraction of --lr left at the last step (default 0.1)\n  \
+           --clip F            longest the whole gradient may be; 0 for none (default 1)\n  \
            --eval-every N      steps between checkpoints (default 250)\n  \
            --threads N         replicas to split each batch across (default: every core)\n  \
            --sample N          characters to write at each checkpoint, 0 for none\n\n\
@@ -201,6 +210,9 @@ fn parse_args() -> Args {
             "--batch" => a.batch = Some(num() as usize),
             "--lr" => a.lr = Some(num() as f32),
             "--eval-every" => a.eval_every = Some(num() as usize),
+            "--warmup" => a.warmup = Some(num() as usize),
+            "--decay-to" => a.decay_to = Some(num() as f32),
+            "--clip" => a.clip = Some(num() as f32),
             "--threads" => a.threads = Some((num() as usize).max(1)),
             "--sample" => a.sample = Some(num() as usize),
             "--quant" => {
@@ -322,6 +334,11 @@ fn train_model(args: Args) -> Res<()> {
         lr: args.lr.unwrap_or(d.lr),
         eval_every: args.eval_every.unwrap_or(d.eval_every),
         threads: args.threads.unwrap_or(d.threads),
+        // `--warmup` unset means a tenth of the run; see `Training::schedule`.
+        warmup: args.warmup.or(d.warmup),
+        decay_to: args.decay_to.unwrap_or(d.decay_to),
+        // Zero is not a clip anyone would want, so it means "none".
+        clip: args.clip.map_or(d.clip, |c| Some(c).filter(|&c| c > 0.0)),
         ..d
     };
 

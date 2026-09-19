@@ -73,6 +73,7 @@ fn options(data: PathBuf, name: &str) -> train::Options {
             eval_windows: 10,
             threads: 1,
             save: None, // `train::run` fills this in from the name.
+            ..Default::default()
         },
         ..train::Options::default()
     }

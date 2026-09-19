@@ -288,8 +288,8 @@ model, same text, 750 steps, each optimiser at the best of the learning rates
 tried for it (AdamW: 0.001–0.03, best 0.003; SGD with momentum: 0.01–1.0, best
 0.1, diverging to NaN at 1.0). Validation loss over four seeds: AdamW 2.18–2.47,
 mean 2.26; SGD 2.56–2.65, mean 2.59. AdamW is ahead on every seed, though one
-of its four is a good deal worse than the others, which a learning-rate warm-up
-would probably fix and which has not been tried.
+of its four is a good deal worse than the others. Warm-up was the guess, and
+[it was right](#the-seed-that-was-worse-than-the-others).
 
 **A mistake no training run can reveal.** A batch here is a loop — the model
 takes one sequence at a time and gradients accumulate — so each window's
@@ -303,8 +303,10 @@ that a batch of three must produce the same gradient as a batch of one.
 
 Things to try: `--layers 1` or `--d-model 32`, to see how little is needed to
 learn spelling; `--context 8`, to see what a model that cannot see a whole word
-writes; `--temperature 0.2` against `1.5`; and `--steps 6000` on a small file,
-to watch the validation loss leave.
+writes; `--temperature 0.2` against `1.5`; `--warmup 0 --decay-to 1 --clip 0`,
+which is how every run in this repository worked before
+[the schedule](#the-seed-that-was-worse-than-the-others) was measured; and
+`--steps 6000` on a small file, to watch the validation loss leave.
 
 ### Keeping what it learned
 
@@ -417,6 +419,108 @@ windows would then depend on scheduling. The rest is the serial part: adding up
 16 copies of the gradient, AdamW, and starting 16 threads a step, together
 about a quarter of the main thread's time.
 
+### The seed that was worse than the others
+
+Four AdamW seeds, and one of them finished at validation 2.47 against about
+2.19 for the rest. The guess written down at the time was learning-rate
+warm-up. It was a guess; this is the measurement.
+
+First, reproduce it. Eight seeds this time, 750 steps, the same 117K model on
+this README, validation loss at the end (which is now measured on a fixed set
+of windows, so two runs are comparable):
+
+| `--lr` | per seed | worst | mean | spread |
+|---|---|---|---|---|
+| 0.001 | 2.43 2.46 2.44 2.46 2.44 2.47 2.43 2.45 | 2.47 | 2.446 | 0.037 |
+| 0.002 | 2.31 2.31 2.37 2.33 2.36 2.40 2.31 2.34 | 2.40 | **2.343** | 0.094 |
+| 0.003 | 2.40 2.45 2.30 2.40 2.32 2.41 2.29 2.29 | 2.45 | 2.358 | 0.167 |
+| 0.006 | 2.69 2.56 2.43 2.62 2.60 2.67 2.55 2.57 | 2.69 | 2.587 | 0.258 |
+| 0.01 | 2.81 2.80 2.73 2.79 2.80 2.81 2.77 2.78 | 2.81 | 2.786 | 0.082 |
+
+There it is, and it is not really "one seed in four". It is that **the spread
+grows with the learning rate** — 0.037, 0.094, 0.167, 0.258 — until at 0.006
+every seed is bad. The bad seed was the first sign of a ceiling the runs were
+already pressed against.
+
+That is the shape warm-up predicts. Read
+[`optim.rs`](crates/nanograd/src/optim.rs) on bias correction again: it exists
+so that the *first* step moves every parameter by the full `lr`, in the
+direction of a gradient estimated from one batch, and `v` is an average of one
+sample. Adam is at its most confident exactly when it knows least. Nothing
+diverges visibly, because the damage is a handful of early steps in a poor
+direction; it shows up later as one run ending worse than its neighbours.
+
+So: four arms, each swept over the same six learning rates and the same eight
+seeds, each reported at its own best rate.
+
+| arm | best `--lr` | per seed at that rate | mean | spread |
+|---|---|---|---|---|
+| flat | 0.002 | 2.31 2.31 2.37 2.33 2.36 2.40 2.31 2.34 | 2.343 | 0.094 |
+| cosine decay only | 0.002 | 2.39 2.41 2.48 2.45 2.45 2.46 2.44 2.39 | 2.434 | 0.094 |
+| warm-up only | 0.006 | 2.27 2.30 2.33 2.33 2.34 2.29 2.28 2.31 | 2.305 | 0.069 |
+| both | 0.006 | 2.25 2.26 2.29 2.31 2.31 2.25 2.26 2.27 | **2.275** | 0.058 |
+
+Three things worth saying out loud.
+
+**Warm-up works, and not by making a good run better.** At 0.003 it is worth
+0.025 (2.358 to 2.333) and nothing you would notice. What it does is raise the
+ceiling: the flat arm falls apart at 0.006 and the warmed-up arm is at its best
+there. The gain is three times the usable learning rate, and the improvement is
+what the extra rate buys.
+
+**Cosine decay alone is worse than doing nothing** — 2.434 against 2.343. Of
+course it is: without a higher peak to pay for it, decaying the rate is just
+training at a lower average rate. It earns its place only on top of warm-up,
+where it is worth a further 0.03, and the floor barely matters (0.1 and 0.3
+measured 2.275 and 2.273; even 1.0, which is no decay at all, gives 2.305).
+
+**The warm-up has to be long enough to be one.** At `--lr 0.006` with the
+cosine, over eight seeds: 10 steps of warm-up scored 2.627 and 25 scored 2.452
+— *worse than no warm-up at all* — 50 gave 2.343 with one seed still at 2.70,
+and 100 gave 2.275. That is why the default is a share of the run, a tenth,
+rather than a number of steps: ten steps is a tenth of a hundred and a
+seventy-fifth of the default run. (Half the run measured 0.025 better again, at
+750 steps and at 2000, but the sign flipped on two of eight seeds, so it is
+inside the spread and a tenth is what everyone uses.)
+
+At the real default length of 2000 steps the effect is smaller and the same
+shape. The current default — `--lr 0.003`, no schedule — scores 2.138 over
+eight seeds. Turning warm-up, cosine decay and clipping on and changing nothing
+else scores **2.087**, with the spread down from 0.052 to 0.041. And the
+learning rate almost stops mattering: 0.003, 0.006, 0.01 and 0.02 land at
+2.087, 2.097, 2.111 and 2.120, where the flat arm had already lost 0.45 by
+0.01. That is the part that matters for a tool: the knob you are least equipped
+to set is the one that now matters least.
+
+**Gradient clipping is insurance, and the measurement says so exactly.** If the
+whole gradient — every tensor laid end to end — is longer than `--clip`, every
+element is scaled by one number, so the direction is untouched. At the good
+setting it does nothing: 2.275 without it, 2.269 to 2.308 across thresholds
+from 0.25 to 2.0, all inside the seed spread. At a bad setting it does
+everything. At `--lr 0.02`, where warm-up alone is not enough, eight seeds ran
+2.29 2.69 2.28 2.73 2.76 2.80 2.31 2.77 — mean 2.578, spread 0.517. With
+`--clip 1` the same eight ran 2.31 2.30 2.28 2.32 2.30 2.31 2.28 2.31 — mean
+2.301, spread 0.036. It cannot replace warm-up, though: on the flat arm at
+0.006 it recovered 0.1 of the 0.24 and left the spread wider than it found it.
+
+It is not free. Clipping is one extra pass over every gradient each step, and
+on the 117K model that is 13% of training throughput (median of five
+interleaved runs: 257,500 characters a second without, 221,700 with). On the
+4.9M `large` preset it is not measurable at all — 7,139 against 7,185, inside
+the noise — because there the arithmetic dwarfs it. So the cost falls entirely
+on the run that takes nine seconds and not at all on the one that takes twenty
+minutes, which is why it is on by default.
+
+The obvious optimisation was tried and refused. A left-to-right sum of a
+hundred thousand squares is a chain of additions each waiting on the one
+before, which is exactly the problem [eight running sums
+fixed](#where-the-time-went) in `matmul_a_bt`. Eight running sums here moved
+the cost from 13.9% to 12.3%, which is inside the run-to-run noise, so the
+simpler code stayed: the cost is the extra pass over the gradients, not the
+order they are added in. (The sum is in `f64` for a different reason, and that
+one is real — on a hundred thousand gradients of 1e-3, `f64` gives the correct
+0.3162278 and `f32` gives 0.3160589.)
+
 ### One tool: `kvad train`
 
 ```bash
@@ -441,8 +545,10 @@ The training loop itself did not move house so much as move down a floor. It
 lives in [`nanograd::text::train`](crates/nanograd/src/text.rs) now, where
 both front ends call it: `train_text` still takes `--layers`, `--d-model`,
 `--heads` and `--context` one at a time, for seeing what each of them does,
-and `kvad train` takes `--size` instead. Nothing about the learning changed in
-the move, and tests say so: every loss a run reports is the same however many
+and `kvad train` takes `--size` instead, along with `--warmup`, `--decay-to` and
+`--clip`, whose defaults come from
+[the measurement above](#the-seed-that-was-worse-than-the-others). Nothing
+about the learning changed in the move, and tests say so: every loss a run reports is the same however many
 threads it uses (to 2.6e-5 — the losses and not the weights, because replicas
 sum in a different order and Adam divides by the size of the gradient, so
 where a gradient is near zero a difference of 1e-7 in it is still a step of a

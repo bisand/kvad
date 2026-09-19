@@ -39,7 +39,7 @@ use crate::checkpoint::{invalid, read_text, write_whole};
 use crate::json::{object, Json};
 use crate::model::Gpt;
 use crate::nn::softmax_cross_entropy;
-use crate::optim::AdamW;
+use crate::optim::{AdamW, Schedule};
 use crate::rng::Rng;
 use std::io;
 use std::path::Path;
@@ -342,6 +342,20 @@ pub struct Training {
     pub eval_every: usize,
     /// Windows drawn at each checkpoint. Always the same ones.
     pub eval_windows: usize,
+    /// Steps spent bringing the learning rate up from nothing to `lr`, and
+    /// the fraction of `lr` left at the last step. See [`Schedule`], which
+    /// says what each is for and what each measured; `Some(0)` with
+    /// `decay_to: 1.0` holds `lr` flat, which is what every run here did
+    /// before this existed.
+    ///
+    /// `None` is "you choose": a tenth of the run. A warm-up is a share of
+    /// the run rather than a number of steps — ten steps of warm-up in a run
+    /// of 750 measured worse than none at all — and only the run knows how
+    /// long it is.
+    pub warmup: Option<usize>,
+    pub decay_to: f32,
+    /// The longest the whole gradient may be before it is scaled down.
+    pub clip: Option<f32>,
     /// Replicas to split each batch across; see [`Replicas`]. Clamped to the
     /// batch size, because a batch cannot be split finer than one window.
     pub threads: usize,
@@ -356,10 +370,25 @@ impl Default for Training {
             steps: 2000,
             batch: 16,
             lr: 3e-3,
+            warmup: None,
+            decay_to: 0.1,
+            clip: Some(1.0),
             eval_every: 250,
             eval_windows: 50,
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
             save: None,
+        }
+    }
+}
+
+impl Training {
+    /// The rate schedule this configuration asks for. A warm-up left unset is
+    /// a tenth of the run, and one longer than the run is the whole of it.
+    pub fn schedule(&self) -> Schedule {
+        Schedule {
+            peak: self.lr,
+            warmup: self.warmup.unwrap_or(self.steps / 10).min(self.steps),
+            decay_to: self.decay_to,
         }
     }
 }
@@ -436,6 +465,8 @@ pub fn train(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "a run of no steps would train nothing"));
     }
     let mut opt = AdamW::new(cfg.lr);
+    opt.clip = cfg.clip;
+    let schedule = cfg.schedule();
     let mut replicas = (cfg.threads.min(batch) > 1).then(|| Replicas::new(model, cfg.threads.min(batch)));
 
     // Characters seen after `steps` steps: every window is `context` of them,
@@ -447,6 +478,9 @@ pub fn train(
     let mut last_val = f32::INFINITY;
 
     for step in 1..=cfg.steps {
+        // The rate is the loop's business, not the optimiser's: Adam decides
+        // which way each weight goes, the schedule decides how far.
+        opt.lr = schedule.at(step, cfg.steps);
         running += match &mut replicas {
             Some(replicas) => replicas.train_step(model, &mut opt, &corpus.train, batch, rng),
             None => train_step(model, &mut opt, &corpus.train, batch, rng),
@@ -895,6 +929,7 @@ mod tests {
             eval_windows: 20,
             threads: 1,
             save: Some(dir.clone()),
+            ..Training::default()
         };
         let mut seen: Vec<(usize, f32, Vec<f32>)> = Vec::new();
         let done = train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
@@ -930,7 +965,7 @@ mod tests {
         let config = GptConfig { vocab: tok.vocab(), ..TINY };
         let run = |eval_every: usize| -> (Vec<f32>, f32) {
             let mut model = Gpt::new(config, &mut Rng::new(4));
-            let cfg = Training { steps: 60, batch: 4, lr: 1e-2, eval_every, eval_windows: 20, threads: 1, save: None };
+            let cfg = Training { steps: 60, batch: 4, lr: 1e-2, eval_every, eval_windows: 20, threads: 1, save: None, ..Training::default() };
             let mut last = 0.0;
             train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
                 if let Report::Step { val_loss, .. } = report {
@@ -965,7 +1000,7 @@ mod tests {
         let config = GptConfig { vocab: tok.vocab(), ..TINY };
         let run = |threads: usize| -> Vec<f32> {
             let mut model = Gpt::new(config, &mut Rng::new(4));
-            let cfg = Training { steps: 60, batch: 4, lr: 1e-2, eval_every: 20, eval_windows: 10, threads, save: None };
+            let cfg = Training { steps: 60, batch: 4, lr: 1e-2, eval_every: 20, eval_windows: 10, threads, save: None, ..Training::default() };
             let mut losses = Vec::new();
             train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
                 if let Report::Step { train_loss, val_loss, .. } = report {
@@ -998,7 +1033,7 @@ mod tests {
         let config = GptConfig { vocab: tok.vocab(), ..TINY };
         let run = |eval_every: usize| -> Vec<f32> {
             let mut model = Gpt::new(config, &mut Rng::new(4));
-            let cfg = Training { steps: 7, batch: 2, lr: 1e-2, eval_every, eval_windows: 5, threads: 1, save: None };
+            let cfg = Training { steps: 7, batch: 2, lr: 1e-2, eval_every, eval_windows: 5, threads: 1, save: None, ..Training::default() };
             let mut losses = Vec::new();
             train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
                 if let Report::Step { train_loss, .. } = report {
@@ -1027,7 +1062,7 @@ mod tests {
     fn a_text_too_short_to_draw_a_window_from_is_refused_by_name() {
         let tok = CharTokenizer::from_text("abc");
         let config = GptConfig { vocab: 3, context: 16, d_model: 8, n_heads: 2, n_layers: 1 };
-        let cfg = Training { steps: 1, batch: 1, lr: 1e-2, eval_every: 1, eval_windows: 1, threads: 1, save: None };
+        let cfg = Training { steps: 1, batch: 1, lr: 1e-2, eval_every: 1, eval_windows: 1, threads: 1, save: None, ..Training::default() };
 
         let attempt = |train_len: usize, val_len: usize| -> String {
             let mut model = Gpt::new(config, &mut Rng::new(4));
@@ -1058,9 +1093,52 @@ mod tests {
         let (tok, corpus) = a_text_and_its_contradiction();
         let config = GptConfig { vocab: tok.vocab(), ..TINY };
         let mut model = Gpt::new(config, &mut Rng::new(4));
-        let cfg = Training { steps: 0, batch: 2, lr: 1e-2, eval_every: 10, eval_windows: 8, threads: 1, save: None };
+        let cfg = Training { steps: 0, batch: 2, lr: 1e-2, eval_every: 10, eval_windows: 8, threads: 1, save: None, ..Training::default() };
         let error = train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |_| {}).unwrap_err();
         assert!(error.to_string().contains("no steps"), "{error}");
+    }
+
+    /// The loop has to actually use the schedule, and not just build one.
+    ///
+    /// Adam moves each weight by about `lr` a step whatever its gradient, so
+    /// the distance a run travels from where it started is close to the sum
+    /// of its rates. A run that spends its whole length climbing to the peak
+    /// has half the rate, on average, of one that starts there — and must
+    /// travel roughly half as far. Measured: 0.433 of it, rather than 0.5,
+    /// because a shorter step also means a different place to step from. The
+    /// bound is wide on both sides of that; what it has to rule out is a
+    /// loop that built a schedule and then ignored it, which measures 1.0.
+    #[test]
+    fn the_loop_moves_at_the_rate_the_schedule_says() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let start: Vec<f32> =
+            Gpt::new(config, &mut Rng::new(4)).params().iter().flat_map(|p| p.value.to_vec()).collect();
+
+        let travelled = |warmup, decay_to| -> f32 {
+            let mut model = Gpt::new(config, &mut Rng::new(4));
+            let cfg = Training {
+                steps: 60,
+                batch: 2,
+                lr: 1e-2,
+                warmup,
+                decay_to,
+                clip: None,
+                eval_every: 60,
+                eval_windows: 5,
+                threads: 1,
+                save: None,
+            };
+            train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |_| {}).unwrap();
+            let end: Vec<f32> = model.params().iter().flat_map(|p| p.value.to_vec()).collect();
+            start.iter().zip(&end).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt()
+        };
+
+        let flat = travelled(Some(0), 1.0);
+        let ramped = travelled(Some(60), 1.0);
+        assert!(flat > 0.0, "nothing moved, so nothing was measured");
+        let ratio = ramped / flat;
+        assert!((0.30..0.60).contains(&ratio), "a run that ramped all the way travelled {ratio} of a flat one");
     }
 
     /// Every checkpoint in a run is measured on the same windows, so that its
@@ -1075,7 +1153,7 @@ mod tests {
         let (tok, corpus) = a_text_and_its_contradiction();
         let config = GptConfig { vocab: tok.vocab(), ..TINY };
         let mut model = Gpt::new(config, &mut Rng::new(4));
-        let cfg = Training { steps: 30, batch: 2, lr: 0.0, eval_every: 10, eval_windows: 8, threads: 1, save: None };
+        let cfg = Training { steps: 30, batch: 2, lr: 0.0, eval_every: 10, eval_windows: 8, threads: 1, save: None, ..Training::default() };
 
         let mut seen = Vec::new();
         train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
@@ -1094,7 +1172,7 @@ mod tests {
         let (tok, corpus) = a_text_and_its_contradiction();
         let config = GptConfig { vocab: tok.vocab(), ..TINY };
         let mut model = Gpt::new(config, &mut Rng::new(4));
-        let cfg = Training { steps: 100, batch: 4, lr: 1e-2, eval_every: 50, eval_windows: 10, threads: 1, save: None };
+        let cfg = Training { steps: 100, batch: 4, lr: 1e-2, eval_every: 50, eval_windows: 10, threads: 1, save: None, ..Training::default() };
 
         let mut pace = Vec::new();
         let mut steps_at_pace = None;

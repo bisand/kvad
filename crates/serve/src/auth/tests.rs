@@ -315,6 +315,7 @@ async fn the_admin_extractor_takes_administrators_and_nobody_else() {
             Err("no backend in tests".into())
         }))),
         setup: std::sync::Arc::new(Setup::default()),
+        oidc: std::sync::Arc::new(Default::default()),
         started: std::time::Instant::now(),
     };
 
@@ -347,6 +348,7 @@ async fn a_cross_site_post_is_refused_before_the_cookie_is_even_looked_up() {
             Err("no backend in tests".into())
         }))),
         setup: std::sync::Arc::new(Setup::default()),
+        oidc: std::sync::Arc::new(Default::default()),
         started: std::time::Instant::now(),
     };
     let cookie = format!("kvad_session={token}");
@@ -396,11 +398,31 @@ fn the_setup_token_works_once_and_only_for_itself() {
 // The modes that are not built yet
 // ---------------------------------------------------------------------------
 
+/// Every mode the config file can name is a mode this server can build, so a
+/// `kvad.toml` that asks for one cannot be refused at startup for a reason
+/// nobody can act on.
 #[test]
-fn an_unimplemented_mode_has_no_provider() {
-    for mode in [Mode::None, Mode::Local, Mode::Basic] {
-        assert_eq!(provider(mode).map(|p| p.mode()).unwrap_or(Mode::None), mode);
+fn every_named_mode_has_a_provider() {
+    let settings = crate::config::Oidc::default();
+    for mode in [Mode::None, Mode::Local, Mode::Basic, Mode::Oidc] {
+        let built = provider(mode, &settings).unwrap_or_else(|e| panic!("{mode}: {e}"));
+        assert_eq!(built.mode(), mode);
     }
-    let Err(err) = provider(Mode::Oidc) else { panic!("oidc claimed to be implemented") };
-    assert!(err.contains("oidc"), "{err}");
+}
+
+/// An identity provider decides who somebody is at the callback, not on every
+/// request; afterwards it is an ordinary session, and nothing else gets in.
+#[test]
+fn oidc_accepts_a_session_or_a_key_and_nothing_else() {
+    let db = db_with_people();
+    let (ada, token) = users::sign_in(&db, "ada", "lovelace-1843", None).unwrap();
+    assert_eq!(Oidc.identify(&Presented::Cookie(token), &db).unwrap().id, Some(ada.id));
+
+    let (_, key) = users::create_key(&db, ada.id, "script").unwrap();
+    assert!(Oidc.identify(&Presented::Bearer(key), &db).is_some());
+
+    // A password is not a way in when the provider is somewhere else.
+    let password = Presented::Basic { name: "ada".into(), password: "lovelace-1843".into() };
+    assert!(Oidc.identify(&password, &db).is_none());
+    assert!(Oidc.identify(&Presented::Nothing, &db).is_none());
 }

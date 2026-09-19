@@ -100,7 +100,6 @@ pub fn by_name(db: &Db, name: &str) -> Res<Option<User>> {
 }
 
 /// Used to match an identity provider's `email` claim to an account.
-#[allow(dead_code)]
 pub fn by_email(db: &Db, email: &str) -> Res<Option<User>> {
     db.with(|c| {
         c.query_row(&format!("SELECT {COLUMNS} FROM users WHERE email = ?1"), [email], user_from)
@@ -256,6 +255,19 @@ pub fn sign_in(db: &Db, name: &str, password: &str, agent: Option<&str>) -> Res<
         return Err(REFUSED.into());
     }
 
+    let token = open_session(db, id, agent)?;
+    let user = get(db, id)?.ok_or("the account vanished as it signed in")?;
+    Ok((user, token))
+}
+
+/// Start a session for an account whose identity has already been
+/// established, and return the token.
+///
+/// Split out of [`sign_in`] because an identity provider establishes it
+/// somewhere else entirely — see [`crate::oidc`] — and there is no password
+/// here to check. Anything calling this is asserting that it has checked
+/// something at least as good.
+pub fn open_session(db: &Db, id: i64, agent: Option<&str>) -> Res<String> {
     let token = secret::token();
     let fingerprint = secret::fingerprint(&token);
     db.with(|c| {
@@ -266,8 +278,7 @@ pub fn sign_in(db: &Db, name: &str, password: &str, agent: Option<&str>) -> Res<
         )?;
         c.execute("UPDATE users SET last_seen_at = datetime('now') WHERE id = ?1", [id])
     })?;
-    let user = get(db, id)?.ok_or("the account vanished as it signed in")?;
-    Ok((user, token))
+    Ok(token)
 }
 
 /// An argon2 hash of nothing in particular, verified against when an account

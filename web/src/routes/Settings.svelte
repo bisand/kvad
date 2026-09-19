@@ -238,6 +238,11 @@
           An <span class="font-medium">admin</span> can change the machine — pull models,
           load them, manage accounts. A <span class="font-medium">user</span> can talk to
           what is already loaded, and sees only their own conversations.
+          {#if auth.mode === "oidc"}
+            This server signs people in through a provider, so roles are taken from
+            <code>admin_emails</code> and <code>admin_roles</code> in
+            <code>kvad.toml</code> at every sign-in: a change made here lasts until then.
+          {/if}
         </p>
 
         <table class="table table-sm mb-3">

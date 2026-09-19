@@ -43,6 +43,93 @@ pub struct Database {
 #[serde(deny_unknown_fields, default)]
 pub struct Auth {
     pub mode: Mode,
+    pub oidc: Oidc,
+}
+
+/// An external identity provider, and who it is allowed to let in.
+///
+/// The allow-list is not optional and there is no default that means
+/// "anybody". An OIDC client pointed at a public provider with no allow-list
+/// would let every Google account in the world sign in to this machine, so a
+/// configuration that forgets one is refused at startup rather than at the
+/// moment somebody notices.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Oidc {
+    /// The provider's issuer URL, e.g. `https://accounts.google.com`. Its
+    /// `/.well-known/openid-configuration` is read from here.
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    /// Where the provider sends the browser back to. Must be registered with
+    /// the provider, and must be this server's own
+    /// `…/api/auth/oidc/callback`.
+    pub redirect_url: String,
+    /// Exact addresses that may sign in, compared without regard to case.
+    pub allow_emails: Vec<String>,
+    /// Whole domains that may, e.g. `example.com`.
+    pub allow_domains: Vec<String>,
+    /// Who becomes an administrator, by address.
+    pub admin_emails: Vec<String>,
+    /// A claim in the ID token holding group or role names, e.g. `groups`.
+    pub role_claim: Option<String>,
+    /// Values of that claim which mean "administrator".
+    pub admin_roles: Vec<String>,
+    /// Scopes asked for beyond `openid email profile`.
+    pub scopes: Vec<String>,
+}
+
+impl Oidc {
+    /// What is missing, if anything.
+    pub fn check(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("issuer", &self.issuer),
+            ("client_id", &self.client_id),
+            ("redirect_url", &self.redirect_url),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("auth.oidc.{name} is not set"));
+            }
+        }
+        if self.allow_emails.is_empty() && self.allow_domains.is_empty() {
+            return Err(
+                "auth.oidc needs allow_emails or allow_domains: without one, everybody with \
+                 an account at the provider could sign in to this machine"
+                    .into(),
+            );
+        }
+        if self.role_claim.is_some() && self.admin_roles.is_empty() {
+            return Err("auth.oidc.role_claim is set but admin_roles is empty, so it decides \
+                        nothing"
+                .into());
+        }
+        Ok(())
+    }
+
+    /// Whether this address is on the list.
+    pub fn allows(&self, email: &str) -> bool {
+        let email = email.trim().to_ascii_lowercase();
+        if self.allow_emails.iter().any(|a| a.trim().eq_ignore_ascii_case(&email)) {
+            return true;
+        }
+        // The domain is what follows the last `@`; an address with none is
+        // not an address.
+        match email.rsplit_once('@') {
+            Some((_, domain)) => {
+                self.allow_domains.iter().any(|d| d.trim().eq_ignore_ascii_case(domain))
+            }
+            None => false,
+        }
+    }
+
+    /// Whether this address, with these claimed roles, is an administrator.
+    pub fn is_admin(&self, email: &str, roles: &[String]) -> bool {
+        if self.admin_emails.iter().any(|a| a.trim().eq_ignore_ascii_case(email.trim())) {
+            return true;
+        }
+        self.role_claim.is_some()
+            && roles.iter().any(|r| self.admin_roles.iter().any(|a| a.trim() == r.trim()))
+    }
 }
 
 /// How a request proves who it is.
@@ -78,7 +165,7 @@ impl Default for Database {
 
 impl Default for Auth {
     fn default() -> Self {
-        Auth { mode: Mode::None }
+        Auth { mode: Mode::None, oidc: Oidc::default() }
     }
 }
 
@@ -137,7 +224,10 @@ impl Config {
         }
         // Which modes exist is `auth::provider`'s to say, not this file's: it
         // is the one that has to build them.
-        crate::auth::provider(self.auth.mode)?;
+        crate::auth::provider(self.auth.mode, &self.auth.oidc)?;
+        if self.auth.mode == Mode::Oidc {
+            self.auth.oidc.check()?;
+        }
         Ok(())
     }
 }
@@ -204,16 +294,98 @@ mod tests {
         }
     }
 
-    /// A mode that is named but not built refuses to start, rather than
-    /// starting and letting everybody in.
+    /// The one configuration mistake that would let the whole internet in.
     #[test]
-    fn an_unimplemented_auth_mode_does_not_quietly_become_none() {
+    fn oidc_without_an_allow_list_is_refused() {
+        let mut o = Oidc {
+            issuer: "https://accounts.example.com".into(),
+            client_id: "abc".into(),
+            redirect_url: "https://kvad.example/api/auth/oidc/callback".into(),
+            ..Oidc::default()
+        };
+        let err = o.check().unwrap_err();
+        assert!(err.contains("allow_emails"), "{err}");
+
+        o.allow_domains = vec!["example.com".into()];
+        assert!(o.check().is_ok());
+
+        // And each piece it cannot work without is named on its own.
+        for missing in ["issuer", "client_id", "redirect_url"] {
+            let mut o = o.clone();
+            match missing {
+                "issuer" => o.issuer.clear(),
+                "client_id" => o.client_id.clear(),
+                _ => o.redirect_url.clear(),
+            }
+            assert!(o.check().unwrap_err().contains(missing));
+        }
+
+        // A role claim that decides nothing is a mistake worth naming too.
+        let mut o = o.clone();
+        o.role_claim = Some("groups".into());
+        assert!(o.check().unwrap_err().contains("admin_roles"));
+    }
+
+    #[test]
+    fn the_allow_list_matches_addresses_and_domains_without_case() {
+        let o = Oidc {
+            allow_emails: vec!["Ada@Example.COM".into()],
+            allow_domains: vec!["Kvad.test".into()],
+            admin_emails: vec!["ada@example.com".into()],
+            role_claim: Some("groups".into()),
+            admin_roles: vec!["kvad-admins".into()],
+            ..Oidc::default()
+        };
+        assert!(o.allows("ada@example.com"));
+        assert!(o.allows("ADA@EXAMPLE.COM"));
+        assert!(o.allows("anyone@kvad.test"));
+        assert!(!o.allows("bob@example.com"), "only ada is listed at example.com");
+        assert!(!o.allows("ada@example.com.evil.test"));
+        assert!(!o.allows("not-an-address"));
+        assert!(!o.allows(""));
+
+        // Admin by address, or by a claimed role, and neither by accident.
+        assert!(o.is_admin("ada@example.com", &[]));
+        assert!(o.is_admin("bob@kvad.test", &["kvad-admins".into()]));
+        assert!(!o.is_admin("bob@kvad.test", &["everyone".into()]));
+        assert!(!o.is_admin("bob@kvad.test", &[]));
+
+        // With no role_claim configured, a claimed role means nothing.
+        let emails_only = Oidc { role_claim: None, ..o.clone() };
+        assert!(!emails_only.is_admin("bob@kvad.test", &["kvad-admins".into()]));
+    }
+
+    /// A mode is checked for what it needs before the socket opens, not when
+    /// somebody first tries to use it.
+    #[test]
+    fn an_auth_mode_that_cannot_work_stops_the_server() {
         let path = std::env::temp_dir().join(format!("kvad-oidc-{}.toml", std::process::id()));
         std::fs::write(&path, "[auth]\nmode = \"oidc\"\n").unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.auth.mode, Mode::Oidc);
+        // Named but with nothing under it: refused, and the message says
+        // which key is missing rather than "misconfigured".
         let err = cfg.check(false).unwrap_err().to_string();
-        assert!(err.contains("not implemented"), "{err}");
+        assert!(err.contains("issuer"), "{err}");
+
+        // Filled in properly, it starts — and may face the network, because
+        // unlike `none` it has something to check.
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "0.0.0.0:8080"
+[auth]
+mode = "oidc"
+[auth.oidc]
+issuer = "https://accounts.example.com"
+client_id = "abc"
+redirect_url = "https://kvad.example/api/auth/oidc/callback"
+allow_domains = ["example.com"]
+"#,
+        )
+        .unwrap();
+        Config::load(&path).unwrap().check(false).unwrap();
         std::fs::remove_file(&path).unwrap();
     }
 

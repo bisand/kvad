@@ -353,6 +353,136 @@ pub async fn revoke_key(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Through an identity provider
+// ---------------------------------------------------------------------------
+
+/// Send the browser to the provider.
+///
+/// A redirect rather than JSON with a URL in it, so that the sign-in button
+/// can be an ordinary link and works with JavaScript turned off.
+pub async fn oidc_start(St(state): St<State>) -> Result<impl IntoResponse, Fail> {
+    if state.auth.mode() != crate::config::Mode::Oidc {
+        return Err(Fail::bad("this server does not sign in through a provider"));
+    }
+    let (settings, flows) = (&state.oidc.0, &state.oidc.1);
+    let url = crate::oidc::start(settings, flows).await.map_err(Fail::bad)?;
+    Ok(axum::response::Redirect::to(&url))
+}
+
+#[derive(serde::Deserialize)]
+pub struct Callback {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    /// What the provider says when it refused, e.g. `access_denied`.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Where the provider sends the browser back to.
+///
+/// Ends in a redirect either way, because what is at the other end of it is a
+/// person looking at a browser and not a program reading JSON. A failure goes
+/// to the sign-in page with a reason in the query string.
+pub async fn oidc_callback(
+    St(state): St<State>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<Callback>,
+) -> impl IntoResponse {
+    let refuse = |why: String| {
+        (
+            [(SET_COOKIE, cleared_cookie(is_https(&headers)))],
+            axum::response::Redirect::to(&format!("/?signin_error={}", urlencode(&why))),
+        )
+            .into_response()
+    };
+
+    if let Some(problem) = query.error {
+        return refuse(format!("the provider refused: {problem}"));
+    }
+    let (Some(code), Some(flow_state)) = (query.code, query.state) else {
+        return refuse("the provider came back without a code".into());
+    };
+
+    let arrived =
+        match crate::oidc::finish(&state.oidc.0, &state.oidc.1, &code, &flow_state).await {
+            Ok(arrived) => arrived,
+            Err(why) => return refuse(why),
+        };
+
+    let agent = headers.get(USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let db = state.db.clone();
+    let signed = tokio::task::spawn_blocking(move || adopt(&db, &arrived, agent.as_deref())).await;
+
+    match signed {
+        Ok(Ok(token)) => (
+            [(SET_COOKIE, session_cookie(&token, is_https(&headers)))],
+            axum::response::Redirect::to("/"),
+        )
+            .into_response(),
+        Ok(Err(why)) => refuse(why),
+        Err(e) => refuse(format!("the sign-in was interrupted: {e}")),
+    }
+}
+
+/// Find or make the account behind an address, and start a session for it.
+///
+/// The role comes from `kvad.toml` every time: with a provider in charge of
+/// identity, the file is in charge of authority, and a role set by hand in
+/// Settings lasts until the next sign-in. The one exception is the rule that
+/// keeps at least one administrator — if applying the config would leave
+/// none, the old role stays and the refusal is logged rather than locking
+/// everybody out of their own server.
+fn adopt(
+    db: &crate::db::Db,
+    arrived: &crate::oidc::Arrived,
+    agent: Option<&str>,
+) -> Result<String, String> {
+    let want = if arrived.admin { "admin" } else { "user" };
+
+    let existing = users::by_email(db, &arrived.email).map_err(|e| e.to_string())?;
+    let user = match existing {
+        Some(user) => {
+            if user.role != want {
+                if let Err(e) = users::set_role(db, user.id, want) {
+                    tracing::warn!("keeping {}'s role as {}: {e}", user.name, user.role);
+                }
+            }
+            user
+        }
+        None => {
+            // A name that is free: `ada`, then `ada-2`, and so on. Two people
+            // at different providers can share a local part.
+            let base = crate::oidc::name_for(&arrived.email, arrived.name.as_deref());
+            let mut name = base.clone();
+            for n in 2..100 {
+                match users::by_name(db, &name).map_err(|e| e.to_string())? {
+                    None => break,
+                    Some(_) => name = format!("{base}-{n}"),
+                }
+            }
+            users::create(db, &name, None, want, Some(&arrived.email)).map_err(|e| e.to_string())?
+        }
+    };
+
+    users::open_session(db, user.id, agent).map_err(|e| e.to_string())
+}
+
+/// Percent-encode for a query string. Only what a message can contain.
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            b' ' => "+".to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

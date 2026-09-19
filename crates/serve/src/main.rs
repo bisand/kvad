@@ -33,6 +33,7 @@ mod conversations;
 mod db;
 mod engine;
 mod models;
+mod oidc;
 mod openai;
 mod scheduler;
 mod secret;
@@ -149,12 +150,17 @@ async fn run(args: Args) -> Res<()> {
     // it is used or when the server restarts.
     let setup = std::sync::Arc::new(auth::Setup::default());
     let accounts = users::count(&db)?;
-    let first_run = cfg.auth.mode != config::Mode::None && accounts == 0;
+    // Not in OIDC mode: the first account there is made by the first person
+    // on the allow-list who signs in, so a setup token would be a second way
+    // in that nobody needs.
+    let first_run =
+        matches!(cfg.auth.mode, config::Mode::Local | config::Mode::Basic) && accounts == 0;
 
     let state = auth::State {
-        auth: auth::provider(cfg.auth.mode)?.into(),
+        auth: auth::provider(cfg.auth.mode, &cfg.auth.oidc)?.into(),
         engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader())),
         setup: std::sync::Arc::clone(&setup),
+        oidc: std::sync::Arc::new((cfg.auth.oidc.clone(), oidc::Flows::default())),
         started: std::time::Instant::now(),
         db,
     };
@@ -175,6 +181,9 @@ async fn run(args: Args) -> Res<()> {
     println!("kvad-serve listening on http://{bound}");
     println!("  config     {}", config_path.display());
     println!("  database   {} (schema {schema})", cfg.database.path.display());
+    if cfg.auth.mode == config::Mode::Oidc {
+        println!("  provider   {}", cfg.auth.oidc.issuer);
+    }
     println!("  auth       {}{}", cfg.auth.mode, match accounts {
         0 => String::new(),
         1 => " · 1 account".into(),

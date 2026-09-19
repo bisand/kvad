@@ -20,8 +20,37 @@ bind = "127.0.0.1:8080"
 # path = "/var/lib/kvad/kvad.db"
 
 [auth]
-# "none" is the only mode implemented. "local" (username and password),
-# "basic" and "oidc" are named here because the name is what people write
-# down; asking for one of them now makes the server refuse to start rather
-# than quietly let everybody in.
+# One of:
+#
+#   none   anyone who can reach the socket is an administrator. Loopback only,
+#          which the server enforces before it opens the socket.
+#   local  a name and a password, against this server's own accounts, with a
+#          session cookie. The first account is made against a one-time token
+#          printed to the terminal.
+#   basic  the same accounts over HTTP Basic, for scripts and for a reverse
+#          proxy that would rather forward a header than a cookie.
+#   oidc   an external identity provider; see below.
+#
+# API keys work alongside every mode with accounts: bearer tokens for /v1 and
+# everything else, carrying their owner's role.
 mode = "none"
+
+# Only read when mode = "oidc". Authorization code with PKCE.
+#
+# [auth.oidc]
+# issuer = "https://accounts.google.com"
+# client_id = "…"
+# client_secret = "…"          # omit for a public client
+# redirect_url = "https://kvad.example.com/api/auth/oidc/callback"
+#
+# Who may sign in. At least one of these is required: a provider will happily
+# authenticate every account it has, and deciding who may use *this machine*
+# is not its job.
+# allow_emails = ["ada@example.com"]
+# allow_domains = ["example.com"]
+#
+# Who is an administrator. Recomputed at every sign-in, so this file — not the
+# Settings page — is the source of truth while this mode is in force.
+# admin_emails = ["ada@example.com"]
+# role_claim = "groups"        # a claim in the ID token holding group names
+# admin_roles = ["kvad-admins"]

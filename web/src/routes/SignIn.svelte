@@ -8,9 +8,12 @@
   let password = $state("");
   let token = $state("");
   let busy = $state(false);
-  let problem = $state(null);
+  // Either something this page just tried, or what the provider sent us back
+  // with — the OIDC callback has nowhere to put an error but the URL.
+  let problem = $state(new URLSearchParams(location.search).get("signin_error"));
 
   const setting_up = $derived(auth.needsSetup);
+  const through_provider = $derived(auth.mode === "oidc");
 
   async function submit(event) {
     event.preventDefault();
@@ -35,6 +38,23 @@
       <p class="mt-1 text-sm opacity-60">transformers from scratch</p>
     </div>
 
+    {#if through_provider}
+      <div class="card bg-base-100 border-base-300 border">
+        <div class="card-body gap-4">
+          <h1 class="text-lg font-medium">Sign in</h1>
+          <p class="text-sm opacity-70">
+            This server hands identity to a provider. You will come back here once it
+            knows who you are.
+          </p>
+          {#if problem}
+            <div role="alert" class="alert alert-error text-sm">{problem}</div>
+          {/if}
+          <!-- An ordinary link, not a fetch: the provider answers with a
+               redirect to itself, which the browser has to follow. -->
+          <a class="btn btn-primary" href="/api/auth/oidc/start">Continue to the provider</a>
+        </div>
+      </div>
+    {:else}
     <form class="card bg-base-100 border-base-300 border" onsubmit={submit}>
       <div class="card-body gap-4">
         {#if setting_up}
@@ -95,6 +115,7 @@
         </button>
       </div>
     </form>
+    {/if}
 
     {#if auth.mode === "basic"}
       <p class="mt-4 text-center text-xs opacity-60">

@@ -306,13 +306,37 @@ impl Provider for Basic {
     }
 }
 
+/// An external identity provider decides who somebody is; this server decides
+/// what they may do about it.
+///
+/// Signing in does not happen through `identify` at all — it happens at
+/// `/api/auth/oidc/callback`, which ends in a session like any other. So this
+/// looks exactly like [`Local`] once somebody is in, and the whole of the
+/// difference is in [`crate::oidc`].
+pub struct Oidc;
+
+impl Provider for Oidc {
+    fn mode(&self) -> Mode {
+        Mode::Oidc
+    }
+
+    fn identify(&self, presented: &Presented, db: &Db) -> Option<Identity> {
+        match presented {
+            Presented::Cookie(token) => {
+                users::from_session(db, token).ok().flatten().map(|u| Identity::of(&u))
+            }
+            other => by_key(other, db),
+        }
+    }
+}
+
 /// The provider for a mode, or an error naming the mode that has none yet.
-pub fn provider(mode: Mode) -> Result<Box<dyn Provider>, String> {
+pub fn provider(mode: Mode, _oidc: &crate::config::Oidc) -> Result<Box<dyn Provider>, String> {
     match mode {
         Mode::None => Ok(Box::new(NoAuth)),
         Mode::Local => Ok(Box::new(Local)),
         Mode::Basic => Ok(Box::new(Basic)),
-        other => Err(format!("auth mode `{other}` is not implemented yet")),
+        Mode::Oidc => Ok(Box::new(Oidc)),
     }
 }
 
@@ -356,6 +380,9 @@ pub struct State {
     pub auth: std::sync::Arc<dyn Provider>,
     pub engine: std::sync::Arc<crate::scheduler::Scheduler>,
     pub setup: std::sync::Arc<Setup>,
+    /// What an identity provider was told, and the sign-ins waiting on it.
+    /// Empty and unused in every other mode.
+    pub oidc: std::sync::Arc<(crate::config::Oidc, crate::oidc::Flows)>,
     pub started: std::time::Instant,
 }
 

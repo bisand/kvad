@@ -49,6 +49,8 @@ pub fn routes() -> Router<State> {
         .route("/api/auth/login", post(crate::accounts::sign_in))
         .route("/api/auth/logout", post(crate::accounts::sign_out))
         .route("/api/auth/setup", post(crate::accounts::setup))
+        .route("/api/auth/oidc/start", get(crate::accounts::oidc_start))
+        .route("/api/auth/oidc/callback", get(crate::accounts::oidc_callback))
         .route("/api/auth/password", post(crate::accounts::change_password))
         .route("/api/users", get(crate::accounts::list_users).post(crate::accounts::create_user))
         .route(

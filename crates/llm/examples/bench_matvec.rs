@@ -71,9 +71,18 @@ fn bench_batch(label: &str, rows: usize, cols: usize, m: usize) {
     let xs: Vec<f32> = (0..m * cols).map(|_| rng.normal()).collect();
 
     println!("\n{label}  [{rows} x {cols}] x {m} tokens");
+    let f32w = Weight::quantize(t.clone(), Precision::F32);
     let w = Weight::quantize(t, Precision::Q8);
-    for (name, allow) in [("q8 sdot", false), ("q8 smmla", true)] {
-        let run = || w.matmul_bt_with(&xs, m, None, allow);
+    let mut baseline = 0.0f64;
+    for (name, allow) in [("f32 gemm", false), ("q8 sdot", false), ("q8 smmla", true)] {
+        let is_f32 = name.starts_with("f32");
+        let run = || {
+            if is_f32 {
+                f32w.matmul_bt_with(&xs, m, None, false)
+            } else {
+                w.matmul_bt_with(&xs, m, None, allow)
+            }
+        };
         for _ in 0..2 {
             std::hint::black_box(run());
         }
@@ -91,7 +100,15 @@ fn bench_batch(label: &str, rows: usize, cols: usize, m: usize) {
             per_call = per_call.min(t0.elapsed().as_secs_f64() / iters as f64);
         }
         let gmac = (m * rows * cols) as f64 / per_call / 1e9;
-        println!("  {name:<10} {:>7.2} ms/call  {:>7.1} GMAC/s", per_call * 1e3, gmac);
+        if is_f32 {
+            baseline = per_call;
+        }
+        println!(
+            "  {name:<10} {:>7.2} ms/call  {:>7.1} GMAC/s  {:>5.2}x",
+            per_call * 1e3,
+            gmac,
+            baseline / per_call
+        );
     }
     if !llm::simd::has_i8mm() {
         println!("  (i8mm unavailable or disabled — both rows are the same kernel)");

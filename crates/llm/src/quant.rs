@@ -32,7 +32,7 @@
 //! production formats do. f32 is kept here because it is one less thing in the
 //! way.)
 
-use crate::tensor::{matvec_bt, Tensor};
+use crate::tensor::{gemm_bt, matvec_bt, Tensor};
 use rayon::prelude::*;
 
 /// Weights per block. 32 is the usual choice: small enough to isolate
@@ -525,24 +525,24 @@ impl Weight {
         if m == 1 {
             return self.matvec_bt(xs, bias);
         }
-        // f32 weights gain nothing here beyond the per-row path.
-        if let Data::F32(_) = self.data {
-            let mut out = Vec::with_capacity(m * self.rows);
-            for i in 0..m {
-                out.extend(self.matvec_bt(&xs[i * self.cols..(i + 1) * self.cols], bias));
-            }
-            return out;
-        }
 
         let (n, rows) = (self.cols, self.rows);
         let blocks = n / BLOCK;
         let use_smmla =
             allow_smmla && crate::simd::has_i8mm() && matches!(self.data, Data::Q8 { .. }) && m >= 2;
+
+        // Both precisions fill the same transposed buffer, so the layout fix-up
+        // and the bias are written once rather than per kernel.
+        let mut out_t = vec![0.0f32; rows * m];
+        if let Data::F32(t) = &self.data {
+            gemm_bt(xs, m, t, &mut out_t);
+            return Self::finish(out_t, m, rows, bias);
+        }
+
         let act = QActBatch::new(xs, m, n, use_smmla);
 
         // Computed transposed — `[rows, m]` — so each thread owns a contiguous
         // run of output rows and reads each weight row exactly once.
-        let mut out_t = vec![0.0f32; rows * m];
         out_t
             .par_chunks_mut(2 * m)
             .enumerate()
@@ -579,8 +579,12 @@ impl Weight {
                 },
             );
 
-        // Transpose into the per-token layout callers want, applying the bias
-        // on the way through.
+        Self::finish(out_t, m, rows, bias)
+    }
+
+    /// Turn the `[rows, m]` working buffer into the `[m, rows]` layout callers
+    /// want, applying the bias on the way through.
+    fn finish(out_t: Vec<f32>, m: usize, rows: usize, bias: Option<&[f32]>) -> Vec<f32> {
         let mut out = vec![0.0f32; m * rows];
         for r in 0..rows {
             let add = bias.map_or(0.0, |b| b[r]);

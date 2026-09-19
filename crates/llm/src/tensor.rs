@@ -59,13 +59,154 @@ pub fn matvec_bt(x: &[f32], w: &Tensor) -> Vec<f32> {
         .into_par_iter()
         .map(|r| {
             let row = w.row(r);
-            let mut acc = 0.0f32;
-            for i in 0..row.len() {
-                acc += x[i] * row[i];
+            // Four lanes, not one running sum: a single chain would stall on
+            // FMA latency rather than run at its throughput.
+            let mut acc = [0.0f32; 4];
+            for (wv, xv) in row.chunks_exact(4).zip(x.chunks_exact(4)) {
+                for l in 0..4 {
+                    acc[l] += wv[l] * xv[l];
+                }
             }
-            acc
+            let mut total = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+            for i in (w.cols - w.cols % 4)..w.cols {
+                total += x[i] * row[i];
+            }
+            total
         })
         .collect()
+}
+
+/// `out_t[r * m + i] = dot(xs[i], w.row(r))` — a batch of `m` activation rows
+/// against every row of `w`, written transposed as `[rows, m]`.
+///
+/// # Register tiling
+///
+/// The naive version of this is the one it replaces: call [`matvec_bt`] once
+/// per activation row. That reads the entire weight matrix `m` times, which
+/// for a prompt of 64 tokens means 64 passes over hundreds of megabytes.
+///
+/// Instead, each weight row is loaded once and used against **four** activation
+/// rows before being discarded. The four running sums live in registers for
+/// the whole row, so the weight value loaded at `k` is multiplied four times
+/// before anything is stored. That is the entire idea behind blocked GEMM:
+/// raise the number of arithmetic operations per byte fetched, until the
+/// bottleneck moves from memory to the FPU.
+///
+/// Within a tile there are 16 independent accumulators — four activation rows
+/// times four lanes across `k`. Independence matters twice over: it lets the
+/// compiler vectorise (float addition is not associative, so it may not
+/// reorder a single chain), and it keeps enough work in flight to hide FMA
+/// latency.
+pub fn gemm_bt(xs: &[f32], m: usize, w: &Tensor, out_t: &mut [f32]) {
+    assert_eq!(xs.len(), m * w.cols, "gemm_bt shape mismatch");
+    assert_eq!(out_t.len(), w.rows * m, "gemm_bt output shape mismatch");
+    let k = w.cols;
+    let nb = k / 4;
+    let tail = nb * 4;
+
+    out_t.par_chunks_mut(RB * m).enumerate().for_each(|(rb, dst)| {
+        let r0 = rb * RB;
+        let rows_here = dst.len() / m;
+
+        let mut t0 = 0;
+        while t0 + TB <= m {
+            if rows_here == RB {
+                // The 4x4 micro-kernel: the whole point of the exercise.
+                let mut acc = [[[0.0f32; 4]; TB]; RB];
+                for b in 0..nb {
+                    let o = b * 4;
+                    // Four weight vectors and four activation vectors are
+                    // loaded, then used for sixteen multiply-accumulates. The
+                    // one-row version managed four. Arithmetic per byte
+                    // fetched is what decides whether a GEMM runs at memory
+                    // speed or at FPU speed.
+                    let mut wv = [[0.0f32; 4]; RB];
+                    for (r, v) in wv.iter_mut().enumerate() {
+                        v.copy_from_slice(&w.data[(r0 + r) * k + o..(r0 + r) * k + o + 4]);
+                    }
+                    let mut xv = [[0.0f32; 4]; TB];
+                    for (t, v) in xv.iter_mut().enumerate() {
+                        v.copy_from_slice(&xs[(t0 + t) * k + o..(t0 + t) * k + o + 4]);
+                    }
+                    for r in 0..RB {
+                        for t in 0..TB {
+                            for l in 0..4 {
+                                // Deliberately `+= a * b` and *not*
+                                // `mul_add`, which would ask for a fused
+                                // multiply-add.
+                                //
+                                // Fusing looks strictly better -- one
+                                // instruction instead of two, and more
+                                // accurate, since `fma` rounds once where
+                                // `a * b + c` rounds twice. Measured here it
+                                // is nearly twice as *slow*: an `fmla` needs
+                                // all three operands live at once, and with 16
+                                // accumulators plus 8 operands already in
+                                // flight that pushes past the 32 vector
+                                // registers and spills to the stack. The
+                                // cheaper instruction loses to the extra
+                                // memory traffic.
+                                acc[r][t][l] += wv[r][l] * xv[t][l];
+                            }
+                        }
+                    }
+                }
+                for r in 0..RB {
+                    for t in 0..TB {
+                        let a = &acc[r][t];
+                        let mut total = (a[0] + a[1]) + (a[2] + a[3]);
+                        for j in tail..k {
+                            total += w.data[(r0 + r) * k + j] * xs[(t0 + t) * k + j];
+                        }
+                        dst[r * m + t0 + t] = total;
+                    }
+                }
+            } else {
+                for r in 0..rows_here {
+                    for t in 0..TB {
+                        dst[r * m + t0 + t] =
+                            dot(&w.data[(r0 + r) * k..(r0 + r + 1) * k], &xs[(t0 + t) * k..(t0 + t + 1) * k]);
+                    }
+                }
+            }
+            t0 += TB;
+        }
+
+        // Whatever is left when the batch is not a multiple of TB.
+        while t0 < m {
+            for r in 0..rows_here {
+                dst[r * m + t0] =
+                    dot(&w.data[(r0 + r) * k..(r0 + r + 1) * k], &xs[t0 * k..(t0 + 1) * k]);
+            }
+            t0 += 1;
+        }
+    });
+}
+
+/// Weight rows and activation rows per micro-kernel tile.
+///
+/// 4x4 keeps 16 accumulator vectors plus 8 operand vectors live, which fits
+/// aarch64's 32 vector registers with room to spare. Larger tiles spill.
+const RB: usize = 4;
+const TB: usize = 4;
+
+/// Plain four-lane dot product, for the edges of the tiling.
+///
+/// Four lanes rather than one running sum, for the usual reason: float
+/// addition is not associative, so a single accumulator chain runs at FMA
+/// latency instead of throughput.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 4];
+    for (av, bv) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        for l in 0..4 {
+            acc[l] += av[l] * bv[l];
+        }
+    }
+    let mut total = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    for j in (a.len() - a.len() % 4)..a.len() {
+        total += a[j] * b[j];
+    }
+    total
 }
 
 /// Layer normalisation: centre, scale to unit variance, then apply a learned
@@ -234,6 +375,37 @@ impl Rope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemm_matches_running_the_rows_one_at_a_time() {
+        // Shapes chosen to exercise both the 4-row tile and the leftovers, and
+        // a `cols` that is not a multiple of 4.
+        for (rows, cols, m) in [(9usize, 13usize, 7usize), (8, 16, 4), (5, 32, 1), (6, 8, 9)] {
+            let mut seed = 0x1234_5678u64;
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 40) as f32 / 8_388_608.0) - 1.0
+            };
+            let w = Tensor::new(rows, cols, (0..rows * cols).map(|_| next()).collect());
+            let xs: Vec<f32> = (0..m * cols).map(|_| next()).collect();
+
+            let mut out_t = vec![0.0f32; rows * m];
+            gemm_bt(&xs, m, &w, &mut out_t);
+
+            for i in 0..m {
+                let single = matvec_bt(&xs[i * cols..(i + 1) * cols], &w);
+                for r in 0..rows {
+                    let (a, b) = (single[r], out_t[r * m + i]);
+                    assert!(
+                        (a - b).abs() < 1e-5,
+                        "{rows}x{cols} m={m} row {i} out {r}: gemm {b} vs matvec {a}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn transpose_swaps_axes_and_is_its_own_inverse() {

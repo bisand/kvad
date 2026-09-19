@@ -165,9 +165,9 @@ Measured on Qwen2.5-0.5B (494M parameters, M5 Pro, 18 threads):
 
 | | weights | tok/s | `first 8 primes` |
 |---|---|---|---|
-| f32 | 1976 MB | ~23 | `2, 3, 5, 7, 11, 13, 17, 19` |
-| q8 | 556 MB (3.6x) | ~35 (1.5x) | `2, 3, 5, 7, 11, 13, 17, 19` |
-| q4 | 309 MB (6.4x) | ~34 (1.5x) | `11, 13, 17, 19, 23, 29, 31, 37` |
+| f32 | 1976 MB | ~34 | `2, 3, 5, 7, 11, 13, 17, 19` |
+| q8 | 556 MB (3.6x) | ~38 | `2, 3, 5, 7, 11, 13, 17, 19` |
+| q4 | 309 MB (6.4x) | ~37 | `11, 13, 17, 19, 23, 29, 31, 37` |
 
 **q8 is free; q4 is not.** q8 reproduced f32 exactly on every test — including
 with the activations quantised as well. q4 broke all three: it misses the
@@ -233,10 +233,10 @@ pure overhead. Measured here: 4.9x on the 153 MB output head, but below 1x on a
 
 | | f32 | q8 |
 |---|---|---|
-| Qwen2.5-0.5B | ~23 tok/s | ~35 tok/s |
+| Qwen2.5-0.5B | ~34 tok/s | ~38 tok/s |
 | GPT-2-medium | ~35 tok/s | ~49 tok/s |
 
-**A 4.9x kernel bought about 1.4x overall.** That gap is the whole lesson in
+**A 4.9x kernel bought well under 1.4x overall.** That gap is the whole lesson in
 optimisation: the output head is one matmul out of 169 per token, and
 everything else — the cache-resident per-layer matrices, attention, the norms,
 the softmax — did not get faster. Amdahl's law, measured rather than quoted.
@@ -274,12 +274,19 @@ Prefill, 654 tokens, Qwen2.5-0.5B, q8:
 
 | | time | |
 |---|---|---|
-| one token at a time (`LLM_PREFILL_CHUNK=1`) | 18.04 s | |
-| batched, `SDOT` (`LLM_NO_I8MM=1`) | 2.80 s | **6.4x** from batching |
-| batched, `SMMLA` | 2.20 s | **1.27x** more from i8mm |
+| one token at a time (`LLM_PREFILL_CHUNK=1`) | 18.7 s | |
+| batched f32 GEMM | 2.81 s | **6.6x** from batching |
+| batched q8, `SDOT` (`LLM_NO_I8MM=1`) | 2.72 s | |
+| batched q8, `SMMLA` | 2.18 s | **1.25x** more from i8mm |
 
-8.2x overall, and 26.5 ms/token becomes 3.3 ms/token. Decoding is untouched —
-it is still a matrix-vector product, and still the same speed.
+Prefill drops from ~28 ms/token to ~3.3 ms/token. Decoding is untouched — it is
+still a matrix-vector product, and still the same speed.
+
+Note where f32 lands: **2.81 s against q8's 2.72 s.** Once the weights are
+reused across a batch, prefill is compute-bound, and quantisation is an
+answer to a memory problem. On the smaller `q_proj` matrix the f32 GEMM is
+actually *faster* than the q8 `SDOT` path, because unpacking and rescaling cost
+more than the bytes they save. Quantisation is a decode optimisation.
 
 `i8mm` is worth more than 1.27x on a single core: 2.04x at
 `RAYON_NUM_THREADS=1`. With all 18 threads running, memory bandwidth becomes
@@ -320,6 +327,57 @@ answers:
 
 Three different numbers for the same instruction, all measured, none of them
 right until the last one. Worth remembering before quoting a speedup.
+
+### The f32 GEMM, and register tiling
+
+Batching only helped the quantised paths at first: with f32 weights `matmul_bt`
+still called the matrix-vector kernel once per token, which reads the whole
+weight matrix `m` times. [`gemm_bt`](crates/llm/src/tensor.rs) fixes that, and
+the fix is the classic one.
+
+A first attempt kept one weight row live and ran it against four activation
+rows. That loads 5 vectors per 4 multiply-accumulates — the loop spends its
+time fetching, not computing. The **4x4 micro-kernel** loads four weight
+vectors and four activation vectors, then does sixteen multiply-accumulates
+with them:
+
+| tile | loads per 4-wide step | FMAs | GMAC/s |
+|---|---|---|---|
+| 1 row x 4 tokens | 5 | 4 | 78.9 |
+| 4 rows x 4 tokens | 8 | 16 | **204.5** |
+
+Same arithmetic, same memory traffic from RAM, 2.6x the throughput. The only
+thing that changed is how many times each fetched value gets used before it is
+thrown away. That ratio — arithmetic per byte fetched — is what decides whether
+a GEMM runs at memory speed or at FPU speed, and 4x4 is sized so the 16
+accumulator vectors plus 8 operand vectors fit in aarch64's 32 vector
+registers.
+
+### The optimisation that wasn't
+
+Rust compiles `acc += a * b` to a separate `fmul` and `fadd`. It will not fuse
+them on its own, because fusing changes the result: `a * b + c` rounds twice,
+`fma(a, b, c)` rounds once. `f32::mul_add` asks for the fused form explicitly.
+
+One instruction instead of two, *and* more accurate. It should be free money.
+Measured across four tile shapes, it was consistently **worse** — 204 GMAC/s
+became 93–116:
+
+| | 4x4 | 4x2 | 2x4 | 2x2 |
+|---|---|---|---|---|
+| `mul_add` | 93.3 | 116.3 | 103.1 | 80.4 |
+| `+= a * b` | **204.5** | | | |
+
+An `fmla` needs all three operands live simultaneously. With 16 accumulators
+and 8 operands already in flight, that tips the tile past the register file and
+it spills to the stack. The cheaper instruction lost to the extra memory
+traffic it caused.
+
+In [`matvec_bt`](crates/llm/src/tensor.rs), where only four accumulators are
+live, `mul_add` made no measurable difference at all — that kernel is
+bandwidth-bound at ~220 GB/s, so its instruction count is irrelevant. Which is
+the more useful half of the lesson: an optimisation is a claim about the
+bottleneck, and if you have not measured the bottleneck you are guessing.
 
 ### Verifying you got it right
 
@@ -372,21 +430,17 @@ state management — good Rust, no ML. Build it last.
 load, which means still reading the full f32 checkpoint off disk. Writing the
 blocks out once would make startup and disk footprint match the memory win.
 
-**5. A real f32 GEMM.** Batched prefill only helps the quantised paths; with
-f32 weights `matmul_bt` still loops row by row, which is why f32 prefill is
-unchanged at 26.5 ms/token. The same blocking would apply.
-
-**6. GPU, via [`candle`](https://github.com/huggingface/candle).** HuggingFace's
+**5. GPU, via [`candle`](https://github.com/huggingface/candle).** HuggingFace's
 Rust framework, Metal backend. You will recognise every operation because you
 wrote them by hand first. 48 GB of unified memory holds a quantised 30B model.
 
-**7. Train your own.** A character-level transformer, 10–30M parameters, on a
+**6. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Needs backprop through attention, layernorm and softmax, plus
 Adam. The gradient check from crate 1 is how you will debug it — extend
 `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
-**8. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
+**7. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike
 full fine-tuning it fits on a laptop.
 

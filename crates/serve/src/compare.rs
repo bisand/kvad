@@ -546,6 +546,26 @@ mod tests {
     use crate::db::Db;
     use std::path::PathBuf;
 
+    /// Keep the tests out of the developer's own configuration.
+    ///
+    /// Loading a model sets the active one, and the active one lives in
+    /// `$XDG_CONFIG_HOME/kvad/state.json` — which without this is the real
+    /// file, so a test run would leave `kvad run` pointing at a temporary
+    /// directory it had already deleted. It did, once, which is why this
+    /// exists.
+    ///
+    /// Once for the whole process: the tests are threads in one binary, and
+    /// an environment variable is process-wide however many of them there
+    /// are.
+    fn somewhere_harmless() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("kvad-test-config-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        });
+    }
+
     /// A real model, trained here, in about a second.
     ///
     /// The plan asks for the API tests to run against a `nanograd`-trained
@@ -553,6 +573,7 @@ mod tests {
     /// gigabytes. Everything below this line is the real engine: the real
     /// loader, the real scheduler, the real tokenizer.
     pub fn tiny_model(name: &str) -> PathBuf {
+        somewhere_harmless();
         use nanograd::model::{Gpt, GptConfig};
         use nanograd::optim::AdamW;
         use nanograd::rng::Rng;

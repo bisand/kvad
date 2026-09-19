@@ -76,6 +76,13 @@ export const PAGES = [
     icon: "M22 12h-4l-3 9L9 3l-3 9H2",
   },
   {
+    path: "/api",
+    label: "API",
+    phase: null,
+    blurb: "Every endpoint this server answers, and what may call it.",
+    icon: "M8 3H7a2 2 0 0 0-2 2v4a2 2 0 0 1-2 2 2 2 0 0 1 2 2v4a2 2 0 0 0 2 2h1M16 3h1a2 2 0 0 1 2 2v4a2 2 0 0 0 2 2 2 2 0 0 0-2 2v4a2 2 0 0 1-2 2h-1",
+  },
+  {
     path: "/settings",
     label: "Settings",
     phase: null,

@@ -5,21 +5,33 @@
 //!     kvad-serve --config path/kvad.toml
 //!
 //! It loads config, opens and migrates a database, decides who a request is
-//! from, manages and runs models, and serves the UI. Training, evals and
-//! monitoring are still to come; see `docs/ui-plan.md`.
+//! from, manages and runs models, trains them, scores them, measures them,
+//! watches itself doing all of it, and serves the UI. `docs/ui-plan.md` is
+//! the plan it was built from, phase by phase.
 //!
 //! # The shape of it
 //!
 //! * [`config`] — the few things that must be known before anything starts.
 //! * [`db`] — SQLite, and the migrations that shape it.
-//! * [`auth`] — who a request is from, and the seam the other modes fit into.
+//! * [`auth`] / [`users`] / [`accounts`] / [`oidc`] — who a request is from,
+//!   and the seam the four modes fit into.
 //! * [`engine`] — which backends this build can load.
 //! * [`scheduler`] — the one owner of the engine thread, and the queue in
 //!   front of it.
 //! * [`models`] — what is on this machine and what the engine holds.
 //! * [`chat`] / [`conversations`] — conversations, stored and served.
 //! * [`openai`] — `/v1`, shaped by somebody else's documentation.
+//! * [`jobs`] — work that outlives the request that asked for it, and the
+//!   two kinds that are not comparisons: downloads and training runs.
+//! * [`training`] / [`datasets`] — starting runs, and the text they read.
+//! * [`compare`] / [`evals`] / [`bench`] — running the same thing against
+//!   several models, which with one model at a time is a sequence.
+//! * [`playground`] — the model without the conversation around it.
+//! * [`metrics`] / [`watching`] / [`machine`] / [`monitoring`] — what the
+//!   server has been doing, in memory and in the database.
 //! * [`api`] — the routing table, and what every handler shares.
+//! * [`openapi`] — that table, described, with a test that says the
+//!   description and the router are the same server.
 //! * [`assets`] — the built UI, embedded, with everything else falling back
 //!   to it so a client-side router survives a reload.
 
@@ -43,6 +55,7 @@ mod models;
 mod monitoring;
 mod oidc;
 mod openai;
+mod openapi;
 mod playground;
 mod scheduler;
 mod secret;

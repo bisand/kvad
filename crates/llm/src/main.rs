@@ -10,6 +10,7 @@
 //!     kvad info [--model R]  read the config without downloading weights
 //!     kvad run  [--model R] [--prompt TEXT]
 //!     kvad chat [--model R] [--system TEXT]
+//!     kvad serve [...]       the HTTP server and web UI
 //!
 //! Sampling flags: --max-tokens N --temperature F --top-k N --top-p F --seed N
 //! --greedy
@@ -109,7 +110,8 @@ fn usage() -> ! {
            cache [REPO|clear]  list or delete pre-quantised weight files\n  \
            info                show a model's config without downloading weights\n  \
            run                 one-shot completion\n  \
-           chat                interactive conversation\n\n\
+           chat                interactive conversation\n  \
+           serve [...]         HTTP server and web UI; options are passed through\n\n\
          options:\n  \
            --model MODEL       a name trained here, a directory, or a Hub repo id\n  \
            \u{20}                   (default: active, else {DEFAULT_MODEL})\n  \
@@ -265,7 +267,73 @@ fn load(args: &Args) -> Res<Llm> {
     Ok(llm)
 }
 
+/// Hand over to `kvad-serve`, passing everything through.
+///
+/// # Why this is an exec and not a function call
+///
+/// `kvad-serve` depends on this crate — it is built around this engine — so
+/// this crate cannot depend on it back. Cargo would refuse the cycle, and it
+/// would be right to: the server knows about the engine and the engine must
+/// not know about the server.
+///
+/// So there are two binaries, and this subcommand is the bridge. It looks
+/// beside itself first, which is where `cargo build` and any sane
+/// installation put them both, and then on `PATH`.
+///
+/// On Unix it *replaces* this process rather than spawning a child. That
+/// matters more than it looks: Ctrl-C reaches the server directly, its exit
+/// status is this command's exit status, and there is no parent sitting in
+/// the process table forwarding signals it might get wrong.
+fn serve(args: Vec<std::ffi::OsString>) -> ! {
+    const BIN: &str = "kvad-serve";
+
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(BIN)))
+        .filter(|path| path.is_file());
+
+    let mut command = std::process::Command::new(match &beside {
+        Some(path) => path.as_os_str(),
+        // Not beside us: let the OS look on PATH, and if that fails the error
+        // below says what to do about it.
+        None => std::ffi::OsStr::new(BIN),
+    });
+    command.args(args);
+
+    #[cfg(unix)]
+    let failure = {
+        use std::os::unix::process::CommandExt;
+        // Only returns if the exec failed.
+        command.exec()
+    };
+    #[cfg(not(unix))]
+    let failure = match command.status() {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(e) => e,
+    };
+
+    // Printed and exited rather than returned: `main` reports a
+    // `Box<dyn Error>` with `Debug`, which would show this as one line with
+    // `\n` in it, and the whole point of it is that somebody reads it.
+    eprintln!(
+        "could not start `{BIN}`: {failure}\n\n\
+         It is a separate binary, because the server depends on this engine and so\n\
+         cannot be linked into it. Build it once:\n\n    \
+         cargo build --release -p kvad-serve\n\n\
+         and it will be found beside this one."
+    );
+    std::process::exit(1);
+}
+
 fn main() -> Res<()> {
+    // Handled before anything else is parsed, because everything after
+    // `serve` belongs to the server and this program must not have opinions
+    // about it.
+    let mut raw = std::env::args_os().skip(1);
+    if raw.next().is_some_and(|first| first == "serve") {
+        serve(raw.collect());
+    }
+
     let args = parse_args();
 
     match args.command.as_str() {

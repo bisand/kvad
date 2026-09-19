@@ -22,7 +22,7 @@ per operator — and the stretch before it is where the lessons are. Where
 legibility and speed genuinely conflict, this repo says which it chose and
 measures what it cost.
 
-Four crates, meant to be read in order:
+Five crates, meant to be read in order:
 
 | Crate | What it is | Dependencies |
 |---|---|---|
@@ -30,10 +30,13 @@ Four crates, meant to be read in order:
 | [`kvad`](crates/llm) | Transformer inference from scratch. Two architectures, real HuggingFace weights. | hub client, tokenizer, safetensors |
 | [`kvad-gpu`](crates/gpu) | The same Llama forward pass on the GPU, in candle. | candle (Metal/CUDA) |
 | [`kvad-tui`](crates/tui) | Terminal app: browse, download, activate, chat. | ratatui |
+| [`kvad-serve`](crates/serve) | HTTP server and web UI: manage, train, score, benchmark, watch. | axum, rusqlite, Svelte |
 
 The first two use no ML framework at all. The third is the same model handed to
 one, so the two can be compared — and so the hand-written version has something
-honest to be measured against.
+honest to be measured against. The last two are applications: no ML in either,
+and the place to see what an engine has to expose before anything can be built
+on it.
 
 ### Where this actually stands
 
@@ -67,6 +70,9 @@ cargo run --release -p kvad -- run --model readme --prompt "## "
 cargo run --release -p kvad -- run --prompt "Why is the sky blue?"
 cargo run --release -p kvad-gpu -- run --prompt "Why is the sky blue?"
 cargo run --release -p kvad-tui
+
+cd web && npm ci && npm run build && cd ..   # once, for the web UI
+cargo run --release -p kvad-serve            # then http://127.0.0.1:8080
 ```
 
 Verified on an M5 Pro:
@@ -1418,6 +1424,134 @@ state management — good Rust, no ML. Build it last.
 
 ---
 
+## Crate 5: `kvad-serve` — the server, and the web UI
+
+```bash
+cd web && npm ci && npm run build && cd ..
+cargo build --release -p kvad-serve
+kvad serve                         # loopback on 8080, no auth
+kvad serve --bind 0.0.0.0:8080     # needs an auth mode, or --insecure
+```
+
+One binary. `rust-embed` bakes `web/dist` into it, so there is nothing to copy
+beside it and nothing to serve it with. `cargo build` never runs npm — a Rust
+build that silently downloads a JavaScript dependency tree is not a Rust build
+— so `web/dist` is built by hand, and a binary built without it serves a page
+saying exactly that.
+
+`kvad serve` is a subcommand of the CLI that hands over to this binary. It has
+to be a hand-over rather than a function call: `kvad-serve` depends on the
+engine crate, so the engine crate cannot depend on it back, and Cargo would be
+right to refuse the cycle. On Unix it `exec`s, so Ctrl-C reaches the server and
+its exit status is yours.
+
+Ten pages: a dashboard, model management, chat, a playground, training,
+datasets, evals, benchmarks, monitoring and settings — plus the API's own
+documentation at `/api`. Four authentication modes (`none`, `local`, `basic`,
+`oidc`), roles, API keys. SQLite for everything the filesystem cannot answer.
+`docs/ui-plan.md` is the plan it was built from, and each phase in it records
+what that phase measured and which of its open questions closed.
+
+### One model at a time, said out loud
+
+The engine holds one loaded model and runs one generation at a time. Every
+awkward thing about this server follows from that, and the design is mostly a
+series of decisions about where to be honest about it.
+
+A **scheduler** owns the engine thread and everything queues behind it, so
+queue depth is a number on the dashboard rather than a mutex nobody can see.
+**Comparisons are sequences**: the Playground's "side by side" and the
+Benchmarks page both load each variant in turn, and both say so on the page
+rather than implying a race. **Training is not queued behind chat, or chat
+behind training** — that one was measured rather than assumed, and the
+measurement is below.
+
+### What it measures, and what it refuses to
+
+Three numbers on this page have been wrong before, which is why the server has
+a benchmark in it rather than a shell script:
+
+- A **round visits every variant once**, and a run is several rounds. Five of A
+  then five of B blames the model for whatever changed about the machine in
+  between.
+- **Median and range**, from samples that are all kept. Two ranges that overlap
+  are two numbers that have not been told apart, and a page that showed one
+  average each would hide that.
+- **Every timed generation drops the KV cache first**, or the second round
+  reports a time to first token that no first run would ever see.
+- A benchmark **will not start** while a training run, an eval or another
+  benchmark is going, and the refusal names what is in the way.
+
+On an 18-core M-series machine, decoding SmolLM2-135M:
+
+| | median | range |
+|---|---|---|
+| idle | 70–84 tok/s | 53–92 |
+| during training, all cores | 32–37 | 25–41 |
+| during training, capped to 8 | 47 | 42–54 |
+
+So chat during a training run runs at roughly half speed, not zero. The banner
+says "slower", because that is what was measured.
+
+And with nothing else running, q4 against q8 at 64 tokens, three rounds each:
+
+| | decode median | range | time to first token |
+|---|---|---|---|
+| q4 | 149.5 tok/s | 149.3–150.2 | 41 ms |
+| q8 | 114.6 tok/s | 97.2–118.3 | 30 ms |
+
+q4 decodes faster and reaches its first token *slower*: decoding is bound by
+memory traffic, where fewer bits win, and prefill is bound by arithmetic, where
+dequantising costs. The same split shows in scoring, where q4 took twice as
+long as q8 for the same 519 tokens.
+
+### The playground is where the logits stop being abstract
+
+Generation computes a distribution over the whole vocabulary at every step and
+throws away everything except the token it drew. The playground keeps it: click
+any token and see what else was in the running, with the model's own
+probabilities — a plain softmax over every logit, not the sampler's reweighting
+of it, so the numbers do not move when you drag the temperature slider. What
+the sampler did is a separate mark on each row saying whether top-k and top-p
+left that token in play at all. At a temperature of 0.8 with top-p 0.95, a
+confident step often leaves exactly one, which is worth seeing: there was no
+choice being made.
+
+Beside it, the tokeniser inspector. `"The cat sat on the mat, and it was 2026."`
+is sixteen tokens, and `2026` is five of them — a space, then each digit alone.
+A token is not a word and not a character, and this is where that stops being a
+thing you have read and starts being a thing you have seen.
+
+### Perplexity, and the thing the engine was missing
+
+`forward_batch` returns logits for the **last** position only, because that is
+all generation ever wants, and every intermediate row is computed and dropped.
+Scoring text wants all of them. `forward_batch_all` runs the output head over
+the whole batch as one matmul instead: about 430 tokens a second, against 114
+for decoding — the same arithmetic, a quarter of the memory traffic. It is
+checked against `nanograd`'s own logits at every position, which is the same
+second-implementation argument the checkpoint test rests on.
+
+### Testing
+
+The API tests train a two-layer GPT on "the cat sat on the mat" *inside the
+test*, save it, and then run a real prompt suite, a real benchmark and a real
+perplexity job against it through the real scheduler. Three tests, under a
+second, no network and no gigabytes.
+
+Authentication got the mutation treatment: each of fifteen checks was deleted
+in turn and the suite rerun. Two escaped the first pass — the `Admin` extractor
+and the CSRF gate had been tested through the functions underneath them and not
+through the extractors the routes are actually written against. Both have tests
+now that fail when their check is removed.
+
+And `/api/openapi.json` is generated from a table that a test compares against
+the router, by reading the source of the files that register routes. A route
+added and not documented fails the build. The first version of that test failed
+on itself: it scanned its own source and found the string it searches *with*.
+
+---
+
 ## Where to go next
 
 Two tracks, one per job. They are independent: the learning track finishes the
@@ -1472,9 +1606,15 @@ prefill is fast. Serving needs the same thing across *different sequences* at
 different positions, which means per-sequence positions in RoPE and attention,
 and admitting new requests between steps instead of between batches.
 
-**5. `kvad-serve`.** An OpenAI-compatible HTTP endpoint, so the thing can be
-pointed at by something that already exists. Deliberately last: a server around
-a single-sequence engine measures nothing interesting.
+**5. `kvad-serve`.** [Done](#crate-5-kvad-serve--the-server-and-the-web-ui) —
+an OpenAI-compatible endpoint, and a web UI around it. It was meant to be last
+for a good reason: a server around a single-sequence engine measures nothing
+interesting *about throughput*. That turned out to be a claim about one number
+rather than about the whole idea. Managing models, training them, scoring them
+and watching the machine are all useful before batching exists, and building
+the admin surface first means steps 3 and 4 land with somewhere to show their
+work. What is still true is that this server will not serve two people at once
+with any grace, and it says so rather than queuing quietly.
 
 **6. Then the hardware.** Real CUDA kernels, flash attention, speculative
 decoding. This is the stretch where legibility and speed start to fight, and

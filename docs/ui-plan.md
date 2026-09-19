@@ -3,8 +3,14 @@
 Written 2026-09-19 against the working tree after `5e551d9`, from a reading of
 `crates/llm/src/{runtime,train,weights,hub}.rs`, the TUI's actor in
 `crates/tui/src/engine.rs`, and the README's "Becoming a server" section.
-Where something is a guess it says so. The phases at the end say what is built;
-everything above them is still the plan rather than a description.
+Where something is a guess it says so. The phases at the end say what is built.
+
+**All eight phases are done.** What is above them was the plan and is now, for
+the most part, a description — but it has deliberately not been rewritten into
+one. The guesses are left where they were made, so that the phases underneath
+them can say which turned out wrong: the compute lease in Phase 4, the copy it
+asked for in the UI, and the claim in the README that a server around a
+single-sequence engine measures nothing interesting.
 
 ## What the owner asked for
 
@@ -384,8 +390,41 @@ a transaction and every migration runs in one, so the runner turns enforcement
 off around each. There is a test that upgrades a database with rows in it.
 
 
-**Phase 7 — polish.** An OpenAPI docs page, `kvad serve` as a subcommand, a
-README chapter, and a release build with the embedded UI.
+**Phase 7 — polish. Done.**
+
+- **`/api/openapi.json` is generated from a table, and a test compares that
+  table to the router** — by reading the source of the files that register
+  routes, because a `Router` has no way to list what is in it. Scanning source
+  is cruder than asking, and it has the one property that matters: a route
+  added and not documented fails the build. It was checked the way Phase 3
+  checked the auth modes, by adding a route and confirming the test names it.
+  The first version failed on itself, having scanned its own source and found
+  the string it searches *with*.
+- **The bodies are described in prose, not as schemas.** A hand-written schema
+  for forty-odd endpoints is a second copy of the handlers, and a second copy
+  drifts; the first time somebody adds a field and the schema does not, the
+  document has stopped being documentation. What is enumerated is exactly what
+  the test can check. A generator (`utoipa`) is the right answer for a codebase
+  whose handlers carry typed extractors for every body — half of these stream,
+  and the annotations would be as long as the table with the drift moved into
+  attributes where no test can see it.
+- **The docs page is ours rather than Swagger UI from a CDN.** The whole point
+  of embedding the UI is one file that runs on a machine with no internet, and
+  a documentation page that fetches 400 KB from elsewhere is not that.
+- **`kvad serve` hands over to the server binary** rather than linking it.
+  `kvad-serve` depends on the engine crate, so the engine crate cannot depend
+  on it back — Cargo would refuse the cycle, and would be right to. On Unix it
+  `exec`s rather than spawning, so Ctrl-C reaches the server and its exit
+  status is the caller's.
+- **A README chapter**, with the numbers from Phases 4 and 6 in it.
+
+**A bug this phase found in Phase 6.** `kvad` with no arguments failed with
+"there is no such directory", because the Phase 6 tests load models through the
+real engine — and loading a model sets the active one, which lives in
+`$XDG_CONFIG_HOME/kvad/state.json`. The test run had left the developer's own
+CLI pointing at a temporary directory it had then deleted. The tests now point
+`XDG_CONFIG_HOME` somewhere harmless. A test suite that writes to `~/.config`
+is a bug whatever else it proves.
 
 ## Testing
 

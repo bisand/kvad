@@ -17,6 +17,7 @@
   import Playground from "./routes/Playground.svelte";
   import Evals from "./routes/Evals.svelte";
   import Benchmarks from "./routes/Benchmarks.svelte";
+  import Api from "./routes/Api.svelte";
   import Settings from "./routes/Settings.svelte";
   import SignIn from "./routes/SignIn.svelte";
   import NotFound from "./routes/NotFound.svelte";
@@ -101,6 +102,8 @@
         <Datasets />
       {:else if page.path === "/monitoring"}
         <Monitoring />
+      {:else if page.path === "/api"}
+        <Api />
       {:else if page.path === "/settings"}
         <Settings />
       {:else}

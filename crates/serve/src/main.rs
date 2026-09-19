@@ -34,11 +34,15 @@ mod datasets;
 mod db;
 mod engine;
 mod jobs;
+mod machine;
+mod metrics;
 mod models;
+mod monitoring;
 mod oidc;
 mod openai;
 mod scheduler;
 mod secret;
+mod watching;
 mod training;
 mod users;
 
@@ -47,6 +51,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// How long per-request rows are kept. Long enough to answer "what happened
+/// last Tuesday", short enough that the table stays readable.
+const KEEP_REQUESTS_DAYS: u32 = 7;
 
 struct Args {
     config: Option<PathBuf>,
@@ -113,14 +121,20 @@ async fn main() {
     // `RUST_LOG` if it is set, otherwise our own requests and warnings from
     // everything else. A default of `info` across every dependency would bury
     // the line somebody is looking for.
+    // The tail is kept where a browser can read it as well as printed, so
+    // that "what did the server say" is answerable from a machine nobody is
+    // sitting at.
+    let metrics = std::sync::Arc::new(metrics::Metrics::new());
     tracing_subscriber::fmt()
+        .with_writer(watching::LogTail(std::sync::Arc::clone(&metrics)))
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "kvad_serve=info,tower_http=warn,warn".into()),
         )
         .init();
 
-    if let Err(e) = run(parse_args()).await {
+    if let Err(e) = run(parse_args(), metrics).await {
         // Startup failures are the ones a person reads, so they go to stderr
         // plainly rather than through the log's formatting.
         eprintln!("kvad-serve: {e}");
@@ -128,7 +142,7 @@ async fn main() {
     }
 }
 
-async fn run(args: Args) -> Res<()> {
+async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     let mut cfg = config::Config::load(&config_path)?;
     if let Some(bind) = args.bind {
@@ -168,6 +182,7 @@ async fn run(args: Args) -> Res<()> {
         auth: auth::provider(cfg.auth.mode, &cfg.auth.oidc)?.into(),
         engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader())),
         jobs: std::sync::Arc::clone(&job_runner),
+        metrics: std::sync::Arc::clone(&metrics),
         setup: std::sync::Arc::clone(&setup),
         oidc: std::sync::Arc::new((cfg.auth.oidc.clone(), oidc::Flows::default())),
         started: std::time::Instant::now(),
@@ -179,14 +194,49 @@ async fn run(args: Args) -> Res<()> {
         // Everything that is not the API is the UI, including paths that do
         // not exist as files; see `assets::serve`.
         .fallback(assets::serve)
+        // Outside the trace layer, so the time recorded is the time the
+        // client waited rather than the time the handler ran.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), watching::timed))
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
+
+    // Requests go to memory as they happen and to the database in batches:
+    // a lock on the database in the middle of every response would be a lock
+    // on the server.
+    tokio::spawn({
+        let (metrics, db) = (std::sync::Arc::clone(&metrics), state.db.clone());
+        async move {
+            let mut tick = tokio::time::interval(metrics::FLUSH_EVERY);
+            let mut since_prune = 0u32;
+            loop {
+                tick.tick().await;
+                let (m, d) = (std::sync::Arc::clone(&metrics), db.clone());
+                // An hour's worth of ticks between prunes. Cheap either way;
+                // this just keeps it off the flush path.
+                since_prune += 1;
+                let prune = since_prune >= 720;
+                if prune {
+                    since_prune = 0;
+                }
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = m.flush(&d);
+                    if prune {
+                        let _ = metrics::Metrics::prune(&d, KEEP_REQUESTS_DAYS);
+                    }
+                })
+                .await;
+            }
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await.map_err(|e| {
         format!("could not bind {}: {e}", cfg.server.bind)
     })?;
     let bound = listener.local_addr()?;
 
+    // Through `tracing` as well as stdout, so that the log tail on the
+    // Monitoring page starts with something rather than with nothing.
+    tracing::info!("listening on http://{bound}, auth {}, schema {schema}", cfg.auth.mode);
     println!("kvad-serve listening on http://{bound}");
     println!("  config     {}", config_path.display());
     println!("  database   {} (schema {schema})", cfg.database.path.display());

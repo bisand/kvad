@@ -315,6 +315,7 @@ async fn the_admin_extractor_takes_administrators_and_nobody_else() {
             Err("no backend in tests".into())
         }))),
         jobs: std::sync::Arc::new(crate::jobs::Jobs::new(db.clone())),
+        metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         setup: std::sync::Arc::new(Setup::default()),
         oidc: std::sync::Arc::new(Default::default()),
         started: std::time::Instant::now(),
@@ -349,6 +350,7 @@ async fn a_cross_site_post_is_refused_before_the_cookie_is_even_looked_up() {
             Err("no backend in tests".into())
         }))),
         jobs: std::sync::Arc::new(crate::jobs::Jobs::new(db.clone())),
+        metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         setup: std::sync::Arc::new(Setup::default()),
         oidc: std::sync::Arc::new(Default::default()),
         started: std::time::Instant::now(),

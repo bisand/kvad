@@ -183,7 +183,7 @@ impl App {
                     self.selected = self.selected.min(self.local.len().saturating_sub(1));
                 }
             }
-            Evt::Loaded { repo, summary, params, instruct, backend, weight_bytes } => {
+            Evt::Loaded { repo, summary, params, instruct, backend, weight_bytes, .. } => {
                 self.status = format!("loaded {repo}");
                 self.active =
                     Some(Active { repo, summary, params, instruct, backend, weight_bytes });

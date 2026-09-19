@@ -15,7 +15,7 @@ export const PAGES = [
   {
     path: "/",
     label: "Dashboard",
-    phase: 5,
+    phase: null,
     blurb: "Throughput, queue depth, memory and disk, and whatever is running.",
     icon: "M3 13h6v8H3zM3 3h6v7H3zM13 3h8v5h-8zM13 11h8v10h-8z",
   },
@@ -71,7 +71,7 @@ export const PAGES = [
   {
     path: "/monitoring",
     label: "Monitoring",
-    phase: 5,
+    phase: null,
     blurb: "Requests, latencies, errors, and the log as it happens.",
     icon: "M22 12h-4l-3 9L9 3l-3 9H2",
   },

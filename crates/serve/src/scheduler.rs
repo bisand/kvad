@@ -40,6 +40,13 @@ pub struct Loaded {
     pub instruct: bool,
     pub backend: String,
     pub weight_bytes: usize,
+    /// The longest conversation this model can hold.
+    pub n_ctx: usize,
+    /// What one token of context costs in the KV cache. The cache grows by
+    /// this much per token and is not pre-allocated, so the interesting
+    /// number is this times the tokens actually held — see
+    /// [`Scheduler::last_cached`].
+    pub kv_bytes_per_token: usize,
 }
 
 /// A step of a load, as it happens.
@@ -77,6 +84,13 @@ pub struct Scheduler {
     waiting: Arc<AtomicUsize>,
     busy: Arc<AtomicBool>,
     loaded: Arc<Mutex<Option<Loaded>>>,
+    /// Tokens in the KV cache after the last generation.
+    ///
+    /// Read from the last `Stats` rather than from the session, because the
+    /// session lives on the engine thread and asking it during a generation
+    /// would mean a lock on the thing being measured. A number from the end
+    /// of the last reply is the honest one to show.
+    cached: Arc<AtomicUsize>,
     /// The engine's interrupt flag, raised to stop a generation mid-stream.
     cancel: Arc<AtomicBool>,
 }
@@ -91,13 +105,20 @@ impl Scheduler {
         let engine = Engine::spawn(loader);
         let cancel = Arc::clone(&engine.cancel);
 
-        let (w, b, l) = (Arc::clone(&waiting), Arc::clone(&busy), Arc::clone(&loaded));
+        let cached = Arc::new(AtomicUsize::new(0));
+        let (w, b, l, c) =
+            (Arc::clone(&waiting), Arc::clone(&busy), Arc::clone(&loaded), Arc::clone(&cached));
         std::thread::Builder::new()
             .name("kvad-scheduler".into())
-            .spawn(move || run(rx, engine, w, b, l))
+            .spawn(move || run(rx, engine, w, b, l, c))
             .expect("failed to spawn the scheduler thread");
 
-        Scheduler { jobs: tx, waiting, busy, loaded, cancel }
+        Scheduler { jobs: tx, waiting, busy, loaded, cached, cancel }
+    }
+
+    /// Tokens the KV cache held after the last generation, or 0.
+    pub fn last_cached(&self) -> usize {
+        self.cached.load(Ordering::Relaxed)
     }
 
     /// How many requests are waiting for the engine, the running one
@@ -173,6 +194,7 @@ fn run(
     waiting: Arc<AtomicUsize>,
     busy: Arc<AtomicBool>,
     loaded: Arc<Mutex<Option<Loaded>>>,
+    cached: Arc<AtomicUsize>,
 ) {
     let set = |to: Option<Loaded>| *loaded.lock().unwrap_or_else(|e| e.into_inner()) = to;
 
@@ -186,6 +208,8 @@ fn run(
                 let result = drain_load(&engine.rx, &progress);
                 if let Ok(model) = &result {
                     set(Some(model.clone()));
+                    // A fresh session holds nothing.
+                    cached.store(0, Ordering::Relaxed);
                 }
                 let _ = done.send(result);
             }
@@ -195,13 +219,18 @@ fn run(
                 let was = drain_unload(&engine.rx);
                 if matches!(was, Ok(Some(_))) {
                     set(None);
+                    cached.store(0, Ordering::Relaxed);
                 }
                 let _ = done.send(was);
             }
 
             Job::Chat { messages, sampling, out } => {
                 engine.send(Cmd::Chat { messages, sampling });
-                drain_chat(&engine.rx, &out);
+                if let Some(stats) = drain_chat(&engine.rx, &out) {
+                    // What the cache holds now: the prompt it prefilled plus
+                    // everything it generated.
+                    cached.store(stats.prompt_tokens + stats.generated_tokens, Ordering::Relaxed);
+                }
             }
         }
 
@@ -218,8 +247,26 @@ fn run(
 fn drain_load(rx: &Receiver<Evt>, progress: &tokio_mpsc::Sender<Progress>) -> Result<Loaded, String> {
     loop {
         match rx.recv() {
-            Ok(Evt::Loaded { repo, summary, params, instruct, backend, weight_bytes }) => {
-                return Ok(Loaded { repo, summary, params, instruct, backend, weight_bytes })
+            Ok(Evt::Loaded {
+                repo,
+                summary,
+                params,
+                instruct,
+                backend,
+                weight_bytes,
+                n_ctx,
+                kv_bytes_per_token,
+            }) => {
+                return Ok(Loaded {
+                    repo,
+                    summary,
+                    params,
+                    instruct,
+                    backend,
+                    weight_bytes,
+                    n_ctx,
+                    kv_bytes_per_token,
+                })
             }
             Ok(Evt::Error(e)) => return Err(e),
             Ok(Evt::Status(message)) => report(progress, Progress::Status { message }),
@@ -248,7 +295,8 @@ fn drain_unload(rx: &Receiver<Evt>) -> Result<Option<String>, String> {
     }
 }
 
-fn drain_chat(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Piece>) {
+/// Forward a generation's tokens, and return the statistics it ended with.
+fn drain_chat(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Piece>) -> Option<Stats> {
     loop {
         let piece = match rx.recv() {
             Ok(Evt::Token(text)) => Piece::Token(text),
@@ -260,13 +308,17 @@ fn drain_chat(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Piece>) {
             Ok(_) => continue,
             Err(_) => Piece::Failed("the engine thread has stopped".into()),
         };
-        let terminal = !matches!(piece, Piece::Token(_));
+        let ended = match &piece {
+            Piece::Token(_) => None,
+            Piece::Done(stats) => Some(Some(*stats)),
+            Piece::Failed(_) => Some(None),
+        };
         // A closed receiver is a client that has gone away. Stop forwarding,
         // but keep draining until the engine finishes this generation, or the
         // next request would read this one's leftovers.
         let _ = out.blocking_send(piece);
-        if terminal {
-            return;
+        if let Some(stats) = ended {
+            return stats;
         }
     }
 }

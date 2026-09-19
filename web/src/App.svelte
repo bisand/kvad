@@ -13,6 +13,7 @@
   import Chat from "./routes/Chat.svelte";
   import Training from "./routes/Training.svelte";
   import Datasets from "./routes/Datasets.svelte";
+  import Monitoring from "./routes/Monitoring.svelte";
   import Settings from "./routes/Settings.svelte";
   import SignIn from "./routes/SignIn.svelte";
   import NotFound from "./routes/NotFound.svelte";
@@ -89,6 +90,8 @@
         <Training />
       {:else if page.path === "/datasets"}
         <Datasets />
+      {:else if page.path === "/monitoring"}
+        <Monitoring />
       {:else if page.path === "/settings"}
         <Settings />
       {:else}

@@ -174,10 +174,36 @@ pub async fn completions(
 
     let pieces = state.engine.chat(turns, sampling).map_err(Fail::internal)?;
     let id = format!("chatcmpl-{}", now_millis());
+    let metrics = state.metrics.clone();
+    // Timed from here rather than by the middleware: for a streamed reply the
+    // middleware sees only the moment the headers went out, which is the
+    // moment before all the work.
+    let started = std::time::Instant::now();
 
-    match body.stream {
-        true => Ok(streamed(id, loaded, pieces).into_response()),
-        false => Ok(whole(id, loaded, pieces).await?.into_response()),
+    let mut response = match body.stream {
+        true => streamed(id, loaded, pieces, metrics, started).into_response(),
+        false => whole(id, loaded, pieces, metrics, started).await?.into_response(),
+    };
+    response.extensions_mut().insert(crate::watching::RecordedItself);
+    Ok(response)
+}
+
+/// Where a completion's row is filed. The route pattern, matching what the
+/// middleware would have recorded.
+const ROUTE: &str = "/v1/chat/completions";
+
+/// What the dashboard's sparklines are made of.
+///
+/// Prefill is time-to-first-token: the wait before anything appears, which is
+/// what somebody watching an empty reply box actually experiences, and a
+/// different complaint from a reply that arrives slowly.
+fn measured(stats: &Stats) -> crate::metrics::Generation {
+    crate::metrics::Generation {
+        prompt_tokens: stats.prompt_tokens as u32,
+        cached_tokens: stats.cached_tokens as u32,
+        generated_tokens: stats.generated_tokens as u32,
+        decode_per_sec: stats.tokens_per_sec() as f64,
+        ttft_millis: stats.prefill_secs as f64 * 1000.0,
     }
 }
 
@@ -227,6 +253,8 @@ fn streamed(
     id: String,
     loaded: crate::scheduler::Loaded,
     mut pieces: tokio::sync::mpsc::Receiver<Piece>,
+    metrics: std::sync::Arc<crate::metrics::Metrics>,
+    started: std::time::Instant,
 ) -> impl IntoResponse {
     let (events, rx) = tokio::sync::mpsc::channel::<Event>(64);
     let created = now_secs();
@@ -259,25 +287,39 @@ fn streamed(
                     };
                     Event::default().data(chunk(delta, None, json!({})).to_string())
                 }
-                Piece::Done(stats) => Event::default().data(
-                    chunk(
-                        json!({}),
-                        Some("stop"),
-                        json!({ "usage": usage(&stats), "kvad": extension(&stats, &loaded) }),
+                Piece::Done(stats) => {
+                    metrics.record_generation(
+                        "POST",
+                        ROUTE,
+                        200,
+                        started.elapsed(),
+                        measured(&stats),
+                    );
+                    Event::default().data(
+                        chunk(
+                            json!({}),
+                            Some("stop"),
+                            json!({ "usage": usage(&stats), "kvad": extension(&stats, &loaded) }),
+                        )
+                        .to_string(),
                     )
-                    .to_string(),
-                ),
+                }
                 // An error mid-stream cannot become a status code — the
                 // headers are long gone — so it is an event of its own, and
                 // the stream ends without `[DONE]`.
                 Piece::Failed(why) => {
+                    // The headers said 200 a while ago; the row says what
+                    // actually happened, which is the only place it can.
+                    metrics.record("POST", ROUTE, 500, started.elapsed());
                     let _ = events.send(sse("error", &json!({ "error": why }))).await;
                     return;
                 }
             };
             if events.send(event).await.is_err() {
                 // The client hung up. Stop the generation rather than let it
-                // run to `max_tokens` for nobody.
+                // run to `max_tokens` for nobody — and record it, because a
+                // reply nobody waited for is still work this server did.
+                metrics.record("POST", ROUTE, 499, started.elapsed());
                 return;
             }
         }
@@ -291,13 +333,25 @@ async fn whole(
     id: String,
     loaded: crate::scheduler::Loaded,
     mut pieces: tokio::sync::mpsc::Receiver<Piece>,
+    metrics: std::sync::Arc<crate::metrics::Metrics>,
+    started: std::time::Instant,
 ) -> Result<Json<serde_json::Value>, Fail> {
     let mut text = String::new();
     while let Some(piece) = pieces.recv().await {
         match piece {
             Piece::Token(t) => text.push_str(&t),
-            Piece::Failed(why) => return Err(Fail::internal(why)),
+            Piece::Failed(why) => {
+                metrics.record("POST", ROUTE, 500, started.elapsed());
+                return Err(Fail::internal(why));
+            }
             Piece::Done(stats) => {
+                metrics.record_generation(
+                    "POST",
+                    ROUTE,
+                    200,
+                    started.elapsed(),
+                    measured(&stats),
+                );
                 return Ok(Json(json!({
                     "id": id,
                     "object": "chat.completion",
@@ -314,6 +368,7 @@ async fn whole(
             }
         }
     }
+    metrics.record("POST", ROUTE, 500, started.elapsed());
     Err(Fail::internal("the engine stopped without finishing the reply"))
 }
 
@@ -379,6 +434,8 @@ mod tests {
             instruct: true,
             backend: "cpu q8".into(),
             weight_bytes: 0,
+            n_ctx: 2048,
+            kv_bytes_per_token: 1024,
         };
         let stats = Stats {
             prompt_tokens: 100,

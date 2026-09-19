@@ -142,6 +142,15 @@ pub enum Evt {
         instruct: bool,
         backend: String,
         weight_bytes: usize,
+        /// The longest conversation this model can hold.
+        n_ctx: usize,
+        /// What one token of context costs in the KV cache.
+        ///
+        /// The cache is not pre-allocated — a 32k-context model would reserve
+        /// gigabytes for a conversation of fifty tokens — so what it actually
+        /// occupies is this times the tokens held, and what it *could* occupy
+        /// is this times `n_ctx`. A caller reporting memory needs both.
+        kv_bytes_per_token: usize,
     },
     /// No model is loaded any more, and what was loaded is named.
     Unloaded(String),
@@ -206,6 +215,16 @@ impl Engine {
     pub fn request_cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+}
+
+/// What one token of context costs in the KV cache: a key and a value, per
+/// layer, at four bytes a float.
+///
+/// The same arithmetic as [`crate::model::KvCache::max_bytes`], divided by
+/// the context length — stated here so that a caller can multiply it by the
+/// tokens actually held rather than by the ones that might be.
+fn kvad_kv_bytes_per_token(spec: &crate::model::Spec) -> usize {
+    2 * spec.n_layer * spec.kv_dim() * std::mem::size_of::<f32>()
 }
 
 /// The model currently loaded, plus its sampler.
@@ -290,6 +309,8 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                             instruct: llm.is_instruct(),
                             backend: llm.backend(),
                             weight_bytes: llm.weight_bytes,
+                            n_ctx: llm.spec.n_ctx,
+                            kv_bytes_per_token: kvad_kv_bytes_per_token(&llm.spec),
                         });
                         let _ = hub::State::set_active(&repo);
                         let d = Sampling::default();

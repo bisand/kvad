@@ -288,8 +288,42 @@ behind training and should not be — a thirty-minute wait is not a queue — an
 the banner says "slower", which is what was measured. This replaces the
 placeholder copy this plan asked for.
 
-**Phase 5 — monitoring.** A metrics ring buffer in memory, rollups in SQLite,
-and the Dashboard and Monitoring pages.
+**Phase 5 — monitoring. Done.**
+
+Two stores, because two questions. A **ring buffer in memory** answers "what
+is happening now" — the last 2000 requests, 500 generations and 500 log lines
+— and reading it costs a mutex and no disk, which is what a page polling every
+few seconds needs. A **table in SQLite** answers "what did yesterday look
+like"; it is written in batches every five seconds, because a lock on the
+database in the middle of every response is a lock on the server, and pruned
+after seven days, because a row a second is nothing for SQLite and unreadable
+for a person.
+
+- **Percentiles come from the samples**, sorted, rather than from buckets.
+  There are at most a few thousand and sorting them is microseconds, so an
+  estimate would be a worse number for no saving.
+- **Routes are grouped by pattern**, `/api/jobs/{id}` rather than
+  `/api/jobs/17`, or a histogram would have one row per id.
+- **The Dashboard** shows what the machine is doing: the loaded model, decode
+  and time-to-first-token sparklines, queue depth, resident memory, the KV
+  cache against what it would cost at full context, disk broken into what can
+  be downloaded again and what cannot, and anything running.
+- **The Monitoring page** has per-route latency, the request log with each
+  generation's numbers beside it, and the server log tail — bounded, in
+  memory, and gone on restart, because a log that has to outlive the process
+  belongs to whatever is running it.
+- **Resident memory is current, not peak.** `getrusage`'s `ru_maxrss` is the
+  obvious answer and the wrong one: it never goes down, so a model that had
+  been unloaded would still show as resident.
+
+**Two bugs this phase found in itself.** The first version attached a
+generation's numbers to "the most recent completion request", which for a
+non-streamed reply was the *previous* one — the handler knows the numbers
+before the middleware records the row. The completions handler now records its
+own row, which also fixes the second: a streamed reply timed by the middleware
+measured the moment the headers went out, which is the moment before all the
+work. Completions are now timed end to end; every other streaming route is
+still timed to its first byte, and the page says so.
 
 **Phase 6 — playground, evals and benchmarks.**
 

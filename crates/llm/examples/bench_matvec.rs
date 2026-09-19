@@ -1,12 +1,12 @@
 //! Microbenchmark for the quantised matmul kernels.
 //!
-//!     cargo run --release -p llm --example bench_matvec
+//!     cargo run --release -p kvad --example bench_matvec
 //!
 //! Shapes are taken from Qwen2.5-0.5B: the output head dominates, so it is the
 //! one worth tuning.
 
-use llm::quant::{Precision, Weight};
-use llm::tensor::Tensor;
+use kvad::quant::{Precision, Weight};
+use kvad::tensor::Tensor;
 use nanograd::rng::Rng;
 use std::time::Instant;
 
@@ -110,14 +110,14 @@ fn bench_batch(label: &str, rows: usize, cols: usize, m: usize) {
             baseline / per_call
         );
     }
-    if !llm::simd::has_i8mm() {
+    if !kvad::simd::has_i8mm() {
         println!("  (i8mm unavailable or disabled — both rows are the same kernel)");
     }
 }
 
 fn main() {
     println!("threads: {}", rayon::current_num_threads());
-    println!("i8mm:    {}", llm::simd::has_i8mm());
+    println!("i8mm:    {}", kvad::simd::has_i8mm());
     // The output head: by far the largest single matmul per token.
     bench("qwen lm_head", 151936, 896);
     // A representative MLP matrix.

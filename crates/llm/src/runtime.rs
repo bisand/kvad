@@ -32,7 +32,7 @@ pub struct Llm {
 
 /// Builds the backend for a model whose files are already on disk.
 ///
-/// The `llm` crate cannot depend on the GPU crate — the dependency runs the
+/// The `kvad` crate cannot depend on the GPU crate — the dependency runs the
 /// other way — so choosing a backend is the caller's job.
 pub type SessionFactory<'a> = &'a mut dyn FnMut(
     &weights::ModelFiles,

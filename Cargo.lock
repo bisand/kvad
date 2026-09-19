@@ -1933,6 +1933,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
+name = "kvad"
+version = "0.1.0"
+dependencies = [
+ "hf-hub",
+ "memmap2",
+ "minijinja",
+ "nanograd",
+ "rayon",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "tokenizers 0.23.2",
+ "ureq",
+]
+
+[[package]]
+name = "kvad-gpu"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "kvad",
+]
+
+[[package]]
+name = "kvad-tui"
+version = "0.1.0"
+dependencies = [
+ "kvad",
+ "kvad-gpu",
+ "ratatui",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2004,40 +2038,6 @@ name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
-
-[[package]]
-name = "llm"
-version = "0.1.0"
-dependencies = [
- "hf-hub",
- "memmap2",
- "minijinja",
- "nanograd",
- "rayon",
- "safetensors 0.8.0",
- "serde",
- "serde_json",
- "tokenizers 0.23.2",
- "ureq",
-]
-
-[[package]]
-name = "llm-gpu"
-version = "0.1.0"
-dependencies = [
- "candle-core",
- "candle-nn",
- "llm",
-]
-
-[[package]]
-name = "llm-tui"
-version = "0.1.0"
-dependencies = [
- "llm",
- "llm-gpu",
- "ratatui",
-]
 
 [[package]]
 name = "lock_api"

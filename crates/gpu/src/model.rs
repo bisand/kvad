@@ -2,7 +2,7 @@
 //!
 //! # What changed, and what did not
 //!
-//! Read this next to [`llm::model::llama`]. The structure is line for line the
+//! Read this next to [`kvad::model::llama`]. The structure is line for line the
 //! same: embed, then per layer `x = x + Attention(RMSNorm(x))` and
 //! `x = x + SwiGLU(RMSNorm(x))`, then a final norm and the output head. RoPE
 //! still rotates Q and K, grouped-query attention still shares KV heads, the
@@ -27,7 +27,7 @@
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
-use llm::model::{Session, Spec};
+use kvad::model::{Session, Spec};
 use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -157,10 +157,10 @@ pub struct GpuLlama {
     pos: usize,
 }
 
-/// `LLM_GPU_DENSE_EMBED=1` restores the dense bf16 lookup table, for
+/// `KVAD_GPU_DENSE_EMBED=1` restores the dense bf16 lookup table, for
 /// measuring what quantising it is worth.
 fn dense_embedding() -> bool {
-    matches!(std::env::var("LLM_GPU_DENSE_EMBED").as_deref(), Ok("1") | Ok("true"))
+    matches!(std::env::var("KVAD_GPU_DENSE_EMBED").as_deref(), Ok("1") | Ok("true"))
 }
 
 /// `y = proj(x) (+ b)`.
@@ -568,7 +568,7 @@ pub fn ggml_name(d: GgmlDType) -> &'static str {
 /// Weight quantisation for the GPU, in GGML's block formats.
 ///
 /// `q8` and `q4` are the same scheme implemented by hand in
-/// [`llm::quant`]: blocks of 32 with a per-block scale. `q4k` is the
+/// [`kvad::quant`]: blocks of 32 with a per-block scale. `q4k` is the
 /// "k-quant" refinement — a second level of scales within a super-block, which
 /// buys noticeably better quality at the same 4 bits.
 pub fn parse_quant(s: &str) -> Option<Option<GgmlDType>> {
@@ -605,7 +605,7 @@ pub fn pick_device(name: Option<&str>) -> Res<Device> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm::model::Arch;
+    use kvad::model::Arch;
     use std::collections::HashMap;
 
     /// A model small enough to build from random numbers, with every

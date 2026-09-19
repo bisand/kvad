@@ -47,10 +47,10 @@ mod aarch64 {
     pub fn has_i8mm() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         *AVAILABLE.get_or_init(|| {
-            // Setting LLM_NO_I8MM forces the SDOT path, which is how the
+            // Setting KVAD_NO_I8MM forces the SDOT path, which is how the
             // contribution of this one instruction gets measured rather than
             // assumed.
-            if std::env::var_os("LLM_NO_I8MM").is_some() {
+            if std::env::var_os("KVAD_NO_I8MM").is_some() {
                 return false;
             }
             std::arch::is_aarch64_feature_detected!("i8mm")

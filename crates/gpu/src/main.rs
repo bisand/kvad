@@ -1,21 +1,21 @@
 //! The same models, on the GPU.
 //!
-//!     llm-gpu run  [--model REPO] [--prompt TEXT] [--device metal] [--dtype bf16]
-//!     llm-gpu chat [--model REPO] [--system TEXT]
+//!     kvad-gpu run  [--model REPO] [--prompt TEXT] [--device metal] [--dtype bf16]
+//!     kvad-gpu chat [--model REPO] [--system TEXT]
 //!
 //! Everything except the forward pass is shared with the CPU engine: the same
 //! Hub client, tokenizer, chat template, sampler and generation loop. Only the
-//! [`Session`](llm::model::Session) behind it changes, which is the whole
+//! [`Session`](kvad::model::Session) behind it changes, which is the whole
 //! point of that trait.
 
-use llm_gpu::model;
+use kvad_gpu::model;
 
-use llm::chat::Message;
-use llm::hub::State;
-use llm::model::{Arch, Session};
-use llm::runtime::Llm;
-use llm::sampler::Sampler;
-use llm_gpu::model::GpuLlama;
+use kvad::chat::Message;
+use kvad::hub::State;
+use kvad::model::{Arch, Session};
+use kvad::runtime::Llm;
+use kvad::sampler::Sampler;
+use kvad_gpu::model::GpuLlama;
 use std::io::{BufRead, Write};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -60,7 +60,7 @@ impl Default for Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: llm-gpu <run|chat> [options]\n\n\
+        "usage: kvad-gpu <run|chat> [options]\n\n\
          options:\n  \
            --model REPO        HuggingFace repo id (default: active, else {DEFAULT_MODEL})\n  \
            --device D          metal | cuda | cpu (default: best available)\n  \
@@ -146,7 +146,7 @@ fn load(args: &Args) -> Res<Llm> {
         if spec.arch != Arch::Llama {
             return Err(format!(
                 "the GPU backend implements the Llama family only; `{}` is {}.\n\
-                 Run it on the CPU engine instead:  llm run --model {repo}",
+                 Run it on the CPU engine instead:  kvad run --model {repo}",
                 repo, spec.arch
             )
             .into());

@@ -6,10 +6,10 @@
 //! parts impossible to accidentally call from the draw path.
 
 use crate::engine::{Backend, Cmd, Engine, Evt};
-use llm::chat::Message;
-use llm::hub::{self, HubModel, LocalModel};
-use llm::model::Arch;
-use llm::runtime::Stats;
+use kvad::chat::Message;
+use kvad::hub::{self, HubModel, LocalModel};
+use kvad::model::Arch;
+use kvad::runtime::Stats;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Tab {
@@ -86,7 +86,7 @@ impl App {
             streaming: None,
             scroll: 0,
             active: None,
-            backend: Backend::Cpu(llm::quant::Precision::Q8),
+            backend: Backend::Cpu(kvad::quant::Precision::Q8),
             busy: false,
             status: "press / to search the Hub, or pick a downloaded model".into(),
             error: None,

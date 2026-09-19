@@ -1,6 +1,6 @@
 //! A terminal UI for browsing, downloading and talking to local models.
 //!
-//!     cargo run --release -p llm-tui
+//!     cargo run --release -p kvad-tui
 //!
 //! Three threads' worth of concerns, kept apart:
 //!

@@ -1,4 +1,7 @@
-# ai-llm
+# Kvad
+
+*Kvad* — Old Norse for a composed, recited poem: what a skald performs from
+memory, one line at a time.
 
 Learning how neural networks and language models work by building them in Rust,
 from the arithmetic up.
@@ -8,9 +11,9 @@ Four crates, meant to be read in order:
 | Crate | What it is | Dependencies |
 |---|---|---|
 | [`nanograd`](crates/nanograd) | A neural network and backpropagation, from scratch. Trains on MNIST. | **none** |
-| [`llm`](crates/llm) | Transformer inference from scratch. Two architectures, real HuggingFace weights. | hub client, tokenizer, safetensors |
-| [`llm-gpu`](crates/gpu) | The same Llama forward pass on the GPU, in candle. | candle (Metal/CUDA) |
-| [`llm-tui`](crates/tui) | Terminal app: browse, download, activate, chat. | ratatui |
+| [`kvad`](crates/llm) | Transformer inference from scratch. Two architectures, real HuggingFace weights. | hub client, tokenizer, safetensors |
+| [`kvad-gpu`](crates/gpu) | The same Llama forward pass on the GPU, in candle. | candle (Metal/CUDA) |
+| [`kvad-tui`](crates/tui) | Terminal app: browse, download, activate, chat. | ratatui |
 
 The first two use no ML framework at all: every matrix multiply, every
 derivative, every attention head and every rotation is code in this repo. The
@@ -22,9 +25,9 @@ third is the same model handed to one, so the two can be compared.
 ./scripts/get-mnist.sh
 cargo test                                      # includes a gradient check
 cargo run --release -p nanograd --bin train_mnist
-cargo run --release -p llm -- run --prompt "Why is the sky blue?"
-cargo run --release -p llm-gpu -- run --prompt "Why is the sky blue?"
-cargo run --release -p llm-tui
+cargo run --release -p kvad -- run --prompt "Why is the sky blue?"
+cargo run --release -p kvad-gpu -- run --prompt "Why is the sky blue?"
+cargo run --release -p kvad-tui
 ```
 
 Verified on an M5 Pro:
@@ -81,7 +84,7 @@ reaches 98%.
 
 ---
 
-## Crate 2: `llm` — the same ideas, at scale
+## Crate 2: `kvad` — the same ideas, at scale
 
 The examples below assume the binaries are on your `PATH`:
 
@@ -89,17 +92,17 @@ The examples below assume the binaries are on your `PATH`:
 cargo install --path crates/llm --path crates/tui
 ```
 
-Otherwise prefix each one with `cargo run --release -p llm --` (or `-p llm-tui`).
+Otherwise prefix each one with `cargo run --release -p kvad --` (or `-p kvad-tui`).
 
 ```bash
-llm search smollm                 # find models; says which we can run
-llm pull HuggingFaceTB/SmolLM2-360M-Instruct
-llm ls                            # what is downloaded, and how big
-llm use  Qwen/Qwen2.5-0.5B-Instruct
-llm run  --prompt "Explain backpropagation in one sentence."
-llm chat --system "You are terse."
-llm info --model openai-community/gpt2-medium   # config only, no weights
-llm cache                         # pre-quantised weight files
+kvad search smollm                 # find models; says which we can run
+kvad pull HuggingFaceTB/SmolLM2-360M-Instruct
+kvad ls                            # what is downloaded, and how big
+kvad use  Qwen/Qwen2.5-0.5B-Instruct
+kvad run  --prompt "Explain backpropagation in one sentence."
+kvad chat --system "You are terse."
+kvad info --model openai-community/gpt2-medium   # config only, no weights
+kvad cache                         # pre-quantised weight files
 ```
 
 Read in this order:
@@ -147,8 +150,8 @@ benchmark.
 
 GPT-2 is a **base** model: pure next-token prediction, no instruction tuning.
 Ask it a question and it writes more questions, because that is what its
-training data looked like. `llm ls` and `llm search` label which is which, and
-`llm chat` warns you.
+training data looked like. `kvad ls` and `kvad search` label which is which, and
+`kvad chat` warns you.
 
 An instruction-tuned model only behaves like an assistant when wrapped in the
 exact marker tokens it was trained on. Those live as a **Jinja template** in
@@ -159,7 +162,7 @@ hardcoding one. "The model is dumb" is very often "the template is wrong".
 ### Quantisation
 
 ```bash
-llm run --quant q8 --model Qwen/Qwen2.5-0.5B-Instruct --prompt "..."
+kvad run --quant q8 --model Qwen/Qwen2.5-0.5B-Instruct --prompt "..."
 ```
 
 `--quant q8|q4` quantises the weight matrices as they load. Each row is chopped
@@ -209,7 +212,7 @@ porting a model to a framework even when you have written it yourself: the
 framework is a second opinion, and it disagreed for a reason.
 
 ```bash
-cargo run --release -p llm --example bench_matvec
+cargo run --release -p kvad --example bench_matvec
 ```
 
 The kernel benchmark is where the interesting part is. On the output head
@@ -306,9 +309,9 @@ Prefill, 654 tokens, Qwen2.5-0.5B, q8:
 
 | | time | |
 |---|---|---|
-| one token at a time (`LLM_PREFILL_CHUNK=1`) | 18.7 s | |
+| one token at a time (`KVAD_PREFILL_CHUNK=1`) | 18.7 s | |
 | batched f32 GEMM | 2.81 s | **6.6x** from batching |
-| batched q8, `SDOT` (`LLM_NO_I8MM=1`) | 2.72 s | |
+| batched q8, `SDOT` (`KVAD_NO_I8MM=1`) | 2.72 s | |
 | batched q8, `SMMLA` | 2.18 s | **1.25x** more from i8mm |
 
 Prefill drops from ~28 ms/token to ~3.3 ms/token. Decoding is untouched — it is
@@ -414,8 +417,8 @@ bottleneck, and if you have not measured the bottleneck you are guessing.
 ### Verifying you got it right
 
 ```bash
-llm run --model openai-community/gpt2 --greedy --prompt "1, 2, 3, 4, 5, 6,"
-llm run --model Qwen/Qwen2.5-0.5B-Instruct --greedy \
+kvad run --model openai-community/gpt2 --greedy --prompt "1, 2, 3, 4, 5, 6,"
+kvad run --model Qwen/Qwen2.5-0.5B-Instruct --greedy \
     --prompt "List the first 8 prime numbers, comma separated."
 ```
 
@@ -432,10 +435,10 @@ bf16 checkpoint and threw them away on exit. [`qcache.rs`](crates/llm/src/qcache
 writes them out instead, and maps the file back on later loads:
 
 ```bash
-llm run --quant q8 --prompt hi      # first: "quantising to q8 (first load)"
-llm run --quant q8 --prompt hi      # after: "mapping q8 weights (556 MB)"
-llm cache                           # what has been written, and where
-llm cache clear                     # it is all derived data; delete freely
+kvad run --quant q8 --prompt hi      # first: "quantising to q8 (first load)"
+kvad run --quant q8 --prompt hi      # after: "mapping q8 weights (556 MB)"
+kvad cache                           # what has been written, and where
+kvad cache clear                     # it is all derived data; delete freely
 ```
 
 | model | quantise | map | |
@@ -495,12 +498,12 @@ natural on-disk form would be GGUF rather than ours.
 
 ---
 
-## Crate 3: `llm-gpu` — the same model, handed to a framework
+## Crate 3: `kvad-gpu` — the same model, handed to a framework
 
 ```bash
-llm-gpu run  --prompt "Why is the sky blue?"
-llm-gpu run  --device metal --dtype bf16 --model Qwen/Qwen2.5-0.5B-Instruct
-llm-gpu chat
+kvad-gpu run  --prompt "Why is the sky blue?"
+kvad-gpu run  --device metal --dtype bf16 --model Qwen/Qwen2.5-0.5B-Instruct
+kvad-gpu chat
 ```
 
 [`model.rs`](crates/gpu/src/model.rs) is the Llama forward pass again, in
@@ -555,7 +558,7 @@ and asking for it says so rather than failing obscurely.
 ### Quantised weights on the GPU
 
 ```bash
-llm-gpu run --quant q8   # or q4, q4k, q6k
+kvad-gpu run --quant q8   # or q4, q4k, q6k
 ```
 
 candle's `QTensor` holds GGML's block formats — the same scheme as
@@ -603,7 +606,7 @@ the *batch*.
 > slower on prefill" from a single pair of measurements at 654 tokens (0.24 s
 > against 0.39 s). That does not reproduce: five runs at each of four prompt
 > lengths give the table above, with a median equal to the minimum every time.
-> Re-running the old arrangement behind `LLM_GPU_DENSE_EMBED=1` rules out the
+> Re-running the old arrangement behind `KVAD_GPU_DENSE_EMBED=1` rules out the
 > embedding change as the cause, so the original figure was simply a bad
 > measurement on a loaded machine. The *shape* of the claim survives — there is
 > a length past which quantising costs you — but it arrives much later and much
@@ -616,8 +619,8 @@ One practical note. The k-quants (`q4k`, `q6k`) need dimensions divisible by
 ### The table that was stored twice
 
 ```bash
-llm-gpu run --quant q8                          # quantised table
-LLM_GPU_DENSE_EMBED=1 llm-gpu run --quant q8    # the dense one, for comparison
+kvad-gpu run --quant q8                          # quantised table
+KVAD_GPU_DENSE_EMBED=1 kvad-gpu run --quant q8   # the dense one, for comparison
 ```
 
 The embedding table was the last dense tensor in a quantised GPU model, and on
@@ -680,10 +683,10 @@ new backend, it was the seam the old one had to grow.
 
 ---
 
-## Crate 4: `llm-tui` — the app
+## Crate 4: `kvad-tui` — the app
 
 ```bash
-cargo run --release -p llm-tui
+cargo run --release -p kvad-tui
 ```
 
 `/` search · `↑↓` select · `enter` download and load · `p` cycle backend ·

@@ -250,7 +250,7 @@ impl State {
         let base = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| dirs_home().join(".config"));
-        base.join("ai-llm").join("state.json")
+        base.join("kvad").join("state.json")
     }
 
     pub fn active() -> Option<String> {

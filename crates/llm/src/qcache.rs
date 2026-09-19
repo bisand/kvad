@@ -639,13 +639,13 @@ fn header(
 /// Deliberately *not* inside the HuggingFace cache: nothing there is ours, and
 /// `huggingface-cli delete-cache` should not have an opinion about our files.
 pub fn cache_root() -> PathBuf {
-    if let Ok(v) = std::env::var("LLM_QUANT_CACHE") {
+    if let Ok(v) = std::env::var("KVAD_QUANT_CACHE") {
         return PathBuf::from(v);
     }
     let base = std::env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".cache"));
-    base.join("ai-llm").join("quant")
+    base.join("kvad").join("quant")
 }
 
 fn home() -> PathBuf {
@@ -686,7 +686,7 @@ pub fn forget(repo: &str) -> usize {
 }
 
 fn enabled() -> bool {
-    !matches!(std::env::var("LLM_NO_QCACHE").as_deref(), Ok("1") | Ok("true"))
+    !matches!(std::env::var("KVAD_NO_QCACHE").as_deref(), Ok("1") | Ok("true"))
 }
 
 /// Build the model for `spec`, using the quantised cache where it can.
@@ -874,9 +874,9 @@ mod tests {
 
     #[test]
     fn cache_paths_are_derived_from_the_repo_id() {
-        std::env::set_var("LLM_QUANT_CACHE", "/tmp/qc");
+        std::env::set_var("KVAD_QUANT_CACHE", "/tmp/qc");
         let p = path_for("Qwen/Qwen2.5-0.5B-Instruct", Precision::Q8);
         assert_eq!(p, PathBuf::from("/tmp/qc/Qwen--Qwen2.5-0.5B-Instruct.q8.nq"));
-        std::env::remove_var("LLM_QUANT_CACHE");
+        std::env::remove_var("KVAD_QUANT_CACHE");
     }
 }

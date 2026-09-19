@@ -1,4 +1,4 @@
-//! # llm
+//! # kvad
 //!
 //! Transformer inference written from scratch: download real weights from the
 //! HuggingFace Hub and run them with hand-written matrix code. Two

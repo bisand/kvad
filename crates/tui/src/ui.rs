@@ -322,7 +322,7 @@ fn truncate(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use crate::app::Active;
-    use llm::chat::Message;
+    use kvad::chat::Message;
     use ratatui::backend::TestBackend;
 
     /// Render one frame and return it as text, so assertions can be written

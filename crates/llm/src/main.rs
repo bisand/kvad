@@ -1,26 +1,26 @@
 //! Command-line front end.
 //!
-//!     llm search QUERY      find models on the Hub, flagging which we can run
-//!     llm pull REPO         download a model into the local cache
-//!     llm ls                list downloaded models
-//!     llm use REPO          set the default model
-//!     llm rm REPO           delete a model from the cache
-//!     llm cache [REPO]      list (or delete) pre-quantised weight files
-//!     llm info [--model R]  read the config without downloading weights
-//!     llm run  [--model R] [--prompt TEXT]
-//!     llm chat [--model R] [--system TEXT]
+//!     kvad search QUERY      find models on the Hub, flagging which we can run
+//!     kvad pull REPO         download a model into the local cache
+//!     kvad ls                list downloaded models
+//!     kvad use REPO          set the default model
+//!     kvad rm REPO           delete a model from the cache
+//!     kvad cache [REPO]      list (or delete) pre-quantised weight files
+//!     kvad info [--model R]  read the config without downloading weights
+//!     kvad run  [--model R] [--prompt TEXT]
+//!     kvad chat [--model R] [--system TEXT]
 //!
 //! Sampling flags: --max-tokens N --temperature F --top-k N --top-p F --seed N
 //! --greedy
 
-use llm::chat::Message;
-use llm::hub::{self, State};
-use llm::model::{KvCache, Spec};
-use llm::qcache;
-use llm::quant::Precision;
-use llm::runtime::Llm;
-use llm::sampler::Sampler;
-use llm::weights;
+use kvad::chat::Message;
+use kvad::hub::{self, State};
+use kvad::model::{KvCache, Spec};
+use kvad::qcache;
+use kvad::quant::Precision;
+use kvad::runtime::Llm;
+use kvad::sampler::Sampler;
+use kvad::weights;
 use std::io::{BufRead, Write};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -65,7 +65,7 @@ impl Default for Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: llm <command> [options]\n\n\
+        "usage: kvad <command> [options]\n\n\
          commands:\n  \
            search QUERY        find models on the Hub\n  \
            pull REPO           download a model\n  \
@@ -163,7 +163,7 @@ fn parse_args() -> Args {
     a
 }
 
-/// Which model to use: the flag, else whatever `llm use` selected, else the
+/// Which model to use: the flag, else whatever `kvad use` selected, else the
 /// built-in default.
 fn resolve_model(args: &Args) -> String {
     args.model
@@ -213,7 +213,7 @@ fn main() -> Res<()> {
             println!(
                 "  chat template: {}",
                 match &files.tokenizer_config {
-                    Some(p) => match llm::chat::ChatTemplate::from_tokenizer_config(p)? {
+                    Some(p) => match kvad::chat::ChatTemplate::from_tokenizer_config(p)? {
                         Some(_) => "yes (instruction-tuned)",
                         None => "no (base model)",
                     },
@@ -243,7 +243,7 @@ fn main() -> Res<()> {
 
 fn search(args: Args) -> Res<()> {
     let Some(query) = args.target else {
-        eprintln!("usage: llm search QUERY");
+        eprintln!("usage: kvad search QUERY");
         std::process::exit(2);
     };
 
@@ -283,7 +283,7 @@ fn search(args: Args) -> Res<()> {
 fn pull(args: Args) -> Res<()> {
     let Some(repo) = args.target.as_deref().map(str::to_string).or_else(|| args.model.clone())
     else {
-        eprintln!("usage: llm pull REPO");
+        eprintln!("usage: kvad pull REPO");
         std::process::exit(2);
     };
 
@@ -295,13 +295,13 @@ fn pull(args: Args) -> Res<()> {
     println!("  {}", spec.summary());
 
     let instruct = match &files.tokenizer_config {
-        Some(p) => llm::chat::ChatTemplate::from_tokenizer_config(p)?.is_some(),
+        Some(p) => kvad::chat::ChatTemplate::from_tokenizer_config(p)?.is_some(),
         None => false,
     };
     println!(
         "  {}",
         if instruct {
-            "instruction-tuned — usable with `llm chat`"
+            "instruction-tuned — usable with `kvad chat`"
         } else {
             "base model — completion only, will not answer questions"
         }
@@ -310,14 +310,14 @@ fn pull(args: Args) -> Res<()> {
     if let Some(local) = hub::find_local(&repo) {
         println!("  {} on disk", hub::human_bytes(local.bytes));
     }
-    println!("\nrun it with:  llm run --model {repo}");
+    println!("\nrun it with:  kvad run --model {repo}");
     Ok(())
 }
 
 fn list_local() -> Res<()> {
     let models = hub::local_models();
     if models.is_empty() {
-        println!("no models downloaded yet. try:  llm search smollm");
+        println!("no models downloaded yet. try:  kvad search smollm");
         return Ok(());
     }
 
@@ -348,11 +348,11 @@ fn list_local() -> Res<()> {
 
 fn use_model(args: Args) -> Res<()> {
     let Some(repo) = args.target else {
-        eprintln!("usage: llm use REPO");
+        eprintln!("usage: kvad use REPO");
         std::process::exit(2);
     };
     if hub::find_local(&repo).is_none() {
-        eprintln!("`{repo}` is not downloaded. Run:  llm pull {repo}");
+        eprintln!("`{repo}` is not downloaded. Run:  kvad pull {repo}");
         std::process::exit(1);
     }
     State::set_active(&repo)?;
@@ -362,11 +362,11 @@ fn use_model(args: Args) -> Res<()> {
 
 fn remove(args: Args) -> Res<()> {
     let Some(repo) = args.target else {
-        eprintln!("usage: llm rm REPO");
+        eprintln!("usage: kvad rm REPO");
         std::process::exit(2);
     };
     let Some(local) = hub::find_local(&repo) else {
-        eprintln!("`{repo}` is not in the cache. Run `llm ls` to see what is.");
+        eprintln!("`{repo}` is not in the cache. Run `kvad ls` to see what is.");
         std::process::exit(1);
     };
 
@@ -400,11 +400,11 @@ fn remove(args: Args) -> Res<()> {
     Ok(())
 }
 
-/// `llm cache` — what has been pre-quantised, and how to get rid of it.
+/// `kvad cache` — what has been pre-quantised, and how to get rid of it.
 ///
 /// These files are pure derived data: deleting one costs a few seconds on the
 /// next load of that model and nothing else, which is why there is no
-/// confirmation prompt here and there is one on `llm rm`.
+/// confirmation prompt here and there is one on `kvad rm`.
 fn cache(args: Args) -> Res<()> {
     match args.target.as_deref() {
         Some("clear") => {
@@ -425,7 +425,7 @@ fn cache(args: Args) -> Res<()> {
     let entries = qcache::entries();
     if entries.is_empty() {
         println!("nothing pre-quantised yet.");
-        println!("the first `llm run --quant q8` writes a file here; later runs map it.");
+        println!("the first `kvad run --quant q8` writes a file here; later runs map it.");
     } else {
         println!("{:<46} {:<6} {:>10}", "MODEL", "QUANT", "SIZE");
         let mut total = 0;

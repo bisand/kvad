@@ -458,7 +458,7 @@ impl CpuSession {
         let cache = KvCache::new(model.spec());
         // Tunable so the effect of batching stays measurable; 1 gives the old
         // token-at-a-time behaviour.
-        let chunk = std::env::var("LLM_PREFILL_CHUNK")
+        let chunk = std::env::var("KVAD_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)

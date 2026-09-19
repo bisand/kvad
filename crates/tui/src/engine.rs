@@ -14,12 +14,12 @@
 //! is busy inside `generate` and not reading its inbox. That uses a shared
 //! [`AtomicBool`] which the per-token callback checks.
 
-use llm::chat::Message;
-use llm::hub::{self, HubModel, LocalModel};
-use llm::model::Session;
-use llm::quant::Precision;
-use llm::runtime::{Llm, Stats};
-use llm::sampler::Sampler;
+use kvad::chat::Message;
+use kvad::hub::{self, HubModel, LocalModel};
+use kvad::model::Session;
+use kvad::quant::Precision;
+use kvad::runtime::{Llm, Stats};
+use kvad::sampler::Sampler;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -114,7 +114,7 @@ impl Engine {
 
         let worker_cancel = Arc::clone(&cancel);
         std::thread::Builder::new()
-            .name("llm-engine".into())
+            .name("kvad-engine".into())
             // Generation recurses through 30 layers of closures and rayon
             // scopes; the default 2 MB is enough, but be explicit.
             .stack_size(8 * 1024 * 1024)
@@ -193,24 +193,24 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 let loaded = match backend {
                     Backend::Cpu(precision) => Llm::load_with(&repo, precision, &mut progress),
                     Backend::Gpu(mode) => {
-                        let dtype = llm_gpu::model::parse_dtype("bf16").expect("known dtype");
+                        let dtype = kvad_gpu::model::parse_dtype("bf16").expect("known dtype");
                         let quant = match mode {
                             GpuMode::Bf16 => None,
-                            GpuMode::Q8 => llm_gpu::model::parse_quant("q8").expect("known quant"),
-                            GpuMode::Q4 => llm_gpu::model::parse_quant("q4").expect("known quant"),
+                            GpuMode::Q8 => kvad_gpu::model::parse_quant("q8").expect("known quant"),
+                            GpuMode::Q4 => kvad_gpu::model::parse_quant("q4").expect("known quant"),
                         };
                         // The GPU backend covers the Llama family only; the
                         // error names the alternative rather than just failing.
                         Llm::load_custom(&repo, &mut progress, &mut |files, spec, _| {
-                            if spec.arch != llm::model::Arch::Llama {
+                            if spec.arch != kvad::model::Arch::Llama {
                                 return Err(format!(
                                     "the GPU backend implements the Llama family only; this model is {}. Press p to pick a CPU backend.",
                                     spec.arch
                                 )
                                 .into());
                             }
-                            let device = llm_gpu::model::pick_device(None)?;
-                            let m = llm_gpu::model::GpuLlama::load(
+                            let device = kvad_gpu::model::pick_device(None)?;
+                            let m = kvad_gpu::model::GpuLlama::load(
                                 &files.weights,
                                 spec.clone(),
                                 dtype,

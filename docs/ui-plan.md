@@ -3,7 +3,8 @@
 Written 2026-09-19 against the working tree after `5e551d9`, from a reading of
 `crates/llm/src/{runtime,train,weights,hub}.rs`, the TUI's actor in
 `crates/tui/src/engine.rs`, and the README's "Becoming a server" section.
-Nothing here is built. Where something is a guess it says so.
+Where something is a guess it says so. The phases at the end say what is built;
+everything above them is still the plan rather than a description.
 
 ## What the owner asked for
 
@@ -127,18 +128,35 @@ per-request timing, pruned or rolled up after N days.
 
 ## Phases
 
-Each ends with something usable.
+Each ends with something usable. A phase is marked done here when it is
+committed.
 
-**Phase 0 — make the engine servable. No HTTP yet.**
+**Phase 0 — make the engine servable. No HTTP yet. Done.**
 
-- Move the `Cmd`/`Evt` actor out of `crates/tui` into `kvad::service`, so the
-  TUI and the server share it.
-- `train::run` and `weights::fetch_with` report progress as `&str`. Add
-  structured events beside them: `Step{n, train, val, chars_per_s}`, `Sample`,
-  `Saved`, and `Download{file, bytes, total}`.
-- Whether `hf-hub` exposes byte-level progress is unchecked.
-- Add a cancel flag to training, and an explicit unload.
-- This touches the TUI, which was never driven interactively. Its own commit.
+- The `Cmd`/`Evt` actor moved out of `crates/tui` into `kvad::service`, and
+  the TUI now spawns it. `Backend::Gpu` is a request `kvad` can describe and
+  not fulfil — the GPU crate depends on `kvad`, not the other way — so
+  `Engine::spawn` takes a `Loader`. `kvad::service::cpu_loader` is the one for
+  a build with no GPU crate in it; the TUI's, in `crates/tui/src/gpu.rs`,
+  handles both.
+- `train::run_watched` and `weights::fetch_watched` report structured events
+  beside the `&str`: `train::Event::{Pace, Step, Saved, Sample}` and
+  `weights::Fetch::{Local, Shards, Download, Fetched}`. `run` and `fetch_with`
+  still exist and are the same calls with the events dropped.
+- **`hf-hub` does expose byte-level progress**, through a `ProgressHandler`
+  passed to `download_file().progress(…)`. It is called from the download's
+  own tokio tasks while the calling thread is blocked inside the request, so
+  the handler has to be `Send + Sync` and take `&self`. That is why
+  `weights::Watcher` is an `Arc<dyn Fn>` where every other progress callback
+  here is a `&mut dyn FnMut`.
+- Training takes a cancel flag: `train::Options::cancel`, copied into
+  `nanograd::text::Training::stop` and read once a step rather than once a
+  checkpoint — checkpoints are hundreds of steps apart and a stop button that
+  takes a minute to answer is one nobody believes. A stopped run reports
+  `stopped: true` and leaves the best model it reached on disk, because saving
+  happens at every improvement rather than at the end.
+- `Cmd::Unload` drops the loaded model without loading another; `u` on the
+  TUI's Models tab is the key for it.
 
 **Phase 1 — skeleton.** `kvad-serve` with config loading, SQLite migrations, the
 embedded SPA, `/api/health`, the auth extractor wired up with only `none`

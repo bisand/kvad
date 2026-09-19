@@ -142,7 +142,9 @@ fn load(args: &Args) -> Res<Llm> {
 
     eprintln!("model: {repo}");
     let t0 = std::time::Instant::now();
-    let llm = Llm::load_custom(&repo, &mut |m| eprintln!("  {m}"), &mut |files, spec, _| {
+    // No watcher: a terminal has the progress lines and wants no bar.
+    let watch = kvad::weights::Watcher::none();
+    let llm = Llm::load_custom(&repo, &mut |m| eprintln!("  {m}"), &watch, &mut |files, spec, _| {
         if spec.arch != Arch::Llama {
             return Err(format!(
                 "the GPU backend implements the Llama family only; `{}` is {}.\n\

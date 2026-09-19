@@ -351,6 +351,8 @@ fn train_model(args: Args) -> Res<()> {
         seed: args.seed,
         sample: args.sample.unwrap_or(160),
         temperature: args.temperature,
+        // A command line already has a way to stop a run: Ctrl-C.
+        cancel: None,
     };
 
     // Say where it is going before it starts, because it is about to take a

@@ -5,11 +5,12 @@
 //! [`Evt`] and is applied here. Keeping that one-directional makes the slow
 //! parts impossible to accidentally call from the draw path.
 
-use crate::engine::{Backend, Cmd, Engine, Evt};
 use kvad::chat::Message;
 use kvad::hub::{self, HubModel, LocalModel};
 use kvad::model::Arch;
 use kvad::runtime::Stats;
+use kvad::service::{Backend, Cmd, Engine, Evt};
+use kvad::weights::Fetch;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Tab {
@@ -153,6 +154,13 @@ impl App {
     pub fn apply(&mut self, evt: Evt) {
         match evt {
             Evt::Status(s) => self.status = s,
+            // A download of several gigabytes says nothing for minutes if it
+            // only reports which file it is on. Bytes go to the same line.
+            Evt::Fetching(f) => {
+                if let Some(line) = describe(&f) {
+                    self.status = line;
+                }
+            }
             Evt::Error(e) => {
                 self.error = Some(e);
                 self.busy = false;
@@ -182,6 +190,14 @@ impl App {
                 self.busy = false;
                 self.messages.clear();
                 self.tab = Tab::Chat;
+            }
+            Evt::Unloaded(repo) => {
+                self.active = None;
+                self.messages.clear();
+                self.streaming = None;
+                self.last_stats = None;
+                self.busy = false;
+                self.status = format!("unloaded {repo}");
             }
             Evt::Token(piece) => {
                 self.streaming.get_or_insert_with(String::new).push_str(&piece);
@@ -276,6 +292,13 @@ impl App {
                 engine.send(Cmd::RefreshLocal);
             }
             K::Char('r') => engine.send(Cmd::RefreshLocal),
+            K::Char('u') => {
+                if self.active.is_some() {
+                    engine.send(Cmd::Unload);
+                } else {
+                    self.status = "nothing is loaded".into();
+                }
+            }
             K::Char('p') => {
                 // Cycle where the next load runs. q8 is usually
                 // indistinguishable from f32 and faster; q4 halves memory
@@ -344,5 +367,69 @@ impl App {
             K::Char(c) => self.input.push(c),
             _ => {}
         }
+    }
+}
+
+/// A fetch event as one line of status text, or `None` for one with nothing
+/// to say that the line above it did not already.
+fn describe(f: &Fetch) -> Option<String> {
+    match f {
+        Fetch::Local => None,
+        Fetch::Shards(n) => Some(format!("{n} shards to fetch")),
+        // A file whose size is unknown was answered from the cache, and
+        // "0 B of 0 B" would be a worse answer than the one already shown.
+        Fetch::Download { total: 0, .. } => None,
+        Fetch::Download { file, bytes, total } => Some(format!(
+            "{file}  {} of {}  ({:.0}%)",
+            hub::human_bytes(*bytes),
+            hub::human_bytes(*total),
+            100.0 * *bytes as f64 / *total as f64
+        )),
+        Fetch::Fetched { file } => Some(format!("fetched {file}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every fetch event either says something a person can read or says
+    /// nothing at all; none of them produce a line about zero bytes.
+    #[test]
+    fn a_download_reads_as_bytes_and_a_percentage() {
+        let line = describe(&Fetch::Download {
+            file: "model.safetensors".into(),
+            bytes: 512 * 1024 * 1024,
+            total: 1024 * 1024 * 1024,
+        });
+        assert_eq!(line.unwrap(), "model.safetensors  512.0 MB of 1.0 GB  (50%)");
+
+        // Cached files report completion and no size; there is nothing to draw.
+        assert_eq!(describe(&Fetch::Download { file: "config.json".into(), bytes: 0, total: 0 }), None);
+        assert_eq!(describe(&Fetch::Local), None);
+        assert_eq!(describe(&Fetch::Shards(4)).unwrap(), "4 shards to fetch");
+    }
+
+    /// An unload leaves the app with nothing selected and nothing to send,
+    /// rather than a chat pointing at a model that is gone.
+    #[test]
+    fn unloading_clears_the_conversation_as_well_as_the_model() {
+        let mut app = App::new();
+        app.active = Some(Active {
+            repo: "openai-community/gpt2".into(),
+            summary: String::new(),
+            params: 0,
+            instruct: false,
+            backend: "cpu q8".into(),
+            weight_bytes: 0,
+        });
+        app.messages.push(Message::user("hello"));
+        app.busy = true;
+
+        app.apply(Evt::Unloaded("openai-community/gpt2".into()));
+        assert!(app.active.is_none());
+        assert!(app.messages.is_empty());
+        assert!(!app.busy);
+        assert_eq!(app.status, "unloaded openai-community/gpt2");
     }
 }

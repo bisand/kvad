@@ -23,7 +23,8 @@ use nanograd::checkpoint;
 use nanograd::rng::Rng;
 use nanograd::text::{self, CharTokenizer};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, Once};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 
 /// The right to change the environment and the working directory. Every test
 /// in this file takes it as its first line and holds it to the end.
@@ -176,6 +177,87 @@ fn a_model_trained_by_name_runs_by_name() {
     assert_eq!(stats.generated_tokens, count);
     assert_eq!(llm.decode(&ids).unwrap(), ours);
 
+    std::fs::remove_dir_all(&summary.dir).unwrap();
+}
+
+/// What a server needs from a training run that a terminal does not: numbers
+/// it can chart, and a way to stop.
+///
+/// Both at once, because they are the same run. The events have to say the
+/// same thing the printed lines say — a chart that disagrees with the log is
+/// worse than no chart — and a cancelled run has to leave the model it had
+/// already saved.
+#[test]
+fn a_run_reports_numbers_and_can_be_stopped_from_another_thread() {
+    let _alone = alone();
+    let name = "watched";
+    let data = corpus_file("watched", &SENTENCE.repeat(60));
+
+    let mut opts = options(data, name);
+    opts.training.steps = 4000; // far more than this will be allowed to take
+    opts.training.eval_every = 10;
+    opts.sample = 40;
+    let cancel = Arc::new(AtomicBool::new(false));
+    opts.cancel = Some(Arc::clone(&cancel));
+
+    // Stopped from a thread that is not the one training, which is the whole
+    // point of the flag: a server cancels a job it is not sitting inside.
+    let stopper = {
+        let cancel = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            cancel.store(true, Ordering::Relaxed);
+        })
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut events: Vec<train::Event> = Vec::new();
+    let summary = train::run_watched(
+        &opts,
+        &mut |line| lines.push(line.to_string()),
+        &mut |e| events.push(e),
+    )
+    .unwrap();
+    stopper.join().unwrap();
+
+    assert!(summary.stopped, "the run reported itself as having finished all 4000 steps");
+    assert!(summary.best_step < opts.training.steps, "it ran to the end anyway");
+
+    let steps: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            train::Event::Step { step, val_loss, steps, .. } => Some((*step, *val_loss, *steps)),
+            _ => None,
+        })
+        .collect();
+    assert!(!steps.is_empty(), "a run that trained reported no checkpoints");
+    assert!(steps.iter().all(|(_, _, total)| *total == 4000), "the denominator is not the run's length");
+
+    // The events and the printed lines are two views of one run, so a
+    // checkpoint in one is a checkpoint in the other.
+    let printed = lines.iter().filter(|l| l.starts_with("step ")).count();
+    assert_eq!(printed, steps.len(), "the log and the events disagree about how many checkpoints there were");
+
+    // The best step is the lowest validation loss the events reported, and it
+    // is the step that said it saved.
+    let best = steps.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
+    assert_eq!(summary.best_step, best);
+    let saved: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            train::Event::Saved { step, .. } => Some(*step),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(saved.last().copied(), Some(best), "the last save was not the best step: {saved:?}");
+
+    // `--sample` asked for text, so every checkpoint carries some.
+    let samples = events.iter().filter(|e| matches!(e, train::Event::Sample { .. })).count();
+    assert_eq!(samples, steps.len());
+
+    // And a stopped run left a model behind, not a half-written directory.
+    assert!(checkpoint::load(&summary.dir).is_ok(), "the cancelled run left nothing loadable");
+    assert!(CharTokenizer::load(&summary.dir).is_ok());
     std::fs::remove_dir_all(&summary.dir).unwrap();
 }
 

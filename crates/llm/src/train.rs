@@ -35,6 +35,8 @@ use nanograd::model::{Gpt, GptConfig};
 use nanograd::rng::Rng;
 use nanograd::text::{self, CharTokenizer, Corpus, Report, Training};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -87,6 +89,11 @@ pub struct Options {
     /// Characters to write at each checkpoint, to watch it learn. 0 for none.
     pub sample: usize,
     pub temperature: f32,
+    /// Raised from another thread to end the run early; see
+    /// [`nanograd::text::Training::stop`], which this is copied into. A
+    /// command line leaves it `None` and uses Ctrl-C; a server cannot, because
+    /// the run it is cancelling is one of several things the process is doing.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for Options {
@@ -100,6 +107,7 @@ impl Default for Options {
             seed: 1337,
             sample: 160,
             temperature: 0.8,
+            cancel: None,
         }
     }
 }
@@ -115,6 +123,9 @@ pub struct Summary {
     pub best_step: usize,
     pub last_val: f32,
     pub elapsed_secs: f32,
+    /// True if [`Options::cancel`] was raised and the run ended early. The
+    /// model in `dir` is still the best step it reached.
+    pub stopped: bool,
 }
 
 /// Where a run's model will be written, and what it will then be called.
@@ -137,12 +148,54 @@ fn target(opts: &Options) -> Res<PathBuf> {
     }
 }
 
+/// What a run is doing, in numbers rather than words.
+///
+/// Beside the lines of text a run already writes, not instead of them —
+/// [`crate::weights::Fetch`] stands in the same relation to a fetch, and for
+/// the same reason. A terminal wants "step 250/2000 train loss 1.842"; a loss
+/// chart wants the two floats and cannot parse them back out of that sentence.
+///
+/// Unlike a [`crate::weights::Watcher`] this is an ordinary `&mut FnMut`:
+/// training runs on the thread that called it, so there is nothing to share
+/// across threads.
+#[derive(Debug, Clone)]
+pub enum Event {
+    /// How fast this machine turned out to be, and what is left at that rate.
+    /// Sent once, early, while there is still time to do something about it.
+    Pace { chars_per_sec: f32, remaining_secs: f32 },
+    /// A validation checkpoint.
+    Step {
+        step: usize,
+        /// The last step this run will take, so a bar has a denominator.
+        steps: usize,
+        train_loss: f32,
+        val_loss: f32,
+        chars_per_sec: f32,
+        elapsed_secs: f32,
+    },
+    /// The model was written to disk, because this step is the best so far.
+    /// Always follows the [`Event::Step`] it belongs to.
+    Saved { step: usize, val_loss: f32 },
+    /// What the model writes when asked, at a checkpoint. Empty unless
+    /// [`Options::sample`] asked for some.
+    Sample { step: usize, text: String },
+}
+
 /// Train, saving the best model as it goes, and say what happened.
 ///
 /// Progress goes to `out` rather than to stdout so that a caller which owns
 /// the screen — the TUI, a test — is not written over. The same reason
 /// [`crate::weights::fetch_with`] takes one.
 pub fn run(opts: &Options, out: &mut dyn FnMut(&str)) -> Res<Summary> {
+    run_watched(opts, out, &mut |_| {})
+}
+
+/// As [`run`], and also reporting [`Event`]s to `watch`.
+pub fn run_watched(
+    opts: &Options,
+    out: &mut dyn FnMut(&str),
+    watch: &mut dyn FnMut(Event),
+) -> Res<Summary> {
     let dir = target(opts)?;
     let text = std::fs::read_to_string(&opts.data)
         .map_err(|e| format!("could not read {}: {e}", opts.data.display()))?;
@@ -199,27 +252,42 @@ pub fn run(opts: &Options, out: &mut dyn FnMut(&str)) -> Res<Summary> {
         text::unigram_loss(&corpus.train, tok.vocab())
     ));
 
-    let cfg = Training { save: Some(dir.clone()), ..opts.training.clone() };
+    let cfg = Training {
+        save: Some(dir.clone()),
+        stop: opts.cancel.clone(),
+        ..opts.training.clone()
+    };
     let prompt = tok.encode("\n").ok().filter(|ids| !ids.is_empty()).unwrap_or_else(|| vec![0]);
     let mut sampler = Rng::new(opts.seed ^ 0x5a5a);
     let done = text::train(&mut model, &tok, &corpus, &cfg, &mut rng, &mut |report| match report {
-        Report::Pace { chars_per_sec, remaining_secs } if remaining_secs >= 20.0 => {
-            out(&format!(
-                "{chars_per_sec:.0} characters a second here — about {} to go. Ctrl-C now if that is too long.",
-                text::human_secs(remaining_secs)
-            ));
+        Report::Pace { chars_per_sec, remaining_secs } => {
+            watch(Event::Pace { chars_per_sec, remaining_secs });
+            // Only worth interrupting a terminal for when the answer is long
+            // enough to act on. A watcher gets it either way and decides for
+            // itself.
+            if remaining_secs >= 20.0 {
+                out(&format!(
+                    "{chars_per_sec:.0} characters a second here — about {} to go. Ctrl-C now if that is too long.",
+                    text::human_secs(remaining_secs)
+                ));
+            }
         }
-        Report::Pace { .. } => {}
-        Report::Step { step, train_loss, val_loss, best, saved, elapsed_secs, model, .. } => {
+        Report::Step { step, train_loss, val_loss, best, saved, elapsed_secs, chars_per_sec, model } => {
             let mark = if saved { "  *saved" } else if best { "  *best" } else { "" };
             out(&format!(
                 "step {step:>5}/{}  train loss {train_loss:.3}  validation loss {val_loss:.3}  ({}){mark}",
                 cfg.steps,
                 text::human_secs(elapsed_secs)
             ));
+            watch(Event::Step { step, steps: cfg.steps, train_loss, val_loss, chars_per_sec, elapsed_secs });
+            if saved {
+                watch(Event::Saved { step, val_loss });
+            }
             if opts.sample > 0 {
                 let out_ids = text::generate(model, &prompt, opts.sample, opts.temperature, &mut sampler);
-                out(&format!("---\n{}\n---", tok.decode(&out_ids).trim()));
+                let text = tok.decode(&out_ids).trim().to_string();
+                out(&format!("---\n{text}\n---"));
+                watch(Event::Sample { step, text });
             }
         }
     })?;
@@ -235,6 +303,7 @@ pub fn run(opts: &Options, out: &mut dyn FnMut(&str)) -> Res<Summary> {
         best_step: done.best_step,
         last_val: done.last_val,
         elapsed_secs: done.elapsed_secs,
+        stopped: done.stopped,
     })
 }
 

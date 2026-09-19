@@ -157,6 +157,43 @@ fn a_trained_model_runs_from_its_directory() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A fetch reports to two callbacks at once, and a model that is already
+/// here downloads nothing.
+///
+/// The second half of that is what a progress bar needs to be told: a local
+/// model finishes instantly and must not leave a bar at 0%. The download path
+/// itself needs the network and so is not tested here.
+#[test]
+fn a_fetch_reports_in_words_and_in_events() {
+    let dir = scratch("watched");
+    let mut model = model();
+    checkpoint::save(&dir, &mut model).unwrap();
+    CharTokenizer::from_text("abc").save(&dir).unwrap();
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let watch = {
+        let seen = std::sync::Arc::clone(&seen);
+        weights::Watcher::new(move |f| seen.lock().unwrap().push(f))
+    };
+    let mut lines = Vec::new();
+    let files =
+        weights::fetch_watched(dir.to_str().unwrap(), &mut |l| lines.push(l.to_string()), &watch)
+            .unwrap();
+    // Resolved, so compared by name rather than by the path as typed.
+    assert_eq!(files.weights.len(), 1);
+    assert!(files.weights[0].ends_with("model.safetensors"));
+
+    assert_eq!(*seen.lock().unwrap(), [weights::Fetch::Local]);
+    assert_eq!(lines, ["a directory on this machine; nothing to fetch"]);
+
+    // And the watcher nobody supplied is the one `fetch_with` uses, which is
+    // the same call with the events dropped.
+    assert!(!weights::Watcher::none().is_listening());
+    assert!(watch.is_listening());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn a_directory_is_a_model_only_if_the_files_are_there() {
     let dir = scratch("files");

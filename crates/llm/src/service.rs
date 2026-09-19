@@ -1,38 +1,59 @@
-//! The background worker.
+//! The engine as a background service: commands in, events out.
 //!
-//! Everything interesting here is slow: downloading a model takes tens of
-//! seconds, loading it takes more, and generation produces a token every few
-//! tens of milliseconds. None of that can happen on the thread that draws the
-//! screen, or the UI would freeze solid and keys would go unanswered.
+//! Everything interesting an engine does is slow. Downloading a model takes
+//! tens of seconds, loading it takes more, and generation produces a token
+//! every few tens of milliseconds. None of that can happen on the thread that
+//! draws a screen or answers an HTTP request, or the caller freezes solid.
 //!
-//! So the engine lives on its own thread, and the two sides talk over a pair
-//! of channels: [`Cmd`] in, [`Evt`] out. The UI thread never blocks — it drains
-//! whatever events have arrived, redraws, and goes back to polling the
-//! keyboard.
+//! So the engine lives on a thread of its own, and the two sides talk over a
+//! pair of channels: [`Cmd`] in, [`Evt`] out. The caller never blocks — it
+//! drains whatever events have arrived and goes back to what it was doing.
 //!
 //! Cancellation is the one thing a channel cannot express, because the worker
 //! is busy inside `generate` and not reading its inbox. That uses a shared
 //! [`AtomicBool`] which the per-token callback checks.
+//!
+//! # One model, one generation
+//!
+//! The worker holds at most one loaded model and runs one generation at a
+//! time, because that is what the engine underneath it does. Commands queue
+//! in the order they were sent. Continuous batching, when it lands, replaces
+//! the inside of this module; the channels either side of it do not change.
+//!
+//! # Why the loader is the caller's
+//!
+//! `kvad` cannot build a GPU session: the GPU crate depends on this one, not
+//! the other way round. So [`Backend::Gpu`] is a request this crate can
+//! describe and not fulfil, and whoever spawns an engine hands it a
+//! [`Loader`] that can. A build with no GPU crate in it passes
+//! [`cpu_loader`], and asking that one for a GPU says what to do instead.
 
-use kvad::chat::Message;
-use kvad::hub::{self, HubModel, LocalModel};
-use kvad::model::Session;
-use kvad::quant::Precision;
-use kvad::runtime::{Llm, Stats};
-use kvad::sampler::Sampler;
+use crate::chat::Message;
+use crate::hub::{self, HubModel, LocalModel};
+use crate::quant::Precision;
+use crate::runtime::{Llm, Stats};
+use crate::sampler::Sampler;
+use crate::weights::{Fetch, Watcher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
+type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
 pub enum Cmd {
     Search(String),
     Load { repo: String, backend: Backend },
+    /// Drop the loaded model, freeing its weights and its KV cache.
+    ///
+    /// Not the same as loading something else: a server needs to be able to
+    /// give the memory back without being told what to spend it on next.
+    Unload,
     Chat(Vec<Message>),
     RefreshLocal,
     Delete(String),
 }
 
-/// Where a model should run. Cycled from the UI with `p`.
+/// Where a model should run.
 ///
 /// One knob covers both axes, because they are the same question — how much
 /// hardware to spend — and the CPU's quantisation levels and the GPU's float
@@ -81,8 +102,10 @@ impl std::fmt::Display for Backend {
 }
 
 pub enum Evt {
-    /// Transient progress text for the status bar.
+    /// Transient progress text for a status bar.
     Status(String),
+    /// The same progress, in numbers, for a progress bar.
+    Fetching(Fetch),
     SearchResults(Vec<HubModel>),
     Local(Vec<LocalModel>),
     Loaded {
@@ -93,21 +116,46 @@ pub enum Evt {
         backend: String,
         weight_bytes: usize,
     },
+    /// No model is loaded any more, and what was loaded is named.
+    Unloaded(String),
     /// A fragment of the assistant's reply.
     Token(String),
     Done(Stats),
     Error(String),
 }
 
+/// Turns a repo id and a [`Backend`] into a loaded model.
+///
+/// See the module docs for why this is the caller's to supply. `progress` is
+/// the line of text a status bar shows; `watch` is the same thing in bytes,
+/// and both are already wired to the event channel by the time a loader sees
+/// them.
+pub type Loader = Box<
+    dyn FnMut(&str, Backend, &mut dyn FnMut(&str), &Watcher) -> Res<Llm> + Send,
+>;
+
+/// The loader for a build with no GPU crate in it.
+///
+/// CPU backends load; a GPU one is refused with the key that changes it,
+/// rather than with a type error at the other end of the program.
+pub fn cpu_loader() -> Loader {
+    Box::new(|repo, backend, progress, watch| match backend {
+        Backend::Cpu(precision) => Llm::load_watched(repo, precision, progress, watch),
+        Backend::Gpu(_) => {
+            Err("this build has no GPU backend; pick a CPU precision instead".into())
+        }
+    })
+}
+
 pub struct Engine {
     tx: Sender<Cmd>,
     pub rx: Receiver<Evt>,
-    /// Set by the UI to interrupt generation mid-stream.
+    /// Set by the caller to interrupt generation mid-stream.
     pub cancel: Arc<AtomicBool>,
 }
 
 impl Engine {
-    pub fn spawn() -> Self {
+    pub fn spawn(loader: Loader) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (evt_tx, evt_rx) = mpsc::channel::<Evt>();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -118,7 +166,7 @@ impl Engine {
             // Generation recurses through 30 layers of closures and rayon
             // scopes; the default 2 MB is enough, but be explicit.
             .stack_size(8 * 1024 * 1024)
-            .spawn(move || worker(cmd_rx, evt_tx, worker_cancel))
+            .spawn(move || worker(cmd_rx, evt_tx, worker_cancel, loader))
             .expect("failed to spawn engine thread");
 
         Engine { tx: cmd_tx, rx: evt_rx, cancel }
@@ -139,7 +187,7 @@ struct Loaded {
     sampler: Sampler,
 }
 
-fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
+fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load: Loader) {
     let say = |msg: &str| {
         let _ = tx.send(Evt::Status(msg.to_string()));
     };
@@ -181,6 +229,13 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 None => say(&format!("{id} is not in the cache")),
             },
 
+            Cmd::Unload => match session.take() {
+                Some(was) => {
+                    let _ = tx.send(Evt::Unloaded(was.llm.repo.clone()));
+                }
+                None => say("nothing is loaded"),
+            },
+
             Cmd::Load { repo, backend } => {
                 // Drop the previous model before loading the next one, or two
                 // sets of weights are briefly resident at once.
@@ -190,38 +245,16 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 let mut progress = |msg: &str| {
                     let _ = tx.send(Evt::Status(format!("{repo}: {msg}")));
                 };
-                let loaded = match backend {
-                    Backend::Cpu(precision) => Llm::load_with(&repo, precision, &mut progress),
-                    Backend::Gpu(mode) => {
-                        let dtype = kvad_gpu::model::parse_dtype("bf16").expect("known dtype");
-                        let quant = match mode {
-                            GpuMode::Bf16 => None,
-                            GpuMode::Q8 => kvad_gpu::model::parse_quant("q8").expect("known quant"),
-                            GpuMode::Q4 => kvad_gpu::model::parse_quant("q4").expect("known quant"),
-                        };
-                        // The GPU backend covers the Llama family only; the
-                        // error names the alternative rather than just failing.
-                        Llm::load_custom(&repo, &mut progress, &mut |files, spec, _| {
-                            if spec.arch != kvad::model::Arch::Llama {
-                                return Err(format!(
-                                    "the GPU backend implements the Llama family only; this model is {}. Press p to pick a CPU backend.",
-                                    spec.arch
-                                )
-                                .into());
-                            }
-                            let device = kvad_gpu::model::pick_device(None)?;
-                            let m = kvad_gpu::model::GpuLlama::load(
-                                &files.weights,
-                                spec.clone(),
-                                dtype,
-                                quant,
-                                device,
-                            )?;
-                            Ok(Box::new(m) as Box<dyn Session>)
-                        })
-                    }
+                // `hf-hub` reports bytes from its own download threads, so the
+                // watcher forwards down the channel rather than touching
+                // anything on this one.
+                let watch = {
+                    let tx = tx.clone();
+                    Watcher::new(move |f: Fetch| {
+                        let _ = tx.send(Evt::Fetching(f));
+                    })
                 };
-                match loaded {
+                match load(&repo, backend, &mut progress, &watch) {
                     Ok(llm) => {
                         let _ = tx.send(Evt::Loaded {
                             repo: repo.clone(),
@@ -241,7 +274,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
 
             Cmd::Chat(messages) => {
                 let Some(s) = session.as_mut() else {
-                    say("no model loaded — pick one on the Models tab");
+                    say("no model loaded");
                     continue;
                 };
                 cancel.store(false, Ordering::Relaxed);
@@ -273,5 +306,72 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An engine that can load nothing, for the tests that are about the
+    /// channels either side of the loader rather than about loading.
+    fn refusing_loader(why: &'static str) -> Loader {
+        Box::new(move |_, _, _, _| Err(why.into()))
+    }
+
+    /// An engine answers on the channel rather than on the calling thread,
+    /// and keeps answering after a load fails.
+    #[test]
+    fn a_failed_load_is_an_event_and_not_the_end_of_the_engine() {
+        let engine = Engine::spawn(refusing_loader("no backend here"));
+        engine.send(Cmd::Load {
+            repo: "nobody/nothing".into(),
+            backend: Backend::Cpu(Precision::Q8),
+        });
+        engine.send(Cmd::Unload);
+
+        let mut errors = Vec::new();
+        let mut statuses = Vec::new();
+        // Local(..) first, then the load's status, its error, and the
+        // "nothing is loaded" the unload answers with.
+        for _ in 0..8 {
+            match engine.rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Evt::Error(e)) => errors.push(e),
+                Ok(Evt::Status(s)) => statuses.push(s),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            if !errors.is_empty() && statuses.iter().any(|s| s == "nothing is loaded") {
+                break;
+            }
+        }
+        assert_eq!(errors, ["no backend here"]);
+        assert!(
+            statuses.iter().any(|s| s == "nothing is loaded"),
+            "the engine stopped serving commands after a failed load: {statuses:?}"
+        );
+    }
+
+    /// The default loader cannot build a GPU session, and says so in terms of
+    /// what to do about it.
+    #[test]
+    fn the_cpu_loader_refuses_a_gpu_backend_by_name() {
+        let watch = Watcher::none();
+        let err = match cpu_loader()("anything", Backend::Gpu(GpuMode::Bf16), &mut |_| {}, &watch) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("the CPU loader built a GPU session"),
+        };
+        assert!(err.contains("CPU precision"), "{err}");
+    }
+
+    #[test]
+    fn backends_cycle_through_every_one_and_come_back() {
+        let mut b = Backend::ALL[0];
+        for _ in 0..Backend::ALL.len() {
+            b = b.next();
+        }
+        assert_eq!(b, Backend::ALL[0]);
+        assert_eq!(Backend::Cpu(Precision::Q8).to_string(), "cpu q8");
+        assert_eq!(Backend::Gpu(GpuMode::Q4).to_string(), "gpu q4");
     }
 }

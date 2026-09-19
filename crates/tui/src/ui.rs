@@ -248,6 +248,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
             ("↑↓", "select"),
             ("enter", "load"),
             ("d", "delete"),
+            ("u", "unload"),
             ("p", "backend"),
             ("l", "local"),
             ("tab", "chat"),

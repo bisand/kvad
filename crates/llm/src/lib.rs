@@ -17,6 +17,8 @@
 //!    them, then [`qcache`] — doing that work once instead of every load.
 //! 7. [`train`]   — `kvad train`, which is the `nanograd` crate's training
 //!    loop with the models given names and a home.
+//! 8. [`service`] — the same engine driven from another thread, which is what
+//!    a terminal UI and a server both need.
 
 pub mod chat;
 pub mod hub;
@@ -24,6 +26,7 @@ pub mod model;
 pub mod qcache;
 pub mod quant;
 pub mod runtime;
+pub mod service;
 pub mod simd;
 pub mod sampler;
 pub mod tensor;

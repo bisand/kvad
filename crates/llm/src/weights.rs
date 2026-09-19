@@ -49,6 +49,7 @@ use crate::tensor::Tensor;
 use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -186,6 +187,107 @@ fn shard_names(index: &Path) -> Res<Vec<String>> {
     Ok(shards)
 }
 
+/// What a fetch is doing, in numbers rather than words.
+///
+/// This exists *beside* the line of text a fetch already reports, not instead
+/// of it. "fetching model.safetensors" is what a person reads; a progress bar
+/// needs to know that 412 of 990 MB have arrived, and a bar is the only
+/// honest way to show a download that takes two minutes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetch {
+    /// Nothing will be downloaded: the model is already a directory here.
+    Local,
+    /// The checkpoint is split, and this many shards are about to be fetched.
+    Shards(usize),
+    /// Bytes moved so far for one file. `total` is 0 when the size is not
+    /// known — a file answered from the cache reports that it is done and
+    /// never says how big it was.
+    Download { file: String, bytes: u64, total: u64 },
+    /// A file is on disk, whether it was downloaded now or cached earlier.
+    Fetched { file: String },
+}
+
+/// Where [`Fetch`] events go.
+///
+/// Two things make this unlike the `&mut dyn FnMut(&str)` beside it, and both
+/// come from `hf-hub`: it takes `&self`, and it is `Send + Sync`. The
+/// download runs on tokio tasks of its own while this thread sits blocked
+/// inside the request, so the handler is called from a thread that is not
+/// this one and cannot be handed a `&mut` to anything on it.
+///
+/// A watcher nobody is listening to drops every event, so callers that do not
+/// want progress pass [`Watcher::none`] rather than an `Option`.
+#[derive(Clone, Default)]
+pub struct Watcher(Option<Arc<dyn Fn(Fetch) + Send + Sync>>);
+
+impl Watcher {
+    pub fn new(f: impl Fn(Fetch) + Send + Sync + 'static) -> Self {
+        Watcher(Some(Arc::new(f)))
+    }
+
+    /// A watcher that discards everything. What [`fetch_with`] uses.
+    pub fn none() -> Self {
+        Watcher(None)
+    }
+
+    pub fn is_listening(&self) -> bool {
+        self.0.is_some()
+    }
+
+    fn emit(&self, event: Fetch) {
+        if let Some(f) = &self.0 {
+            f(event);
+        }
+    }
+}
+
+impl std::fmt::Debug for Watcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Watcher").field(&self.is_listening()).finish()
+    }
+}
+
+/// Adapts one `hf-hub` download to a [`Watcher`].
+///
+/// Every event is reported under the filename this relay was built for rather
+/// than the one `hf-hub` names, so that a caller drawing a bar sees the file
+/// it asked for whichever path the download took. One `download_file` call
+/// fetches exactly one file, so the two can only ever be the same name; the
+/// xet batch path does not carry a name at all.
+struct Relay {
+    file: String,
+    watch: Watcher,
+}
+
+impl hf_hub::progress::ProgressHandler for Relay {
+    fn on_progress(&self, event: &hf_hub::progress::ProgressEvent) {
+        use hf_hub::progress::{DownloadEvent as D, FileStatus, ProgressEvent as P};
+        let file = || self.file.clone();
+        match event {
+            P::Download(D::Progress { files }) => {
+                for f in files {
+                    self.watch.emit(match f.status {
+                        FileStatus::Complete => Fetch::Fetched { file: file() },
+                        _ => Fetch::Download {
+                            file: file(),
+                            bytes: f.bytes_completed,
+                            total: f.total_bytes,
+                        },
+                    });
+                }
+            }
+            P::Download(D::AggregateProgress { bytes_completed, total_bytes, .. }) => {
+                self.watch.emit(Fetch::Download {
+                    file: file(),
+                    bytes: *bytes_completed,
+                    total: *total_bytes,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Download (or reuse from the local cache) everything needed to run `repo_id`,
 /// reporting progress to stderr. A directory is used as it is.
 pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
@@ -197,11 +299,21 @@ pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
 /// The TUI needs this: anything written straight to stderr lands on top of the
 /// rendered frame and corrupts the display.
 pub fn fetch_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<ModelFiles> {
+    fetch_watched(repo_id, progress, &Watcher::none())
+}
+
+/// As [`fetch_with`], and also reporting [`Fetch`] events to `watch`.
+pub fn fetch_watched(
+    repo_id: &str,
+    progress: &mut dyn FnMut(&str),
+    watch: &Watcher,
+) -> Res<ModelFiles> {
     if let Some(dir) = local_dir(repo_id) {
         progress(match trained_name(&dir) {
             Some(_) => "a model trained here; nothing to fetch",
             None => "a directory on this machine; nothing to fetch",
         });
+        watch.emit(Fetch::Local);
         return ModelFiles::from_dir(&dir);
     }
     // Typed as a path, so meant as one: say the directory is missing, rather
@@ -224,12 +336,34 @@ pub fn fetch_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<ModelFil
 
     let repo = &repo;
     let progress = std::cell::RefCell::new(progress);
+    // `hf-hub` emits nothing at all when no handler is set, so a fetch nobody
+    // is watching pays for none of this.
+    let handler = |filename: &str| {
+        watch
+            .is_listening()
+            .then(|| hf_hub::progress::Progress::new(Relay { file: filename.to_string(), watch: watch.clone() }))
+    };
+    let fetched = |filename: &str, path: PathBuf| -> PathBuf {
+        watch.emit(Fetch::Fetched { file: filename.to_string() });
+        path
+    };
     let get = |filename: &str| -> Res<PathBuf> {
         (progress.borrow_mut())(&format!("fetching {filename}"));
-        Ok(repo.download_file().filename(filename.to_string()).send()?)
+        let path = repo
+            .download_file()
+            .filename(filename.to_string())
+            .maybe_progress(handler(filename))
+            .send()?;
+        Ok(fetched(filename, path))
     };
     let try_get = |filename: &str| -> Option<PathBuf> {
-        repo.download_file().filename(filename.to_string()).send().ok()
+        let path = repo
+            .download_file()
+            .filename(filename.to_string())
+            .maybe_progress(handler(filename))
+            .send()
+            .ok()?;
+        Some(fetched(filename, path))
     };
 
     // Single file, or a shard index naming several.
@@ -238,6 +372,7 @@ pub fn fetch_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<ModelFil
         None => {
             let shards = shard_names(&get("model.safetensors.index.json")?)?;
             (progress.borrow_mut())(&format!("checkpoint is split across {} shards", shards.len()));
+            watch.emit(Fetch::Shards(shards.len()));
             shards.iter().map(|s| get(s)).collect::<Res<Vec<_>>>()?
         }
     };

@@ -67,9 +67,21 @@ impl Llm {
         precision: Precision,
         progress: &mut dyn FnMut(&str),
     ) -> Res<Self> {
+        Self::load_watched(repo_id, precision, progress, &weights::Watcher::none())
+    }
+
+    /// As [`Llm::load_with`], reporting the download in bytes as well as in
+    /// words. A server draws a progress bar from `watch`; a terminal does not
+    /// need one and passes [`weights::Watcher::none`].
+    pub fn load_watched(
+        repo_id: &str,
+        precision: Precision,
+        progress: &mut dyn FnMut(&str),
+        watch: &weights::Watcher,
+    ) -> Res<Self> {
         // What the quantised-weight cache files this model under.
         let repo = weights::model_id(repo_id);
-        Self::load_custom(repo_id, progress, &mut |files, spec, progress| {
+        Self::load_custom(repo_id, progress, watch, &mut |files, spec, progress| {
             let model = qcache::load(&repo, files, spec, precision, progress)?;
             Ok(Box::new(CpuSession::new(model, precision)))
         })
@@ -79,9 +91,10 @@ impl Llm {
     pub fn load_custom(
         repo_id: &str,
         progress: &mut dyn FnMut(&str),
+        watch: &weights::Watcher,
         build: SessionFactory,
     ) -> Res<Self> {
-        let files = weights::fetch_with(repo_id, progress)?;
+        let files = weights::fetch_watched(repo_id, progress, watch)?;
         progress("reading weights");
         let spec = Spec::from_json(&files.config)?;
         let session = build(&files, &spec, progress)?;

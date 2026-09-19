@@ -43,6 +43,8 @@ use crate::optim::{AdamW, Schedule};
 use crate::rng::Rng;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
 
@@ -362,6 +364,15 @@ pub struct Training {
     /// Where to write the model whenever validation loss improves. `None`
     /// trains and keeps nothing.
     pub save: Option<std::path::PathBuf>,
+    /// Set from another thread to end the run early. `None` is a run that
+    /// cannot be stopped, which is what a command line wants: Ctrl-C.
+    ///
+    /// Read once a step, not once a checkpoint. Checkpoints are hundreds of
+    /// steps apart by default, and a stop button that takes a minute to
+    /// answer is a stop button nobody believes. A stopped run leaves the best
+    /// model so far on disk, because `save` writes at every improvement
+    /// rather than at the end.
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 impl Default for Training {
@@ -377,6 +388,7 @@ impl Default for Training {
             eval_windows: 50,
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
             save: None,
+            stop: None,
         }
     }
 }
@@ -422,6 +434,10 @@ pub struct Trained {
     pub best_step: usize,
     pub last_val: f32,
     pub elapsed_secs: f32,
+    /// True if [`Training::stop`] was raised and the run ended before its
+    /// last step. The numbers above are still the truth about what happened;
+    /// they are just about a shorter run than the one that was asked for.
+    pub stopped: bool,
 }
 
 /// Steps to time before reporting a pace. Ten is enough for an estimate good
@@ -477,7 +493,17 @@ pub fn train(
     let (mut best_val, mut best_step) = (f32::INFINITY, 0);
     let mut last_val = f32::INFINITY;
 
+    let stopped = |cfg: &Training| cfg.stop.as_deref().is_some_and(|s| s.load(Ordering::Relaxed));
+    let mut ended_early = false;
+
     for step in 1..=cfg.steps {
+        // Asked before the step rather than after it, so that a stop raised
+        // during step N is answered by not starting step N+1.
+        if stopped(cfg) {
+            ended_early = true;
+            break;
+        }
+
         // The rate is the loop's business, not the optimiser's: Adam decides
         // which way each weight goes, the schedule decides how far.
         opt.lr = schedule.at(step, cfg.steps);
@@ -520,7 +546,13 @@ pub fn train(
         }
     }
 
-    Ok(Trained { best_val, best_step, last_val, elapsed_secs: started.elapsed().as_secs_f32() })
+    Ok(Trained {
+        best_val,
+        best_step,
+        last_val,
+        elapsed_secs: started.elapsed().as_secs_f32(),
+        stopped: ended_early,
+    })
 }
 
 /// A number of seconds as something to read: "45s", "6m 20s", "1h 12m".
@@ -892,6 +924,78 @@ mod tests {
     ///
     /// The two halves are built by hand rather than with [`Corpus::new`], so
     /// that not one window of the one is in the other.
+    /// A raised [`Training::stop`] ends the run at the next step, not at the
+    /// next checkpoint, and says so in the result.
+    ///
+    /// Asserted by counting checkpoints rather than by timing: a run of 400
+    /// steps evaluating every 5 would report 80 times, and stopping from
+    /// inside the first report has to leave it at exactly one. The model on
+    /// disk is the one that first report saved, so a stopped run is still a
+    /// run you can use.
+    #[test]
+    fn a_raised_stop_ends_the_run_at_the_next_step() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let mut model = Gpt::new(config, &mut Rng::new(4));
+        let dir = scratch("stopped");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let cfg = Training {
+            steps: 400,
+            batch: 2,
+            lr: 1e-2,
+            eval_every: 5,
+            eval_windows: 5,
+            threads: 1,
+            save: Some(dir.clone()),
+            stop: Some(Arc::clone(&stop)),
+            ..Training::default()
+        };
+
+        let mut checkpoints = 0;
+        let done = train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
+            if let Report::Step { .. } = report {
+                checkpoints += 1;
+                stop.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap();
+
+        assert_eq!(checkpoints, 1, "the run kept going past the step the stop was raised on");
+        assert!(done.stopped, "a run that was stopped reported itself as finished");
+        assert_eq!(done.best_step, 5);
+        assert!(dir.join(crate::checkpoint::WEIGHTS_FILE).is_file(), "a stopped run left no model behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stop that is already raised stops before the first step, and the
+    /// result is a run that trained nothing rather than an error.
+    #[test]
+    fn a_stop_raised_before_the_start_trains_nothing() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let mut model = Gpt::new(config, &mut Rng::new(4));
+        let cfg = Training {
+            steps: 400,
+            batch: 2,
+            lr: 1e-2,
+            eval_every: 5,
+            eval_windows: 5,
+            threads: 1,
+            save: None,
+            stop: Some(Arc::new(AtomicBool::new(true))),
+            ..Training::default()
+        };
+
+        let mut reports = 0;
+        let done =
+            train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |_| reports += 1).unwrap();
+        assert_eq!(reports, 0);
+        assert!(done.stopped);
+        assert_eq!(done.best_step, 0);
+        assert!(done.best_val.is_infinite(), "a run of no steps measured a loss");
+    }
+
     fn a_text_and_its_contradiction() -> (CharTokenizer, Corpus) {
         let tok = CharTokenizer::from_text("abc");
         let corpus =
@@ -1128,6 +1232,7 @@ mod tests {
                 eval_windows: 5,
                 threads: 1,
                 save: None,
+                stop: None,
             };
             train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |_| {}).unwrap();
             let end: Vec<f32> = model.params().iter().flat_map(|p| p.value.to_vec()).collect();

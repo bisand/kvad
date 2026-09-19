@@ -14,14 +14,14 @@
 //! * `rayon` fans each matmul across cores underneath the engine.
 
 mod app;
-mod engine;
+mod gpu;
 mod ui;
 
 use app::App;
+use kvad::service::Engine;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::ExecutableCommand;
-use engine::Engine;
 use ratatui::prelude::*;
 use std::io::stdout;
 use std::time::Duration;
@@ -55,7 +55,9 @@ fn restore() -> Res<()> {
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Res<()> {
-    let engine = Engine::spawn();
+    // The GPU half of the loader is this crate's, because `kvad` cannot
+    // reach the GPU crate; see `gpu`.
+    let engine = Engine::spawn(gpu::loader());
     let mut app = App::new();
     if let Some(model) = std::env::args().nth(1) {
         // By absolute path if it is a directory: loading makes it the active

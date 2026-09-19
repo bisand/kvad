@@ -39,7 +39,7 @@
 //! use — the mean subtraction turned out not to be earning its cost.
 
 use crate::matrix::Matrix;
-use crate::nn::{sgd, Layer};
+use crate::nn::{sgd, Layer, Param};
 
 /// Added to the variance before the square root, so a constant row divides by
 /// something small rather than by zero.
@@ -144,12 +144,11 @@ impl Layer for LayerNorm {
         format!("LayerNorm({}, {} params)", self.gamma.len(), 2 * self.gamma.len())
     }
 
-    fn weights_mut(&mut self) -> Option<&mut [f32]> {
-        Some(&mut self.gamma)
-    }
-
-    fn weight_grads(&self) -> Option<&[f32]> {
-        Some(&self.dgamma)
+    fn params(&mut self) -> Vec<Param<'_>> {
+        vec![
+            Param::new("gamma", &mut self.gamma, &self.dgamma),
+            Param::new("beta", &mut self.beta, &self.dbeta),
+        ]
     }
 }
 
@@ -233,12 +232,8 @@ impl Layer for RmsNorm {
         format!("RmsNorm({}, {} params)", self.gamma.len(), self.gamma.len())
     }
 
-    fn weights_mut(&mut self) -> Option<&mut [f32]> {
-        Some(&mut self.gamma)
-    }
-
-    fn weight_grads(&self) -> Option<&[f32]> {
-        Some(&self.dgamma)
+    fn params(&mut self) -> Vec<Param<'_>> {
+        vec![Param::new("gamma", &mut self.gamma, &self.dgamma)]
     }
 }
 

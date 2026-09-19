@@ -22,6 +22,20 @@
 //! sequence*, and attention is the only layer in a transformer where rows talk
 //! to each other. `P[i][j]` is how much position `i` reads from position `j`.
 //!
+//! # A parameter that does nothing
+//!
+//! `Wk` is a `Linear`, and a `Linear` has a bias, so every key gets the same
+//! vector `b` added to it. Follow that through: `q_i · (k_j + b)` is
+//! `q_i · k_j + q_i · b`, and the second term does not depend on `j`. Every
+//! score in row `i` moves by the same amount, and softmax does not care — it
+//! only sees differences within a row. The key bias cannot change the output,
+//! its gradient is exactly zero, and it never trains. GPT-2 ships one in every
+//! layer anyway. The gradient check found this, not the algebra: it reported a
+//! 100% disagreement on one tensor, which turned out to be rounding noise
+//! compared with rounding noise. (With rotary position embeddings the keys are
+//! rotated by position after the bias is added, the term stops being constant
+//! along the row, and the bias starts to matter — which is why Qwen has one.)
+//!
 //! One sequence per call. A batch of sequences is a loop around this: the
 //! gradient buffers accumulate until `zero_grad`, which is what they were
 //! for all along.
@@ -30,7 +44,7 @@
 //! [`matrix`]: crate::matrix
 
 use crate::matrix::Matrix;
-use crate::nn::{Layer, Linear};
+use crate::nn::{prefixed, Layer, Linear, Param};
 use crate::rng::Rng;
 
 /// Multi-head causal self-attention over one sequence: `[seq, d_model]` in,
@@ -151,8 +165,8 @@ impl Layer for CausalSelfAttention {
         // x fed three projections, so it is to blame through all three. When a
         // value is used in several places, its gradients add.
         let mut dx = self.wq.backward(&dq);
-        add_into(&mut dx, &self.wk.backward(&dk));
-        add_into(&mut dx, &self.wv.backward(&dv));
+        dx.add_in_place(&self.wk.backward(&dk));
+        dx.add_in_place(&self.wv.backward(&dv));
         dx
     }
 
@@ -168,6 +182,14 @@ impl Layer for CausalSelfAttention {
         self.wk.zero_grad();
         self.wv.zero_grad();
         self.wo.zero_grad();
+    }
+
+    fn params(&mut self) -> Vec<Param<'_>> {
+        let mut all = prefixed("wq", self.wq.params());
+        all.extend(prefixed("wk", self.wk.params()));
+        all.extend(prefixed("wv", self.wv.params()));
+        all.extend(prefixed("wo", self.wo.params()));
+        all
     }
 
     fn describe(&self) -> String {
@@ -256,12 +278,6 @@ fn put_head(m: &mut Matrix, h: usize, head: &Matrix) {
     }
 }
 
-fn add_into(acc: &mut Matrix, g: &Matrix) {
-    for (a, g) in acc.data.iter_mut().zip(g.data.iter()) {
-        *a += g;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,14 +321,14 @@ mod tests {
         // Every weight of every projection. Wk is the one most worth
         // checking: its gradient arrives through a transposed product.
         for (i, name) in ["Wq", "Wk", "Wv", "Wo"].into_iter().enumerate() {
-            let analytic = projection(&mut attn, i).weight_grads().unwrap().to_vec();
+            let analytic = projection(&mut attn, i).params()[0].grad.to_vec();
             let mut numerical = vec![0.0; analytic.len()];
             for (idx, slot) in numerical.iter_mut().enumerate() {
-                projection(&mut attn, i).weights_mut().unwrap()[idx] += eps;
+                projection(&mut attn, i).params()[0].value[idx] += eps;
                 let up = loss(&mut attn, &x, &targets);
-                projection(&mut attn, i).weights_mut().unwrap()[idx] -= 2.0 * eps;
+                projection(&mut attn, i).params()[0].value[idx] -= 2.0 * eps;
                 let down = loss(&mut attn, &x, &targets);
-                projection(&mut attn, i).weights_mut().unwrap()[idx] += eps;
+                projection(&mut attn, i).params()[0].value[idx] += eps;
                 *slot = (up - down) / (2.0 * eps);
             }
             let rel = relative_error(&analytic, &numerical);
@@ -332,6 +348,36 @@ mod tests {
         }
         let rel = relative_error(&dx.data, &numerical);
         assert!(rel < 1e-2, "dx: analytic and numerical gradients differ (rel {rel:.4})");
+    }
+
+    /// See "A parameter that does nothing" at the top of the file.
+    #[test]
+    fn the_key_bias_cannot_change_anything() {
+        let (mut attn, x, targets) = setup();
+        crate::gradcheck::scramble(&mut attn, &mut Rng::new(5));
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        attn.zero_grad();
+        let (_, dlogits) = softmax_cross_entropy(&attn.forward(&x), &targets);
+        attn.backward(&dlogits);
+        for p in attn.params() {
+            match p.name.as_str() {
+                "wk.bias" => assert!(norm(p.grad) < 1e-6, "key bias gradient {:e}", norm(p.grad)),
+                _ => assert!(norm(p.grad) > 1e-2, "{} gradient {:e}", p.name, norm(p.grad)),
+            }
+        }
+
+        // Not merely a small gradient at this point: move it a long way and
+        // the output stays where it was.
+        let before = attn.forward(&x);
+        for p in attn.params() {
+            if p.name == "wk.bias" {
+                p.value.iter_mut().for_each(|v| *v += 5.0);
+            }
+        }
+        let after = attn.forward(&x);
+        let moved = before.data.iter().zip(&after.data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(moved < 1e-5, "output moved by {moved:e}");
     }
 
     /// Changing a token must not change anything before it.

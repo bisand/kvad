@@ -109,6 +109,12 @@ Zero dependencies. Read in this order:
    pass is `Linear`'s with the same shortcut: add each gradient row into the
    table row its token selected. Add, not assign — a token used three times is
    to blame three times.
+7. **[`block.rs`](crates/nanograd/src/block.rs)** — the residual connection,
+   `y = x + f(x)`, and the transformer block, which is two of them. The backward
+   pass is `dx = dy + f.backward(dy)`, and the first term is the point: whatever
+   the branch does to the gradient, `dy` also reaches the layer below untouched.
+   One test makes it concrete — 24 layers that each pass back about a tenth of
+   their gradient deliver 3e-22 of it in a chain, and 1.5 of it with the `x +`.
 
 ### The test worth running first
 
@@ -140,6 +146,23 @@ build the one-hot matrix for real, push it through the matmuls from step 1, and
 require the lookup and its gradient to match *to the bit*. No tolerance to tune,
 because there is no approximation — the shortcut performs the same additions in
 the same order.
+
+Checking the whole block turned up two things no single layer had shown.
+
+*ReLU cannot be checked tightly.* Nudge a weight and some hidden unit crosses
+zero, where the slope jumps and a centred difference is simply wrong. Correct
+gradients disagreed with their estimates by up to 0.011 with ReLU in the MLP,
+and by under 0.0002 with GELU. That is why the block uses GELU, and it is not
+cosmetic: dropping a `3` from GELU's own derivative measures 0.011–0.014, which
+a ReLU-sized tolerance would have waved through.
+
+*Attention's key bias does nothing.* The check reported a 100% disagreement on
+one tensor. Adding the same vector to every key moves every score in a row by
+the same amount, and softmax only sees differences within a row — so the
+gradient is exactly zero, and the check was comparing rounding noise with
+rounding noise. Move that bias by 5.0 and the output moves by 1e-6. GPT-2 ships
+one in every layer. (RoPE rotates the keys after the bias is added, which makes
+it matter again; Qwen has one for that reason.)
 
 ### Things to try
 
@@ -797,11 +820,13 @@ story, the serving track is what the second half of the mission actually costs.
 corpus you pick. Backprop through attention
 ([`attention.rs`](crates/nanograd/src/attention.rs)) and through LayerNorm and
 RMSNorm ([`norm.rs`](crates/nanograd/src/norm.rs)), and the embedding
-([`embedding.rs`](crates/nanograd/src/embedding.rs)) are done. That is every
-layer of the original Transformer, whose MLP used ReLU; GPT-2's GELU and
-Llama's SwiGLU are not written yet. Still needed are the residual wiring that
-makes the layers a block, and Adam. The gradient check from crate 1 is how you
-will debug each one — extend `nanograd` (hard, most educational) or use
+([`embedding.rs`](crates/nanograd/src/embedding.rs)), and the block that wires
+them together with GELU and residual connections
+([`block.rs`](crates/nanograd/src/block.rs)) are done — a GPT-2-shaped block,
+gradient-checked end to end. Llama's SwiGLU and RoPE are not written. Still
+needed are a model that stacks blocks between an embedding and an output head,
+Adam, and a training loop over a text file. The gradient check from crate 1 is
+how you will debug each one — extend `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
 **2. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices

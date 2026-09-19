@@ -27,15 +27,34 @@ pub trait Layer {
     fn zero_grad(&mut self) {}
     fn describe(&self) -> String;
 
-    /// Flat view of this layer's weights, if it has any. Used by the gradient
-    /// check, and handy when you want to inspect or serialise a model.
-    fn weights_mut(&mut self) -> Option<&mut [f32]> {
-        None
+    /// Every parameter tensor in this layer, each beside the gradient
+    /// accumulated for it. A layer built from other layers returns theirs.
+    ///
+    /// This is how anything outside a layer reaches what is inside it: the
+    /// gradient check nudges `value` and compares against `grad`, and it is
+    /// what you would walk to save a model.
+    fn params(&mut self) -> Vec<Param<'_>> {
+        Vec::new()
     }
-    /// Flat view of the gradients accumulated for those same weights.
-    fn weight_grads(&self) -> Option<&[f32]> {
-        None
+}
+
+/// One parameter tensor, flattened, and its gradient.
+pub struct Param<'a> {
+    /// Dotted, like `attn.1.wq.weight`, so a failed check can say where.
+    pub name: String,
+    pub value: &'a mut [f32],
+    pub grad: &'a [f32],
+}
+
+impl<'a> Param<'a> {
+    pub fn new(name: &str, value: &'a mut [f32], grad: &'a [f32]) -> Self {
+        Param { name: name.to_string(), value, grad }
     }
+}
+
+/// The parameters of a child layer, renamed to say whose child it is.
+pub fn prefixed<'a>(prefix: &str, params: Vec<Param<'a>>) -> Vec<Param<'a>> {
+    params.into_iter().map(|p| Param { name: format!("{prefix}.{}", p.name), ..p }).collect()
 }
 
 /// SGD with momentum over one parameter vector.
@@ -132,12 +151,11 @@ impl Layer for Linear {
         format!("Linear({} -> {}, {} params)", self.w.rows, self.w.cols, self.param_count())
     }
 
-    fn weights_mut(&mut self) -> Option<&mut [f32]> {
-        Some(&mut self.w.data)
-    }
-
-    fn weight_grads(&self) -> Option<&[f32]> {
-        Some(&self.dw.data)
+    fn params(&mut self) -> Vec<Param<'_>> {
+        vec![
+            Param::new("weight", &mut self.w.data, &self.dw.data),
+            Param::new("bias", &mut self.b, &self.db),
+        ]
     }
 }
 
@@ -170,6 +188,67 @@ impl Layer for Relu {
 
     fn describe(&self) -> String {
         "ReLU".to_string()
+    }
+}
+
+/// `y = x * P(Z < x)` for a standard normal `Z` — a ReLU with the corner
+/// sanded off. Where ReLU asks "is x positive?" and answers 0 or 1, GELU
+/// answers with a probability, so a slightly negative input is mostly, not
+/// entirely, switched off. It is what GPT-2 uses.
+///
+/// The exact form needs the normal CDF. This is OpenAI's tanh approximation,
+/// the same one Kvad's inference engine uses for GPT-2, because a model has to
+/// be run with the nonlinearity it was trained with.
+///
+/// It is here for a second, measured reason. ReLU's corner breaks the
+/// numerical gradient: nudge a weight and some hidden unit crosses zero, where
+/// the slope jumps and a centred difference is simply wrong. Checking a whole
+/// transformer block with ReLU in its MLP, correct gradients disagreed with
+/// their numerical estimates by up to 0.011 — and by under 0.0001 with the
+/// ReLU taken out. A smooth activation lets the check be a hundred times
+/// stricter, which is the difference between catching a subtle bug and not.
+#[derive(Default)]
+pub struct Gelu {
+    x: Vec<f32>,
+}
+
+impl Gelu {
+    const C: f32 = 0.797_884_6; // sqrt(2/pi)
+    const A: f32 = 0.044715;
+}
+
+impl Layer for Gelu {
+    fn forward(&mut self, x: &Matrix) -> Matrix {
+        self.x = x.data.clone();
+        let data = x
+            .data
+            .iter()
+            .map(|&v| 0.5 * v * (1.0 + (Self::C * (v + Self::A * v * v * v)).tanh()))
+            .collect();
+        Matrix::from_vec(x.rows, x.cols, data)
+    }
+
+    fn backward(&mut self, dy: &Matrix) -> Matrix {
+        // y = 0.5 * x * (1 + t), with t = tanh(u) and u = C * (x + A x^3).
+        // The product rule gives one term for each factor that contains x,
+        // and tanh' = 1 - tanh^2:
+        //
+        //   dy/dx = 0.5 * (1 + t)  +  0.5 * x * (1 - t^2) * C * (1 + 3 A x^2)
+        let data = dy
+            .data
+            .iter()
+            .zip(self.x.iter())
+            .map(|(&g, &x)| {
+                let t = (Self::C * (x + Self::A * x * x * x)).tanh();
+                let du = Self::C * (1.0 + 3.0 * Self::A * x * x);
+                g * (0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * du)
+            })
+            .collect();
+        Matrix::from_vec(dy.rows, dy.cols, data)
+    }
+
+    fn describe(&self) -> String {
+        "GELU".to_string()
     }
 }
 
@@ -287,6 +366,27 @@ mod tests {
         assert!((loss - 3f32.ln()).abs() < 1e-5, "loss was {loss}");
     }
 
+    #[test]
+    fn gelu_is_a_smoothed_relu() {
+        let y = Gelu::default().forward(&Matrix::from_vec(1, 5, vec![-6.0, -1.0, 0.0, 1.0, 6.0]));
+        assert!(y.data[0].abs() < 1e-6, "far below zero it is off: {}", y.data[0]);
+        assert!((y.data[1] + 0.1588).abs() < 1e-3, "gelu(-1) = {}", y.data[1]);
+        assert_eq!(y.data[2], 0.0);
+        assert!((y.data[3] - 0.8412).abs() < 1e-3, "gelu(1) = {}", y.data[3]);
+        assert!((y.data[4] - 6.0).abs() < 1e-6, "far above zero it is the identity: {}", y.data[4]);
+    }
+
+    #[test]
+    fn gelu_gradient_matches_numerical() {
+        let mut rng = Rng::new(41);
+        // Spread wide enough to cover the dip below zero and both flat ends.
+        let x = Matrix::from_vec(4, 6, (0..24).map(|_| 2.0 * rng.normal()).collect::<Vec<f32>>());
+        let report = crate::gradcheck::check_layer(&mut Gelu::default(), &x, &[2, 0, 5, 3], 1e-2);
+        for c in report {
+            assert!(c.rel < 2e-3, "{}: analytic and numerical gradients differ (rel {:.4})", c.name, c.rel);
+        }
+    }
+
     /// The test that matters.
     ///
     /// Nudge one weight by ±eps, measure how the loss actually changes, and
@@ -318,10 +418,10 @@ mod tests {
         // Probe a handful of weights in the first Linear layer.
         let eps = 1e-3;
         for idx in [0usize, 5, 11, 17, 23] {
-            let analytic = net.layers[0].weight_grads().unwrap()[idx];
+            let analytic = net.layers[0].params()[0].grad[idx];
 
             let nudge = |net: &mut Mlp, d: f32| {
-                net.layers[0].weights_mut().unwrap()[idx] += d;
+                net.layers[0].params()[0].value[idx] += d;
             };
 
             nudge(&mut net, eps);

@@ -41,6 +41,14 @@ impl Matrix {
         self.data.iter_mut().for_each(|x| *x = v);
     }
 
+    /// `self += other`, element by element.
+    pub fn add_in_place(&mut self, other: &Matrix) {
+        assert_eq!((self.rows, self.cols), (other.rows, other.cols), "add shape mismatch");
+        for (a, b) in self.data.iter_mut().zip(other.data.iter()) {
+            *a += b;
+        }
+    }
+
     /// `self @ b`, where self is [m, k] and b is [k, n]. Result is [m, n].
     ///
     /// The loop order is i-k-j rather than the textbook i-j-k: it lets the

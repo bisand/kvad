@@ -64,6 +64,34 @@ pub enum Precision {
 }
 
 impl Precision {
+    /// Bytes one weight costs in memory at this precision.
+    ///
+    /// Fractional, because the quantised formats are not whole bytes: q8 is
+    /// eight bits of payload plus one `f32` scale per [`BLOCK`] weights, so
+    /// nine bits; q4 is five. Multiply by a parameter count and you have what
+    /// a model will occupy before it is downloaded — which is the number
+    /// somebody wants *before* committing to sixteen gigabytes.
+    ///
+    /// The weights only. A KV cache needs the context length, which a search
+    /// result does not carry.
+    pub fn bytes_per_weight(self) -> f64 {
+        let scale = std::mem::size_of::<f32>() as f64 / BLOCK as f64;
+        match self {
+            Precision::F32 => 4.0,
+            Precision::Q8 => 1.0 + scale,
+            Precision::Q4 => 0.5 + scale,
+        }
+    }
+
+    /// What `params` weights occupy at this precision.
+    pub fn weight_bytes(self, params: u64) -> u64 {
+        (params as f64 * self.bytes_per_weight()) as u64
+    }
+
+    /// Smallest first, which is the order "what is the cheapest way to run
+    /// this" wants to be asked in.
+    pub const SMALLEST_FIRST: [Precision; 3] = [Precision::Q4, Precision::Q8, Precision::F32];
+
     pub fn parse(s: &str) -> Option<Precision> {
         match s.to_ascii_lowercase().as_str() {
             "f32" | "none" => Some(Precision::F32),

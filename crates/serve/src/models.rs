@@ -160,6 +160,26 @@ pub struct Found {
     blocker: Option<String>,
     /// Already on this machine, so the button says "load" rather than "pull".
     local: bool,
+    /// Weights, as the Hub counts them from the safetensors headers.
+    params: Option<u64>,
+    /// Bytes to download.
+    bytes: Option<u64>,
+    /// What the weights would occupy here, per precision — which is not the
+    /// download size, because loading quantises.
+    memory: Option<Memory>,
+    /// The best precision whose weights fit in this machine's memory, or
+    /// `null` for "nothing fits" / "we could not tell".
+    fits_at: Option<String>,
+    /// Which of those two `fits_at: null` means.
+    size_known: bool,
+}
+
+/// What a model costs here, at each precision this engine offers.
+#[derive(serde::Serialize)]
+pub struct Memory {
+    f32: u64,
+    q8: u64,
+    q4: u64,
 }
 
 pub async fn search(
@@ -187,6 +207,18 @@ pub async fn search(
                 runnable: m.runnable(),
                 blocker: m.blocker(),
                 local: here.contains(&m.id.as_str()),
+                params: m.params,
+                bytes: m.download_bytes,
+                memory: m.params.map(|p| Memory {
+                    f32: kvad::quant::Precision::F32.weight_bytes(p),
+                    q8: kvad::quant::Precision::Q8.weight_bytes(p),
+                    q4: kvad::quant::Precision::Q4.weight_bytes(p),
+                }),
+                fits_at: match m.fit() {
+                    hub::Fit::At(p) => Some(p.to_string()),
+                    hub::Fit::TooBig | hub::Fit::Unknown => None,
+                },
+                size_known: m.params.is_some(),
                 id: m.id.clone(),
             })
             .collect(),

@@ -483,21 +483,28 @@ fn search(args: Args) -> Res<()> {
 
     let local: Vec<String> = hub::local_models().into_iter().map(|m| m.id).collect();
     println!(
-        "{:<46} {:>10}  {:<7} {}",
-        "MODEL", "DOWNLOADS", "ARCH", "STATUS"
+        "{:<40} {:>10} {:>9}  {:<7} {}",
+        "MODEL", "DOWNLOADS", "SIZE", "ARCH", "STATUS"
     );
     for m in &results {
+        // The size is the download; the fit is what it costs *here*, which is
+        // a different number because the weights are quantised on load.
+        let size = m
+            .download_bytes
+            .map(hub::human_bytes)
+            .unwrap_or_else(|| "-".into());
         let status = match m.blocker() {
             Some(reason) => reason,
             None if local.contains(&m.id) => "downloaded".into(),
-            None if m.looks_instruct => "runnable · chat".into(),
-            None => "runnable · completion".into(),
+            None if m.looks_instruct => format!("chat · {}", m.fit()),
+            None => format!("completion · {}", m.fit()),
         };
         // Names come from the Hub; print them, never act on them.
         println!(
-            "{:<46} {:>10}  {:<7} {}",
-            truncate(&m.id, 46),
+            "{:<40} {:>10} {:>9}  {:<7} {}",
+            truncate(&m.id, 40),
             m.downloads,
+            size,
             m.arch.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
             status
         );

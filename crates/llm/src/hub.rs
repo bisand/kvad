@@ -40,6 +40,14 @@ pub struct HubModel {
     /// Heuristic, from the name. Only loading the tokenizer config can
     /// actually confirm it, which `pull` does.
     pub looks_instruct: bool,
+    /// Weights, counted by the Hub from the safetensors headers. `None` for a
+    /// repo that ships no safetensors — a GGUF mirror, say — which is also a
+    /// repo this engine cannot load.
+    pub params: Option<u64>,
+    /// Bytes to download: the parameter counts multiplied by the width of the
+    /// dtype each is stored in. Not the same as what it costs in memory here,
+    /// which depends on the precision it is loaded at.
+    pub download_bytes: Option<u64>,
 }
 
 impl HubModel {
@@ -59,12 +67,89 @@ impl HubModel {
             }
         }
     }
+
+    /// What this model's weights would occupy here, at each precision.
+    ///
+    /// Weights only — a KV cache needs the context length, and a search result
+    /// does not carry one. For a 7B model that understates the real
+    /// requirement by a gigabyte or two at a long context, which is worth
+    /// knowing and is still the right number to show: it is the part that is
+    /// fixed, and the part that decides whether the download is worth starting.
+    pub fn memory_at(&self, precision: crate::quant::Precision) -> Option<u64> {
+        self.params.map(|p| precision.weight_bytes(p))
+    }
+
+    /// The cheapest precision whose weights fit in this machine's memory.
+    ///
+    /// `None` means either that we do not know the size, or that nothing fits.
+    /// [`HubModel::fit`] tells those apart.
+    pub fn best_precision(&self) -> Option<crate::quant::Precision> {
+        let usable = crate::machine::usable_memory()?;
+        let params = self.params?;
+        // Largest first, so the answer is the *best* precision that fits
+        // rather than merely the smallest.
+        crate::quant::Precision::SMALLEST_FIRST
+            .into_iter()
+            .rev()
+            .find(|p| p.weight_bytes(params) <= usable)
+    }
+
+    pub fn fit(&self) -> Fit {
+        match (self.params, crate::machine::usable_memory()) {
+            (None, _) | (_, None) => Fit::Unknown,
+            (Some(_), Some(_)) => match self.best_precision() {
+                Some(p) => Fit::At(p),
+                None => Fit::TooBig,
+            },
+        }
+    }
+}
+
+/// Whether a model will run on this machine, and how cheaply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// Fits, at this precision or anything smaller.
+    At(crate::quant::Precision),
+    /// Does not fit even at q4.
+    TooBig,
+    /// The Hub did not say how big it is, or we cannot read this machine's
+    /// memory. Saying nothing beats guessing.
+    Unknown,
+}
+
+impl std::fmt::Display for Fit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Fit::At(p) => write!(f, "fits at {p}"),
+            Fit::TooBig => f.write_str("too big"),
+            Fit::Unknown => f.write_str("?"),
+        }
+    }
+}
+
+/// Bytes a dtype takes per value, as the Hub names them.
+fn dtype_bytes(name: &str) -> u64 {
+    match name {
+        "F64" | "I64" | "U64" => 8,
+        "F32" | "I32" | "U32" => 4,
+        "F16" | "BF16" | "I16" | "U16" => 2,
+        // F8_E4M3, F8_E5M2, I8, U8, BOOL, and the 4-bit types, which the Hub
+        // still counts one value per byte.
+        _ => 1,
+    }
 }
 
 /// Search the Hub, newest-first by download count.
 pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
+    // `expand[]` *replaces* the default field set rather than adding to it, so
+    // everything this function reads has to be named — including the fields
+    // that used to arrive for free. Asking for one more thing and silently
+    // losing `config` was the first version of this.
     let url = format!(
-        "https://huggingface.co/api/models?search={}&config=true&sort=downloads&direction=-1&limit={}&filter=text-generation",
+        "https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit={}\
+         &filter=text-generation\
+         &expand[]=config&expand[]=downloads&expand[]=likes&expand[]=gated\
+         &expand[]=safetensors",
         urlencode(query),
         limit.clamp(1, 100)
     );
@@ -82,6 +167,19 @@ pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             let lower = id.to_ascii_lowercase();
+            let safetensors = m.get("safetensors");
+            let params = safetensors.and_then(|s| s.get("total")).and_then(|v| v.as_u64());
+            // Each dtype's count times its width. A model stored half in bf16
+            // and half in fp8 is neither one nor the other.
+            let download_bytes = safetensors
+                .and_then(|s| s.get("parameters"))
+                .and_then(|p| p.as_object())
+                .map(|by_dtype| {
+                    by_dtype
+                        .iter()
+                        .filter_map(|(dtype, n)| Some(n.as_u64()? * dtype_bytes(dtype)))
+                        .sum()
+                });
             HubModel {
                 arch: model_type.as_deref().and_then(Arch::from_model_type),
                 model_type,
@@ -91,6 +189,8 @@ pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
                 looks_instruct: ["instruct", "-it", "chat", "sft"]
                     .iter()
                     .any(|k| lower.contains(k)),
+                params,
+                download_bytes,
                 id: id.to_string(),
             }
         })
@@ -260,7 +360,9 @@ fn dir_size(path: &Path) -> u64 {
 }
 
 pub fn human_bytes(b: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    // Up to TB, because a search result can now be a 1.5 TB checkpoint and
+    // "1491.9 GB" is a number nobody reads as one and a half terabytes.
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = b as f64;
     let mut u = 0;
     while v >= 1024.0 && u < UNITS.len() - 1 {
@@ -346,10 +448,77 @@ mod tests {
         assert_eq!(urlencode("Qwen/Qwen2.5"), "Qwen%2FQwen2.5");
     }
 
+    fn sized(params: Option<u64>) -> HubModel {
+        HubModel {
+            id: "a/b".into(),
+            model_type: Some("llama".into()),
+            arch: Some(Arch::Llama),
+            downloads: 0,
+            likes: 0,
+            gated: false,
+            looks_instruct: false,
+            params,
+            download_bytes: params.map(|p| p * 2),
+        }
+    }
+
+    /// The quantised formats are not whole bytes, and the arithmetic that says
+    /// how big a download will be has to know it.
+    #[test]
+    fn a_models_size_here_depends_on_the_precision_it_is_loaded_at() {
+        use crate::quant::Precision;
+        let m = sized(Some(8_000_000_000));
+
+        // 4 bytes, 9 bits and 5 bits per weight.
+        assert_eq!(m.memory_at(Precision::F32), Some(32_000_000_000));
+        assert_eq!(m.memory_at(Precision::Q8), Some(9_000_000_000));
+        assert_eq!(m.memory_at(Precision::Q4), Some(5_000_000_000));
+        // Smaller is smaller, at every step.
+        assert!(m.memory_at(Precision::Q4) < m.memory_at(Precision::Q8));
+        assert!(m.memory_at(Precision::Q8) < m.memory_at(Precision::F32));
+
+        // A repo with no safetensors says nothing rather than zero.
+        assert_eq!(sized(None).memory_at(Precision::Q8), None);
+        assert_eq!(sized(None).fit(), Fit::Unknown);
+    }
+
+    /// The verdict has to be the *best* precision that fits, not the smallest
+    /// one that does — otherwise every model would report q4.
+    #[test]
+    fn the_fit_is_the_best_precision_that_will_run() {
+        use crate::quant::Precision;
+        let Some(usable) = crate::machine::usable_memory() else { return };
+
+        // A model whose f32 weights alone exceed memory, but whose q8 fit.
+        let params = (usable as f64 / Precision::Q8.bytes_per_weight()) as u64;
+        assert_eq!(sized(Some(params)).fit(), Fit::At(Precision::Q8));
+
+        // Something that fits comfortably at full precision.
+        let tiny = (usable as f64 / 4.0) as u64 / 100;
+        assert_eq!(sized(Some(tiny)).fit(), Fit::At(Precision::F32));
+
+        // And something no precision saves.
+        let huge = (usable as f64 / Precision::Q4.bytes_per_weight()) as u64 * 4;
+        assert_eq!(sized(Some(huge)).fit(), Fit::TooBig);
+    }
+
+    /// The Hub reports a mixed-dtype checkpoint as counts per dtype, and the
+    /// download is the sum of each times its width.
+    #[test]
+    fn download_size_counts_each_dtype_at_its_own_width() {
+        assert_eq!(dtype_bytes("BF16"), 2);
+        assert_eq!(dtype_bytes("F32"), 4);
+        assert_eq!(dtype_bytes("F8_E4M3"), 1);
+        // Anything unrecognised counts as a byte rather than as nothing, so an
+        // unknown dtype understates rather than vanishing.
+        assert_eq!(dtype_bytes("SOMETHING_NEW"), 1);
+    }
+
     #[test]
     fn byte_formatting() {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KB");
         assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GB");
+        assert_eq!(human_bytes(1536 * 1024 * 1024 * 1024), "1.5 TB");
     }
 }

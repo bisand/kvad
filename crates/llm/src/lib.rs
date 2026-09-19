@@ -22,6 +22,7 @@
 
 pub mod chat;
 pub mod hub;
+pub mod machine;
 pub mod model;
 pub mod qcache;
 pub mod quant;

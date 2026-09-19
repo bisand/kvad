@@ -11,6 +11,25 @@
   const TRASH = "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6";
   const SEARCH = "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3";
 
+  /** A parameter count, as people say it: 596M, 8.0B. */
+  function params(n) {
+    if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 1e10 ? 0 : 1)}B params`;
+    return `${Math.round(n / 1e6)}M params`;
+  }
+
+  /**
+   * What the weights cost here at each precision, for the tooltip.
+   *
+   * The verdict badge says the best one that fits; this says the whole story,
+   * because "too big" is much more useful when you can see by how much.
+   */
+  function atEachPrecision(r) {
+    if (!r.memory) return "size unknown";
+    return `weights here: ${humanBytes(r.memory.f32)} at f32 · ${humanBytes(
+      r.memory.q8,
+    )} at q8 · ${humanBytes(r.memory.q4)} at q4`;
+  }
+
   let query = $state("");
   let results = $state(null);
   let searching = $state(false);
@@ -229,7 +248,9 @@
           <thead>
             <tr>
               <th class="w-full">Model</th>
-              <th class="whitespace-nowrap">Downloads</th>
+              <th class="text-right whitespace-nowrap">Download</th>
+              <th class="whitespace-nowrap">Fits here</th>
+              <th class="text-right whitespace-nowrap">Downloads</th>
               <th></th>
             </tr>
           </thead>
@@ -247,7 +268,34 @@
                        results are runnable before anything is downloaded. -->
                   <div class="mt-0.5 text-xs opacity-60">{r.blocker ?? r.arch}</div>
                 </td>
-                <td class="text-sm whitespace-nowrap opacity-70">{r.downloads.toLocaleString()}</td>
+                <td class="text-right text-sm whitespace-nowrap opacity-70">
+                  {r.bytes ? humanBytes(r.bytes) : "—"}
+                  {#if r.params}
+                    <div class="text-xs opacity-60">{params(r.params)}</div>
+                  {/if}
+                </td>
+                <td class="whitespace-nowrap">
+                  <!-- The download size and what it costs here are different
+                       numbers: loading quantises, so a 16 GB checkpoint is
+                       4.5 GB of weights at q8. This column is the second one,
+                       against what this machine has. -->
+                  {#if !r.size_known}
+                    <span class="text-xs opacity-50">unknown</span>
+                  {:else if r.fits_at}
+                    <div class="tooltip" data-tip={atEachPrecision(r)}>
+                      <span class="badge badge-sm badge-success badge-soft">
+                        {r.fits_at}
+                      </span>
+                    </div>
+                  {:else}
+                    <div class="tooltip" data-tip={atEachPrecision(r)}>
+                      <span class="badge badge-sm badge-error badge-soft">too big</span>
+                    </div>
+                  {/if}
+                </td>
+                <td class="text-right text-sm whitespace-nowrap opacity-70">
+                  {r.downloads.toLocaleString()}
+                </td>
                 <td class="text-right whitespace-nowrap">
                   <button
                     class="btn btn-sm"

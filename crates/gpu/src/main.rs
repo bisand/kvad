@@ -29,6 +29,7 @@ struct Args {
     system: Option<String>,
     device: Option<String>,
     dtype: String,
+    quant: String,
     max_tokens: usize,
     temperature: f32,
     top_k: usize,
@@ -47,6 +48,7 @@ impl Default for Args {
             // bf16 is what these checkpoints ship as, so it is both the
             // smallest and the most faithful default.
             dtype: "bf16".into(),
+            quant: "none".into(),
             max_tokens: 256,
             temperature: 0.7,
             top_k: 40,
@@ -63,6 +65,7 @@ fn usage() -> ! {
            --model REPO        HuggingFace repo id (default: active, else {DEFAULT_MODEL})\n  \
            --device D          metal | cuda | cpu (default: best available)\n  \
            --dtype T           bf16 | f16 | f32 (default bf16)\n  \
+           --quant Q           none | q8 | q4 | q4k | q6k (default none)\n  \
            --prompt TEXT       prompt for `run`\n  \
            --system TEXT       system prompt for `chat`\n  \
            --max-tokens N      generation budget (default 256)\n  \
@@ -107,6 +110,7 @@ fn parse_args() -> Args {
             "--model" => a.model = Some(value.clone()),
             "--device" => a.device = Some(value.clone()),
             "--dtype" => a.dtype = value.clone(),
+            "--quant" => a.quant = value.clone(),
             "--prompt" => a.prompt = Some(value.clone()),
             "--system" => a.system = Some(value.clone()),
             "--max-tokens" => a.max_tokens = num() as usize,
@@ -132,6 +136,8 @@ fn load(args: &Args) -> Res<Llm> {
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let dtype = model::parse_dtype(&args.dtype)
         .ok_or_else(|| format!("unknown dtype `{}` (try bf16, f16 or f32)", args.dtype))?;
+    let quant = model::parse_quant(&args.quant)
+        .ok_or_else(|| format!("unknown quant `{}` (try none, q8, q4, q4k or q6k)", args.quant))?;
     let device = model::pick_device(args.device.as_deref())?;
 
     eprintln!("model: {repo}");
@@ -145,7 +151,7 @@ fn load(args: &Args) -> Res<Llm> {
             )
             .into());
         }
-        let m = GpuLlama::load(&files.weights, spec.clone(), dtype, device.clone())?;
+        let m = GpuLlama::load(&files.weights, spec.clone(), dtype, quant, device.clone())?;
         Ok(Box::new(m) as Box<dyn Session>)
     })?;
 

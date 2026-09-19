@@ -117,12 +117,29 @@ impl Weight {
             Precision::Q4 => {
                 let mut qs = Vec::with_capacity(rows * cols / 2);
                 for block in t.data.chunks_exact(BLOCK) {
-                    let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-                    // 4 bits signed spans -8..7. Scaling by 7 keeps the mapping
-                    // symmetric and wastes only the single code -8, which is
-                    // worth it for not having to think about asymmetry.
-                    let scale = amax / 7.0;
-                    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                    // Four bits span the sixteen codes -8..7, and the scale
+                    // must map the block's extreme value onto one end of that
+                    // range. Dividing the *magnitude* by 7 looks symmetric and
+                    // reads more naturally, but it never produces -8: one code
+                    // in sixteen is wasted and every step is ~12% coarser than
+                    // it needs to be.
+                    //
+                    // Dividing the *signed* extreme by -8 uses all sixteen.
+                    // The sign is what makes it work: whichever end the
+                    // extreme value sits at, it lands on -8 and the rest of
+                    // the block spreads across the remaining codes.
+                    //
+                    // This cost real accuracy — the coarser version turned
+                    // `17 + 25 = 42` into 40 on SmolLM2, which the fixed one
+                    // gets right.
+                    let mut extreme = 0.0f32;
+                    for &v in block {
+                        if v.abs() > extreme.abs() {
+                            extreme = v;
+                        }
+                    }
+                    let scale = extreme / -8.0;
+                    let inv = if scale != 0.0 { 1.0 / scale } else { 0.0 };
                     scales.push(scale);
                     // Split packing: byte k holds weight k in the low nibble
                     // and weight k+16 in the high nibble.
@@ -136,9 +153,10 @@ impl Weight {
                     // same reason.
                     let (lo, hi) = block.split_at(BLOCK / 2);
                     for (&l, &h) in lo.iter().zip(hi.iter()) {
-                        let a = (l * inv).round().clamp(-8.0, 7.0) as i32 + 8;
-                        let b = (h * inv).round().clamp(-8.0, 7.0) as i32 + 8;
-                        qs.push((a as u8 & 0x0f) | ((b as u8 & 0x0f) << 4));
+                        // `+ 8.5` rounds and applies the offset in one step.
+                        let a = (l * inv + 8.5).clamp(0.0, 15.0) as u8;
+                        let b = (h * inv + 8.5).clamp(0.0, 15.0) as u8;
+                        qs.push((a & 0x0f) | ((b & 0x0f) << 4));
                     }
                 }
                 Weight { rows, cols, data: Data::Q4 { scales, qs } }

@@ -41,22 +41,26 @@ pub enum Cmd {
 pub enum Backend {
     Cpu(Precision),
     /// The best GPU available, at this dtype.
-    Gpu(GpuDType),
+    Gpu(GpuMode),
 }
 
+/// How the GPU should hold the weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GpuDType {
+pub enum GpuMode {
+    /// Dense half precision — what the checkpoint ships as.
     Bf16,
-    F32,
+    Q8,
+    Q4,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 5] = [
+    pub const ALL: [Backend; 6] = [
         Backend::Cpu(Precision::F32),
         Backend::Cpu(Precision::Q8),
         Backend::Cpu(Precision::Q4),
-        Backend::Gpu(GpuDType::Bf16),
-        Backend::Gpu(GpuDType::F32),
+        Backend::Gpu(GpuMode::Bf16),
+        Backend::Gpu(GpuMode::Q8),
+        Backend::Gpu(GpuMode::Q4),
     ];
 
     pub fn next(self) -> Backend {
@@ -69,8 +73,9 @@ impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Backend::Cpu(p) => write!(f, "cpu {p}"),
-            Backend::Gpu(GpuDType::Bf16) => f.write_str("gpu bf16"),
-            Backend::Gpu(GpuDType::F32) => f.write_str("gpu f32"),
+            Backend::Gpu(GpuMode::Bf16) => f.write_str("gpu bf16"),
+            Backend::Gpu(GpuMode::Q8) => f.write_str("gpu q8"),
+            Backend::Gpu(GpuMode::Q4) => f.write_str("gpu q4"),
         }
     }
 }
@@ -187,12 +192,13 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 };
                 let loaded = match backend {
                     Backend::Cpu(precision) => Llm::load_with(&repo, precision, &mut progress),
-                    Backend::Gpu(dt) => {
-                        let name = match dt {
-                            GpuDType::Bf16 => "bf16",
-                            GpuDType::F32 => "f32",
+                    Backend::Gpu(mode) => {
+                        let dtype = llm_gpu::model::parse_dtype("bf16").expect("known dtype");
+                        let quant = match mode {
+                            GpuMode::Bf16 => None,
+                            GpuMode::Q8 => llm_gpu::model::parse_quant("q8").expect("known quant"),
+                            GpuMode::Q4 => llm_gpu::model::parse_quant("q4").expect("known quant"),
                         };
-                        let dtype = llm_gpu::model::parse_dtype(name).expect("known dtype");
                         // The GPU backend covers the Llama family only; the
                         // error names the alternative rather than just failing.
                         Llm::load_custom(&repo, &mut progress, &mut |files, spec| {
@@ -208,6 +214,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                                 &files.weights,
                                 spec.clone(),
                                 dtype,
+                                quant,
                                 device,
                             )?;
                             Ok(Box::new(m) as Box<dyn Session>)

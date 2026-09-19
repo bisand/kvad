@@ -24,40 +24,83 @@
 //! there is one `forward`, and `m = 1` is simply the narrow case. The
 //! framework's matmul does not care.
 
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
 use llm::model::{Session, Spec};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// One projection matrix, dense or quantised.
+///
+/// The two want opposite layouts. A dense matmul is cheapest if the weight is
+/// pre-transposed to `[in, out]`, so the forward pass is a plain `x @ w`.
+/// `QMatMul` instead keeps HuggingFace's `[out, in]` and transposes inside its
+/// kernel. Hiding that behind one `forward` keeps the block code identical
+/// either way.
+enum Proj {
+    Dense(Tensor),
+    Quant(QMatMul),
+}
+
+impl Proj {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Proj::Dense(w) => x.matmul(w),
+            Proj::Quant(q) => q.forward(x),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Proj::Dense(t) => t.elem_count() * t.dtype().size_in_bytes(),
+            Proj::Quant(q) => match q {
+                QMatMul::QTensor(t) => t.storage_size_in_bytes(),
+                _ => 0,
+            },
+        }
+    }
+
+    fn params(&self) -> usize {
+        match self {
+            Proj::Dense(t) => t.elem_count(),
+            Proj::Quant(q) => match q {
+                QMatMul::QTensor(t) => t.shape().elem_count(),
+                _ => 0,
+            },
+        }
+    }
+}
+
 struct Block {
     attn_norm: Tensor,
-    /// Stored already transposed, `[in, out]`, so the forward pass is a plain
-    /// `x @ w` with no per-call transpose.
-    q: Tensor,
+    q: Proj,
     q_b: Option<Tensor>,
-    k: Tensor,
+    k: Proj,
     k_b: Option<Tensor>,
-    v: Tensor,
+    v: Proj,
     v_b: Option<Tensor>,
-    o: Tensor,
+    o: Proj,
     mlp_norm: Tensor,
-    gate: Tensor,
-    up: Tensor,
-    down: Tensor,
+    gate: Proj,
+    up: Proj,
+    down: Proj,
 }
 
 pub struct GpuLlama {
     spec: Spec,
     device: Device,
     dtype: DType,
+    quant: Option<GgmlDType>,
     /// `[vocab, n_embd]`, for the embedding lookup.
+    ///
+    /// Kept dense and, when the rest is quantised, in half precision: only one
+    /// row is read per token, so it costs memory but almost no bandwidth.
+    /// `QTensor` cannot be indexed a row at a time anyway.
     embed: Tensor,
-    /// `[n_embd, vocab]`, the output head. A separate transposed copy even
-    /// when the model ties its embeddings — the two uses want opposite
-    /// layouts, and one extra copy of the table is cheaper than transposing on
-    /// every token.
-    head: Tensor,
+    /// The output head. A separate copy even when the model ties its
+    /// embeddings, because lookup and matmul want opposite layouts.
+    head: Proj,
     blocks: Vec<Block>,
     final_norm: Tensor,
     /// Precomputed rotations, `[n_ctx, head_dim / 2]`.
@@ -68,9 +111,9 @@ pub struct GpuLlama {
     pos: usize,
 }
 
-/// `y = x @ w (+ b)`, with `w` already `[in, out]`.
-fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> candle_core::Result<Tensor> {
-    let y = x.matmul(w)?;
+/// `y = proj(x) (+ b)`.
+fn linear(x: &Tensor, w: &Proj, b: Option<&Tensor>) -> candle_core::Result<Tensor> {
+    let y = w.forward(x)?;
     match b {
         Some(b) => y.broadcast_add(b),
         None => Ok(y),
@@ -93,19 +136,73 @@ fn repeat_kv(x: &Tensor, group: usize) -> candle_core::Result<Tensor> {
 }
 
 impl GpuLlama {
-    pub fn load(paths: &[std::path::PathBuf], spec: Spec, dtype: DType, device: Device) -> Res<Self> {
+    pub fn load(
+        paths: &[std::path::PathBuf],
+        spec: Spec,
+        dtype: DType,
+        quant: Option<GgmlDType>,
+        device: Device,
+    ) -> Res<Self> {
+        // Quantising reads f32 and produces blocks, so in that mode the
+        // weights arrive as f32 and each one is converted and dropped in turn
+        // — peak memory is the quantised model plus a single tensor, not two
+        // full copies. Activations then stay f32 too, which is what candle's
+        // quantised kernels expect.
+        let load_dtype = if quant.is_some() { DType::F32 } else { dtype };
+        let compute = load_dtype;
+
+        // The quantiser reads from host memory, so in that mode the checkpoint
+        // is mapped on the CPU and each tensor is quantised *onto* the device
+        // one at a time. Without quantisation the weights go straight to the
+        // device in their final form.
+        // Every quantised format works in blocks along the contraction axis,
+        // and k-quants use a 256-wide super-block. A model whose dimensions
+        // are not a multiple of that simply cannot use them — Qwen2.5-0.5B is
+        // 896 wide, which is fine for q8 and q4 (32) and hopeless for q4k.
+        // Candle reports this per tensor, deep in the load; better to say it
+        // once, up front, and name the alternative.
+        if let Some(gd) = quant {
+            let block = gd.block_size();
+            let dims = [
+                ("hidden size", spec.n_embd),
+                ("MLP width", spec.intermediate),
+                ("attention output", spec.n_head * spec.head_dim),
+                ("KV width", spec.kv_dim()),
+            ];
+            if let Some((what, n)) = dims.iter().find(|(_, n)| n % block != 0) {
+                return Err(format!(
+                    "{} needs dimensions divisible by {block}, but this model's {what} is {n}.\n\
+                     Try --quant q8 or --quant q4, whose blocks are 32.",
+                    ggml_name(gd)
+                )
+                .into());
+            }
+        }
+
+        let load_dev = if quant.is_some() { Device::Cpu } else { device.clone() };
+
         // SAFETY: candle memory-maps the checkpoints; they are read-only cache
         // entries that nothing else writes while we hold them.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(paths, dtype, &device)? };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(paths, load_dtype, &load_dev)? };
+
+        // Dense tensors (norms, embeddings) still have to make the trip.
+        let to_dev = |t: Tensor| -> Res<Tensor> { Ok(t.to_device(&device)?) };
 
         let (e, hd) = (spec.n_embd, spec.head_dim);
         let (qd, kvd) = (spec.n_head * hd, spec.kv_dim());
         let model = vb.pp("model");
 
-        // HuggingFace stores `nn.Linear` weights as [out, in]; transposing once
-        // at load lets every forward pass be a plain matmul.
-        let load_t = |vb: &VarBuilder, name: &str, out: usize, inp: usize| -> Res<Tensor> {
-            Ok(vb.get((out, inp), name)?.t()?.contiguous()?)
+        // HuggingFace stores `nn.Linear` weights as [out, in]. Dense matmuls
+        // want the transpose; quantised ones want it exactly as stored.
+        let dev = device.clone();
+        let load_t = move |vb: &VarBuilder, name: &str, out: usize, inp: usize| -> Res<Proj> {
+            let w = vb.get((out, inp), name)?;
+            Ok(match quant {
+                None => Proj::Dense(w.t()?.contiguous()?),
+                Some(gd) => Proj::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(
+                    &w, gd, &dev,
+                )?)?),
+            })
         };
 
         let mut blocks = Vec::with_capacity(spec.n_layer);
@@ -114,25 +211,37 @@ impl GpuLlama {
             let attn = l.pp("self_attn");
             let mlp = l.pp("mlp");
             blocks.push(Block {
-                attn_norm: l.get(e, "input_layernorm.weight")?,
+                attn_norm: to_dev(l.get(e, "input_layernorm.weight")?)?,
                 q: load_t(&attn, "q_proj.weight", qd, e)?,
-                q_b: attn.get(qd, "q_proj.bias").ok(),
+                q_b: attn.get(qd, "q_proj.bias").ok().map(&to_dev).transpose()?,
                 k: load_t(&attn, "k_proj.weight", kvd, e)?,
-                k_b: attn.get(kvd, "k_proj.bias").ok(),
+                k_b: attn.get(kvd, "k_proj.bias").ok().map(&to_dev).transpose()?,
                 v: load_t(&attn, "v_proj.weight", kvd, e)?,
-                v_b: attn.get(kvd, "v_proj.bias").ok(),
+                v_b: attn.get(kvd, "v_proj.bias").ok().map(&to_dev).transpose()?,
                 o: load_t(&attn, "o_proj.weight", e, qd)?,
-                mlp_norm: l.get(e, "post_attention_layernorm.weight")?,
+                mlp_norm: to_dev(l.get(e, "post_attention_layernorm.weight")?)?,
                 gate: load_t(&mlp, "gate_proj.weight", spec.intermediate, e)?,
                 up: load_t(&mlp, "up_proj.weight", spec.intermediate, e)?,
                 down: load_t(&mlp, "down_proj.weight", e, spec.intermediate)?,
             });
         }
 
-        let embed = model.get((spec.vocab_size, e), "embed_tokens.weight")?;
-        let head = match vb.get((spec.vocab_size, e), "lm_head.weight") {
-            Ok(w) => w.t()?.contiguous()?,
-            Err(_) => embed.t()?.contiguous()?,
+        let embed_full = model.get((spec.vocab_size, e), "embed_tokens.weight")?;
+        let head = {
+            let w = vb.get((spec.vocab_size, e), "lm_head.weight").unwrap_or_else(|_| embed_full.clone());
+            match quant {
+                None => Proj::Dense(w.t()?.contiguous()?),
+                Some(gd) => {
+                    Proj::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(&w, gd, &device)?)?)
+                }
+            }
+        };
+        // Half precision for the lookup table once the rest is quantised; it
+        // is converted to the compute dtype one row at a time.
+        let embed = if quant.is_some() {
+            to_dev(embed_full.to_dtype(DType::BF16)?)?
+        } else {
+            embed_full
         };
 
         // The same rotation table as `Rope::new`, built once on the device.
@@ -144,19 +253,20 @@ impl GpuLlama {
         let positions: Vec<f32> = (0..spec.n_ctx).map(|p| p as f32).collect();
         let positions = Tensor::from_vec(positions, (spec.n_ctx, 1), &device)?;
         let angles = positions.matmul(&inv)?;
-        let cos = angles.cos()?.to_dtype(dtype)?;
-        let sin = angles.sin()?.to_dtype(dtype)?;
+        let cos = angles.cos()?.to_dtype(compute)?;
+        let sin = angles.sin()?.to_dtype(compute)?;
 
         Ok(GpuLlama {
             kv: (0..spec.n_layer).map(|_| None).collect(),
             blocks,
             embed,
             head,
-            final_norm: model.get(e, "norm.weight")?,
+            final_norm: to_dev(model.get(e, "norm.weight")?)?,
             cos,
             sin,
             device,
-            dtype,
+            dtype: compute,
+            quant,
             pos: 0,
             spec,
         })
@@ -170,7 +280,10 @@ impl GpuLlama {
         } else {
             "cpu"
         };
-        format!("{kind} {}", dtype_name(self.dtype))
+        match self.quant {
+            None => format!("{kind} {}", dtype_name(self.dtype)),
+            Some(q) => format!("{kind} {}", ggml_name(q)),
+        }
     }
 
     /// Drop everything after `len` positions, for reuse across chat turns.
@@ -272,7 +385,7 @@ impl GpuLlama {
         // Only the last position predicts anything we need.
         let last = x.i(m - 1)?.unsqueeze(0)?;
         let last = ops::rms_norm(&last, &self.final_norm, spec.eps)?;
-        let logits = last.matmul(&self.head)?.to_dtype(DType::F32)?;
+        let logits = self.head.forward(&last)?.to_dtype(DType::F32)?;
         Ok(logits.flatten_all()?.to_vec1::<f32>()?)
     }
 
@@ -282,7 +395,13 @@ impl GpuLlama {
             .blocks
             .iter()
             .map(|b| {
-                n(&b.q) + n(&b.k) + n(&b.v) + n(&b.o) + n(&b.gate) + n(&b.up) + n(&b.down)
+                b.q.params()
+                    + b.k.params()
+                    + b.v.params()
+                    + b.o.params()
+                    + b.gate.params()
+                    + b.up.params()
+                    + b.down.params()
                     + n(&b.attn_norm)
                     + n(&b.mlp_norm)
             })
@@ -296,11 +415,12 @@ impl GpuLlama {
             .blocks
             .iter()
             .map(|b| {
-                per(&b.q) + per(&b.k) + per(&b.v) + per(&b.o) + per(&b.gate) + per(&b.up)
-                    + per(&b.down)
+                b.q.bytes() + b.k.bytes() + b.v.bytes() + b.o.bytes() + b.gate.bytes()
+                    + b.up.bytes()
+                    + b.down.bytes()
             })
             .sum();
-        blocks + per(&self.embed) + per(&self.head)
+        blocks + per(&self.embed) + self.head.bytes()
     }
 }
 
@@ -353,6 +473,33 @@ pub fn dtype_name(d: DType) -> &'static str {
             DType::I64 => "i64",
             _ => "?",
         },
+    }
+}
+
+pub fn ggml_name(d: GgmlDType) -> &'static str {
+    match d {
+        GgmlDType::Q8_0 => "q8",
+        GgmlDType::Q4_0 => "q4",
+        GgmlDType::Q4K => "q4k",
+        GgmlDType::Q6K => "q6k",
+        _ => "quant",
+    }
+}
+
+/// Weight quantisation for the GPU, in GGML's block formats.
+///
+/// `q8` and `q4` are the same scheme implemented by hand in
+/// [`llm::quant`]: blocks of 32 with a per-block scale. `q4k` is the
+/// "k-quant" refinement — a second level of scales within a super-block, which
+/// buys noticeably better quality at the same 4 bits.
+pub fn parse_quant(s: &str) -> Option<Option<GgmlDType>> {
+    match s.to_ascii_lowercase().as_str() {
+        "none" | "off" | "dense" => Some(None),
+        "q8" | "q8_0" => Some(Some(GgmlDType::Q8_0)),
+        "q4" | "q4_0" => Some(Some(GgmlDType::Q4_0)),
+        "q4k" | "q4_k" => Some(Some(GgmlDType::Q4K)),
+        "q6k" | "q6_k" => Some(Some(GgmlDType::Q6K)),
+        _ => None,
     }
 }
 

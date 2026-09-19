@@ -170,14 +170,40 @@ Measured on Qwen2.5-0.5B (494M parameters, M5 Pro, 18 threads):
 |---|---|---|---|
 | f32 | 1976 MB | ~34 | `2, 3, 5, 7, 11, 13, 17, 19` |
 | q8 | 556 MB (3.6x) | ~38 | `2, 3, 5, 7, 11, 13, 17, 19` |
-| q4 | 309 MB (6.4x) | ~37 | `11, 13, 17, 19, 23, 29, 31, 37` |
+| q4 | 309 MB (6.4x) | ~37 | `2, 3, 5, 7, 11, 13, 17` |
 
-**q8 is free; q4 is not.** q8 reproduced f32 exactly on every test — including
-with the activations quantised as well. q4 broke all three: it misses the
-sequence start above, turns `17 + 25 = 42` into `40` on SmolLM2, and sends
-GPT-2 into `"The jury's jury's jury's"`. Still fluent, still confident, quietly
-wrong. Half-billion-parameter models have less redundancy to spare than the
-7B+ models where q4 is usually judged.
+**q8 is free; q4 mostly is not.** q8 reproduces f32 exactly on every test,
+including with the activations quantised as well. q4 gets GPT-2's counting and
+SmolLM2's arithmetic right but still drops a prime above — fluent, confident,
+quietly wrong. Half-billion-parameter models have less redundancy to spare than
+the 7B+ models where q4 is usually judged.
+
+> **A correction.** q4 used to fail *all three* tests, and this README used to
+> say so. That was a bug in the scale, not a property of 4-bit weights — see
+> [the scale that wasted a code](#the-scale-that-wasted-a-code).
+
+### The scale that wasted a code
+
+Four bits span sixteen codes, `-8..7`. The obvious scale is
+`block_max_magnitude / 7`, which is symmetric and reads naturally. It also never
+produces `-8`: one code in sixteen is unused and every step is 1/7 of the range
+instead of 1/8.
+
+Dividing the *signed* extreme by `-8` uses all sixteen. The sign is what makes
+it work — whichever end the extreme sits at, it lands on `-8` and the rest of
+the block spreads over the remaining codes. The trade is that the *opposite*
+extreme now clips to 7/8 of its value, so it is not a free win; measured over
+random blocks it is a **9.54% → 8.49%** mean relative error, about what the
+8/7 step ratio predicts.
+
+On real models that margin decided three test cases. Before the fix, q4 turned
+`17 + 25 = 42` into `40`, sent GPT-2 into `"The jury's jury's jury's"`, and
+started the primes at 11. After it, the first two are correct.
+
+I found this by comparing against GGML's `Q4_0` through candle, which produced
+better output than my own q4 from the same checkpoint. That is the argument for
+porting a model to a framework even when you have written it yourself: the
+framework is a second opinion, and it disagreed for a reason.
 
 ```bash
 cargo run --release -p llm --example bench_matvec
@@ -455,6 +481,56 @@ memory. `bf16` is the default because it is also what the checkpoints ship as.
 The GPU backend covers the **Llama family only**; GPT-2 stays on the CPU engine,
 and asking for it says so rather than failing obscurely.
 
+### Quantised weights on the GPU
+
+```bash
+llm-gpu run --quant q8   # or q4, q4k, q6k
+```
+
+candle's `QTensor` holds GGML's block formats — the same scheme as
+[`quant.rs`](crates/llm/src/quant.rs): blocks with a shared scale, `Q8_0` and
+`Q4_0` being 32-wide exactly like ours. `QMatMul` keeps HuggingFace's
+`[out, in]` layout and transposes inside its kernel, where the dense path wants
+the transpose done once at load, so [`Proj`](crates/gpu/src/model.rs) hides the
+difference.
+
+All six backends, Qwen2.5-0.5B, decode:
+
+| backend | weights | tok/s |
+|---|---|---|
+| cpu f32 | 1976 MB | 31 |
+| cpu q8 | 556 MB | 34 |
+| cpu q4 | 309 MB | 33 |
+| metal bf16 | 1260 MB | 87 |
+| **metal q8** | **797 MB** | **141** |
+| metal q4 | 550 MB | 177 |
+
+Quantisation is worth **1.6x** on the GPU (87 → 141 tok/s) where it was worth
+nothing on the CPU. Our CPU decode never became bandwidth-bound in the first
+place: it has a fixed per-matmul cost — a rayon dispatch and an allocation —
+that sets the speed at this model size, so shrinking the weights changed
+nothing. The GPU has no such floor, so the bytes actually matter.
+
+And then the other direction. Prefill of 654 tokens:
+
+| | |
+|---|---|
+| metal bf16 | **0.24 s** |
+| metal q8 | 0.39 s |
+
+**Quantising makes GPU prefill slower**, by the same 1.6x it makes decode
+faster. Prefill is compute-bound, so the dequantisation is pure added work —
+precisely the conclusion the CPU chapter reached, reproduced on completely
+different hardware. It is the clearest evidence in this repo that the
+bottleneck, not the arithmetic, decides what an optimisation is worth.
+
+Two practical notes. The memory win is 1.6x rather than 3.6x because the
+embedding table stays dense: `QTensor` cannot be indexed a row at a time, and
+at one row per token it costs memory but almost no bandwidth. And the k-quants
+(`q4k`, `q6k`) need dimensions divisible by 256 — Qwen is 896 wide, so they are
+refused up front with a message naming `q8` and `q4` instead of failing halfway
+through the load.
+
 ### One trait, two backends
 
 Adding the GPU needed a change to the CPU engine's shape.
@@ -467,7 +543,8 @@ So the cache moved inside, behind a `Session` trait: `forward`, `cached`,
 `truncate`. Everything above it — prefix reuse, sampling, streaming, the chat
 loop, the TUI — stopped caring which backend it was talking to. The CLI keeps
 its `--quant`, the GPU CLI gets `--device` and `--dtype`, and in the TUI `p`
-cycles through all five: `cpu f32`, `cpu q8`, `cpu q4`, `gpu bf16`, `gpu f32`.
+cycles through all six: `cpu f32`, `cpu q8`, `cpu q4`, `gpu bf16`, `gpu q8`,
+`gpu q4`.
 
 That is the usual shape of this kind of work: the interesting part was not the
 new backend, it was the seam the old one had to grow.
@@ -483,8 +560,8 @@ cargo run --release -p llm-tui
 `/` search · `↑↓` select · `enter` download and load · `p` cycle backend ·
 `d` delete · `tab` switch to chat · `esc` interrupt generation.
 
-`p` cycles all five backends — `cpu f32`, `cpu q8`, `cpu q4`, `gpu bf16`,
-`gpu f32` — and is the quickest way to feel the trade-offs: load a model at
+`p` cycles all six backends — `cpu f32`, `cpu q8`, `cpu q4`, `gpu bf16`,
+`gpu q8`, `gpu q4` — and is the quickest way to feel the trade-offs: load a model at
 f32, ask it something arithmetic, reload at q4 and ask again, then reload on
 the GPU and watch the token rate.
 
@@ -511,10 +588,9 @@ state management — good Rust, no ML. Build it last.
 load, which means still reading the full f32 checkpoint off disk. Writing the
 blocks out once would make startup and disk footprint match the memory win.
 
-**5. Quantised weights on the GPU.** The Metal path is bf16 only, so a model
-that fits in 556 MB on the CPU takes 1260 MB there. candle supports quantised
-tensors; wiring them in would close the memory gap that currently makes decode
-only 2.5x faster instead of more.
+**5. A quantised embedding table.** The GPU's memory win stops at 1.6x because
+the embedding stays dense. Storing it quantised and dequantising one row per
+token would close most of the rest.
 
 **6. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Needs backprop through attention, layernorm and softmax, plus

@@ -48,10 +48,37 @@ pub enum Cmd {
     /// Not the same as loading something else: a server needs to be able to
     /// give the memory back without being told what to spend it on next.
     Unload,
-    Chat(Vec<Message>),
+    Chat { messages: Vec<Message>, sampling: Sampling },
     RefreshLocal,
     Delete(String),
 }
+
+/// How to turn logits into tokens, chosen per request.
+///
+/// [`Sampler`] itself owns a random generator and so cannot be built by a
+/// caller and sent across a channel; this is the part of it that is a
+/// decision rather than state.
+#[derive(Debug, Clone, Copy)]
+pub struct Sampling {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    /// `None` continues the loaded model's generator where the last request
+    /// left it, so two identical requests differ. `Some(n)` restarts it, so
+    /// two identical requests agree — which is what a benchmark, a test or a
+    /// bug report needs, and what nobody wants by default.
+    pub seed: Option<u64>,
+    pub max_tokens: usize,
+}
+
+impl Default for Sampling {
+    fn default() -> Self {
+        Sampling { temperature: 0.7, top_k: 40, top_p: 0.95, seed: None, max_tokens: 512 }
+    }
+}
+
+/// The generator a model starts with when nothing asks for a seed.
+const DEFAULT_SEED: u64 = 7;
 
 /// Where a model should run.
 ///
@@ -265,19 +292,31 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                             weight_bytes: llm.weight_bytes,
                         });
                         let _ = hub::State::set_active(&repo);
-                        session = Some(Loaded { llm, sampler: Sampler::new(0.7, 40, 0.95, 7) });
+                        let d = Sampling::default();
+                        let sampler =
+                            Sampler::new(d.temperature, d.top_k, d.top_p, DEFAULT_SEED);
+                        session = Some(Loaded { llm, sampler });
                         let _ = tx.send(Evt::Local(hub::local_models()));
                     }
                     Err(e) => fail(e),
                 }
             }
 
-            Cmd::Chat(messages) => {
+            Cmd::Chat { messages, sampling } => {
                 let Some(s) = session.as_mut() else {
                     say("no model loaded");
                     continue;
                 };
                 cancel.store(false, Ordering::Relaxed);
+
+                // The knobs are this request's; the generator is the
+                // session's, unless this request asked for one of its own.
+                s.sampler.temperature = sampling.temperature;
+                s.sampler.top_k = sampling.top_k;
+                s.sampler.top_p = sampling.top_p;
+                if let Some(seed) = sampling.seed {
+                    s.sampler.reseed(seed);
+                }
 
                 let ids = match s.llm.encode_chat(&messages) {
                     Ok(ids) => ids,
@@ -291,7 +330,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 // still matches, so a chat prefills only the newest message.
                 let tx2 = tx.clone();
                 let cancel2 = Arc::clone(&cancel);
-                let result = s.llm.generate(&ids, &mut s.sampler, 512, |piece| {
+                let result = s.llm.generate(&ids, &mut s.sampler, sampling.max_tokens, |piece| {
                     if cancel2.load(Ordering::Relaxed) {
                         return false;
                     }

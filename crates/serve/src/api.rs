@@ -1,22 +1,98 @@
-//! The JSON API. One route so far.
+//! The JSON API, and the plumbing every handler in it shares.
 //!
-//! Everything under `/api` is this server's own; `/v1` is reserved for the
-//! OpenAI-compatible surface that arrives with chat in Phase 2, and the two
-//! are kept apart so that the compatible half can stay compatible.
+//! Two surfaces, kept apart on purpose:
+//!
+//! * `/api/**` is this server's own — models, conversations, health. It can
+//!   change whenever the UI needs it to.
+//! * `/v1/**` is the OpenAI-compatible surface. It is shaped by somebody
+//!   else's documentation and has to stay that way, which is the whole point
+//!   of it: anything that already speaks to OpenAI speaks to this.
+//!
+//! The UI's chat goes through `/v1/chat/completions` like any other client,
+//! so the compatible path is the one that gets exercised every day rather
+//! than the one that quietly rots.
 
 use crate::auth::{Identity, State};
-use axum::routing::get;
+use axum::extract::State as St;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
 pub fn routes() -> Router<State> {
-    Router::new().route("/api/health", get(health))
+    Router::new()
+        .route("/api/health", get(health))
+        .route("/api/models", get(crate::models::list).delete(crate::models::remove))
+        .route("/api/models/search", get(crate::models::search))
+        .route("/api/models/load", post(crate::models::load))
+        .route("/api/models/unload", post(crate::models::unload))
+        .route("/api/models/active", post(crate::models::set_active))
+        .route("/api/models/pull", post(crate::models::pull))
+        .route("/api/qcache", delete(crate::models::forget_qcache))
+        .route("/api/generation", delete(crate::openai::cancel))
+        .route(
+            "/api/conversations",
+            get(crate::conversations::list).post(crate::conversations::create),
+        )
+        .route(
+            "/api/conversations/{id}",
+            get(crate::conversations::get)
+                .patch(crate::conversations::update)
+                .delete(crate::conversations::remove),
+        )
+        .route("/api/conversations/{id}/messages", post(crate::conversations::append))
+        .route("/v1/models", get(crate::openai::models))
+        .route("/v1/chat/completions", post(crate::openai::completions))
+}
+
+/// A request that could not be answered, as a status and a sentence.
+///
+/// One shape for every failure, so a client has one thing to parse:
+/// `{"error": "..."}`. The message is for a person to read — it is what lands
+/// in a toast — so it says what went wrong rather than which function it
+/// happened in.
+#[derive(Debug)]
+pub struct Fail(pub StatusCode, pub String);
+
+impl Fail {
+    pub fn bad(why: impl Into<String>) -> Self {
+        Fail(StatusCode::BAD_REQUEST, why.into())
+    }
+    pub fn missing(what: impl Into<String>) -> Self {
+        Fail(StatusCode::NOT_FOUND, what.into())
+    }
+    pub fn internal(why: impl Into<String>) -> Self {
+        Fail(StatusCode::INTERNAL_SERVER_ERROR, why.into())
+    }
+}
+
+impl IntoResponse for Fail {
+    fn into_response(self) -> Response {
+        (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
+    }
+}
+
+/// Run blocking work — SQLite, the filesystem, the Hub — off the runtime.
+///
+/// Everything under this server that touches a disk is synchronous, because
+/// the engine is. Rather than pretend otherwise, each handler says so by
+/// going through here, and the error comes back as text because
+/// `Box<dyn Error>` is not `Send` and cannot cross a thread boundary.
+pub async fn blocking<T, F>(f: F) -> Result<T, Fail>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Box<dyn std::error::Error>> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || f().map_err(|e| e.to_string())).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(why)) => Err(Fail::internal(why)),
+        Err(e) => Err(Fail::internal(format!("a background task failed: {e}"))),
+    }
 }
 
 #[derive(serde::Serialize)]
 pub struct Health {
     /// Always `"ok"`: a handler that runs at all is a server that is serving.
-    /// Whether the *engine* is healthy is a different question, and gets its
-    /// own fields once there is an engine.
     status: &'static str,
     version: &'static str,
     uptime_secs: u64,
@@ -26,12 +102,15 @@ pub struct Health {
     /// Whether a built UI is in this binary. A person who sees the stub page
     /// and thinks the server is broken can be pointed here.
     ui_embedded: bool,
+    /// What the engine is holding, and how much is waiting for it.
+    loaded: Option<crate::scheduler::Loaded>,
+    queue_depth: usize,
     /// Who the server thinks is asking. With `auth.mode = "none"` this is
     /// always the local operator, and saying so out loud is the point.
     you: Identity,
 }
 
-async fn health(who: Identity, axum::extract::State(state): axum::extract::State<State>) -> Json<Health> {
+async fn health(who: Identity, St(state): St<State>) -> Json<Health> {
     Json(Health {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
@@ -40,6 +119,8 @@ async fn health(who: Identity, axum::extract::State(state): axum::extract::State
         // health is what you call when things are already wrong.
         schema: state.db.version().unwrap_or(0),
         ui_embedded: crate::assets::is_embedded(),
+        loaded: state.engine.loaded(),
+        queue_depth: state.engine.depth(),
         you: who,
     })
 }

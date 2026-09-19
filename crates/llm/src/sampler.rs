@@ -30,6 +30,15 @@ impl Sampler {
         Sampler { temperature, top_k, top_p, rng: Rng::new(seed) }
     }
 
+    /// Start the generator again from `seed`.
+    ///
+    /// Sampling is a stream, not a function: the same logits give different
+    /// tokens depending on how many draws came before. Anything that has to
+    /// be reproducible has to be able to say where the stream begins.
+    pub fn reseed(&mut self, seed: u64) {
+        self.rng = Rng::new(seed);
+    }
+
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
         if self.temperature <= 0.0 {
             return argmax(logits) as u32;

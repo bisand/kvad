@@ -4,25 +4,36 @@
 //!     kvad-serve --bind 0.0.0.0:8080      needs an auth mode, or --insecure
 //!     kvad-serve --config path/kvad.toml
 //!
-//! What it is not, yet: this phase is the skeleton. It loads config, opens
-//! and migrates a database, decides who a request is from, serves `/api/health`
-//! and serves the built UI. The engine, chat and the OpenAI-compatible routes
-//! arrive next; see `docs/ui-plan.md`.
+//! It loads config, opens and migrates a database, decides who a request is
+//! from, manages and runs models, and serves the UI. Training, evals and
+//! monitoring are still to come; see `docs/ui-plan.md`.
 //!
 //! # The shape of it
 //!
 //! * [`config`] — the few things that must be known before anything starts.
 //! * [`db`] — SQLite, and the migrations that shape it.
 //! * [`auth`] — who a request is from, and the seam the other modes fit into.
-//! * [`api`] — the JSON API under `/api`.
+//! * [`engine`] — which backends this build can load.
+//! * [`scheduler`] — the one owner of the engine thread, and the queue in
+//!   front of it.
+//! * [`models`] — what is on this machine and what the engine holds.
+//! * [`chat`] / [`conversations`] — conversations, stored and served.
+//! * [`openai`] — `/v1`, shaped by somebody else's documentation.
+//! * [`api`] — the routing table, and what every handler shares.
 //! * [`assets`] — the built UI, embedded, with everything else falling back
 //!   to it so a client-side router survives a reload.
 
 mod api;
 mod assets;
 mod auth;
+mod chat;
 mod config;
+mod conversations;
 mod db;
+mod engine;
+mod models;
+mod openai;
+mod scheduler;
 
 use axum::Router;
 use std::net::SocketAddr;
@@ -128,6 +139,7 @@ async fn run(args: Args) -> Res<()> {
     let schema = db.version()?;
     let state = auth::State {
         auth: auth::provider(cfg.auth.mode)?.into(),
+        engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader())),
         started: std::time::Instant::now(),
         db,
     };
@@ -149,6 +161,10 @@ async fn run(args: Args) -> Res<()> {
     println!("  config     {}", config_path.display());
     println!("  database   {} (schema {schema})", cfg.database.path.display());
     println!("  auth       {}", cfg.auth.mode);
+    println!(
+        "  backends   {}",
+        engine::available().iter().map(|c| c.id.clone()).collect::<Vec<_>>().join(", ")
+    );
     if !assets::is_embedded() {
         println!("  web UI     not built into this binary — open the address above to see how");
     }

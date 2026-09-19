@@ -27,15 +27,23 @@
       <div class="stat-value text-2xl">v{health.version}</div>
       <div class="stat-desc">up {duration(health.uptime_secs)}</div>
     </div>
+    <!-- The engine, which is the thing anyone opening this actually wants to
+         know about. The database's schema is in the navbar; it is not news. -->
     <div class="stat">
-      <div class="stat-title">Database</div>
-      <div class="stat-value text-2xl">schema {health.schema}</div>
-      <div class="stat-desc">SQLite, WAL</div>
+      <div class="stat-title">Loaded</div>
+      <div class="stat-value truncate text-2xl">
+        {health.loaded ? health.loaded.repo.split("/").at(-1) : "nothing"}
+      </div>
+      <div class="stat-desc truncate">
+        {health.loaded ? health.loaded.backend : "no model in memory"}
+      </div>
     </div>
     <div class="stat">
-      <div class="stat-title">Signed in as</div>
-      <div class="stat-value text-2xl">{health.you.name}</div>
-      <div class="stat-desc">{health.you.role}</div>
+      <div class="stat-title">Queue</div>
+      <div class="stat-value text-2xl">{health.queue_depth}</div>
+      <div class="stat-desc">
+        {health.queue_depth === 0 ? "idle" : "waiting for the engine"}
+      </div>
     </div>
     <div class="stat">
       <div class="stat-title">Web UI</div>

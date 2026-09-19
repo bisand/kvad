@@ -39,8 +39,10 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 ///
 /// Explicit rather than globbed: the order is the whole contract, and a
 /// directory listing sorts however the filesystem feels like it.
-const MIGRATIONS: &[(&str, &str)] =
-    &[("001-settings", include_str!("migrations/001-settings.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("001-settings", include_str!("migrations/001-settings.sql")),
+    ("002-chat", include_str!("migrations/002-chat.sql")),
+];
 
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Connection>>);

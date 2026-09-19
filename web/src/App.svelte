@@ -8,6 +8,8 @@
   import Toasts from "./lib/components/Toasts.svelte";
   import Unbuilt from "./lib/components/Unbuilt.svelte";
   import Dashboard from "./routes/Dashboard.svelte";
+  import Models from "./routes/Models.svelte";
+  import Chat from "./routes/Chat.svelte";
   import NotFound from "./routes/NotFound.svelte";
 
   const DRAWER = "kvad-drawer";
@@ -57,6 +59,10 @@
         <NotFound />
       {:else if page.path === "/"}
         <Dashboard {health} error={healthError} />
+      {:else if page.path === "/models"}
+        <Models />
+      {:else if page.path === "/chat"}
+        <Chat />
       {:else}
         <Unbuilt {page} />
       {/if}

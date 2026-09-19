@@ -5,6 +5,9 @@
 // thing; this way the plan in `docs/ui-plan.md` and the navigation are the
 // same document, and a page that lies about being ready is impossible.
 //
+// `phase` is null for a page that is built, and the phase number for one that
+// is not; `Unbuilt.svelte` renders the second kind.
+//
 // `icon` is an SVG path drawn at 24×24 with a 1.5 stroke — see `Icon.svelte`.
 // Inline rather than an icon package: ten icons is not worth a dependency.
 
@@ -19,14 +22,14 @@ export const PAGES = [
   {
     path: "/models",
     label: "Models",
-    phase: 2,
+    phase: null,
     blurb: "What is on this machine, what is on the Hub, and which one is loaded.",
     icon: "M12 3 3 7.5 12 12l9-4.5zM3 12l9 4.5 9-4.5M3 16.5 12 21l9-4.5",
   },
   {
     path: "/chat",
     label: "Chat",
-    phase: 2,
+    phase: null,
     blurb: "Talk to the loaded model, with the numbers for every reply.",
     icon: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
   },

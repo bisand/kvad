@@ -198,8 +198,47 @@ GPU backend is in the server's build. `kvad-serve` has no engine and so no
 Also worth knowing: the default bind is `127.0.0.1:8080`, which is a
 well-contended port. `--bind` or `server.bind` moves it.
 
-**Phase 2 — models and chat.** The Models page, `/v1/chat/completions` and
-`/v1/models` over SSE, and the Chat page with persisted conversations.
+**Phase 2 — models and chat. Done.**
+
+- **A `Scheduler` owns the engine thread.** `kvad::service::Engine` already
+  runs one thing at a time, but it speaks over one pair of channels with one
+  receiver, and an HTTP server has many requests each wanting their own stream
+  of tokens. The scheduler is that one receiver: jobs queue first-in
+  first-out, `depth()` is a number the dashboard shows, and continuous
+  batching will replace the inside of its loop without changing anything
+  above it. Searching, listing, deleting and pulling do *not* go through it —
+  a Hub search has no business waiting behind a thirty-second generation.
+- **`/v1/chat/completions` and `/v1/models`**, streaming and not. The `kvad`
+  object beside `usage` carries what OpenAI's schema has nowhere to put:
+  cached tokens, prefill and decode split apart, and the backend. Naming a
+  model that is not loaded loads it, which is slow and is what `model` means.
+- **Sampling is per request.** `service::Cmd::Chat` carries a `Sampling`, and
+  its `seed` is an `Option`: `None` continues the loaded model's generator so
+  two identical requests differ, `Some(n)` restarts it so they agree. That is
+  what a benchmark or a bug report needs and what nobody wants by default.
+- **The Models page** lists what is here with the same `runnable()`/`blocker()`
+  verdicts `kvad search` prints, searches the Hub, pulls with a byte-level
+  progress bar over the Phase 0 `Fetch` events, loads and unloads with a
+  backend picker, sets the default model the CLI and TUI share, deletes with a
+  confirmation that says whether the model can ever come back, and manages the
+  quantised-weights cache.
+- **The Chat page** persists conversations in SQLite and shows each reply's
+  numbers under it — including cached tokens, so the KV cache is visible doing
+  its job on the second turn. System prompt, sampler controls, a stop button
+  that tells both the stream and the engine, and export to Markdown. A reply
+  that was stopped is kept; the question is saved before the answer is asked
+  for, so a generation that dies does not lose it.
+- **Storage is written by the UI, not by the endpoint.** `/v1/chat/completions`
+  stays stateless and identical for every client; our own UI posts what was
+  said to `/api/conversations` afterwards. One code path through the engine,
+  and it is the compatible one.
+
+**Open decision 2 is settled:** the GPU backend is a cargo feature, on by
+default. Cargo cannot express "default on macOS", and it does not need to —
+the workspace already requires macOS to build `kvad-gpu` at all. A CPU-only
+server is `--no-default-features`, and `engine::available()` offers only what
+the build can honour, so the picker cannot promise a backend that is not
+there.
 
 **Phase 3 — auth.** `local`, `basic`, API keys, roles, then OIDC.
 
@@ -225,8 +264,8 @@ README chapter, and a release build with the embedded UI.
 
 1. **Multi-user with roles, or a single admin?** Roles cost about a day and
    matter only if other people will use the instance.
-2. **GPU in the server from the start?** The `Backend` enum already covers it,
-   but it pulls candle and metal into `kvad-serve`'s build. Proposed: a cargo
-   feature, on by default on macOS.
-3. **Layout of the frontend.** Proposed: `web/` at the repository root, beside
-   `crates/`, with its own `package.json`.
+2. **GPU in the server from the start?** Settled in Phase 2: a cargo feature,
+   on by default. See that phase for why "on macOS" turned out not to be a
+   thing cargo can say, or need to.
+3. **Layout of the frontend.** Settled in Phase 1: `web/` at the repository
+   root, beside `crates/`, with its own `package.json`.

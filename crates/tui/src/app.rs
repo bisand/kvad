@@ -359,7 +359,10 @@ impl App {
                 self.streaming = Some(String::new());
                 self.busy = true;
                 self.scroll = u16::MAX;
-                engine.send(Cmd::Chat(self.messages.clone()));
+                engine.send(Cmd::Chat {
+                    messages: self.messages.clone(),
+                    sampling: Default::default(),
+                });
             }
             K::Backspace => {
                 self.input.pop();

@@ -107,6 +107,7 @@ pub fn provider(mode: Mode) -> Result<Box<dyn Provider>, String> {
 pub struct State {
     pub db: crate::db::Db,
     pub auth: std::sync::Arc<dyn Provider>,
+    pub engine: std::sync::Arc<crate::scheduler::Scheduler>,
     pub started: std::time::Instant,
 }
 
@@ -173,6 +174,19 @@ impl FromRequestParts<State> for Admin {
 mod tests {
     use super::*;
 
+    /// Enough `State` to run an extractor: a database nobody reads and an
+    /// engine that can load nothing.
+    fn state_with(provider: impl Provider) -> State {
+        State {
+            db: crate::db::Db::in_memory().unwrap(),
+            auth: std::sync::Arc::new(provider),
+            engine: std::sync::Arc::new(crate::scheduler::Scheduler::spawn(Box::new(
+                |_, _, _, _| Err("no backend in tests".into()),
+            ))),
+            started: std::time::Instant::now(),
+        }
+    }
+
     fn parts() -> Parts {
         axum::http::Request::builder().uri("/api/health").body(()).unwrap().into_parts().0
     }
@@ -200,11 +214,7 @@ mod tests {
                 Some(Identity { name: "someone".into(), role: Role::User })
             }
         }
-        let state = State {
-            db: crate::db::Db::in_memory().unwrap(),
-            auth: std::sync::Arc::new(AsUser),
-            started: std::time::Instant::now(),
-        };
+        let state = state_with(AsUser);
 
         // Signed in, so `Identity` is happy...
         let who = Identity::from_request_parts(&mut parts(), &state).await.unwrap();
@@ -231,11 +241,7 @@ mod tests {
                 Some("Basic realm=\"kvad\"")
             }
         }
-        let state = State {
-            db: crate::db::Db::in_memory().unwrap(),
-            auth: std::sync::Arc::new(Nobody),
-            started: std::time::Instant::now(),
-        };
+        let state = state_with(Nobody);
         let Err(denied) = Identity::from_request_parts(&mut parts(), &state).await else {
             panic!("an unidentified request was let through");
         };

@@ -18,6 +18,16 @@
 //! `model.safetensors.index.json` mapping each tensor name to the file holding
 //! it. [`Checkpoint`] hides that: open all the shards, build one name index,
 //! and look tensors up without caring where they live.
+//!
+//! # Models that are not on the Hub
+//!
+//! Wherever a repo id is accepted, a directory is too: if the name given is a
+//! directory that exists, it is read in place and nothing is fetched. That is
+//! how a model trained by this repository's own `nanograd` gets here, and the
+//! rule — an existing directory wins over a repo of the same name — is the one
+//! `transformers` uses, so nobody has to learn a second one. The directory
+//! holds what a Hub repo would: `config.json`, `tokenizer.json`, and either
+//! `model.safetensors` or a shard index.
 
 use crate::tensor::Tensor;
 use safetensors::{Dtype, SafeTensors};
@@ -35,8 +45,75 @@ pub struct ModelFiles {
     pub generation_config: Option<PathBuf>,
 }
 
+/// Whether `model` names a directory on this machine rather than a Hub repo.
+pub fn is_local(model: &str) -> bool {
+    Path::new(model).is_dir()
+}
+
+/// Whether `model` was written the way paths are and repo ids never are.
+pub fn looks_like_path(model: &str) -> bool {
+    model.starts_with(['.', '/', '~'])
+}
+
+/// The name a model is known by once loaded: a repo id as it is, a directory
+/// as its absolute path.
+///
+/// Anything keyed on the name — the quantised-weight cache above all — must
+/// not think `out/readme`, `./out/readme` and the same words typed from
+/// another working directory are three models, or worse, one.
+pub fn model_id(model: &str) -> String {
+    match is_local(model) {
+        true => std::fs::canonicalize(model).map_or_else(|_| model.to_string(), |p| p.display().to_string()),
+        false => model.to_string(),
+    }
+}
+
+impl ModelFiles {
+    /// The files of a model that is already in `dir`.
+    pub fn from_dir(dir: &Path) -> Res<Self> {
+        let need = |name: &str| -> Res<PathBuf> {
+            let path = dir.join(name);
+            match path.is_file() {
+                true => Ok(path),
+                false => Err(format!("{} has no {name}", dir.display()).into()),
+            }
+        };
+        let maybe = |name: &str| Some(dir.join(name)).filter(|p| p.is_file());
+
+        let weights = match maybe("model.safetensors") {
+            Some(single) => vec![single],
+            None => {
+                let index = maybe("model.safetensors.index.json").ok_or_else(|| {
+                    format!("{} has no model.safetensors, and no shard index either", dir.display())
+                })?;
+                shard_names(&index)?.iter().map(|s| need(s)).collect::<Res<Vec<_>>>()?
+            }
+        };
+
+        Ok(ModelFiles {
+            weights,
+            tokenizer: need("tokenizer.json")?,
+            config: need("config.json")?,
+            tokenizer_config: maybe("tokenizer_config.json"),
+            generation_config: maybe("generation_config.json"),
+        })
+    }
+}
+
+/// The distinct files a shard index points at.
+fn shard_names(index: &Path) -> Res<Vec<String>> {
+    let json = read_json(index)?;
+    let map = json.get("weight_map").and_then(|m| m.as_object()).ok_or("shard index has no weight_map")?;
+
+    // Many tensor names point at the same handful of files.
+    let mut shards: Vec<String> = map.values().filter_map(|v| v.as_str().map(String::from)).collect();
+    shards.sort();
+    shards.dedup();
+    Ok(shards)
+}
+
 /// Download (or reuse from the local cache) everything needed to run `repo_id`,
-/// reporting progress to stderr.
+/// reporting progress to stderr. A directory is used as it is.
 pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
     fetch_with(repo_id, &mut |msg| eprintln!("  {msg}"))
 }
@@ -46,9 +123,19 @@ pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
 /// The TUI needs this: anything written straight to stderr lands on top of the
 /// rendered frame and corrupts the display.
 pub fn fetch_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<ModelFiles> {
-    let (owner, name) = repo_id
-        .split_once('/')
-        .ok_or_else(|| format!("expected a repo id like `openai-community/gpt2`, got `{repo_id}`"))?;
+    if is_local(repo_id) {
+        progress("a directory on this machine; nothing to fetch");
+        return ModelFiles::from_dir(Path::new(repo_id));
+    }
+    // Typed as a path, so meant as one: say the directory is missing, rather
+    // than go and ask the Hub for a repo called `./out`.
+    if looks_like_path(repo_id) {
+        return Err(format!("`{repo_id}` looks like a path, and there is no such directory").into());
+    }
+
+    let (owner, name) = repo_id.split_once('/').ok_or_else(|| {
+        format!("expected a repo id like `openai-community/gpt2` or a directory, got `{repo_id}`")
+    })?;
 
     let client = hf_hub::HFClientSync::new()?;
     let repo = client.model(owner, name);
@@ -67,18 +154,7 @@ pub fn fetch_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<ModelFil
     let weights = match try_get("model.safetensors") {
         Some(single) => vec![single],
         None => {
-            let index = get("model.safetensors.index.json")?;
-            let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index)?)?;
-            let map = json
-                .get("weight_map")
-                .and_then(|m| m.as_object())
-                .ok_or("shard index has no weight_map")?;
-
-            // Many tensor names point at the same handful of files.
-            let mut shards: Vec<String> =
-                map.values().filter_map(|v| v.as_str().map(String::from)).collect();
-            shards.sort();
-            shards.dedup();
+            let shards = shard_names(&get("model.safetensors.index.json")?)?;
             (progress.borrow_mut())(&format!("checkpoint is split across {} shards", shards.len()));
             shards.iter().map(|s| get(s)).collect::<Res<Vec<_>>>()?
         }

@@ -70,14 +70,15 @@ fn usage() -> ! {
            search QUERY        find models on the Hub\n  \
            pull REPO           download a model\n  \
            ls                  list downloaded models\n  \
-           use REPO            set the default model\n  \
+           use REPO|DIR        set the default model\n  \
            rm REPO             delete a model from the cache\n  \
            cache [REPO|clear]  list or delete pre-quantised weight files\n  \
            info                show a model's config without downloading weights\n  \
            run                 one-shot completion\n  \
            chat                interactive conversation\n\n\
          options:\n  \
-           --model REPO        HuggingFace repo id (default: active, else {DEFAULT_MODEL})\n  \
+           --model REPO|DIR    HuggingFace repo id, or a directory holding a model\n  \
+                               (default: active, else {DEFAULT_MODEL})\n  \
            --prompt TEXT       prompt for `run`\n  \
            --system TEXT       system prompt for `chat`\n  \
            --max-tokens N      generation budget (default 256)\n  \
@@ -351,8 +352,14 @@ fn use_model(args: Args) -> Res<()> {
         eprintln!("usage: kvad use REPO");
         std::process::exit(2);
     };
-    if hub::find_local(&repo).is_none() {
-        eprintln!("`{repo}` is not downloaded. Run:  kvad pull {repo}");
+    // A directory is remembered by its absolute path: the active model has to
+    // mean the same thing from whichever directory `kvad` is next run in.
+    let repo = weights::model_id(&repo);
+    if !weights::is_local(&repo) && hub::find_local(&repo).is_none() {
+        match weights::looks_like_path(&repo) {
+            true => eprintln!("`{repo}` looks like a path, and there is no such directory"),
+            false => eprintln!("`{repo}` is not downloaded. Run:  kvad pull {repo}"),
+        }
         std::process::exit(1);
     }
     State::set_active(&repo)?;
@@ -416,7 +423,8 @@ fn cache(args: Args) -> Res<()> {
             return Ok(());
         }
         Some(repo) => {
-            println!("deleted {} file(s) for {repo}", qcache::forget(repo));
+            // A directory is filed under its absolute path, however it was typed.
+            println!("deleted {} file(s) for {repo}", qcache::forget(&weights::model_id(repo)));
             return Ok(());
         }
         None => {}

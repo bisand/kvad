@@ -14,11 +14,14 @@ use kvad::model::gpt2;
 use kvad::model::{KvCache, Spec, Transformer};
 use kvad::qcache::Live;
 use kvad::quant::Precision;
-use kvad::weights::Checkpoint;
+use kvad::runtime::Llm;
+use kvad::sampler::Sampler;
+use kvad::weights::{self, Checkpoint, ModelFiles};
 use nanograd::checkpoint;
 use nanograd::model::{Gpt, GptConfig};
+use nanograd::optim::AdamW;
 use nanograd::rng::Rng;
-use nanograd::text::CharTokenizer;
+use nanograd::text::{generate, train_step, CharTokenizer};
 use std::path::PathBuf;
 
 const CONFIG: GptConfig = GptConfig { vocab: 23, context: 12, d_model: 16, n_heads: 4, n_layers: 3 };
@@ -112,5 +115,82 @@ fn the_tokenizers_library_agrees_on_every_id() {
 
     let as_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
     assert_eq!(theirs.decode(&as_u32, true).unwrap(), text);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The whole journey, as a user makes it: train a model on a text, save it,
+/// and hand the directory to the engine by name, exactly as `kvad run --model
+/// DIR` does. Everything is real — the engine's tokeniser reads the prompt,
+/// its KV cache carries the generation — and with sampling switched off both
+/// sides must write the same characters.
+#[test]
+fn a_trained_model_runs_from_its_directory() {
+    let text = "the cat sat on the mat. ".repeat(40);
+    let tok = CharTokenizer::from_text(&text);
+    let tokens = tok.encode(&text).unwrap();
+    let config = GptConfig { vocab: tok.vocab(), context: 32, d_model: 32, n_heads: 4, n_layers: 2 };
+
+    let mut rng = Rng::new(3);
+    let mut model = Gpt::new(config, &mut rng);
+    let mut opt = AdamW::new(3e-3);
+    for _ in 0..300 {
+        train_step(&mut model, &mut opt, &tokens, 4, &mut rng);
+    }
+
+    let dir = scratch("journey");
+    checkpoint::save(&dir, &mut model).unwrap();
+    tok.save(&dir).unwrap();
+
+    let prompt = "the cat";
+    let count = 24;
+    let ours = tok.decode(&generate(&mut model, &tok.encode(prompt).unwrap(), count, 0.0, &mut rng));
+    // If it has not learned the sentence, agreeing about it proves little.
+    assert_eq!(ours, "the cat sat on the mat. the cat", "the model did not learn its text");
+
+    let mut llm = Llm::load_with(dir.to_str().unwrap(), Precision::F32, &mut |_| {}).unwrap();
+    assert!(!llm.is_instruct());
+    let ids = llm.encode(prompt).unwrap();
+    let (stats, ids) = llm.generate(&ids, &mut Sampler::new(0.0, 0, 1.0, 0), count, |_| true).unwrap();
+    assert_eq!(stats.generated_tokens, count);
+    assert_eq!(llm.decode(&ids).unwrap(), ours);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_directory_is_a_model_only_if_the_files_are_there() {
+    let dir = scratch("files");
+    let mut model = model();
+    checkpoint::save(&dir, &mut model).unwrap();
+
+    // The weights and the config, but no tokeniser: say which file, and where.
+    let error = ModelFiles::from_dir(&dir).err().unwrap().to_string();
+    assert!(error.contains("tokenizer.json") && error.contains(dir.to_str().unwrap()), "{error}");
+
+    CharTokenizer::from_text("abc").save(&dir).unwrap();
+    let files = ModelFiles::from_dir(&dir).unwrap();
+    assert_eq!(files.weights, [dir.join("model.safetensors")]);
+    assert!(files.tokenizer_config.is_none(), "a base model: no chat template to find");
+
+    // A model too large for one file: the index names its shards, many
+    // tensors to each, and every shard has to be there.
+    std::fs::rename(dir.join("model.safetensors"), dir.join("part-b.safetensors")).unwrap();
+    let index = r#"{"weight_map":{"x":"part-b.safetensors","y":"part-a.safetensors","z":"part-b.safetensors"}}"#;
+    std::fs::write(dir.join("model.safetensors.index.json"), index).unwrap();
+    let error = ModelFiles::from_dir(&dir).err().unwrap().to_string();
+    assert!(error.contains("part-a.safetensors"), "{error}");
+    std::fs::write(dir.join("part-a.safetensors"), b"").unwrap();
+    let files = ModelFiles::from_dir(&dir).unwrap();
+    assert_eq!(files.weights, [dir.join("part-a.safetensors"), dir.join("part-b.safetensors")]);
+
+    // However the directory is spelled, it is one model with one name...
+    let spelled = dir.join("..").join(dir.file_name().unwrap());
+    assert!(weights::is_local(spelled.to_str().unwrap()));
+    assert_eq!(weights::model_id(spelled.to_str().unwrap()), weights::model_id(dir.to_str().unwrap()));
+    // ...a repo id is left alone, and a path to nowhere is not sent to the Hub.
+    assert_eq!(weights::model_id("openai-community/gpt2"), "openai-community/gpt2");
+    let error = weights::fetch_with("./no/such/model", &mut |_| {}).err().unwrap().to_string();
+    assert!(error.contains("no such directory"), "{error}");
+
     std::fs::remove_dir_all(&dir).unwrap();
 }

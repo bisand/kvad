@@ -133,6 +133,17 @@ impl App {
         }
     }
 
+    /// Ask the engine for `repo`: a repo id, or a directory holding a model.
+    pub fn load(&mut self, repo: String, engine: &Engine) {
+        if self.busy {
+            self.status = "busy — wait for the current operation".into();
+            return;
+        }
+        self.busy = true;
+        self.status = format!("loading {repo} on {}", self.backend);
+        engine.send(Cmd::Load { repo, backend: self.backend });
+    }
+
     pub fn selected_entry(&self) -> Option<Entry> {
         self.entries().into_iter().nth(self.selected)
     }
@@ -288,13 +299,7 @@ impl App {
                     self.status = format!("cannot run {}: {}", entry.id, entry.detail);
                     return;
                 }
-                if self.busy {
-                    self.status = "busy — wait for the current operation".into();
-                    return;
-                }
-                self.busy = true;
-                self.status = format!("loading {} on {}", entry.id, self.backend);
-                engine.send(Cmd::Load { repo: entry.id, backend: self.backend });
+                self.load(entry.id, engine);
             }
             _ => {}
         }

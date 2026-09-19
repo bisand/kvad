@@ -1,6 +1,10 @@
 //! A terminal UI for browsing, downloading and talking to local models.
 //!
 //!     cargo run --release -p kvad-tui
+//!     cargo run --release -p kvad-tui -- out/readme    # open with a model loading
+//!
+//! The argument is a repo id or a directory, such as one `nanograd`'s
+//! `train_text --save` wrote.
 //!
 //! Three threads' worth of concerns, kept apart:
 //!
@@ -53,6 +57,11 @@ fn restore() -> Res<()> {
 fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Res<()> {
     let engine = Engine::spawn();
     let mut app = App::new();
+    if let Some(model) = std::env::args().nth(1) {
+        // By absolute path if it is a directory: loading makes it the active
+        // model, and that has to survive a change of working directory.
+        app.load(kvad::weights::model_id(&model), &engine);
+    }
 
     while !app.should_quit {
         // Drain whatever the engine has produced since the last frame. During

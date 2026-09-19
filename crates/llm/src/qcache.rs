@@ -588,15 +588,26 @@ impl Drop for Writer {
 /// symlink to `blobs/<sha256 of the contents>`. So reading the link gives a
 /// content hash for nothing — no bytes touched — which beats comparing sizes,
 /// because a re-download at a different revision can easily land on the same
-/// length. Files that are not symlinks (a hand-placed checkpoint) fall back to
-/// the size, which is the best that can be had without hashing gigabytes.
+/// length.
+///
+/// A file that is not a symlink is a model somebody put there, and the likely
+/// somebody is `nanograd`, saving over its last attempt. Size alone is
+/// useless for that: the size of a checkpoint is decided by the architecture,
+/// so a retrained model is the same length *to the byte*, and the cache
+/// happily served the weights of the model it replaced. So it is the size and
+/// the modification time, which is `make`'s answer and has `make`'s flaw — a
+/// copy that preserves timestamps can defeat it — and costs nothing, where
+/// hashing a hand-placed 8 GB checkpoint on every load would cost more than
+/// the cache saves.
 fn identify(path: &Path) -> Res<String> {
     if let Ok(target) = std::fs::read_link(path) {
         if let Some(name) = target.file_name().and_then(|n| n.to_str()) {
             return Ok(format!("sha256:{name}"));
         }
     }
-    Ok(format!("bytes:{}", std::fs::metadata(path)?.len()))
+    let meta = std::fs::metadata(path)?;
+    let modified = meta.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    Ok(format!("bytes:{} modified:{modified}", meta.len()))
 }
 
 /// Everything that has to match for a cache file to be reusable.
@@ -652,9 +663,47 @@ fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// The cache file for one repo at one precision.
+/// The cache file for one model at one precision.
 pub fn path_for(repo: &str, precision: Precision) -> PathBuf {
-    cache_root().join(format!("{}.{precision}.nq", repo.replace('/', "--")))
+    cache_root().join(file_name_for(repo, precision))
+}
+
+/// A repo id becomes its own file name, which is what makes the directory
+/// readable with `ls`. A model loaded from a directory is known by its
+/// absolute path (see `weights::model_id`), and a path makes a poor file name:
+/// it can be longer than a file name may be, and flattening its slashes lets
+/// two different paths collide. So it is filed under its last component, for
+/// the human, and a hash of the whole path, for correctness. Nothing reads
+/// the model's name back out of the file name; the header has it.
+fn file_name_for(repo: &str, precision: Precision) -> String {
+    let path = Path::new(repo);
+    if !path.is_absolute() {
+        return format!("{}.{precision}.nq", repo.replace('/', "--"));
+    }
+    // FNV-1a: five lines, and unlike the standard library's hasher, promised
+    // to give the same answer after the next compiler upgrade.
+    let hash = repo.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    let last = path.file_name().and_then(|n| n.to_str()).unwrap_or("model");
+    format!("local--{last}-{hash:016x}.{precision}.nq")
+}
+
+/// The model a cache file says it belongs to, read from its header.
+fn repo_of(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let n = file.metadata().ok()?.len();
+    let mut at = [0u8; 8];
+    file.seek(SeekFrom::End(-8)).ok()?;
+    file.read_exact(&mut at).ok()?;
+    let at = u64::from_le_bytes(at);
+    // A header is a few kilobytes of JSON. Anything else is not a header, and
+    // is certainly not worth allocating for.
+    let len = n.checked_sub(8)?.checked_sub(at).filter(|&len| len < (1 << 24))?;
+    let mut json = vec![0u8; len as usize];
+    file.seek(SeekFrom::Start(at)).ok()?;
+    file.read_exact(&mut json).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&json).ok()?;
+    json.get("repo")?.as_str().map(String::from)
 }
 
 /// Everything currently cached: (path, repo, precision, bytes).
@@ -669,7 +718,10 @@ pub fn entries() -> Vec<(PathBuf, String, String, u64)> {
             let stem = path.file_name()?.to_str()?.strip_suffix(".nq")?.to_string();
             let (repo, precision) = stem.rsplit_once('.')?;
             let bytes = e.metadata().ok()?.len();
-            Some((path, repo.replacen("--", "/", 1), precision.to_string(), bytes))
+            // The header knows; the file name is a guess for a file whose
+            // header cannot be read.
+            let repo = repo_of(&path).unwrap_or_else(|| repo.replacen("--", "/", 1));
+            Some((path, repo, precision.to_string(), bytes))
         })
         .collect();
     out.sort();
@@ -819,6 +871,39 @@ mod tests {
         }
     }
 
+    /// The case that was broken: a model retrained and saved over itself. Its
+    /// file has the same name and exactly the same length, and a cache that
+    /// identified it by those served the old model's weights under the new
+    /// model's name.
+    #[test]
+    fn a_retrained_model_is_not_the_model_it_replaced() {
+        let weights = tmp("retrained.safetensors");
+        let cache = tmp("retrained");
+        let files = [weights.clone()];
+
+        std::fs::write(&weights, [1u8; 64]).unwrap();
+        let w = Writer::create(&cache).unwrap();
+        w.finish(header("out/model", &files, &spec(), Precision::Q8).unwrap()).unwrap();
+        assert!(Mapped::open(&cache, "out/model", &files, &spec(), Precision::Q8).unwrap().is_some());
+
+        // Same length, different floats, saved a second later. The time is
+        // set rather than waited for, so the test does not depend on how
+        // finely this file system keeps it.
+        let before = std::fs::metadata(&weights).unwrap().modified().unwrap();
+        std::fs::write(&weights, [2u8; 64]).unwrap();
+        let file = std::fs::File::options().write(true).open(&weights).unwrap();
+        file.set_modified(before + std::time::Duration::from_secs(1)).unwrap();
+        drop(file);
+
+        let error = Mapped::open(&cache, "out/model", &files, &spec(), Precision::Q8).err().unwrap();
+        assert!(error.to_string().contains("`sources` changed"), "{error}");
+
+        // And a file nobody touched is still itself.
+        assert_eq!(identify(&weights).unwrap(), identify(&weights).unwrap());
+        std::fs::remove_file(&weights).unwrap();
+        std::fs::remove_file(&cache).unwrap();
+    }
+
     /// A cache that can be read after the rules changed is worse than none.
     #[test]
     fn stale_caches_are_rejected() {
@@ -878,5 +963,35 @@ mod tests {
         let p = path_for("Qwen/Qwen2.5-0.5B-Instruct", Precision::Q8);
         assert_eq!(p, PathBuf::from("/tmp/qc/Qwen--Qwen2.5-0.5B-Instruct.q8.nq"));
         std::env::remove_var("KVAD_QUANT_CACHE");
+    }
+
+    #[test]
+    fn a_directory_is_filed_under_its_whole_path() {
+        let name = |repo: &str| file_name_for(repo, Precision::Q8);
+        // Readable, and a legal file name however deep the directory is.
+        let deep = format!("/{}/readme", "a-long-directory-name/".repeat(30));
+        assert!(name(&deep).starts_with("local--readme-") && name(&deep).len() < 64, "{}", name(&deep));
+        // Flattening the slashes would have made one file of these two.
+        assert_ne!(name("/out/a/b"), name("/out/a--b"));
+        assert_ne!(name("/one/readme"), name("/two/readme"));
+        assert_eq!(name("/one/readme"), name("/one/readme"));
+        // Pinned, because a hash that changed would orphan every cache file.
+        assert_eq!(name("/out/readme"), "local--readme-3ee92617cc0f7705.q8.nq");
+    }
+
+    /// `kvad cache` lists models by name, and a directory's name cannot be
+    /// recovered from its file name. It is read from the header instead.
+    #[test]
+    fn the_listing_reads_the_name_from_the_header() {
+        let path = tmp("named");
+        let w = Writer::create(&path).unwrap();
+        w.finish(header("/home/me/out/my--model", &[], &spec(), Precision::Q8).unwrap()).unwrap();
+        assert_eq!(repo_of(&path).as_deref(), Some("/home/me/out/my--model"));
+
+        std::fs::write(&path, b"not a cache file at all").unwrap();
+        assert_eq!(repo_of(&path), None);
+        std::fs::write(&path, b"short").unwrap();
+        assert_eq!(repo_of(&path), None);
+        std::fs::remove_file(&path).unwrap();
     }
 }

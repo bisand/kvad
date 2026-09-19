@@ -343,8 +343,43 @@ nothing. Measured against the same run left alone, that cost 0.06 and 0.04 of
 training loss over the first 50 steps on two seeds, nothing on a third, and
 nothing visible on any by step 100.
 
-What is still missing is the last step: `kvad run --model out/readme`. The
-engine can load the file but only knows how to find models on the Hub.
+### Running it in the engine
+
+```bash
+kvad run --model out/readme --greedy --prompt "## "
+kvad use out/readme          # make it the default, from any directory
+kvad-tui out/readme          # open the TUI with it loading
+```
+
+Wherever the engine takes a repo id it takes a directory, by the rule
+`transformers` uses: a directory that exists wins. From there it is the same
+code path as a model from the Hub — the same loader, tokeniser, KV cache and
+quantised kernels — so the 117K model gets `--quant q8` for free. (How fast it
+is cannot honestly be said: its context holds 64 tokens, the run is over in
+about 20 ms, and six of them measured anywhere from 970 to 5,600 tokens a
+second.) With sampling off, the engine and `nanograd` wrote the same 61
+characters for each of three trained models; [a test](crates/llm/tests/nanograd_checkpoint.rs)
+makes that journey on every run, from a text to a trained model to a directory
+to the engine's output.
+
+This is a base model in the plainest sense: it continues text. It has no chat
+template and no idea what a question is, and a prompt containing a character it
+never saw loses that character silently, because that is what the tokeniser
+library does with one.
+
+**The bug that was waiting for this.** The quantised-weight cache has to know
+whether a checkpoint is still the file it quantised. For Hub models it reads
+the content hash out of the HuggingFace cache's symlink, for free. For any
+other file it fell back to the size — and the size of a checkpoint is decided
+by the architecture, so a model retrained and saved over itself is the same
+length *to the byte*. Reproduced before it was touched: train, run with
+`--quant q8`, retrain into the same directory, run again, and the engine mapped
+the old cache and wrote the old model's text under the new model's name, while
+`--quant f32` beside it wrote the new one's. Nothing had ever saved over a
+checkpoint before, so nothing had ever hit it. The identity is now the size and
+the modification time — `make`'s answer, with `make`'s flaw, that a copy which
+preserves timestamps can defeat it. Hashing would close that, and would cost
+more on a hand-placed 8 GB checkpoint than the cache saves.
 
 ---
 
@@ -1111,9 +1146,9 @@ works, at 117 thousand parameters rather than 10 million, and the result is
 saved as a GPT-2 checkpoint ([`checkpoint.rs`](crates/nanograd/src/checkpoint.rs))
 from which the `kvad` engine computes the same logits. What stands between the
 two sizes is speed — one core, one sequence at a time, about 22,000 characters
-a second. What stands between the two crates is small: the engine finds models
-only on the Hub, and has no way to be pointed at a directory. Llama's SwiGLU
-and RoPE are not written. The gradient check from crate 1 is how
+a second. Nothing stands between the two crates any more: `kvad run --model DIR`
+runs what `train_text --save DIR` wrote. Llama's SwiGLU and RoPE are not
+written. The gradient check from crate 1 is how
 you will debug each one — extend `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 

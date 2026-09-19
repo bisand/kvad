@@ -67,7 +67,8 @@ impl Llm {
         precision: Precision,
         progress: &mut dyn FnMut(&str),
     ) -> Res<Self> {
-        let repo = repo_id.to_string();
+        // What the quantised-weight cache files this model under.
+        let repo = weights::model_id(repo_id);
         Self::load_custom(repo_id, progress, &mut |files, spec, progress| {
             let model = qcache::load(&repo, files, spec, precision, progress)?;
             Ok(Box::new(CpuSession::new(model, precision)))

@@ -6,6 +6,10 @@
 //! and identical for every client, and it means a conversation is saved
 //! because somebody chose to save it rather than as a side effect of asking a
 //! question.
+//!
+//! Every route passes `who.id` down to [`crate::chat`], which puts it in the
+//! `WHERE` clause. Somebody else's conversation is therefore not found rather
+//! than found and refused, and the 404 does not confirm that it exists.
 
 use crate::api::{blocking, Fail};
 use crate::auth::{Identity, State};
@@ -30,21 +34,24 @@ pub struct Full {
     messages: Vec<Stored>,
 }
 
-pub async fn list(_: Identity, St(state): St<State>) -> Result<Json<Vec<Conversation>>, Fail> {
+pub async fn list(who: Identity, St(state): St<State>) -> Result<Json<Vec<Conversation>>, Fail> {
     let db = state.db.clone();
-    blocking(move || chat::list(&db)).await.map(Json)
+    let me = who.id;
+    blocking(move || chat::list(&db, me)).await.map(Json)
 }
 
 pub async fn create(
-    _: Identity,
+    who: Identity,
     St(state): St<State>,
     Json(body): Json<NewConversation>,
 ) -> Result<Json<Conversation>, Fail> {
     let db = state.db.clone();
+    let me = who.id;
     blocking(move || {
         let title = body.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
         chat::create(
             &db,
+            me,
             title.unwrap_or("New conversation"),
             body.system.as_deref(),
             body.model.as_deref(),
@@ -55,15 +62,16 @@ pub async fn create(
 }
 
 pub async fn get(
-    _: Identity,
+    who: Identity,
     St(state): St<State>,
     Path(id): Path<i64>,
 ) -> Result<Json<Full>, Fail> {
     let db = state.db.clone();
+    let me = who.id;
     let found = blocking(move || {
-        Ok(match chat::get(&db, id)? {
+        Ok(match chat::get(&db, id, me)? {
             None => None,
-            Some(conversation) => Some((conversation, chat::messages(&db, id)?)),
+            Some(conversation) => Some((conversation, chat::messages(&db, id, me)?)),
         })
     })
     .await?;
@@ -94,16 +102,18 @@ where
 }
 
 pub async fn update(
-    _: Identity,
+    who: Identity,
     St(state): St<State>,
     Path(id): Path<i64>,
     Json(body): Json<Patch>,
 ) -> Result<Json<Conversation>, Fail> {
     let db = state.db.clone();
+    let me = who.id;
     let updated = blocking(move || {
         chat::update(
             &db,
             id,
+            me,
             body.title.as_deref().map(str::trim).filter(|t| !t.is_empty()),
             body.system.as_ref().map(|s| s.as_deref()),
             body.model.as_deref(),
@@ -114,12 +124,13 @@ pub async fn update(
 }
 
 pub async fn remove(
-    _: Identity,
+    who: Identity,
     St(state): St<State>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, Fail> {
     let db = state.db.clone();
-    match blocking(move || chat::delete(&db, id)).await? {
+    let me = who.id;
+    match blocking(move || chat::delete(&db, id, me)).await? {
         true => Ok(Json(serde_json::json!({ "deleted": id }))),
         false => Err(Fail::missing(format!("there is no conversation {id}"))),
     }
@@ -139,28 +150,29 @@ pub struct NewMessage {
 }
 
 pub async fn append(
-    _: Identity,
+    who: Identity,
     St(state): St<State>,
     Path(id): Path<i64>,
     Json(body): Json<NewMessage>,
 ) -> Result<Json<Stored>, Fail> {
     let db = state.db.clone();
+    let me = who.id;
     let exists = {
         let db = db.clone();
-        blocking(move || chat::exists(&db, id)).await?
+        blocking(move || chat::exists(&db, id, me)).await?
     };
     if !exists {
         return Err(Fail::missing(format!("there is no conversation {id}")));
     }
 
     blocking(move || {
-        let stored = chat::append(&db, id, &body.role, &body.content, body.stats.as_ref())?;
+        let stored = chat::append(&db, id, me, &body.role, &body.content, body.stats.as_ref())?;
         if body.title_if_unnamed {
             // Only a conversation still carrying the placeholder gets
             // renamed, so a title somebody typed is never overwritten.
-            let current = chat::get(&db, id)?;
+            let current = chat::get(&db, id, me)?;
             if current.is_some_and(|c| c.title == "New conversation") {
-                chat::update(&db, id, Some(&chat::title_from(&body.content)), None, None)?;
+                chat::update(&db, id, me, Some(&chat::title_from(&body.content)), None, None)?;
             }
         }
         Ok(stored)

@@ -3,6 +3,20 @@
 //! Reading and writing rows, and nothing else — no engine, no HTTP. The chat
 //! that a person sees is assembled by the UI out of these rows plus a call to
 //! `/v1/chat/completions`, which knows nothing about them.
+//!
+//! # Whose conversation
+//!
+//! Every function that touches one takes an `owner: Option<i64>` and matches
+//! it with SQL's `IS`, which compares NULL to NULL as equal. So:
+//!
+//! * signed in as account 5, you see `owner = 5`;
+//! * with `auth.mode = "none"`, where there are no accounts, you see
+//!   `owner IS NULL` — which is everything, because that is all there is.
+//!
+//! The scope is in the `WHERE` clause of every statement rather than in a
+//! check beside it, so a conversation that is not yours is not found rather
+//! than found and then refused. That also means the 404 does not confirm that
+//! somebody else's conversation exists.
 
 use crate::db::Db;
 use rusqlite::{params, Connection, Row};
@@ -86,31 +100,47 @@ const LIST_SQL: &str = "SELECT c.id, c.title, c.system, c.model, c.created_at, c
         (SELECT count(*) FROM messages m WHERE m.conversation = c.id) AS messages
      FROM conversations c";
 
-pub fn list(db: &Db) -> Res<Vec<Conversation>> {
+/// `IS` rather than `=`, so that NULL matches NULL: the mode with no accounts
+/// owns the conversations that have no owner.
+const MINE: &str = "c.owner IS ?1";
+
+pub fn list(db: &Db, owner: Option<i64>) -> Res<Vec<Conversation>> {
     db.with(|c| {
-        let mut q = c.prepare(&format!("{LIST_SQL} ORDER BY c.updated_at DESC, c.id DESC"))?;
-        let rows = q.query_map([], conversation_from)?;
-        rows.collect()
+        let mut q = c.prepare(&format!(
+            "{LIST_SQL} WHERE {MINE} ORDER BY c.updated_at DESC, c.id DESC"
+        ))?;
+        let rows = q.query_map([owner], conversation_from)?.collect();
+        rows
     })
 }
 
-pub fn get(db: &Db, id: i64) -> Res<Option<Conversation>> {
+pub fn get(db: &Db, id: i64, owner: Option<i64>) -> Res<Option<Conversation>> {
     db.with(|c| {
-        c.query_row(&format!("{LIST_SQL} WHERE c.id = ?1"), [id], conversation_from)
-            .map(Some)
-            .or_else(none_if_missing)
+        c.query_row(
+            &format!("{LIST_SQL} WHERE c.id = ?2 AND {MINE}"),
+            params![owner, id],
+            conversation_from,
+        )
+        .map(Some)
+        .or_else(none_if_missing)
     })
 }
 
-pub fn create(db: &Db, title: &str, system: Option<&str>, model: Option<&str>) -> Res<Conversation> {
+pub fn create(
+    db: &Db,
+    owner: Option<i64>,
+    title: &str,
+    system: Option<&str>,
+    model: Option<&str>,
+) -> Res<Conversation> {
     let id = db.with(|c| {
         c.execute(
-            "INSERT INTO conversations (title, system, model) VALUES (?1, ?2, ?3)",
-            params![title, system, model],
+            "INSERT INTO conversations (title, system, model, owner) VALUES (?1, ?2, ?3, ?4)",
+            params![title, system, model, owner],
         )?;
         Ok(c.last_insert_rowid())
     })?;
-    get(db, id)?.ok_or_else(|| "the conversation vanished as it was created".into())
+    get(db, id, owner)?.ok_or_else(|| "the conversation vanished as it was created".into())
 }
 
 /// Change a conversation's title, system prompt or model.
@@ -121,38 +151,56 @@ pub fn create(db: &Db, title: &str, system: Option<&str>, model: Option<&str>) -
 pub fn update(
     db: &Db,
     id: i64,
+    owner: Option<i64>,
     title: Option<&str>,
     system: Option<Option<&str>>,
     model: Option<&str>,
 ) -> Res<Option<Conversation>> {
+    // Every statement carries the owner, so an update is silently nothing
+    // rather than a change to somebody else's conversation.
     let changed = db.with(|c| {
         let mut n = 0;
+        let set = |column: &str, value: &dyn rusqlite::ToSql| -> rusqlite::Result<usize> {
+            c.execute(
+                &format!("UPDATE conversations SET {column} = ?3 WHERE id = ?2 AND owner IS ?1"),
+                params![owner, id, value],
+            )
+        };
         if let Some(title) = title {
-            n += c.execute("UPDATE conversations SET title = ?2 WHERE id = ?1", params![id, title])?;
+            n += set("title", &title)?;
         }
         if let Some(system) = system {
-            n += c.execute("UPDATE conversations SET system = ?2 WHERE id = ?1", params![id, system])?;
+            n += set("system", &system)?;
         }
         if let Some(model) = model {
-            n += c.execute("UPDATE conversations SET model = ?2 WHERE id = ?1", params![id, model])?;
+            n += set("model", &model)?;
         }
         if n > 0 {
-            c.execute("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?1", [id])?;
+            c.execute(
+                "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?2 AND owner IS ?1",
+                params![owner, id],
+            )?;
         }
         Ok(())
     });
     changed?;
-    get(db, id)
+    get(db, id, owner)
 }
 
-pub fn delete(db: &Db, id: i64) -> Res<bool> {
+pub fn delete(db: &Db, id: i64, owner: Option<i64>) -> Res<bool> {
     // `ON DELETE CASCADE` takes the messages, and `foreign_keys` is turned on
     // for every connection in `Db::prepare` — without it SQLite would leave
     // them behind, silently.
-    Ok(db.with(|c| c.execute("DELETE FROM conversations WHERE id = ?1", [id]))? > 0)
+    Ok(db.with(|c| {
+        c.execute("DELETE FROM conversations WHERE id = ?2 AND owner IS ?1", params![owner, id])
+    })? > 0)
 }
 
-pub fn messages(db: &Db, id: i64) -> Res<Vec<Stored>> {
+/// The messages of a conversation of `owner`'s. Empty for one that is not.
+pub fn messages(db: &Db, id: i64, owner: Option<i64>) -> Res<Vec<Stored>> {
+    if !exists(db, id, owner)? {
+        return Ok(Vec::new());
+    }
     db.with(|c| {
         let mut q = c.prepare(
             "SELECT id, role, content, created_at, model, backend, prompt_tokens,
@@ -186,9 +234,19 @@ pub fn messages(db: &Db, id: i64) -> Res<Vec<Stored>> {
     })
 }
 
-pub fn append(db: &Db, id: i64, role: &str, content: &str, stats: Option<&Stats>) -> Res<Stored> {
+pub fn append(
+    db: &Db,
+    id: i64,
+    owner: Option<i64>,
+    role: &str,
+    content: &str,
+    stats: Option<&Stats>,
+) -> Res<Stored> {
     if !matches!(role, "system" | "user" | "assistant") {
         return Err(format!("`{role}` is not a role a message can have").into());
+    }
+    if !exists(db, id, owner)? {
+        return Err(format!("there is no conversation {id}").into());
     }
     let row = db.with(|c| {
         c.execute(
@@ -214,7 +272,7 @@ pub fn append(db: &Db, id: i64, role: &str, content: &str, stats: Option<&Stats>
         c.execute("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?1", [id])?;
         Ok(new)
     })?;
-    messages(db, id)?
+    messages(db, id, owner)?
         .into_iter()
         .find(|m| m.id == row)
         .ok_or_else(|| "the message vanished as it was written".into())
@@ -227,21 +285,29 @@ fn none_if_missing<T>(e: rusqlite::Error) -> rusqlite::Result<Option<T>> {
     }
 }
 
-/// Whether a conversation exists, without reading it.
-pub fn exists(db: &Db, id: i64) -> Res<bool> {
+/// Whether a conversation of `owner`'s exists, without reading it.
+pub fn exists(db: &Db, id: i64, owner: Option<i64>) -> Res<bool> {
     db.with(|c: &Connection| {
-        c.query_row("SELECT 1 FROM conversations WHERE id = ?1", [id], |_| Ok(()))
-            .map(|_| true)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(false),
-                other => Err(other),
-            })
+        c.query_row(
+            "SELECT 1 FROM conversations WHERE id = ?2 AND owner IS ?1",
+            params![owner, id],
+            |_| Ok(()),
+        )
+        .map(|_| true)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            other => Err(other),
+        })
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The owner every test that is not about ownership uses: none, which is
+    /// what `auth.mode = "none"` passes.
+    const ALONE: Option<i64> = None;
 
     fn stats() -> Stats {
         Stats {
@@ -258,14 +324,14 @@ mod tests {
     #[test]
     fn a_conversation_keeps_its_messages_in_order_and_their_numbers_with_them() {
         let db = Db::in_memory().unwrap();
-        let c = create(&db, "First", Some("Be brief."), Some("gpt2")).unwrap();
+        let c = create(&db, ALONE, "First", Some("Be brief."), Some("gpt2")).unwrap();
         assert_eq!(c.messages, 0);
 
-        append(&db, c.id, "user", "hello", None).unwrap();
-        let reply = append(&db, c.id, "assistant", "hi", Some(&stats())).unwrap();
-        append(&db, c.id, "user", "again", None).unwrap();
+        append(&db, c.id, ALONE, "user", "hello", None).unwrap();
+        let reply = append(&db, c.id, ALONE, "assistant", "hi", Some(&stats())).unwrap();
+        append(&db, c.id, ALONE, "user", "again", None).unwrap();
 
-        let all = messages(&db, c.id).unwrap();
+        let all = messages(&db, c.id, ALONE).unwrap();
         assert_eq!(
             all.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
             ["hello", "hi", "again"]
@@ -278,7 +344,7 @@ mod tests {
         assert_eq!(kept.backend.as_deref(), Some("cpu q8"));
         assert_eq!(reply.id, all[1].id);
 
-        assert_eq!(get(&db, c.id).unwrap().unwrap().messages, 3);
+        assert_eq!(get(&db, c.id, ALONE).unwrap().unwrap().messages, 3);
     }
 
     /// Deleting a conversation has to take its messages with it. SQLite
@@ -287,20 +353,24 @@ mod tests {
     #[test]
     fn deleting_a_conversation_takes_its_messages() {
         let db = Db::in_memory().unwrap();
-        let a = create(&db, "Going", None, None).unwrap();
-        let b = create(&db, "Staying", None, None).unwrap();
-        append(&db, a.id, "user", "one", None).unwrap();
-        append(&db, b.id, "user", "two", None).unwrap();
+        let a = create(&db, ALONE, "Going", None, None).unwrap();
+        let b = create(&db, ALONE, "Staying", None, None).unwrap();
+        append(&db, a.id, ALONE, "user", "one", None).unwrap();
+        append(&db, b.id, ALONE, "user", "two", None).unwrap();
 
-        assert!(delete(&db, a.id).unwrap());
-        assert!(!delete(&db, a.id).unwrap(), "deleting it twice reported success twice");
-        assert!(!exists(&db, a.id).unwrap());
+        assert!(delete(&db, a.id, ALONE).unwrap());
+        assert!(!delete(&db, a.id, ALONE).unwrap(), "deleting it twice reported success twice");
+        assert!(!exists(&db, a.id, ALONE).unwrap());
 
         let orphans: i64 = db
-            .with(|c| c.query_row("SELECT count(*) FROM messages WHERE conversation = ?1", [a.id], |r| r.get(0)))
+            .with(|c| {
+                c.query_row("SELECT count(*) FROM messages WHERE conversation = ?1", [a.id], |r| {
+                    r.get(0)
+                })
+            })
             .unwrap();
         assert_eq!(orphans, 0, "the messages outlived their conversation");
-        assert_eq!(messages(&db, b.id).unwrap().len(), 1);
+        assert_eq!(messages(&db, b.id, ALONE).unwrap().len(), 1);
     }
 
     /// Each field of an update is optional, and a system prompt can be
@@ -308,17 +378,17 @@ mod tests {
     #[test]
     fn an_update_changes_only_what_it_was_given() {
         let db = Db::in_memory().unwrap();
-        let c = create(&db, "Old", Some("Be brief."), None).unwrap();
+        let c = create(&db, ALONE, "Old", Some("Be brief."), None).unwrap();
 
-        let renamed = update(&db, c.id, Some("New"), None, None).unwrap().unwrap();
+        let renamed = update(&db, c.id, ALONE, Some("New"), None, None).unwrap().unwrap();
         assert_eq!(renamed.title, "New");
         assert_eq!(renamed.system.as_deref(), Some("Be brief."), "a rename lost the system prompt");
 
-        let cleared = update(&db, c.id, None, Some(None), None).unwrap().unwrap();
+        let cleared = update(&db, c.id, ALONE, None, Some(None), None).unwrap().unwrap();
         assert_eq!(cleared.title, "New");
         assert_eq!(cleared.system, None);
 
-        assert!(update(&db, 9999, Some("x"), None, None).unwrap().is_none());
+        assert!(update(&db, 9999, ALONE, Some("x"), None, None).unwrap().is_none());
     }
 
     #[test]
@@ -342,8 +412,52 @@ mod tests {
     #[test]
     fn a_message_needs_a_role_that_exists() {
         let db = Db::in_memory().unwrap();
-        let c = create(&db, "x", None, None).unwrap();
-        let err = append(&db, c.id, "wizard", "abracadabra", None).unwrap_err().to_string();
+        let c = create(&db, ALONE, "x", None, None).unwrap();
+        let err = append(&db, c.id, ALONE, "wizard", "abracadabra", None).unwrap_err().to_string();
         assert!(err.contains("wizard"), "{err}");
+    }
+
+    /// The test this module exists for. Delete the `owner IS ?1` from any one
+    /// of these statements and this fails.
+    ///
+    /// A conversation that is not yours is not *refused*, it is not *found* —
+    /// so the answer to "does conversation 3 exist" is the same whether it
+    /// does not exist at all or merely is not yours.
+    #[test]
+    fn one_persons_conversation_is_not_anothers_to_read_or_change() {
+        let db = Db::in_memory().unwrap();
+        let (ada, bob) = (Some(1), Some(2));
+        // Real rows, because the foreign key is enforced.
+        crate::users::create(&db, "ada", Some("lovelace-1843"), "admin", None).unwrap();
+        crate::users::create(&db, "bob", Some("builder-2024"), "user", None).unwrap();
+
+        let hers = create(&db, ada, "Ada's", Some("Be brief."), None).unwrap();
+        append(&db, hers.id, ada, "user", "a secret", None).unwrap();
+        let his = create(&db, bob, "Bob's", None, None).unwrap();
+
+        // Each sees one conversation: their own.
+        assert_eq!(list(&db, ada).unwrap().len(), 1);
+        assert_eq!(list(&db, bob).unwrap().iter().map(|c| c.id).collect::<Vec<_>>(), [his.id]);
+
+        // Bob cannot read hers, by id or by its messages.
+        assert!(get(&db, hers.id, bob).unwrap().is_none());
+        assert!(messages(&db, hers.id, bob).unwrap().is_empty(), "bob read ada's messages");
+        assert!(!exists(&db, hers.id, bob).unwrap());
+
+        // ...nor rename it, nor add to it, nor delete it.
+        assert!(update(&db, hers.id, bob, Some("Bob's now"), None, None).unwrap().is_none());
+        assert!(append(&db, hers.id, bob, "user", "hello?", None).is_err());
+        assert!(!delete(&db, hers.id, bob).unwrap());
+
+        // And none of that changed anything.
+        let still = get(&db, hers.id, ada).unwrap().unwrap();
+        assert_eq!(still.title, "Ada's");
+        assert_eq!(messages(&db, hers.id, ada).unwrap().len(), 1);
+
+        // The mode with no accounts sees the conversations with no owner, and
+        // those alone.
+        let shared = create(&db, None, "From before accounts", None, None).unwrap();
+        assert_eq!(list(&db, None).unwrap().iter().map(|c| c.id).collect::<Vec<_>>(), [shared.id]);
+        assert!(get(&db, hers.id, None).unwrap().is_none());
     }
 }

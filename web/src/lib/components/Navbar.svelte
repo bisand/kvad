@@ -1,10 +1,12 @@
 <script>
   import Icon from "./Icon.svelte";
   import ThemeMenu from "./ThemeMenu.svelte";
+  import { auth } from "../auth.svelte.js";
 
   let { drawerId, title, health, error } = $props();
 
   const MENU = "M4 6h16M4 12h16M4 18h16";
+  const OUT = "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9";
 </script>
 
 <header class="navbar bg-base-100 border-base-300 sticky top-0 z-10 min-h-16 border-b px-2 sm:px-4">
@@ -34,5 +36,15 @@
       {/if}
     </span>
     <ThemeMenu />
+    {#if auth.hasAccounts}
+      <button
+        class="btn btn-ghost btn-sm btn-square"
+        aria-label={`Sign out of ${auth.who?.name}`}
+        title={`Signed in as ${auth.who?.name} (${auth.who?.role})`}
+        onclick={() => auth.signOut()}
+      >
+        <Icon path={OUT} />
+      </button>
+    {/if}
   </div>
 </header>

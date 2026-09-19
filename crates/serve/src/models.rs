@@ -14,7 +14,7 @@
 //! chat endpoint needs that reader anyway.
 
 use crate::api::{blocking, Fail};
-use crate::auth::{Admin, State};
+use crate::auth::{Admin, Identity, State};
 use crate::scheduler::Progress;
 use axum::extract::{Query, State as St};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -109,7 +109,10 @@ fn default_backend(db: &crate::db::Db) -> String {
     }
 }
 
-pub async fn list(_: Admin, St(state): St<State>) -> Result<Json<Listing>, Fail> {
+/// Readable by anyone signed in, because the Chat page needs to know what is
+/// loaded. Everything that *changes* a model takes `Admin` instead. Nothing
+/// here is a secret: model names, sizes, and which backends this build has.
+pub async fn list(_: Identity, St(state): St<State>) -> Result<Json<Listing>, Fail> {
     let db = state.db.clone();
     let scanned = blocking(move || {
         Ok((

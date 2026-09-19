@@ -43,6 +43,23 @@ pub fn routes() -> Router<State> {
         .route("/api/conversations/{id}/messages", post(crate::conversations::append))
         .route("/v1/models", get(crate::openai::models))
         .route("/v1/chat/completions", post(crate::openai::completions))
+        // Signing in, and the one route that has to answer a request with no
+        // credential at all.
+        .route("/api/auth", get(crate::accounts::situation))
+        .route("/api/auth/login", post(crate::accounts::sign_in))
+        .route("/api/auth/logout", post(crate::accounts::sign_out))
+        .route("/api/auth/setup", post(crate::accounts::setup))
+        .route("/api/auth/password", post(crate::accounts::change_password))
+        .route("/api/users", get(crate::accounts::list_users).post(crate::accounts::create_user))
+        .route(
+            "/api/users/{id}",
+            axum::routing::patch(crate::accounts::update_user)
+                .delete(crate::accounts::delete_user),
+        )
+        .route("/api/sessions", get(crate::accounts::list_sessions))
+        .route("/api/sessions/{hash}", delete(crate::accounts::revoke_session))
+        .route("/api/keys", get(crate::accounts::list_keys).post(crate::accounts::create_key))
+        .route("/api/keys/{id}", delete(crate::accounts::revoke_key))
 }
 
 /// A request that could not be answered, as a status and a sentence.
@@ -105,6 +122,9 @@ pub struct Health {
     /// What the engine is holding, and how much is waiting for it.
     loaded: Option<crate::scheduler::Loaded>,
     queue_depth: usize,
+    /// Which authentication mode is in force. The UI shows or hides the
+    /// sign-out button by it.
+    auth: String,
     /// Who the server thinks is asking. With `auth.mode = "none"` this is
     /// always the local operator, and saying so out loud is the point.
     you: Identity,
@@ -121,6 +141,7 @@ async fn health(who: Identity, St(state): St<State>) -> Json<Health> {
         ui_embedded: crate::assets::is_embedded(),
         loaded: state.engine.loaded(),
         queue_depth: state.engine.depth(),
+        auth: state.auth.mode().to_string(),
         you: who,
     })
 }

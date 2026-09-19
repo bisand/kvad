@@ -42,6 +42,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001-settings", include_str!("migrations/001-settings.sql")),
     ("002-chat", include_str!("migrations/002-chat.sql")),
+    ("003-users", include_str!("migrations/003-users.sql")),
 ];
 
 #[derive(Clone)]

@@ -135,14 +135,9 @@ impl Config {
             )
             .into());
         }
-        if self.auth.mode != Mode::None {
-            return Err(format!(
-                "auth.mode = \"{}\" is not implemented yet; only \"none\" is. \
-                 Until it is, bind loopback.",
-                self.auth.mode
-            )
-            .into());
-        }
+        // Which modes exist is `auth::provider`'s to say, not this file's: it
+        // is the one that has to build them.
+        crate::auth::provider(self.auth.mode)?;
         Ok(())
     }
 }
@@ -220,5 +215,20 @@ mod tests {
         let err = cfg.check(false).unwrap_err().to_string();
         assert!(err.contains("not implemented"), "{err}");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The modes that *are* built start, and a mode with accounts may bind
+    /// somewhere other than loopback without being insisted on: the reason
+    /// `none` may not is that it has nothing to check.
+    #[test]
+    fn a_mode_with_accounts_may_face_the_network() {
+        let mut cfg = Config::default();
+        cfg.server.bind = "0.0.0.0:8080".parse().unwrap();
+        for mode in [Mode::Local, Mode::Basic] {
+            cfg.auth.mode = mode;
+            assert!(cfg.check(false).is_ok(), "{mode} was refused");
+        }
+        cfg.auth.mode = Mode::None;
+        assert!(cfg.check(false).is_err());
     }
 }

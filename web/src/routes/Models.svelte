@@ -1,7 +1,12 @@
 <script>
   import { models, humanBytes } from "../lib/models.svelte.js";
+  import { auth } from "../lib/auth.svelte.js";
   import { toasts } from "../lib/toasts.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
+
+  // Every one of these is enforced on the server as well; hiding them is so
+  // that a user is not offered buttons that answer 403.
+  const may = $derived(auth.isAdmin);
 
   const TRASH = "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6";
   const SEARCH = "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3";
@@ -66,7 +71,7 @@
           {/if}
         </div>
 
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2" class:hidden={!may}>
           <label class="text-xs opacity-60" for="backend">Next load on</label>
           <select
             id="backend"
@@ -154,7 +159,7 @@
                 </td>
                 <td class="text-sm whitespace-nowrap opacity-70">{humanBytes(m.bytes)}</td>
                 <td class="whitespace-nowrap">
-                  <div class="flex justify-end gap-1">
+                  <div class="flex justify-end gap-1" class:hidden={!may}>
                     <button
                       class="btn btn-sm"
                       disabled={!m.runnable || !!models.busy || models.loaded?.repo === m.id}
@@ -187,7 +192,18 @@
     {/if}
   </section>
 
-  <!-- The Hub. -->
+  {#if !may}
+    <div role="alert" class="alert alert-soft text-sm">
+      <span>
+        Loading, pulling and deleting models are an administrator's to do. What is
+        loaded is what you can chat with.
+      </span>
+    </div>
+  {/if}
+
+  <!-- The Hub. Searching it makes an outbound request on this machine's
+       behalf, so it is an administrator's too. -->
+  {#if may}
   <section>
     <h2 class="mb-2 text-sm font-medium opacity-60">Search the Hub</h2>
     <form class="join w-full max-w-lg" onsubmit={search}>
@@ -249,8 +265,10 @@
     {/if}
   </section>
 
+  {/if}
+
   <!-- Quantised weights: derived, and always safe to throw away. -->
-  {#if models.listing?.qcache.length}
+  {#if may && models.listing?.qcache.length}
     <section>
       <h2 class="mb-1 text-sm font-medium opacity-60">Quantised weights</h2>
       <p class="mb-2 text-xs opacity-60">

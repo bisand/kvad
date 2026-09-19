@@ -23,6 +23,7 @@
 //! * [`assets`] — the built UI, embedded, with everything else falling back
 //!   to it so a client-side router survives a reload.
 
+mod accounts;
 mod api;
 mod assets;
 mod auth;
@@ -34,6 +35,8 @@ mod engine;
 mod models;
 mod openai;
 mod scheduler;
+mod secret;
+mod users;
 
 use axum::Router;
 use std::net::SocketAddr;
@@ -137,9 +140,21 @@ async fn run(args: Args) -> Res<()> {
 
     let db = db::Db::open(&cfg.database.path)?;
     let schema = db.version()?;
+    // Sessions that ran out are refused whether or not they are still rows;
+    // this only keeps the table from growing forever.
+    let swept = users::sweep(&db).unwrap_or(0);
+
+    // A mode with accounts and no accounts needs a way in. One token, printed
+    // where only somebody with access to this terminal can read it, gone when
+    // it is used or when the server restarts.
+    let setup = std::sync::Arc::new(auth::Setup::default());
+    let accounts = users::count(&db)?;
+    let first_run = cfg.auth.mode != config::Mode::None && accounts == 0;
+
     let state = auth::State {
         auth: auth::provider(cfg.auth.mode)?.into(),
         engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader())),
+        setup: std::sync::Arc::clone(&setup),
         started: std::time::Instant::now(),
         db,
     };
@@ -160,13 +175,32 @@ async fn run(args: Args) -> Res<()> {
     println!("kvad-serve listening on http://{bound}");
     println!("  config     {}", config_path.display());
     println!("  database   {} (schema {schema})", cfg.database.path.display());
-    println!("  auth       {}", cfg.auth.mode);
+    println!("  auth       {}{}", cfg.auth.mode, match accounts {
+        0 => String::new(),
+        1 => " · 1 account".into(),
+        n => format!(" · {n} accounts"),
+    });
     println!(
         "  backends   {}",
         engine::available().iter().map(|c| c.id.clone()).collect::<Vec<_>>().join(", ")
     );
     if !assets::is_embedded() {
         println!("  web UI     not built into this binary — open the address above to see how");
+    }
+
+    if first_run {
+        // After the address, so that the two things somebody needs — where to
+        // go and what to type when they get there — are together at the end.
+        println!();
+        println!("This server has no accounts yet. Open the address above and use this");
+        println!("one-time setup token to make the first one:");
+        println!();
+        println!("    {}", setup.issue());
+        println!();
+        println!("It is not stored anywhere, and a restart issues a new one.");
+    }
+    if swept > 0 {
+        tracing::info!("swept {swept} expired session(s)");
     }
 
     axum::serve(listener, app).with_graceful_shutdown(interrupted()).await?;

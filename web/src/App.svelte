@@ -2,6 +2,7 @@
   import { router } from "./lib/router.svelte.js";
   import { pageFor } from "./lib/pages.js";
   import { health as fetchHealth } from "./lib/api.js";
+  import { auth } from "./lib/auth.svelte.js";
   import { toasts } from "./lib/toasts.svelte.js";
   import Navbar from "./lib/components/Navbar.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
@@ -10,6 +11,8 @@
   import Dashboard from "./routes/Dashboard.svelte";
   import Models from "./routes/Models.svelte";
   import Chat from "./routes/Chat.svelte";
+  import Settings from "./routes/Settings.svelte";
+  import SignIn from "./routes/SignIn.svelte";
   import NotFound from "./routes/NotFound.svelte";
 
   const DRAWER = "kvad-drawer";
@@ -19,10 +22,18 @@
 
   const page = $derived(pageFor(router.path));
 
+  // Who this browser is, before anything else is drawn. Rendering the app and
+  // then discovering every call is a 401 is a worse first impression than a
+  // sign-in form.
+  $effect(() => {
+    auth.refresh();
+  });
+
   // The server is polled rather than asked once, so that a restart while the
   // tab is open is noticed. Thirty seconds: often enough to spot a restart,
   // rare enough to be invisible in a request log.
   $effect(() => {
+    if (!auth.signedIn) return;
     let alive = true;
     async function poll(first) {
       try {
@@ -49,6 +60,15 @@
   });
 </script>
 
+{#if !auth.ready}
+  <!-- One frame, usually. Better than a flash of the app followed by a flash
+       of the sign-in form. -->
+  <div class="grid min-h-screen place-items-center">
+    <span class="loading loading-spinner"></span>
+  </div>
+{:else if !auth.signedIn}
+  <SignIn />
+{:else}
 <div class="drawer lg:drawer-open">
   <input id={DRAWER} type="checkbox" class="drawer-toggle" />
 
@@ -63,6 +83,8 @@
         <Models />
       {:else if page.path === "/chat"}
         <Chat />
+      {:else if page.path === "/settings"}
+        <Settings />
       {:else}
         <Unbuilt {page} />
       {/if}
@@ -71,5 +93,6 @@
 
   <Sidebar drawerId={DRAWER} />
 </div>
+{/if}
 
 <Toasts />

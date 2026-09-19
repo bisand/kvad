@@ -28,6 +28,7 @@ use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
 use llm::model::{Session, Spec};
+use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -72,6 +73,53 @@ impl Proj {
     }
 }
 
+/// The token embedding table, `[vocab, n_embd]`, read one row per token.
+///
+/// This was the last dense tensor in a quantised model, and on a small model
+/// it is not a small one: Qwen2.5-0.5B's is 136M of its 494M parameters, 272 MB
+/// in bf16 against 797 MB for everything else put together.
+///
+/// Quantising it needs an operation the rest of the engine never wanted —
+/// *gather rows and dequantise only those*. A `QTensor` is blocks, not a
+/// matrix, so row `t` is a range of blocks that has to be decoded on its own;
+/// candle has a kernel for exactly this (`QTensor::embedding`, GGML's
+/// `get_rows`), which is what makes this three lines rather than a Metal
+/// shader.
+///
+/// The bigger win is not the compression. When a model ties its embeddings —
+/// and small ones nearly always do — the lookup table and the output head are
+/// the *same matrix*, but they were stored twice because a dense lookup and a
+/// quantised matmul want different things. Quantise the lookup and they want
+/// the same thing, so one `Arc<QTensor>` serves both.
+enum Embed {
+    Dense(Tensor),
+    Quant(Arc<QTensor>),
+}
+
+impl Embed {
+    /// Row `ids[i]` of the table, per element of `ids`.
+    fn rows(&self, ids: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Embed::Dense(t) => t.index_select(ids, 0),
+            Embed::Quant(q) => q.embedding(ids),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Embed::Dense(t) => t.elem_count() * t.dtype().size_in_bytes(),
+            Embed::Quant(q) => q.storage_size_in_bytes(),
+        }
+    }
+
+    fn params(&self) -> usize {
+        match self {
+            Embed::Dense(t) => t.elem_count(),
+            Embed::Quant(q) => q.shape().elem_count(),
+        }
+    }
+}
+
 struct Block {
     attn_norm: Tensor,
     q: Proj,
@@ -92,15 +140,13 @@ pub struct GpuLlama {
     device: Device,
     dtype: DType,
     quant: Option<GgmlDType>,
-    /// `[vocab, n_embd]`, for the embedding lookup.
-    ///
-    /// Kept dense and, when the rest is quantised, in half precision: only one
-    /// row is read per token, so it costs memory but almost no bandwidth.
-    /// `QTensor` cannot be indexed a row at a time anyway.
-    embed: Tensor,
-    /// The output head. A separate copy even when the model ties its
-    /// embeddings, because lookup and matmul want opposite layouts.
+    embed: Embed,
+    /// The output head. Shares the embedding's storage when the model ties
+    /// them and both are quantised; a transposed copy otherwise.
     head: Proj,
+    /// Whether `head` is the same allocation as `embed`, so the memory
+    /// accounting does not count it twice.
+    tied: bool,
     blocks: Vec<Block>,
     final_norm: Tensor,
     /// Precomputed rotations, `[n_ctx, head_dim / 2]`.
@@ -109,6 +155,12 @@ pub struct GpuLlama {
     /// Per layer, `[1, n_kv_head, seq, head_dim]` for keys and values.
     kv: Vec<Option<(Tensor, Tensor)>>,
     pos: usize,
+}
+
+/// `LLM_GPU_DENSE_EMBED=1` restores the dense bf16 lookup table, for
+/// measuring what quantising it is worth.
+fn dense_embedding() -> bool {
+    matches!(std::env::var("LLM_GPU_DENSE_EMBED").as_deref(), Ok("1") | Ok("true"))
 }
 
 /// `y = proj(x) (+ b)`.
@@ -226,22 +278,40 @@ impl GpuLlama {
             });
         }
 
-        let embed_full = model.get((spec.vocab_size, e), "embed_tokens.weight")?;
-        let head = {
-            let w = vb.get((spec.vocab_size, e), "lm_head.weight").unwrap_or_else(|_| embed_full.clone());
-            match quant {
-                None => Proj::Dense(w.t()?.contiguous()?),
-                Some(gd) => {
-                    Proj::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(&w, gd, &device)?)?)
-                }
+        // The table, and the output head — which is the same matrix again
+        // unless the model says otherwise.
+        let table = model.get((spec.vocab_size, e), "embed_tokens.weight")?;
+        let own_head = vb.get((spec.vocab_size, e), "lm_head.weight").ok();
+
+        let mut tied = false;
+        let (embed, head) = match quant {
+            None => {
+                // Dense keeps two copies: `index_select` wants
+                // `[vocab, n_embd]` and `matmul` wants the transpose, and
+                // neither is cheap to fake from the other.
+                let w = own_head.unwrap_or_else(|| table.clone());
+                (Embed::Dense(to_dev(table)?), Proj::Dense(to_dev(w.t()?.contiguous()?)?))
             }
-        };
-        // Half precision for the lookup table once the rest is quantised; it
-        // is converted to the compute dtype one row at a time.
-        let embed = if quant.is_some() {
-            to_dev(embed_full.to_dtype(DType::BF16)?)?
-        } else {
-            embed_full
+            // The arrangement this replaced, kept behind a flag so the
+            // difference it makes is one environment variable wide: a dense
+            // half-precision table, and the head quantised separately from it.
+            Some(gd) if dense_embedding() => {
+                let w = own_head.unwrap_or_else(|| table.clone());
+                let head = QMatMul::from_qtensor(QTensor::quantize_onto(&w, gd, &device)?)?;
+                (Embed::Dense(to_dev(table.to_dtype(DType::BF16)?)?), Proj::Quant(head))
+            }
+            Some(gd) => {
+                let q = Arc::new(QTensor::quantize_onto(&table, gd, &device)?);
+                let head = match own_head {
+                    Some(w) => QMatMul::from_qtensor(QTensor::quantize_onto(&w, gd, &device)?)?,
+                    // Tied, and now in one layout: one allocation, two uses.
+                    None => {
+                        tied = true;
+                        QMatMul::from_arc(Arc::clone(&q))?
+                    }
+                };
+                (Embed::Quant(q), Proj::Quant(head))
+            }
         };
 
         // The same rotation table as `Rope::new`, built once on the device.
@@ -261,6 +331,7 @@ impl GpuLlama {
             blocks,
             embed,
             head,
+            tied,
             final_norm: to_dev(model.get(e, "norm.weight")?)?,
             cos,
             sin,
@@ -332,7 +403,7 @@ impl GpuLlama {
         let scale = 1.0 / (hd as f64).sqrt();
 
         let ids = Tensor::from_slice(tokens, (m,), &self.device)?;
-        let mut x = self.embed.index_select(&ids, 0)?.to_dtype(self.dtype)?;
+        let mut x = self.embed.rows(&ids)?.to_dtype(self.dtype)?;
 
         let cos = self.cos.narrow(0, pos0, m)?.contiguous()?;
         let sin = self.sin.narrow(0, pos0, m)?.contiguous()?;
@@ -406,11 +477,12 @@ impl GpuLlama {
                     + n(&b.mlp_norm)
             })
             .sum();
-        blocks + n(&self.embed) + n(&self.final_norm)
+        blocks + self.embed.params() + n(&self.final_norm)
     }
 
     fn memory_bytes(&self) -> usize {
         let per = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
+        let opt = |t: &Option<Tensor>| t.as_ref().map_or(0, per);
         let blocks: usize = self
             .blocks
             .iter()
@@ -418,9 +490,16 @@ impl GpuLlama {
                 b.q.bytes() + b.k.bytes() + b.v.bytes() + b.o.bytes() + b.gate.bytes()
                     + b.up.bytes()
                     + b.down.bytes()
+                    + per(&b.attn_norm)
+                    + per(&b.mlp_norm)
+                    + opt(&b.q_b)
+                    + opt(&b.k_b)
+                    + opt(&b.v_b)
             })
             .sum();
-        blocks + per(&self.embed) + self.head.bytes()
+        // A tied head is the embedding, not a copy of it.
+        let head = if self.tied { 0 } else { self.head.bytes() };
+        blocks + self.embed.bytes() + head + per(&self.final_norm)
     }
 }
 
@@ -521,4 +600,124 @@ pub fn pick_device(name: Option<&str>) -> Res<Device> {
         "cuda" => Device::new_cuda(0)?,
         _ => Device::new_metal(0).or_else(|_| Device::new_cuda(0)).unwrap_or(Device::Cpu),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm::model::Arch;
+    use std::collections::HashMap;
+
+    /// A model small enough to build from random numbers, with every
+    /// dimension a multiple of 32 so the quantisers will take it.
+    fn tiny_spec() -> Spec {
+        Spec {
+            arch: Arch::Llama,
+            n_layer: 1,
+            n_head: 2,
+            n_kv_head: 1,
+            n_embd: 64,
+            head_dim: 32,
+            n_ctx: 16,
+            vocab_size: 64,
+            intermediate: 128,
+            eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_embeddings: true,
+        }
+    }
+
+    /// Write a checkpoint the loader will accept, with or without its own
+    /// output head.
+    fn write_checkpoint(spec: &Spec, own_head: bool, tag: &str) -> std::path::PathBuf {
+        let d = Device::Cpu;
+        let (e, i) = (spec.n_embd, spec.intermediate);
+        let (qd, kvd) = (spec.n_head * spec.head_dim, spec.kv_dim());
+        let rand = |r: usize, c: usize| Tensor::randn(0f32, 0.02f32, (r, c), &d).unwrap();
+
+        let mut t: HashMap<String, Tensor> = HashMap::new();
+        t.insert("model.embed_tokens.weight".into(), rand(spec.vocab_size, e));
+        t.insert("model.norm.weight".into(), Tensor::ones(e, DType::F32, &d).unwrap());
+        let p = "model.layers.0";
+        t.insert(format!("{p}.input_layernorm.weight"), Tensor::ones(e, DType::F32, &d).unwrap());
+        t.insert(
+            format!("{p}.post_attention_layernorm.weight"),
+            Tensor::ones(e, DType::F32, &d).unwrap(),
+        );
+        t.insert(format!("{p}.self_attn.q_proj.weight"), rand(qd, e));
+        t.insert(format!("{p}.self_attn.k_proj.weight"), rand(kvd, e));
+        t.insert(format!("{p}.self_attn.v_proj.weight"), rand(kvd, e));
+        t.insert(format!("{p}.self_attn.o_proj.weight"), rand(e, qd));
+        t.insert(format!("{p}.mlp.gate_proj.weight"), rand(i, e));
+        t.insert(format!("{p}.mlp.up_proj.weight"), rand(i, e));
+        t.insert(format!("{p}.mlp.down_proj.weight"), rand(e, i));
+        if own_head {
+            t.insert("lm_head.weight".into(), rand(spec.vocab_size, e));
+        }
+
+        // Unique per test as well as per process: the tests run in parallel
+        // and would otherwise delete each other's checkpoints.
+        let path = std::env::temp_dir().join(format!(
+            "gpu-tiny-{}-{tag}-{own_head}.safetensors",
+            std::process::id()
+        ));
+        candle_core::safetensors::save(&t, &path).unwrap();
+        path
+    }
+
+    /// Tying is the common case and the one that saves the memory, but an
+    /// untied model must still load — and must *not* be reported as sharing
+    /// storage it does not share.
+    #[test]
+    fn tied_and_untied_models_both_run() {
+        let spec = tiny_spec();
+        for own_head in [false, true] {
+            let path = write_checkpoint(&spec, own_head, "both-run");
+            let mut m = GpuLlama::load(
+                std::slice::from_ref(&path),
+                spec.clone(),
+                DType::F32,
+                Some(GgmlDType::Q8_0),
+                Device::Cpu,
+            )
+            .unwrap();
+
+            assert_eq!(m.tied, !own_head);
+            let logits = m.forward(&[1, 2, 3]).unwrap();
+            assert_eq!(logits.len(), spec.vocab_size);
+            assert!(logits.iter().all(|v| v.is_finite()));
+
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// The point of the exercise: quantising the table, and sharing it with
+    /// the head, must actually shrink the model.
+    #[test]
+    fn a_quantised_table_costs_less_than_a_dense_one() {
+        let spec = tiny_spec();
+        let path = write_checkpoint(&spec, false, "costs-less");
+        let load = |quant| {
+            GpuLlama::load(
+                std::slice::from_ref(&path),
+                spec.clone(),
+                DType::F32,
+                quant,
+                Device::Cpu,
+            )
+            .unwrap()
+        };
+
+        let dense = load(None);
+        let quant = load(Some(GgmlDType::Q8_0));
+
+        // 8 bits plus an f16 scale per 32 weights, against 32 bits — and the
+        // tied head is no longer a second copy.
+        let table = spec.vocab_size * spec.n_embd;
+        assert_eq!(dense.embed.bytes(), table * 4);
+        assert_eq!(quant.embed.bytes(), table * 34 / 32);
+        assert!(quant.memory_bytes() * 3 < dense.memory_bytes());
+
+        std::fs::remove_file(&path).unwrap();
+    }
 }

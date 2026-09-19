@@ -529,9 +529,9 @@ Two differences are worth noticing because they run *against* the framework:
 
 | | CPU (q8) | Metal (bf16) | |
 |---|---|---|---|
-| Qwen2.5-0.5B, decode | ~34 tok/s | ~86 tok/s | 2.5x |
+| Qwen2.5-0.5B, decode | 35 tok/s | 115 tok/s | 3.3x |
 | SmolLM2-135M, decode | ~35 tok/s | ~168 tok/s | 4.7x |
-| Qwen2.5-0.5B, prefill (654 tokens) | 2.30 s | 0.32 s | **7.2x** |
+| Qwen2.5-0.5B, prefill (640 tokens) | 2.15 s | 0.18 s | **12x** |
 
 **The GPU wins far more on prefill than on decode**, and that is the same
 distinction as everywhere else in this repo. Prefill is compute-bound, which is
@@ -546,7 +546,7 @@ allocation — that does not shrink with the matrix. At this size that overhead,
 not arithmetic, sets the speed. The GPU, which scales with actual work, shows
 the expected 4.7x instead.
 
-Metal `f32` runs at ~63 tok/s against bf16's ~86, for exactly double the
+Metal `f32` runs at about two thirds of bf16's rate, for exactly double the
 memory. `bf16` is the default because it is also what the checkpoints ship as.
 
 The GPU backend covers the **Llama family only**; GPT-2 stays on the CPU engine,
@@ -569,38 +569,96 @@ All six backends, Qwen2.5-0.5B, decode:
 
 | backend | weights | tok/s |
 |---|---|---|
-| cpu f32 | 1976 MB | 31 |
-| cpu q8 | 556 MB | 34 |
-| cpu q4 | 309 MB | 33 |
-| metal bf16 | 1260 MB | 87 |
-| **metal q8** | **797 MB** | **141** |
-| metal q4 | 550 MB | 177 |
+| cpu f32 | 1976 MB | 34 |
+| cpu q8 | 556 MB | 35 |
+| cpu q4 | 309 MB | 36 |
+| metal bf16 | 1260 MB | 115 |
+| **metal q8** | **525 MB** | **193** |
+| metal q4 | 278 MB | 236 |
 
-Quantisation is worth **1.6x** on the GPU (87 → 141 tok/s) where it was worth
+Quantisation is worth **1.7x** on the GPU (115 → 193 tok/s) where it was worth
 nothing on the CPU. Our CPU decode never became bandwidth-bound in the first
 place: it has a fixed per-matmul cost — a rayon dispatch and an allocation —
 that sets the speed at this model size, so shrinking the weights changed
 nothing. The GPU has no such floor, so the bytes actually matter.
 
-And then the other direction. Prefill of 654 tokens:
+And then prefill, where it stops being free — eventually:
 
-| | |
-|---|---|
-| metal bf16 | **0.24 s** |
-| metal q8 | 0.39 s |
+| prompt | metal bf16 | metal q8 | |
+|---|---|---|---|
+| 140 tokens | 0.070 s | **0.040 s** | q8 1.75x faster |
+| 640 tokens | 0.180 s | **0.160 s** | q8 1.12x faster |
+| 1340 tokens | 0.390 s | 0.380 s | even |
+| 5040 tokens | **2.590 s** | 2.750 s | q8 1.06x *slower* |
 
-**Quantising makes GPU prefill slower**, by the same 1.6x it makes decode
-faster. Prefill is compute-bound, so the dequantisation is pure added work —
-precisely the conclusion the CPU chapter reached, reproduced on completely
-different hardware. It is the clearest evidence in this repo that the
-bottleneck, not the arithmetic, decides what an optimisation is worth.
+There is a crossover, at around 1300 tokens on this machine. A short prompt is
+still narrow enough that reading the weights dominates, so smaller weights win;
+a long one turns every matmul into real work over a wide batch, and then the
+dequantisation is pure overhead. Same principle as
+[the two CPU kernels](#two-kernels-chosen-by-size), one bottleneck moving under
+a different axis: there it was the size of the *matrix*, here it is the size of
+the *batch*.
 
-Two practical notes. The memory win is 1.6x rather than 3.6x because the
-embedding table stays dense: `QTensor` cannot be indexed a row at a time, and
-at one row per token it costs memory but almost no bandwidth. And the k-quants
-(`q4k`, `q6k`) need dimensions divisible by 256 — Qwen is 896 wide, so they are
-refused up front with a message naming `q8` and `q4` instead of failing halfway
-through the load.
+> **Correction.** An earlier version of this section claimed a flat "1.6x
+> slower on prefill" from a single pair of measurements at 654 tokens (0.24 s
+> against 0.39 s). That does not reproduce: five runs at each of four prompt
+> lengths give the table above, with a median equal to the minimum every time.
+> Re-running the old arrangement behind `LLM_GPU_DENSE_EMBED=1` rules out the
+> embedding change as the cause, so the original figure was simply a bad
+> measurement on a loaded machine. The *shape* of the claim survives — there is
+> a length past which quantising costs you — but it arrives much later and much
+> more gently than reported. Measure the curve, not two points on it.
+
+One practical note. The k-quants (`q4k`, `q6k`) need dimensions divisible by
+256 — Qwen is 896 wide, so they are refused up front with a message naming
+`q8` and `q4` instead of failing halfway through the load.
+
+### The table that was stored twice
+
+```bash
+llm-gpu run --quant q8                          # quantised table
+LLM_GPU_DENSE_EMBED=1 llm-gpu run --quant q8    # the dense one, for comparison
+```
+
+The embedding table was the last dense tensor in a quantised GPU model, and on
+a small model it is not a small one: 136M of Qwen2.5-0.5B's 494M parameters live
+in `[151936, 896]`. At bf16 that is 272 MB.
+
+It stayed dense because the lookup needs an operation nothing else in the engine
+wants — *gather rows and dequantise only those*. A `QTensor` is a run of blocks,
+not a matrix, so row `t` is a span of blocks that has to be decoded on its own.
+candle turns out to ship exactly that kernel (`QTensor::embedding`, which is
+GGML's `get_rows`), so the change is one method call rather than a Metal shader.
+
+**The compression is the smaller half of it.** Qwen ties its embeddings — small
+models nearly always do — so the lookup table and the output head are the *same
+matrix*. They were stored twice anyway, because a dense `index_select` wants
+`[vocab, n_embd]` and a matmul wants the transpose. Quantise the lookup and both
+want the identical thing: one `Arc<QTensor>`, two uses.
+
+| | before | after |
+|---|---|---|
+| metal q8 | 797 MB | **525 MB** |
+| metal q4 | 550 MB | **278 MB** |
+
+525 MB for 494M parameters is 8.5 bits each, which is exactly `Q8_0` — 8-bit
+codes plus an f16 scale per 32. The model is now at the format's floor, with
+nothing left dense but the norms, and the win over bf16 goes from 1.6x to
+**2.4x** (4.5x at q4).
+
+**And it changed the speed by nothing at all:** 196.6 → 195.7 tok/s at q8,
+239.6 → 237.3 at q4, prefill identical to three decimals. Exactly as it should
+be. One row of 151936 is read per token, so the table was never on the
+bandwidth path — it was pure capacity. Everywhere else in this repo,
+quantisation traded accuracy for speed. Here it trades accuracy for *room*, and
+that is the whole point: memory is what stops you loading a bigger model, and a
+bigger model is worth far more than 1% of tok/s.
+
+The CPU engine needed no change for any of this. `Weight::row` has dequantised
+one row at a time since quantisation was added, and the tied head has always
+been the same `Weight` — the hand-written version got here by the path of least
+resistance, because one type did both jobs. The framework version duplicated
+precisely because its two operations wanted two different types.
 
 ### One trait, two backends
 
@@ -655,17 +713,13 @@ state management — good Rust, no ML. Build it last.
 
 ## Where to go next
 
-**4. A quantised embedding table.** The GPU's memory win stops at 1.6x because
-the embedding stays dense. Storing it quantised and dequantising one row per
-token would close most of the rest.
-
-**5. Train your own.** A character-level transformer, 10–30M parameters, on a
+**4. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Needs backprop through attention, layernorm and softmax, plus
 Adam. The gradient check from crate 1 is how you will debug it — extend
 `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
-**6. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
+**5. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike
 full fine-tuning it fits on a laptop.
 

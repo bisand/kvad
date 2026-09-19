@@ -43,7 +43,7 @@ use crate::nn::{sgd, Layer, Param};
 
 /// Added to the variance before the square root, so a constant row divides by
 /// something small rather than by zero.
-const EPS: f32 = 1e-5;
+pub const EPS: f32 = 1e-5;
 
 /// `y = gamma * (x - mean) / std + beta`, each row on its own.
 ///

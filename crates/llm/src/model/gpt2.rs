@@ -49,6 +49,11 @@ pub struct Model {
     /// way to invent one. Replacing this with RoPE is the single biggest
     /// difference in `llama.rs`.
     wpe: Weight,
+    /// A separate output head, `[vocab, n_embd]`, and its bias. No GPT-2 that
+    /// OpenAI released has either. A checkpoint written by this repository's
+    /// own `nanograd` has both, and says so with `tie_word_embeddings: false`.
+    lm_head: Option<Weight>,
+    lm_head_b: Option<Vec<f32>>,
     blocks: Vec<Block>,
     lnf_g: Vec<f32>,
     lnf_b: Vec<f32>,
@@ -87,7 +92,14 @@ impl Model {
             });
         }
 
+        let (lm_head, lm_head_b) = match spec.tie_embeddings {
+            true => (None, None),
+            false => (src.try_matrix("lm_head.weight"), src.try_vector("lm_head.bias")),
+        };
+
         Ok(Model {
+            lm_head,
+            lm_head_b,
             wte: src.matrix("wte.weight")?,
             wpe: src.matrix("wpe.weight")?,
             blocks,
@@ -95,6 +107,14 @@ impl Model {
             lnf_b: src.vector("ln_f.bias")?,
             spec,
         })
+    }
+}
+
+impl Model {
+    /// Logits from the final hidden state: the token table read the other
+    /// way round, unless the checkpoint brought a head of its own.
+    fn head(&self, x: &[f32]) -> Vec<f32> {
+        self.lm_head.as_ref().unwrap_or(&self.wte).matvec_bt(x, self.lm_head_b.as_deref())
     }
 }
 
@@ -115,14 +135,23 @@ impl Transformer for Model {
                 + b.proj_b.len()
                 + 4 * self.spec.n_embd
         });
-        self.wte.param_count() + self.wpe.param_count() + per_block * self.blocks.len()
+        self.wte.param_count()
+            + self.wpe.param_count()
+            + self.lm_head.as_ref().map_or(0, |h| h.param_count())
+            + self.lm_head_b.as_ref().map_or(0, |b| b.len())
+            + self.lnf_g.len()
+            + self.lnf_b.len()
+            + per_block * self.blocks.len()
     }
 
     fn memory_bytes(&self) -> usize {
         let per_block: usize = self.blocks.first().map_or(0, |b| {
             b.attn_w.bytes() + b.attn_proj_w.bytes() + b.fc_w.bytes() + b.proj_w.bytes()
         });
-        self.wte.bytes() + self.wpe.bytes() + per_block * self.blocks.len()
+        self.wte.bytes()
+            + self.wpe.bytes()
+            + self.lm_head.as_ref().map_or(0, |h| h.bytes())
+            + per_block * self.blocks.len()
     }
 
     fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
@@ -186,7 +215,7 @@ impl Transformer for Model {
         // Only the last position predicts anything we need, so the output head
         // stays a matrix-vector product.
         let last = layer_norm(&xs[(m - 1) * e..m * e], &self.lnf_g, &self.lnf_b, spec.eps);
-        self.wte.matvec_bt(&last, None)
+        self.head(&last)
     }
 
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32> {
@@ -230,6 +259,6 @@ impl Transformer for Model {
         cache.len += 1;
 
         let x = layer_norm(&x, &self.lnf_g, &self.lnf_b, spec.eps);
-        self.wte.matvec_bt(&x, None)
+        self.head(&x)
     }
 }

@@ -138,6 +138,14 @@ Zero dependencies. Read in this order:
     generation, which is only "predict, draw, append, ask again" — and which
     recomputes every earlier position for every new character, the waste the
     KV cache in crate 2 exists to remove.
+11. **[`checkpoint.rs`](crates/nanograd/src/checkpoint.rs)** — the trained
+    model on disk. A model is a list of named arrays of floats and nothing
+    else, so the only decision in saving one is which names — and those are a
+    contract with whoever reads the file. This crate uses GPT-2's, so what it
+    writes is a GPT-2 checkpoint that crate 2 loads with the code it uses for
+    OpenAI's. ([`json.rs`](crates/nanograd/src/json.rs) is there because the
+    files are JSON and the crate has no dependencies. It teaches nothing about
+    networks; skip it.)
 
 ### The test worth running first
 
@@ -293,6 +301,50 @@ Things to try: `--layers 1` or `--d-model 32`, to see how little is needed to
 learn spelling; `--context 8`, to see what a model that cannot see a whole word
 writes; `--temperature 0.2` against `1.5`; and `--steps 6000` on a small file,
 to watch the validation loss leave.
+
+### Keeping what it learned
+
+```bash
+alias train_text="cargo run --release -p nanograd --bin train_text --"
+train_text --data README.md --save out/readme
+train_text --load out/readme --steps 0 --prompt "## "     # just write
+train_text --load out/readme --data README.md --steps 500 --save out/more
+```
+
+`--save` writes a directory of three files: `model.safetensors`, `config.json`
+and `tokenizer.json`. They are GPT-2's names, GPT-2's tensor layout and the
+HuggingFace tokeniser format, written by hand with no library — the 117K model
+is 471 KB, all but 2.4 KB of it floats. The tokeniser has to travel with the
+weights: id 17 means whatever character was seventeenth in *that* text, and a
+loaded model refuses text containing a character it has no row for.
+
+Saving and loading back bit for bit is tested, and proves less than it seems
+to. A writer and a reader that share a misunderstanding — query and key in the
+wrong thirds of GPT-2's fused matrix, say — agree with each other perfectly.
+The only real test of a file format is a second implementation, and this
+repository has one: [a test in crate 2](crates/llm/tests/nanograd_checkpoint.rs)
+saves a `nanograd` model, loads it with the GPT-2 code written to run OpenAI's
+weights, and requires the same logits at every position. They agree to 5e-7 of
+their size. Of 22 mistakes made on purpose, the round trip missed the ones made
+the same way in both directions; that test caught every one that touched the
+layout, the smallest at 0.2.
+
+It also had a hole of its own, found the same way. With the floats written
+big-endian the engine loads garbage and produces NaN — and the test passed,
+because `f32::max` prefers anything to a NaN, so the largest difference between
+two rows of NaN came out as zero. A comparison that cannot fail on NaN is not a
+comparison.
+
+Two things in the file are not GPT-2's. Its output head is its own tensor with
+a bias, where GPT-2 reuses the embedding table, so the config says
+`tie_word_embeddings: false` and the engine's GPT-2 learned to honour that. And
+the optimiser's state is not saved: a resumed run starts Adam's averages from
+nothing. Measured against the same run left alone, that cost 0.06 and 0.04 of
+training loss over the first 50 steps on two seeds, nothing on a third, and
+nothing visible on any by step 100.
+
+What is still missing is the last step: `kvad run --model out/readme`. The
+engine can load the file but only knows how to find models on the Hub.
 
 ---
 
@@ -1055,11 +1107,13 @@ stacks them ([`model.rs`](crates/nanograd/src/model.rs)): gradient-checked end
 to end, and able to memorise a sequence, as are AdamW
 ([`optim.rs`](crates/nanograd/src/optim.rs)) and a training loop over a text
 file with sampling ([`text.rs`](crates/nanograd/src/text.rs)). So this step
-works, at 117 thousand parameters rather than 10 million. What stands between
-the two is speed — one core, one sequence at a time, about 22,000 characters a
-second — and saving the result: a trained model is lost when the process exits,
-and nothing yet writes weights that the `kvad` engine could load. Llama's
-SwiGLU and RoPE are not written. The gradient check from crate 1 is how
+works, at 117 thousand parameters rather than 10 million, and the result is
+saved as a GPT-2 checkpoint ([`checkpoint.rs`](crates/nanograd/src/checkpoint.rs))
+from which the `kvad` engine computes the same logits. What stands between the
+two sizes is speed — one core, one sequence at a time, about 22,000 characters
+a second. What stands between the two crates is small: the engine finds models
+only on the Hub, and has no way to be pointed at a directory. Llama's SwiGLU
+and RoPE are not written. The gradient check from crate 1 is how
 you will debug each one — extend `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 

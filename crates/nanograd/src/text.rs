@@ -26,11 +26,25 @@
 //! see four times as far with the same context. Characters are used here
 //! because they need no training of their own and no vocabulary file, and
 //! because watching a model discover *spelling* from nothing is half the fun.
+//!
+//! A saved model is useless without the tokeniser it was trained with: id 17
+//! means whatever character was seventeenth in *that* text. So the vocabulary
+//! is saved beside the weights, as a `tokenizer.json` in the format the
+//! HuggingFace `tokenizers` library reads. That library has no character
+//! tokeniser, but it does not need one. BPE starts from single characters and
+//! applies a list of learned merges; with an empty list it stops where it
+//! started.
 
+use crate::checkpoint::{invalid, read_text, write_whole};
+use crate::json::{object, Json};
 use crate::model::Gpt;
 use crate::nn::softmax_cross_entropy;
 use crate::optim::AdamW;
 use crate::rng::Rng;
+use std::io;
+use std::path::Path;
+
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
 
 /// One id per distinct character, in sorted order.
 pub struct CharTokenizer {
@@ -58,6 +72,77 @@ impl CharTokenizer {
 
     pub fn decode(&self, ids: &[usize]) -> String {
         ids.iter().map(|&id| self.chars[id]).collect()
+    }
+
+    /// BPE with no merges, and a decoder that joins the pieces with nothing
+    /// between them.
+    fn to_json(&self) -> Json {
+        let vocab = self.chars.iter().enumerate().map(|(id, c)| (c.to_string(), id.into())).collect();
+        object([
+            ("version", "1.0".into()),
+            ("truncation", Json::Null),
+            ("padding", Json::Null),
+            ("added_tokens", Json::Array(vec![])),
+            ("normalizer", Json::Null),
+            // No splitting into words first: spaces and newlines are
+            // characters like any other, and the model predicts them too.
+            ("pre_tokenizer", Json::Null),
+            ("post_processor", Json::Null),
+            ("decoder", object([("type", "Fuse".into())])),
+            (
+                "model",
+                object([
+                    ("type", "BPE".into()),
+                    ("dropout", Json::Null),
+                    ("unk_token", Json::Null),
+                    ("continuing_subword_prefix", Json::Null),
+                    ("end_of_word_suffix", Json::Null),
+                    ("fuse_unk", Json::Bool(false)),
+                    ("byte_fallback", Json::Bool(false)),
+                    ("vocab", Json::Object(vocab)),
+                    ("merges", Json::Array(vec![])),
+                ]),
+            ),
+        ])
+    }
+
+    /// Only a vocabulary this tokeniser could have written: single
+    /// characters, ids `0..n` in character order, no merges.
+    fn from_json(json: &Json) -> Result<Self, String> {
+        let model = json.get("model").ok_or("tokenizer: no model")?;
+        if model.get("merges").and_then(Json::as_array).is_none_or(|m| !m.is_empty()) {
+            return Err("tokenizer: it has merges, so it is not a character tokeniser".into());
+        }
+        let vocab = model.get("vocab").and_then(Json::as_object).ok_or("tokenizer: no vocab")?;
+
+        let mut chars = vec![None; vocab.len()];
+        for (token, id) in vocab {
+            let mut letters = token.chars();
+            let (Some(c), None) = (letters.next(), letters.next()) else {
+                return Err(format!("tokenizer: {token:?} is not a single character"));
+            };
+            let slot = id.as_usize().and_then(|id| chars.get_mut(id)).ok_or("tokenizer: an id is out of range")?;
+            if slot.replace(c).is_some() {
+                return Err("tokenizer: two characters share an id".into());
+            }
+        }
+        // Every slot was filled: as many distinct ids as there are slots.
+        let chars: Vec<char> = chars.into_iter().flatten().collect();
+        if !chars.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err("tokenizer: ids are not in character order".into());
+        }
+        Ok(CharTokenizer { chars })
+    }
+
+    /// Write `tokenizer.json` into `dir`, beside the model it belongs to.
+    pub fn save(&self, dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        write_whole(&dir.join(TOKENIZER_FILE), self.to_json().to_string().as_bytes())
+    }
+
+    pub fn load(dir: &Path) -> io::Result<Self> {
+        let text = read_text(&dir.join(TOKENIZER_FILE))?;
+        Json::parse(&text).and_then(|json| Self::from_json(&json)).map_err(invalid)
     }
 }
 
@@ -201,6 +286,36 @@ mod tests {
         assert_eq!(tok.vocab(), 4 + 4 + 2);
         assert_eq!(tok.encode("lol").unwrap(), tok.encode("lol").unwrap());
         assert_ne!(tok.encode("l"), tok.encode("L"));
+    }
+
+    /// The characters a file format is most likely to mangle, because the
+    /// vocabulary is where they have to survive as JSON keys.
+    #[test]
+    fn a_saved_tokeniser_gives_every_character_its_old_id() {
+        let text = "tab\t newline\n \"quotes\" back\\slash \u{1} é → 😀";
+        let tok = CharTokenizer::from_text(text);
+        let dir = std::env::temp_dir().join(format!("nanograd-tokeniser-{}", std::process::id()));
+        tok.save(&dir).unwrap();
+        let back = CharTokenizer::load(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(back.chars, tok.chars);
+        assert_eq!(back.encode(text), tok.encode(text));
+    }
+
+    #[test]
+    fn a_vocabulary_that_is_not_ours_is_refused() {
+        let with = |vocab: &str, merges: &str| {
+            let json = format!(r#"{{"model":{{"type":"BPE","vocab":{vocab},"merges":{merges}}}}}"#);
+            CharTokenizer::from_json(&Json::parse(&json).unwrap()).map(|t| t.chars)
+        };
+        assert_eq!(with(r#"{"a":0,"b":1}"#, "[]"), Ok(vec!['a', 'b']));
+        assert!(with(r#"{"a":0,"b":1}"#, r#"["a b"]"#).unwrap_err().contains("merges"));
+        assert!(with(r#"{"a":0,"th":1}"#, "[]").unwrap_err().contains("single character"));
+        assert!(with(r#"{"a":0,"b":2}"#, "[]").unwrap_err().contains("out of range"));
+        assert!(with(r#"{"a":0,"b":0}"#, "[]").unwrap_err().contains("share an id"));
+        // Our `encode` is a binary search, so the order is not a detail.
+        assert!(with(r#"{"b":0,"a":1}"#, "[]").unwrap_err().contains("character order"));
     }
 
     #[test]

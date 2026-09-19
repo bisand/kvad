@@ -15,15 +15,19 @@
 //! 8. [`model`]  — all of it assembled into a GPT that predicts the next token.
 //! 9. [`optim`]  — AdamW, and why SGD is not enough for a transformer.
 //! 10. [`text`]  — from a text file to training windows, and from a model to text.
+//! 11. [`checkpoint`] — a trained model on disk, laid out so that `kvad` can run it.
+//!     ([`json`] is there because it has to be; it teaches nothing about networks.)
 //!
 //! Then run `cargo test -p nanograd`: the gradient check in `nn` verifies the
 //! hand-derived derivatives against numerically measured ones.
 
 pub mod attention;
 pub mod block;
+pub mod checkpoint;
 pub mod embedding;
 #[cfg(test)]
 mod gradcheck;
+pub mod json;
 pub mod matrix;
 pub mod mnist;
 pub mod model;

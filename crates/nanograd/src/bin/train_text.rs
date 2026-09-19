@@ -6,10 +6,20 @@
 //!
 //! Any plain text file will do: `--data path/to/file.txt`.
 //!
+//! Keep what it learned, and come back to it:
+//!
+//!     train_text --save out/shakespeare
+//!     train_text --load out/shakespeare --steps 0 --prompt "ROMEO:"   # just write
+//!     train_text --load out/shakespeare --steps 500 --save out/more   # train on
+//!
 //! Options: --data PATH --steps N --batch N --context N --d-model N --heads N
 //!          --layers N --lr F --eval-every N --sample N --temperature F
-//!          --prompt TEXT --seed N
+//!          --prompt TEXT --seed N --save DIR --load DIR
+//!
+//! With `--load`, the model's shape comes from the checkpoint, and --context,
+//! --d-model, --heads and --layers are ignored.
 
+use nanograd::checkpoint;
 use nanograd::model::{Gpt, GptConfig};
 use nanograd::optim::AdamW;
 use nanograd::rng::Rng;
@@ -31,6 +41,8 @@ struct Args {
     temperature: f32,
     prompt: Option<String>,
     seed: u64,
+    save: Option<PathBuf>,
+    load: Option<PathBuf>,
 }
 
 impl Default for Args {
@@ -49,6 +61,8 @@ impl Default for Args {
             temperature: 0.8,
             prompt: None,
             seed: 1337,
+            save: None,
+            load: None,
         }
     }
 }
@@ -85,6 +99,8 @@ fn parse_args() -> Args {
             "--temperature" => a.temperature = parse(i) as f32,
             "--prompt" => a.prompt = Some(value(i)),
             "--seed" => a.seed = parse(i) as u64,
+            "--save" => a.save = Some(PathBuf::from(value(i))),
+            "--load" => a.load = Some(PathBuf::from(value(i))),
             other => {
                 eprintln!("unknown flag {other}");
                 std::process::exit(2);
@@ -97,6 +113,40 @@ fn parse_args() -> Args {
 
 fn main() -> std::io::Result<()> {
     let args = parse_args();
+    let mut rng = Rng::new(args.seed);
+
+    // A saved model comes with the tokeniser it was trained with, and only
+    // that one will do: id 17 means whatever was seventeenth in *its* text.
+    let loaded = match &args.load {
+        Some(dir) => {
+            let both = checkpoint::load(dir).and_then(|model| Ok((model, CharTokenizer::load(dir)?)));
+            let (model, tok) = both.unwrap_or_else(|e| {
+                eprintln!("could not load a model: {e}");
+                std::process::exit(1);
+            });
+            if model.config().vocab != tok.vocab() {
+                eprintln!("{}: the model and the tokeniser disagree about the vocabulary", dir.display());
+                std::process::exit(1);
+            }
+            println!("loaded {}", dir.display());
+            Some((model, tok))
+        }
+        None => None,
+    };
+
+    // Nothing to learn from is needed just to write.
+    if args.steps == 0 {
+        let Some((mut model, tok)) = loaded else {
+            eprintln!("--steps 0 trains nothing; it is only useful with --load");
+            std::process::exit(2);
+        };
+        println!("model: {}", model.summary());
+        let prompt = encode_prompt(&tok, args.prompt.as_deref().unwrap_or("\n"), args.prompt.is_none());
+        let out = generate(&mut model, &prompt, args.sample, args.temperature, &mut rng);
+        println!("---\n{}\n---", tok.decode(&out).trim());
+        return Ok(());
+    }
+
     let path = args
         .data
         .clone()
@@ -106,8 +156,23 @@ fn main() -> std::io::Result<()> {
         e
     })?;
 
-    let tok = CharTokenizer::from_text(&text);
-    let tokens = tok.encode(&text).expect("the tokeniser was built from this text");
+    let (mut model, tok) = loaded.unwrap_or_else(|| {
+        let tok = CharTokenizer::from_text(&text);
+        let config = GptConfig {
+            vocab: tok.vocab(),
+            context: args.context,
+            d_model: args.d_model,
+            n_heads: args.heads,
+            n_layers: args.layers,
+        };
+        (Gpt::new(config, &mut rng), tok)
+    });
+    // Only a loaded tokeniser can fail here. The vocabulary is as fixed as the
+    // weights are: a character the model never saw has no row in its tables.
+    let tokens = tok.encode(&text).unwrap_or_else(|c| {
+        eprintln!("{} contains {c:?}, which the loaded model has no token for", path.display());
+        std::process::exit(1);
+    });
     let corpus = Corpus::new(tokens, 0.1);
     println!(
         "text: {} characters, {} distinct   train: {}   validation: {}",
@@ -117,15 +182,7 @@ fn main() -> std::io::Result<()> {
         corpus.val.len()
     );
 
-    let mut rng = Rng::new(args.seed);
-    let config = GptConfig {
-        vocab: tok.vocab(),
-        context: args.context,
-        d_model: args.d_model,
-        n_heads: args.heads,
-        n_layers: args.layers,
-    };
-    let mut model = Gpt::new(config, &mut rng);
+    let context = model.config().context;
     let mut opt = AdamW::new(args.lr);
     println!("model: {}", model.summary());
     println!("hyperparams: steps={} batch={} lr={}", args.steps, args.batch, args.lr);
@@ -134,19 +191,18 @@ fn main() -> std::io::Result<()> {
     // the first; one that knows only which characters are common scores the
     // second. Anything below that was learned from the *order* of the text.
     println!(
-        "loss to beat: {:.3} knowing nothing, {:.3} knowing only letter frequencies\n",
+        "loss to beat: {:.3} knowing nothing, {:.3} knowing only letter frequencies",
         (tok.vocab() as f32).ln(),
         unigram_loss(&corpus.train, tok.vocab())
     );
+    if args.load.is_some() {
+        let val = evaluate(&mut model, &corpus.val, 50, &mut rng);
+        println!("validation loss as loaded: {val:.3}");
+    }
+    println!();
 
-    let prompt = match &args.prompt {
-        Some(p) => tok.encode(p).unwrap_or_else(|c| {
-            eprintln!("the prompt contains {c:?}, which is not in the text");
-            std::process::exit(2);
-        }),
-        // A newline, if the text has one: "start a fresh line".
-        None => tok.encode("\n").unwrap_or_else(|_| vec![corpus.train[0]]),
-    };
+    // A newline, if the text has one: "start a fresh line".
+    let prompt = encode_prompt(&tok, args.prompt.as_deref().unwrap_or("\n"), args.prompt.is_none());
 
     let started = Instant::now();
     let mut running = 0.0;
@@ -160,7 +216,7 @@ fn main() -> std::io::Result<()> {
             println!(
                 "step {step:>5}  train loss {:.3}  validation loss {val:.3}  ({elapsed:.0}s, {:.0} chars/s)",
                 running / since as f32,
-                (step * args.batch * args.context) as f32 / elapsed
+                (step * args.batch * context) as f32 / elapsed
             );
             running = 0.0;
 
@@ -170,5 +226,28 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+
+    if let Some(dir) = &args.save {
+        checkpoint::save(dir, &mut model)?;
+        tok.save(dir)?;
+        println!("saved to {}", dir.display());
+    }
     Ok(())
+}
+
+/// The prompt as token ids. The default prompt is allowed to be missing from
+/// the vocabulary, and falls back to token 0; one the user typed is not.
+fn encode_prompt(tok: &CharTokenizer, prompt: &str, is_default: bool) -> Vec<usize> {
+    match tok.encode(prompt) {
+        Ok(ids) if !ids.is_empty() => ids,
+        _ if is_default => vec![0],
+        Ok(_) => {
+            eprintln!("the prompt is empty");
+            std::process::exit(2);
+        }
+        Err(c) => {
+            eprintln!("the prompt contains {c:?}, which is not in the model's vocabulary");
+            std::process::exit(2);
+        }
+    }
 }

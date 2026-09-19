@@ -324,14 +324,22 @@ pub fn attend(spec: &Spec, q: &[f32], k_cache: &[f32], v_cache: &[f32], n_positi
     // vanish. This constant is the "scaled" in "scaled dot-product attention".
     let scale = 1.0 / (hd as f32).sqrt();
 
-    let heads: Vec<Vec<f32>> = (0..spec.n_head)
-        .into_par_iter()
-        .map(|head| {
+    // One contiguous output, sliced per task, rather than a `Vec` per head
+    // and a `concat` to join them: heads are small and there are a lot of
+    // layers, so those allocations are not free at 169 matmuls a token.
+    let mut out = vec![0.0f32; spec.n_head * hd];
+    let per_task = spec.n_head.div_ceil(rayon::current_num_threads().max(1)).max(1);
+    out.par_chunks_mut(per_task * hd).enumerate().for_each(|(task, dst)| {
+        // Reused across every head this task handles.
+        let mut scores = Vec::with_capacity(n_positions);
+
+        for (j, slot) in dst.chunks_mut(hd).enumerate() {
+            let head = task * per_task + j;
             let q_head = &q[head * hd..(head + 1) * hd];
             // Which KV head this query head reads from.
             let kv_off = (head / group) * hd;
 
-            let mut scores = Vec::with_capacity(n_positions);
+            scores.clear();
             for t in 0..n_positions {
                 let base = t * kv_dim + kv_off;
                 let k_head = &k_cache[base..base + hd];
@@ -343,7 +351,6 @@ pub fn attend(spec: &Spec, q: &[f32], k_cache: &[f32], v_cache: &[f32], n_positi
             }
             softmax_inplace(&mut scores);
 
-            let mut out = vec![0.0f32; hd];
             for (t, &w) in scores.iter().enumerate() {
                 if w < 1e-8 {
                     continue;
@@ -351,14 +358,12 @@ pub fn attend(spec: &Spec, q: &[f32], k_cache: &[f32], v_cache: &[f32], n_positi
                 let base = t * kv_dim + kv_off;
                 let v_head = &v_cache[base..base + hd];
                 for i in 0..hd {
-                    out[i] += w * v_head[i];
+                    slot[i] += w * v_head[i];
                 }
             }
-            out
-        })
-        .collect();
-
-    heads.concat()
+        }
+    });
+    out
 }
 
 #[cfg(test)]
@@ -451,6 +456,12 @@ pub struct CpuSession {
     precision: crate::quant::Precision,
     /// Prompt tokens per batched prefill pass.
     chunk: usize,
+    /// The threads every matmul runs on.
+    ///
+    /// Owning a pool rather than using rayon's global one is not about
+    /// isolation — it is so the forward pass can run *inside* it. See
+    /// [`CpuSession::forward`].
+    pool: rayon::ThreadPool,
 }
 
 impl CpuSession {
@@ -463,8 +474,53 @@ impl CpuSession {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(64);
-        CpuSession { model, cache, precision, chunk }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads())
+            .thread_name(|i| format!("kvad-{i}"))
+            .build()
+            .expect("building a thread pool");
+        CpuSession { model, cache, precision, chunk, pool }
     }
+}
+
+/// How many threads to decode on.
+///
+/// Not `num_cpus`. This machine reports 18 logical CPUs, but six of them are
+/// performance cores and twelve are efficiency cores, and rayon splits a matmul
+/// into equal pieces regardless. Every parallel section then ends when the
+/// slowest piece does, so the E-cores set the pace and adding them past a point
+/// makes decoding *slower* — measured at 35 tok/s on all 18 against 50 on
+/// eleven.
+///
+/// So: all the performance cores, plus a few efficiency cores to absorb the
+/// tail, and never the whole machine. `KVAD_THREADS` overrides it.
+pub fn threads() -> usize {
+    if let Some(n) = std::env::var("KVAD_THREADS").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
+    let total = std::thread::available_parallelism().map_or(4, |n| n.get());
+    match perf_cores() {
+        // Apple silicon and other big.LITTLE parts. Two thirds of the slow
+        // cores is where this machine measures best (69 tok/s at 14-15 of 18);
+        // the last few add throughput worth less than the barrier they extend.
+        Some(fast) if fast < total => (fast + 2 * (total - fast) / 3).clamp(1, total),
+        _ => total,
+    }
+}
+
+/// Performance-core count, where the OS will say.
+#[cfg(target_os = "macos")]
+fn perf_cores() -> Option<usize> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.perflevel0.logicalcpu"])
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn perf_cores() -> Option<usize> {
+    None
 }
 
 impl Session for CpuSession {
@@ -472,12 +528,34 @@ impl Session for CpuSession {
         self.model.spec()
     }
 
+    /// Run the whole pass *inside* the pool, not from outside it.
+    ///
+    /// This one line was worth more than every kernel in `quant.rs` put
+    /// together, and the reason is worth understanding.
+    ///
+    /// A `par_iter()` called from a thread that is not a pool worker takes
+    /// rayon's cold path: push the job onto an injection queue, wake the
+    /// workers, then block the caller on a condition variable until they
+    /// finish. Two kernel transitions and a scheduler round trip, per matmul.
+    /// Decoding one token runs 169 matmuls, so that is 169 sleeps and 169
+    /// wake-ups, each one costing more than the arithmetic it is waiting for.
+    /// A profile of the old code found 20% of CPU time in the kernels and the
+    /// rest in `swtch_pri` and `psynch_cvwait` — the pool thrashing.
+    ///
+    /// `install` moves the whole pass onto a pool thread and blocks the caller
+    /// once. Every `par_iter` inside is then being called *from* a worker, so
+    /// it takes the hot path — push onto that worker's own deque, and let the
+    /// other workers steal — with no injection queue and no condvar. The cold
+    /// path is paid once per token instead of 169 times.
     fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
-        let mut logits = Vec::new();
-        for part in tokens.chunks(self.chunk) {
-            logits = self.model.forward_batch(part, &mut self.cache);
-        }
-        Ok(logits)
+        let CpuSession { model, cache, chunk, pool, .. } = self;
+        Ok(pool.install(|| {
+            let mut logits = Vec::new();
+            for part in tokens.chunks(*chunk) {
+                logits = model.forward_batch(part, cache);
+            }
+            logits
+        }))
     }
 
     fn cached(&self) -> usize {

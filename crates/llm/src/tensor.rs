@@ -55,10 +55,11 @@ impl Tensor {
 /// a contiguous row, so we parallelise over outputs directly.
 pub fn matvec_bt(x: &[f32], w: &Tensor) -> Vec<f32> {
     assert_eq!(x.len(), w.cols, "matvec_bt shape mismatch");
-    (0..w.rows)
-        .into_par_iter()
-        .map(|r| {
-            let row = w.row(r);
+    let mut out = vec![0.0f32; w.rows];
+    let per = w.rows.div_ceil(rayon::current_num_threads().max(1)).max(1);
+    out.par_chunks_mut(per).enumerate().for_each(|(task, dst)| {
+        for (j, slot) in dst.iter_mut().enumerate() {
+            let row = w.row(task * per + j);
             // Four lanes, not one running sum: a single chain would stall on
             // FMA latency rather than run at its throughput.
             let mut acc = [0.0f32; 4];
@@ -71,9 +72,10 @@ pub fn matvec_bt(x: &[f32], w: &Tensor) -> Vec<f32> {
             for i in (w.cols - w.cols % 4)..w.cols {
                 total += x[i] * row[i];
             }
-            total
-        })
-        .collect()
+            *slot = total;
+        }
+    });
+    out
 }
 
 /// `out_t[r * m + i] = dot(xs[i], w.row(r))` — a batch of `m` activation rows

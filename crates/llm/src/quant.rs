@@ -38,6 +38,20 @@ use rayon::prelude::*;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// Rows one task should handle, so that a parallel section is one job per
+/// thread instead of a tree of them.
+///
+/// `into_par_iter().map(..).collect()` over 896 rows looks innocent and is
+/// not: rayon splits it adaptively, which means a binary tree of `join`s,
+/// steal attempts between them, an epoch-based reclaim, and an allocation for
+/// the collected result — all to hand each thread a few microseconds of work.
+/// Decoding one token does this 169 times. Slicing the output into exactly one
+/// chunk per thread up front costs none of it.
+#[inline]
+fn rows_per_task(rows: usize) -> usize {
+    rows.div_ceil(rayon::current_num_threads().max(1)).max(1)
+}
+
 /// Weights per block. 32 is the usual choice: small enough to isolate
 /// outliers, large enough that the per-block scale is not itself the cost.
 pub const BLOCK: usize = 32;
@@ -323,14 +337,16 @@ impl Weight {
                 let blocks_per_row = n / BLOCK;
                 let xq = QActivation::new(x);
 
-                // `map_init` gives each worker thread one scratch buffer that
-                // is reused for every row it handles, rather than allocating
-                // 151936 of them.
-                (0..self.rows)
-                    .into_par_iter()
-                    .map_init(
-                        || vec![0i32; blocks_per_row],
-                        |dots, r| {
+                let mut out = vec![0.0f32; self.rows];
+                let per = rows_per_task(self.rows);
+                out.par_chunks_mut(per).enumerate().for_each(|(task, dst)| {
+                    // One scratch buffer per task, reused for every row it
+                    // handles, rather than 151936 of them.
+                    let mut dots = vec![0i32; blocks_per_row];
+                    for (j, slot) in dst.iter_mut().enumerate() {
+                        let r = task * per + j;
+                        {
+                            let dots = &mut dots;
                             let base = r * blocks_per_row;
 
                             // ---- pass 1: integers only ---------------------
@@ -404,10 +420,11 @@ impl Weight {
                                 let d = if offset { d - 8 * xq.sums[b] } else { d };
                                 sums[b & 1] += scales[base + b] * xq.scales[b] * d as f32;
                             }
-                            sums[0] + sums[1]
-                        },
-                    )
-                    .collect()
+                            *slot = sums[0] + sums[1];
+                        }
+                    }
+                });
+                out
             }
         };
 
@@ -436,9 +453,11 @@ impl Weight {
             _ => Vec::new(),
         };
 
-        (0..self.rows)
-            .into_par_iter()
-            .map(|r| {
+        let mut out = vec![0.0f32; self.rows];
+        let per = rows_per_task(self.rows);
+        out.par_chunks_mut(per).enumerate().for_each(|(task, dst)| {
+            for (j, slot) in dst.iter_mut().enumerate() {
+                let r = task * per + j;
                 let base = r * blocks_per_row;
                 // Four independent lanes: float addition is not associative,
                 // so a single accumulator would run at FMA latency rather than
@@ -487,9 +506,10 @@ impl Weight {
                     }
                     Data::F32(_) => unreachable!(),
                 }
-                (sums[0] + sums[1]) + (sums[2] + sums[3])
-            })
-            .collect()
+                *slot = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+            }
+        });
+        out
     }
 }
 

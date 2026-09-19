@@ -10,11 +10,13 @@
 //! 3. [`mnist`]  — reading the dataset off disk.
 //! 4. [`attention`] — the first piece of a transformer, built from 1 and 2.
 //! 5. [`norm`]   — LayerNorm and RMSNorm, and why their gradients look as they do.
+//! 6. [`embedding`] — token ids to vectors: a `Linear` layer with the zeros skipped.
 //!
 //! Then run `cargo test -p nanograd`: the gradient check in `nn` verifies the
 //! hand-derived derivatives against numerically measured ones.
 
 pub mod attention;
+pub mod embedding;
 #[cfg(test)]
 mod gradcheck;
 pub mod matrix;

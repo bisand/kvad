@@ -103,6 +103,12 @@ Zero dependencies. Read in this order:
    see its input being shifted or stretched, so the gradient must have no
    component in those directions. LayerNorm ignores both and subtracts two
    projections. RMSNorm ignores only the stretch and subtracts one.
+6. **[`embedding.rs`](crates/nanograd/src/embedding.rs)** — token ids to
+   vectors. A lookup does not look differentiable, but it is a `Linear` layer
+   fed one-hot rows with the multiplications by zero skipped, so its backward
+   pass is `Linear`'s with the same shortcut: add each gradient row into the
+   table row its token selected. Add, not assign — a token used three times is
+   to blame three times.
 
 ### The test worth running first
 
@@ -128,6 +134,12 @@ standard deviation are 1 — so a backward pass that forgot to multiply by eithe
 one passes. The tests use a scrambled `gamma` and inputs with a standard
 deviation near 3 for exactly that reason. A gradient check is only as good as
 the point you run it at.
+
+The embedding has a better test available than a numerical one, and uses it:
+build the one-hot matrix for real, push it through the matmuls from step 1, and
+require the lookup and its gradient to match *to the bit*. No tolerance to tune,
+because there is no approximation — the shortcut performs the same additions in
+the same order.
 
 ### Things to try
 
@@ -784,10 +796,13 @@ story, the serving track is what the second half of the mission actually costs.
 **1. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Backprop through attention
 ([`attention.rs`](crates/nanograd/src/attention.rs)) and through LayerNorm and
-RMSNorm ([`norm.rs`](crates/nanograd/src/norm.rs)) is done; still needed are an
-embedding, the residual wiring of a block, and Adam. The gradient check from
-crate 1 is how you will debug each one — extend `nanograd` (hard, most
-educational) or use [`burn`](https://github.com/tracel-ai/burn).
+RMSNorm ([`norm.rs`](crates/nanograd/src/norm.rs)), and the embedding
+([`embedding.rs`](crates/nanograd/src/embedding.rs)) are done. That is every
+layer of the original Transformer, whose MLP used ReLU; GPT-2's GELU and
+Llama's SwiGLU are not written yet. Still needed are the residual wiring that
+makes the layers a block, and Adam. The gradient check from crate 1 is how you
+will debug each one — extend `nanograd` (hard, most educational) or use
+[`burn`](https://github.com/tracel-ai/burn).
 
 **2. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike

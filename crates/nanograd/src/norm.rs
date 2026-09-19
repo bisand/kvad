@@ -39,7 +39,7 @@
 //! use — the mean subtraction turned out not to be earning its cost.
 
 use crate::matrix::Matrix;
-use crate::nn::Layer;
+use crate::nn::{sgd, Layer};
 
 /// Added to the variance before the square root, so a constant row divides by
 /// something small rather than by zero.
@@ -239,14 +239,6 @@ impl Layer for RmsNorm {
 
     fn weight_grads(&self) -> Option<&[f32]> {
         Some(&self.dgamma)
-    }
-}
-
-/// SGD with momentum over one parameter vector — the same update as `Linear`.
-fn sgd(param: &mut [f32], grad: &[f32], velocity: &mut [f32], lr: f32, momentum: f32) {
-    for i in 0..param.len() {
-        velocity[i] = momentum * velocity[i] - lr * grad[i];
-        param[i] += velocity[i];
     }
 }
 

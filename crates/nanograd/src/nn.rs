@@ -38,6 +38,17 @@ pub trait Layer {
     }
 }
 
+/// SGD with momentum over one parameter vector.
+///
+/// The velocity is a decaying sum of past gradients, so a direction the
+/// gradients agree on builds up speed and one they disagree on cancels out.
+pub(crate) fn sgd(param: &mut [f32], grad: &[f32], velocity: &mut [f32], lr: f32, momentum: f32) {
+    for i in 0..param.len() {
+        velocity[i] = momentum * velocity[i] - lr * grad[i];
+        param[i] += velocity[i];
+    }
+}
+
 /// A fully connected layer: `y = x @ W + b`.
 pub struct Linear {
     /// [in_features, out_features]
@@ -108,14 +119,8 @@ impl Layer for Linear {
     }
 
     fn step(&mut self, lr: f32, momentum: f32) {
-        for i in 0..self.w.data.len() {
-            self.vw.data[i] = momentum * self.vw.data[i] - lr * self.dw.data[i];
-            self.w.data[i] += self.vw.data[i];
-        }
-        for i in 0..self.b.len() {
-            self.vb[i] = momentum * self.vb[i] - lr * self.db[i];
-            self.b[i] += self.vb[i];
-        }
+        sgd(&mut self.w.data, &self.dw.data, &mut self.vw.data, lr, momentum);
+        sgd(&mut self.b, &self.db, &mut self.vb, lr, momentum);
     }
 
     fn zero_grad(&mut self) {

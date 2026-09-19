@@ -47,6 +47,15 @@ pub struct Block {
     v_w: Weight,
     v_b: Option<Vec<f32>>,
     o_w: Weight,
+    /// Qwen3's per-head RMSNorm on the queries and the keys, applied after
+    /// the projection and *before* RoPE. One vector of `head_dim`, shared by
+    /// every head — so it normalises each head's slice independently rather
+    /// than the whole projection at once.
+    ///
+    /// Absent in Llama and Qwen2, which is the only difference between them
+    /// and Qwen3 that reaches this file.
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
     mlp_norm: Vec<f32>,
     /// The gate and the value are computed by two separate matrices from the
     /// same input; `down` projects their product back to `n_embd`.
@@ -67,6 +76,24 @@ pub struct Model {
     rope: Rope,
 }
 
+/// RMSNorm every head of a projection in place, if this model has the weights
+/// for it.
+///
+/// Qwen3's addition to the Llama block, and the whole of it. The weight is one
+/// vector of `head_dim` reused across heads, so this normalises each head's
+/// own slice — which is the point: it bounds the magnitude of each head's
+/// query and key independently before they meet in a dot product, and lets the
+/// model be trained without the attention logits drifting apart between heads.
+///
+/// `None` is every other model in this family, where it costs one branch per
+/// layer.
+fn norm_heads(x: &mut [f32], weight: Option<&[f32]>, spec: &Spec) {
+    let Some(weight) = weight else { return };
+    for head in x.chunks_mut(spec.head_dim) {
+        head.copy_from_slice(&rms_norm(head, weight, spec.eps));
+    }
+}
+
 impl Model {
     pub fn load(src: &dyn Source, spec: Spec) -> Res<Self> {
         let mut blocks = Vec::with_capacity(spec.n_layer);
@@ -81,6 +108,8 @@ impl Model {
                 v_w: src.matrix(&p("self_attn.v_proj.weight"))?,
                 v_b: src.try_vector(&p("self_attn.v_proj.bias")),
                 o_w: src.matrix(&p("self_attn.o_proj.weight"))?,
+                q_norm: src.try_vector(&p("self_attn.q_norm.weight")),
+                k_norm: src.try_vector(&p("self_attn.k_norm.weight")),
                 mlp_norm: src.vector(&p("post_attention_layernorm.weight"))?,
                 gate_w: src.matrix(&p("mlp.gate_proj.weight"))?,
                 up_w: src.matrix(&p("mlp.up_proj.weight"))?,
@@ -144,6 +173,8 @@ impl Model {
 
             // Each row rotates by its own absolute position.
             for i in 0..m {
+                norm_heads(&mut q[i * qdim..(i + 1) * qdim], block.q_norm.as_deref(), spec);
+                norm_heads(&mut k[i * kvdim..(i + 1) * kvdim], block.k_norm.as_deref(), spec);
                 self.apply_rope(&mut q[i * qdim..(i + 1) * qdim], pos0 + i);
                 self.apply_rope(&mut k[i * kvdim..(i + 1) * kvdim], pos0 + i);
                 cache.push(l, &k[i * kvdim..(i + 1) * kvdim], &v[i * kvdim..(i + 1) * kvdim]);
@@ -262,6 +293,12 @@ impl Transformer for Model {
             let mut q = linear(&h, &block.q_w, block.q_b.as_ref());
             let mut k = linear(&h, &block.k_w, block.k_b.as_ref());
             let v = linear(&h, &block.v_w, block.v_b.as_ref());
+
+            // Qwen3 normalises each head of Q and K here, between the
+            // projection and the rotation. Nothing else does, and for
+            // everything else this is a no-op.
+            norm_heads(&mut q, block.q_norm.as_deref(), spec);
+            norm_heads(&mut k, block.k_norm.as_deref(), spec);
 
             // Position enters here, as a rotation of Q and K -- and nowhere
             // else. V is left alone: it carries content, not location.

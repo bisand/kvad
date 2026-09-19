@@ -37,8 +37,11 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 pub enum Arch {
     Gpt2,
     /// Llama and everything shaped like it: Llama 2/3, Mistral, Qwen2/2.5,
-    /// SmolLM2, TinyLlama. The differences between those are configuration,
-    /// not code.
+    /// Qwen3, SmolLM2 and TinyLlama (both of which report `llama`). The
+    /// differences between those are configuration, not code — with one
+    /// exception, Qwen3's per-head RMSNorm on Q and K, which is a dozen lines
+    /// in `llama.rs` and skipped by every model that does not ship the weights
+    /// for it.
     Llama,
 }
 
@@ -48,20 +51,37 @@ impl Arch {
     ///
     /// Used both when loading a checkpoint and when searching the Hub, so the
     /// search can say up front which results are actually runnable.
+    ///
+    /// # Why this is an exact list and not a substring test
+    ///
+    /// It used to ask whether the type *contained* `qwen2` or `smollm`, which
+    /// is a reasonable guess and quietly wrong in both directions of the
+    /// family tree. `qwen3_5_moe` contains `qwen3` and is a mixture of
+    /// experts. `smollm3` contains `smollm` and drops RoPE on every fourth
+    /// layer (`no_rope_layer_interval` in its config) — which this engine
+    /// would not know to do, so it would load happily and be subtly wrong on
+    /// nine layers of thirty-six. A model that fails to load is a message; a
+    /// model that runs and is wrong is a bug report from a confused user.
+    ///
+    /// So the list is the architectures that have actually been run here.
+    /// Adding one means reading its config for the fields this family does not
+    /// have, and the usual tell is a name for something in it that `Spec` has
+    /// no field for.
     pub fn from_model_type(model_type: &str) -> Option<Arch> {
         let t = model_type.to_ascii_lowercase();
-        match t.as_str() {
-            t if t.contains("gpt2") => Some(Arch::Gpt2),
-            // These all share one implementation. If you hit an unsupported
-            // model_type, checking whether it is Llama-shaped is usually a
-            // matter of looking for rms_norm_eps and rope_theta in its config.
-            t if t.contains("llama")
-                || t.contains("qwen2")
-                || t.contains("mistral")
-                || t.contains("smollm") =>
-            {
-                Some(Arch::Llama)
-            }
+        // `architectures` entries are class names — `LlamaForCausalLM` — and
+        // are the fallback for the few configs with no `model_type`. Reduce
+        // them to the same stem rather than keeping two lists.
+        let stem = t
+            .trim_end_matches("forcausallm")
+            .trim_end_matches("lmheadmodel")
+            .trim_end_matches("model");
+        match stem {
+            "gpt2" => Some(Arch::Gpt2),
+            // One implementation. The differences between these four are
+            // configuration, except Qwen3's per-head RMSNorm on Q and K, which
+            // `llama.rs` applies when the weights for it are present.
+            "llama" | "mistral" | "qwen2" | "qwen3" => Some(Arch::Llama),
             _ => None,
         }
     }
@@ -144,8 +164,8 @@ impl Spec {
         let arch = Arch::from_model_type(&model_type).ok_or_else(|| {
             format!(
                 "unsupported architecture `{model_type}`.\n\
-                 This engine implements two: gpt2 and llama (which covers \
-                 Llama 2/3, Mistral, Qwen2/2.5, SmolLM2, TinyLlama)."
+                 This engine implements two: gpt2, and llama — which covers \
+                 Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM2 and TinyLlama."
             )
         })?;
 
@@ -385,6 +405,25 @@ pub fn attend(spec: &Spec, q: &[f32], k_cache: &[f32], v_cache: &[f32], n_positi
 
 #[cfg(test)]
 mod tests {
+
+    /// The families this engine has actually been run against, and the
+    /// near-misses that a substring test used to accept.
+    #[test]
+    fn only_architectures_that_have_been_run_here_are_claimed() {
+        for t in ["llama", "mistral", "qwen2", "qwen3", "LlamaForCausalLM", "Qwen3ForCausalLM"] {
+            assert_eq!(Arch::from_model_type(t), Some(Arch::Llama), "{t}");
+        }
+        assert_eq!(Arch::from_model_type("gpt2"), Some(Arch::Gpt2));
+        assert_eq!(Arch::from_model_type("GPT2LMHeadModel"), Some(Arch::Gpt2));
+
+        // Each of these is a real model_type on the Hub, and each one a
+        // substring test said yes to. A mixture of experts, and a model that
+        // skips RoPE on every fourth layer.
+        for t in ["qwen3_5_moe", "qwen2_moe", "smollm3", "deepseek_v2", "deepseek_v3",
+                  "deepseek_v4", "gemma2", "phi3"] {
+            assert_eq!(Arch::from_model_type(t), None, "claimed to run `{t}`");
+        }
+    }
     use super::*;
 
     fn test_spec() -> Spec {

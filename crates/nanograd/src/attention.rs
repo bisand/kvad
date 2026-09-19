@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn the_key_bias_cannot_change_anything() {
         let (mut attn, x, targets) = setup();
-        crate::gradcheck::scramble(&mut attn, &mut Rng::new(5));
+        crate::gradcheck::scramble(attn.params(), &mut Rng::new(5));
         let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
 
         attn.zero_grad();

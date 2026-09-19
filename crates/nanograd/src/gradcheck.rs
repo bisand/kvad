@@ -14,7 +14,7 @@ pub fn relative_error(analytic: &[f32], numerical: &[f32]) -> f32 {
 }
 
 use crate::matrix::Matrix;
-use crate::nn::{softmax_cross_entropy, Layer};
+use crate::nn::{softmax_cross_entropy, Layer, Param};
 use crate::rng::Rng;
 
 /// One gradient, measured two ways.
@@ -39,12 +39,40 @@ fn checked(name: String, analytic: &[f32], numerical: &[f32]) -> Checked {
     }
 }
 
+/// Gradient-check every parameter of anything that has parameters and a loss.
+///
+/// Call it *after* a backward pass, so the gradients it reads are the ones to
+/// be judged. `params` is fetched afresh around every nudge, because the
+/// forward pass inside `loss` needs the model back in between.
+pub fn check_params<M: ?Sized>(
+    model: &mut M,
+    params: impl for<'a> Fn(&'a mut M) -> Vec<Param<'a>>,
+    loss: impl Fn(&mut M) -> f32,
+    nudge: f32,
+) -> Vec<Checked> {
+    let analytic: Vec<(String, Vec<f32>)> =
+        params(model).into_iter().map(|p| (p.name, p.grad.to_vec())).collect();
+
+    let mut report = Vec::new();
+    for (p, (name, grad)) in analytic.into_iter().enumerate() {
+        let mut numerical = vec![0.0; grad.len()];
+        for (i, slot) in numerical.iter_mut().enumerate() {
+            params(model)[p].value[i] += nudge;
+            let up = loss(model);
+            params(model)[p].value[i] -= 2.0 * nudge;
+            let down = loss(model);
+            params(model)[p].value[i] += nudge;
+            *slot = (up - down) / (2.0 * nudge);
+        }
+        report.push(checked(name, &grad, &numerical));
+    }
+    report
+}
+
 /// Gradient-check a whole layer: every parameter tensor it reports, and the
 /// gradient it hands to the layer below, which comes last, as `"dx"`.
 ///
-/// The loss is softmax cross-entropy on the layer's output, one target per
-/// row. `layer.params()` is fetched afresh around every nudge, because the
-/// forward pass in between needs the layer back.
+/// The loss is softmax cross-entropy on the layer's output, one target per row.
 pub fn check_layer(layer: &mut dyn Layer, x: &Matrix, targets: &[usize], nudge: f32) -> Vec<Checked> {
     let loss = |layer: &mut dyn Layer, x: &Matrix| softmax_cross_entropy(&layer.forward(x), targets).0;
     let centred = |up: f32, down: f32| (up - down) / (2.0 * nudge);
@@ -52,22 +80,7 @@ pub fn check_layer(layer: &mut dyn Layer, x: &Matrix, targets: &[usize], nudge: 
     layer.zero_grad();
     let (_, dlogits) = softmax_cross_entropy(&layer.forward(x), targets);
     let dx = layer.backward(&dlogits);
-    let analytic: Vec<(String, Vec<f32>)> =
-        layer.params().into_iter().map(|p| (p.name, p.grad.to_vec())).collect();
-
-    let mut report = Vec::new();
-    for (p, (name, grad)) in analytic.into_iter().enumerate() {
-        let mut numerical = vec![0.0; grad.len()];
-        for (i, slot) in numerical.iter_mut().enumerate() {
-            layer.params()[p].value[i] += nudge;
-            let up = loss(layer, x);
-            layer.params()[p].value[i] -= 2.0 * nudge;
-            let down = loss(layer, x);
-            layer.params()[p].value[i] += nudge;
-            *slot = centred(up, down);
-        }
-        report.push(checked(name, &grad, &numerical));
-    }
+    let mut report = check_params(layer, |l| l.params(), |l| loss(l, x), nudge);
 
     let mut x = x.clone();
     let mut numerical = vec![0.0; x.data.len()];
@@ -88,8 +101,8 @@ pub fn check_layer(layer: &mut dyn Layer, x: &Matrix, targets: &[usize], nudge: 
 /// A fresh layer is the worst place to check a gradient: gammas are exactly 1
 /// and biases exactly 0, and a backward pass that forgot to multiply by one,
 /// or that mishandled the other, passes. See the norm tests.
-pub fn scramble(layer: &mut dyn Layer, rng: &mut Rng) {
-    for p in layer.params() {
+pub fn scramble(params: Vec<Param<'_>>, rng: &mut Rng) {
+    for p in params {
         p.value.iter_mut().for_each(|v| *v += 0.3 * rng.normal());
     }
 }

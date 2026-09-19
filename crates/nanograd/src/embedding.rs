@@ -36,7 +36,7 @@
 //! up with `0, 1, 2, ...` instead of token ids, and added to the result.
 
 use crate::matrix::Matrix;
-use crate::nn::sgd;
+use crate::nn::{sgd, Param};
 use crate::rng::Rng;
 
 pub struct Embedding {
@@ -94,6 +94,10 @@ impl Embedding {
 
     pub fn zero_grad(&mut self) {
         self.dtable.fill(0.0);
+    }
+
+    pub fn params(&mut self) -> Vec<Param<'_>> {
+        vec![Param::new("table", &mut self.table.data, &self.dtable.data)]
     }
 
     pub fn describe(&self) -> String {

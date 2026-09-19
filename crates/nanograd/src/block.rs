@@ -178,7 +178,7 @@ mod tests {
     fn analytic_gradient_matches_numerical() {
         let mut rng = Rng::new(31);
         let mut block = Block::new(D_MODEL, 2, &mut rng);
-        scramble(&mut block, &mut rng);
+        scramble(block.params(), &mut rng);
         let x = random(SEQ, D_MODEL, &mut rng);
 
         let report = check_layer(&mut block, &x, &TARGETS, NUDGE);
@@ -223,7 +223,7 @@ mod tests {
         let mut rng = Rng::new(33);
         // A Linear layer scaled down to a tenth: each one passes back about a
         // tenth of the gradient it is given.
-        let mut weak = |rng: &mut Rng| -> Box<dyn Layer> {
+        let weak = |rng: &mut Rng| -> Box<dyn Layer> {
             let mut l = Linear::new(D_MODEL, D_MODEL, rng);
             l.params().into_iter().for_each(|p| p.value.iter_mut().for_each(|v| *v *= 0.1));
             Box::new(l)

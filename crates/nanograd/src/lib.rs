@@ -12,6 +12,7 @@
 //! 5. [`norm`]   — LayerNorm and RMSNorm, and why their gradients look as they do.
 //! 6. [`embedding`] — token ids to vectors: a `Linear` layer with the zeros skipped.
 //! 7. [`block`]  — the residual connection, and the transformer block made of two.
+//! 8. [`model`]  — all of it assembled into a GPT that predicts the next token.
 //!
 //! Then run `cargo test -p nanograd`: the gradient check in `nn` verifies the
 //! hand-derived derivatives against numerically measured ones.
@@ -23,6 +24,7 @@ pub mod embedding;
 mod gradcheck;
 pub mod matrix;
 pub mod mnist;
+pub mod model;
 pub mod nn;
 pub mod norm;
 pub mod rng;

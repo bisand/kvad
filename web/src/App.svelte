@@ -1,0 +1,69 @@
+<script>
+  import { router } from "./lib/router.svelte.js";
+  import { pageFor } from "./lib/pages.js";
+  import { health as fetchHealth } from "./lib/api.js";
+  import { toasts } from "./lib/toasts.svelte.js";
+  import Navbar from "./lib/components/Navbar.svelte";
+  import Sidebar from "./lib/components/Sidebar.svelte";
+  import Toasts from "./lib/components/Toasts.svelte";
+  import Unbuilt from "./lib/components/Unbuilt.svelte";
+  import Dashboard from "./routes/Dashboard.svelte";
+  import NotFound from "./routes/NotFound.svelte";
+
+  const DRAWER = "kvad-drawer";
+
+  let health = $state(null);
+  let healthError = $state(null);
+
+  const page = $derived(pageFor(router.path));
+
+  // The server is polled rather than asked once, so that a restart while the
+  // tab is open is noticed. Thirty seconds: often enough to spot a restart,
+  // rare enough to be invisible in a request log.
+  $effect(() => {
+    let alive = true;
+    async function poll(first) {
+      try {
+        const next = await fetchHealth();
+        if (!alive) return;
+        if (healthError) toasts.success("Server is back.");
+        health = next;
+        healthError = null;
+      } catch (e) {
+        if (!alive) return;
+        // Only the first failure is worth a toast; after that the navbar's
+        // indicator says it, and a toast every thirty seconds would be noise.
+        if (!healthError) toasts.error(e.message);
+        healthError = e.message;
+        if (first) health = null;
+      }
+    }
+    poll(true);
+    const timer = setInterval(() => poll(false), 30_000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  });
+</script>
+
+<div class="drawer lg:drawer-open">
+  <input id={DRAWER} type="checkbox" class="drawer-toggle" />
+
+  <div class="drawer-content flex min-h-screen flex-col">
+    <Navbar drawerId={DRAWER} title={page?.label ?? "Not found"} {health} error={healthError} />
+    <main class="grow p-4 sm:p-6">
+      {#if !page}
+        <NotFound />
+      {:else if page.path === "/"}
+        <Dashboard {health} error={healthError} />
+      {:else}
+        <Unbuilt {page} />
+      {/if}
+    </main>
+  </div>
+
+  <Sidebar drawerId={DRAWER} />
+</div>
+
+<Toasts />

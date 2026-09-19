@@ -1,0 +1,25 @@
+[package]
+name = "kvad-serve"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HTTP server and web UI for kvad: manage models, chat, train and watch."
+
+[[bin]]
+name = "kvad-serve"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+kvad = { path = "../llm" }
+mime_guess = "2.0.5"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rust-embed = "8.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+toml = "1.1.6"
+tower-http = { version = "0.7.1", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

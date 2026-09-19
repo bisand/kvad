@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>kvad</title>
+    <script>
+      // Before first paint, or the page flashes light and then goes dark.
+      // Nothing is set when the choice is "system": daisyUI's `--prefersdark`
+      // already follows the OS, and an explicit attribute would override it.
+      try {
+        const theme = localStorage.getItem("kvad.theme");
+        if (theme === "light" || theme === "dim")
+          document.documentElement.dataset.theme = theme;
+      } catch {}
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

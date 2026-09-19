@@ -158,10 +158,45 @@ committed.
 - `Cmd::Unload` drops the loaded model without loading another; `u` on the
   TUI's Models tab is the key for it.
 
-**Phase 1 — skeleton.** `kvad-serve` with config loading, SQLite migrations, the
-embedded SPA, `/api/health`, the auth extractor wired up with only `none`
-implemented, and the Svelte shell: a daisyUI drawer sidebar, navbar, theme
-toggle and a toast store.
+**Phase 1 — skeleton. Done.**
+
+`crates/serve` and `web/`, and nothing of the engine yet.
+
+- **Config** is `kvad.toml`, all of it optional, with
+  `docs/kvad.example.toml` as the reference. `--config`, `--bind` and `--db`
+  override it. The one refusal that matters happens before the socket opens:
+  `auth.mode = "none"` off loopback needs `--insecure`, and a mode that is
+  named but unbuilt stops the server rather than quietly letting everyone in.
+- **SQLite** through `rusqlite`, WAL, one connection behind a mutex, numbered
+  `.sql` migrations embedded with `include_str!` and tracked in
+  `PRAGMA user_version` — four bytes in the file header, written by the same
+  transaction as the schema it describes, so the two cannot disagree.
+- **Auth** is a `Provider` trait with `Identity` and `Admin` as axum
+  extractors, so a handler that needs an administrator cannot be written
+  without asking for one. `NoAuth` is the only provider; the rest is Phase 3
+  and changes `auth.rs` alone.
+- **The SPA** is embedded with `rust-embed` from `web/dist`. `cargo build`
+  never runs npm, so `web/dist/.gitkeep` is committed to give the directory
+  something to exist as, and a binary built without a UI serves a page saying
+  which command would fix it. Anything that is not a file falls back to
+  `index.html`, which is what makes a reload of `/models` work; a missing
+  `.js` is still a 404, or a broken build would answer with HTML and the
+  console would report a syntax error instead of a missing file.
+- **The shell** is Svelte 5 + Vite 8, Tailwind 4 and daisyUI 5: drawer
+  sidebar, navbar, a three-way theme menu (system / light / dim, the system
+  default left to daisyUI's `--prefersdark`), and a toast store where errors
+  stay until dismissed and everything else clears itself. 52 KB of JavaScript
+  and 78 KB of CSS, 20 and 13 gzipped. Every planned page is in the sidebar
+  from the start, and the ones that are not built say which phase brings them.
+- **The dashboard** shows the one thing this phase can honestly show: whether
+  the browser and the server agree they are talking, polled every 30s.
+
+Not settled here, because nothing needed it yet: open decision 2, whether the
+GPU backend is in the server's build. `kvad-serve` has no engine and so no
+`Loader` to choose one for.
+
+Also worth knowing: the default bind is `127.0.0.1:8080`, which is a
+well-contended port. `--bind` or `server.bind` moves it.
 
 **Phase 2 — models and chat.** The Models page, `/v1/chat/completions` and
 `/v1/models` over SSE, and the Chat page with persisted conversations.

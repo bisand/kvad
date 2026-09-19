@@ -62,17 +62,22 @@ pub struct ModelFiles {
     pub generation_config: Option<PathBuf>,
 }
 
-/// Where models trained on this machine live.
+/// Where everything this machine cannot download again is kept.
 ///
-/// `$XDG_DATA_HOME/kvad/models`, or `~/.local/share/kvad/models`. Data rather
-/// than cache, because these cannot be downloaded again: the only copy of a
-/// model you trained is the one on your disk. The active-model setting next
-/// door in `hub::State` follows the same convention with `XDG_CONFIG_HOME`.
-pub fn models_dir() -> PathBuf {
+/// `$XDG_DATA_HOME/kvad`, or `~/.local/share/kvad`. Data rather than cache,
+/// because a model you trained has exactly one copy, and so does the server's
+/// database. Settings live next door under `XDG_CONFIG_HOME`; see
+/// [`crate::hub::config_dir`].
+pub fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".local/share"));
-    base.join("kvad").join("models")
+    base.join("kvad")
+}
+
+/// Where models trained on this machine live: `models` under [`data_dir`].
+pub fn models_dir() -> PathBuf {
+    data_dir().join("models")
 }
 
 fn home() -> PathBuf {

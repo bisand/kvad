@@ -1,0 +1,52 @@
+<script>
+  import { PAGES } from "../pages.js";
+  import { router, navigate } from "../router.svelte.js";
+  import Icon from "./Icon.svelte";
+
+  // The id of the drawer's checkbox, so picking a page can close the drawer
+  // on a narrow screen. On a wide one the checkbox is not what is holding the
+  // sidebar open (`lg:drawer-open` is), so clearing it there does nothing.
+  let { drawerId } = $props();
+
+  function pick(event, path) {
+    navigate(event, path);
+    const toggle = document.getElementById(drawerId);
+    if (toggle) toggle.checked = false;
+  }
+</script>
+
+<div class="drawer-side z-20">
+  <label for={drawerId} aria-label="close sidebar" class="drawer-overlay"></label>
+  <!-- The border matters in the light theme, where base-200 and base-100 are
+       close enough that the sidebar would otherwise have no edge. -->
+  <nav class="bg-base-200 border-base-300 flex min-h-full w-64 flex-col border-r">
+    <a
+      href="/"
+      onclick={(e) => pick(e, "/")}
+      class="flex items-baseline gap-2 px-4 h-16 shrink-0"
+    >
+      <span class="text-xl font-semibold tracking-tight">kvad</span>
+      <span class="text-xs opacity-60">transformers from scratch</span>
+    </a>
+
+    <ul class="menu w-full grow gap-0.5 px-2">
+      {#each PAGES as page (page.path)}
+        <li>
+          <a
+            href={page.path}
+            onclick={(e) => pick(e, page.path)}
+            class={router.path === page.path ? "menu-active" : ""}
+            aria-current={router.path === page.path ? "page" : undefined}
+          >
+            <Icon path={page.icon} />
+            <span class="grow">{page.label}</span>
+          </a>
+        </li>
+      {/each}
+    </ul>
+
+    <p class="px-4 py-3 text-xs opacity-50">
+      One model, one generation at a time. Continuous batching is not here yet.
+    </p>
+  </nav>
+</div>

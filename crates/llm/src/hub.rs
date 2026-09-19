@@ -285,12 +285,20 @@ pub fn human_bytes(b: u64) -> String {
 /// only create a second source of truth to keep in sync.
 pub struct State;
 
+/// Where settings somebody typed are kept: `$XDG_CONFIG_HOME/kvad`, or
+/// `~/.config/kvad`. Config rather than data, because everything in here can
+/// be written again from scratch — unlike a trained model. See
+/// [`crate::weights::data_dir`] for the other side of that line.
+pub fn config_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs_home().join(".config"))
+        .join("kvad")
+}
+
 impl State {
     pub fn path() -> PathBuf {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_home().join(".config"));
-        base.join("kvad").join("state.json")
+        config_dir().join("state.json")
     }
 
     pub fn active() -> Option<String> {

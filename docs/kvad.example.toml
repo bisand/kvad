@@ -1,0 +1,27 @@
+# kvad-serve's bootstrap configuration.
+#
+# Copy to $XDG_CONFIG_HOME/kvad/kvad.toml (or ~/.config/kvad/kvad.toml), or
+# point at it with `kvad-serve --config PATH`. Every key has a default, and a
+# missing file is not an error — with no file at all the server binds loopback
+# with no authentication, which is the right answer on a laptop.
+#
+# Only what has to be known before the server starts belongs here. Settings
+# that can be changed while it runs live in the database and are edited from
+# the UI.
+
+[server]
+# Loopback by default. Binding anything else with auth.mode = "none" is
+# refused: everyone who could reach the address would be an administrator.
+bind = "127.0.0.1:8080"
+
+[database]
+# Defaults to $XDG_DATA_HOME/kvad/kvad.db. Data rather than cache: what is in
+# it — conversations, training runs, API keys — cannot be downloaded again.
+# path = "/var/lib/kvad/kvad.db"
+
+[auth]
+# "none" is the only mode implemented. "local" (username and password),
+# "basic" and "oidc" are named here because the name is what people write
+# down; asking for one of them now makes the server refuse to start rather
+# than quietly let everybody in.
+mode = "none"

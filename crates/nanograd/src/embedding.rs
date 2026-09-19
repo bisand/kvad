@@ -97,7 +97,7 @@ impl Embedding {
     }
 
     pub fn params(&mut self) -> Vec<Param<'_>> {
-        vec![Param::new("table", &mut self.table.data, &self.dtable.data)]
+        vec![Param::new("table", &mut self.table.data, &mut self.dtable.data)]
     }
 
     pub fn describe(&self) -> String {

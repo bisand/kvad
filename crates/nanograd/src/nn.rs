@@ -19,7 +19,7 @@
 use crate::matrix::Matrix;
 use crate::rng::Rng;
 
-pub trait Layer {
+pub trait Layer: Send {
     fn forward(&mut self, x: &Matrix) -> Matrix;
     fn backward(&mut self, dy: &Matrix) -> Matrix;
     /// Apply accumulated gradients. Layers with no parameters do nothing.
@@ -43,11 +43,14 @@ pub struct Param<'a> {
     /// Dotted, like `attn.1.wq.weight`, so a failed check can say where.
     pub name: String,
     pub value: &'a mut [f32],
-    pub grad: &'a [f32],
+    /// Writable too, though only one thing writes it from outside the layer:
+    /// data-parallel training, which adds every replica's gradient into one
+    /// model's. See `text::Replicas`.
+    pub grad: &'a mut [f32],
 }
 
 impl<'a> Param<'a> {
-    pub fn new(name: &str, value: &'a mut [f32], grad: &'a [f32]) -> Self {
+    pub fn new(name: &str, value: &'a mut [f32], grad: &'a mut [f32]) -> Self {
         Param { name: name.to_string(), value, grad }
     }
 }
@@ -153,8 +156,8 @@ impl Layer for Linear {
 
     fn params(&mut self) -> Vec<Param<'_>> {
         vec![
-            Param::new("weight", &mut self.w.data, &self.dw.data),
-            Param::new("bias", &mut self.b, &self.db),
+            Param::new("weight", &mut self.w.data, &mut self.dw.data),
+            Param::new("bias", &mut self.b, &mut self.db),
         ]
     }
 }
@@ -210,6 +213,10 @@ impl Layer for Relu {
 #[derive(Default)]
 pub struct Gelu {
     x: Vec<f32>,
+    /// `tanh(u)` for each input, kept from the forward pass. The backward
+    /// pass needs the same value, and `tanh` is the expensive part: measured
+    /// in `train_text`, it was a sixth of all the time spent training.
+    t: Vec<f32>,
 }
 
 impl Gelu {
@@ -220,11 +227,8 @@ impl Gelu {
 impl Layer for Gelu {
     fn forward(&mut self, x: &Matrix) -> Matrix {
         self.x = x.data.clone();
-        let data = x
-            .data
-            .iter()
-            .map(|&v| 0.5 * v * (1.0 + (Self::C * (v + Self::A * v * v * v)).tanh()))
-            .collect();
+        self.t = x.data.iter().map(|&v| (Self::C * (v + Self::A * v * v * v)).tanh()).collect();
+        let data = x.data.iter().zip(&self.t).map(|(&v, &t)| 0.5 * v * (1.0 + t)).collect();
         Matrix::from_vec(x.rows, x.cols, data)
     }
 
@@ -237,9 +241,8 @@ impl Layer for Gelu {
         let data = dy
             .data
             .iter()
-            .zip(self.x.iter())
-            .map(|(&g, &x)| {
-                let t = (Self::C * (x + Self::A * x * x * x)).tanh();
+            .zip(self.x.iter().zip(&self.t))
+            .map(|(&g, (&x, &t))| {
                 let du = Self::C * (1.0 + 3.0 * Self::A * x * x);
                 g * (0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * du)
             })

@@ -146,8 +146,8 @@ impl Layer for LayerNorm {
 
     fn params(&mut self) -> Vec<Param<'_>> {
         vec![
-            Param::new("gamma", &mut self.gamma, &self.dgamma),
-            Param::new("beta", &mut self.beta, &self.dbeta),
+            Param::new("gamma", &mut self.gamma, &mut self.dgamma),
+            Param::new("beta", &mut self.beta, &mut self.dbeta),
         ]
     }
 }
@@ -233,7 +233,7 @@ impl Layer for RmsNorm {
     }
 
     fn params(&mut self) -> Vec<Param<'_>> {
-        vec![Param::new("gamma", &mut self.gamma, &self.dgamma)]
+        vec![Param::new("gamma", &mut self.gamma, &mut self.dgamma)]
     }
 }
 

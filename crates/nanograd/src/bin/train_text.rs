@@ -14,7 +14,11 @@
 //!
 //! Options: --data PATH --steps N --batch N --context N --d-model N --heads N
 //!          --layers N --lr F --eval-every N --sample N --temperature F
-//!          --prompt TEXT --seed N --save DIR --load DIR
+//!          --prompt TEXT --seed N --save DIR --load DIR --threads N
+//!
+//! Training uses every core unless told otherwise. `--threads 1` is the plain
+//! loop in `text::train_step`; more is `text::Replicas`. A run is reproducible
+//! for a given seed *and* number of threads.
 //!
 //! With `--load`, the model's shape comes from the checkpoint, and --context,
 //! --d-model, --heads and --layers are ignored.
@@ -23,7 +27,7 @@ use nanograd::checkpoint;
 use nanograd::model::{Gpt, GptConfig};
 use nanograd::optim::AdamW;
 use nanograd::rng::Rng;
-use nanograd::text::{evaluate, generate, train_step, unigram_loss, CharTokenizer, Corpus};
+use nanograd::text::{evaluate, generate, train_step, unigram_loss, CharTokenizer, Corpus, Replicas};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -43,6 +47,7 @@ struct Args {
     seed: u64,
     save: Option<PathBuf>,
     load: Option<PathBuf>,
+    threads: usize,
 }
 
 impl Default for Args {
@@ -63,6 +68,9 @@ impl Default for Args {
             seed: 1337,
             save: None,
             load: None,
+            // Every core there is. A batch cannot be split finer than one
+            // window to a thread, which `main` sees to.
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
         }
     }
 }
@@ -101,6 +109,7 @@ fn parse_args() -> Args {
             "--seed" => a.seed = parse(i) as u64,
             "--save" => a.save = Some(PathBuf::from(value(i))),
             "--load" => a.load = Some(PathBuf::from(value(i))),
+            "--threads" => a.threads = (parse(i) as usize).max(1),
             other => {
                 eprintln!("unknown flag {other}");
                 std::process::exit(2);
@@ -183,9 +192,10 @@ fn main() -> std::io::Result<()> {
     );
 
     let context = model.config().context;
+    let threads = args.threads.min(args.batch);
     let mut opt = AdamW::new(args.lr);
     println!("model: {}", model.summary());
-    println!("hyperparams: steps={} batch={} lr={}", args.steps, args.batch, args.lr);
+    println!("hyperparams: steps={} batch={} lr={} threads={threads}", args.steps, args.batch, args.lr);
 
     // Two numbers to hold the loss against. A model that knows nothing scores
     // the first; one that knows only which characters are common scores the
@@ -204,10 +214,14 @@ fn main() -> std::io::Result<()> {
     // A newline, if the text has one: "start a fresh line".
     let prompt = encode_prompt(&tok, args.prompt.as_deref().unwrap_or("\n"), args.prompt.is_none());
 
+    let mut replicas = (threads > 1).then(|| Replicas::new(&model, threads));
     let started = Instant::now();
     let mut running = 0.0;
     for step in 1..=args.steps {
-        running += train_step(&mut model, &mut opt, &corpus.train, args.batch, &mut rng);
+        running += match &mut replicas {
+            Some(replicas) => replicas.train_step(&mut model, &mut opt, &corpus.train, args.batch, &mut rng),
+            None => train_step(&mut model, &mut opt, &corpus.train, args.batch, &mut rng),
+        };
 
         if step % args.eval_every == 0 || step == args.steps {
             let since = if step % args.eval_every == 0 { args.eval_every } else { step % args.eval_every };

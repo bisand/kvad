@@ -249,9 +249,11 @@ cargo run --release -p nanograd --bin train_text -- --data README.md
 
 Any plain text works. The numbers below are from the second command — this
 README, 50 KB, as the entire training set — because it was the text to hand.
-Defaults: 2 layers, 4 heads, `d_model` 64, context 64, 117,221 parameters,
-about 22,000 characters a second on one core of an M5 Pro, 91 seconds for 2000
-steps.
+Defaults: 2 layers, 4 heads, `d_model` 64, context 64, 117,221 parameters. The
+run below took 91 seconds for its 2000 steps, at about 22,000 characters a
+second on one core of an M5 Pro. It takes about 11 seconds now, for reasons given
+under [Where the time went](#where-the-time-went); the losses and samples are
+from the slower code and have not been regenerated.
 
 ```
 loss to beat: 4.615 knowing nothing, 3.378 knowing only letter frequencies
@@ -342,6 +344,72 @@ the optimiser's state is not saved: a resumed run starts Adam's averages from
 nothing. Measured against the same run left alone, that cost 0.06 and 0.04 of
 training loss over the first 50 steps on two seeds, nothing on a third, and
 nothing visible on any by step 100.
+
+### Where the time went
+
+Training ran at 22,000 characters a second, and the plan was to use more cores.
+A profiler was run first — this repository has
+[been burned before](#the-floor-under-everything) — and eight seconds of
+`sample` said something nobody had guessed:
+
+| | share of the time |
+|---|---|
+| `matmul_a_bt` (`dx = dy @ Wᵀ`) | 49% |
+| `matmul` (`y = x @ W`) | 18% |
+| `matmul_at_b` (`dW = xᵀ @ dy`) | 13% |
+| `tanh`, inside GELU | 10% |
+
+Three matrix products do the same number of multiplications, and one of them
+cost as much as the other two and everything else combined. The other two add
+a multiple of one row into another, which a compiler turns into SIMD without
+being asked. `matmul_a_bt` was a dot product: `acc += a[p] * b[p]`. Floating-
+point addition is not associative, a compiler may not change what a program
+computes, and so it may not reorder that sum; each addition waited for the one
+before it. The disassembly showed the multiplications vectorised four at a
+time and the additions done singly, in a chain. The fix is to say in the code
+that the order is free — keep eight running sums and add them up at the end
+([`matrix.rs`](crates/nanograd/src/matrix.rs)). Four sums did nothing; 16 and
+32 were slower than 8, because attention's vectors are 16 long and a chunk that
+does not fill falls to the slow loop. GELU was computing each `tanh` twice,
+forward and again backward, and now keeps it.
+
+Then the cores. The windows of a batch are independent until their gradients
+are added, so `text::Replicas` gives each thread a copy of the model and a
+share of the windows, and adds the gradients into the one model with an
+optimiser: broadcast, compute, all-reduce, which is data parallelism as a GPU
+cluster does it, with a core for a GPU and a `memcpy` for the network. Window
+`i` always goes to replica `i mod n`, so a run is reproducible for a given
+thread count; between thread counts only the order of a sum differs. Over 1000
+steps on three seeds, 1 thread and 16 printed the same training and validation
+loss to three decimals at every checkpoint but one, where they differed by
+0.001.
+
+| characters a second, batch 16 | range over 5 runs | median |
+|---|---|---|
+| as it was | 20,600–21,700 | 21,500 |
+| eight-lane dot product, `tanh` kept; 1 thread | 36,100–37,300 | 36,400 |
+| 6 threads | 141,400–145,700 | 143,900 |
+| 12 threads | 142,900–192,300 | 177,100 |
+| 16 threads (one window each) | 163,200–208,900 | 190,200 |
+
+That is 1.7x from two changes to the arithmetic and 5.2x more from threads:
+8.9x. The default 2000 steps, sampling included, take 10.5 to 12.7 seconds
+rather than 91. The runs were interleaved, five of each, on a machine 70% idle
+before and 87% after. An earlier attempt is worth recording: halfway through
+it another job started 144 processes that spin forever, the unchanged code
+measured a third of its own speed, and every ratio held while every absolute
+number was wrong.
+
+Sixteen threads buy 5.2x, not 16x, and the profiler says why. This machine has
+6 fast cores and 12 slow ones; every step ends when the slowest thread does, and
+the main thread spent 73% of its time waiting. Six threads, which fit on the
+fast cores, get 4.0x, and repeat to within 3%; past six the range opens to 28%,
+because it depends on which cores the scheduler picks. Letting threads pull windows from a shared queue, so that
+fast cores take more, was tried and measured no better than noise at these
+batch sizes — and it would cost reproducibility, since which replica sums which
+windows would then depend on scheduling. The rest is the serial part: adding up
+16 copies of the gradient, AdamW, and starting 16 threads a step, together
+about a quarter of the main thread's time.
 
 ### Running it in the engine
 
@@ -1145,8 +1213,9 @@ file with sampling ([`text.rs`](crates/nanograd/src/text.rs)). So this step
 works, at 117 thousand parameters rather than 10 million, and the result is
 saved as a GPT-2 checkpoint ([`checkpoint.rs`](crates/nanograd/src/checkpoint.rs))
 from which the `kvad` engine computes the same logits. What stands between the
-two sizes is speed — one core, one sequence at a time, about 22,000 characters
-a second. Nothing stands between the two crates any more: `kvad run --model DIR`
+two sizes is speed, which is nine times what it was — about 190,000 characters
+a second across the cores — and still a hand-written loop on a CPU: a 10M
+parameter model is some eighty times the arithmetic per character. Nothing stands between the two crates any more: `kvad run --model DIR`
 runs what `train_text --save DIR` wrote. Llama's SwiGLU and RoPE are not
 written. The gradient check from crate 1 is how
 you will debug each one — extend `nanograd` (hard, most educational) or use

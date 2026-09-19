@@ -107,22 +107,54 @@ impl Matrix {
     /// dx = dy @ Wᵀ.
     pub fn matmul_a_bt(&self, b: &Matrix) -> Matrix {
         assert_eq!(self.cols, b.cols, "matmul_a_bt shape mismatch");
-        let (m, k, n) = (self.rows, self.cols, b.rows);
+        let (m, n) = (self.rows, b.rows);
         let mut out = Matrix::zeros(m, n);
         for i in 0..m {
             let a_row = self.row(i);
             let out_row = out.row_mut(i);
-            for j in 0..n {
-                let b_row = b.row(j);
-                let mut acc = 0.0;
-                for p in 0..k {
-                    acc += a_row[p] * b_row[p];
-                }
-                out_row[j] = acc;
+            for (j, out) in out_row.iter_mut().enumerate() {
+                *out = dot(a_row, b.row(j));
             }
         }
         out
     }
+}
+
+/// How many running sums [`dot`] keeps.
+const LANES: usize = 8;
+
+/// The dot product, summed in eight lanes rather than one.
+///
+/// The obvious loop, `acc += a[p] * b[p]`, was half of all the time spent
+/// training a transformer in this crate, and the reason is a rule of
+/// arithmetic, not of hardware. Floating-point addition is not associative:
+/// `(x + y) + z` and `x + (y + z)` round differently. A compiler may not
+/// change what a program computes, so it may not reorder that sum, and a sum
+/// that must be done in order is done one number at a time — each addition
+/// waiting for the one before — while a SIMD register that holds four floats
+/// sits idle. (The compiler did vectorise the *multiplications*. Then it
+/// added the products up singly.)
+///
+/// Eight independent sums say, in the code, that the order is ours to choose:
+/// lane `l` takes elements `l, l + 8, l + 16, ...`, and the lanes meet at the
+/// end. Now the additions are two 4-wide vector adds with no dependence on
+/// each other. Measured on `train_text`, this one function made training 1.5x
+/// faster end to end; 4 lanes did nothing, and 16 and 32 were slower than 8,
+/// because attention's vectors are 16 long and a chunk that does not fill is
+/// handled by the slow loop.
+///
+/// The answer differs from the single sum's in the last bits. Neither is
+/// more correct; they are two roundings of the same number.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; LANES];
+    let (a_chunks, b_chunks) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
+    let tail: f32 = a_chunks.remainder().iter().zip(b_chunks.remainder()).map(|(x, y)| x * y).sum();
+    for (ca, cb) in a_chunks.zip(b_chunks) {
+        for l in 0..LANES {
+            acc[l] += ca[l] * cb[l];
+        }
+    }
+    acc.iter().sum::<f32>() + tail
 }
 
 #[cfg(test)]
@@ -176,5 +208,18 @@ mod tests {
         let c = m(2, 4, &[1., 2., 3., 4., 5., 6., 7., 8.]);
         let d = m(3, 4, &[1., 0., -1., 2., 3., 1., 0., -2., 0.5, 2., 1., 1.]);
         assert_eq!(c.matmul_a_bt(&d), naive_matmul(&c, &transpose(&d)));
+    }
+
+    /// Wide enough to fill the lanes of `dot` four times over and leave five
+    /// elements for the remainder, which the small cases above never reach.
+    /// The values are small whole numbers, so every partial sum is exact and
+    /// the order of addition cannot excuse a difference.
+    #[test]
+    fn a_bt_matches_definition_beyond_one_chunk() {
+        let (rows, k, n) = (3, 4 * LANES + 5, 6);
+        let values = |count: usize, salt: usize| (0..count).map(|i| ((i * 7 + salt) % 11) as f32 - 5.0).collect();
+        let a = Matrix::from_vec(rows, k, values(rows * k, 1));
+        let b = Matrix::from_vec(n, k, values(n * k, 4));
+        assert_eq!(a.matmul_a_bt(&b), naive_matmul(&a, &transpose(&b)));
     }
 }

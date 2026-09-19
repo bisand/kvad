@@ -200,6 +200,95 @@ pub fn train_step(model: &mut Gpt, opt: &mut AdamW, tokens: &[usize], batch: usi
     total / batch as f32
 }
 
+/// Copies of a model, one to a thread, that share the work of each batch.
+///
+/// # Data parallelism
+///
+/// The windows in a batch have nothing to do with each other until their
+/// gradients are added up, and addition does not care who did the work. So:
+///
+/// 1. **Broadcast.** Every replica is given the current weights.
+/// 2. **Compute.** Each takes its share of the windows and runs forward and
+///    backward on them, accumulating gradients of its own, on a thread of its
+///    own. Nothing is shared and nothing is locked.
+/// 3. **All-reduce.** The replicas' gradients are added into the one model
+///    that has an optimiser, and it takes the step.
+///
+/// That is the whole of how a model is trained on a thousand GPUs, with a
+/// core standing in for a GPU and a `memcpy` for the network. It is also why
+/// each replica is a full model rather than a view of shared weights: a layer
+/// keeps what it saw on the way forward for use on the way back, so two
+/// threads cannot be inside the same layer at once.
+///
+/// The step it takes is the step [`train_step`] would have taken — the same
+/// windows, drawn in the same order from the same generator — except that the
+/// gradients are summed in a different order, and floating-point addition
+/// notices. Window `i` always goes to replica `i mod n` and the replicas are
+/// always reduced in order, so a run is reproducible for a given number of
+/// threads, and differs in the last bits between one number and another.
+pub struct Replicas {
+    models: Vec<Gpt>,
+}
+
+impl Replicas {
+    pub fn new(model: &Gpt, threads: usize) -> Self {
+        assert!(threads > 0, "training needs at least one thread");
+        // Built with throwaway weights; every step begins by replacing them.
+        let models = (0..threads).map(|_| Gpt::new(model.config(), &mut Rng::new(0))).collect();
+        Replicas { models }
+    }
+
+    /// One step on `batch` random windows, split across the replicas.
+    /// Returns their mean loss.
+    pub fn train_step(&mut self, model: &mut Gpt, opt: &mut AdamW, tokens: &[usize], batch: usize, rng: &mut Rng) -> f32 {
+        let context = model.config().context;
+        let windows: Vec<_> = (0..batch).map(|_| window(tokens, context, rng)).collect();
+        let n = self.models.len();
+
+        for replica in self.models.iter_mut() {
+            for (theirs, ours) in replica.params().into_iter().zip(model.params()) {
+                theirs.value.copy_from_slice(ours.value); //           broadcast
+            }
+        }
+
+        let total: f32 = std::thread::scope(|scope| {
+            let windows = &windows;
+            let running: Vec<_> = self
+                .models
+                .iter_mut()
+                .enumerate()
+                .map(|(r, replica)| {
+                    scope.spawn(move || {
+                        let mut total = 0.0;
+                        replica.zero_grad();
+                        for (input, target) in windows.iter().skip(r).step_by(n) {
+                            let logits = replica.forward(input);
+                            let (loss, mut dlogits) = softmax_cross_entropy(&logits, target);
+                            // By the whole batch, not by this replica's share
+                            // of it: the mean is over every window there is.
+                            dlogits.data.iter_mut().for_each(|g| *g /= batch as f32);
+                            replica.backward(&dlogits); //               compute
+                            total += loss;
+                        }
+                        total
+                    })
+                })
+                .collect();
+            running.into_iter().map(|thread| thread.join().expect("a training thread panicked")).sum()
+        });
+
+        model.zero_grad();
+        for replica in self.models.iter_mut() {
+            for (ours, theirs) in model.params().into_iter().zip(replica.params()) {
+                ours.grad.iter_mut().zip(theirs.grad.iter()).for_each(|(sum, g)| *sum += g); // all-reduce
+            }
+        }
+        opt.step(model.params());
+
+        total / batch as f32
+    }
+}
+
 /// Mean loss over `windows` random windows, with no learning.
 pub fn evaluate(model: &mut Gpt, tokens: &[usize], windows: usize, rng: &mut Rng) -> f32 {
     let context = model.config().context;
@@ -411,9 +500,94 @@ mod tests {
         for _ in 0..2 {
             train_step(&mut model, &mut frozen, &tokens, 3, &mut rng);
             let three = grads(&mut model);
-            let worst = one.iter().zip(&three).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            let worst = worst_gap(&one, &three);
             assert!(worst < 1e-6, "a batch of three identical windows differs from one by {worst:e}");
         }
+    }
+
+    /// The largest difference between two lists of numbers. `f32::max` prefers
+    /// anything to a NaN, so a fold over it reports two lists of NaN as
+    /// identical; this reports them as infinitely far apart.
+    fn worst_gap(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        if a.iter().chain(b).any(|v| !v.is_finite()) {
+            return f32::INFINITY;
+        }
+        a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max)
+    }
+
+    /// A text that can be learned — it counts to seven, over and over — with
+    /// an occasional wrong note, so that no two windows are quite alike.
+    fn some_tokens(count: usize, vocab: usize) -> Vec<usize> {
+        let mut rng = Rng::new(31);
+        (0..count).map(|i| if rng.below(8) == 0 { rng.below(vocab) } else { i % 7 }).collect()
+    }
+
+    const SMALL: GptConfig = GptConfig { vocab: 10, context: 8, d_model: 8, n_heads: 2, n_layers: 2 };
+
+    /// Splitting a batch across threads must not change what is computed,
+    /// only who computes it. Seven windows do not divide evenly among two,
+    /// three or four replicas, and ten replicas leave three with nothing to do.
+    #[test]
+    fn replicas_compute_the_gradient_one_model_would() {
+        let tokens = some_tokens(200, SMALL.vocab);
+        let grads = |model: &mut Gpt| -> Vec<f32> { model.params().iter().flat_map(|p| p.grad.to_vec()).collect() };
+        let frozen = || {
+            let mut opt = AdamW::new(0.0);
+            opt.weight_decay = 0.0;
+            opt
+        };
+
+        for threads in [1, 2, 3, 4, 10] {
+            let (mut alone, mut shared) = (Gpt::new(SMALL, &mut Rng::new(5)), Gpt::new(SMALL, &mut Rng::new(5)));
+            let (mut rng_a, mut rng_b) = (Rng::new(9), Rng::new(9));
+            let (mut opt_a, mut opt_b) = (frozen(), frozen());
+            let mut replicas = Replicas::new(&shared, threads);
+
+            // Twice, so that a gradient left over from the first step, in the
+            // model or in any replica, would show up in the second.
+            for step in 0..2 {
+                let loss_a = train_step(&mut alone, &mut opt_a, &tokens, 7, &mut rng_a);
+                let loss_b = replicas.train_step(&mut shared, &mut opt_b, &tokens, 7, &mut rng_b);
+                let (a, b) = (grads(&mut alone), grads(&mut shared));
+
+                let size = a.iter().fold(0.0f32, |m, g| m.max(g.abs()));
+                let gap = worst_gap(&a, &b) / size;
+                assert!(gap < 1e-5, "{threads} threads, step {step}: gradients differ by {gap:e} of their size");
+                assert!((loss_a - loss_b).abs() < 1e-5, "{threads} threads: loss {loss_a} against {loss_b}");
+                // One replica adds the windows up in the same order, so there
+                // is not even rounding to tell them apart.
+                if threads == 1 {
+                    assert_eq!(a, b);
+                }
+            }
+        }
+    }
+
+    /// With a learning rate of zero the weights never move, and a replica
+    /// still holding the weights it was built with would go unnoticed. So
+    /// train for real, and require the loss to follow the same path step by
+    /// step — which it only can if every replica sees every update.
+    #[test]
+    fn replicas_are_given_the_new_weights_every_step() {
+        let tokens = some_tokens(200, SMALL.vocab);
+        let (mut alone, mut shared) = (Gpt::new(SMALL, &mut Rng::new(5)), Gpt::new(SMALL, &mut Rng::new(5)));
+        let (mut rng_a, mut rng_b) = (Rng::new(9), Rng::new(9));
+        let (mut opt_a, mut opt_b) = (AdamW::new(0.01), AdamW::new(0.01));
+        let mut replicas = Replicas::new(&shared, 3);
+
+        let mut first = 0.0;
+        for step in 0..30 {
+            let loss_a = train_step(&mut alone, &mut opt_a, &tokens, 6, &mut rng_a);
+            let loss_b = replicas.train_step(&mut shared, &mut opt_b, &tokens, 6, &mut rng_b);
+            // Measured: they never part by more than 5e-7.
+            assert!((loss_a - loss_b).abs() < 1e-5, "step {step}: loss {loss_a} alone, {loss_b} shared");
+            if step == 0 {
+                first = loss_a;
+            }
+        }
+        let last = train_step(&mut alone, &mut opt_a, &tokens, 6, &mut rng_a);
+        assert!(last < first - 0.3, "nothing was learned ({first} to {last}), so nothing was tested");
     }
 
     /// Everything in the crate at once: tokeniser, windows, model, AdamW and

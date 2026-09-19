@@ -136,7 +136,7 @@ mod tests {
         }
 
         fn params(&mut self) -> Vec<Param<'_>> {
-            let tensors = self.values.iter_mut().zip(self.grads.iter());
+            let tensors = self.values.iter_mut().zip(self.grads.iter_mut());
             self.names.iter().zip(tensors).map(|(n, (v, g))| Param::new(n, v, g)).collect()
         }
     }

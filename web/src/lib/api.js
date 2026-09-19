@@ -46,25 +46,30 @@ export async function api(path, options = {}) {
 export const health = () => api("/api/health");
 
 /**
- * POST something and read the Server-Sent Events it answers with.
+ * Read a stream of Server-Sent Events.
  *
- * Not `EventSource`, which can only issue GET and so cannot carry a body.
- * Loading a model, pulling one and streaming a reply all need a request body,
- * so all three are POST with an SSE response and all three are read here.
+ * Not `EventSource`, for two reasons: it can only issue GET, so it cannot
+ * carry the body that loading a model or asking for a completion needs; and
+ * it reconnects on its own, which for a job that has ended means replaying
+ * the whole history forever. `fetch` does neither.
  *
- * `on` maps an event name to a handler. The default name for an event without
- * one is "message", which is what /v1/chat/completions sends.
+ * `on` maps an event name to a handler. The default name for an event with no
+ * `event:` line is "message", which is what /v1/chat/completions sends.
  *
  * @param {string} path
- * @param {object} body
+ * @param {object} [body] omitted for a GET
  * @param {Record<string, (data: string) => void>} on
  * @param {AbortSignal} [signal]
+ * @param {"POST"|"GET"} [method]
  */
-export async function sse(path, body, on, signal) {
+export async function sse(path, body, on, signal, method = "POST") {
   const response = await fetch(path, {
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "text/event-stream" },
-    body: JSON.stringify(body),
+    method,
+    headers:
+      method === "GET"
+        ? { accept: "text/event-stream" }
+        : { "content-type": "application/json", accept: "text/event-stream" },
+    body: method === "GET" ? undefined : JSON.stringify(body),
     signal,
   });
   if (!response.ok || !response.body) {

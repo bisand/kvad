@@ -43,14 +43,14 @@ export const PAGES = [
   {
     path: "/training",
     label: "Training",
-    phase: 4,
+    phase: null,
     blurb: "Start a run, watch the loss curve, read what it writes, stop it.",
     icon: "M3 17l6-6 4 4 8-8M21 7v5h-5",
   },
   {
     path: "/datasets",
     label: "Datasets",
-    phase: 4,
+    phase: null,
     blurb: "The text files runs are trained on, and what is in them.",
     icon: "M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
   },

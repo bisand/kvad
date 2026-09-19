@@ -70,10 +70,10 @@ batching exists. So:
   lifted out and shared. Requests queue first-in, first-out, and queue depth is
   a visible metric. When continuous batching lands it replaces the inside of the
   scheduler and nothing above it changes.
-- **Training takes a compute lease.** Whether chat stays usable during training
-  (for example with training capped to N threads) has to be measured, not
-  assumed — interleaved, five runs, median and range. Until it is measured the
-  UI says "training in progress, inference queued".
+- **Training takes a compute lease.** Measured in Phase 4: chat during a
+  training run decodes at roughly half idle speed on all cores, two-thirds
+  with the run capped. So the two are allowed to run together and the UI says
+  "slower" rather than "queued"; the numbers are in that phase.
 - **The UI's chat calls `/v1/chat/completions` itself.** One code path,
   exercised by our own UI. Per-message stats (prefill tok/s, decode tok/s,
   cached tokens) go in an extension field.
@@ -242,8 +242,51 @@ there.
 
 **Phase 3 — auth.** `local`, `basic`, API keys, roles, then OIDC.
 
-**Phase 4 — jobs.** A job runner with downloads and training as jobs, SSE
-progress, the Training and Datasets pages, and the live loss chart.
+**Phase 4 — jobs. Done.**
+
+- **Work that outlives its request.** A download takes minutes and a training
+  run can take an hour, both longer than a browser tab reliably stays open, so
+  the work belongs to the server and a request only watches it. Each live job
+  has a `broadcast` channel; a watcher subscribes *before* the history is read
+  so nothing is lost in between, which means a step can be seen twice — hence
+  metrics and samples keyed by step. Restarting the server marks whatever was
+  running as failed, because a row that claims to be running when nothing is
+  is a run somebody waits for forever.
+- **Checkpoints are written down as they happen**, not at the end, so a run
+  watched in a tab yesterday is a chart today and a run that dies halfway
+  still has its curve. Pulls became jobs too; loads did not, because they are
+  engine work and take seconds.
+- **One training run at a time**, refused rather than queued: an hour of
+  waiting with no way to see why is worse than being told now. Downloads have
+  no such limit — they are waiting on a network.
+- **The Training page** has the live loss chart (uPlot, colours read from
+  daisyUI's variables so it follows the theme), the best step marked, the
+  samples each checkpoint writes, cancel, history, and "chat with this".
+  Cancelling uses the flag Phase 0 put on `Training::stop`; a stopped run
+  keeps the best model it reached and is `cancelled`, not `failed`.
+- **The Datasets page** answers the unseen-character question before a run
+  rather than after: `kvad train --from` refuses a text containing a character
+  the model has no token for, but only once it has read the file and only for
+  the *first* offender. The check here names all of them, so the fix is one
+  edit.
+
+**The compute lease, measured rather than assumed.** Five generations at each
+setting with idle runs either side to catch drift, on an 18-core machine
+decoding SmolLM2-135M at q8:
+
+| | median | range |
+|---|---|---|
+| idle | 70–84 tok/s | 53–92 |
+| training, 18 threads | 32–37 tok/s | 25–41 |
+| training, 8 threads | 47 tok/s | 42–54 |
+| training, 4 threads | 52 tok/s | 44–56 |
+
+So chat during training runs at **roughly half idle speed** on all cores
+(45% and 52% across two runs), and about two-thirds with the run capped to 8
+threads; 8 against 4 is inside the noise. Inference is therefore *not* queued
+behind training and should not be — a thirty-minute wait is not a queue — and
+the banner says "slower", which is what was measured. This replaces the
+placeholder copy this plan asked for.
 
 **Phase 5 — monitoring.** A metrics ring buffer in memory, rollups in SQLite,
 and the Dashboard and Monitoring pages.

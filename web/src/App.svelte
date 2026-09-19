@@ -11,6 +11,8 @@
   import Dashboard from "./routes/Dashboard.svelte";
   import Models from "./routes/Models.svelte";
   import Chat from "./routes/Chat.svelte";
+  import Training from "./routes/Training.svelte";
+  import Datasets from "./routes/Datasets.svelte";
   import Settings from "./routes/Settings.svelte";
   import SignIn from "./routes/SignIn.svelte";
   import NotFound from "./routes/NotFound.svelte";
@@ -83,6 +85,10 @@
         <Models />
       {:else if page.path === "/chat"}
         <Chat />
+      {:else if page.path === "/training"}
+        <Training />
+      {:else if page.path === "/datasets"}
+        <Datasets />
       {:else if page.path === "/settings"}
         <Settings />
       {:else}

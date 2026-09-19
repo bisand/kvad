@@ -30,13 +30,16 @@ mod auth;
 mod chat;
 mod config;
 mod conversations;
+mod datasets;
 mod db;
 mod engine;
+mod jobs;
 mod models;
 mod oidc;
 mod openai;
 mod scheduler;
 mod secret;
+mod training;
 mod users;
 
 use axum::Router;
@@ -148,6 +151,11 @@ async fn run(args: Args) -> Res<()> {
     // A mode with accounts and no accounts needs a way in. One token, printed
     // where only somebody with access to this terminal can read it, gone when
     // it is used or when the server restarts.
+    // Anything that was running when the server last stopped is not running
+    // now, whatever its row says.
+    let job_runner = std::sync::Arc::new(jobs::Jobs::new(db.clone()));
+    let orphans = job_runner.abandon_orphans().unwrap_or(0);
+
     let setup = std::sync::Arc::new(auth::Setup::default());
     let accounts = users::count(&db)?;
     // Not in OIDC mode: the first account there is made by the first person
@@ -159,6 +167,7 @@ async fn run(args: Args) -> Res<()> {
     let state = auth::State {
         auth: auth::provider(cfg.auth.mode, &cfg.auth.oidc)?.into(),
         engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader())),
+        jobs: std::sync::Arc::clone(&job_runner),
         setup: std::sync::Arc::clone(&setup),
         oidc: std::sync::Arc::new((cfg.auth.oidc.clone(), oidc::Flows::default())),
         started: std::time::Instant::now(),
@@ -210,6 +219,9 @@ async fn run(args: Args) -> Res<()> {
     }
     if swept > 0 {
         tracing::info!("swept {swept} expired session(s)");
+    }
+    if orphans > 0 {
+        tracing::info!("{orphans} job(s) were interrupted by a restart and are marked failed");
     }
 
     axum::serve(listener, app).with_graceful_shutdown(interrupted()).await?;

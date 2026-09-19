@@ -43,6 +43,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("001-settings", include_str!("migrations/001-settings.sql")),
     ("002-chat", include_str!("migrations/002-chat.sql")),
     ("003-users", include_str!("migrations/003-users.sql")),
+    ("004-jobs", include_str!("migrations/004-jobs.sql")),
 ];
 
 #[derive(Clone)]

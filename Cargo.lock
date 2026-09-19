@@ -2456,6 +2456,7 @@ dependencies = [
  "kvad",
  "kvad-gpu",
  "mime_guess",
+ "nanograd",
  "openidconnect",
  "rusqlite",
  "rust-embed",

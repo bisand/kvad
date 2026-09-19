@@ -15,13 +15,11 @@
 
 use crate::api::{blocking, Fail};
 use crate::auth::{Admin, Identity, State};
-use crate::scheduler::Progress;
 use axum::extract::{Query, State as St};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
 use kvad::hub;
-use kvad::weights;
 use serde_json::json;
 use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
@@ -294,59 +292,30 @@ pub struct PullRequest {
 
 /// Download a model without loading it.
 ///
-/// Not scheduler work: a download is network and disk, and making it wait
-/// behind a generation would be a queue for no reason. It is also why the
-/// Models page can pull one model while chatting with another.
+/// A job rather than a stream, since Phase 4. A checkpoint of several
+/// gigabytes takes longer than a browser tab reliably stays open, and a
+/// download that dies because somebody navigated away is a download that has
+/// to start again. The answer is the job; watch it at
+/// `/api/jobs/{id}/events`.
+///
+/// Still not scheduler work: a download is network and disk, so making it
+/// wait behind a generation would be a queue for no reason. That is why the
+/// Models page can pull one model while somebody chats with another.
 pub async fn pull(
-    _: Admin,
+    who: Admin,
+    St(state): St<State>,
     Json(body): Json<PullRequest>,
-) -> Result<impl IntoResponse, Fail> {
+) -> Result<Json<crate::jobs::Job>, Fail> {
     let repo = body.repo.trim().to_string();
     if repo.is_empty() {
         return Err(Fail::bad("no model was named"));
     }
-
-    let (events, rx) = tokio::sync::mpsc::channel::<Event>(64);
-    let reporter = events.clone();
-    tokio::task::spawn_blocking(move || {
-        let watch = {
-            let reporter = reporter.clone();
-            weights::Watcher::new(move |f| {
-                if let Some(p) = progress_of(f) {
-                    // `try_send` rather than blocking: this runs on hf-hub's
-                    // own download threads, which must not be held up by a
-                    // browser that is reading slowly.
-                    let _ = reporter.try_send(sse("progress", &p));
-                }
-            })
-        };
-        let mut say = |message: &str| {
-            let _ = reporter.blocking_send(sse(
-                "progress",
-                &Progress::Status { message: message.to_string() },
-            ));
-        };
-        let outcome = match weights::fetch_watched(&repo, &mut say, &watch) {
-            Ok(_) => sse("pulled", &json!({ "repo": repo })),
-            Err(e) => sse("error", &json!({ "error": e.to_string() })),
-        };
-        let _ = reporter.blocking_send(outcome);
-    });
-    drop(events);
-
-    Ok(stream(rx))
-}
-
-fn progress_of(f: weights::Fetch) -> Option<Progress> {
-    match f {
-        weights::Fetch::Download { total: 0, .. }
-        | weights::Fetch::Local
-        | weights::Fetch::Shards(_) => None,
-        weights::Fetch::Download { file, bytes, total } => {
-            Some(Progress::Download { file, bytes, total })
-        }
-        weights::Fetch::Fetched { file } => Some(Progress::Fetched { file }),
-    }
+    let jobs = state.jobs.clone();
+    let owner = who.0.id;
+    blocking(move || crate::jobs::pull(&jobs, repo, owner))
+        .await
+        .map(Json)
+        .map_err(|e| Fail::bad(e.1))
 }
 
 #[derive(serde::Deserialize)]

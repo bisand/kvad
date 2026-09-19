@@ -379,6 +379,7 @@ pub struct State {
     pub db: crate::db::Db,
     pub auth: std::sync::Arc<dyn Provider>,
     pub engine: std::sync::Arc<crate::scheduler::Scheduler>,
+    pub jobs: std::sync::Arc<crate::jobs::Jobs>,
     pub setup: std::sync::Arc<Setup>,
     /// What an identity provider was told, and the sign-ins waiting on it.
     /// Empty and unused in every other mode.

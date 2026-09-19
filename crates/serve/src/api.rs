@@ -62,6 +62,7 @@ pub fn routes() -> Router<State> {
         .route("/api/sessions/{hash}", delete(crate::accounts::revoke_session))
         .route("/api/keys", get(crate::accounts::list_keys).post(crate::accounts::create_key))
         .route("/api/keys/{id}", delete(crate::accounts::revoke_key))
+        .merge(crate::training::routes())
 }
 
 /// A request that could not be answered, as a status and a sentence.

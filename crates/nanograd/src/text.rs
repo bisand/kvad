@@ -66,6 +66,17 @@ impl CharTokenizer {
         self.chars.len()
     }
 
+    /// Every character this tokeniser has an id for, in order.
+    ///
+    /// [`encode`](Self::encode) reports the *first* character it cannot
+    /// handle, which is what a training run needs — it is about to fail and
+    /// the message should name the culprit. Anything that wants to say what a
+    /// text would cost *before* running it needs the whole set to compare
+    /// against, and this is it.
+    pub fn chars(&self) -> &[char] {
+        &self.chars
+    }
+
     /// Fails with the offending character if the text holds one this
     /// tokeniser never saw: the model has no row for it.
     pub fn encode(&self, text: &str) -> Result<Vec<usize>, char> {

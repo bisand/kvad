@@ -80,8 +80,57 @@ class Models {
     return ok;
   }
 
+  /**
+   * Pull a model. Since Phase 4 this is a job, not a stream: a checkpoint of
+   * several gigabytes outlasts a browser tab, and a download that died
+   * because somebody navigated away is a download that has to start again.
+   * Closing this page now only stops the watching.
+   */
   async pull(repo) {
-    const ok = await this.#watch("pulling", "/api/models/pull", { repo }, "pulled");
+    if (this.busy) {
+      toasts.warning(`Already ${this.busy.what}. Wait for it to finish.`);
+      return false;
+    }
+    let job;
+    try {
+      job = await api("/api/models/pull", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repo }),
+      });
+    } catch (e) {
+      toasts.error(e.message);
+      return false;
+    }
+
+    this.busy = { what: "pulling", message: "starting", bytes: 0, total: 0 };
+    let ok = false;
+    try {
+      await sse(
+        `/api/jobs/${job.id}/events`,
+        undefined,
+        {
+          update: (data) => {
+            const u = JSON.parse(data);
+            if (u.kind === "download") {
+              this.busy = { what: "pulling", message: u.file, bytes: u.bytes, total: u.total };
+            } else if (u.kind === "status") {
+              this.busy = { what: "pulling", message: u.message, bytes: 0, total: 0 };
+            } else if (u.kind === "ended") {
+              ok = u.state === "done";
+              if (!ok && u.error) throw new Error(u.error);
+            }
+          },
+        },
+        undefined,
+        "GET",
+      );
+    } catch (e) {
+      toasts.error(e.message);
+    } finally {
+      this.busy = null;
+      await this.refresh();
+    }
     if (ok) toasts.success(`Pulled ${repo}.`);
     return ok;
   }

@@ -7,3 +7,4 @@
 # to exist for rust-embed to compile, which is what the .gitkeep is for.
 /web/dist/*
 !/web/dist/.gitkeep
+*.env

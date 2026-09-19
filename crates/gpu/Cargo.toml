@@ -3,6 +3,7 @@ name = "kvad-gpu"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "The same transformer, on the GPU via candle."
 
 [lib]

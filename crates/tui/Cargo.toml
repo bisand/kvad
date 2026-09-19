@@ -3,6 +3,7 @@ name = "kvad-tui"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Terminal UI for browsing, downloading and chatting with local models."
 
 [[bin]]

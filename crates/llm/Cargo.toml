@@ -3,6 +3,7 @@ name = "kvad"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Transformer inference from scratch: GPT-2 and Llama-family models, no ML framework."
 
 [dependencies]

@@ -44,7 +44,7 @@ Numbers to measure against (M5 Pro, 6 fast + 12 slow cores, default model of
 1250 and then overfits.
 
 The repository is public at https://github.com/bisand/kvad, `master` tracking
-`origin/master`. Push only when asked. It has no LICENSE file.
+`origin/master`, under the MIT licence. Push only when asked.
 
 ## Task 1: `kvad train`
 

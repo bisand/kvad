@@ -5,6 +5,7 @@ members = ["crates/nanograd", "crates/llm", "crates/tui", "crates/gpu"]
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
+license = "MIT"
 
 # Release-ish profile for `cargo run` too. Numerical code is 20-50x slower
 # in debug builds, which makes "is my backprop wrong?" impossible to tell

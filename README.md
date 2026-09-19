@@ -1267,3 +1267,7 @@ And for the serving track:
   with PagedAttention* (2023) — the vLLM paper, and step 4 above.
 - Yu et al., *Orca* (2022) — where continuous batching comes from.
 - Dao et al., *FlashAttention* (2022).
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

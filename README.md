@@ -47,9 +47,18 @@ activation quantisation, an i8mm integer kernel, a tiled f32 GEMM, batched
 prefill, prefix caching across chat turns, and a memory-mapped cache of
 pre-quantised weights.
 
-It has none of what makes a *server* fast: no continuous batching, no paged KV
-cache, no HTTP API, no kernels of its own on CUDA, no speculative decoding. The
-KV cache is a `Vec<f32>` per layer that grows by appending, and 805 MB of it at
+There is now an HTTP API and a web UI around it: OpenAI-compatible completions,
+plus model management, training, evals, benchmarks and monitoring. None of that
+makes it a fast server, and it is built not to pretend otherwise — requests
+queue behind one another because the engine runs one generation at a time, and
+the queue depth is a number on the dashboard rather than a mutex nobody can
+see. What it did change is that the decode numbers in this README now have a
+button that reproduces them: interleaved rounds, medians and ranges, and a
+refusal to measure a machine that is busy doing something else.
+
+It still has none of what makes a server *fast*: no continuous batching, no
+paged KV cache, no kernels of its own on CUDA, no speculative decoding. The KV
+cache is a `Vec<f32>` per layer that grows by appending, and 805 MB of it at
 Qwen's full context. Nothing here has been benchmarked against vLLM or SGLang,
 because a single-sequence engine and a serving engine do not yet have a number
 in common.

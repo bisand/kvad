@@ -331,7 +331,7 @@ impl Weight {
 
         let mut out = match &self.data {
             Data::F32(t) => matvec_bt(x, t),
-            _ if self.bytes() < INTEGER_PATH_MIN_BYTES => self.matvec_bt_dequant(x),
+            _ if dequant_kernel() => self.matvec_bt_dequant(x),
             _ => {
                 let n = self.cols;
                 let blocks_per_row = n / BLOCK;
@@ -441,8 +441,9 @@ impl Weight {
     /// The dequantising kernel: unpack each weight to `f32` and use ordinary
     /// float FMAs, leaving the activations alone.
     ///
-    /// Slower than the integer path on large matrices, and *faster* on small
-    /// ones — see [`INTEGER_PATH_MIN_BYTES`].
+    /// No longer the default at any size — see [`dequant_kernel`] for the
+    /// threshold that used to select it and why it was wrong. Kept as the
+    /// baseline the integer path is measured against.
     fn matvec_bt_dequant(&self, x: &[f32]) -> Vec<f32> {
         let n = self.cols;
         let blocks_per_row = n / BLOCK;
@@ -513,22 +514,26 @@ impl Weight {
     }
 }
 
-/// Above this many bytes of weights, quantise the activations and use the
-/// integer kernel; below it, dequantise to f32 instead.
+/// Which kernel a quantised weight uses.
 ///
-/// # Why there are two kernels
+/// There used to be a size threshold here — integer dots above 32 MB of
+/// weights, dequantise to f32 below it — on the measured grounds that the
+/// integer path won 5x on the output head and *lost* on a 5 MB MLP matrix.
 ///
-/// The integer path is much faster on a matrix that has to be streamed from
-/// main memory, and slower on one that already fits in cache. A cache-resident
-/// matmul is not bandwidth-bound, so shrinking the weights buys nothing, and
-/// the extra steps — quantising the activation vector, the second pass over
-/// the block dots — are pure overhead.
+/// That threshold was measuring rayon, not arithmetic. Every call in that
+/// benchmark paid ~0.17 ms of cold-path dispatch (see
+/// [`crate::model::CpuSession::forward`]), which is invisible next to a 153 MB
+/// matmul and is the entire runtime of a 5 MB one. With the dispatch gone, the
+/// integer path wins everywhere it applies: 1.13x to 1.70x end to end across
+/// three models and both precisions, and nothing measured slower.
 ///
-/// Measured here: the 151936-row output head runs 5.1x faster with integer
-/// dots, while a 5 MB MLP matrix runs *slower* than simply dequantising. The
-/// threshold sits between the two. It is empirical, and the right value on
-/// another machine depends on its last-level cache.
-const INTEGER_PATH_MIN_BYTES: usize = 32 << 20;
+/// So there is one kernel now. The dequantising one is kept because it is the
+/// honest baseline for what the integer path buys, and `KVAD_DEQUANT=1`
+/// selects it.
+fn dequant_kernel() -> bool {
+    matches!(std::env::var("KVAD_DEQUANT").as_deref(), Ok("1") | Ok("true"))
+}
+
 
 // ---------------------------------------------------------------------------
 // Batched matmul: the prefill path

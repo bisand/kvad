@@ -116,6 +116,24 @@ fn bench_batch(label: &str, rows: usize, cols: usize, m: usize) {
 }
 
 fn main() {
+    // Everything below runs *inside* a pool, the way the engine does.
+    //
+    // This matters more than it looks. Benchmarking from the main thread —
+    // which is not a pool worker — makes every call take rayon's cold path:
+    // inject the job, wake the workers, block on a condvar. That cost is a
+    // flat ~0.17 ms here, which is invisible next to the output head and
+    // completely swamps a 5 MB MLP matrix. Measured that way, `mlp.down` took
+    // exactly 0.17 ms at f32, q8 and q4 alike — six times the bytes, the same
+    // time — and the conclusion "small matrices do not benefit from
+    // quantisation" was really "this harness measures its own dispatch".
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(kvad::model::threads())
+        .build()
+        .expect("building a thread pool");
+    pool.install(run);
+}
+
+fn run() {
     println!("threads: {}", rayon::current_num_threads());
     println!("i8mm:    {}", kvad::simd::has_i8mm());
     // The output head: by far the largest single matmul per token.

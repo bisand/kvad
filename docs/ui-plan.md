@@ -379,7 +379,10 @@ for the same 519 tokens. Chased down afterwards: `matmul_bt_with` gates the
 batched `SMMLA` kernel on `Data::Q8`, so q4 prefill takes the row-at-a-time
 fallback. Both paths are integer and neither dequantises, so this is a missing
 kernel rather than a cost of quantisation — which is the opposite of what the
-first reading of the number assumed. On a two-case suite, q8 continued "The
+first reading of the number assumed. Since written: unpacking a row pair of
+nibbles into `i8` hands q4 to the same kernel, roughly doubling q4 prefill and
+closing the gap. The page found a real bug in the engine underneath it, which
+is the best argument for having built it. On a two-case suite, q8 continued "The
 capital of France is" with " Paris" and q4 with " the capital of the country
 of France"; on held-out prose q8 scored 2.03 perplexity against q4's 2.26, and
 on the same text shuffled, 514.8 against 568.1. Quantisation costs accuracy in

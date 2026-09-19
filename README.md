@@ -966,6 +966,38 @@ Rust exposes `SMMLA` only through an unstable intrinsic, so
 four lines. Availability is detected at runtime, so one binary still runs on
 CPUs without it.
 
+**q4 takes this kernel too, and for a while it did not.** The gate was one
+condition — `matches!(self.data, Data::Q8 { .. })` — and everything at q4
+prefilled on the row-at-a-time fallback while unpacking nibbles on top. The web
+UI's benchmark page is what turned it up, by measuring time to first token
+beside decode rate and showing q4 losing the one while winning the other.
+
+The fix is a format problem rather than a kernel problem. `SMMLA` wants eight
+contiguous `i8`; q4 stores two weights per byte, with the *low* nibble of each
+byte belonging to the first half of a block and the high nibble to the second,
+and the sign carried as a bias removed later during scaling. Unpacking a row
+pair into plain `i8` — subtracting the 8 on the way, which is exactly the
+correction `row_dot` applies afterwards — hands the existing kernel an operand
+it already understands, and costs `n` bytes of work reused across all `m`
+activation rows.
+
+Prefill, 862 tokens of this README, Qwen2.5-0.5B, five rounds interleaved:
+
+| | median | range | |
+|---|---|---|---|
+| q4, row at a time (`KVAD_NO_I8MM=1`) | 4.58 s | 4.05–4.77 | |
+| q4, `SMMLA` | 2.54 s | 2.02–2.74 | **1.8x** |
+| q8, `SMMLA` | 2.52 s | 2.03–2.78 | |
+
+A second run of five put q4 at 2.15 s against 4.68 s, so the gain is 1.8–2.2x
+depending on the round. The absolute times are worse than the table above
+because the machine was not quiet; the ratios are the claim, and interleaving
+the settings is what makes them survive that. The line that matters is the
+third: q4 prefill went from roughly half q8's speed to level with it, while
+still decoding faster. In the server's own benchmark, time to first token at q4
+moved from 41 ms to 33.8 against q8's 34.3 — a difference that has stopped
+existing.
+
 ### The bug worth stealing
 
 The first version of the `SMMLA` kernel was **slower than the `SDOT` path it
@@ -1509,13 +1541,19 @@ And with nothing else running, q4 against q8 at 64 tokens, three rounds each:
 | q4 | 149.5 tok/s | 149.3–150.2 | 41 ms |
 | q8 | 114.6 tok/s | 97.2–118.3 | 30 ms |
 
-q4 decodes faster and reaches its first token *slower*, and the same split
-shows in scoring, where q4 took twice as long as q8 for the same 519 tokens.
+q4 decoded faster and reached its first token *slower*, and the same split
+showed in scoring, where q4 took twice as long as q8 for the same 519 tokens.
 Decoding is bound by memory traffic, where fewer bits win. Prefill is bound by
-arithmetic — and q8 has a batched `SMMLA` kernel there while q4 does not, so it
-falls back to a row at a time. Both are integer; neither dequantises. The gap
-is a kernel nobody has written, not a price quantisation charges, and finding
-that out took one benchmark run on a page built for the purpose.
+arithmetic — and q8 had a batched `SMMLA` kernel there while q4 did not, so it
+fell back to a row at a time. Both are integer; neither dequantises. That was a
+missing kernel rather than a price quantisation charges, and
+[it has since been written](#batched-prefill-and-i8mm): q4 prefill roughly
+doubled and the 41-against-30 gap closed to nothing.
+
+This is the first thing the web UI paid for. Nobody would have run that
+comparison from a shell, because it needs two model loads and ten interleaved
+generations to say anything, and the number it turned up was hiding in plain
+sight behind a decode rate that looked fine.
 
 ### The playground is where the logits stop being abstract
 
@@ -1663,19 +1701,17 @@ with any grace, and it says so rather than queuing quietly.
 decoding. This is the stretch where legibility and speed start to fight, and
 the point at which this README owes an honest account of the trade.
 
-**And a missing kernel, which the benchmark page turned up.** q4 decodes faster
-than q8 — 149 against 115 tok/s on SmolLM2-135M — and reaches its first token
-*slower*, 41 ms against 30. Scoring a held-out file, which is nearly all
-prefill, took q4 twice as long as q8.
-
-Not a cost of quantisation: both paths are integer, and neither dequantises to
-floats. It is one line in `matmul_bt_with`, which gates the batched `SMMLA`
-kernel on `Data::Q8`. q4 has no such kernel and falls back to a row at a time,
-unpacking nibbles as it goes — so prefill at q4 is the portable path while q8
-gets [the i8mm one](#batched-prefill-and-i8mm).
-Whether a q4 `SMMLA` pays depends on whether unpacking into the operand shape
-that kernel wants costs less than the kernel saves, and nobody has tried. It is
-the smallest unclaimed win on this list.
+**And a kernel the benchmark page found, which is now written.** q4 decoded
+faster than q8 and reached its first token *slower* — 41 ms against 30 — which
+read like a cost of quantisation and was not. Both paths are integer and
+neither dequantises; the batched `SMMLA` kernel was simply gated on
+`Data::Q8`, and q4 fell back to a row at a time. Unpacking a row pair of
+nibbles into `i8` hands it to the same kernel and
+[roughly doubles q4 prefill](#batched-prefill-and-i8mm), which puts it level
+with q8 while it still decodes faster. Worth writing down as a method rather
+than a result: the number came from a page built to compare things, the
+explanation that first suggested itself was wrong, and reading the dispatch
+took less time than believing it would have cost.
 
 ### Worth reading alongside
 

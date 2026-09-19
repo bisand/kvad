@@ -631,8 +631,13 @@ impl Weight {
 
         let (n, rows) = (self.cols, self.rows);
         let blocks = n / BLOCK;
-        let use_smmla =
-            allow_smmla && crate::simd::has_i8mm() && matches!(self.data, Data::Q8 { .. }) && m >= 2;
+        // Both quantised layouts, not just q8. q4's nibbles are unpacked to
+        // `i8` once per row pair below, which is `n` bytes of work reused
+        // across all `m` activation rows.
+        let use_smmla = allow_smmla
+            && crate::simd::has_i8mm()
+            && matches!(self.data, Data::Q8 { .. } | Data::Q4 { .. })
+            && m >= 2;
 
         // Both precisions fill the same transposed buffer, so the layout fix-up
         // and the bias are written once rather than per kernel.
@@ -643,6 +648,10 @@ impl Weight {
         }
 
         let act = QActBatch::new(xs, m, n, use_smmla);
+        let unpacked_len = match (use_smmla, &self.data) {
+            (true, Data::Q4 { .. }) => 2 * n,
+            _ => 0,
+        };
 
         // Computed transposed — `[rows, m]` — so each thread owns a contiguous
         // run of output rows and reads each weight row exactly once.
@@ -650,8 +659,11 @@ impl Weight {
             .par_chunks_mut(2 * m)
             .enumerate()
             .for_each_init(
-                || vec![0i32; blocks],
-                |scratch, (rp, chunk)| {
+                // The second buffer holds one row pair of q4 weights unpacked
+                // to `i8`; it stays empty for q8, which the kernel reads
+                // straight out of the weight matrix.
+                || (vec![0i32; blocks], vec![0i8; unpacked_len]),
+                |(scratch, unpacked), (rp, chunk)| {
                 let r0 = rp * 2;
                 let have_pair = chunk.len() == 2 * m;
 
@@ -661,7 +673,7 @@ impl Weight {
                     // whose sizes are fixed by `rows`, `cols` and `m`.
                     #[cfg(target_arch = "aarch64")]
                     unsafe {
-                        self.smmla_row_pair(&act, r0, m, blocks, chunk);
+                        self.smmla_row_pair(&act, r0, m, blocks, chunk, unpacked);
                     }
                     #[cfg(not(target_arch = "aarch64"))]
                     unreachable!();
@@ -760,6 +772,42 @@ impl Weight {
         total[0] + total[1]
     }
 
+    /// Unpack weight rows `r0` and `r0+1` from nibbles into `i8`.
+    ///
+    /// Two things happen here, and the second is what makes the kernel
+    /// reusable. The nibbles are laid out two-to-a-byte with the *low* half of
+    /// each byte belonging to the first sixteen weights of a block and the
+    /// high half to the second sixteen, so unpacking has to scatter rather
+    /// than stream. And the stored nibble is unsigned, 0 to 15, with the bias
+    /// removed later — `row_dot` does it as `d - 8 * sum(activations)`.
+    /// Subtracting 8 here instead is exactly equivalent, and it means the
+    /// result is an ordinary signed weight that `SMMLA` can eat without the
+    /// kernel knowing anything about quantisation.
+    ///
+    /// Cost is `n` bytes read and `2n` written per row pair, against `m/2`
+    /// passes of the kernel over the same pair — so it is amortised by the
+    /// batch, which is the only reason this is worth doing at all.
+    ///
+    /// Its only caller is the `SMMLA` kernel, which exists on aarch64 alone;
+    /// elsewhere this is dead outside the tests, and the tests still want it
+    /// because what it checks is a layout rather than an instruction.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    fn unpack_q4_pair(&self, r0: usize, out: &mut [i8]) {
+        const HALF: usize = BLOCK / 2;
+        let Data::Q4 { qs, .. } = &self.data else { unreachable!() };
+        let n = self.cols;
+        for (row, half) in [r0, r0 + 1].into_iter().zip([0, n]) {
+            let src = &qs[row * n / 2..(row + 1) * n / 2];
+            let dst = &mut out[half..half + n];
+            for (sblock, dblock) in src.chunks_exact(HALF).zip(dst.chunks_exact_mut(BLOCK)) {
+                for (j, &byte) in sblock.iter().enumerate() {
+                    dblock[j] = (byte & 0x0f) as i8 - 8;
+                    dblock[HALF + j] = (byte >> 4) as i8 - 8;
+                }
+            }
+        }
+    }
+
     /// Two output rows at once, via `SMMLA`.
     ///
     /// Each instruction handles a 2x2 tile: weight rows `r0`/`r0+1` against
@@ -785,12 +833,23 @@ impl Weight {
         m: usize,
         blocks: usize,
         dst: &mut [f32],
+        unpacked: &mut [i8],
     ) {
         use crate::simd::*;
-        let Data::Q8 { scales, qs } = &self.data else { unreachable!() };
         let n = self.cols;
-        let w0 = qs.as_ptr().add(r0 * n);
-        let w1 = qs.as_ptr().add((r0 + 1) * n);
+        // q8 is already the operand the instruction wants, so the kernel
+        // reads the weight matrix in place. q4 is not, so it is unpacked into
+        // `unpacked` first — once per row pair, and then read `m` times.
+        let (scales, w0, w1) = match &self.data {
+            Data::Q8 { scales, qs } => {
+                (scales, qs.as_ptr().add(r0 * n), qs.as_ptr().add((r0 + 1) * n))
+            }
+            Data::Q4 { scales, .. } => {
+                self.unpack_q4_pair(r0, unpacked);
+                (scales, unpacked.as_ptr(), unpacked.as_ptr().add(n))
+            }
+            Data::F32(_) => unreachable!(),
+        };
         let (ws0, ws1) = (r0 * blocks, (r0 + 1) * blocks);
 
         dst.fill(0.0);
@@ -1003,22 +1062,71 @@ mod tests {
     #[test]
     fn smmla_kernel_matches_the_portable_path() {
         let mut rng = Rng::new(31337);
-        // Odd batch sizes and an odd row count exercise the leftover handling.
-        for m in [2usize, 3, 8, 9, 16] {
-            let t = random_tensor(71, 128, 5);
-            let xs: Vec<f32> = (0..m * 128).map(|_| rng.normal()).collect();
-            let bias: Vec<f32> = (0..71).map(|_| rng.normal() * 0.1).collect();
-            let w = Weight::quantize(t, Precision::Q8);
+        // Both quantised layouts: q4 reaches the same kernel by being
+        // unpacked into it, and an unpacker that scattered the nibbles wrongly
+        // would produce numbers that still look like numbers.
+        for precision in [Precision::Q8, Precision::Q4] {
+            // Odd batch sizes and an odd row count exercise the leftover
+            // handling.
+            for m in [2usize, 3, 8, 9, 16] {
+                let t = random_tensor(71, 128, 5);
+                let xs: Vec<f32> = (0..m * 128).map(|_| rng.normal()).collect();
+                let bias: Vec<f32> = (0..71).map(|_| rng.normal() * 0.1).collect();
+                let w = Weight::quantize(t, precision);
 
-            let fast = w.matmul_bt_with(&xs, m, Some(&bias), true);
-            let slow = w.matmul_bt_with(&xs, m, Some(&bias), false);
-            for (i, (a, b)) in slow.iter().zip(fast.iter()).enumerate() {
-                assert!(
-                    (a - b).abs() < 1e-4,
-                    "m={m} element {i}: smmla {b} vs portable {a}"
-                );
+                let fast = w.matmul_bt_with(&xs, m, Some(&bias), true);
+                let slow = w.matmul_bt_with(&xs, m, Some(&bias), false);
+                for (i, (a, b)) in slow.iter().zip(fast.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() < 1e-4,
+                        "{precision} m={m} element {i}: smmla {b} vs portable {a}"
+                    );
+                }
             }
         }
+    }
+
+    /// The nibbles, unpacked, must be the weights the portable path reads.
+    ///
+    /// Tested against the layout rather than against the other kernel, because
+    /// the two failures that matter here — the halves of a byte swapped, and
+    /// the bias not removed — are both invisible in an aggregate dot product
+    /// against random data. A swapped pair is still a plausible number.
+    #[test]
+    fn unpacking_a_nibble_row_gives_the_weights_it_encodes() {
+        let mut rng = Rng::new(5);
+        let (rows, cols) = (4, BLOCK * 3);
+        let w = Weight::quantize(random_tensor(rows, cols, 7), Precision::Q4);
+        let Data::Q4 { qs, .. } = &w.data else { panic!("not q4") };
+
+        let mut out = vec![0i8; 2 * cols];
+        w.unpack_q4_pair(2, &mut out);
+
+        for (row, half) in [2usize, 3].into_iter().zip([0, cols]) {
+            for b in 0..cols / BLOCK {
+                let byte = |j: usize| qs[row * cols / 2 + b * (BLOCK / 2) + j];
+                for j in 0..BLOCK / 2 {
+                    // The low nibble belongs to the first half of the block
+                    // and the high nibble to the second — not to neighbouring
+                    // weights, which is the obvious wrong reading.
+                    assert_eq!(
+                        out[half + b * BLOCK + j],
+                        (byte(j) & 0x0f) as i8 - 8,
+                        "row {row} block {b} low nibble {j}"
+                    );
+                    assert_eq!(
+                        out[half + b * BLOCK + BLOCK / 2 + j],
+                        (byte(j) >> 4) as i8 - 8,
+                        "row {row} block {b} high nibble {j}"
+                    );
+                }
+            }
+        }
+        // And the bias really is gone: unsigned nibbles would never be
+        // negative, and over a few hundred weights some must be.
+        assert!(out.iter().any(|&v| v < 0), "the 8 was not subtracted");
+        assert!(out.iter().all(|&v| (-8..=7).contains(&v)));
+        let _ = rng.normal();
     }
 
     /// Batching must not change the answer beyond quantisation noise.

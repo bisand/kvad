@@ -90,6 +90,12 @@ pub struct Spec {
     pub head_dim: usize,
     pub n_ctx: usize,
     pub vocab_size: usize,
+    /// Width of the MLP's hidden layer.
+    ///
+    /// The hand-written loader never needed this — it reads each matrix's
+    /// shape straight from the checkpoint. A framework that allocates tensors
+    /// up front has to be told.
+    pub intermediate: usize,
     pub eps: f32,
     pub rope_theta: f32,
     pub tie_embeddings: bool,
@@ -158,6 +164,8 @@ impl Spec {
             head_dim,
             n_ctx: num(&["n_positions", "n_ctx", "max_position_embeddings"]).unwrap_or(1024),
             vocab_size: num(&["vocab_size"]).ok_or("config: no vocab_size")?,
+            // GPT-2 does not state it; its MLP widens by 4x by construction.
+            intermediate: num(&["intermediate_size", "n_inner"]).unwrap_or(4 * n_embd),
             eps: float(&["layer_norm_epsilon", "rms_norm_eps"]).unwrap_or(1e-5),
             rope_theta: float(&["rope_theta"]).unwrap_or(10000.0),
             tie_embeddings: v
@@ -380,6 +388,7 @@ mod tests {
             head_dim: 2,
             n_ctx: 16,
             vocab_size: 32,
+            intermediate: 32,
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: true,
@@ -419,5 +428,89 @@ mod tests {
         // Truncating upwards is a no-op, not an extension.
         cache.truncate(99);
         assert_eq!(cache.len, 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+/// A loaded model plus its KV cache, behind one interface.
+///
+/// [`Transformer`] deliberately keeps the cache outside the model, because on
+/// the CPU it is a plain `Vec<f32>` the caller can own. A GPU backend cannot
+/// work that way — its cache lives in device memory and must never round-trip
+/// through the host between layers. So the cache moves inside, and everything
+/// above this line (prefix reuse, sampling, streaming) stops caring which
+/// backend it is talking to.
+pub trait Session: Send {
+    fn spec(&self) -> &Spec;
+    /// Run `tokens` and return logits for the **last** one.
+    fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>>;
+    /// Tokens currently held in the cache.
+    fn cached(&self) -> usize;
+    /// Drop everything after `len` positions, for reuse across chat turns.
+    fn truncate(&mut self, len: usize) -> Res<()>;
+    /// Short description of where this runs, e.g. `cpu q8` or `metal bf16`.
+    fn label(&self) -> String;
+    fn param_count(&self) -> usize;
+    fn weight_bytes(&self) -> usize;
+}
+
+/// The hand-written engine, as a [`Session`].
+pub struct CpuSession {
+    model: Box<dyn Transformer>,
+    cache: KvCache,
+    precision: crate::quant::Precision,
+    /// Prompt tokens per batched prefill pass.
+    chunk: usize,
+}
+
+impl CpuSession {
+    pub fn new(model: Box<dyn Transformer>, precision: crate::quant::Precision) -> Self {
+        let cache = KvCache::new(model.spec());
+        // Tunable so the effect of batching stays measurable; 1 gives the old
+        // token-at-a-time behaviour.
+        let chunk = std::env::var("LLM_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(64);
+        CpuSession { model, cache, precision, chunk }
+    }
+}
+
+impl Session for CpuSession {
+    fn spec(&self) -> &Spec {
+        self.model.spec()
+    }
+
+    fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
+        let mut logits = Vec::new();
+        for part in tokens.chunks(self.chunk) {
+            logits = self.model.forward_batch(part, &mut self.cache);
+        }
+        Ok(logits)
+    }
+
+    fn cached(&self) -> usize {
+        self.cache.len
+    }
+
+    fn truncate(&mut self, len: usize) -> Res<()> {
+        self.cache.truncate(len);
+        Ok(())
+    }
+
+    fn label(&self) -> String {
+        format!("cpu {}", self.precision)
+    }
+
+    fn param_count(&self) -> usize {
+        self.model.param_count()
+    }
+
+    fn weight_bytes(&self) -> usize {
+        self.model.memory_bytes()
     }
 }

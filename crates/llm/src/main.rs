@@ -179,7 +179,7 @@ fn load(args: &Args) -> Res<Llm> {
         "  {:.1}M parameters · weights {:.0} MB ({}) · loaded in {:.1}s",
         llm.param_count as f64 / 1e6,
         llm.weight_bytes as f64 / 1e6,
-        llm.precision,
+        llm.backend(),
         t0.elapsed().as_secs_f32(),
     );
     eprintln!(
@@ -395,7 +395,7 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 fn run(args: Args) -> Res<()> {
-    let llm = load(&args)?;
+    let mut llm = load(&args)?;
 
     // An instruction-tuned model given a bare prompt still needs its template,
     // or it falls back to base-model behaviour and rambles.
@@ -421,9 +421,8 @@ fn run(args: Args) -> Res<()> {
     };
     eprintln!("  prompt is {} tokens\n", ids.len());
 
-    let mut cache = llm.new_cache();
     let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
-    let (stats, _) = llm.generate(&ids, &mut cache, &mut sampler, args.max_tokens, |piece| {
+    let (stats, _) = llm.generate(&ids, &mut sampler, args.max_tokens, |piece| {
         print!("{piece}");
         let _ = std::io::stdout().flush();
         true
@@ -438,7 +437,7 @@ fn run(args: Args) -> Res<()> {
 }
 
 fn chat(args: Args) -> Res<()> {
-    let llm = load(&args)?;
+    let mut llm = load(&args)?;
     if !llm.is_instruct() {
         eprintln!(
             "\nwarning: {} is a base model with no chat template. It will continue\n\
@@ -469,6 +468,7 @@ fn chat(args: Args) -> Res<()> {
             "/quit" | "/exit" => break,
             "/reset" => {
                 messages.retain(|m: &Message| m.role == "system");
+                llm.reset()?;
                 eprintln!("(history cleared)");
                 continue;
             }
@@ -478,19 +478,22 @@ fn chat(args: Args) -> Res<()> {
         messages.push(Message::user(line));
         let ids = llm.encode_chat(&messages)?;
 
-        // Re-encoding and re-prefilling the whole conversation each turn is
-        // the simple thing, and wrong at scale: turn N re-reads turns 1..N-1.
-        // Keeping the cache across turns is the fix, and is what the TUI does.
-        let mut cache = llm.new_cache();
+        // The cache lives in the session and survives between turns: only the
+        // newest message is prefilled, not the whole transcript.
         let mut reply = String::new();
-        let (stats, _) = llm.generate(&ids, &mut cache, &mut sampler, args.max_tokens, |piece| {
+        let (stats, _) = llm.generate(&ids, &mut sampler, args.max_tokens, |piece| {
             print!("{piece}");
             let _ = std::io::stdout().flush();
             reply.push_str(piece);
             true
         })?;
         println!();
-        eprintln!("  [{} tok, {:.1} tok/s]\n", stats.generated_tokens, stats.tokens_per_sec());
+        eprintln!(
+            "  [{} tok, {:.1} tok/s, {} cached]\n",
+            stats.generated_tokens,
+            stats.tokens_per_sec(),
+            stats.cached_tokens
+        );
         messages.push(Message::assistant(reply));
     }
     Ok(())

@@ -16,7 +16,7 @@
 
 use llm::chat::Message;
 use llm::hub::{self, HubModel, LocalModel};
-use llm::model::KvCache;
+use llm::model::Session;
 use llm::quant::Precision;
 use llm::runtime::{Llm, Stats};
 use llm::sampler::Sampler;
@@ -26,10 +26,53 @@ use std::sync::Arc;
 
 pub enum Cmd {
     Search(String),
-    Load { repo: String, precision: Precision },
+    Load { repo: String, backend: Backend },
     Chat(Vec<Message>),
     RefreshLocal,
     Delete(String),
+}
+
+/// Where a model should run. Cycled from the UI with `p`.
+///
+/// One knob covers both axes, because they are the same question — how much
+/// hardware to spend — and the CPU's quantisation levels and the GPU's float
+/// widths are just different answers to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Cpu(Precision),
+    /// The best GPU available, at this dtype.
+    Gpu(GpuDType),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuDType {
+    Bf16,
+    F32,
+}
+
+impl Backend {
+    pub const ALL: [Backend; 5] = [
+        Backend::Cpu(Precision::F32),
+        Backend::Cpu(Precision::Q8),
+        Backend::Cpu(Precision::Q4),
+        Backend::Gpu(GpuDType::Bf16),
+        Backend::Gpu(GpuDType::F32),
+    ];
+
+    pub fn next(self) -> Backend {
+        let i = Backend::ALL.iter().position(|b| *b == self).unwrap_or(0);
+        Backend::ALL[(i + 1) % Backend::ALL.len()]
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backend::Cpu(p) => write!(f, "cpu {p}"),
+            Backend::Gpu(GpuDType::Bf16) => f.write_str("gpu bf16"),
+            Backend::Gpu(GpuDType::F32) => f.write_str("gpu f32"),
+        }
+    }
 }
 
 pub enum Evt {
@@ -42,7 +85,7 @@ pub enum Evt {
         summary: String,
         params: usize,
         instruct: bool,
-        precision: Precision,
+        backend: String,
         weight_bytes: usize,
     },
     /// A fragment of the assistant's reply.
@@ -85,11 +128,9 @@ impl Engine {
     }
 }
 
-struct Session {
+/// The model currently loaded, plus its sampler.
+struct Loaded {
     llm: Llm,
-    cache: KvCache,
-    /// The exact tokens currently represented in `cache`.
-    cached_ids: Vec<u32>,
     sampler: Sampler,
 }
 
@@ -101,7 +142,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
         let _ = tx.send(Evt::Error(e.to_string()));
     };
 
-    let mut session: Option<Session> = None;
+    let mut session: Option<Loaded> = None;
     let _ = tx.send(Evt::Local(hub::local_models()));
 
     while let Ok(cmd) = rx.recv() {
@@ -135,7 +176,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 None => say(&format!("{id} is not in the cache")),
             },
 
-            Cmd::Load { repo, precision } => {
+            Cmd::Load { repo, backend } => {
                 // Drop the previous model before loading the next one, or two
                 // sets of weights are briefly resident at once.
                 session = None;
@@ -144,24 +185,47 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 let mut progress = |msg: &str| {
                     let _ = tx.send(Evt::Status(format!("{repo}: {msg}")));
                 };
-                match Llm::load_with(&repo, precision, &mut progress) {
+                let loaded = match backend {
+                    Backend::Cpu(precision) => Llm::load_with(&repo, precision, &mut progress),
+                    Backend::Gpu(dt) => {
+                        let name = match dt {
+                            GpuDType::Bf16 => "bf16",
+                            GpuDType::F32 => "f32",
+                        };
+                        let dtype = llm_gpu::model::parse_dtype(name).expect("known dtype");
+                        // The GPU backend covers the Llama family only; the
+                        // error names the alternative rather than just failing.
+                        Llm::load_custom(&repo, &mut progress, &mut |files, spec| {
+                            if spec.arch != llm::model::Arch::Llama {
+                                return Err(format!(
+                                    "the GPU backend implements the Llama family only; this model is {}. Press p to pick a CPU backend.",
+                                    spec.arch
+                                )
+                                .into());
+                            }
+                            let device = llm_gpu::model::pick_device(None)?;
+                            let m = llm_gpu::model::GpuLlama::load(
+                                &files.weights,
+                                spec.clone(),
+                                dtype,
+                                device,
+                            )?;
+                            Ok(Box::new(m) as Box<dyn Session>)
+                        })
+                    }
+                };
+                match loaded {
                     Ok(llm) => {
                         let _ = tx.send(Evt::Loaded {
                             repo: repo.clone(),
                             summary: llm.spec.summary(),
                             params: llm.param_count,
                             instruct: llm.is_instruct(),
-                            precision: llm.precision,
+                            backend: llm.backend(),
                             weight_bytes: llm.weight_bytes,
                         });
                         let _ = hub::State::set_active(&repo);
-                        let cache = llm.new_cache();
-                        session = Some(Session {
-                            llm,
-                            cache,
-                            cached_ids: Vec::new(),
-                            sampler: Sampler::new(0.7, 40, 0.95, 7),
-                        });
+                        session = Some(Loaded { llm, sampler: Sampler::new(0.7, 40, 0.95, 7) });
                         let _ = tx.send(Evt::Local(hub::local_models()));
                     }
                     Err(e) => fail(e),
@@ -183,15 +247,11 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                     }
                 };
 
-                // Reuse as much of the previous turn's cache as still matches.
-                // In a chat the whole history is a shared prefix, so this
-                // usually means prefilling only the newest message.
-                let shared = Llm::common_prefix(&s.cached_ids, &ids);
-                s.cache.truncate(shared);
-
+                // The session reuses whatever of the previous turn's cache
+                // still matches, so a chat prefills only the newest message.
                 let tx2 = tx.clone();
                 let cancel2 = Arc::clone(&cancel);
-                let result = s.llm.generate(&ids, &mut s.cache, &mut s.sampler, 512, |piece| {
+                let result = s.llm.generate(&ids, &mut s.sampler, 512, |piece| {
                     if cancel2.load(Ordering::Relaxed) {
                         return false;
                     }
@@ -199,8 +259,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 });
 
                 match result {
-                    Ok((stats, final_ids)) => {
-                        s.cached_ids = final_ids;
+                    Ok((stats, _)) => {
                         let _ = tx.send(Evt::Done(stats));
                     }
                     Err(e) => fail(e),

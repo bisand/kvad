@@ -5,11 +5,10 @@
 //! [`Evt`] and is applied here. Keeping that one-directional makes the slow
 //! parts impossible to accidentally call from the draw path.
 
-use crate::engine::{Cmd, Engine, Evt};
+use crate::engine::{Backend, Cmd, Engine, Evt};
 use llm::chat::Message;
 use llm::hub::{self, HubModel, LocalModel};
 use llm::model::Arch;
-use llm::quant::Precision;
 use llm::runtime::Stats;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -38,7 +37,7 @@ pub struct Active {
     pub summary: String,
     pub params: usize,
     pub instruct: bool,
-    pub precision: Precision,
+    pub backend: String,
     pub weight_bytes: usize,
 }
 
@@ -61,9 +60,9 @@ pub struct App {
     pub scroll: u16,
 
     pub active: Option<Active>,
-    /// Precision the *next* load will use. Changing it does not touch the
-    /// model already in memory — quantisation happens at load time.
-    pub precision: Precision,
+    /// Where the *next* load will run. Changing it does not touch the model
+    /// already in memory — the backend is chosen when weights are read.
+    pub backend: Backend,
     pub busy: bool,
     pub status: String,
     pub error: Option<String>,
@@ -87,7 +86,7 @@ impl App {
             streaming: None,
             scroll: 0,
             active: None,
-            precision: Precision::F32,
+            backend: Backend::Cpu(llm::quant::Precision::Q8),
             busy: false,
             status: "press / to search the Hub, or pick a downloaded model".into(),
             error: None,
@@ -165,10 +164,10 @@ impl App {
                     self.selected = self.selected.min(self.local.len().saturating_sub(1));
                 }
             }
-            Evt::Loaded { repo, summary, params, instruct, precision, weight_bytes } => {
+            Evt::Loaded { repo, summary, params, instruct, backend, weight_bytes } => {
                 self.status = format!("loaded {repo}");
                 self.active =
-                    Some(Active { repo, summary, params, instruct, precision, weight_bytes });
+                    Some(Active { repo, summary, params, instruct, backend, weight_bytes });
                 self.busy = false;
                 self.messages.clear();
                 self.tab = Tab::Chat;
@@ -267,15 +266,12 @@ impl App {
             }
             K::Char('r') => engine.send(Cmd::RefreshLocal),
             K::Char('p') => {
-                // Cycle the precision used for the next load. q8 is usually
-                // indistinguishable from f32 and half again as fast; q4 halves
-                // the memory again but visibly degrades small models.
-                self.precision = match self.precision {
-                    Precision::F32 => Precision::Q8,
-                    Precision::Q8 => Precision::Q4,
-                    Precision::Q4 => Precision::F32,
-                };
-                self.status = format!("next load will use {}", self.precision);
+                // Cycle where the next load runs. q8 is usually
+                // indistinguishable from f32 and faster; q4 halves memory
+                // again but visibly degrades small models; the GPU is faster
+                // than any of them but only handles the Llama family.
+                self.backend = self.backend.next();
+                self.status = format!("next load will use {}", self.backend);
             }
             K::Char('d') => {
                 if let Some(e) = self.selected_entry() {
@@ -297,8 +293,8 @@ impl App {
                     return;
                 }
                 self.busy = true;
-                self.status = format!("loading {} as {}", entry.id, self.precision);
-                engine.send(Cmd::Load { repo: entry.id, precision: self.precision });
+                self.status = format!("loading {} on {}", entry.id, self.backend);
+                engine.send(Cmd::Load { repo: entry.id, backend: self.backend });
             }
             _ => {}
         }

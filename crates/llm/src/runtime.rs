@@ -4,7 +4,7 @@
 //! This is the API the CLI and the TUI both drive.
 
 use crate::chat::{ChatTemplate, Message};
-use crate::model::{self, KvCache, Spec, Transformer};
+use crate::model::{self, CpuSession, Session, Spec};
 use crate::quant::Precision;
 use crate::sampler::Sampler;
 use crate::weights;
@@ -16,16 +16,24 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 pub struct Llm {
     pub repo: String,
     pub spec: Spec,
-    pub model: Box<dyn Transformer>,
+    pub session: Box<dyn Session>,
     pub tokenizer: Tokenizer,
     pub chat: Option<ChatTemplate>,
     /// Token ids that end generation. Usually one; Llama 3 has two.
     pub eos: Vec<u32>,
     pub param_count: usize,
-    pub precision: Precision,
-    /// Bytes the weights occupy in memory.
+    /// Bytes the weights occupy, on whichever device holds them.
     pub weight_bytes: usize,
+    /// Exactly the tokens the session's cache currently represents, so the
+    /// next turn can find the shared prefix.
+    cached_ids: Vec<u32>,
 }
+
+/// Builds the backend for a model whose files are already on disk.
+///
+/// The `llm` crate cannot depend on the GPU crate — the dependency runs the
+/// other way — so choosing a backend is the caller's job.
+pub type SessionFactory<'a> = &'a mut dyn FnMut(&weights::ModelFiles, &Spec) -> Res<Box<dyn Session>>;
 
 /// Progress and timing for one generation run.
 #[derive(Debug, Default, Clone, Copy)]
@@ -54,10 +62,22 @@ impl Llm {
         precision: Precision,
         progress: &mut dyn FnMut(&str),
     ) -> Res<Self> {
+        Self::load_custom(repo_id, progress, &mut |files, spec| {
+            let model = model::load(&files.weights, spec.clone(), precision)?;
+            Ok(Box::new(CpuSession::new(model, precision)))
+        })
+    }
+
+    /// Load a model with a backend of the caller's choosing.
+    pub fn load_custom(
+        repo_id: &str,
+        progress: &mut dyn FnMut(&str),
+        build: SessionFactory,
+    ) -> Res<Self> {
         let files = weights::fetch_with(repo_id, progress)?;
-        progress(&format!("reading weights ({precision})"));
+        progress("reading weights");
         let spec = Spec::from_json(&files.config)?;
-        let model = model::load(&files.weights, spec.clone(), precision)?;
+        let session = build(&files, &spec)?;
         let tokenizer = Tokenizer::from_file(&files.tokenizer).map_err(|e| e.to_string())?;
 
         let chat = match &files.tokenizer_config {
@@ -87,18 +107,18 @@ impl Llm {
         eos.sort_unstable();
         eos.dedup();
 
-        let param_count = model.param_count();
-        let weight_bytes = model.memory_bytes();
+        let param_count = session.param_count();
+        let weight_bytes = session.weight_bytes();
         Ok(Llm {
             repo: repo_id.to_string(),
             spec,
-            model,
+            session,
             tokenizer,
             chat,
             eos,
             param_count,
-            precision,
             weight_bytes,
+            cached_ids: Vec::new(),
         })
     }
 
@@ -126,13 +146,21 @@ impl Llm {
         }
     }
 
-    pub fn new_cache(&self) -> KvCache {
-        KvCache::new(&self.spec)
+    /// Where this model runs, e.g. `cpu q8` or `metal bf16`.
+    pub fn backend(&self) -> String {
+        self.session.label()
+    }
+
+    /// Forget the conversation so far, so the next prompt starts clean.
+    pub fn reset(&mut self) -> Res<()> {
+        self.cached_ids.clear();
+        self.session.truncate(0)
     }
 
     /// How many leading tokens two sequences share.
     ///
-    /// Used with [`KvCache::truncate`] to reuse the cache across chat turns.
+    /// In a chat, turn N's tokens begin with all of turn N-1's, so this is
+    /// usually the entire conversation so far.
     pub fn common_prefix(a: &[u32], b: &[u32]) -> usize {
         a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
     }
@@ -140,17 +168,16 @@ impl Llm {
     /// Generate from `prompt_ids`, calling `on_token` with each new fragment of
     /// text as it appears.
     ///
-    /// If `cache` is non-empty its contents are taken to be the first
-    /// `cache.len` tokens of `prompt_ids`, and only the remainder is prefilled.
-    /// Callers reusing a cache across turns must therefore truncate it to the
-    /// common prefix first; see [`Llm::common_prefix`].
+    /// The KV cache lives inside the session, and is reused across calls: the
+    /// shared prefix with the previous prompt is kept and only the remainder
+    /// is prefilled. On a chat that means re-reading just the newest message
+    /// rather than the whole transcript.
     ///
     /// Returning `false` from `on_token` stops generation — that is how the
     /// TUI implements its interrupt key.
     pub fn generate(
-        &self,
+        &mut self,
         prompt_ids: &[u32],
-        cache: &mut KvCache,
         sampler: &mut Sampler,
         max_tokens: usize,
         mut on_token: impl FnMut(&str) -> bool,
@@ -159,38 +186,18 @@ impl Llm {
             return Err("prompt encoded to zero tokens".into());
         }
 
-        // Anything already cached is a prefix we can skip. Always leave at
-        // least one token to process, or there would be no logits to sample
-        // the next token from.
-        let reuse = cache.len.min(prompt_ids.len().saturating_sub(1));
-        cache.truncate(reuse);
+        // Always leave at least one token to process, or there would be no
+        // logits to sample the next token from.
+        let reuse = Self::common_prefix(&self.cached_ids, prompt_ids)
+            .min(self.session.cached())
+            .min(prompt_ids.len() - 1);
+        self.session.truncate(reuse)?;
 
         let mut stats =
             Stats { prompt_tokens: prompt_ids.len(), cached_tokens: reuse, ..Default::default() };
 
-        // Prefill: push the prompt through to populate the cache, in batches.
-        // Only the logits from the final token matter -- the earlier ones
-        // predict tokens we already have.
-        //
-        // Chunked rather than all at once: a long prompt would otherwise
-        // allocate activation buffers proportional to its whole length, and
-        // the weight reuse that makes batching worthwhile has already
-        // saturated well before then.
-        // Tunable so its effect can be measured rather than assumed; 1 gives
-        // the old token-at-a-time behaviour.
-        let chunk = std::env::var("LLM_PREFILL_CHUNK")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(64);
         let t0 = Instant::now();
-        let mut logits = Vec::new();
-        let mut fed = reuse;
-        while fed < prompt_ids.len() {
-            let end = (fed + chunk).min(prompt_ids.len());
-            logits = self.model.forward_batch(&prompt_ids[fed..end], cache);
-            fed = end;
-        }
+        let mut logits = self.session.forward(&prompt_ids[reuse..])?;
         stats.prefill_secs = t0.elapsed().as_secs_f32();
 
         let mut ids: Vec<u32> = prompt_ids.to_vec();
@@ -214,12 +221,11 @@ impl Llm {
                 break;
             }
 
-            logits = self.model.forward(next, cache);
+            logits = self.session.forward(&[next])?;
         }
         stats.decode_secs = t1.elapsed().as_secs_f32();
 
-        // `ids` is now exactly what the cache holds, which is what a caller
-        // reusing the cache next turn needs in order to find the shared prefix.
+        self.cached_ids = ids.clone();
         Ok((stats, ids))
     }
 }

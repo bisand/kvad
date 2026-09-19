@@ -9,10 +9,12 @@ Three crates, meant to be read in order:
 |---|---|---|
 | [`nanograd`](crates/nanograd) | A neural network and backpropagation, from scratch. Trains on MNIST. | **none** |
 | [`llm`](crates/llm) | Transformer inference from scratch. Two architectures, real HuggingFace weights. | hub client, tokenizer, safetensors |
+| [`llm-gpu`](crates/gpu) | The same Llama forward pass on the GPU, in candle. | candle (Metal/CUDA) |
 | [`llm-tui`](crates/tui) | Terminal app: browse, download, activate, chat. | ratatui |
 
-No ML framework anywhere. Every matrix multiply, every derivative, every
-attention head and every rotation is code in this repo.
+The first two use no ML framework at all: every matrix multiply, every
+derivative, every attention head and every rotation is code in this repo. The
+third is the same model handed to one, so the two can be compared.
 
 ## Quick start
 
@@ -21,6 +23,7 @@ attention head and every rotation is code in this repo.
 cargo test                                      # includes a gradient check
 cargo run --release -p nanograd --bin train_mnist
 cargo run --release -p llm -- run --prompt "Why is the sky blue?"
+cargo run --release -p llm-gpu -- run --prompt "Why is the sky blue?"
 cargo run --release -p llm-tui
 ```
 
@@ -395,17 +398,95 @@ test for the Llama refactor, and both are the acceptance test for `--quant q8`.
 
 ---
 
-## Crate 3: `llm-tui` — the app
+## Crate 3: `llm-gpu` — the same model, handed to a framework
+
+```bash
+llm-gpu run  --prompt "Why is the sky blue?"
+llm-gpu run  --device metal --dtype bf16 --model Qwen/Qwen2.5-0.5B-Instruct
+llm-gpu chat
+```
+
+[`model.rs`](crates/gpu/src/model.rs) is the Llama forward pass again, in
+[candle](https://github.com/huggingface/candle). Read it next to
+[`llama.rs`](crates/llm/src/model/llama.rs): the structure is line for line the
+same, and every operation is one you already wrote.
+
+- `matvec_bt` becomes `Tensor::matmul`.
+- The loop over attention heads becomes one batched matmul over a
+  `[1, n_head, seq, head_dim]` tensor.
+- `candle_nn::rotary_emb::rope` is the same `rotate_half` convention as
+  `Rope::apply`, and `ops::rms_norm` the same scale-only normalisation.
+
+Two differences are worth noticing because they run *against* the framework:
+
+- **Batching is free.** The CPU engine needed a separate `forward_batch`,
+  because a matrix-vector product and a matrix-matrix product are genuinely
+  different kernels. On the GPU there is one `forward`, and a single token is
+  just the narrow case.
+- **The causal mask comes back.** With a KV cache the CPU engine got masking
+  for free — the cache only ever held earlier positions. Here the whole batch
+  is one matmul, so the future has to be masked out explicitly, with the
+  triangular `-inf` matrix every tutorial shows.
+
+### Numbers
+
+| | CPU (q8) | Metal (bf16) | |
+|---|---|---|---|
+| Qwen2.5-0.5B, decode | ~34 tok/s | ~86 tok/s | 2.5x |
+| SmolLM2-135M, decode | ~35 tok/s | ~168 tok/s | 4.7x |
+| Qwen2.5-0.5B, prefill (654 tokens) | 2.30 s | 0.32 s | **7.2x** |
+
+**The GPU wins far more on prefill than on decode**, and that is the same
+distinction as everywhere else in this repo. Prefill is compute-bound, which is
+what a GPU is for. Decode is memory-bound, and there the CPU is carrying int8
+weights (556 MB) against the GPU's bf16 (1260 MB) — quantisation claws back
+most of a hardware generation.
+
+The other oddity in that table: SmolLM2-135M decodes no faster than Qwen-494M on
+the CPU, despite being a quarter the size. It has *more* layers (30 vs 24), and
+our CPU decode has a fixed cost per matmul — a rayon dispatch and an
+allocation — that does not shrink with the matrix. At this size that overhead,
+not arithmetic, sets the speed. The GPU, which scales with actual work, shows
+the expected 4.7x instead.
+
+Metal `f32` runs at ~63 tok/s against bf16's ~86, for exactly double the
+memory. `bf16` is the default because it is also what the checkpoints ship as.
+
+The GPU backend covers the **Llama family only**; GPT-2 stays on the CPU engine,
+and asking for it says so rather than failing obscurely.
+
+### One trait, two backends
+
+Adding the GPU needed a change to the CPU engine's shape.
+[`Transformer`](crates/llm/src/model/mod.rs) deliberately keeps the KV cache
+*outside* the model, because on the CPU it is a `Vec<f32>` the caller can own.
+A GPU backend cannot work that way — its cache lives in device memory and must
+never round-trip through the host between layers.
+
+So the cache moved inside, behind a `Session` trait: `forward`, `cached`,
+`truncate`. Everything above it — prefix reuse, sampling, streaming, the chat
+loop, the TUI — stopped caring which backend it was talking to. The CLI keeps
+its `--quant`, the GPU CLI gets `--device` and `--dtype`, and in the TUI `p`
+cycles through all five: `cpu f32`, `cpu q8`, `cpu q4`, `gpu bf16`, `gpu f32`.
+
+That is the usual shape of this kind of work: the interesting part was not the
+new backend, it was the seam the old one had to grow.
+
+---
+
+## Crate 4: `llm-tui` — the app
 
 ```bash
 cargo run --release -p llm-tui
 ```
 
-`/` search · `↑↓` select · `enter` download and load · `p` cycle precision ·
+`/` search · `↑↓` select · `enter` download and load · `p` cycle backend ·
 `d` delete · `tab` switch to chat · `esc` interrupt generation.
 
-`p` is the quickest way to feel the quantisation trade-off: load a model at
-f32, ask it something arithmetic, then reload at q4 and ask again.
+`p` cycles all five backends — `cpu f32`, `cpu q8`, `cpu q4`, `gpu bf16`,
+`gpu f32` — and is the quickest way to feel the trade-offs: load a model at
+f32, ask it something arithmetic, reload at q4 and ask again, then reload on
+the GPU and watch the token rate.
 
 Three concerns on three threads: the UI loop only draws and reads keys, the
 engine thread downloads and generates, and `rayon` fans each matmul across cores
@@ -430,9 +511,10 @@ state management — good Rust, no ML. Build it last.
 load, which means still reading the full f32 checkpoint off disk. Writing the
 blocks out once would make startup and disk footprint match the memory win.
 
-**5. GPU, via [`candle`](https://github.com/huggingface/candle).** HuggingFace's
-Rust framework, Metal backend. You will recognise every operation because you
-wrote them by hand first. 48 GB of unified memory holds a quantised 30B model.
+**5. Quantised weights on the GPU.** The Metal path is bf16 only, so a model
+that fits in 556 MB on the CPU takes 1260 MB there. candle supports quantised
+tensors; wiring them in would close the memory gap that currently makes decode
+only 2.5x faster instead of more.
 
 **6. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Needs backprop through attention, layernorm and softmax, plus

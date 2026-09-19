@@ -300,6 +300,221 @@ pub fn evaluate(model: &mut Gpt, tokens: &[usize], windows: usize, rng: &mut Rng
     total / windows as f32
 }
 
+// ---------------------------------------------------------------------------
+// The training loop
+// ---------------------------------------------------------------------------
+
+/// One idea, repeated: draw a batch, take a step, and every so often ask the
+/// validation split how it is going.
+///
+/// The loop lives here rather than in a `main` because there are two front
+/// ends to it — `train_text` in this crate and `kvad train` in the engine —
+/// and a training loop copied into two places is two training loops.
+///
+/// # Keeping the best model, not the last
+///
+/// A run on a small text overfits in plain sight: validation loss bottoms out
+/// and then climbs while training loss keeps falling. Saving at the end saves
+/// the memoriser. So the model is written every time the validation loss
+/// improves on the best this run has seen, and a run that gets worse leaves
+/// the good model where it was. That is early stopping, done by keeping the
+/// best rather than by halting: the run still finishes, and still prints what
+/// happened, so the overfitting stays visible instead of being hidden by a
+/// loop that quietly gave up.
+///
+/// For that comparison to mean anything the two losses must be measured on
+/// the same windows. They are: every checkpoint evaluates on windows drawn
+/// from a generator of its own, seeded the same way each time. A side effect
+/// is that the training run no longer depends on how often it is evaluated,
+/// because evaluation no longer takes draws from the training generator.
+///
+/// The bar starts at infinity, so the first checkpoint always writes. With
+/// `--from` that matters: a model continuing on different text cannot be
+/// compared with its old loss on its old text, and a run that saved nothing
+/// because it never beat a number from another corpus would be a run that
+/// silently did nothing.
+#[derive(Clone)]
+pub struct Training {
+    pub steps: usize,
+    pub batch: usize,
+    pub lr: f32,
+    /// Steps between validation checkpoints.
+    pub eval_every: usize,
+    /// Windows drawn at each checkpoint. Always the same ones.
+    pub eval_windows: usize,
+    /// Replicas to split each batch across; see [`Replicas`]. Clamped to the
+    /// batch size, because a batch cannot be split finer than one window.
+    pub threads: usize,
+    /// Where to write the model whenever validation loss improves. `None`
+    /// trains and keeps nothing.
+    pub save: Option<std::path::PathBuf>,
+}
+
+impl Default for Training {
+    fn default() -> Self {
+        Training {
+            steps: 2000,
+            batch: 16,
+            lr: 3e-3,
+            eval_every: 250,
+            eval_windows: 50,
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            save: None,
+        }
+    }
+}
+
+/// What a run says about itself while it runs.
+pub enum Report<'a> {
+    /// How fast this machine is turning out to be, and what the rest of the
+    /// run will cost at that rate. Sent once, early — the point of it is to
+    /// arrive while there is still something to be done about the answer.
+    Pace { chars_per_sec: f32, remaining_secs: f32 },
+    /// A validation checkpoint. `model` is handed over so that the caller can
+    /// write a sample from it, which is the part anyone actually watches.
+    Step {
+        step: usize,
+        train_loss: f32,
+        val_loss: f32,
+        /// The best validation loss so far, and so written to disk if there
+        /// is anywhere to write it.
+        best: bool,
+        saved: bool,
+        elapsed_secs: f32,
+        chars_per_sec: f32,
+        model: &'a mut Gpt,
+    },
+}
+
+/// What a finished run leaves behind.
+#[derive(Debug)]
+pub struct Trained {
+    pub best_val: f32,
+    pub best_step: usize,
+    pub last_val: f32,
+    pub elapsed_secs: f32,
+}
+
+/// Steps to time before reporting a pace. Ten is enough for an estimate good
+/// to a few per cent, and on the slowest model here costs about ten seconds.
+const PACE_AFTER: usize = 10;
+
+/// The windows every checkpoint is measured on. Any fixed number would do;
+/// what matters is that it is the same one every time.
+const EVAL_SEED: u64 = 20_260_919;
+
+/// Train `model` on `corpus`, reporting as it goes and keeping the best.
+pub fn train(
+    model: &mut Gpt,
+    tok: &CharTokenizer,
+    corpus: &Corpus,
+    cfg: &Training,
+    rng: &mut Rng,
+    report: &mut dyn FnMut(Report),
+) -> io::Result<Trained> {
+    let context = model.config().context;
+    let batch = cfg.batch.max(1);
+    let eval_every = cfg.eval_every.max(1);
+
+    // A window is `context + 1` tokens, and both splits are drawn from. Say
+    // so here, where the numbers are, rather than let `window` assert its way
+    // out of a thread halfway through the first step.
+    for (which, tokens) in [("training", &corpus.train), ("validation", &corpus.val)] {
+        if tokens.len() <= context {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "too little text: the {which} split is {} characters and a context of {context} needs \
+                     more than that. The validation split is the last tenth, so about {} characters in all.",
+                    tokens.len(),
+                    10 * (context + 1)
+                ),
+            ));
+        }
+    }
+    if cfg.steps == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a run of no steps would train nothing"));
+    }
+    let mut opt = AdamW::new(cfg.lr);
+    let mut replicas = (cfg.threads.min(batch) > 1).then(|| Replicas::new(model, cfg.threads.min(batch)));
+
+    // Characters seen after `steps` steps: every window is `context` of them,
+    // and there are `batch` windows to a step.
+    let chars = |steps: usize| (steps * batch * context) as f32;
+    let started = std::time::Instant::now();
+    let (mut running, mut since) = (0.0, 0);
+    let (mut best_val, mut best_step) = (f32::INFINITY, 0);
+    let mut last_val = f32::INFINITY;
+
+    for step in 1..=cfg.steps {
+        running += match &mut replicas {
+            Some(replicas) => replicas.train_step(model, &mut opt, &corpus.train, batch, rng),
+            None => train_step(model, &mut opt, &corpus.train, batch, rng),
+        };
+        since += 1;
+
+        if step == PACE_AFTER.min(cfg.steps) {
+            let rate = chars(step) / started.elapsed().as_secs_f32();
+            report(Report::Pace { chars_per_sec: rate, remaining_secs: chars(cfg.steps - step) / rate });
+        }
+
+        if step % eval_every == 0 || step == cfg.steps {
+            let val = evaluate(model, &corpus.val, cfg.eval_windows, &mut Rng::new(EVAL_SEED));
+            let best = val < best_val;
+            if best {
+                (best_val, best_step) = (val, step);
+            }
+            let saved = match (&cfg.save, best) {
+                (Some(dir), true) => {
+                    save(dir, model, tok)?;
+                    true
+                }
+                _ => false,
+            };
+            let elapsed = started.elapsed().as_secs_f32();
+            report(Report::Step {
+                step,
+                train_loss: running / since as f32,
+                val_loss: val,
+                best,
+                saved,
+                elapsed_secs: elapsed,
+                chars_per_sec: chars(step) / elapsed,
+                model,
+            });
+            (running, since, last_val) = (0.0, 0, val);
+        }
+    }
+
+    Ok(Trained { best_val, best_step, last_val, elapsed_secs: started.elapsed().as_secs_f32() })
+}
+
+/// A number of seconds as something to read: "45s", "6m 20s", "1h 12m".
+///
+/// Training runs span four orders of magnitude here — a test finishes in a
+/// second, the largest preset takes half an hour — and "1832s" makes nobody
+/// any the wiser.
+pub fn human_secs(secs: f32) -> String {
+    let secs = secs.max(0.0).round() as u64;
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s:02}s"),
+        (h, m, _) => format!("{h}h {m:02}m"),
+    }
+}
+
+/// A model and the tokeniser it was trained with, written into one directory.
+///
+/// They travel together because neither is any use alone: id 17 means
+/// whatever character was seventeenth in *that* text. The tokeniser is
+/// rewritten on every save, unchanged, rather than once at the start, so that
+/// the directory is a complete model from the first write and after an
+/// interrupted run — a few kilobytes against a directory nothing can load.
+pub fn save(dir: &Path, model: &mut Gpt, tok: &CharTokenizer) -> io::Result<()> {
+    crate::checkpoint::save(dir, model)?;
+    tok.save(dir)
+}
+
 /// Continue `prompt` by `count` tokens, one at a time.
 ///
 /// This is all generation is: predict a distribution over the next token,
@@ -619,4 +834,289 @@ mod tests {
     }
 
     const STEPS: usize = 150;
+
+    // -----------------------------------------------------------------------
+    // The training loop
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_duration_is_written_the_way_a_person_would_say_it() {
+        assert_eq!(human_secs(0.0), "0s");
+        assert_eq!(human_secs(45.4), "45s");
+        assert_eq!(human_secs(59.6), "1m 00s");
+        assert_eq!(human_secs(380.0), "6m 20s");
+        assert_eq!(human_secs(4320.0), "1h 12m");
+        // Never a negative duration, whatever a clock says.
+        assert_eq!(human_secs(-3.0), "0s");
+    }
+
+    /// A text that contradicts its own validation split: the same three
+    /// letters, in the opposite order. Learning the training half can only
+    /// make the validation half worse, which is overfitting with the
+    /// gradualness taken out — a run on this text gets worse from its first
+    /// checkpoint, reliably, in a second.
+    ///
+    /// The two halves are built by hand rather than with [`Corpus::new`], so
+    /// that not one window of the one is in the other.
+    fn a_text_and_its_contradiction() -> (CharTokenizer, Corpus) {
+        let tok = CharTokenizer::from_text("abc");
+        let corpus =
+            Corpus { train: tok.encode(&"abc".repeat(200)).unwrap(), val: tok.encode(&"acb".repeat(40)).unwrap() };
+        (tok, corpus)
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nanograd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    const TINY: GptConfig = GptConfig { vocab: 7, context: 16, d_model: 32, n_heads: 4, n_layers: 2 };
+
+    /// The directory must hold the model from the step with the lowest
+    /// validation loss, and not the one the run happened to stop on.
+    ///
+    /// Checking the loss alone would not do it: two steps can score the same
+    /// to three decimals and be different models. So snapshot the weights at
+    /// every checkpoint, and require the file to be the snapshot from the
+    /// step the run said was best, float for float.
+    #[test]
+    fn the_saved_model_is_the_best_one_and_not_the_last() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let mut model = Gpt::new(config, &mut Rng::new(4));
+        let dir = scratch("best");
+
+        let cfg = Training {
+            steps: 240,
+            batch: 4,
+            lr: 1e-2,
+            eval_every: 40,
+            eval_windows: 20,
+            threads: 1,
+            save: Some(dir.clone()),
+        };
+        let mut seen: Vec<(usize, f32, Vec<f32>)> = Vec::new();
+        let done = train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
+            if let Report::Step { step, val_loss, model, .. } = report {
+                seen.push((step, val_loss, model.params().iter().flat_map(|p| p.value.to_vec()).collect()));
+            }
+        })
+        .unwrap();
+
+        // The run has to have got worse, or there is nothing here to test.
+        assert_eq!(seen.len(), 6);
+        assert!(done.best_step < cfg.steps, "validation never got worse: {seen:?}", seen = seen.iter().map(|s| s.1).collect::<Vec<_>>());
+        assert!(done.last_val > done.best_val, "last {} against best {}", done.last_val, done.best_val);
+        assert_eq!(done.best_val, seen.iter().map(|s| s.1).fold(f32::INFINITY, f32::min));
+
+        let best = seen.iter().find(|s| s.0 == done.best_step).expect("the best step was reported");
+        let mut back = crate::checkpoint::load(&dir).unwrap();
+        let on_disk: Vec<f32> = back.params().iter().flat_map(|p| p.value.to_vec()).collect();
+        assert_eq!(on_disk, best.2, "the directory holds some step other than {}", done.best_step);
+
+        // And its tokeniser, so that the directory is a model and not half of one.
+        assert_eq!(CharTokenizer::load(&dir).unwrap().chars, tok.chars);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Evaluating draws windows from a generator of its own, so asking more
+    /// often cannot change the answer. Before that it shared the training
+    /// generator, and `--eval-every 100` and `--eval-every 250` trained two
+    /// different models.
+    #[test]
+    fn how_often_a_run_is_evaluated_does_not_change_what_it_learns() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let run = |eval_every: usize| -> (Vec<f32>, f32) {
+            let mut model = Gpt::new(config, &mut Rng::new(4));
+            let cfg = Training { steps: 60, batch: 4, lr: 1e-2, eval_every, eval_windows: 20, threads: 1, save: None };
+            let mut last = 0.0;
+            train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
+                if let Report::Step { val_loss, .. } = report {
+                    last = val_loss;
+                }
+            })
+            .unwrap();
+            (model.params().iter().flat_map(|p| p.value.to_vec()).collect(), last)
+        };
+
+        let (often, val_often) = run(10);
+        let (seldom, val_seldom) = run(30);
+        assert_eq!(often, seldom, "how often it was evaluated changed the weights");
+        // ...and the same windows every time, so the last reading agrees too.
+        assert_eq!(val_often, val_seldom);
+    }
+
+    /// Threads are a matter of who does the arithmetic, not of what it is,
+    /// and `train` has to keep it that way — the loop that chooses between
+    /// `Replicas` and `train_step` now lives here rather than in a `main`.
+    ///
+    /// The losses, not the weights. Replicas sum the same gradients in a
+    /// different order, so they differ in the last bits, and Adam divides by
+    /// the size of the gradient: where a gradient is near zero, a difference
+    /// of 1e-7 in it can still be a step of a whole learning rate. Measured,
+    /// individual weights part by up to 5e-3 after 40 steps, while every loss
+    /// reported here stays within 2.6e-5 — which is why the threshold is on
+    /// the loss and is 1e-4.
+    #[test]
+    fn a_run_learns_the_same_thing_however_many_threads_it_uses() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let run = |threads: usize| -> Vec<f32> {
+            let mut model = Gpt::new(config, &mut Rng::new(4));
+            let cfg = Training { steps: 60, batch: 4, lr: 1e-2, eval_every: 20, eval_windows: 10, threads, save: None };
+            let mut losses = Vec::new();
+            train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
+                if let Report::Step { train_loss, val_loss, .. } = report {
+                    losses.extend([train_loss, val_loss]);
+                }
+            })
+            .unwrap();
+            losses
+        };
+
+        let one = run(1);
+        assert_eq!(one.len(), 6, "three checkpoints, two losses each");
+        // Four windows to a batch, so eight threads is four with four idle.
+        for threads in [2, 3, 4, 8] {
+            let many = run(threads);
+            let worst = worst_gap(&one, &many);
+            assert!(worst < 1e-4, "{threads} threads changed a loss by {worst:e}");
+        }
+    }
+
+    /// The training loss a checkpoint prints is the mean since the last one,
+    /// including a final interval that is shorter than the rest.
+    ///
+    /// Dividing by `eval_every` instead of by the number of steps actually
+    /// taken is the mistake, and it is invisible whenever the steps divide
+    /// evenly — which the defaults do. So: the same run reported both ways.
+    #[test]
+    fn a_reported_training_loss_is_the_mean_since_the_last_checkpoint() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let run = |eval_every: usize| -> Vec<f32> {
+            let mut model = Gpt::new(config, &mut Rng::new(4));
+            let cfg = Training { steps: 7, batch: 2, lr: 1e-2, eval_every, eval_windows: 5, threads: 1, save: None };
+            let mut losses = Vec::new();
+            train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
+                if let Report::Step { train_loss, .. } = report {
+                    losses.push(train_loss);
+                }
+            })
+            .unwrap();
+            losses
+        };
+
+        // Seven steps, one at a time...
+        let each = run(1);
+        assert_eq!(each.len(), 7);
+        // ...and all seven at once, which is a final interval of 7 where a
+        // run of 7 with `eval_every` 10 would have expected 10.
+        let whole = run(10);
+        assert_eq!(whole.len(), 1);
+        let mean = each.iter().sum::<f32>() / 7.0;
+        assert!((whole[0] - mean).abs() < 1e-5, "reported {}, the mean of the seven was {mean}", whole[0]);
+    }
+
+    /// Both splits have to be longer than the context, and the message has
+    /// to say which one is not — the validation split is a tenth of the
+    /// text, so it is nearly always the one that runs out first.
+    #[test]
+    fn a_text_too_short_to_draw_a_window_from_is_refused_by_name() {
+        let tok = CharTokenizer::from_text("abc");
+        let config = GptConfig { vocab: 3, context: 16, d_model: 8, n_heads: 2, n_layers: 1 };
+        let cfg = Training { steps: 1, batch: 1, lr: 1e-2, eval_every: 1, eval_windows: 1, threads: 1, save: None };
+
+        let attempt = |train_len: usize, val_len: usize| -> String {
+            let mut model = Gpt::new(config, &mut Rng::new(4));
+            let corpus = Corpus {
+                train: tok.encode(&"abc".repeat(train_len)).unwrap(),
+                val: tok.encode(&"abc".repeat(val_len)).unwrap(),
+            };
+            train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |_| {})
+                .err()
+                .map_or_else(String::new, |e| e.to_string())
+        };
+
+        // Plenty to train on, not enough to be tested on: the case a caller
+        // is least likely to have thought about.
+        let error = attempt(100, 5);
+        assert!(error.contains("validation split is 15"), "{error}");
+        assert!(error.contains("170 characters in all"), "{error}");
+        assert!(attempt(5, 100).contains("training split is 15"));
+        // Exactly one window is enough.
+        assert_eq!(attempt(6, 6), "");
+    }
+
+    /// A run that cannot train is a mistake, not a no-op. Left to itself it
+    /// would report a best validation loss of infinity at step 0 and leave
+    /// the directory it was pointed at empty.
+    #[test]
+    fn a_run_of_no_steps_is_refused() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let mut model = Gpt::new(config, &mut Rng::new(4));
+        let cfg = Training { steps: 0, batch: 2, lr: 1e-2, eval_every: 10, eval_windows: 8, threads: 1, save: None };
+        let error = train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |_| {}).unwrap_err();
+        assert!(error.to_string().contains("no steps"), "{error}");
+    }
+
+    /// Every checkpoint in a run is measured on the same windows, so that its
+    /// number can be compared with the one before — which is the whole basis
+    /// for keeping the best model.
+    ///
+    /// The way to see it is to stop the model moving. At a learning rate of
+    /// zero the weights never change, so anything that makes two checkpoints
+    /// disagree is the measurement and not the model.
+    #[test]
+    fn every_checkpoint_measures_the_same_validation_windows() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let mut model = Gpt::new(config, &mut Rng::new(4));
+        let cfg = Training { steps: 30, batch: 2, lr: 0.0, eval_every: 10, eval_windows: 8, threads: 1, save: None };
+
+        let mut seen = Vec::new();
+        train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| {
+            if let Report::Step { val_loss, .. } = report {
+                seen.push(val_loss);
+            }
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.windows(2).all(|p| p[0] == p[1]), "a still model was measured differently: {seen:?}");
+    }
+
+    /// The estimate has to arrive while it is still worth having.
+    #[test]
+    fn a_run_says_how_fast_it_is_going_before_it_is_over() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let mut model = Gpt::new(config, &mut Rng::new(4));
+        let cfg = Training { steps: 100, batch: 4, lr: 1e-2, eval_every: 50, eval_windows: 10, threads: 1, save: None };
+
+        let mut pace = Vec::new();
+        let mut steps_at_pace = None;
+        let mut latest = 0;
+        train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |report| match report {
+            Report::Pace { chars_per_sec, remaining_secs } => {
+                steps_at_pace = Some(latest);
+                pace.push((chars_per_sec, remaining_secs));
+            }
+            Report::Step { step, .. } => latest = step,
+        })
+        .unwrap();
+
+        assert_eq!(pace.len(), 1, "the pace is reported once");
+        // Before the first checkpoint at step 50, so before any of the run
+        // has been paid for twice over.
+        assert_eq!(steps_at_pace, Some(0));
+        let (rate, remaining) = pace[0];
+        assert!(rate > 0.0 && rate.is_finite(), "{rate} characters a second");
+        // Nine tenths of the run was still to come.
+        let whole = rate * remaining / 0.9;
+        let want = (cfg.steps * cfg.batch * config.context) as f32;
+        assert!((whole - want).abs() < 0.01 * want, "estimated {whole} characters in all, not {want}");
+    }
 }

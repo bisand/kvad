@@ -167,6 +167,46 @@ pub fn find_local(id: &str) -> Option<LocalModel> {
     local_models().into_iter().find(|m| m.id.eq_ignore_ascii_case(id))
 }
 
+/// Every model trained on this machine, by name.
+///
+/// Kept apart from [`local_models`] rather than folded into it, because the
+/// two are not the same kind of thing. A downloaded model can be deleted and
+/// fetched again; a trained one is the only copy there is. `kvad ls` lists
+/// them in a section of their own for that reason, and `kvad rm` says
+/// "retraining" rather than "re-download" when asked to delete one.
+pub fn trained_models() -> Vec<LocalModel> {
+    let root = crate::weights::models_dir();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<LocalModel> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|entry| {
+            let path = entry.path();
+            let config = path.join("config.json");
+            LocalModel {
+                id: entry.file_name().to_string_lossy().into_owned(),
+                bytes: dir_size(&path),
+                arch: crate::weights::read_json(&config).ok().and_then(|j| {
+                    j.get("model_type").and_then(|m| m.as_str()).and_then(Arch::from_model_type)
+                }),
+                // A directory left behind by a run that was stopped before
+                // its first checkpoint has a tokeniser and no weights.
+                complete: path.join("model.safetensors").is_file() && config.is_file(),
+                path,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+pub fn find_trained(name: &str) -> Option<LocalModel> {
+    trained_models().into_iter().find(|m| m.id == name)
+}
+
 fn find_config(model_dir: &Path) -> Option<PathBuf> {
     let snapshots = model_dir.join("snapshots");
     for rev in std::fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {

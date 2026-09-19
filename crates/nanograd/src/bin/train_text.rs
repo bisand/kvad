@@ -22,55 +22,51 @@
 //!
 //! With `--load`, the model's shape comes from the checkpoint, and --context,
 //! --d-model, --heads and --layers are ignored.
+//!
+//! `--save` writes the best model this run saw, not the last one: every time
+//! the validation loss improves, the directory is rewritten. See
+//! `text::Training` for why, and for what "best" means after a `--load`.
+//!
+//! This binary is the `nanograd` way in. The same loop, with trained models
+//! given names and a home of their own, is `kvad train`.
 
 use nanograd::checkpoint;
 use nanograd::model::{Gpt, GptConfig};
-use nanograd::optim::AdamW;
 use nanograd::rng::Rng;
-use nanograd::text::{evaluate, generate, train_step, unigram_loss, CharTokenizer, Corpus, Replicas};
+use nanograd::text::{
+    evaluate, generate, human_secs, train, unigram_loss, CharTokenizer, Corpus, Report, Training,
+};
 use std::path::PathBuf;
-use std::time::Instant;
 
 struct Args {
     data: Option<PathBuf>,
-    steps: usize,
-    batch: usize,
     context: usize,
     d_model: usize,
     heads: usize,
     layers: usize,
-    lr: f32,
-    eval_every: usize,
     sample: usize,
     temperature: f32,
     prompt: Option<String>,
     seed: u64,
-    save: Option<PathBuf>,
     load: Option<PathBuf>,
-    threads: usize,
+    training: Training,
 }
 
 impl Default for Args {
     fn default() -> Self {
         Args {
             data: None,
-            steps: 2000,
-            batch: 16,
             context: 64,
             d_model: 64,
             heads: 4,
             layers: 2,
-            lr: 3e-3,
-            eval_every: 250,
             sample: 200,
             temperature: 0.8,
             prompt: None,
             seed: 1337,
-            save: None,
             load: None,
-            // Every core there is. A batch cannot be split finer than one
-            // window to a thread, which `main` sees to.
-            threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            // Steps, batch, learning rate, evaluation and every core there is.
+            training: Training::default(),
         }
     }
 }
@@ -95,21 +91,21 @@ fn parse_args() -> Args {
         };
         match argv[i].as_str() {
             "--data" => a.data = Some(PathBuf::from(value(i))),
-            "--steps" => a.steps = parse(i) as usize,
-            "--batch" => a.batch = parse(i) as usize,
+            "--steps" => a.training.steps = parse(i) as usize,
+            "--batch" => a.training.batch = parse(i) as usize,
             "--context" => a.context = parse(i) as usize,
             "--d-model" => a.d_model = parse(i) as usize,
             "--heads" => a.heads = parse(i) as usize,
             "--layers" => a.layers = parse(i) as usize,
-            "--lr" => a.lr = parse(i) as f32,
-            "--eval-every" => a.eval_every = parse(i) as usize,
+            "--lr" => a.training.lr = parse(i) as f32,
+            "--eval-every" => a.training.eval_every = parse(i) as usize,
             "--sample" => a.sample = parse(i) as usize,
             "--temperature" => a.temperature = parse(i) as f32,
             "--prompt" => a.prompt = Some(value(i)),
             "--seed" => a.seed = parse(i) as u64,
-            "--save" => a.save = Some(PathBuf::from(value(i))),
+            "--save" => a.training.save = Some(PathBuf::from(value(i))),
             "--load" => a.load = Some(PathBuf::from(value(i))),
-            "--threads" => a.threads = (parse(i) as usize).max(1),
+            "--threads" => a.training.threads = (parse(i) as usize).max(1),
             other => {
                 eprintln!("unknown flag {other}");
                 std::process::exit(2);
@@ -144,7 +140,7 @@ fn main() -> std::io::Result<()> {
     };
 
     // Nothing to learn from is needed just to write.
-    if args.steps == 0 {
+    if args.training.steps == 0 {
         let Some((mut model, tok)) = loaded else {
             eprintln!("--steps 0 trains nothing; it is only useful with --load");
             std::process::exit(2);
@@ -191,11 +187,10 @@ fn main() -> std::io::Result<()> {
         corpus.val.len()
     );
 
-    let context = model.config().context;
-    let threads = args.threads.min(args.batch);
-    let mut opt = AdamW::new(args.lr);
+    let cfg = &args.training;
+    let threads = cfg.threads.min(cfg.batch);
     println!("model: {}", model.summary());
-    println!("hyperparams: steps={} batch={} lr={} threads={threads}", args.steps, args.batch, args.lr);
+    println!("hyperparams: steps={} batch={} lr={} threads={threads}", cfg.steps, cfg.batch, cfg.lr);
 
     // Two numbers to hold the loss against. A model that knows nothing scores
     // the first; one that knows only which characters are common scores the
@@ -214,37 +209,35 @@ fn main() -> std::io::Result<()> {
     // A newline, if the text has one: "start a fresh line".
     let prompt = encode_prompt(&tok, args.prompt.as_deref().unwrap_or("\n"), args.prompt.is_none());
 
-    let mut replicas = (threads > 1).then(|| Replicas::new(&model, threads));
-    let started = Instant::now();
-    let mut running = 0.0;
-    for step in 1..=args.steps {
-        running += match &mut replicas {
-            Some(replicas) => replicas.train_step(&mut model, &mut opt, &corpus.train, args.batch, &mut rng),
-            None => train_step(&mut model, &mut opt, &corpus.train, args.batch, &mut rng),
-        };
-
-        if step % args.eval_every == 0 || step == args.steps {
-            let since = if step % args.eval_every == 0 { args.eval_every } else { step % args.eval_every };
-            let elapsed = started.elapsed().as_secs_f32();
-            let val = evaluate(&mut model, &corpus.val, 50, &mut rng);
+    let mut sampler = Rng::new(args.seed ^ 0x5a5a);
+    let done = train(&mut model, &tok, &corpus, cfg, &mut rng, &mut |report| match report {
+        // Only when there is time to act on it. A run that is already over
+        // does not need an estimate of when it will be.
+        Report::Pace { chars_per_sec, remaining_secs } if remaining_secs >= 20.0 => {
+            println!("at {chars_per_sec:.0} chars/s here, about {} to go\n", human_secs(remaining_secs));
+        }
+        Report::Pace { .. } => {}
+        Report::Step { step, train_loss, val_loss, best, saved, elapsed_secs, chars_per_sec, model } => {
+            let mark = if saved { "  *saved" } else if best { "  *best" } else { "" };
             println!(
-                "step {step:>5}  train loss {:.3}  validation loss {val:.3}  ({elapsed:.0}s, {:.0} chars/s)",
-                running / since as f32,
-                (step * args.batch * context) as f32 / elapsed
+                "step {step:>5}  train loss {train_loss:.3}  validation loss {val_loss:.3}  ({elapsed_secs:.0}s, {chars_per_sec:.0} chars/s){mark}"
             );
-            running = 0.0;
-
             if args.sample > 0 {
-                let out = generate(&mut model, &prompt, args.sample, args.temperature, &mut rng);
+                let out = generate(model, &prompt, args.sample, args.temperature, &mut sampler);
                 println!("---\n{}\n---\n", tok.decode(&out).trim());
             }
         }
-    }
+    })?;
 
-    if let Some(dir) = &args.save {
-        checkpoint::save(dir, &mut model)?;
-        tok.save(dir)?;
-        println!("saved to {}", dir.display());
+    if let Some(dir) = &cfg.save {
+        println!(
+            "saved to {}: step {} of {}, validation loss {:.3} (last was {:.3})",
+            dir.display(),
+            done.best_step,
+            cfg.steps,
+            done.best_val,
+            done.last_val
+        );
     }
     Ok(())
 }

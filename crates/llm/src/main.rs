@@ -2,9 +2,10 @@
 //!
 //!     kvad search QUERY      find models on the Hub, flagging which we can run
 //!     kvad pull REPO         download a model into the local cache
-//!     kvad ls                list downloaded models
+//!     kvad train --data F    train a model of your own, from a text file
+//!     kvad ls                list downloaded and trained models
 //!     kvad use REPO          set the default model
-//!     kvad rm REPO           delete a model from the cache
+//!     kvad rm REPO           delete a model
 //!     kvad cache [REPO]      list (or delete) pre-quantised weight files
 //!     kvad info [--model R]  read the config without downloading weights
 //!     kvad run  [--model R] [--prompt TEXT]
@@ -12,6 +13,10 @@
 //!
 //! Sampling flags: --max-tokens N --temperature F --top-k N --top-p F --seed N
 //! --greedy
+//!
+//! Wherever a model is named, three things are accepted and tried in this
+//! order: a directory that exists, a model trained here by that name, a Hub
+//! repo id. See `kvad::weights`.
 
 use kvad::chat::Message;
 use kvad::hub::{self, State};
@@ -19,6 +24,7 @@ use kvad::model::{KvCache, Spec};
 use kvad::qcache;
 use kvad::quant::Precision;
 use kvad::runtime::Llm;
+use kvad::train;
 use kvad::sampler::Sampler;
 use kvad::weights;
 use std::io::{BufRead, Write};
@@ -43,6 +49,17 @@ struct Args {
     top_p: f32,
     seed: u64,
     quant: Precision,
+    /// `train` only.
+    data: Option<String>,
+    from: Option<String>,
+    name: Option<String>,
+    size: Option<String>,
+    steps: Option<usize>,
+    batch: Option<usize>,
+    lr: Option<f32>,
+    eval_every: Option<usize>,
+    threads: Option<usize>,
+    sample: Option<usize>,
 }
 
 impl Default for Args {
@@ -59,6 +76,16 @@ impl Default for Args {
             top_p: 0.95,
             seed: 7,
             quant: Precision::F32,
+            data: None,
+            from: None,
+            name: None,
+            size: None,
+            steps: None,
+            batch: None,
+            lr: None,
+            eval_every: None,
+            threads: None,
+            sample: None,
         }
     }
 }
@@ -69,16 +96,17 @@ fn usage() -> ! {
          commands:\n  \
            search QUERY        find models on the Hub\n  \
            pull REPO           download a model\n  \
-           ls                  list downloaded models\n  \
-           use REPO|DIR        set the default model\n  \
-           rm REPO             delete a model from the cache\n  \
+           train               train a model of your own from a text file\n  \
+           ls                  list downloaded and trained models\n  \
+           use MODEL           set the default model\n  \
+           rm MODEL            delete a downloaded or trained model\n  \
            cache [REPO|clear]  list or delete pre-quantised weight files\n  \
            info                show a model's config without downloading weights\n  \
            run                 one-shot completion\n  \
            chat                interactive conversation\n\n\
          options:\n  \
-           --model REPO|DIR    HuggingFace repo id, or a directory holding a model\n  \
-                               (default: active, else {DEFAULT_MODEL})\n  \
+           --model MODEL       a name trained here, a directory, or a Hub repo id\n  \
+           \u{20}                   (default: active, else {DEFAULT_MODEL})\n  \
            --prompt TEXT       prompt for `run`\n  \
            --system TEXT       system prompt for `chat`\n  \
            --max-tokens N      generation budget (default 256)\n  \
@@ -87,7 +115,24 @@ fn usage() -> ! {
            --top-p F           nucleus threshold (default 0.95)\n  \
            --seed N            sampling seed (default 7)\n  \
            --quant f32|q8|q4   quantise weights on load (default f32)\n  \
-           --greedy            shorthand for --temperature 0"
+           --greedy            shorthand for --temperature 0\n\n\
+         kvad train options:\n  \
+           --data FILE         plain text to learn from (required)\n  \
+           --name NAME         what to call it; one word, no `/`\n  \
+           --from MODEL        train an existing model further, instead of a new one\n  \
+           --size NAME         model shape: {sizes} (default {default_size})\n  \
+           --steps N           training steps (default 2000)\n  \
+           --batch N           windows per step (default 16)\n  \
+           --lr F              learning rate (default 0.003)\n  \
+           --eval-every N      steps between checkpoints (default 250)\n  \
+           --threads N         replicas to split each batch across (default: every core)\n  \
+           --sample N          characters to write at each checkpoint, 0 for none\n\n\
+         `--from` has two limits worth knowing. The character vocabulary is fixed at\n\
+         first training, so text with a character the model never saw is refused. And\n\
+         the optimiser's state is not saved, so a resumed run restarts AdamW's running\n\
+         averages: measured at up to 0.06 of training loss over 50 steps, gone by 100.",
+        sizes = train::SIZES.iter().map(|s| s.name).collect::<Vec<_>>().join("|"),
+        default_size = train::SIZES[train::DEFAULT_SIZE].name,
     );
     std::process::exit(2);
 }
@@ -148,6 +193,16 @@ fn parse_args() -> Args {
             "--top-k" => a.top_k = num() as usize,
             "--top-p" => a.top_p = num() as f32,
             "--seed" => a.seed = num() as u64,
+            "--data" => a.data = Some(value.clone()),
+            "--from" => a.from = Some(value.clone()),
+            "--name" => a.name = Some(value.clone()),
+            "--size" => a.size = Some(value.clone()),
+            "--steps" => a.steps = Some(num() as usize),
+            "--batch" => a.batch = Some(num() as usize),
+            "--lr" => a.lr = Some(num() as f32),
+            "--eval-every" => a.eval_every = Some(num() as usize),
+            "--threads" => a.threads = Some((num() as usize).max(1)),
+            "--sample" => a.sample = Some(num() as usize),
             "--quant" => {
                 a.quant = Precision::parse(&value).unwrap_or_else(|| {
                     eprintln!("--quant expects f32, q8 or q4, got `{value}`");
@@ -224,6 +279,7 @@ fn main() -> Res<()> {
             Ok(())
         }
         "search" => search(args),
+        "train" => train_model(args),
         "pull" => pull(args),
         "ls" => list_local(),
         "use" => use_model(args),
@@ -241,6 +297,90 @@ fn main() -> Res<()> {
 // ---------------------------------------------------------------------------
 // Model management
 // ---------------------------------------------------------------------------
+
+/// `kvad train` — the one command that makes a model instead of fetching one.
+fn train_model(args: Args) -> Res<()> {
+    let Some(data) = args.data.as_deref() else {
+        eprintln!("usage: kvad train --data FILE --name NAME");
+        eprintln!("       kvad train --data FILE --from NAME     (train an existing model further)");
+        std::process::exit(2);
+    };
+
+    let size = match args.size.as_deref() {
+        None => &train::SIZES[train::DEFAULT_SIZE],
+        Some(name) => train::size(name).unwrap_or_else(|| {
+            let names: Vec<_> = train::SIZES.iter().map(|s| s.name).collect();
+            eprintln!("--size expects one of {}, got `{name}`", names.join(", "));
+            std::process::exit(2);
+        }),
+    };
+
+    let d = nanograd::text::Training::default();
+    let training = nanograd::text::Training {
+        steps: args.steps.unwrap_or(d.steps),
+        batch: args.batch.unwrap_or(d.batch),
+        lr: args.lr.unwrap_or(d.lr),
+        eval_every: args.eval_every.unwrap_or(d.eval_every),
+        threads: args.threads.unwrap_or(d.threads),
+        ..d
+    };
+
+    let opts = train::Options {
+        data: data.into(),
+        from: args.from.clone(),
+        name: args.name.clone(),
+        size,
+        training,
+        seed: args.seed,
+        sample: args.sample.unwrap_or(160),
+        temperature: args.temperature,
+    };
+
+    // Say where it is going before it starts, because it is about to take a
+    // while and overwriting a model is not undoable.
+    match (&opts.name, &opts.from) {
+        (Some(name), _) if !weights::is_model_name(name) => {
+            eprintln!("`{name}` is not a model name: it has to be one word, with no `/` in it");
+            std::process::exit(2);
+        }
+        (Some(name), _) => {
+            let dir = train::would_write(name);
+            match train::holds_a_model(&dir) {
+                true => println!("training `{name}`, replacing the model already in {}", dir.display()),
+                false => println!("training `{name}` into {}", dir.display()),
+            }
+        }
+        (None, Some(from)) => {
+            println!("training `{from}` further, in place — pass --name to keep the old one as well");
+        }
+        (None, None) => {
+            eprintln!("a new model needs a name:  kvad train --data {data} --name NAME");
+            std::process::exit(2);
+        }
+    }
+    // Only for a new model. With `--from` the shape comes from the
+    // checkpoint, so say plainly that `--size` is being ignored rather than
+    // let someone believe they resized a model by asking.
+    match (opts.from.is_some(), args.size.is_some()) {
+        (false, _) => println!("size {}: {}", size.name, size.shape()),
+        (true, true) => eprintln!("ignoring --size: a model's shape is fixed when it is first trained"),
+        (true, false) => {}
+    }
+
+    let summary = train::run(&opts, &mut |line| println!("{line}"))?;
+    println!(
+        "\nkept step {} of {}: validation loss {:.3} (the last step measured {:.3})",
+        summary.best_step, opts.training.steps, summary.best_val, summary.last_val
+    );
+    println!(
+        "{} parameters, {} in {}",
+        summary.params,
+        hub::human_bytes(summary.dir.join("model.safetensors").metadata().map(|m| m.len()).unwrap_or(0)),
+        summary.dir.display()
+    );
+    println!("\nrun it with:  kvad run --model {} --prompt \"...\"", summary.handle);
+    Ok(())
+}
 
 fn search(args: Args) -> Res<()> {
     let Some(query) = args.target else {
@@ -315,17 +455,23 @@ fn pull(args: Args) -> Res<()> {
     Ok(())
 }
 
+/// `kvad ls` — everything runnable on this machine, in two sections.
+///
+/// Downloaded and trained models are listed apart because they are different
+/// kinds of thing: one can be fetched again, and the other is the only copy
+/// there is. Both are named the way `--model` wants them.
 fn list_local() -> Res<()> {
-    let models = hub::local_models();
-    if models.is_empty() {
-        println!("no models downloaded yet. try:  kvad search smollm");
+    let downloaded = hub::local_models();
+    let trained = hub::trained_models();
+    if downloaded.is_empty() && trained.is_empty() {
+        println!("nothing here yet. try:  kvad search smollm");
+        println!("               or:  kvad train --data some.txt --name mine");
         return Ok(());
     }
 
     let active = State::active();
     let mut total = 0;
-    println!("{:<46} {:<7} {:>9}", "MODEL", "ARCH", "SIZE");
-    for m in &models {
+    let mut row = |m: &hub::LocalModel, note: &str| {
         total += m.bytes;
         let marker = if active.as_deref() == Some(m.id.as_str()) { " *" } else { "" };
         println!(
@@ -334,16 +480,36 @@ fn list_local() -> Res<()> {
             m.arch.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
             hub::human_bytes(m.bytes),
             marker,
-            if m.complete { "" } else { "  (config only)" }
+            note
         );
+    };
+
+    if !downloaded.is_empty() {
+        println!("{:<46} {:<7} {:>9}", "DOWNLOADED", "ARCH", "SIZE");
+        for m in &downloaded {
+            row(m, if m.complete { "" } else { "  (config only)" });
+        }
     }
-    println!("\n{} models, {}", models.len(), hub::human_bytes(total));
+    if !trained.is_empty() {
+        if !downloaded.is_empty() {
+            println!();
+        }
+        println!("{:<46} {:<7} {:>9}", "TRAINED HERE", "ARCH", "SIZE");
+        for m in &trained {
+            row(m, if m.complete { "" } else { "  (unfinished — no weights)" });
+        }
+    }
+
+    println!("\n{} models, {}", downloaded.len() + trained.len(), hub::human_bytes(total));
     if let Some(a) = active {
         println!("* active: {a}");
     } else {
         println!("no active model set (using {DEFAULT_MODEL})");
     }
     println!("cache: {}", hub::cache_dir().display());
+    if !trained.is_empty() {
+        println!("trained: {}", weights::models_dir().display());
+    }
     Ok(())
 }
 
@@ -356,9 +522,11 @@ fn use_model(args: Args) -> Res<()> {
     // mean the same thing from whichever directory `kvad` is next run in.
     let repo = weights::model_id(&repo);
     if !weights::is_local(&repo) && hub::find_local(&repo).is_none() {
-        match weights::looks_like_path(&repo) {
-            true => eprintln!("`{repo}` looks like a path, and there is no such directory"),
-            false => eprintln!("`{repo}` is not downloaded. Run:  kvad pull {repo}"),
+        match (weights::looks_like_path(&repo), repo.contains('/')) {
+            (true, _) => eprintln!("`{repo}` looks like a path, and there is no such directory"),
+            (_, true) => eprintln!("`{repo}` is not downloaded. Run:  kvad pull {repo}"),
+            // No slash, so not a repo id: they meant a model trained here.
+            (_, false) => eprintln!("`{repo}` is not a model trained here. Run `kvad ls` to see what is."),
         }
         std::process::exit(1);
     }
@@ -372,8 +540,10 @@ fn remove(args: Args) -> Res<()> {
         eprintln!("usage: kvad rm REPO");
         std::process::exit(2);
     };
-    let Some(local) = hub::find_local(&repo) else {
-        eprintln!("`{repo}` is not in the cache. Run `kvad ls` to see what is.");
+    // Trained first: `kvad ls` shows both, so `kvad rm` has to know both.
+    let trained = hub::find_trained(&repo);
+    let Some(local) = trained.clone().or_else(|| hub::find_local(&repo)) else {
+        eprintln!("`{repo}` is not a model on this machine. Run `kvad ls` to see what is.");
         std::process::exit(1);
     };
 
@@ -382,7 +552,13 @@ fn remove(args: Args) -> Res<()> {
     println!("about to delete:");
     println!("  {}", local.path.display());
     println!("  {} ({})", local.id, hub::human_bytes(local.bytes));
-    print!("\nre-download would be needed to use it again. delete? [y/N] ");
+    match trained.is_some() {
+        // There is nowhere to fetch a trained model back from. Say so
+        // plainly: this is the one deletion in `kvad` that cannot be undone
+        // by waiting for a download.
+        true => print!("\nit was trained here and is not on the Hub; deleting it is final. delete? [y/N] "),
+        false => print!("\nre-download would be needed to use it again. delete? [y/N] "),
+    }
     std::io::stdout().flush()?;
 
     let mut answer = String::new();

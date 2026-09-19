@@ -28,6 +28,22 @@
 //! `transformers` uses, so nobody has to learn a second one. The directory
 //! holds what a Hub repo would: `config.json`, `tokenizer.json`, and either
 //! `model.safetensors` or a shard index.
+//!
+//! A directory is a poor name, though. `kvad train --name shakespeare` puts
+//! its model in a home of its own — `$XDG_DATA_HOME/kvad/models/shakespeare`
+//! — and from then on the bare word `shakespeare` means that model from any
+//! working directory. So a model name is resolved in three steps, in this
+//! order:
+//!
+//! 1. a directory of that name that exists, relative to where you are;
+//! 2. a model of that name trained here;
+//! 3. a repo id on the Hub.
+//!
+//! The three cannot be confused by accident. A Hub repo id always contains a
+//! slash (`owner/name`) and a trained model's name never may, because it has
+//! to be one path component — which is also what keeps `../../etc` from being
+//! a model name. And step 1 comes first so that the `transformers` rule still
+//! holds: a directory that is there wins.
 
 use crate::tensor::Tensor;
 use safetensors::{Dtype, SafeTensors};
@@ -45,9 +61,57 @@ pub struct ModelFiles {
     pub generation_config: Option<PathBuf>,
 }
 
+/// Where models trained on this machine live.
+///
+/// `$XDG_DATA_HOME/kvad/models`, or `~/.local/share/kvad/models`. Data rather
+/// than cache, because these cannot be downloaded again: the only copy of a
+/// model you trained is the one on your disk. The active-model setting next
+/// door in `hub::State` follows the same convention with `XDG_CONFIG_HOME`.
+pub fn models_dir() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home().join(".local/share"));
+    base.join("kvad").join("models")
+}
+
+fn home() -> PathBuf {
+    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Whether `name` is usable as the name of a trained model: exactly one
+/// ordinary path component.
+///
+/// This is the check that makes `models_dir().join(name)` safe to build. A
+/// name with a slash in it, an absolute path, `.` or `..` would all escape
+/// the models directory, and `..` is the one somebody would try.
+pub fn is_model_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none()
+}
+
+/// Where a model trained here by that name lives, if one does.
+///
+/// The path comes back resolved, as [`local_dir`]'s does, so that the two
+/// answers can be compared and neither depends on how the models home was
+/// reached.
+pub fn trained_dir(name: &str) -> Option<PathBuf> {
+    let dir = models_dir().join(name);
+    (is_model_name(name) && dir.is_dir()).then(|| std::fs::canonicalize(&dir).unwrap_or(dir))
+}
+
+/// The directory a model name refers to on this machine, if any: a directory
+/// that exists as typed, else a model trained here under that name.
+pub fn local_dir(model: &str) -> Option<PathBuf> {
+    let typed = Path::new(model);
+    if typed.is_dir() {
+        return Some(std::fs::canonicalize(typed).unwrap_or_else(|_| typed.to_path_buf()));
+    }
+    trained_dir(model)
+}
+
 /// Whether `model` names a directory on this machine rather than a Hub repo.
 pub fn is_local(model: &str) -> bool {
-    Path::new(model).is_dir()
+    local_dir(model).is_some()
 }
 
 /// Whether `model` was written the way paths are and repo ids never are.
@@ -55,17 +119,27 @@ pub fn looks_like_path(model: &str) -> bool {
     model.starts_with(['.', '/', '~'])
 }
 
-/// The name a model is known by once loaded: a repo id as it is, a directory
-/// as its absolute path.
+/// The name a model is known by once loaded: a repo id as it is, a model
+/// trained here by its bare name, any other directory by its absolute path.
 ///
 /// Anything keyed on the name — the quantised-weight cache above all — must
 /// not think `out/readme`, `./out/readme` and the same words typed from
-/// another working directory are three models, or worse, one.
+/// another working directory are three models, or worse, one. The same goes
+/// for `shakespeare` and the long path it stands for, which is why a trained
+/// model resolves *back* to its name here rather than forward to its path.
 pub fn model_id(model: &str) -> String {
-    match is_local(model) {
-        true => std::fs::canonicalize(model).map_or_else(|_| model.to_string(), |p| p.display().to_string()),
-        false => model.to_string(),
+    match local_dir(model) {
+        Some(dir) => trained_name(&dir).unwrap_or_else(|| dir.display().to_string()),
+        None => model.to_string(),
     }
+}
+
+/// The name of a trained model, given its directory — the reverse of
+/// [`trained_dir`], and `None` for a directory that is not in the models home.
+pub fn trained_name(dir: &Path) -> Option<String> {
+    let root = std::fs::canonicalize(models_dir()).ok()?;
+    let dir = std::fs::canonicalize(dir).ok()?;
+    (dir.parent()? == root).then(|| dir.file_name()?.to_str().map(str::to_string))?
 }
 
 impl ModelFiles {
@@ -123,9 +197,12 @@ pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
 /// The TUI needs this: anything written straight to stderr lands on top of the
 /// rendered frame and corrupts the display.
 pub fn fetch_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<ModelFiles> {
-    if is_local(repo_id) {
-        progress("a directory on this machine; nothing to fetch");
-        return ModelFiles::from_dir(Path::new(repo_id));
+    if let Some(dir) = local_dir(repo_id) {
+        progress(match trained_name(&dir) {
+            Some(_) => "a model trained here; nothing to fetch",
+            None => "a directory on this machine; nothing to fetch",
+        });
+        return ModelFiles::from_dir(&dir);
     }
     // Typed as a path, so meant as one: say the directory is missing, rather
     // than go and ask the Hub for a repo called `./out`.
@@ -134,7 +211,12 @@ pub fn fetch_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<ModelFil
     }
 
     let (owner, name) = repo_id.split_once('/').ok_or_else(|| {
-        format!("expected a repo id like `openai-community/gpt2` or a directory, got `{repo_id}`")
+        // No slash, so it cannot be a repo id and was not a trained model
+        // either. Say which of the two they might have meant.
+        format!(
+            "`{repo_id}` is not a model trained here, and a Hub repo id looks like \
+             `openai-community/gpt2`. `kvad ls` lists what is on this machine."
+        )
     })?;
 
     let client = hf_hub::HFClientSync::new()?;

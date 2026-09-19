@@ -62,6 +62,8 @@ measurement in this repo keeps pointing at.
 cargo test                                      # includes a gradient check
 cargo run --release -p nanograd --bin train_mnist
 cargo run --release -p nanograd --bin train_text -- --data README.md
+cargo run --release -p kvad -- train --data README.md --name readme
+cargo run --release -p kvad -- run --model readme --prompt "## "
 cargo run --release -p kvad -- run --prompt "Why is the sky blue?"
 cargo run --release -p kvad-gpu -- run --prompt "Why is the sky blue?"
 cargo run --release -p kvad-tui
@@ -345,6 +347,10 @@ nothing. Measured against the same run left alone, that cost 0.06 and 0.04 of
 training loss over the first 50 steps on two seeds, nothing on a third, and
 nothing visible on any by step 100.
 
+`--save` keeps the best model rather than the last — see
+[One tool: `kvad train`](#one-tool-kvad-train), where the same loop gets a
+name and a home.
+
 ### Where the time went
 
 Training ran at 22,000 characters a second, and the plan was to use more cores.
@@ -411,15 +417,129 @@ windows would then depend on scheduling. The rest is the serial part: adding up
 16 copies of the gradient, AdamW, and starting 16 threads a step, together
 about a quarter of the main thread's time.
 
+### One tool: `kvad train`
+
+```bash
+kvad train --data corpus.txt --name shakespeare    # train a new model
+kvad train --from shakespeare --data more.txt      # train it further
+kvad run --model shakespeare --prompt "ROMEO:"
+kvad ls                                            # it is listed, by name
+```
+
+`train_text` and `kvad` used to be two programs with a directory passed
+between them. They are one now, and the joining piece is a name. `--name
+shakespeare` writes into `$XDG_DATA_HOME/kvad/models/shakespeare`, and from
+then on the bare word means that model wherever you are: `kvad run --model
+shakespeare`, `kvad use shakespeare`, `kvad rm shakespeare`, `kvad-tui
+shakespeare`. A model name is resolved in three steps — a directory of that
+name that exists, then a model trained here, then a Hub repo id — and the
+three cannot collide by accident, because a repo id always has a slash in it
+and a name may never have one. A directory still wins, which is the rule
+`transformers` uses.
+
+The training loop itself did not move house so much as move down a floor. It
+lives in [`nanograd::text::train`](crates/nanograd/src/text.rs) now, where
+both front ends call it: `train_text` still takes `--layers`, `--d-model`,
+`--heads` and `--context` one at a time, for seeing what each of them does,
+and `kvad train` takes `--size` instead. Nothing about the learning changed in
+the move, and tests say so: every loss a run reports is the same however many
+threads it uses (to 2.6e-5 — the losses and not the weights, because replicas
+sum in a different order and Adam divides by the size of the gradient, so
+where a gradient is near zero a difference of 1e-7 in it is still a step of a
+whole learning rate), and the training loss a checkpoint prints is the mean
+since the last one, including a final interval shorter than the rest — which
+is invisible whenever the steps divide evenly, as the defaults do.
+
+**It keeps the best model, not the last.** A run on a small text overfits in
+plain sight — validation loss bottoms out and then climbs while training loss
+keeps falling — and the old `--save` wrote whatever step the run ended on,
+which is the memoriser. Now the directory is rewritten every time validation
+improves, and a run that gets worse leaves the good model where it was. This is
+early stopping done by keeping the best rather than by halting: the run still
+finishes and still prints, so the overfitting stays visible instead of being
+hidden by a loop that quietly gave up.
+
+That comparison only means something if the two losses are measured on the
+same windows, and they were not: evaluation drew from the training generator,
+so every checkpoint scored a different sample — and, worse, `--eval-every 100`
+and `--eval-every 250` trained two different models, because the draws came
+out of the same stream as the training windows. Evaluation has a generator of
+its own now, seeded the same way every time.
+
+**`--from` is the owner's "add new training sets to existing models",** and it
+has two limits worth saying out loud, both of which are in `kvad train --help`:
+
+* **The vocabulary is fixed at first training.** A character tokeniser gives
+  ids to the characters it saw, and the model has one row per id in its
+  embedding table and one in its output head. There is no row to give a
+  character that was not there the first time, so text containing one is
+  refused, and the message says which character it was. Training a new model
+  on both texts together is the answer.
+* **The optimiser's state is not saved.** AdamW keeps two running averages per
+  weight and a resumed run starts them from nothing. Measured: at most 0.06 of
+  training loss over the first 50 steps on two seeds, nothing on a third, and
+  nothing visible on any by step 100.
+
+`kvad ls` lists trained models in a section of their own rather than mixed in
+with downloads, and `kvad rm` says something different about them, because they
+are a different kind of thing: a downloaded model can be fetched again and a
+trained one cannot. Twenty-nine mutations were made on purpose to see which of these
+claims a test would actually defend — the last model saved instead of the best,
+a bar that starts at zero so nothing is written, the tokeniser left out of the
+directory, `..` accepted as a model name, a name sent to the Hub without being
+looked for here, an unseen character quietly given a fresh vocabulary. Two
+survived the first pass, and both were real gaps: nothing required two
+checkpoints in one run to be measured on the same windows, and nothing stopped
+two directories with the same last component from being one model to the
+quantised-weight cache. Both have tests now.
+
+**`--size` is measured, not guessed.** Three shapes, timed the way everything
+in this repository is timed — interleaved, five runs of each, on this README
+as the training text, batch 16, all 16 threads, an M5 Pro 93% idle. The
+parameter counts are for that text's 101 characters: the embedding table and
+the output head are as wide as the vocabulary is, so another text gives
+another count.
+
+| `--size` | shape | parameters | chars/s, 5 runs | median | default 2000 steps |
+|---|---|---|---|---|---|
+| `small` | 2 layers, d_model 64, ctx 64 | 117,221 | 137,100–260,600 | 228,800 | 9 s |
+| `medium` | 4 layers, d_model 128, ctx 128 | 835,685 | 38,500–52,000 | 39,500 | 1m 44s |
+| `large` | 6 layers, d_model 256, ctx 256 | 4,856,421 | 5,800–7,700 | 7,000 | 19m 25s |
+
+(Sampling off and one validation pass at the end, which is why `small` comes
+out at 9 seconds where [the threads table](#where-the-time-went) says 10.5 to
+12.7 for the same run with sampling on. The ranges are wide for the reason
+given there: 16 threads on 6 fast and 12 slow cores, and every step ends when
+the slowest one does.)
+
+Those numbers are from one machine, though, and a table in a README cannot
+know yours. So the run times its own first ten steps and says what it expects
+to cost here, before there is anything to regret:
+
+```
+$ kvad train --data README.md --name big --size large
+size large: 6 layers, 8 heads, d_model 256, context 256
+model: Gpt(6 layers, 8 heads, d_model 256, vocab 103, context 256, 4857447 params)
+loss to beat: 4.635 knowing nothing, 3.341 knowing only letter frequencies
+7958 characters a second here — about 17m 04s to go. Ctrl-C now if that is too long.
+```
+
+Ten steps is the whole cost of knowing, and on the slowest preset that is
+about nine seconds. Which is also the shape of the next problem: five million
+parameters is a fifth of the 10–30M this repository wants to reach, and it
+already takes twenty minutes to do two thousand steps. The
+[roadmap](#finishing-the-story) says what that costs and what would have to
+change.
+
 ### Running it in the engine
 
 ```bash
-kvad run --model out/readme --greedy --prompt "## "
-kvad use out/readme          # make it the default, from any directory
-kvad-tui out/readme          # open the TUI with it loading
+kvad run --model readme --greedy --prompt "## "     # a name, or a directory
+kvad use readme              # make it the default, from any directory
+kvad-tui readme              # open the TUI with it loading
 ```
 
-Wherever the engine takes a repo id it takes a directory, by the rule
+Wherever the engine takes a repo id it takes a name or a directory, by the rule
 `transformers` uses: a directory that exists wins. From there it is the same
 code path as a model from the Hub — the same loader, tokeniser, KV cache and
 quantised kernels — so the 117K model gets `--quant q8` for free. (How fast it
@@ -1215,9 +1335,10 @@ saved as a GPT-2 checkpoint ([`checkpoint.rs`](crates/nanograd/src/checkpoint.rs
 from which the `kvad` engine computes the same logits. What stands between the
 two sizes is speed, which is nine times what it was — about 190,000 characters
 a second across the cores — and still a hand-written loop on a CPU: a 10M
-parameter model is some eighty times the arithmetic per character. Nothing stands between the two crates any more: `kvad run --model DIR`
-runs what `train_text --save DIR` wrote. Llama's SwiGLU and RoPE are not
-written. The gradient check from crate 1 is how
+parameter model is some eighty times the arithmetic per character. Nothing
+stands between the two crates any more, nor between the two commands:
+`kvad train --data FILE --name NAME` trains, `kvad run --model NAME` runs, and
+`kvad ls` lists. Llama's SwiGLU and RoPE are not written. The gradient check from crate 1 is how
 you will debug each one — extend `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 

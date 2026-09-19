@@ -265,6 +265,7 @@ fn add_into(acc: &mut Matrix, g: &Matrix) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gradcheck::relative_error;
     use crate::nn::softmax_cross_entropy;
 
     const SEQ: usize = 5;
@@ -290,18 +291,6 @@ mod tests {
             2 => &mut attn.wv,
             _ => &mut attn.wo,
         }
-    }
-
-    /// How far apart two gradients are, as a fraction of their size.
-    ///
-    /// The MLP check compares a few weights one at a time. Attention has many
-    /// gradients that are legitimately tiny, where f32 rounding in the
-    /// numerical estimate swamps the value, so compare whole vectors instead:
-    /// a wrong sign or a missing term moves this to ~1, rounding noise does not.
-    fn relative_error(analytic: &[f32], numerical: &[f32]) -> f32 {
-        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let diff: Vec<f32> = analytic.iter().zip(numerical).map(|(a, n)| a - n).collect();
-        norm(&diff) / (norm(analytic) + norm(numerical)).max(1e-12)
     }
 
     #[test]

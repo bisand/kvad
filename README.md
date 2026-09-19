@@ -97,6 +97,12 @@ Zero dependencies. Read in this order:
    self-attention, forward and backward. Read it after the rest: it is three
    `Linear` layers and two of the products from step 1, and the only new
    derivative in it is the softmax's.
+5. **[`norm.rs`](crates/nanograd/src/norm.rs)** — LayerNorm and RMSNorm. The
+   forward pass is two lines; the file is about the backward pass, and the
+   argument that gets you there without the algebra: a normalised row cannot
+   see its input being shifted or stretched, so the gradient must have no
+   component in those directions. LayerNorm ignores both and subtracts two
+   projections. RMSNorm ignores only the stretch and subtracts one.
 
 ### The test worth running first
 
@@ -115,6 +121,13 @@ from the softmax derivative, forget the `1/sqrt(d)` on the way back, or miss the
 transpose in `dK`, and that becomes 0.2 to 0.8. Two more tests pin the causal
 mask from both sides: the future cannot change the past's output, and the past's
 loss cannot blame the future's input.
+
+The norms get the same treatment, with one trap worth knowing about. Check a
+fresh LayerNorm on inputs drawn from N(0, 1) and both `gamma` and the row's
+standard deviation are 1 — so a backward pass that forgot to multiply by either
+one passes. The tests use a scrambled `gamma` and inputs with a standard
+deviation near 3 for exactly that reason. A gradient check is only as good as
+the point you run it at.
 
 ### Things to try
 
@@ -769,11 +782,12 @@ story, the serving track is what the second half of the mission actually costs.
 ### Finishing the story
 
 **1. Train your own.** A character-level transformer, 10–30M parameters, on a
-corpus you pick. Backprop through attention is done
-([`attention.rs`](crates/nanograd/src/attention.rs)); still needed are an
-embedding, layernorm, the residual wiring of a block, and Adam. The gradient
-check from crate 1 is how you will debug each one — extend `nanograd` (hard,
-most educational) or use [`burn`](https://github.com/tracel-ai/burn).
+corpus you pick. Backprop through attention
+([`attention.rs`](crates/nanograd/src/attention.rs)) and through LayerNorm and
+RMSNorm ([`norm.rs`](crates/nanograd/src/norm.rs)) is done; still needed are an
+embedding, the residual wiring of a block, and Adam. The gradient check from
+crate 1 is how you will debug each one — extend `nanograd` (hard, most
+educational) or use [`burn`](https://github.com/tracel-ai/burn).
 
 **2. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike

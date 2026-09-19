@@ -716,13 +716,13 @@ state management — good Rust, no ML. Build it last.
 
 ## Where to go next
 
-**4. Train your own.** A character-level transformer, 10–30M parameters, on a
+**1. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Needs backprop through attention, layernorm and softmax, plus
 Adam. The gradient check from crate 1 is how you will debug it — extend
 `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
-**5. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
+**2. Fine-tune with LoRA.** Freeze the model, train two small low-rank matrices
 per weight matrix. This is what "custom model" means in practice, and unlike
 full fine-tuning it fits on a laptop.
 

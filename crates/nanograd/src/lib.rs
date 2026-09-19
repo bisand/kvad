@@ -13,6 +13,7 @@
 //! 6. [`embedding`] — token ids to vectors: a `Linear` layer with the zeros skipped.
 //! 7. [`block`]  — the residual connection, and the transformer block made of two.
 //! 8. [`model`]  — all of it assembled into a GPT that predicts the next token.
+//! 9. [`optim`]  — AdamW, and why SGD is not enough for a transformer.
 //!
 //! Then run `cargo test -p nanograd`: the gradient check in `nn` verifies the
 //! hand-derived derivatives against numerically measured ones.
@@ -27,4 +28,5 @@ pub mod mnist;
 pub mod model;
 pub mod nn;
 pub mod norm;
+pub mod optim;
 pub mod rng;

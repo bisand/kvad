@@ -121,6 +121,14 @@ Zero dependencies. Read in this order:
    because almost nothing is new; what is new is why positions are needed at
    all, and how a model should be initialised so that it starts out ignorant
    rather than confidently wrong.
+9. **[`optim.rs`](crates/nanograd/src/optim.rs)** — AdamW. SGD has one learning
+   rate for a model whose gradients differ by orders of magnitude between
+   tensors. Adam divides each parameter's gradient by how large that
+   parameter's gradients usually are, and the size cancels: scale every
+   gradient by 1000 and the trajectory does not change. What is left is sign
+   and consistency, and `lr` comes to mean "how far a parameter may move per
+   step". It lives outside the layers — they own parameters and gradients, it
+   owns its running averages — and reaches them through `params()`.
 
 ### The test worth running first
 
@@ -188,6 +196,18 @@ step and requires every tensor to have moved.
 *It can memorise one sequence.* Loss 2.41 to 0.0001 in 100 steps. The oldest
 sanity check there is, and the first time forward, backward and the optimiser
 all have to agree, through every layer at once.
+
+An optimiser has no gradient to check, but Adam makes promises exact enough to
+test instead. With bias correction the first step is `lr * g / (|g| + eps)`, so
+gradients of 500 and of 0.00001 both move their weight by `lr` — the second one
+0.1% short, which is precisely what `eps` is for. A steady gradient covers `lr`
+per step whatever its size; one that flips sign every step, at ±100, gets 0.018
+from home in 200 steps that could have covered 2.0. In a valley a million times
+steeper one way than the other, Adam reaches the bottom along both axes in 300
+steps; SGD, at the largest learning rate the steep axis allows, moves 0.0006
+along the shallow one. And with no gradient at all, only weight decay acts:
+matrices shrink by `1 - lr * decay` a step and biases and gains do not move —
+the test that tells AdamW from Adam with L2 folded into the gradient.
 
 ### Things to try
 
@@ -960,8 +980,9 @@ RMSNorm ([`norm.rs`](crates/nanograd/src/norm.rs)), and the embedding
 them together with GELU and residual connections
 ([`block.rs`](crates/nanograd/src/block.rs)) are done, and so is the GPT that
 stacks them ([`model.rs`](crates/nanograd/src/model.rs)): gradient-checked end
-to end, and able to memorise a sequence. It has never seen a text file. Still
-needed are Adam, a training loop that reads one, and sampling from the result;
+to end, and able to memorise a sequence, as is AdamW
+([`optim.rs`](crates/nanograd/src/optim.rs)). It has never seen a text file.
+Still needed are a training loop that reads one, and sampling from the result;
 Llama's SwiGLU and RoPE are not written. The gradient check from crate 1 is how
 you will debug each one — extend `nanograd` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).

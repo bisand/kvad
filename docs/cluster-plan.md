@@ -275,6 +275,51 @@ simple:
    layers, weights, cache, headroom — before a byte is downloaded, and says
    *does not fit* when that is the answer.
 
+**And a way to overrule it.** Rule 3 is right for running a model and wrong
+for developing this feature: any model small enough to iterate on fits on the
+coordinator, so the planner would give every worker nothing and no byte would
+ever cross the wire. `--split 0..12,12..24` names the layer ranges by hand,
+one per node in the order `--workers` lists them, coordinator first, and
+skips the planner entirely. It is checked — contiguous, covering every layer
+once — and the memory check still runs and still refuses. This is not a test
+hook. It is what the loopback tests in Phase 2 use, what a development rig
+uses, and what an operator who knows something the planner does not will
+reach for.
+
+### A development rig
+
+Two Macs of any vintage and one cable. The one this plan was written beside
+is an M5 Pro MacBook Pro (48 GB, Thunderbolt 5) and an M2 MacBook Air (8 GB,
+Thunderbolt 3/USB4); the link negotiates to 40 Gb/s and the chips differing
+is of no interest to TCP.
+
+- **The cable has to be a Thunderbolt or USB4 one.** The USB-C charging
+  cables Apple ships carry USB 2 data. With one of those the Thunderbolt
+  Bridge never comes up, and it looks exactly like a software fault.
+- With the right cable, System Settings → Network → Thunderbolt Bridge shows
+  a self-assigned `169.254.x.x` address on each side. The firewall may ask
+  about incoming connections the first time a worker listens.
+- Both machines build the same revision; the handshake insists.
+- The M2 has `i8mm`, so both take the same kernels. A pair where one side
+  lacks it (an M1) is a different question: the integer sums are exact
+  whichever instruction computes them, but the block scales are applied in
+  f32 afterwards, and whether the tiled and the row-at-a-time paths do that
+  in the same order has not been checked. Such a pair may agree to the bit
+  or only to a rounding, and the revision check would not notice either way.
+  Unverified; worth a test the day somebody has an M1 to hand.
+
+A lopsided pair is more useful than a matched one. It is enough for all of
+Phase 0. Its speed difference tests the claim that time per token is a sum
+and not a maximum: move layers from the fast machine to the slow one with
+`--split` and the rate should fall by what those layers cost there, and no
+more. And 8 GB — about 6 GB usable under `USABLE_FRACTION` — exercises the
+planner's *does not fit* and its headroom arithmetic, which two large
+machines never would.
+
+What it cannot show is Phase 4's headline. With 48 + 8 GB there is next to
+nothing that fits the pair and not the larger machine alone. That needs a
+second machine with real memory, and is the only phase that does.
+
 ### Security
 
 A worker downloads what it is told to and gives a stranger its memory, so it
@@ -330,9 +375,13 @@ uncut, five interleaved rounds — the refactor must cost nothing, and if it
 does, that is found here.
 
 **Phase 2 — a worker on loopback.** `worker.rs`, `RemoteStage`, the
-handshake and the key, `kvad worker`, `--workers`. Test: a worker on port 0
-in a thread, same bit-identical assertions as Phase 1; plus wrong key,
-revision mismatch, worker killed mid-generation, cancel mid-prefill.
+handshake and the key, `kvad worker`, `--workers`, and `--split`, because
+without it a small model never leaves the coordinator. Test: a worker on
+port 0 in a thread, same bit-identical assertions as Phase 1; plus wrong key,
+revision mismatch, worker killed mid-generation, cancel mid-prefill, and a
+`--split` with a gap, an overlap or the wrong number of ranges. Then the same
+thing by hand across the development rig's cable, which is the first time a
+hidden state leaves a machine.
 
 **Phase 3 — load only your share.** The fetch filter, the shard in the
 quantised cache's identity, per-node memory checks, `plan.rs` and

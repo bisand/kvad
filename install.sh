@@ -86,7 +86,10 @@ ask() {
             # The terminal went away mid-question. Nobody is answering, so
             # this is an unattended run after all — and it takes the
             # unattended answer, not the one meant for somebody watching.
+            # Latched, because a loop that re-asks would otherwise spin on
+            # an EOF that is never going to turn into an answer.
             printf '\n' >&2
+            INTERACTIVE=0
             [ "$unattended" = y ]
             return
         fi
@@ -99,24 +102,59 @@ ask() {
     done
 }
 
+# ask_value QUESTION DEFAULT  ->  answer in VALUE
+#
+# Enter keeps the default, which is what makes this safe to put in front of
+# somebody who does not care. An unattended run takes the default without
+# asking, so --yes never blocks on a question nobody is there to answer.
+ask_value() {
+    VALUE=$2
+    [ "$INTERACTIVE" -eq 1 ] || return 0
+    printf '%s %s[%s]%s ' "$1" "$DIM" "$2" "$R" > /dev/tty
+    if ! read -r reply < /dev/tty; then
+        printf '\n' >&2
+        INTERACTIVE=0
+        return 0
+    fi
+    [ -n "$reply" ] && VALUE=$reply
+    return 0
+}
+
 # ---------------------------------------------------------------- address --
 
 # HOST:PORT, with IPv6 in brackets the way every other tool spells it. The
 # port is split off the right so `[::1]:8080` divides where you would expect.
-check_bind() {
+#
+# Reports rather than exits: a wrong flag should stop the run, but a typo at a
+# prompt should only mean being asked again, and both need the same rules.
+# Sets bind_host and bind_port, which the checks below read.
+bind_valid() {
     addr=$1
+    BIND_ERROR=""
     case $addr in
         *:*) ;;
-        *) die "--bind wants HOST:PORT, for example 127.0.0.1:8080 (got '$addr')" ;;
+        *) BIND_ERROR="'$addr' is not HOST:PORT, for example 127.0.0.1:8080"; return 1 ;;
     esac
     bind_port=${addr##*:}
     bind_host=${addr%:*}
     case $bind_port in
-        ''|*[!0-9]*) die "--bind: '$bind_port' is not a port number" ;;
+        ''|*[!0-9]*) BIND_ERROR="'$bind_port' is not a port number"; return 1 ;;
     esac
-    [ "$bind_port" -ge 1 ] && [ "$bind_port" -le 65535 ] ||
-        die "--bind: port $bind_port is outside 1-65535"
-    [ -n "$bind_host" ] || die "--bind: no host in '$addr'"
+    if [ "$bind_port" -lt 1 ] || [ "$bind_port" -gt 65535 ]; then
+        BIND_ERROR="port $bind_port is outside 1-65535"
+        return 1
+    fi
+    if [ -z "$bind_host" ]; then
+        BIND_ERROR="no host in '$addr'"
+        return 1
+    fi
+    return 0
+}
+
+# The same rules, for an address that came from a flag: there is nobody to
+# ask again, so a bad one ends the run.
+check_bind() {
+    bind_valid "$1" || die "--bind: $BIND_ERROR"
 }
 
 is_loopback() {
@@ -137,6 +175,43 @@ port_taken() {
     else
         return 1
     fi
+}
+
+# Ask where the service should listen, and keep asking while the answer would
+# produce one that cannot start. "Pick another with --bind" is useless advice
+# halfway through a run: the person is right here, so offer them the choice
+# instead of sending them back to the shell.
+#
+# Only ever reached interactively, which is what makes the loop safe — every
+# path out of it that is not `return` is a question somebody answered.
+choose_bind() {
+    while :; do
+        [ "$INTERACTIVE" -eq 1 ] || return 1
+        ask_value "Address for kvad-serve to listen on" "$SERVICE_BIND"
+        # Held as a candidate until every check has passed. An address that
+        # was just rejected must not become the default that Enter accepts,
+        # or declining it walks straight back into the same warning.
+        candidate=$VALUE
+        if ! bind_valid "$candidate"; then
+            say "  $BIND_ERROR"
+            continue
+        fi
+        if ! is_loopback "$bind_host"; then
+            warn "$candidate is not a loopback address, and kvad-serve refuses a
+  non-loopback bind while auth.mode is \"none\" — which is the default. The
+  service would fail to start and be restarted for as long as it is loaded.
+  Set an auth mode first in ${XDG_CONFIG_HOME:-$HOME/.config}/kvad/kvad.toml;
+  the bundled kvad.example.toml says how."
+            ask "Use $candidate anyway?" n n || continue
+        fi
+        if port_taken "$bind_port"; then
+            warn "something is already listening on port $bind_port. Two servers cannot
+  share it, so kvad-serve would fail to bind and be restarted in a loop."
+            ask "Use port $bind_port anyway?" n n || continue
+        fi
+        SERVICE_BIND=$candidate
+        return 0
+    done
 }
 
 # ------------------------------------------------------------- arguments --
@@ -538,17 +613,28 @@ UNIT
 
 if [ -f "$SRC/kvad-serve" ]; then
     do_service=0
+    was_asked=0
     case $WANT_SERVICE in
         yes) do_service=1 ;;
         no)  do_service=0 ;;
         *)
             say ""
-            say "${B}kvad-serve${R} is the HTTP API and web UI, on http://$SERVICE_BIND."
+            say "${B}kvad-serve${R} is the HTTP API and web UI."
             say "It can start automatically when you log in, or you can run it by hand."
-            ask "Start kvad-serve at login?" n && do_service=1
+            if ask "Start kvad-serve at login?" n; then
+                do_service=1
+                was_asked=1
+            fi
             ;;
     esac
-    if [ "$do_service" -eq 1 ]; then
+
+    # Somebody who was asked whether gets asked where, unless they already
+    # said with --bind. A run driven by flags is not interrupted by either
+    # question: it gets the checks below instead, which decline rather than
+    # ask.
+    if [ "$do_service" -eq 1 ] && [ "$was_asked" -eq 1 ] && [ "$BIND_GIVEN" -eq 0 ]; then
+        choose_bind || do_service=0
+    elif [ "$do_service" -eq 1 ]; then
         # Both of these produce a unit that looks installed and never serves
         # anything, so they are worth a question rather than a surprise.
         if ! is_loopback "$bind_host"; then

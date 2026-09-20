@@ -84,9 +84,15 @@ curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh
 
 Prebuilt binaries from the latest [release](https://github.com/bisand/kvad/releases),
 checked against that release's `SHA256SUMS` and put in `~/.local/bin`. It asks
-two questions — whether to add that directory to your `PATH`, and whether
-`kvad-serve` should start when you log in — and asks them on `/dev/tty`, so
-they survive being piped into `sh`. Nothing needs root.
+whether to add that directory to your `PATH`, whether `kvad-serve` should
+start when you log in, and — if it should — what address it listens on, with
+`127.0.0.1:8080` offered as the default. It asks on `/dev/tty`, so the
+questions survive being piped into `sh`. Nothing needs root.
+
+Say an address it cannot serve from and it says why and asks again, rather
+than installing a service that cannot start: a port something else already
+holds, or a non-loopback address, which `kvad-serve` refuses while no auth
+mode is configured.
 
 For a machine with nobody watching, `--yes` never opens a terminal and
 answers both questions the quiet way — binaries and nothing else. Ask for
@@ -98,11 +104,8 @@ curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh 
 
 `--prefix DIR`, `--version vX.Y.Z` and `--uninstall` do what they look like;
 `--uninstall` removes the binaries and the service and leaves your models and
-conversations alone. `--bind HOST:PORT` sets the address the background
-service listens on, which defaults to `127.0.0.1:8080` — the installer checks
-before writing a unit that something is not already on that port, and that
-the address is a loopback one, because `kvad-serve` refuses a non-loopback
-bind with no auth mode and launchd would restart it forever. `sh install.sh
+conversations alone. `--bind HOST:PORT` answers the address
+question ahead of time, for a run that should not stop to ask. `sh install.sh
 --help` lists the rest.
 
 macOS gets all four binaries. Linux gets `kvad` and a CPU-only `kvad-serve`:

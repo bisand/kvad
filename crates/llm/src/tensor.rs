@@ -347,6 +347,53 @@ impl Rope {
         Rope { cos, sin, half }
     }
 
+    /// Build from frequencies somebody else chose, with every cosine and sine
+    /// scaled by `amplitude`.
+    ///
+    /// [`Rope::new`] computes its own geometric frequencies, which is what
+    /// every model here does *except* the ones with a `rope_scaling` block:
+    /// YaRN interpolates between the trained frequencies and slower ones, so
+    /// the table cannot be derived from `theta` alone.
+    ///
+    /// `amplitude` is the part of YaRN that is not a rotation. Scaling cos and
+    /// sin together scales the rotated vector, which is the trick's way of
+    /// raising attention temperature at long context -- and is why this is not
+    /// simply a table of angles. It is 1.0 for every config shipped so far,
+    /// because DeepSeek sets `mscale` and `mscale_all_dim` to the same number
+    /// and they divide out; it is here because the next config need not.
+    pub fn from_freqs(inv_freq: &[f32], max_positions: usize, amplitude: f32) -> Self {
+        let half = inv_freq.len();
+        let mut cos = Vec::with_capacity(max_positions * half);
+        let mut sin = Vec::with_capacity(max_positions * half);
+        for pos in 0..max_positions {
+            for &f in inv_freq {
+                let angle = pos as f32 * f;
+                cos.push(angle.cos() * amplitude);
+                sin.push(angle.sin() * amplitude);
+            }
+        }
+        Rope { cos, sin, half }
+    }
+
+    /// Rotate one head's vector in place, pairing `2i` with `2i + 1`.
+    ///
+    /// The other convention, and the older one -- GPT-J's. DeepSeek's
+    /// reference implementation reaches it by a detour: it permutes the vector
+    /// into the half-split layout, applies the rotation [`Rope::apply`] uses,
+    /// and leaves the result permuted. Both the query and the key get the same
+    /// permutation and the only thing done with them is a dot product against
+    /// each other, so the permutation cancels and this is what is left.
+    pub fn apply_interleaved(&self, x: &mut [f32], pos: usize) {
+        debug_assert_eq!(x.len(), self.half * 2);
+        let base = pos * self.half;
+        for i in 0..self.half {
+            let (c, s) = (self.cos[base + i], self.sin[base + i]);
+            let (a, b) = (x[2 * i], x[2 * i + 1]);
+            x[2 * i] = a * c - b * s;
+            x[2 * i + 1] = b * c + a * s;
+        }
+    }
+
     /// Rotate one head's vector in place, for a token at `pos`.
     ///
     /// HuggingFace pairs coordinate `i` with `i + head_dim/2` rather than

@@ -497,7 +497,7 @@ fn search(args: Args) -> Res<()> {
 
     let local: Vec<String> = hub::local_models().into_iter().map(|m| m.id).collect();
     println!(
-        "{:<40} {:>10} {:>9}  {:<7} {}",
+        "{:<40} {:>10} {:>9}  {:<11} {}",
         "MODEL", "DOWNLOADS", "SIZE", "ARCH", "STATUS"
     );
     for m in &results {
@@ -515,7 +515,7 @@ fn search(args: Args) -> Res<()> {
         };
         // Names come from the Hub; print them, never act on them.
         println!(
-            "{:<40} {:>10} {:>9}  {:<7} {}",
+            "{:<40} {:>10} {:>9}  {:<11} {}",
             truncate(&m.id, 40),
             m.downloads,
             size,
@@ -583,7 +583,7 @@ fn list_local() -> Res<()> {
         total += m.bytes;
         let marker = if active.as_deref() == Some(m.id.as_str()) { " *" } else { "" };
         println!(
-            "{:<46} {:<7} {:>9}{}{}",
+            "{:<46} {:<11} {:>9}{}{}",
             truncate(&m.id, 46),
             m.arch.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
             hub::human_bytes(m.bytes),
@@ -593,7 +593,7 @@ fn list_local() -> Res<()> {
     };
 
     if !downloaded.is_empty() {
-        println!("{:<46} {:<7} {:>9}", "DOWNLOADED", "ARCH", "SIZE");
+        println!("{:<46} {:<11} {:>9}", "DOWNLOADED", "ARCH", "SIZE");
         for m in &downloaded {
             row(m, if m.complete { "" } else { "  (config only)" });
         }
@@ -602,7 +602,7 @@ fn list_local() -> Res<()> {
         if !downloaded.is_empty() {
             println!();
         }
-        println!("{:<46} {:<7} {:>9}", "TRAINED HERE", "ARCH", "SIZE");
+        println!("{:<46} {:<11} {:>9}", "TRAINED HERE", "ARCH", "SIZE");
         for m in &trained {
             row(m, if m.complete { "" } else { "  (unfinished — no weights)" });
         }

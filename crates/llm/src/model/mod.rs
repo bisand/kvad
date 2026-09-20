@@ -20,13 +20,16 @@
 //!
 //! So this module holds the skeleton — [`Spec`], [`KvCache`], [`attend`] — and
 //! the architecture modules supply the rest. Reading `gpt2.rs` first is
-//! recommended: it is the simpler of the two, and `llama.rs` is written to be
-//! read as a diff against it.
+//! recommended: it is the simplest of them, and `llama.rs` is written to be
+//! read as a diff against it. `deepseek.rs` is a diff against *that*, and is
+//! where the skeleton stops being enough.
 //!
 //! Which of them a build contains is a Cargo feature; see [`arch`], which is
 //! also where to look when adding one.
 
 pub mod arch;
+#[cfg(feature = "arch-deepseek")]
+pub mod deepseek;
 #[cfg(feature = "arch-gpt2")]
 pub mod gpt2;
 #[cfg(feature = "arch-llama")]
@@ -68,14 +71,16 @@ pub struct Spec {
     /// How wide one position's worth of cache is, in each of the two streams.
     ///
     /// Ordinary attention stores a key and a value, both [`Spec::kv_dim`]
-    /// wide, and for both architectures here that is what this says. It is a
-    /// field an architecture sets rather than a number the skeleton computes,
-    /// because an architecture that caches something else is not hypothetical.
+    /// wide, and for every architecture here but one that is what this says.
+    /// DeepSeek's latent attention stores something else, in two streams of
+    /// different widths, which is why this is a field the architecture sets
+    /// rather than a number the skeleton computes.
     pub cache: CacheShape,
     /// The model's `config.json`, as it was read.
     ///
     /// Everything above this line is a field most of the Hub agrees on.
-    /// Everything an architecture needs and nobody else has heard of is read
+    /// Everything an architecture needs and nobody else has heard of —
+    /// `kv_lora_rank`, `n_routed_experts`, `first_k_dense_replace` — is read
     /// from here, by the module that knows what it means.
     pub config: Json,
 }
@@ -624,8 +629,11 @@ mod tests {
         // Each of these is a real model_type on the Hub, and each one a
         // substring test said yes to. A mixture of experts, and a model that
         // skips RoPE on every fourth layer.
-        for t in ["qwen3_5_moe", "qwen2_moe", "smollm3", "deepseek_v2", "deepseek_v3",
-                  "deepseek_v4", "gemma2", "phi3"] {
+        // DeepSeek is its own module now, and answers to its own names.
+        assert!(Arch::from_model_type("deepseek_v2").unwrap().is("deepseek_v2"));
+        assert!(Arch::from_model_type("DeepseekV3ForCausalLM").unwrap().is("deepseek_v3"));
+
+        for t in ["qwen3_5_moe", "qwen2_moe", "smollm3", "deepseek_v4", "gemma2", "phi3"] {
             assert_eq!(Arch::from_model_type(t), None, "claimed to run `{t}`");
         }
     }

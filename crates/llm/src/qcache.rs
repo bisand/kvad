@@ -196,10 +196,50 @@ pub trait Source {
     /// the result, so this is a property of the *checkpoint*, not of the
     /// cache, and the mapped source ignores the distinction entirely.
     fn matrix_t(&self, name: &str) -> Res<Weight>;
+    /// Rows `start..start + count` of a stored matrix, on their own.
+    ///
+    /// DeepSeek stores one matrix per layer holding every head's
+    /// up-projection for keys and values back to back, and the engine wants
+    /// them apart: the key half is folded into the query and the value half
+    /// is applied after the softmax, so they are used at opposite ends of the
+    /// attention and never together. Slicing at load time costs one pass and
+    /// saves doing it on every token.
+    ///
+    /// The slice is cached under a name derived from this one, so the second
+    /// load maps it like any other weight.
+    fn matrix_rows(&self, name: &str, start: usize, count: usize) -> Res<Weight>;
+    /// As [`Source::matrix_rows`], transposed: `[count, cols]` stored as
+    /// `[cols, count]`.
+    ///
+    /// The engine has one matmul kernel and it computes `x @ Wᵀ`. A slice
+    /// that has to be applied the *other* way round is transposed once here
+    /// rather than given a second kernel.
+    fn matrix_rows_t(&self, name: &str, start: usize, count: usize) -> Res<Weight>;
     /// A 1-D tensor: norm weights, biases. Never quantised — they are a
     /// rounding error in both size and cost.
     fn vector(&self, name: &str) -> Res<Vec<f32>>;
     fn try_vector(&self, name: &str) -> Option<Vec<f32>>;
+}
+
+/// The name a sliced weight is cached under.
+///
+/// Derived rather than passed in, so the run that writes the cache and the run
+/// that reads it cannot disagree about it.
+fn slice_name(name: &str, start: usize, count: usize, transposed: bool) -> String {
+    let t = if transposed { "t" } else { "" };
+    format!("{name}#{start}+{count}{t}")
+}
+
+/// A contiguous band of rows, as a matrix of its own.
+fn rows_of(t: &Tensor, name: &str, start: usize, count: usize) -> Res<Tensor> {
+    if start + count > t.rows {
+        return Err(format!("`{name}` has {} rows; asked for {count} starting at {start}", t.rows).into());
+    }
+    let mut data = Vec::with_capacity(count * t.cols);
+    for r in start..start + count {
+        data.extend_from_slice(t.row(r));
+    }
+    Ok(Tensor::new(count, t.cols, data))
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +327,20 @@ impl Source for Live<'_> {
     fn matrix_t(&self, name: &str) -> Res<Weight> {
         let w = self.quantized(self.ckpt.get(name)?.transposed());
         self.record(|out| out.put_weight(name, &w));
+        Ok(w)
+    }
+
+    fn matrix_rows(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
+        let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?);
+        let as_name = slice_name(name, start, count, false);
+        self.record(|out| out.put_weight(&as_name, &w));
+        Ok(w)
+    }
+
+    fn matrix_rows_t(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
+        let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?.transposed());
+        let as_name = slice_name(name, start, count, true);
+        self.record(|out| out.put_weight(&as_name, &w));
         Ok(w)
     }
 
@@ -409,6 +463,14 @@ impl Mapped {
 impl Source for Mapped {
     fn matrix(&self, name: &str) -> Res<Weight> {
         self.build(name)
+    }
+
+    fn matrix_rows(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
+        self.build(&slice_name(name, start, count, false))
+    }
+
+    fn matrix_rows_t(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
+        self.build(&slice_name(name, start, count, true))
     }
 
     fn try_matrix(&self, name: &str) -> Option<Weight> {

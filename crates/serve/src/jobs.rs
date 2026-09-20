@@ -391,7 +391,7 @@ pub fn row(r: &rusqlite::Row) -> rusqlite::Result<Job> {
 }
 
 // ---------------------------------------------------------------------------
-// The two kinds of job
+// The kinds of job
 // ---------------------------------------------------------------------------
 
 /// Download a model in the background.
@@ -428,6 +428,111 @@ pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>) -> Res<Job> {
     })?;
 
     jobs.get(id)?.ok_or_else(|| "the job vanished as it started".into())
+}
+
+/// Read a website into a dataset, in the background.
+///
+/// Network and disk, like a pull, so several may run at once — but not two
+/// onto the same name, which would be two crawls writing one file.
+pub fn crawl(
+    jobs: &Arc<Jobs>,
+    request: crate::crawl::Request,
+    owner: Option<i64>,
+) -> Res<Job> {
+    let taken = jobs.db.with(|c| {
+        c.query_row(
+            "SELECT 1 FROM jobs
+             WHERE kind = 'crawl' AND state IN ('queued','running') AND label = ?1 LIMIT 1",
+            [&request.name],
+            |_| Ok(()),
+        )
+        .optional()
+    })?;
+    if taken.is_some() {
+        return Err(format!("`{}` is already being read; wait for it or stop it", request.name).into());
+    }
+
+    let id = jobs.create("crawl", &request.name, &serde_json::to_value(&request)?, owner)?;
+    let (cancel, events) = jobs.register(id);
+    let worker = Arc::clone(jobs);
+    let db = jobs.db.clone();
+
+    std::thread::Builder::new().name(format!("kvad-crawl-{id}")).spawn(move || {
+        let mut say = |note: crate::crawl::Note| match note {
+            crate::crawl::Note::Say(message) => {
+                let _ = events.send(Update::Status { message });
+            }
+            crate::crawl::Note::Page { url, title, done, total } => {
+                // The bar and the line under it: how far along, and what it
+                // is reading, which is the half anybody actually watches.
+                let _ = events.send(Update::Progress { done, total });
+                let name = match title.is_empty() {
+                    true => url,
+                    false => title,
+                };
+                let _ = events.send(Update::Status { message: name });
+            }
+        };
+
+        let outcome = crate::crawl::run(&request, &mut say, &cancel)
+            .and_then(|crawled| keep(&db, &request, &crawled, owner));
+
+        // A stopped crawl keeps the pages it read, the same bargain a stopped
+        // training run makes with its best checkpoint. There is no reason to
+        // throw away four hundred pages because somebody wanted the four
+        // hundredth to be the last.
+        match (outcome, cancel.load(Ordering::Relaxed)) {
+            (Ok(result), stopped) => {
+                worker.finish(id, if stopped { "cancelled" } else { "done" }, None, Some(result))
+            }
+            (Err(e), _) => worker.finish(id, "failed", Some(e.to_string()), None),
+        }
+    })?;
+
+    jobs.get(id)?.ok_or_else(|| "the job vanished as it started".into())
+}
+
+/// Write what a crawl came back with: the text, and the manifest beside it.
+///
+/// The manifest is written second and its failure is not the crawl's: a
+/// corpus with no record of where it came from is worse than one with, and
+/// much better than no corpus at all after twenty minutes of fetching.
+fn keep(
+    db: &Db,
+    request: &crate::crawl::Request,
+    crawled: &crate::crawl::Crawled,
+    owner: Option<i64>,
+) -> Res<serde_json::Value> {
+    let dataset =
+        crate::datasets::save(db, &request.name, &crawled.text, owner, Some(&request.url))?;
+
+    let mut wrote = None;
+    if let Ok(path) = crate::datasets::manifest_of(&request.name) {
+        match serde_json::to_vec_pretty(&crawled.manifest)
+            .map_err(|e| e.to_string())
+            .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()))
+        {
+            Ok(()) => wrote = Some(path.display().to_string()),
+            Err(e) => tracing::warn!("could not write the crawl manifest: {e}"),
+        }
+    }
+
+    let manifest = &crawled.manifest;
+    Ok(serde_json::json!({
+        "dataset": dataset.name,
+        "id": dataset.id,
+        "start": manifest.start,
+        "scope": manifest.scope,
+        "pages": manifest.pages.len(),
+        "skipped": manifest.skipped.len(),
+        "stopped": manifest.stopped,
+        "characters": manifest.characters,
+        "distinct": manifest.distinct,
+        "mapped": manifest.mapped.iter().map(|m| m.count).sum::<usize>(),
+        "dropped": manifest.dropped.len(),
+        "alphabet": manifest.alphabet.iter().take(200).collect::<Vec<_>>(),
+        "manifest": wrote,
+    }))
 }
 
 /// What a training run was asked for. Stored as the job's `params`, so a run

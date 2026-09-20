@@ -346,6 +346,22 @@ pub const ENDPOINTS: &[Endpoint] = &[
         produces: JSON, events: &[],
     },
     Endpoint {
+        method: "post", path: "/api/datasets/crawl", tag: "Datasets", access: Access::Admin,
+        summary: "Read a website into a corpus",
+        description: "Starts a job — answers with it, rather than with the dataset, \
+                      because this takes minutes and several hundred requests. Links are \
+                      followed within the starting URL's directory by default (the whole \
+                      host with `same_host`), `robots.txt` is obeyed, and the text and a \
+                      manifest of every page read are written together.",
+        query: &[],
+        body: Some(Body {
+            content_type: "application/json",
+            description: "`{url, name, same_host?, max_pages?, max_bytes?, delay_ms?, \
+                          drop_rare?}`.",
+        }),
+        produces: JSON, events: &[],
+    },
+    Endpoint {
         method: "get", path: "/api/datasets/{id}", tag: "Datasets", access: Access::Admin,
         summary: "A dataset, with the start of it",
         description: "", query: &[], body: None, produces: JSON, events: &[],

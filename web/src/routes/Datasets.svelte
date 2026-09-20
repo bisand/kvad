@@ -4,6 +4,8 @@
   import { training } from "../lib/training.svelte.js";
   import { toasts } from "../lib/toasts.svelte.js";
   import { humanBytes } from "../lib/models.svelte.js";
+  import { watchJob } from "../lib/jobwatch.js";
+  import { api } from "../lib/api.js";
   import Icon from "../lib/components/Icon.svelte";
 
   const TRASH =
@@ -16,9 +18,94 @@
   let against = $state("");
   let checks = $state({});
 
+  // Reading a website.
+  let url = $state("");
+  let crawlName = $state("");
+  let named = $state(false);
+  let showing = $state(false);
+  let limits = $state({ same_host: false, max_pages: 400, max_mb: 16, delay_ms: 250, drop_rare: 10 });
+  /** The crawl being watched: `{ job, done, total, line }`. */
+  let crawl = $state(null);
+  let watcher = null;
+
   $effect(() => {
     training.refresh();
   });
+
+  // A crawl outlives the tab that started it, so pick up whichever one is
+  // going — after a reload, or in a second window.
+  $effect(() => {
+    const going = training.crawling;
+    if (going && crawl?.job.id !== going.id) follow(going);
+  });
+
+  $effect(() => () => watcher?.abort());
+
+  /**
+   * A name from an address: `doc.rust-lang.org/book/` becomes
+   * `doc.rust-lang.org-book`. The server has the last word on what is a legal
+   * name; this only has to be a good suggestion.
+   */
+  function nameFrom(address) {
+    try {
+      const u = new URL(address);
+      const parts = u.pathname.split("/").filter(Boolean);
+      const last = parts.pop()?.replace(/\.(html?|php|md|txt)$/i, "");
+      return [u.hostname, ...parts, last]
+        .filter(Boolean)
+        .join("-")
+        .replace(/[^A-Za-z0-9._-]+/g, "-")
+        .replace(/^[.-]+/, "")
+        .slice(0, 96);
+    } catch {
+      return "";
+    }
+  }
+
+  $effect(() => {
+    if (!named) crawlName = nameFrom(url);
+  });
+
+  function follow(job) {
+    watcher?.abort();
+    crawl = { job, done: 0, total: 0, line: "" };
+    watcher = watchJob(job.id, {
+      onUpdate: (u) => {
+        if (!crawl) return;
+        if (u.kind === "progress") crawl = { ...crawl, done: u.done, total: u.total };
+        else if (u.kind === "status") crawl = { ...crawl, line: u.message };
+        else if (u.kind === "ended") ended(job.id, u);
+      },
+      onError: (e) => toasts.error(e.message),
+    });
+  }
+
+  /** The row now carries the result; the stream does not. Read it back. */
+  async function ended(id, update) {
+    if (update.state === "failed") toasts.error(update.error ?? "the crawl failed");
+    else toasts.success("The text is in the datasets below.");
+    try {
+      const { metrics, samples, ...job } = await api(`/api/jobs/${id}`);
+      if (crawl?.job.id === id) crawl = { ...crawl, job };
+    } catch {
+      // The toast said how it ended; the job list below says the rest.
+    }
+    await training.refresh();
+  }
+
+  async function start(event) {
+    event.preventDefault();
+    const job = await training.crawl({
+      url: url.trim(),
+      name: crawlName.trim(),
+      same_host: limits.same_host,
+      max_pages: Number(limits.max_pages),
+      max_bytes: Math.round(Number(limits.max_mb) * 1024 * 1024),
+      delay_ms: Number(limits.delay_ms),
+      drop_rare: Number(limits.drop_rare),
+    });
+    if (job) follow(job);
+  }
 
   async function pick(event) {
     const file = event.currentTarget.files?.[0];
@@ -56,6 +143,23 @@
 
   const counted = $derived(text ? [...text].length : 0);
   const distinct = $derived(text ? new Set(text).size : 0);
+
+  const live = $derived(crawl?.job.state === "running" || crawl?.job.state === "queued");
+  const result = $derived(crawl?.job.result ?? null);
+
+  /** Where the crawl would be allowed to go, in the words the server uses. */
+  const scope = $derived.by(() => {
+    try {
+      const u = new URL(url);
+      if (limits.same_host) return `${u.origin}/`;
+      const path = u.pathname.endsWith("/")
+        ? u.pathname
+        : u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1);
+      return `${u.origin}${path || "/"}`;
+    } catch {
+      return "";
+    }
+  });
 </script>
 
 <div class="mx-auto flex max-w-4xl flex-col gap-6">
@@ -87,6 +191,131 @@
         second number above is the size of the model's embedding table and output head.
       </p>
     </form>
+  </section>
+
+
+  <!-- The other way to get a corpus: point it at a documentation site and
+       let it read. A job, because it is minutes and hundreds of requests. -->
+  <section class="card bg-base-100 border-base-300 border">
+    <form class="card-body gap-3 p-4" onsubmit={start}>
+      <h2 class="text-sm font-medium opacity-60">Read a website</h2>
+      <div class="flex flex-wrap items-end gap-2">
+        <fieldset class="fieldset grow">
+          <legend class="fieldset-legend">Address</legend>
+          <input
+            class="input input-sm w-full"
+            type="url"
+            bind:value={url}
+            placeholder="https://doc.rust-lang.org/book/"
+            required
+          />
+        </fieldset>
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">Name</legend>
+          <input
+            class="input input-sm"
+            bind:value={crawlName}
+            oninput={() => (named = true)}
+            placeholder="doc.rust-lang.org-book"
+            required
+          />
+        </fieldset>
+        <button class="btn btn-sm" disabled={live || !url.trim() || !crawlName.trim()}>
+          {#if live}<span class="loading loading-spinner loading-xs"></span>{/if}
+          Start
+        </button>
+      </div>
+
+      <p class="text-xs opacity-60">
+        {#if scope}
+          Follows links under <code>{scope}</code> and nowhere else.
+        {:else}
+          Follows links under the address's own directory and nowhere else —
+          <code>/book/</code> links into the standard library's documentation on nearly every
+          page, and that is a hundred times the book.
+        {/if}
+        <code>robots.txt</code> is obeyed, and the text and a record of every page read are
+        kept together.
+      </p>
+
+      <button
+        type="button"
+        class="link link-hover w-fit text-xs opacity-60"
+        onclick={() => (showing = !showing)}
+      >
+        {showing ? "Hide" : "Show"} limits
+      </button>
+
+      {#if showing}
+        <div class="flex flex-wrap items-end gap-2">
+          <fieldset class="fieldset">
+            <legend class="fieldset-legend">Pages</legend>
+            <input class="input input-sm w-24" type="number" min="1" max="5000" bind:value={limits.max_pages} />
+          </fieldset>
+          <fieldset class="fieldset">
+            <legend class="fieldset-legend">Megabytes</legend>
+            <input class="input input-sm w-24" type="number" min="1" max="64" bind:value={limits.max_mb} />
+          </fieldset>
+          <fieldset class="fieldset">
+            <legend class="fieldset-legend">Pause (ms)</legend>
+            <input class="input input-sm w-24" type="number" min="50" max="10000" step="50" bind:value={limits.delay_ms} />
+          </fieldset>
+          <fieldset class="fieldset">
+            <legend class="fieldset-legend">Drop characters seen under</legend>
+            <input class="input input-sm w-24" type="number" min="0" max="1000" bind:value={limits.drop_rare} />
+          </fieldset>
+          <label class="label cursor-pointer gap-2 text-xs">
+            <input type="checkbox" class="checkbox checkbox-sm" bind:checked={limits.same_host} />
+            The whole host, not just this directory
+          </label>
+        </div>
+        <p class="text-xs opacity-60">
+          The web writes with three kinds of quotation mark and two kinds of dash, and a
+          character tokeniser gives every one of them a row of its own. Typography is mapped
+          onto ASCII, and characters seen fewer times than that are dropped — a row of an
+          embedding table seen eight times is a row that never trained. ASCII is never
+          dropped however rare it is, and the run says what went, so the number can be
+          argued with.
+        </p>
+      {/if}
+    </form>
+
+    {#if crawl}
+      <div class="border-base-300 flex flex-col gap-1 border-t px-4 py-3">
+        {#if live}
+          <progress class="progress w-full" value={crawl.done} max={Math.max(crawl.total, 1)}
+          ></progress>
+          <div class="flex items-center gap-2 text-xs opacity-70">
+            <span class="whitespace-nowrap">{crawl.done} of about {crawl.total}</span>
+            <span class="grow truncate">{crawl.line}</span>
+            <button
+              type="button"
+              class="btn btn-xs btn-ghost"
+              onclick={() => training.cancel(crawl.job.id)}
+            >
+              Stop
+            </button>
+          </div>
+        {:else if crawl.job.error}
+          <p class="text-error text-xs">{crawl.job.error}</p>
+        {:else if result}
+          <p class="text-xs opacity-70">
+            <span class="font-medium">{result.dataset}</span>
+            — {result.pages.toLocaleString()} pages, {result.characters.toLocaleString()}
+            characters, {result.distinct} distinct{#if result.skipped}, {result.skipped} skipped{/if}{#if result.stopped}, stopped at {result.stopped}{/if}.
+          </p>
+          {#if result.dropped}
+            <p class="text-xs opacity-60">
+              {result.dropped} rare character{result.dropped === 1 ? "" : "s"} removed, and
+              {result.mapped.toLocaleString()} mapped onto ASCII.
+            </p>
+          {/if}
+          {#if result.manifest}
+            <p class="text-xs opacity-50">Every page it read: <code>{result.manifest}</code></p>
+          {/if}
+        {/if}
+      </div>
+    {/if}
   </section>
 
   <section>
@@ -131,6 +360,11 @@
             <tr class="hover:bg-base-200/50">
               <td class="max-w-0">
                 <div class="truncate font-medium">{d.name}</div>
+                {#if d.source}
+                  <div class="truncate text-xs opacity-50">
+                    {d.source}{d.manifest ? " · manifest kept beside it" : ""}
+                  </div>
+                {/if}
                 {#if !d.present}
                   <div class="text-error text-xs">the file is gone from disk</div>
                 {:else if checks[d.id]}

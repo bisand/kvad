@@ -46,6 +46,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("004-jobs", include_str!("migrations/004-jobs.sql")),
     ("005-requests", include_str!("migrations/005-requests.sql")),
     ("006-evals", include_str!("migrations/006-evals.sql")),
+    ("007-crawl", include_str!("migrations/007-crawl.sql")),
 ];
 
 #[derive(Clone)]
@@ -171,18 +172,28 @@ fn migrate(conn: &Connection) -> Res<()> {
 mod tests {
     use super::*;
 
-    /// Migration 006 rebuilds the jobs table to widen its `kind` check, and
-    /// a rebuild is a `DROP TABLE` — which, with foreign keys enforced, would
-    /// take every training metric and sample on the machine with it. This is
-    /// the upgrade an existing installation makes, run against rows.
+    /// Migrations 006 and 007 rebuild the jobs table to widen its `kind`
+    /// check, and a rebuild is a `DROP TABLE` — which, with foreign keys
+    /// enforced, would take every training metric and sample on the machine
+    /// with it. This is the upgrade an existing installation makes, run
+    /// against rows.
     #[test]
     fn widening_the_kinds_of_job_keeps_the_jobs_and_their_charts() {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
 
-        // Everything up to the migration under test.
-        let before: Vec<_> = MIGRATIONS.iter().take_while(|(n, _)| *n != "006-evals").collect();
-        assert_eq!(before.len() + 1, MIGRATIONS.len(), "006 is no longer the last migration");
+        // A tripwire rather than a version number: this test is about
+        // rebuilding `jobs`, and it should fail when a migration starts doing
+        // that and nobody has looked here.
+        let rebuilds: Vec<&str> = MIGRATIONS
+            .iter()
+            .filter(|(_, sql)| sql.contains("CREATE TABLE jobs_new"))
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(rebuilds, ["006-evals", "007-crawl"], "a migration rebuilds `jobs` unwatched");
+
+        // Everything up to the first of them; `migrate` then runs the rest.
+        let before: Vec<_> = MIGRATIONS.iter().take_while(|(n, _)| *n != rebuilds[0]).collect();
         for (i, (_, sql)) in before.iter().enumerate() {
             conn.execute_batch(&format!(
                 "BEGIN; {sql}; PRAGMA user_version = {}; COMMIT;",
@@ -221,12 +232,14 @@ mod tests {
                 .unwrap();
         assert_eq!((metrics, samples), (1, 1), "the rebuild cascaded through the chart");
 
-        // The point of the rebuild: kinds the old check refused.
-        conn.execute(
-            "INSERT INTO jobs (kind, state, label, params) VALUES ('bench', 'running', 'b', '{}')",
-            [],
-        )
-        .unwrap();
+        // The point of the rebuilds: kinds the old checks refused.
+        for kind in ["bench", "crawl"] {
+            conn.execute(
+                "INSERT INTO jobs (kind, state, label, params) VALUES (?1, 'running', 'b', '{}')",
+                [kind],
+            )
+            .unwrap();
+        }
         // And the check is still a check.
         assert!(conn
             .execute(

@@ -93,7 +93,7 @@ batching exists. So:
 | **Chat** | Persisted conversations, system prompt, sampler controls, per-message stats, stop button, export |
 | **Playground** | Raw completion, the same prompt side by side across F32/Q8/Q4 or two models, a tokeniser inspector, per-token top-k probabilities |
 | **Training** | New run (dataset, size preset, `--from`, steps, learning rate), live train/val loss chart with the best-step marker, samples at each checkpoint, cancel, run history, a "chat with this" button |
-| **Datasets** | Upload and list text files; character count, vocabulary, and the unseen-character check against a model before `--from` fails on it |
+| **Datasets** | Upload and list text files; character count, vocabulary, and the unseen-character check against a model before `--from` fails on it; read a documentation site into a corpus, scoped to the starting URL's directory, with a manifest of every page kept beside the text |
 | **Evals** | Perplexity on a held-out file; saved prompt suites with expected outputs as regression tests across models and quantisations |
 | **Benchmarks** | The measurement protocol as a feature: interleaved A/B, 5 runs, median and range, idle check first, results stored so the README numbers can be reproduced |
 | **Monitoring** | Request log, latency histograms, errors, server log tail |

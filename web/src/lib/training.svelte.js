@@ -165,6 +165,34 @@ class Training {
     }
   }
 
+  /**
+   * Read a website into a dataset.
+   *
+   * Answers with the job, not the dataset: this takes minutes, and the page
+   * that asked follows it the way the Training page follows a run.
+   */
+  async crawl(request) {
+    try {
+      const job = await api("/api/datasets/crawl", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      await this.refresh();
+      return job;
+    } catch (e) {
+      toasts.error(e.message);
+      return null;
+    }
+  }
+
+  /** A crawl that is still going, if there is one. */
+  get crawling() {
+    return this.jobs.find(
+      (j) => j.kind === "crawl" && (j.state === "running" || j.state === "queued"),
+    );
+  }
+
   async removeDataset(id) {
     try {
       await api(`/api/datasets/${id}`, { method: "DELETE" });

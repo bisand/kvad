@@ -23,6 +23,7 @@ pub fn routes() -> Router<State> {
         .route("/api/train", post(start))
         .route("/api/train/options", get(options))
         .route("/api/datasets", get(list_datasets).post(upload))
+        .route("/api/datasets/crawl", post(start_crawl))
         .route("/api/datasets/{id}", get(dataset).delete(remove_dataset))
         .route("/api/datasets/{id}/check", get(check))
         // Uploads are text and the store has its own limit; axum's default of
@@ -340,10 +341,35 @@ async fn upload(
 ) -> Result<Json<Dataset>, Fail> {
     let db = state.db.clone();
     let owner = who.0.id;
-    blocking(move || datasets::save(&db, q.name.trim(), &text, owner))
+    blocking(move || datasets::save(&db, q.name.trim(), &text, owner, None))
         .await
         .map(Json)
         .map_err(|e| Fail::bad(e.1))
+}
+
+/// Read a website into a dataset.
+///
+/// Answers with the job, not with the dataset: this takes minutes and several
+/// hundred requests, and the page that asked follows it the way it follows a
+/// training run.
+async fn start_crawl(
+    who: Admin,
+    St(state): St<State>,
+    Json(body): Json<crate::crawl::Request>,
+) -> Result<Json<Job>, Fail> {
+    let request = body.sane();
+    datasets::check_name(request.name.trim()).map_err(Fail::bad)?;
+    let request = crate::crawl::Request { name: request.name.trim().to_string(), ..request };
+    let jobs = state.jobs.clone();
+    blocking(move || {
+        // Before the job exists: an address that cannot be fetched is this
+        // request's answer, not a row that fails a second after it is made.
+        crate::crawl::check(&request)?;
+        jobs::crawl(&jobs, request, who.0.id)
+    })
+    .await
+    .map(Json)
+    .map_err(|e| Fail::bad(e.1))
 }
 
 #[derive(serde::Serialize)]

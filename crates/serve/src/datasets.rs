@@ -41,6 +41,12 @@ pub struct Dataset {
     pub characters: i64,
     pub distinct: i64,
     pub created_at: String,
+    /// Where it came from: the address a crawl started at, or `None` for a
+    /// file somebody uploaded.
+    pub source: Option<String>,
+    /// Whether a crawl's manifest is beside the file — every page it read, in
+    /// the order it read them.
+    pub manifest: bool,
     /// False when the row is here and the file is not — somebody tidied the
     /// directory by hand, and a listing that pretended otherwise would fail
     /// at the point of training.
@@ -78,6 +84,13 @@ pub fn path_of(name: &str) -> Res<PathBuf> {
     Ok(dir().join(name))
 }
 
+/// Where a crawl's record of itself goes: beside the text, under the same
+/// name, so that moving one and forgetting the other takes an effort.
+pub fn manifest_of(name: &str) -> Res<PathBuf> {
+    check_name(name)?;
+    Ok(dir().join(format!("{name}.crawl.json")))
+}
+
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Dataset> {
     let name: String = r.get("name")?;
     Ok(Dataset {
@@ -86,12 +99,14 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Dataset> {
         characters: r.get("characters")?,
         distinct: r.get("distinct_chars")?,
         created_at: r.get("created_at")?,
+        source: r.get("source")?,
+        manifest: manifest_of(&name).is_ok_and(|p| p.is_file()),
         present: path_of(&name).is_ok_and(|p| p.is_file()),
         name,
     })
 }
 
-const COLUMNS: &str = "id, name, bytes, characters, distinct_chars, created_at";
+const COLUMNS: &str = "id, name, bytes, characters, distinct_chars, created_at, source";
 
 pub fn list(db: &Db) -> Res<Vec<Dataset>> {
     db.with(|c| {
@@ -113,7 +128,13 @@ pub fn get(db: &Db, id: i64) -> Res<Option<Dataset>> {
 /// `shakespeare-2` and then `shakespeare-2-final`. What it does not do is
 /// touch any model already trained on the old text: that model has the
 /// tokeniser it was trained with and does not care what this file says now.
-pub fn save(db: &Db, name: &str, text: &str, owner: Option<i64>) -> Res<Dataset> {
+pub fn save(
+    db: &Db,
+    name: &str,
+    text: &str,
+    owner: Option<i64>,
+    source: Option<&str>,
+) -> Res<Dataset> {
     let path = path_of(name)?;
     if text.len() > MAX_BYTES {
         return Err(format!(
@@ -133,11 +154,12 @@ pub fn save(db: &Db, name: &str, text: &str, owner: Option<i64>) -> Res<Dataset>
 
     let id = db.with(|c| {
         c.execute(
-            "INSERT INTO datasets (name, bytes, characters, distinct_chars, owner)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO datasets (name, bytes, characters, distinct_chars, owner, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(name) DO UPDATE SET
-                bytes = ?2, characters = ?3, distinct_chars = ?4, created_at = datetime('now')",
-            params![name, text.len() as i64, characters, distinct, owner],
+                bytes = ?2, characters = ?3, distinct_chars = ?4, source = ?6,
+                created_at = datetime('now')",
+            params![name, text.len() as i64, characters, distinct, owner, source],
         )?;
         c.query_row("SELECT id FROM datasets WHERE name = ?1", [name], |r| r.get(0))
     })?;
@@ -159,8 +181,11 @@ pub fn count(text: &str) -> (i64, i64) {
 pub fn delete(db: &Db, id: i64) -> Res<bool> {
     let Some(dataset) = get(db, id)? else { return Ok(false) };
     // The row goes whether or not the file does: a row pointing at nothing is
-    // worse than a file nobody knows about.
+    // worse than a file nobody knows about. The manifest goes with the text
+    // it describes; on its own it would be a record of a corpus that is not
+    // here any more.
     let _ = std::fs::remove_file(path_of(&dataset.name)?);
+    let _ = std::fs::remove_file(manifest_of(&dataset.name)?);
     Ok(db.with(|c| c.execute("DELETE FROM datasets WHERE id = ?1", [id]))? > 0)
 }
 

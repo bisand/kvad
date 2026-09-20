@@ -1,6 +1,6 @@
 [package]
 name = "kvad"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,7 +19,7 @@ arch-deepseek = []
 hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
 memmap2 = "0.9.11"
 minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "serde"] }
-nanograd = { version = "0.1.0", path = "../nanograd" }
+nanograd = { path = "../nanograd" }
 rayon = "1.10.0"
 safetensors = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }

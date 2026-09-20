@@ -76,7 +76,43 @@ So the second job is a direction, not a claim. [The roadmap](#where-to-go-next)
 says what would have to become true first, starting with the one thing every
 measurement in this repo keeps pointing at.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh
+```
+
+Prebuilt binaries from the latest [release](https://github.com/bisand/kvad/releases),
+checked against that release's `SHA256SUMS` and put in `~/.local/bin`. It asks
+two questions — whether to add that directory to your `PATH`, and whether
+`kvad-serve` should start when you log in — and asks them on `/dev/tty`, so
+they survive being piped into `sh`. Nothing needs root.
+
+For a machine with nobody watching, `--yes` never opens a terminal and
+answers both questions the quiet way — binaries and nothing else. Ask for
+the rest explicitly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh -s -- --yes --service
+```
+
+`--prefix DIR`, `--version vX.Y.Z` and `--uninstall` do what they look like;
+`--uninstall` removes the binaries and the service and leaves your models and
+conversations alone. `sh install.sh --help` lists the rest.
+
+macOS gets all four binaries. Linux gets `kvad` and a CPU-only `kvad-serve`:
+`kvad-tui` and `kvad-gpu` both link candle against Metal, which is not a thing
+off a Mac. Apple Silicon is what this is developed and measured on; the
+`x86_64-apple-darwin` build is compiled but not run before release.
+
+The binaries are unsigned and unnotarized, which is deliberate rather than
+lazy: Gatekeeper's quarantine flag is set by LaunchServices, so a tarball
+fetched with `curl` never gets one and runs as-is. Download the same tarball
+with a browser and macOS will want convincing.
+
 ## Quick start
+
+From a checkout, with Rust and (for the web UI) Node installed:
 
 ```bash
 ./scripts/get-mnist.sh

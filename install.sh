@@ -17,9 +17,9 @@
 #
 #     curl -fsSL .../install.sh | sh -s -- --yes --service
 #
-# --yes answers every question with the default and never opens the terminal.
-# The defaults are deliberately the quiet ones: install the binaries, touch
-# nothing else. Ask for the rest with --add-path and --service.
+# --yes never opens the terminal, and answers every question the quiet way:
+# install the binaries and touch nothing else — no shell rc edited, no service
+# started. Ask for those explicitly with --add-path and --service.
 #
 # Nothing here needs root. Nothing here writes outside $HOME unless you point
 # --prefix somewhere else.
@@ -51,32 +51,41 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # Interactive unless told otherwise, and only if there is a terminal to ask
 # on. Both conditions matter: `--yes` is a choice, no /dev/tty is a fact.
-INTERACTIVE=1
-[ -r /dev/tty ] && [ -w /dev/tty ] || INTERACTIVE=0
-
-# ask QUESTION DEFAULT  ->  0 for yes, 1 for no
 #
-# DEFAULT is y or n, and is what a non-interactive run gets without being
-# asked. Anything that is not a clear yes or no re-asks rather than guessing.
+# Opened rather than tested with -r: in a container started without a tty,
+# /dev/tty exists and passes every permission check, and opening it fails
+# with ENXIO. Asking is the only way to find out.
+INTERACTIVE=1
+{ : < /dev/tty; } 2>/dev/null || INTERACTIVE=0
+
+# ask QUESTION DEFAULT [UNATTENDED]  ->  0 for yes, 1 for no
+#
+# DEFAULT is what Enter means, and UNATTENDED — if given — is what a run with
+# --yes or no terminal gets instead. The two differ on purpose: "add this to
+# your PATH?" is worth a yes from somebody reading the question, and is not
+# something to do to a machine with nobody watching. Anything that is not a
+# clear yes or no re-asks rather than guessing.
 ask() {
     question=$1
     default=$2
+    unattended=${3:-$2}
     case $default in
         y) hint="Y/n" ;;
         *) hint="y/N" ;;
     esac
     if [ "$INTERACTIVE" -eq 0 ]; then
-        printf '%s %s[%s -> %s]%s\n' "$question" "$DIM" "$hint" "$default" "$R" >&2
-        [ "$default" = y ]
+        printf '%s %s[not asked -> %s]%s\n' "$question" "$DIM" "$unattended" "$R" >&2
+        [ "$unattended" = y ]
         return
     fi
     while :; do
         printf '%s %s[%s]%s ' "$question" "$DIM" "$hint" "$R" > /dev/tty
         if ! read -r reply < /dev/tty; then
-            # Terminal closed mid-question. Take the default rather than
-            # spinning on an endless EOF.
+            # The terminal went away mid-question. Nobody is answering, so
+            # this is an unattended run after all — and it takes the
+            # unattended answer, not the one meant for somebody watching.
             printf '\n' >&2
-            [ "$default" = y ]
+            [ "$unattended" = y ]
             return
         fi
         case $reply in
@@ -269,7 +278,9 @@ fetch "$BASE/$NAME.tar.gz" "$TMP/$NAME.tar.gz" || die "no build of $VERSION for 
 # and a corrupted mirror, which are the failures that actually happen here.
 step "Checking the download against SHA256SUMS"
 if fetch "$BASE/SHA256SUMS" "$TMP/SHA256SUMS" 2>/dev/null; then
-    expected=$(grep " $NAME.tar.gz\$" "$TMP/SHA256SUMS" | awk '{print $1}' | head -n 1)
+    # Compared as a whole field, not matched as a pattern: the name is full
+    # of dots, and a regex would take them for wildcards.
+    expected=$(awk -v want="$NAME.tar.gz" '$2 == want { print $1; exit }' "$TMP/SHA256SUMS")
     if [ -z "$expected" ]; then
         warn "SHA256SUMS does not mention $NAME.tar.gz; continuing unverified"
     else
@@ -380,7 +391,7 @@ if ! on_path; then
     case $WANT_PATH in
         yes) do_path=1 ;;
         no)  do_path=0 ;;
-        *)   ask "Add it to $RC?" y && do_path=1 ;;
+        *)   ask "Add it to $RC?" y n && do_path=1 ;;
     esac
     if [ "$do_path" -eq 1 ]; then
         mkdir -p "$(dirname "$RC")"
@@ -394,6 +405,8 @@ if ! on_path; then
             say "  added to $RC"
         fi
         say "  ${DIM}open a new terminal, or run: export PATH=\"$PREFIX:\$PATH\"${R}"
+    elif [ "$INTERACTIVE" -eq 0 ]; then
+        say "  ${DIM}pass --add-path to have this script add it${R}"
     else
         say "  ${DIM}run it as $PREFIX/kvad, or add that directory to PATH yourself${R}"
     fi

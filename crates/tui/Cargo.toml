@@ -1,6 +1,6 @@
 [package]
 name = "kvad-tui"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,5 +12,5 @@ path = "src/main.rs"
 
 [dependencies]
 kvad = { path = "../llm" }
-kvad-gpu = { version = "0.1.0", path = "../gpu" }
+kvad-gpu = { path = "../gpu" }
 ratatui = "0.29.0"

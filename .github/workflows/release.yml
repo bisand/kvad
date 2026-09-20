@@ -1,0 +1,287 @@
+# Builds and uploads the binaries for a GitHub release.
+#
+# The release is the trigger and the source of truth. Draft a release in the
+# GitHub UI (or `gh release create v0.2.0`), publish it, and this workflow
+# builds four tarballs from its tag, stamps that tag into the crate versions,
+# and attaches the tarballs and a SHA256SUMS to that same release. Nothing
+# here creates a release, so the version is decided in one place by a person.
+#
+# Between publishing and the last upload there is a window where the release
+# exists with no assets, and `install.sh` will say it cannot find a build for
+# this machine. That is the cost of letting the release be the trigger.
+# Re-run against an existing release with `workflow_dispatch`.
+#
+# Why the shape is this:
+#
+# * The version is rewritten into `[workspace.package]` rather than committed.
+#   `Cargo.toml` in git says what the last released version was; what a
+#   *binary* reports comes from the release it was built for. One line to
+#   rewrite, because every crate inherits it with `version.workspace = true`.
+# * `cargo update --workspace` after the rewrite, because changing a workspace
+#   member's version makes `Cargo.lock` stale and `--locked` would refuse to
+#   build. `--workspace` touches only those members; third-party dependencies
+#   stay pinned exactly where the committed lock file put them.
+# * The web UI is built once, not once per target. `rust-embed` reads
+#   `web/dist` at compile time (see crates/serve/src/assets.rs), so every
+#   target needs those files present — but they are the same files, and
+#   building them four times would be four chances to ship four UIs.
+# * Linux gets `kvad` and `kvad-serve` only. `kvad-tui` and `kvad-gpu` both
+#   link candle with Metal, which does not exist off macOS, so `kvad-serve`
+#   there is built `--no-default-features`.
+# * `--no-default-features` is given to `-p kvad-serve` alone. Applied to the
+#   whole workspace it would also switch off `kvad`'s `arch-*` features, and
+#   the result would be an engine that can run no architectures at all.
+# * Nothing is stripped or notarized. Stripping a macOS arm64 binary breaks
+#   the ad-hoc signature the linker gave it, and a tarball fetched with curl
+#   is never quarantined by Gatekeeper — so the simple thing is also the
+#   thing that runs.
+
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of an existing release to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ---------------------------------------------------------------------
+  # The tag, checked once, so three jobs agree on what is being built.
+  version:
+    name: version
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          set -eu
+          tag="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          # A tag that is not a version would produce a tarball nobody can
+          # name and a Cargo.toml that does not parse. Stop here instead.
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tag '$tag' is not vMAJOR.MINOR.PATCH"; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "building $tag (crate version ${tag#v})"
+
+  # ---------------------------------------------------------------------
+  web:
+    name: web UI
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      # A missing index.html means kvad-serve would compile happily and serve
+      # its "no UI was built into this binary" stub. Better to fail here.
+      - name: Check there is a UI
+        run: test -s web/dist/index.html
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+
+  # ---------------------------------------------------------------------
+  build:
+    name: ${{ matrix.target }}
+    needs: [version, web]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+            packages: -p kvad -p kvad-tui -p kvad-gpu -p kvad-serve
+            extra: ""
+          - target: x86_64-apple-darwin
+            os: macos-15
+            packages: -p kvad -p kvad-tui -p kvad-gpu -p kvad-serve
+            extra: ""
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            packages: -p kvad
+            extra: -p kvad-serve --no-default-features
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            packages: -p kvad
+            extra: -p kvad-serve --no-default-features
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Stamp the release version into the workspace
+        run: |
+          set -eu
+          version="${{ needs.version.outputs.version }}"
+          # The first `version = "..."` in the root manifest is the workspace
+          # one; every crate inherits it. Anchored and count-limited so a
+          # dependency's version can never be hit by accident.
+          perl -0pi -e 's/^version = "[^"]*"$/version = "'"$version"'"/m' Cargo.toml
+          grep -q "^version = \"$version\"$" Cargo.toml || {
+            echo "::error::failed to stamp $version into Cargo.toml"; exit 1; }
+          cargo update --workspace --quiet
+          cargo metadata --format-version 1 --no-deps --offline |
+            tr ',' '\n' | grep -E '"(name|version)"' | head -20
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.packages }}
+          if [ -n "${{ matrix.extra }}" ]; then
+            cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.extra }}
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          set -eu
+          name="kvad-${{ needs.version.outputs.tag }}-${{ matrix.target }}"
+          out="dist/$name"
+          mkdir -p "$out"
+
+          # Whatever this target produced, rather than a list per platform:
+          # the matrix already decided, and repeating it here is a second
+          # place for the two to disagree.
+          for bin in kvad kvad-serve kvad-tui kvad-gpu; do
+            if [ -f "target/${{ matrix.target }}/release/$bin" ]; then
+              cp "target/${{ matrix.target }}/release/$bin" "$out/$bin"
+              chmod 755 "$out/$bin"
+            fi
+          done
+          test -f "$out/kvad" || { echo "::error::no kvad binary was built"; exit 1; }
+
+          cp LICENSE README.md "$out/"
+          cp docs/kvad.example.toml "$out/"
+
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -la "dist/$name.tar.gz"
+
+      # Runs the binary it just built, on the machine that built it, and
+      # checks it agrees with the release about what it is. Only possible for
+      # the native targets — an x86_64 build on an arm64 runner would need
+      # Rosetta, which the runners do not have.
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          set -eu
+          expected="kvad ${{ needs.version.outputs.version }}"
+          got=$(./dist/${{ steps.package.outputs.name }}/kvad --version)
+          [ "$got" = "$expected" ] || {
+            echo "::error::built binary reports '$got', expected '$expected'"; exit 1; }
+          ./dist/${{ steps.package.outputs.name }}/kvad-serve --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.tar.gz
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  upload:
+    name: attach to the release
+    needs: [version, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One file, sorted, so `grep " $name.tar.gz$"` in install.sh has
+      # exactly one line to find.
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum -- *.tar.gz | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # --clobber so a re-run replaces assets instead of failing on them.
+          gh release upload "${{ needs.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" --clobber \
+            artifacts/*.tar.gz artifacts/SHA256SUMS
+
+      # Appended, not written: the notes are the maintainer's. The marker
+      # makes a re-run leave them alone rather than stack a second copy.
+      - name: Add install instructions to the notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${{ needs.version.outputs.tag }}"
+          repo="${{ github.repository }}"
+          notes=$(gh release view "$tag" --repo "$repo" --json body --jq .body)
+          case "$notes" in *"<!-- install -->"*) echo "already there"; exit 0 ;; esac
+          gh release edit "$tag" --repo "$repo" --notes "$notes
+
+          <!-- install -->
+          ## Install
+
+          \`\`\`
+          curl -fsSL https://raw.githubusercontent.com/$repo/master/install.sh | sh
+          \`\`\`
+
+          It asks before putting anything on your PATH or starting anything at
+          login. For an unattended install, add \`--yes\` (and \`--service\` if the
+          server should run in the background):
+
+          \`\`\`
+          curl -fsSL https://raw.githubusercontent.com/$repo/master/install.sh | sh -s -- --yes --service
+          \`\`\`
+
+          macOS ships \`kvad\`, \`kvad-serve\`, \`kvad-tui\` and \`kvad-gpu\`. Linux ships
+          \`kvad\` and a CPU-only \`kvad-serve\`; the other two link Metal.
+
+          Downloads can be checked against \`SHA256SUMS\` below."

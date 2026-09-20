@@ -1,6 +1,6 @@
 [package]
 name = "kvad-serve"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -28,7 +28,7 @@ kvad = { path = "../llm" }
 kvad-gpu = { path = "../gpu", optional = true }
 libc = "0.2.189"
 mime_guess = "2.0.5"
-nanograd = { version = "0.1.0", path = "../nanograd" }
+nanograd = { path = "../nanograd" }
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = "8.12.0"

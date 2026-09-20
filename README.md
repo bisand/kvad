@@ -47,6 +47,15 @@ activation quantisation, an i8mm integer kernel, a tiled f32 GEMM, batched
 prefill, prefix caching across chat turns, and a memory-mapped cache of
 pre-quantised weights.
 
+It runs four architectures, and the fourth is the one that says most about
+where inference has gone. **DeepSeek-V2-Lite** — 15.7 billion parameters, 2.4
+billion of them used on any given token — loads in 92 seconds, occupies 17.7 GB
+at q8, and decodes at **23.4 tok/s** on the CPU. It needed multi-head latent
+attention and a 64-expert mixture, neither of which the GPT-2-to-Llama skeleton
+had any room for, which is why architectures are
+[plugin modules](#six-years-of-architecture-progress-as-a-table) now rather
+than arms in a `match`.
+
 There is now an HTTP API and a web UI around it: OpenAI-compatible completions,
 plus model management, training, evals, benchmarks and monitoring. None of that
 makes it a fast server, and it is built not to pretend otherwise — requests
@@ -772,6 +781,60 @@ and holds a conversation, while GPT-2 cannot.** The architecture changes above
 are real but marginal. Nearly all of that gap is training data and
 post-training. Running both in the same binary makes the point better than any
 benchmark.
+
+### The one that needed its own file
+
+Everything above this point is true of GPT-2 and of Llama, and none of it was
+true of the first mixture-of-experts checkpoint pointed at it.
+DeepSeek-V2-Lite is the model this engine grew a registry for, and it is worth
+looking at what it actually costs to run:
+
+```
+deepseek_v2 · 27 layers · 16 heads · 2048 embd · 163840 ctx · 102400 vocab
+15706.5M parameters · weights 17670 MB (cpu q8) · loaded in 92.2s
+
+def fibonacci(n):
+    """Return the nth Fibonacci number."""
+    if n == 0:
+        return 0
+    elif n == 1:
+        return 1
+    else:
+        return fibonacci(n-1) + fibonacci(n-2)
+```
+
+15.7 billion parameters, of which the router picks **2.4 billion** per token:
+six experts of sixty-four, plus two that always run. It costs a 2.4B model to
+decode and knows what a 16B model knows, and that is the entire argument for a
+mixture of experts.
+
+Decode, five interleaved rounds each, medians and the range across all
+samples — [the protocol the benchmark page enforces](#what-it-measures-and-what-it-refuses-to),
+run from a shell because one of these takes 17 GB of RAM:
+
+| | weights | decode | prefill (13 tokens) |
+|---|---|---|---|
+| q8 | 16.5 GB | **23.4 tok/s** (22.8–24.7) | 0.47s (0.46–0.58) |
+| q4 | 9.1 GB | **18.0 tok/s** (17.7–18.2) | 0.44s (0.44–0.49) |
+
+**q8 decodes faster than q4 here, by 30%, while reading twice the bytes** —
+which is not a surprise by the time you get here, because
+[the same thing happens to Qwen2.5-0.5B](#what-it-is-worth-end-to-end). It is
+worth repeating on this model anyway, because a mixture of experts is the case
+where you would most expect the memory argument to win: decoding touches only
+six experts of sixty-four, so q4 saves more than a gigabyte of traffic per
+token and still loses.
+
+The reason is that decoding is `m = 1`, and at `m = 1` there is no
+[i8mm tile](#batched-prefill-and-i8mm) to take. `matvec_bt` walks one weight
+row at a time, and q4's row has to be masked and shifted apart before any
+arithmetic happens, where q8's goes straight into `sdot`. Reading half as much
+memory does not help once you are no longer waiting on memory. Prefill, where
+the tiles *do* apply, shows the expected shape instead — q4 marginally ahead.
+
+So q4 on this model buys 7.4 GB of RAM and costs 23% of the decode rate. That
+is a real trade and the right one on a machine that cannot fit q8; it is
+simply not the free lunch the name suggests.
 
 ### Base models versus instruction-tuned
 

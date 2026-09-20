@@ -148,6 +148,46 @@ pub enum Parts<'a> {
     Q4 { scales: &'a [f32], qs: &'a [u8] },
 }
 
+/// Pass 1 for one 4-bit weight row: `out[b]` is block `b`'s integer dot.
+///
+/// The result is the dot of the *signed* weights, `-8` to `7`, whichever path
+/// ran — so pass 2 is the same code for q8 and q4, and so is the convention
+/// [`Weight::unpack_q4_pair`] has always fed `SMMLA`.
+///
+/// The two paths get there differently, and the difference is forced. The
+/// portable one multiplies the nibbles as stored — unsigned, 0 to 15 — and
+/// subtracts the bias once per block, against the block's summed activations.
+/// That looks like deferred bookkeeping and it is not: moving the `- 8` into
+/// the inner loop, which is what `SDOT` needs, is a five-fold *slowdown*.
+/// LLVM stops vectorising the reduction and starts vectorising across blocks
+/// instead, gathering weights a byte at a time into lanes. So the portable
+/// path keeps the shape that vectorises and pays a correction per block, and
+/// where the instruction can simply be written down,
+/// [`crate::simd::q4_row_dots`] writes it.
+#[inline]
+fn q4_row_dots(row: &[u8], acts: &[i8], sums: &[i32], out: &mut [i32]) {
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::has_dotprod() {
+        // Safety: guarded by the check above, and the three lengths agree by
+        // construction -- `row` is half a weight row, `acts` a whole
+        // activation row, `out` one slot per block.
+        unsafe { crate::simd::q4_row_dots(row, acts, out) };
+        return;
+    }
+
+    const HALF: usize = BLOCK / 2;
+    for (b, (d, (wb, xb))) in
+        out.iter_mut().zip(row.chunks_exact(HALF).zip(acts.chunks_exact(BLOCK))).enumerate()
+    {
+        let (xlo, xhi) = xb.split_at(HALF);
+        // Two uniform reductions: low nibbles against the first half of the
+        // block, high nibbles against the second.
+        let lo: i32 = wb.iter().zip(xlo.iter()).map(|(&w, &v)| (w & 0x0f) as i32 * v as i32).sum();
+        let hi: i32 = wb.iter().zip(xhi.iter()).map(|(&w, &v)| (w >> 4) as i32 * v as i32).sum();
+        *d = lo + hi - 8 * sums[b];
+    }
+}
+
 /// A weight matrix, in whichever precision it was loaded at.
 ///
 /// The model code never branches on precision: it calls [`Weight::matvec`] or
@@ -407,28 +447,8 @@ impl Weight {
                                     }
                                 }
                                 Data::Q4 { qs, .. } => {
-                                    const HALF: usize = BLOCK / 2;
                                     let row = &qs[r * n / 2..(r + 1) * n / 2];
-                                    for (d, (wb, xb)) in dots
-                                        .iter_mut()
-                                        .zip(row.chunks_exact(HALF).zip(xq.qs.chunks_exact(BLOCK)))
-                                    {
-                                        let (xlo, xhi) = xb.split_at(HALF);
-                                        // Two uniform reductions: low nibbles
-                                        // against the first half of the block,
-                                        // high nibbles against the second.
-                                        let lo: i32 = wb
-                                            .iter()
-                                            .zip(xlo.iter())
-                                            .map(|(&w, &v)| (w & 0x0f) as i32 * v as i32)
-                                            .sum();
-                                        let hi: i32 = wb
-                                            .iter()
-                                            .zip(xhi.iter())
-                                            .map(|(&w, &v)| (w >> 4) as i32 * v as i32)
-                                            .sum();
-                                        *d = lo + hi;
-                                    }
+                                    q4_row_dots(row, &xq.qs, &xq.sums, dots);
                                 }
                                 Data::F32(_) => unreachable!(),
                             }
@@ -438,14 +458,8 @@ impl Weight {
                                 Data::Q8 { scales, .. } | Data::Q4 { scales, .. } => scales,
                                 Data::F32(_) => unreachable!(),
                             };
-                            // The 4-bit codes are stored offset by 8, undone
-                            // here against the summed quantised activations --
-                            // still integer, one correction per block.
-                            let offset = matches!(self.data, Data::Q4 { .. });
-
                             let mut sums = [0.0f32; 2];
                             for (b, &d) in dots.iter().enumerate() {
-                                let d = if offset { d - 8 * xq.sums[b] } else { d };
                                 sums[b & 1] += scales[base + b] * xq.scales[b] * d as f32;
                             }
                             *slot = sums[0] + sums[1];
@@ -766,20 +780,9 @@ impl Weight {
                 }
             }
             Data::Q4 { qs, .. } => {
-                const HALF: usize = BLOCK / 2;
                 let wrow = &qs[r * n / 2..(r + 1) * n / 2];
                 let arow = &act.qs[i * n..(i + 1) * n];
-                for (d, (wb, ab)) in scratch
-                    .iter_mut()
-                    .zip(wrow.chunks_exact(HALF).zip(arow.chunks_exact(BLOCK)))
-                {
-                    let (alo, ahi) = ab.split_at(HALF);
-                    let lo: i32 =
-                        wb.iter().zip(alo.iter()).map(|(&w, &v)| (w & 0x0f) as i32 * v as i32).sum();
-                    let hi: i32 =
-                        wb.iter().zip(ahi.iter()).map(|(&w, &v)| (w >> 4) as i32 * v as i32).sum();
-                    *d = lo + hi;
-                }
+                q4_row_dots(wrow, arow, &act.sums[i * blocks..(i + 1) * blocks], scratch);
             }
             Data::F32(_) => unreachable!(),
         }
@@ -789,12 +792,10 @@ impl Weight {
             Data::Q8 { scales, .. } | Data::Q4 { scales, .. } => scales,
             Data::F32(_) => unreachable!(),
         };
-        let offset = matches!(self.data, Data::Q4 { .. });
         let (wbase, abase) = (r * blocks, i * blocks);
 
         let mut total = [0.0f32; 2];
         for (b, &d) in scratch.iter().enumerate() {
-            let d = if offset { d - 8 * act.sums[abase + b] } else { d };
             total[b & 1] += scales[wbase + b] * act.scales[abase + b] * d as f32;
         }
         total[0] + total[1]
@@ -807,10 +808,10 @@ impl Weight {
     /// each byte belonging to the first sixteen weights of a block and the
     /// high half to the second sixteen, so unpacking has to scatter rather
     /// than stream. And the stored nibble is unsigned, 0 to 15, with the bias
-    /// removed later — `row_dot` does it as `d - 8 * sum(activations)`.
-    /// Subtracting 8 here instead is exactly equivalent, and it means the
+    /// taken off here rather than later — exactly equivalent, and it means the
     /// result is an ordinary signed weight that `SMMLA` can eat without the
-    /// kernel knowing anything about quantisation.
+    /// kernel knowing anything about quantisation. [`q4_row_dots`] hands pass
+    /// 2 the same convention, from either of its paths.
     ///
     /// Cost is `n` bytes read and `2n` written per row pair, against `m/2`
     /// passes of the kernel over the same pair — so it is amortised by the

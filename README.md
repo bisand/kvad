@@ -43,9 +43,9 @@ on it.
 Kvad runs one sequence at a time. On an M5 Pro, Qwen2.5-0.5B decodes at
 **191 tok/s** on Metal at q8 and **112 tok/s** on the hand-written CPU engine —
 which is also, for now, what this machine's GPU does in bf16. It has weight and
-activation quantisation, an i8mm integer kernel, a tiled f32 GEMM, batched
-prefill, prefix caching across chat turns, and a memory-mapped cache of
-pre-quantised weights.
+activation quantisation, an i8mm integer kernel, a hand-written 4-bit decode
+kernel, a tiled f32 GEMM, batched prefill, prefix caching across chat turns,
+and a memory-mapped cache of pre-quantised weights.
 
 It runs four architectures, and the fourth is the one that says most about
 where inference has gone. **DeepSeek-V2-Lite** — 15.7 billion parameters, 2.4
@@ -817,24 +817,34 @@ run from a shell because one of these takes 17 GB of RAM:
 | q8 | 16.5 GB | **23.4 tok/s** (22.8–24.7) | 0.47s (0.46–0.58) |
 | q4 | 9.1 GB | **18.0 tok/s** (17.7–18.2) | 0.44s (0.44–0.49) |
 
-**q8 decodes faster than q4 here, by 30%, while reading twice the bytes** —
-which is not a surprise by the time you get here, because
-[the same thing happens to Qwen2.5-0.5B](#what-it-is-worth-end-to-end). It is
-worth repeating on this model anyway, because a mixture of experts is the case
-where you would most expect the memory argument to win: decoding touches only
-six experts of sixty-four, so q4 saves more than a gigabyte of traffic per
-token and still loses.
+**q8 decoded faster than q4 here, by 30%, while reading twice the bytes.** A
+mixture of experts is the case where you would most expect the memory argument
+to win — decoding touches only six experts of sixty-four, so q4 saves more than
+a gigabyte of traffic per token — and it lost anyway.
 
-The reason is that decoding is `m = 1`, and at `m = 1` there is no
-[i8mm tile](#batched-prefill-and-i8mm) to take. `matvec_bt` walks one weight
-row at a time, and q4's row has to be masked and shifted apart before any
-arithmetic happens, where q8's goes straight into `sdot`. Reading half as much
-memory does not help once you are no longer waiting on memory. Prefill, where
-the tiles *do* apply, shows the expected shape instead — q4 marginally ahead.
+The explanation this README gave was that decoding is `m = 1`, where there is
+no [i8mm tile](#batched-prefill-and-i8mm) to take: `matvec_bt` walks one weight
+row at a time, q8's goes straight into `sdot`, and q4's has to be masked and
+shifted apart first. Reading half as much memory does not help once you are no
+longer waiting on memory.
 
-So q4 on this model buys 7.4 GB of RAM and costs 23% of the decode rate. That
-is a real trade and the right one on a machine that cannot fit q8; it is
-simply not the free lunch the name suggests.
+That was the right mechanism and much too large a number for it, and the
+difference was a kernel nobody had written. The nibble unpacking was costing
+about five times what it should, because of *which* loop LLVM chose to
+vectorise; written out by hand it costs 9%, and
+[the section that chases that down](#the-nibble-kernel-the-compiler-would-not-write)
+is the more useful half of this story. Re-measured on the same model, five
+interleaved rounds, with q8 as the control:
+
+| | q8 (untouched) | q4 before | q4 after |
+|---|---|---|---|
+| decode | 19.3 tok/s (18.1–19.8) | 15.0 (13.2–15.6) | **20.3** (18.3–21.1) |
+
+q4 goes from 22% behind q8 to 5% ahead, on 7.4 GB less memory. (Absolute rates
+in that second table are lower across the board than the first: the machine was
+busy, which is why it reports a control alongside. The first table was run
+idle.) q4 on this model is now what the name suggests — and it took two
+sessions and a disassembler to stop it being a trade.
 
 ### Base models versus instruction-tuned
 
@@ -976,6 +986,106 @@ slower. So the threshold is gone and there is one kernel. The dequantising one
 survives as the baseline the integer path is measured against, behind
 `KVAD_DEQUANT=1`.
 
+### The nibble kernel the compiler would not write
+
+For most of this project q4 decoded *slower* than q8, on every model, and this
+README said so in three places with an explanation attached: `m = 1` decode
+walks one weight row at a time, q8's row goes straight into `sdot`, and q4's
+has to be masked and shifted apart first. Reading half the bytes does not help
+once you are not waiting on bytes.
+
+The mechanism was right. The size of it was not — and the size was an accident
+of what LLVM decided to vectorise.
+
+`sdot` multiplies `i8` by `i8`. A 4-bit code is stored unsigned, `0` to `15`,
+with the bias taken off afterwards; mask one out of a byte and widen it and you
+get a *zero*-extend, and a zero-extended operand against a sign-extended one is
+not a shape `sdot` can take. So the q4 loop got `smull`/`smlal` instead —
+eight lanes an instruction where `sdot` does sixteen, four of them per block,
+with a widening step in front of each.
+
+The obvious fix is to subtract the 8 inside the loop, which makes the weight
+genuinely signed. It is exactly equivalent arithmetic — `sum((n-8)v)` and
+`sum(nv) - 8 sum(v)` agree over the integers — and it made things **five times
+slower**. Casting through `i8` without subtracting does nothing at all: LLVM
+knows the top bits are zero and folds the sign-extend straight back. Measured
+on one core, a 896-wide row, block dots only:
+
+| | GMAC/s |
+|---|---|
+| unsigned nibbles, bias per block *(what shipped)* | 24 |
+| signed nibbles, same iterator form | 4 |
+| signed, one fused accumulator | 7 |
+| signed, with the block sizes as array types | 2 |
+| q8, for scale | 88 |
+
+Every attempt to make the inner loop signed made the autovectoriser abandon the
+reduction and vectorise *across blocks* instead — loading weights a byte at a
+time into lanes with `ld1.b`, dozens of single-byte loads where there had been
+one `ldr q`. The disassembly is unambiguous about it, and no amount of
+rephrasing the Rust talked it out of the idea.
+
+So the kernel is written down, next to `SMMLA` in [`simd.rs`](crates/llm/src/simd.rs),
+and it is ten lines:
+
+```rust
+let packed = vld1q_u8(w);                      // 16 bytes = 32 weights
+let bias = vdupq_n_s8(-8);
+let lo = vaddq_s8(vreinterpretq_s8_u8(vandq_u8(packed, vdupq_n_u8(0x0f))), bias);
+let hi = vaddq_s8(vreinterpretq_s8_u8(vshrq_n_u8(packed, 4)), bias);
+let acc = vdotq_s32(vdupq_n_s32(0), lo, vld1q_s8(x));
+vdotq_s32(acc, hi, vld1q_s8(x.add(16)))
+```
+
+Two ops remove the bias from thirty-two weights at once, which is the thing the
+scalar loop could not express. Four blocks run per iteration so that `vpaddq`
+reduces four accumulators in three instructions instead of four `addv`s. That
+lands at **80 GMAC/s against the portable path's 24** — and within 9% of q8,
+which is what unpacking nibbles should actually cost.
+
+Note what this is *not*. It is not an instruction Rust cannot name; `vdotq_s32`
+is stable and the compiler emits `sdot` for q8 without being asked. It is the
+compiler declining to *choose* it — the same reason `SMMLA` is hand-written one
+screen up, arrived at from the opposite direction.
+
+The old path is still there for CPUs without `dotprod`, and `KVAD_NO_DOTPROD=1`
+selects it, which is how everything below was measured. Both produce
+bit-identical output — verified, not assumed — because the two ways of removing
+the bias are the same integers.
+
+### What the kernel is worth end to end
+
+Interleaved rounds, `KVAD_NO_DOTPROD=1` against the kernel, same binary and
+the same weights. **q8 is the control**: its kernel was not touched, so
+whatever the two q8 arms differ by is what this machine's noise is worth.
+
+| | q8 (control) | q4 before | q4 after | |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | 108 / 108 tok/s | 91 | **112** | 1.23x |
+| DeepSeek-V2-Lite 15.7B | 19.0 / 19.3 | 15.0 | **20.3** | 1.35x |
+| SmolLM2-135M | 166 / 162 | 154 | **165** | 1.07x |
+
+q8's two arms land within 4% of each other; q4 moves 7–35%. The gain tracks
+matrix size, which is what it should do — a 135M model spends most of a decode
+step in dispatch, and there is no kernel for that.
+
+Absolute numbers here are lower than elsewhere in this README because the
+machine was not idle (`dasd` was indexing at 99% of a core throughout), which
+is why this table reports a ratio against a control rather than a rate. The
+ratio is the claim.
+
+And the microbenchmark, which is where it is cleanest:
+
+```
+qwen lm_head  [151936 x 896]
+  f32      545 MB     2.62 ms/call   1.00x
+  q8       153 MB     0.88 ms/call   2.97x
+  q4        85 MB     0.73 ms/call   3.59x
+```
+
+q4 is now the fastest kernel at every matrix size, which is the first time that
+has been true.
+
 ### What it is worth end to end
 
 | | f32 | q8 | |
@@ -992,9 +1102,11 @@ is what let the kernels through; before that, the honest summary of this
 section was "a 4.9x kernel bought under 1.4x overall", and the Amdahl's-law
 moral drawn from it was measuring a scheduler.
 
-And note what q4 still does *not* buy: at 91 tok/s it is *slower* than q8's
-112 — unpacking nibbles costs more than the halved bytes save — while being
-much less accurate. Its only advantage is memory.
+For a long time the honest footnote here was that q4 bought none of this: at
+91 tok/s it was *slower* than q8's 112, so its only advantage was memory. That
+was [a missing kernel, not a price quantisation charges](#the-nibble-kernel-the-compiler-would-not-write).
+q4 now decodes at 112 as well. It is still much less accurate, and that part is
+real.
 
 ### Batched prefill, and i8mm
 
@@ -1401,7 +1513,7 @@ All six backends, Qwen2.5-0.5B, decode:
 |---|---|---|
 | cpu f32 | 1976 MB | 64 |
 | cpu q8 | 556 MB | 112 |
-| cpu q4 | 309 MB | 91 |
+| cpu q4 | 309 MB | 112 |
 | metal bf16 | 1260 MB | 113 |
 | **metal q8** | **525 MB** | **191** |
 | metal q4 | 278 MB | 228 |
@@ -1625,7 +1737,11 @@ And with nothing else running, q4 against q8 at 64 tokens, three rounds each:
 
 q4 decoded faster and reached its first token *slower*, and the same split
 showed in scoring, where q4 took twice as long as q8 for the same 519 tokens.
-Decoding is bound by memory traffic, where fewer bits win. Prefill is bound by
+Decoding is bound by memory traffic, where fewer bits win — though on a model
+this small that was as much luck as principle. On anything larger q4 decoded
+*slower* until [its kernel was written](#the-nibble-kernel-the-compiler-would-not-write),
+and this page had simply found the one model whose matrices were small enough
+to hide it. Prefill is bound by
 arithmetic — and q8 had a batched `SMMLA` kernel there while q4 did not, so it
 fell back to a row at a time. Both are integer; neither dequantises. That was a
 missing kernel rather than a price quantisation charges, and

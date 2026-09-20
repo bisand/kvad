@@ -136,6 +136,9 @@ fn main() {
 fn run() {
     println!("threads: {}", rayon::current_num_threads());
     println!("i8mm:    {}", kvad::simd::has_i8mm());
+    // q4's kernel is hand-written too, and the one that decides whether 4-bit
+    // decode beats 8-bit. KVAD_NO_DOTPROD turns it off.
+    println!("dotprod: {}", kvad::simd::has_dotprod());
     // The output head: by far the largest single matmul per token.
     bench("qwen lm_head", 151936, 896);
     // A representative MLP matrix.

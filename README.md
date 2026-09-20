@@ -684,6 +684,32 @@ cut around the paragraph that earned the score instead, found by adding up
 what each of the question's words contributed to each paragraph: the same
 judgement the ranking made, applied one level down.
 
+**A question is phrased in its asker's words, not the corpus's.** The book
+says `push` fifty-five times and `pushing` five, so a question about what
+happens "after pushing to the vector" shared no word with the passage that
+answers it — and the one term that separates that section's two halves counted
+for nothing, leaving the ranking to `element` and `vector`, which are spread
+evenly over both. Every earlier measurement of that question was really a
+measurement of this.
+
+So: Porter's stemmer, the whole algorithm rather than three rules. Stripping
+`-ing`, `-ed` and `-s` by hand is thirty lines and turns `string` into `str`,
+which on a corpus of code does more damage than it repairs. Porter's rules are
+conditioned on the *measure* of what would be left, and `str` has a measure of
+zero and not a vowel in it — so `string` is left alone while `pushing`
+reduces. It collapsed the book's vocabulary from 5,392 distinct words to
+3,406, and indexing still takes under 40 ms. It is not linguistics: `closure`
+becomes `closur`. Both sides of the index go through the same function, so
+what is asked of it is that it agree with itself.
+
+**And the budget is the model's, not a constant.** 4,000 characters is a
+comfortable fifth of a 2k context and an unusable thirtieth of a 32k one. The
+section that answers the question above is 4,096 characters, so a flat 4,000
+cut the answer off the end of it — retrieval had done its job and the trim
+undid it. Two fifths of the window, capped, because a 32k model handed fifty
+thousand characters pays prefill for them on every turn and buries the passage
+that matters among four that do not.
+
 **The part worth keeping is that the two halves are measured apart.** Whether
 the right passage comes back and whether the model then reads it properly are
 different questions that fail for different reasons. Asked what the book says

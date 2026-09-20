@@ -94,14 +94,26 @@ pub struct Completions {
     dataset: Option<i64>,
 }
 
-/// How much of a dataset to put in front of the model, in characters.
-///
-/// About a thousand tokens at four characters each — comfortable inside the
-/// 2k context of the smallest instruction-tuned model here, and a small share
-/// of a larger one's. Five chunks, because the sixth is rarely better than
-/// the first and always costs the same.
-const GROUNDING_BUDGET: usize = 4_000;
+/// How many passages to look for. The sixth is rarely better than the first
+/// and always costs the same.
 const GROUNDING_CHUNKS: usize = 5;
+
+/// How much of a corpus to put in front of the model, in characters.
+///
+/// A share of what the model can hold rather than a fixed number: 4,000
+/// characters is a comfortable fifth of a 2k context and an unusable
+/// thirtieth of a 32k one. Found by measuring — the section of the book that
+/// answers what happens to a reference after a push is 4,096 characters, and
+/// a flat budget of 4,000 cut the answer off the end of it.
+///
+/// Four characters to the token, and two fifths of the window: the rest is
+/// the conversation so far and the reply, which have to fit as well. Capped,
+/// because a 32k model would otherwise be handed fifty thousand characters —
+/// which costs prefill on every turn and buries the passage that matters
+/// among four that do not.
+fn grounding_budget(n_ctx: usize) -> usize {
+    (n_ctx * 4 * 2 / 5).clamp(2_000, 12_000)
+}
 
 #[derive(serde::Deserialize)]
 pub struct Turn {
@@ -157,35 +169,6 @@ pub async fn completions(
     let sampling = body.sampling()?;
     let mut turns = body.turns()?;
 
-    // Retrieval goes in front of everything else the conversation says, so
-    // that a system prompt the user wrote still has the last word on tone.
-    if let Some(dataset) = body.dataset {
-        // Everything else that reads a corpus is behind `Admin` — the
-        // preview, the search, the listing — and an answer built out of one
-        // is that corpus read aloud. A different gate here would be a way
-        // around the others.
-        if !who.is_admin() {
-            return Err(Fail::denied("answering from a dataset is an administrator's to ask for"));
-        }
-        let question = body
-            .messages
-            .iter()
-            .rev()
-            .find(|t| t.role == "user")
-            .map(|t| t.content.clone())
-            .ok_or_else(|| Fail::bad("answering from a dataset needs a question to search it with"))?;
-        let db = state.db.clone();
-        let found = blocking(move || {
-            crate::retrieval::grounding(&db, dataset, &question, GROUNDING_CHUNKS, GROUNDING_BUDGET)
-        })
-        .await
-        .map_err(|e| Fail::bad(e.1))?;
-        // Nothing matched: the model is told nothing rather than told that
-        // nothing was found, and answers as it otherwise would.
-        if let Some(grounding) = found {
-            turns.insert(0, Message::system(&grounding));
-        }
-    }
 
     let loaded = match (&body.model, state.engine.loaded()) {
         (None, Some(l)) => l,
@@ -218,6 +201,39 @@ pub async fn completions(
                 .map_err(|why| Fail::bad(format!("could not load {wanted}: {why}")))?
         }
     };
+
+    // Retrieval goes in front of everything else the conversation says, so
+    // that a system prompt the user wrote still has the last word on tone.
+    // After the load, because how much may be put in front of the model is a
+    // fact about the model.
+    if let Some(dataset) = body.dataset {
+        // Everything else that reads a corpus is behind `Admin` — the
+        // preview, the search, the listing — and an answer built out of one
+        // is that corpus read aloud. A different gate here would be a way
+        // around the others.
+        if !who.is_admin() {
+            return Err(Fail::denied("answering from a dataset is an administrator's to ask for"));
+        }
+        let question = body
+            .messages
+            .iter()
+            .rev()
+            .find(|t| t.role == "user")
+            .map(|t| t.content.clone())
+            .ok_or_else(|| Fail::bad("answering from a dataset needs a question to search it with"))?;
+        let db = state.db.clone();
+        let budget = grounding_budget(loaded.n_ctx);
+        let found = blocking(move || {
+            crate::retrieval::grounding(&db, dataset, &question, GROUNDING_CHUNKS, budget)
+        })
+        .await
+        .map_err(|e| Fail::bad(e.1))?;
+        // Nothing matched: the model is told nothing rather than told that
+        // nothing was found, and answers as it otherwise would.
+        if let Some(grounding) = found {
+            turns.insert(0, Message::system(&grounding));
+        }
+    }
 
     let pieces = state.engine.chat(turns, sampling).map_err(Fail::internal)?;
     let id = format!("chatcmpl-{}", now_millis());

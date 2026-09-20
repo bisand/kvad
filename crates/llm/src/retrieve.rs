@@ -27,6 +27,10 @@
 //! keeping a list to do what the formula already does — and the list would be
 //! wrong for a corpus about the word `if`.
 
+mod stem;
+
+pub use stem::stem;
+
 use std::collections::HashMap;
 
 /// One piece of a corpus, and where it came from.
@@ -176,10 +180,16 @@ fn split(text: &str) -> Vec<String> {
 /// `vector`'s 5.0, and a chapter on I/O with no vector in it outranked the
 /// chapter on vectors. A passage is never relevant because it contains a
 /// single letter, in prose or in code: `Box<T>` is found by `box`.
+///
+/// What is left is stemmed, so that a question may be phrased in its asker's
+/// words rather than the corpus's — the corpus says `push` fifty-five times
+/// and a question says `pushing`. Both sides of the index come through this
+/// one function, which is the whole of what is asked of [`stem`]: it has to
+/// agree with itself, not produce words.
 pub fn words(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.chars().nth(1).is_some())
-        .map(|w| w.to_lowercase())
+        .map(|w| stem(&w.to_lowercase()))
 }
 
 /// What one chunk scored, and why.
@@ -702,7 +712,9 @@ let v: Vec<i32> = Vec::new();
         let hits = index().search("create a vector", 1);
         let words: Vec<&str> = hits[0].because.iter().map(|(w, _)| w.as_str()).collect();
         assert_eq!(words[0], "vector", "the rarest word should be worth the most");
-        assert!(words.contains(&"create"));
+        // Stems, not words: `create` is indexed as `creat`, and the badge in
+        // the UI shows what actually matched.
+        assert!(words.contains(&"creat"), "{words:?}");
         assert!(hits[0].score > 0.0);
     }
 
@@ -711,6 +723,8 @@ let v: Vec<i32> = Vec::new();
     #[test]
     fn a_single_letter_is_not_why_a_passage_is_relevant() {
         assert_eq!(words("how do I make a Vec<T>").collect::<Vec<_>>(), ["how", "do", "make", "vec"]);
+        // And `pushing` finds the corpus's `push`, which is the point of it.
+        assert_eq!(words("after pushing").collect::<Vec<_>>(), ["after", "push"]);
         // The name survives being cut up; only the single letters go.
         assert_eq!(words("trpl::join").collect::<Vec<_>>(), ["trpl", "join"]);
         assert_eq!(words("I/O").collect::<Vec<_>>(), Vec::<String>::new());

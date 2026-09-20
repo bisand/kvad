@@ -278,9 +278,27 @@ mod tests {
         const BLOCK: usize = 32;
         let blocks = 9;
         // Nothing random: a pattern that puts every nibble value somewhere,
-        // and activations that differ block to block.
+        // and activations that differ block to block. 251 is prime and the
+        // row is longer than it, so the step of 13 walks every residue and
+        // the activations cover -125..=125.
+        //
+        // The subtraction is done in `i32` and cast afterwards. Casting
+        // first — `((i * 13) % 251) as i8 - 125` — wraps 250 to -6 and then
+        // underflows `i8`, which is a panic in any build with overflow checks
+        // and silently different data in any build without them. This test
+        // never reached the kernel it is about.
         let packed: Vec<u8> = (0..blocks * BLOCK / 2).map(|i| (i * 37 + 11) as u8).collect();
-        let acts: Vec<i8> = (0..blocks * BLOCK).map(|i| ((i * 13) % 251) as i8 - 125).collect();
+        let acts: Vec<i8> =
+            (0..blocks * BLOCK).map(|i| (((i * 13) % 251) as i32 - 125) as i8).collect();
+
+        // Asserted rather than assumed. The data above is the whole strength
+        // of this test, and when it was quietly wrong the test did not get
+        // weaker — it stopped running at all, for several commits, without
+        // anything downstream noticing.
+        assert_eq!((acts.iter().min(), acts.iter().max()), (Some(&-125), Some(&125)));
+        let nibbles: std::collections::HashSet<u8> =
+            packed.iter().flat_map(|b| [b & 0x0f, b >> 4]).collect();
+        assert_eq!(nibbles.len(), 16, "every nibble value has to occur somewhere");
 
         let mut want = vec![0i32; blocks];
         for (b, d) in want.iter_mut().enumerate() {

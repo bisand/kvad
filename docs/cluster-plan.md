@@ -3,9 +3,10 @@
 Written 2026-09-20 against the working tree after `45a4621`, from a reading of
 `crates/llm/src/model/{mod,arch,llama,deepseek}.rs`, `qcache.rs`, `weights.rs`,
 `service.rs`, `machine.rs`, `crates/gpu/src/model.rs` and
-`crates/serve/src/{engine,scheduler}.rs`. Nothing here has been measured. Every
-number is arithmetic from published specifications and says so; Phase 0 exists
-to replace them with measurements before any engine code is written.
+`crates/serve/src/{engine,scheduler}.rs`. Nothing here has been measured
+except where a line gives a date and says what was measured. Every other
+number is arithmetic from published specifications and says so; Phase 0
+exists to replace them with measurements before any engine code is written.
 
 ## What the owner asked for
 
@@ -86,6 +87,7 @@ Arithmetic and commonly reported figures, to be replaced in Phase 0:
 | 10 GbE | 10 Gb/s | ~0.1–0.2 ms | ideal |
 | 1 GbE | 1 Gb/s | ~0.3 ms | fine for decode, slows long prefill |
 | Wi-Fi | varies | 2–10 ms, jittery | works, not recommended |
+| USB 2 NCM — a charging cable | 0.48 Gb/s nominal | 1.34 ms mean, measured 2026-09-20 | a trap, not a choice; see *A development rig* |
 
 Things worth knowing before buying cables:
 
@@ -290,12 +292,35 @@ reach for.
 
 Two Macs of any vintage and one cable. The one this plan was written beside
 is an M5 Pro MacBook Pro (48 GB, Thunderbolt 5) and an M2 MacBook Air (8 GB,
-Thunderbolt 3/USB4); the link negotiates to 40 Gb/s and the chips differing
-is of no interest to TCP.
+Thunderbolt 3/USB4); the ports are good for 40 Gb/s between them and the
+chips differing is of no interest to TCP.
 
 - **The cable has to be a Thunderbolt or USB4 one.** The USB-C charging
   cables Apple ships carry USB 2 data. With one of those the Thunderbolt
   Bridge never comes up, and it looks exactly like a software fault.
+
+  Worse than that, measured on this pair on 2026-09-20: it does not look like
+  a fault at all. macOS falls back to USB NCM without saying so. An ordinary
+  interface appears — `en12` here, not a bridge member and with no entry in
+  System Settings — takes a self-assigned `169.254.x.x`, answers `ping6` on
+  its link-local address and carries TCP; SSH to the other Mac over it works
+  first try. Everything a connectivity test would check passes. It is a 480
+  Mb/s link whose round trip averaged 1.34 ms over 50 packets, best 0.93,
+  worst 7.03: slower than the gigabit Ethernet row above, and about a
+  hundredth of what the two ports could do. A worker would run on it and
+  simply be slow, which is the failure this plan is least able to see. Three
+  checks tell the truth where `ifconfig` does not:
+
+  | check | charging cable | Thunderbolt cable |
+  |---|---|---|
+  | `system_profiler SPThunderboltDataType` | *No device connected*, on every bus | the peer Mac, by name |
+  | `ifconfig bridge0` | `status: inactive` | active, with an address |
+  | `ioreg -p IOService -n enN -r -t` | `AppleUSB20XHCIARMPort` → `AppleUSBNCM11Data` | `AppleThunderboltIP…` |
+
+  The registry path is the one that cannot be misread: the port it hangs
+  off is named `usb-drd1-port-hs`, and *hs* is USB 2.0 High Speed. Phase 0
+  should print these three checks before it prints a number, so that no
+  measurement is ever recorded against a link nobody identified.
 - With the right cable, System Settings → Network → Thunderbolt Bridge shows
   a self-assigned `169.254.x.x` address on each side. The firewall may ask
   about incoming connections the first time a worker listens.

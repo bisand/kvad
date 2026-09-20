@@ -838,13 +838,20 @@ interleaved rounds, with q8 as the control:
 
 | | q8 (untouched) | q4 before | q4 after |
 |---|---|---|---|
-| decode | 19.3 tok/s (18.1–19.8) | 15.0 (13.2–15.6) | **20.3** (18.3–21.1) |
+| decode | 24.8 tok/s (24.3–25.0) | 19.2 (18.0–19.5) | **26.8** (26.4–27.6) |
 
-q4 goes from 22% behind q8 to 5% ahead, on 7.4 GB less memory. (Absolute rates
-in that second table are lower across the board than the first: the machine was
-busy, which is why it reports a control alongside. The first table was run
-idle.) q4 on this model is now what the name suggests — and it took two
-sessions and a disassembler to stop it being a trade.
+q4 goes from 22% behind q8 to **8% ahead**, on 7.4 GB less memory. The control
+arm varies by 1% across ten runs, so the 40% is not the machine.
+
+(Both tables were measured idle. The second reads a little faster on q8 too,
+which is a different prompt and generation length rather than anything
+changing: the q8 kernel was not touched, so take the control's agreement
+between arms as the thing to trust and not the absolute rate. The first sample
+of each run is discarded — faulting 16.5 GB of weights in from the page cache
+costs a 6.5 s prefill against 0.7 s warm, and that is a disk measurement.)
+
+q4 on this model is now what the name suggests — and it took two sessions and a
+disassembler to stop it being a trade.
 
 ### Base models versus instruction-tuned
 
@@ -1056,35 +1063,32 @@ the bias are the same integers.
 ### What the kernel is worth end to end
 
 Interleaved rounds, `KVAD_NO_DOTPROD=1` against the kernel, same binary and
-the same weights. **q8 is the control**: its kernel was not touched, so
-whatever the two q8 arms differ by is what this machine's noise is worth.
+the same weights, medians with the range across all samples. **q8 is the
+control**: its kernel was not touched, so whatever its two arms differ by is
+what this machine's noise is worth.
 
 | | q8 (control) | q4 before | q4 after | |
 |---|---|---|---|---|
-| Qwen2.5-0.5B | 108 / 108 tok/s | 91 | **112** | 1.23x |
-| DeepSeek-V2-Lite 15.7B | 19.0 / 19.3 | 15.0 | **20.3** | 1.35x |
-| SmolLM2-135M | 166 / 162 | 154 | **165** | 1.07x |
+| Qwen2.5-0.5B | 110.7 tok/s (107–111) | 91.3 (84–96) | **116.4** (114–117) | 1.27x |
+| DeepSeek-V2-Lite 15.7B | 24.8 (24.3–25.0) | 19.2 (18.0–19.5) | **26.8** (26.4–27.6) | 1.40x |
+| SmolLM2-135M | 173.7 (169–176) | 159.2 (155–171) | **175.9** (170–182) | 1.10x |
 
-q8's two arms land within 4% of each other; q4 moves 7–35%. The gain tracks
-matrix size, which is what it should do — a 135M model spends most of a decode
-step in dispatch, and there is no kernel for that.
+The control's two arms agree within 1% on all three models; q4 moves 10–40%.
+The gain tracks matrix size, which is what it should do — a 135M model spends
+most of a decode step in dispatch, and there is no kernel for that.
 
-Absolute numbers here are lower than elsewhere in this README because the
-machine was not idle (`dasd` was indexing at 99% of a core throughout), which
-is why this table reports a ratio against a control rather than a rate. The
-ratio is the claim.
+**q4 is now the fastest CPU precision on every model here**, which has not been
+true before: 116 against q8's 111 on Qwen, 176 against 174 on SmolLM2, 26.8
+against 24.8 on DeepSeek.
 
 And the microbenchmark, which is where it is cleanest:
 
 ```
 qwen lm_head  [151936 x 896]
-  f32      545 MB     2.62 ms/call   1.00x
-  q8       153 MB     0.88 ms/call   2.97x
-  q4        85 MB     0.73 ms/call   3.59x
+  f32      545 MB     2.67 ms/call   1.00x
+  q8       153 MB     0.89 ms/call   2.99x
+  q4        85 MB     0.74 ms/call   3.60x
 ```
-
-q4 is now the fastest kernel at every matrix size, which is the first time that
-has been true.
 
 ### What it is worth end to end
 
@@ -1105,8 +1109,8 @@ moral drawn from it was measuring a scheduler.
 For a long time the honest footnote here was that q4 bought none of this: at
 91 tok/s it was *slower* than q8's 112, so its only advantage was memory. That
 was [a missing kernel, not a price quantisation charges](#the-nibble-kernel-the-compiler-would-not-write).
-q4 now decodes at 112 as well. It is still much less accurate, and that part is
-real.
+q4 now decodes at 116, ahead of q8. It is still much less accurate, and that
+part is real.
 
 ### Batched prefill, and i8mm
 
@@ -1513,7 +1517,7 @@ All six backends, Qwen2.5-0.5B, decode:
 |---|---|---|
 | cpu f32 | 1976 MB | 64 |
 | cpu q8 | 556 MB | 112 |
-| cpu q4 | 309 MB | 112 |
+| cpu q4 | 309 MB | 116 |
 | metal bf16 | 1260 MB | 113 |
 | **metal q8** | **525 MB** | **191** |
 | metal q4 | 278 MB | 228 |

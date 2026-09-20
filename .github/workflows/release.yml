@@ -274,12 +274,24 @@ jobs:
           \`\`\`
 
           It asks before putting anything on your PATH or starting anything at
-          login. For an unattended install, add \`--yes\` (and \`--service\` if the
-          server should run in the background):
+          login, and if the server should start at login it asks what address to
+          listen on, offering \`127.0.0.1:8080\`. Name one it cannot serve from — an
+          address something already holds, or a non-loopback one, which
+          \`kvad-serve\` refuses while no auth mode is configured — and it says why
+          and asks again, rather than installing a service that cannot start.
+
+          For a machine with nobody watching, \`--yes\` never opens a terminal and
+          answers every question the quiet way: binaries only, nothing added to
+          your shell and nothing started. Ask for the rest explicitly, \`--bind\`
+          included, since a run that cannot stop to ask would otherwise take 8080:
 
           \`\`\`
-          curl -fsSL https://raw.githubusercontent.com/$repo/master/install.sh | sh -s -- --yes --service
+          curl -fsSL https://raw.githubusercontent.com/$repo/master/install.sh | sh -s -- --yes --service --bind 127.0.0.1:8123
           \`\`\`
+
+          \`--prefix DIR\`, \`--version vX.Y.Z\` and \`--uninstall\` do what they look
+          like; \`--uninstall\` takes the binaries and the service and leaves your
+          models and conversations alone. \`sh install.sh --help\` lists the rest.
 
           macOS ships \`kvad\`, \`kvad-serve\`, \`kvad-tui\` and \`kvad-gpu\`. Linux ships
           \`kvad\` and a CPU-only \`kvad-serve\`; the other two link Metal.

@@ -132,18 +132,19 @@ pub fn grounding(db: &Db, id: i64, question: &str, k: usize, budget: usize) -> R
 mod tests {
     use super::*;
 
-    /// The index is thrown away when the file under it moves, and kept when
-    /// it does not. A crawl of the same name replaces a dataset in place, so
-    /// "same id, different text" is the ordinary case and not a strange one.
+    /// What decides whether a cached index is thrown away: a crawl of the
+    /// same name replaces a dataset in place, so "same id, different text" is
+    /// the ordinary case and not a strange one, and the length and the
+    /// modification time both move when it happens.
+    ///
+    /// Named for what it checks rather than for what the cache does with the
+    /// answer: `index_for` writes through `datasets`, which is the real
+    /// datasets directory, so the level below it is what a test can reach.
     #[test]
-    fn an_index_outlives_a_request_and_not_an_edit() {
-        let db = Db::in_memory().unwrap();
+    fn a_rewritten_corpus_has_a_different_fingerprint() {
         let dir = std::env::temp_dir().join(format!("kvad-retrieval-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // `datasets::save` writes into the real datasets directory, so this
-        // test works the level below it: the cache is about a path and its
-        // fingerprint, and that is what is exercised here.
         let path = dir.join("corpus");
         std::fs::write(&path, "# One\n\nvectors and slices\n").unwrap();
         let first = fingerprint(&path);

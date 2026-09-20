@@ -710,6 +710,7 @@ kvad use  Qwen/Qwen2.5-0.5B-Instruct
 kvad run  --prompt "Explain backpropagation in one sentence."
 kvad chat --system "You are terse."
 kvad info --model openai-community/gpt2-medium   # config only, no weights
+kvad arch                          # architectures this build can run
 kvad cache                         # pre-quantised weight files
 ```
 
@@ -719,11 +720,14 @@ Read in this order:
    softmax, then RMSNorm, SwiGLU and RoPE. Nine functions, four architectures.
 2. **[`weights.rs`](crates/llm/src/weights.rs)** — safetensors is a length, a
    JSON header, and raw floats. Plus shard indexes and bf16 widening.
-3. **[`model/mod.rs`](crates/llm/src/model/mod.rs)** — the skeleton both
+3. **[`model/mod.rs`](crates/llm/src/model/mod.rs)** — the skeleton the
    architectures share, including attention itself.
 4. **[`model/gpt2.rs`](crates/llm/src/model/gpt2.rs)** — read first, it is
-   simpler. Then **[`model/llama.rs`](crates/llm/src/model/llama.rs)**, written
-   to be read as a diff against it.
+   simplest. Then **[`model/llama.rs`](crates/llm/src/model/llama.rs)**,
+   written to be read as a diff against it, and
+   **[`model/deepseek.rs`](crates/llm/src/model/deepseek.rs)**, a diff against
+   *that*. **[`model/arch.rs`](crates/llm/src/model/arch.rs)** is the registry
+   they plug into, and where to look when adding a fifth.
 5. **[`quant.rs`](crates/llm/src/quant.rs)** — block-wise int8/int4 weights
    and the kernels that consume them, then
    **[`simd.rs`](crates/llm/src/simd.rs)** for the one instruction the compiler
@@ -733,20 +737,35 @@ Read in this order:
 6. **[`sampler.rs`](crates/llm/src/sampler.rs)**, then
    **[`chat.rs`](crates/llm/src/chat.rs)**.
 
-### Five years of architecture progress, as a table
+### Six years of architecture progress, as a table
 
-| GPT-2 (2019) | Llama family (2023+) | Why |
-|---|---|---|
-| learned position rows (`wpe`) | RoPE: rotate Q and K by angle ∝ position | no hard context ceiling; position becomes *relative* for free |
-| LayerNorm (centre, scale, bias) | RMSNorm (scale only) | the centring was never load-bearing |
-| GELU MLP, 2 matrices | SwiGLU, 3 matrices | a learned gate per channel |
-| multi-head attention | grouped-query attention | KV cache shrinks by the group factor |
-| one fused QKV matrix | three projections | Q and KV now have different widths |
+| GPT-2 (2019) | Llama family (2023+) | DeepSeek V2/V3 (2024+) | Why |
+|---|---|---|---|
+| learned position rows (`wpe`) | RoPE: rotate Q and K by angle ∝ position | RoPE on *part* of each head, YaRN-interpolated | the rest of the head has to survive being multiplied by a matrix |
+| LayerNorm (centre, scale, bias) | RMSNorm (scale only) | RMSNorm, plus one on the compressed vector | the centring was never load-bearing |
+| GELU MLP, 2 matrices | SwiGLU, 3 matrices | 64 or 256 SwiGLUs, a router, and 1–2 that always run | parameters you have, without arithmetic you pay for |
+| multi-head attention | grouped-query attention | multi-head *latent* attention | the KV cache is what a server runs out of |
+| one fused QKV matrix | three projections | two, one of which is a rank-512 bottleneck | Q and KV now have different widths, then different ranks |
 
-What did *not* change: the residual stream, the alternation of attention and
-MLP, tied embeddings, the causal mask, scaled dot-product attention. `attend()`
-in `model/mod.rs` is shared verbatim between the two — grouped-query attention
-is just a smaller `kv_dim`, and GPT-2 is the `n_kv_head == n_head` case.
+The last row of that table is the interesting one, and it is worth stating as
+numbers. For DeepSeek-V2-Lite — 16 heads, 128-wide values — ordinary
+multi-head attention would store 5120 floats per position per layer.
+Grouped-query attention would divide that by the group factor. MLA stores
+**576**: one 512-wide compressed vector, and one 64-wide rotary key shared by
+every head.
+
+It gets away with it because the per-head matrix that would turn that vector
+into a key can be moved onto the query instead — `q · (W c) = (Wᵀ q) · c` —
+and there is one query per step against thousands of keys. That identity is
+the whole architecture, and [`model/deepseek.rs`](crates/llm/src/model/deepseek.rs)
+is mostly an explanation of it.
+
+What did *not* change across all three: the residual stream, the alternation
+of attention and MLP, the causal mask, scaled dot-product attention. `attend()`
+in `model/mod.rs` is shared verbatim between GPT-2 and Llama — grouped-query
+attention is just a smaller `kv_dim`, and GPT-2 is the `n_kv_head == n_head`
+case. DeepSeek is the first one that needed its own, which is what
+[`model/arch.rs`](crates/llm/src/model/arch.rs) exists for.
 
 And the detail worth sitting with: **SmolLM2-135M is smaller than GPT-2-medium
 and holds a conversation, while GPT-2 cannot.** The architecture changes above

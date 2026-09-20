@@ -819,3 +819,50 @@ fn the_quantised_path_predicts_the_same_tokens() {
         assert!(worst < spread / 10.0, "{tag}: q8 moved a logit by {worst} of {spread}");
     }
 }
+
+/// Write the tiny model, and this engine's logits for it, where somebody can
+/// check them against `transformers`.
+///
+/// The second implementation in this file is a careful reading of
+/// `modeling_deepseek.py`, and a careful reading can still be a wrong one —
+/// the same misunderstanding would be in both. The only cure is to run the
+/// actual reference, which needs Python, PyTorch and `trust_remote_code`, and
+/// which therefore cannot live in `cargo test`.
+///
+/// So this is the seam. Set the variable and it writes a directory that
+/// `AutoModelForCausalLM.from_pretrained` will load, plus `logits.json` — what
+/// this engine says every position's distribution is. `scripts/check-deepseek.py`
+/// loads both and compares.
+///
+///     KVAD_DEEPSEEK_FIXTURE=/tmp/ds cargo test -p kvad --test deepseek -- --ignored
+#[test]
+#[ignore = "writes a fixture for the Python reference; needs a directory to write to"]
+fn write_a_fixture_for_the_reference_implementation() {
+    let Ok(dir) = std::env::var("KVAD_DEEPSEEK_FIXTURE") else {
+        panic!("set KVAD_DEEPSEEK_FIXTURE to a directory to write");
+    };
+    for (flavour, name) in [(Flavour::V2, "v2"), (Flavour::V3, "v3")] {
+        let t = tiny(flavour);
+        let out = std::path::Path::new(&dir).join(name);
+        std::fs::create_dir_all(&out).unwrap();
+        write_safetensors(&out.join("model.safetensors"), &t.tensors);
+        std::fs::write(
+            out.join("config.json"),
+            serde_json::to_string_pretty(&t.config).unwrap(),
+        )
+        .unwrap();
+
+        let tokens: Vec<u32> = vec![3, 17, 8, 0, 29, 11, 5];
+        let (model, spec) = engine(&t, &format!("fixture-{name}"));
+        let mut cache = KvCache::new(&spec);
+        let logits = model.forward_batch_all(&tokens, &mut cache);
+        let rows: Vec<Vec<f32>> =
+            logits.chunks(t.vocab).map(<[f32]>::to_vec).collect();
+        std::fs::write(
+            out.join("logits.json"),
+            serde_json::to_string(&serde_json::json!({"tokens": tokens, "logits": rows})).unwrap(),
+        )
+        .unwrap();
+        println!("wrote {}", out.display());
+    }
+}

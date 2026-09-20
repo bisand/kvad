@@ -98,7 +98,14 @@ Things worth knowing before buying cables:
   PCs' are USB 3 only and cannot network host to host; those use Ethernet.
 - A chain A—B—C works because B bridges, in software. Three Macs with two
   ports each can form a full triangle; beyond that it is a chain or a ring,
-  and the pipeline order should follow the cables.
+  and the pipeline order should follow the cables. This is a property of the
+  Thunderbolt Bridge specifically, which is a real layer-2 bridge: every
+  Thunderbolt port is a member of `bridge0`, so B forwards frames between A
+  and C, all three share one broadcast domain, and there is no routing to
+  configure. It also means B bridges only while B is awake. A USB NCM link
+  joins no bridge and is strictly two hosts, and macOS does not route between
+  interfaces by default (`net.inet.ip.forwarding` is 0) — so a machine on the
+  far end of a charging cable is an endpoint and can never be a middle.
 - macOS 26.2 added RDMA over Thunderbolt 5, which MLX uses. It matters for
   tensor parallelism (below), not for a layer split. To verify, not assume.
 
@@ -228,9 +235,45 @@ No new binary. Two entry points to the same `worker::serve`:
   serving its own model says so in `Hello` rather than swapping.
 
 On the coordinator: `kvad run --model X --workers host:port,host:port`, and a
-`[cluster]` table in `kvad.toml` for the server. Discovery by mDNS
-(`_kvad._tcp`) comes in Phase 5; an address list comes first, because it is
-debuggable.
+`[cluster]` table in `kvad.toml` for the server. An address list stays, as
+the override, because it is debuggable — but it is not enough by itself, and
+the next section is why.
+
+### Addressing and discovery
+
+An address list is the wrong *first* step, and the development rig is why.
+Over a cable the peer is `fe80::100d:68ff:f0c0:4a08%en12`. Nobody types that
+twice; it changes when the cable moves or the machine reboots; and the
+interface it is scoped to has a different name on each end. Static addresses
+are worse, because they have to be applied by hand to a machine that is
+otherwise stock, and re-applied when it is not.
+
+Three pieces. None of them is new work.
+
+**A machine is an identity, not an address.** A worker persists an id once,
+and `Hello` carries it beside the revision it already carries. Everything
+else rests on this, because one peer honestly has several addresses: a
+link-local per cable, a LAN address over Wi-Fi, a tailnet address if one is
+running. The same id answering on four of them is one machine with four
+paths, not four workers, and the planner must not count its memory four
+times.
+
+**Discovery by mDNS, and earlier than Phase 5.** `mDNSResponder` is running
+on every Mac already. A worker registers `_kvad._tcp` with its id and its
+revision in TXT; the coordinator browses, and gets every address each peer
+can be reached on — including a link-local on a cable plugged in a moment
+ago. Nothing to configure and nothing to redo when a cable moves. It belongs
+in Phase 2, with the first worker that is not on loopback, because that is
+the phase where the addresses first become unspeakable.
+
+**The coordinator measures its paths and pins the fastest.** For each id,
+ping every candidate address — the Phase 0 measurement, over the Phase 0
+listener — and keep the best. This is the piece that earns itself twice. It
+is also the only thing that would have caught a 480 Mb/s charging cable,
+which presents as a working link and is distinguishable from Thunderbolt by
+nothing a socket can observe. A cluster that reports the chosen path and its
+speed for each peer cannot silently record a Phase 4 number against a link
+nobody identified.
 
 ### Weights
 
@@ -295,7 +338,7 @@ is an M5 Pro MacBook Pro (48 GB, Thunderbolt 5) and an M2 MacBook Air (8 GB,
 Thunderbolt 3/USB4); the ports are good for 40 Gb/s between them and the
 chips differing is of no interest to TCP.
 
-- **The cable has to be a Thunderbolt or USB4 one.** The USB-C charging
+- **Measuring anything needs a Thunderbolt or USB4 cable.** The USB-C charging
   cables Apple ships carry USB 2 data. With one of those the Thunderbolt
   Bridge never comes up, and it looks exactly like a software fault.
 
@@ -321,6 +364,22 @@ chips differing is of no interest to TCP.
   off is named `usb-drd1-port-hs`, and *hs* is USB 2.0 High Speed. Phase 0
   should print these three checks before it prints a number, so that no
   measurement is ever recorded against a link nobody identified.
+- **Until a Thunderbolt cable is to hand, build on the USB one.** It is the
+  wrong link to measure over and a perfectly good one to develop against.
+  Correctness does not depend on bandwidth: Phases 1 to 3 are bit-identical
+  logits, a handshake, a key, shard loading and the failure paths, and every
+  one of those passes or fails the same way at 480 Mb/s as at 40 Gb/s. What
+  waits for the real cable is every *number* — the table above, Phase 0's
+  replacement of it, and Phase 4 entirely.
+
+  Being slow is briefly an advantage. A 32 KB hop costs the 1.34 ms of
+  measured round trip plus, arithmetically, 0.55 ms at the nominal rate.
+  That is visible in the tok/s of a small model, where Thunderbolt would
+  hide it inside a millisecond — so a hop that happens when it should not,
+  or twice where it should happen once, is loud on this cable and quiet on
+  the good one. Prefill is the reverse: 2 MB is at least 33 ms at the
+  nominal rate, and the effective rate has not been measured at all, so
+  pipelined prefill cannot be judged here.
 - With the right cable, System Settings → Network → Thunderbolt Bridge shows
   a self-assigned `169.254.x.x` address on each side. The firewall may ask
   about incoming connections the first time a worker listens.
@@ -390,6 +449,14 @@ real Macs. Replace the table above. If a Thunderbolt round trip is 5 ms
 rather than 0.3, this plan changes here and not in Phase 4. *This is also
 where `wire.rs` gets written and tested, so it is not throwaway.*
 
+It splits in two, because the rig has no Thunderbolt cable yet. The tool,
+the listener, `wire.rs` and the link identification — the three checks from
+*A development rig*, printed before any number — can be built and tested now
+over USB and loopback, and they are what the later phases actually depend
+on. The numbers that replace the table wait for the cable; nothing between
+here and Phase 4 is blocked on them. What must not happen is the table being
+filled in from whichever link is to hand.
+
 **Phase 1 — split the model, in one process.** `Shard`, the three-method
 `Transformer`, shard-aware `load` and `KvCache` for GPT-2, Llama and DeepSeek.
 `LocalStage` and `PipelineSession` with every stage local. No sockets. Test:
@@ -399,14 +466,19 @@ for each architecture, a model cut into 1, 2 and 3 shards produces logits
 uncut, five interleaved rounds — the refactor must cost nothing, and if it
 does, that is found here.
 
-**Phase 2 — a worker on loopback.** `worker.rs`, `RemoteStage`, the
-handshake and the key, `kvad worker`, `--workers`, and `--split`, because
-without it a small model never leaves the coordinator. Test: a worker on
+**Phase 2 — a worker on loopback.** `worker.rs`, `RemoteStage`, the handshake
+and the key, `kvad worker`, `--workers`, and `--split`, because without it a
+small model never leaves the coordinator. Also the machine id, `_kvad._tcp`
+and the path probe from *Addressing and discovery*: this is the phase where a
+peer stops being `127.0.0.1` and starts being a scoped link-local address,
+which is the point at which typing addresses stops working. Test: a worker on
 port 0 in a thread, same bit-identical assertions as Phase 1; plus wrong key,
 revision mismatch, worker killed mid-generation, cancel mid-prefill, and a
 `--split` with a gap, an overlap or the wrong number of ranges. Then the same
 thing by hand across the development rig's cable, which is the first time a
-hidden state leaves a machine.
+hidden state leaves a machine — found by discovery rather than by an address,
+and with the chosen path and its speed printed, so that what it crossed is on
+the record.
 
 **Phase 3 — load only your share.** The fetch filter, the shard in the
 quantised cache's identity, per-node memory checks, `plan.rs` and
@@ -421,10 +493,10 @@ after. The README chapter gets written here, from the numbers.
 
 **Phase 5 — the server.** `[cluster]` and `[worker]` in `kvad.toml`, worker
 mode inside `kvad-serve`, a Cluster page (nodes, memory, layers per node,
-per-hop latency, a per-stage share of each token), mDNS discovery, load
-progress per node over the existing SSE. GPU stages: `GpuLlama` gains the
-hidden-in, hidden-out form of `run`, one host round trip of `n_embd` floats
-per stage boundary.
+per-hop latency, a per-stage share of each token, and for each peer the chosen
+path and its measured speed), load progress per node over the existing SSE.
+GPU stages: `GpuLlama` gains the hidden-in, hidden-out form of `run`, one host
+round trip of `n_embd` floats per stage boundary.
 
 **Phase 6 — what the numbers ask for.** Chain forwarding. Peer weight
 transfer. AVX2 kernels, then Linux workers. A `cuda` feature for `kvad-gpu`.
@@ -446,3 +518,9 @@ at which a cluster stops being only about memory.
 - A worker with a GPU and a slow CPU (the mining rig) can hold no `ends` and
   should never be a coordinator. Does the planner need to know, or is that
   the operator's job? Start with the operator's.
+- Does the Thunderbolt Bridge actually run spanning tree? `bridge0` reports
+  `proto stp`, but with a zero root id, zero hello time and zero forward
+  delay — which reads as configured and not running. If it is not, the full
+  triangle suggested above is a broadcast storm rather than a redundant
+  ring. Cheap to settle the day there are three machines and three cables;
+  until then, build chains.

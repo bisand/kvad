@@ -612,7 +612,7 @@ mod tests {
     /// dimension a multiple of 32 so the quantisers will take it.
     fn tiny_spec() -> Spec {
         Spec {
-            arch: Arch::Llama,
+            arch: Arch::require("llama"),
             n_layer: 1,
             n_head: 2,
             n_kv_head: 1,
@@ -624,6 +624,8 @@ mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: true,
+            cache: kvad::model::CacheShape { k: 32, v: 32 },
+            config: kvad::model::Json::default(),
         }
     }
 

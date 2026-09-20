@@ -6,7 +6,7 @@
 //! and this is the TUI's — CPU backends straight through to the core's own,
 //! GPU ones through `kvad_gpu`.
 
-use kvad::model::{Arch, Session};
+use kvad::model::Session;
 use kvad::runtime::Llm;
 use kvad::service::{cpu_loader, Backend, GpuMode, Loader};
 use kvad::weights::Watcher;
@@ -35,7 +35,7 @@ fn load_on_gpu(
     Llm::load_custom(repo, progress, watch, &mut |files, spec, _| {
         // The GPU backend covers the Llama family only; the error names the
         // alternative rather than just failing.
-        if spec.arch != Arch::Llama {
+        if !spec.arch.is("llama") {
             return Err(format!(
                 "the GPU backend implements the Llama family only; this model is {}. \
                  Press p to pick a CPU backend.",

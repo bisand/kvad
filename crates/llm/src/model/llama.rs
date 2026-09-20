@@ -22,7 +22,7 @@
 //! path for free. Mixing the two layouts up produces fluent nonsense rather
 //! than an error, which is why the counting test in the README exists.
 
-use super::{attend, KvCache, Spec, Transformer};
+use super::{attend, Architecture, KvCache, Spec, Transformer};
 use crate::qcache::Source;
 use crate::quant::Weight;
 use crate::tensor::{rms_norm, swiglu_inplace, Rope};
@@ -37,6 +37,24 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 fn linear(x: &[f32], w: &Weight, bias: Option<&Vec<f32>>) -> Vec<f32> {
     w.matvec_bt(x, bias.map(|b| b.as_slice()))
 }
+
+/// This module's entry in the registry.
+///
+/// Four `model_type`s, one implementation. They differ in configuration —
+/// widths, head counts, rope base — except for Qwen3's per-head RMSNorm on Q
+/// and K, which is applied when the weights for it are present and is the only
+/// branch in this file that is about *which* model is running.
+///
+/// The list is exact on purpose. `qwen2_moe` and `qwen3_5_moe` are mixtures of
+/// experts and are not this; `smollm3` skips RoPE on every fourth layer and is
+/// not this either, though a substring test happily said all three were.
+pub static ARCH: Architecture = Architecture {
+    id: "llama",
+    model_types: &["llama", "mistral", "qwen2", "qwen3"],
+    about: "Llama 2/3, Mistral, Qwen2/2.5/3, SmolLM2, TinyLlama: RoPE, RMSNorm, SwiGLU, GQA",
+    configure: |_| Ok(()),
+    load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
+};
 
 pub struct Block {
     attn_norm: Vec<f32>,

@@ -108,7 +108,8 @@ fn usage() -> ! {
            use MODEL           set the default model\n  \
            rm MODEL            delete a downloaded or trained model\n  \
            cache [REPO|clear]  list or delete pre-quantised weight files\n  \
-           info                show a model's config without downloading weights\n  \
+           info                show a model's config without downloading weights
+  arch                list the architectures this build can run\n  \
            run                 one-shot completion\n  \
            chat                interactive conversation\n  \
            serve [...]         HTTP server and web UI; options are passed through\n\n\
@@ -355,6 +356,19 @@ fn main() -> Res<()> {
                     },
                     None => "no (base model)",
                 }
+            );
+            Ok(())
+        }
+        "arch" => {
+            // What *this* binary can run, which is a build-time question:
+            // every architecture is a Cargo feature.
+            println!("{:<14} {:<30} WHAT IT IS", "ARCHITECTURE", "CONFIG model_type");
+            for a in kvad::model::arch::registry() {
+                println!("{:<14} {:<30} {}", a.id(), a.model_types().join(", "), a.about());
+            }
+            println!(
+                "\n{} of them, chosen at build time; see `arch-*` in crates/llm/Cargo.toml.",
+                kvad::model::arch::registry().len()
             );
             Ok(())
         }

@@ -12,7 +12,7 @@ use kvad_gpu::model;
 
 use kvad::chat::Message;
 use kvad::hub::State;
-use kvad::model::{Arch, Session};
+use kvad::model::Session;
 use kvad::runtime::Llm;
 use kvad::sampler::Sampler;
 use kvad_gpu::model::GpuLlama;
@@ -145,7 +145,7 @@ fn load(args: &Args) -> Res<Llm> {
     // No watcher: a terminal has the progress lines and wants no bar.
     let watch = kvad::weights::Watcher::none();
     let llm = Llm::load_custom(&repo, &mut |m| eprintln!("  {m}"), &watch, &mut |files, spec, _| {
-        if spec.arch != Arch::Llama {
+        if !spec.arch.is("llama") {
             return Err(format!(
                 "the GPU backend implements the Llama family only; `{}` is {}.\n\
                  Run it on the CPU engine instead:  kvad run --model {repo}",

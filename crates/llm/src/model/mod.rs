@@ -19,82 +19,28 @@
 //! *contents* of `Norm`, `MLP`, and how position gets into `Attention`.
 //!
 //! So this module holds the skeleton — [`Spec`], [`KvCache`], [`attend`] — and
-//! [`gpt2`] and [`llama`] supply the rest. Reading `gpt2.rs` first is
+//! the architecture modules supply the rest. Reading `gpt2.rs` first is
 //! recommended: it is the simpler of the two, and `llama.rs` is written to be
 //! read as a diff against it.
+//!
+//! Which of them a build contains is a Cargo feature; see [`arch`], which is
+//! also where to look when adding one.
 
+pub mod arch;
+#[cfg(feature = "arch-gpt2")]
 pub mod gpt2;
+#[cfg(feature = "arch-llama")]
 pub mod llama;
+
+pub use arch::{Arch, Architecture};
 
 use crate::tensor::softmax_inplace;
 use crate::weights::read_json;
 use rayon::prelude::*;
 use std::path::Path;
+use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Arch {
-    Gpt2,
-    /// Llama and everything shaped like it: Llama 2/3, Mistral, Qwen2/2.5,
-    /// Qwen3, SmolLM2 and TinyLlama (both of which report `llama`). The
-    /// differences between those are configuration, not code — with one
-    /// exception, Qwen3's per-head RMSNorm on Q and K, which is a dozen lines
-    /// in `llama.rs` and skipped by every model that does not ship the weights
-    /// for it.
-    Llama,
-}
-
-impl Arch {
-    /// Map a HuggingFace `model_type` (or `architectures[0]`) onto an
-    /// implementation, or `None` if we cannot run it.
-    ///
-    /// Used both when loading a checkpoint and when searching the Hub, so the
-    /// search can say up front which results are actually runnable.
-    ///
-    /// # Why this is an exact list and not a substring test
-    ///
-    /// It used to ask whether the type *contained* `qwen2` or `smollm`, which
-    /// is a reasonable guess and quietly wrong in both directions of the
-    /// family tree. `qwen3_5_moe` contains `qwen3` and is a mixture of
-    /// experts. `smollm3` contains `smollm` and drops RoPE on every fourth
-    /// layer (`no_rope_layer_interval` in its config) — which this engine
-    /// would not know to do, so it would load happily and be subtly wrong on
-    /// nine layers of thirty-six. A model that fails to load is a message; a
-    /// model that runs and is wrong is a bug report from a confused user.
-    ///
-    /// So the list is the architectures that have actually been run here.
-    /// Adding one means reading its config for the fields this family does not
-    /// have, and the usual tell is a name for something in it that `Spec` has
-    /// no field for.
-    pub fn from_model_type(model_type: &str) -> Option<Arch> {
-        let t = model_type.to_ascii_lowercase();
-        // `architectures` entries are class names — `LlamaForCausalLM` — and
-        // are the fallback for the few configs with no `model_type`. Reduce
-        // them to the same stem rather than keeping two lists.
-        let stem = t
-            .trim_end_matches("forcausallm")
-            .trim_end_matches("lmheadmodel")
-            .trim_end_matches("model");
-        match stem {
-            "gpt2" => Some(Arch::Gpt2),
-            // One implementation. The differences between these four are
-            // configuration, except Qwen3's per-head RMSNorm on Q and K, which
-            // `llama.rs` applies when the weights for it are present.
-            "llama" | "mistral" | "qwen2" | "qwen3" => Some(Arch::Llama),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for Arch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Arch::Gpt2 => "gpt2",
-            Arch::Llama => "llama",
-        })
-    }
-}
 
 /// Everything the runtime needs to know about a model, normalised across
 /// architectures so the rest of the program does not have to branch.
@@ -119,6 +65,77 @@ pub struct Spec {
     pub eps: f32,
     pub rope_theta: f32,
     pub tie_embeddings: bool,
+    /// How wide one position's worth of cache is, in each of the two streams.
+    ///
+    /// Ordinary attention stores a key and a value, both [`Spec::kv_dim`]
+    /// wide, and for both architectures here that is what this says. It is a
+    /// field an architecture sets rather than a number the skeleton computes,
+    /// because an architecture that caches something else is not hypothetical.
+    pub cache: CacheShape,
+    /// The model's `config.json`, as it was read.
+    ///
+    /// Everything above this line is a field most of the Hub agrees on.
+    /// Everything an architecture needs and nobody else has heard of is read
+    /// from here, by the module that knows what it means.
+    pub config: Json,
+}
+
+/// The width of one cached row in each of the KV cache's two streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheShape {
+    pub k: usize,
+    pub v: usize,
+}
+
+/// A model's `config.json`, with the lookups every architecture needs.
+///
+/// Shared behind an `Arc` because [`Spec`] is cloned freely and a config is a
+/// few kilobytes of `serde_json` tree that nobody mutates.
+#[derive(Clone, Default)]
+pub struct Json(Arc<serde_json::Value>);
+
+impl Json {
+    pub fn new(v: serde_json::Value) -> Self {
+        Json(Arc::new(v))
+    }
+
+    pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        self.0.get(key)
+    }
+
+    /// The first of `keys` that is present and a number.
+    ///
+    /// Several keys because the same quantity has different names in
+    /// different eras: `n_layer` became `num_hidden_layers`, `n_embd` became
+    /// `hidden_size`.
+    pub fn num(&self, keys: &[&str]) -> Option<usize> {
+        keys.iter().find_map(|k| self.0.get(*k)?.as_u64()).map(|n| n as usize)
+    }
+
+    pub fn float(&self, keys: &[&str]) -> Option<f32> {
+        keys.iter().find_map(|k| self.0.get(*k)?.as_f64()).map(|n| n as f32)
+    }
+
+    pub fn flag(&self, key: &str) -> Option<bool> {
+        self.0.get(key)?.as_bool()
+    }
+
+    pub fn text(&self, key: &str) -> Option<&str> {
+        self.0.get(key)?.as_str()
+    }
+
+    /// A number the architecture cannot run without.
+    pub fn need(&self, key: &str) -> Res<usize> {
+        self.num(&[key]).ok_or_else(|| format!("config: no `{key}`").into())
+    }
+}
+
+/// Terse on purpose: a `Spec` is printed in logs and in error messages, and
+/// the config behind it is a few hundred lines.
+impl std::fmt::Debug for Json {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("config.json")
+    }
 }
 
 impl Spec {
@@ -138,62 +155,58 @@ impl Spec {
     }
 
     pub fn from_json(path: &Path) -> Res<Self> {
-        let v = read_json(path)?;
-        let num = |keys: &[&str]| -> Option<usize> {
-            keys.iter().find_map(|k| v.get(*k)?.as_u64()).map(|n| n as usize)
-        };
-        let float = |keys: &[&str]| -> Option<f32> {
-            keys.iter().find_map(|k| v.get(*k)?.as_f64()).map(|n| n as f32)
-        };
+        Spec::from_config(Json::new(read_json(path)?))
+    }
 
+    /// As [`Spec::from_json`], from a config already in hand.
+    ///
+    /// The shared fields are read here; then the architecture is handed the
+    /// half-built `Spec` to finish, because the rest of the file is written in
+    /// its vocabulary and not ours.
+    pub fn from_config(config: Json) -> Res<Self> {
         // `model_type` is the reliable discriminator; `architectures` is a
         // fallback for the handful of configs that omit it.
-        let model_type = v
-            .get("model_type")
-            .and_then(|m| m.as_str())
+        let model_type = config
+            .text("model_type")
             .map(str::to_ascii_lowercase)
             .or_else(|| {
-                v.get("architectures")?
-                    .as_array()?
-                    .first()?
-                    .as_str()
-                    .map(str::to_ascii_lowercase)
+                config.get("architectures")?.as_array()?.first()?.as_str().map(str::to_ascii_lowercase)
             })
             .ok_or("config.json has neither model_type nor architectures")?;
 
         let arch = Arch::from_model_type(&model_type).ok_or_else(|| {
-            format!(
-                "unsupported architecture `{model_type}`.\n\
-                 This engine implements two: gpt2, and llama — which covers \
-                 Llama 2/3, Mistral, Qwen2/2.5, Qwen3, SmolLM2 and TinyLlama."
-            )
+            format!("unsupported architecture `{model_type}`.\nThis build runs: {}.", arch::supported())
         })?;
 
-        let n_embd = num(&["n_embd", "hidden_size"]).ok_or("config: no hidden size")?;
-        let n_head = num(&["n_head", "num_attention_heads"]).ok_or("config: no head count")?;
+        let n_embd = config.num(&["n_embd", "hidden_size"]).ok_or("config: no hidden size")?;
+        let n_head = config.num(&["n_head", "num_attention_heads"]).ok_or("config: no head count")?;
         // Llama 3.2 states head_dim explicitly; everyone else implies it.
-        let head_dim = num(&["head_dim"]).unwrap_or(n_embd / n_head);
+        let head_dim = config.num(&["head_dim"]).unwrap_or(n_embd / n_head);
+        // Absent means ordinary multi-head attention.
+        let n_kv_head = config.num(&["num_key_value_heads"]).unwrap_or(n_head);
 
-        Ok(Spec {
+        let mut spec = Spec {
             arch,
-            n_layer: num(&["n_layer", "num_hidden_layers"]).ok_or("config: no layer count")?,
+            n_layer: config.num(&["n_layer", "num_hidden_layers"]).ok_or("config: no layer count")?,
             n_head,
-            // Absent means ordinary multi-head attention.
-            n_kv_head: num(&["num_key_value_heads"]).unwrap_or(n_head),
+            n_kv_head,
             n_embd,
             head_dim,
-            n_ctx: num(&["n_positions", "n_ctx", "max_position_embeddings"]).unwrap_or(1024),
-            vocab_size: num(&["vocab_size"]).ok_or("config: no vocab_size")?,
+            n_ctx: config.num(&["n_positions", "n_ctx", "max_position_embeddings"]).unwrap_or(1024),
+            vocab_size: config.num(&["vocab_size"]).ok_or("config: no vocab_size")?,
             // GPT-2 does not state it; its MLP widens by 4x by construction.
-            intermediate: num(&["intermediate_size", "n_inner"]).unwrap_or(4 * n_embd),
-            eps: float(&["layer_norm_epsilon", "rms_norm_eps"]).unwrap_or(1e-5),
-            rope_theta: float(&["rope_theta"]).unwrap_or(10000.0),
-            tie_embeddings: v
-                .get("tie_word_embeddings")
-                .and_then(|t| t.as_bool())
-                // GPT-2 ties unconditionally and does not say so in its config.
-                .unwrap_or(arch == Arch::Gpt2),
-        })
+            intermediate: config.num(&["intermediate_size", "n_inner"]).unwrap_or(4 * n_embd),
+            eps: config.float(&["layer_norm_epsilon", "rms_norm_eps"]).unwrap_or(1e-5),
+            rope_theta: config.float(&["rope_theta"]).unwrap_or(10000.0),
+            // GPT-2 ties unconditionally and does not say so in its config.
+            tie_embeddings: config.flag("tie_word_embeddings").unwrap_or(arch.is("gpt2")),
+            // The ordinary answer. An architecture that caches something else
+            // overwrites this in `configure`.
+            cache: CacheShape { k: n_kv_head * head_dim, v: n_kv_head * head_dim },
+            config,
+        };
+        arch.configure(&mut spec)?;
+        Ok(spec)
     }
 
     pub fn summary(&self) -> String {
@@ -267,7 +280,7 @@ pub trait Transformer: Send + Sync {
 pub struct KvCache {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
-    kv_dim: usize,
+    shape: CacheShape,
     pub len: usize,
 }
 
@@ -278,7 +291,7 @@ impl KvCache {
         KvCache {
             k: (0..spec.n_layer).map(|_| Vec::new()).collect(),
             v: (0..spec.n_layer).map(|_| Vec::new()).collect(),
-            kv_dim: spec.kv_dim(),
+            shape: spec.cache,
             len: 0,
         }
     }
@@ -309,8 +322,8 @@ impl KvCache {
             return;
         }
         for (k, v) in self.k.iter_mut().zip(self.v.iter_mut()) {
-            k.truncate(len * self.kv_dim);
-            v.truncate(len * self.kv_dim);
+            k.truncate(len * self.shape.k);
+            v.truncate(len * self.shape.v);
         }
         self.len = len;
     }
@@ -325,12 +338,14 @@ impl KvCache {
 
     /// Bytes currently held.
     pub fn bytes(&self) -> usize {
-        2 * self.len * self.kv_dim * self.k.len() * std::mem::size_of::<f32>()
+        let per_pos = self.shape.k + self.shape.v;
+        self.len * per_pos * self.k.len() * std::mem::size_of::<f32>()
     }
 
     /// Bytes this cache would hold at full context.
     pub fn max_bytes(spec: &Spec) -> usize {
-        2 * spec.n_layer * spec.n_ctx * spec.kv_dim() * std::mem::size_of::<f32>()
+        let per_pos = spec.cache.k + spec.cache.v;
+        spec.n_layer * spec.n_ctx * per_pos * std::mem::size_of::<f32>()
     }
 }
 
@@ -401,82 +416,6 @@ pub fn attend(spec: &Spec, q: &[f32], k_cache: &[f32], v_cache: &[f32], n_positi
         }
     });
     out
-}
-
-#[cfg(test)]
-mod tests {
-
-    /// The families this engine has actually been run against, and the
-    /// near-misses that a substring test used to accept.
-    #[test]
-    fn only_architectures_that_have_been_run_here_are_claimed() {
-        for t in ["llama", "mistral", "qwen2", "qwen3", "LlamaForCausalLM", "Qwen3ForCausalLM"] {
-            assert_eq!(Arch::from_model_type(t), Some(Arch::Llama), "{t}");
-        }
-        assert_eq!(Arch::from_model_type("gpt2"), Some(Arch::Gpt2));
-        assert_eq!(Arch::from_model_type("GPT2LMHeadModel"), Some(Arch::Gpt2));
-
-        // Each of these is a real model_type on the Hub, and each one a
-        // substring test said yes to. A mixture of experts, and a model that
-        // skips RoPE on every fourth layer.
-        for t in ["qwen3_5_moe", "qwen2_moe", "smollm3", "deepseek_v2", "deepseek_v3",
-                  "deepseek_v4", "gemma2", "phi3"] {
-            assert_eq!(Arch::from_model_type(t), None, "claimed to run `{t}`");
-        }
-    }
-    use super::*;
-
-    fn test_spec() -> Spec {
-        Spec {
-            arch: Arch::Llama,
-            n_layer: 2,
-            n_head: 4,
-            n_kv_head: 2,
-            n_embd: 8,
-            head_dim: 2,
-            n_ctx: 16,
-            vocab_size: 32,
-            intermediate: 32,
-            eps: 1e-5,
-            rope_theta: 10000.0,
-            tie_embeddings: true,
-        }
-    }
-
-    #[test]
-    fn grouped_query_attention_shrinks_the_cache() {
-        let spec = test_spec();
-        // 4 query heads over 2 KV heads: each KV head serves two queries, so
-        // only half as much has to be stored per position.
-        assert_eq!(spec.group_size(), 2);
-        assert_eq!(spec.kv_dim(), 4);
-        assert_eq!(spec.kv_dim() * 2, spec.n_head * spec.head_dim);
-    }
-
-    #[test]
-    fn cache_truncation_keeps_the_prefix_intact() {
-        let spec = test_spec();
-        let mut cache = KvCache::new(&spec);
-        for pos in 0..5 {
-            let k: Vec<f32> = (0..spec.kv_dim()).map(|i| (pos * 10 + i) as f32).collect();
-            cache.push(0, &k, &k);
-            cache.push(1, &k, &k);
-            cache.len += 1;
-        }
-        assert_eq!(cache.len, 5);
-        assert_eq!(cache.keys(0).len(), 5 * spec.kv_dim());
-
-        cache.truncate(3);
-        assert_eq!(cache.len, 3);
-        assert_eq!(cache.keys(0).len(), 3 * spec.kv_dim());
-        assert_eq!(cache.keys(1).len(), 3 * spec.kv_dim());
-        // Position 2 must still hold exactly what it held before.
-        assert_eq!(cache.keys(0)[2 * spec.kv_dim()], 20.0);
-
-        // Truncating upwards is a no-op, not an extension.
-        cache.truncate(99);
-        assert_eq!(cache.len, 3);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -662,5 +601,99 @@ impl Session for CpuSession {
 
     fn weight_bytes(&self) -> usize {
         self.model.memory_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    /// The families this engine has actually been run against, and the
+    /// near-misses that a substring test used to accept.
+    #[test]
+    fn only_architectures_that_have_been_run_here_are_claimed() {
+        let llama = Arch::require("llama");
+        for t in ["llama", "mistral", "qwen2", "qwen3", "LlamaForCausalLM", "Qwen3ForCausalLM"] {
+            assert_eq!(Arch::from_model_type(t), Some(llama), "{t}");
+        }
+        let gpt2 = Arch::require("gpt2");
+        assert_eq!(Arch::from_model_type("gpt2"), Some(gpt2));
+        assert_eq!(Arch::from_model_type("GPT2LMHeadModel"), Some(gpt2));
+
+        // Each of these is a real model_type on the Hub, and each one a
+        // substring test said yes to. A mixture of experts, and a model that
+        // skips RoPE on every fourth layer.
+        for t in ["qwen3_5_moe", "qwen2_moe", "smollm3", "deepseek_v2", "deepseek_v3",
+                  "deepseek_v4", "gemma2", "phi3"] {
+            assert_eq!(Arch::from_model_type(t), None, "claimed to run `{t}`");
+        }
+    }
+
+    /// No two modules may answer to the same `model_type`, or which one runs a
+    /// checkpoint would depend on the order of the registry.
+    #[test]
+    fn no_two_architectures_claim_the_same_model_type() {
+        let mut seen: Vec<&str> =
+            arch::registry().iter().flat_map(|a| a.model_types()).copied().collect();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "two architectures claim the same model_type");
+    }
+
+    fn test_spec() -> Spec {
+        let (n_kv_head, head_dim) = (2, 2);
+        Spec {
+            arch: Arch::require("llama"),
+            n_layer: 2,
+            n_head: 4,
+            n_kv_head,
+            n_embd: 8,
+            head_dim,
+            n_ctx: 16,
+            vocab_size: 32,
+            intermediate: 32,
+            eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_embeddings: true,
+            cache: CacheShape { k: n_kv_head * head_dim, v: n_kv_head * head_dim },
+            config: Json::default(),
+        }
+    }
+
+    #[test]
+    fn grouped_query_attention_shrinks_the_cache() {
+        let spec = test_spec();
+        // 4 query heads over 2 KV heads: each KV head serves two queries, so
+        // only half as much has to be stored per position.
+        assert_eq!(spec.group_size(), 2);
+        assert_eq!(spec.kv_dim(), 4);
+        assert_eq!(spec.kv_dim() * 2, spec.n_head * spec.head_dim);
+    }
+
+    #[test]
+    fn cache_truncation_keeps_the_prefix_intact() {
+        let spec = test_spec();
+        let mut cache = KvCache::new(&spec);
+        for pos in 0..5 {
+            let k: Vec<f32> = (0..spec.kv_dim()).map(|i| (pos * 10 + i) as f32).collect();
+            cache.push(0, &k, &k);
+            cache.push(1, &k, &k);
+            cache.len += 1;
+        }
+        assert_eq!(cache.len, 5);
+        assert_eq!(cache.keys(0).len(), 5 * spec.kv_dim());
+
+        cache.truncate(3);
+        assert_eq!(cache.len, 3);
+        assert_eq!(cache.keys(0).len(), 3 * spec.kv_dim());
+        assert_eq!(cache.keys(1).len(), 3 * spec.kv_dim());
+        // Position 2 must still hold exactly what it held before.
+        assert_eq!(cache.keys(0)[2 * spec.kv_dim()], 20.0);
+
+        // Truncating upwards is a no-op, not an extension.
+        cache.truncate(99);
+        assert_eq!(cache.len, 3);
     }
 }

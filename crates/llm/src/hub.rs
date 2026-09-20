@@ -452,7 +452,7 @@ mod tests {
         HubModel {
             id: "a/b".into(),
             model_type: Some("llama".into()),
-            arch: Some(Arch::Llama),
+            arch: Some(Arch::require("llama")),
             downloads: 0,
             likes: 0,
             gated: false,

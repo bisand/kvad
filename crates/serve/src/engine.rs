@@ -59,7 +59,7 @@ pub fn parse(id: &str) -> Option<Backend> {
 
 #[cfg(feature = "gpu")]
 mod gpu {
-    use kvad::model::{Arch, Session};
+    use kvad::model::Session;
     use kvad::runtime::Llm;
     use kvad::service::GpuMode;
     use kvad::weights::Watcher;
@@ -77,7 +77,7 @@ mod gpu {
             GpuMode::Q4 => kvad_gpu::model::parse_quant("q4").expect("known quant"),
         };
         Llm::load_custom(repo, progress, watch, &mut |files, spec, _| {
-            if spec.arch != Arch::Llama {
+            if !spec.arch.is("llama") {
                 return Err(format!(
                     "the GPU backend implements the Llama family only; this model is {}. \
                      Pick a CPU backend instead.",

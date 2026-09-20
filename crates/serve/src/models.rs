@@ -458,7 +458,7 @@ mod tests {
     /// cannot re-download a model you trained.
     #[test]
     fn a_model_that_cannot_run_says_why() {
-        let good = describe(&local("a/b", Some(Arch::Llama), true), false);
+        let good = describe(&local("a/b", Some(Arch::require("llama")), true), false);
         assert!(good.runnable && good.blocker.is_none());
         assert_eq!(good.arch.as_deref(), Some("llama"));
 
@@ -466,10 +466,10 @@ mod tests {
         assert!(!strange.runnable);
         assert!(strange.blocker.unwrap().contains("neither"));
 
-        let half = describe(&local("a/b", Some(Arch::Gpt2), false), false);
+        let half = describe(&local("a/b", Some(Arch::require("gpt2")), false), false);
         assert!(half.blocker.unwrap().contains("download did not finish"));
 
-        let stopped = describe(&local("mine", Some(Arch::Gpt2), false), true);
+        let stopped = describe(&local("mine", Some(Arch::require("gpt2")), false), true);
         assert!(stopped.blocker.unwrap().contains("first checkpoint"));
     }
 

@@ -11,12 +11,25 @@
 //! with position information added once, at the very bottom, by looking up a
 //! learned vector per slot in the context window.
 
-use super::{attend, KvCache, Spec, Transformer};
+use super::{attend, Architecture, KvCache, Spec, Transformer};
 use crate::qcache::Source;
 use crate::quant::Weight;
 use crate::tensor::{gelu_inplace, layer_norm};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// This module's entry in the registry.
+///
+/// `gpt2` is the `model_type`; `GPT2LMHeadModel` reduces to the same stem.
+/// Nothing here needs configuring — GPT-2 caches a key and a value per head
+/// per position, which is what [`Spec`] assumes by default.
+pub static ARCH: Architecture = Architecture {
+    id: "gpt2",
+    model_types: &["gpt2"],
+    about: "GPT-2 (2019): learned positions, LayerNorm, GELU, one fused QKV matrix",
+    configure: |_| Ok(()),
+    load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
+};
 
 pub struct Block {
     ln1_g: Vec<f32>,

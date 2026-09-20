@@ -69,7 +69,7 @@
 //! avoid. safetensors makes the same trade. The checks are about provenance —
 //! is this the right file, written by the right rules — not integrity.
 
-use crate::model::{gpt2, llama, Arch, Spec, Transformer};
+use crate::model::{Spec, Transformer};
 use crate::quant::{Parts, Precision, Weight, BLOCK};
 use crate::tensor::Tensor;
 use crate::weights::{Checkpoint, ModelFiles};
@@ -804,16 +804,19 @@ pub fn load(
     Ok(model)
 }
 
+/// Hand the weights to whichever architecture the config named.
+///
+/// There is no `match` here any more, and that is the point: a new
+/// architecture is a module and one line in `model/arch.rs`, not an arm in
+/// every loader that ever learned the old list.
 fn build(src: &dyn Source, spec: &Spec) -> Res<Box<dyn Transformer>> {
-    Ok(match spec.arch {
-        Arch::Gpt2 => Box::new(gpt2::Model::load(src, spec.clone())?),
-        Arch::Llama => Box::new(llama::Model::load(src, spec.clone())?),
-    })
+    spec.arch.load(src, spec.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Arch, CacheShape, Json};
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("nq-test-{}-{name}", std::process::id()));
@@ -823,7 +826,7 @@ mod tests {
 
     fn spec() -> Spec {
         Spec {
-            arch: Arch::Llama,
+            arch: Arch::require("llama"),
             n_layer: 1,
             n_head: 1,
             n_kv_head: 1,
@@ -835,6 +838,8 @@ mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: true,
+            cache: CacheShape { k: 32, v: 32 },
+            config: Json::default(),
         }
     }
 

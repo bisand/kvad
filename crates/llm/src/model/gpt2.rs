@@ -1,6 +1,6 @@
 //! GPT-2 (2019).
 //!
-//! The simpler of the two architectures, and the one to read first. Its block
+//! The simplest of the architectures here, and the one to read first. Its block
 //! is:
 //!
 //! ```text

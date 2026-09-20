@@ -148,7 +148,10 @@ enum Flavour {
 }
 
 fn tiny(flavour: Flavour) -> Tiny {
-    let (hidden, n_head, nope, rope, v_head, lat) = (64usize, 2usize, 16usize, 8usize, 16, 32);
+    // Every matrix the quantiser sees has a row length that is a multiple of
+    // 32, because anything narrower it leaves as f32 — and a tiny model that
+    // quietly skipped quantisation would test the wrong loader.
+    let (hidden, n_head, nope, rope, v_head, lat) = (64usize, 2usize, 32usize, 16usize, 32, 64);
     let (n_layer, vocab, n_experts, first_dense) = (3usize, 32usize, 4usize, 1usize);
     let (moe_inter, inter, n_shared) = (32usize, 64usize, 1usize);
     let q_lora = match flavour {
@@ -315,14 +318,16 @@ fn tiny(flavour: Flavour) -> Tiny {
 
 /// Load the tiny model through the engine's ordinary path.
 fn engine(tiny: &Tiny, tag: &str) -> (Box<dyn Transformer>, Spec) {
+    at(tiny, tag, Precision::F32)
+}
+
+fn at(tiny: &Tiny, tag: &str, precision: Precision) -> (Box<dyn Transformer>, Spec) {
     let path =
         std::env::temp_dir().join(format!("kvad-ds-{}-{tag}.safetensors", std::process::id()));
     write_safetensors(&path, &tiny.tensors);
     let ckpt = Checkpoint::open(std::slice::from_ref(&path)).unwrap();
     let spec = Spec::from_config(Json::new(tiny.config.clone())).unwrap();
-    // f32: this is a test of the arithmetic, not of the quantiser, which has
-    // its own.
-    let model = deepseek::Model::load(&Live::new(&ckpt, Precision::F32), spec.clone()).unwrap();
+    let model = deepseek::Model::load(&Live::new(&ckpt, precision), spec.clone()).unwrap();
     let _ = std::fs::remove_file(&path);
     (Box::new(model), spec)
 }
@@ -775,4 +780,42 @@ fn an_fp8_checkpoint_is_refused_by_name() {
         .to_string();
     assert!(err.contains("fp8"), "{err}");
     assert!(err.contains("bf16"), "{err}");
+}
+
+/// The quantised path is the one anybody will actually run, and MLA gives it
+/// something new to get wrong: the per-head slices of `kv_b_proj` are
+/// quantised as matrices of their own, one of them transposed first.
+///
+/// This does not check that q8 is *accurate* — `quant.rs` has tests for that.
+/// It checks that the same model, loaded the other way, still predicts the
+/// same tokens.
+#[test]
+fn the_quantised_path_predicts_the_same_tokens() {
+    for (flavour, tag) in [(Flavour::V2, "q8-v2"), (Flavour::V3, "q8-v3")] {
+        let t = tiny(flavour);
+        let tokens: Vec<u32> = vec![3, 17, 8, 0, 29];
+
+        let (exact, spec) = at(&t, tag, Precision::F32);
+        let (rough, _) = at(&t, tag, Precision::Q8);
+
+        let mut a = KvCache::new(&spec);
+        let mut b = KvCache::new(&spec);
+        let want = exact.forward_batch(&tokens, &mut a);
+        let got = rough.forward_batch(&tokens, &mut b);
+
+        // Weights this small and this random are the worst case for a block
+        // quantiser, so the logits are compared by their order, not their
+        // values: the best token, and the direction of every gap.
+        let best = |v: &[f32]| {
+            let pick = |m: (usize, f32), (i, &x): (usize, &f32)| if x > m.1 { (i, x) } else { m };
+            v.iter().enumerate().fold((0, f32::NEG_INFINITY), pick).0
+        };
+        assert_eq!(best(&got), best(&want), "{tag}: different argmax");
+        assert!(got.iter().all(|v| v.is_finite()), "{tag}: not finite");
+
+        let spread = want.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - want.iter().copied().fold(f32::INFINITY, f32::min);
+        let worst = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(worst < spread / 10.0, "{tag}: q8 moved a logit by {worst} of {spread}");
+    }
 }

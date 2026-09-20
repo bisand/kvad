@@ -356,7 +356,8 @@ impl KvCache {
 
 /// Multi-head causal self-attention for a single query position.
 ///
-/// Shared by both architectures, because attention itself never changed. For
+/// Shared by GPT-2 and the Llama family, because attention itself did not
+/// change between them. (DeepSeek's does not call this; see `deepseek.rs`.) For
 /// each head: score this token's query against the key of every token so far,
 /// softmax those scores into weights, and return the correspondingly weighted
 /// average of the values.

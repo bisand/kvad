@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Transformer inference from scratch: GPT-2 and Llama-family models, no ML framework."
+description = "Transformer inference from scratch: GPT-2, Llama-family and DeepSeek models, no ML framework."
 
 [features]
 # Architectures are modules, and each one is optional: a build with a feature

@@ -424,7 +424,11 @@ impl Router {
         let strength = |g: usize| -> f32 {
             let group = &choice[g * per_group..(g + 1) * per_group];
             match self.select {
-                // V2 scores a group by its single best expert.
+                // V2 scores a group by its single best expert. (It also masks
+                // the losers to zero rather than to minus infinity, which can
+                // pick a masked expert when fewer than `top_k` survive; that
+                // only happens if a whole group scores zero under a softmax,
+                // and this refuses to instead.)
                 Select::GroupLimited => group.iter().copied().fold(f32::NEG_INFINITY, f32::max),
                 // V3 by its best two, which stops one strong expert from
                 // dragging in a group that is otherwise weak.

@@ -27,7 +27,7 @@ Five crates, meant to be read in order:
 | Crate | What it is | Dependencies |
 |---|---|---|
 | [`nanograd`](crates/nanograd) | A neural network and backpropagation, from scratch. Trains on MNIST. | **none** |
-| [`kvad`](crates/llm) | Transformer inference from scratch. Two architectures, real HuggingFace weights. | hub client, tokenizer, safetensors |
+| [`kvad`](crates/llm) | Transformer inference from scratch. Four architectures, real HuggingFace weights. | hub client, tokenizer, safetensors |
 | [`kvad-gpu`](crates/gpu) | The same Llama forward pass on the GPU, in candle. | candle (Metal/CUDA) |
 | [`kvad-tui`](crates/tui) | Terminal app: browse, download, activate, chat. | ratatui |
 | [`kvad-serve`](crates/serve) | HTTP server and web UI: manage, train, score, benchmark, watch. | axum, rusqlite, Svelte |
@@ -716,7 +716,7 @@ kvad cache                         # pre-quantised weight files
 Read in this order:
 
 1. **[`tensor.rs`](crates/llm/src/tensor.rs)** — matmul, LayerNorm, GELU,
-   softmax, then RMSNorm, SwiGLU and RoPE. Nine functions, two architectures.
+   softmax, then RMSNorm, SwiGLU and RoPE. Nine functions, four architectures.
 2. **[`weights.rs`](crates/llm/src/weights.rs)** — safetensors is a length, a
    JSON header, and raw floats. Plus shard indexes and bf16 widening.
 3. **[`model/mod.rs`](crates/llm/src/model/mod.rs)** — the skeleton both

@@ -13,10 +13,18 @@
 #
 # Why the shape is this:
 #
-# * The version is rewritten into `[workspace.package]` rather than committed.
-#   `Cargo.toml` in git says what the last released version was; what a
-#   *binary* reports comes from the release it was built for. One line to
-#   rewrite, because every crate inherits it with `version.workspace = true`.
+# * The version is rewritten into `[workspace.package]` from the tag, and —
+#   once the release has its files — committed back to master, so the branch
+#   says what the last release was. One line to rewrite, because every crate
+#   inherits it with `version.workspace = true`.
+#
+#   The builds still come from the tag, not from that commit. A release is a
+#   statement about the code at a tag, and master may have moved on since it
+#   was published; taking the tag's tree and stamping the version into it
+#   keeps the artifacts faithful to the release they are attached to.
+#
+#   The commit is last on purpose. A build that fails should not leave master
+#   claiming a version that has no binaries behind it.
 # * `cargo update --workspace` after the rewrite, because changing a workspace
 #   member's version makes `Cargo.lock` stale and `--locked` would refuse to
 #   build. `--workspace` touches only those members; third-party dependencies
@@ -297,3 +305,62 @@ jobs:
           \`kvad\` and a CPU-only \`kvad-serve\`; the other two link Metal.
 
           Downloads can be checked against \`SHA256SUMS\` below."
+
+  # ---------------------------------------------------------------------
+  bump:
+    name: commit the version to master
+    needs: [version, upload]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          # The default token, with the workflow's contents: write, is what
+          # pushes this back. checkout keeps the credentials for it.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set the workspace version and push it
+        run: |
+          set -eu
+          version="${{ needs.version.outputs.version }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Master can move while a release builds — this workflow takes over
+          # ten minutes — so each attempt starts from whatever master is now
+          # and applies the version to that. Rebasing a commit that edits
+          # Cargo.toml onto a master that also edited it conflicts, and a
+          # conflict in an unattended job is a job that hangs on a prompt or
+          # dies half-rebased. Re-applying cannot conflict: there is only
+          # ever one commit, and it is always on top.
+          for attempt in 1 2 3; do
+            git fetch --quiet origin master
+            git reset --quiet --hard origin/master
+
+            perl -0pi -e 's/^version = "[^"]*"$/version = "'"$version"'"/m' Cargo.toml
+            grep -q "^version = \"$version\"$" Cargo.toml || {
+              echo "::error::failed to set $version in Cargo.toml"; exit 1; }
+            cargo update --workspace --quiet
+
+            # A re-run against a release whose version master already carries
+            # has nothing to say, and an empty commit would be noise.
+            if git diff --quiet; then
+              echo "master is already at $version"
+              exit 0
+            fi
+
+            git add Cargo.toml Cargo.lock
+            git commit --quiet -m "Set the workspace version to $version
+
+          Written by the release workflow from the tag of the GitHub release
+          this was built for, so master says what the last release was."
+
+            if git push origin HEAD:master; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "master moved while this ran; taking it again"
+          done
+          echo "::error::could not push the version to master after 3 attempts"
+          exit 1

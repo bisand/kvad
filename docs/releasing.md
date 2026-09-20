@@ -31,10 +31,28 @@ dependencies carry no version of their own, so there is exactly one number
 and nothing to keep in sync.
 
 The workflow rewrites that line from the release's tag before it builds, and
-does not commit the change. What is in git says what the last release was;
-what a *binary* says when you run `kvad --version` comes from the release it
-was built for. A build that disagrees with its release fails the smoke test
-rather than shipping.
+then — once the release has its files — commits it back to `master`, so the
+branch says what the last release was. A build that disagrees with its
+release fails the smoke test rather than shipping.
+
+The builds themselves come from the tag, not from that commit. A release is a
+statement about the code at a tag, and `master` may have moved on since it was
+published; taking the tag's tree and stamping the version into it keeps the
+artifacts faithful to the release they are attached to. The consequence worth
+knowing is that the tagged tree does not contain its own version — check out
+`v0.1.1` and `Cargo.toml` says whatever the release before it set. The commit
+on `master` is what carries the number forward.
+
+The commit is the last thing the workflow does, because a build that failed
+should not leave `master` claiming a version with no binaries behind it. It is
+also written to be safe to repeat: a re-run against a release whose version
+`master` already carries says so and commits nothing.
+
+`master` can move while a release builds — this workflow takes over ten
+minutes — so each push attempt starts from whatever `master` is at that moment
+and applies the version to it, rather than rebasing. Rebasing a commit that
+edits `Cargo.toml` onto a `master` that also edited it conflicts, and a
+conflict in an unattended job is a job that dies half-rebased.
 
 Rewriting the version makes `Cargo.lock` stale, so the workflow runs
 `cargo update --workspace` before building — that updates only the workspace

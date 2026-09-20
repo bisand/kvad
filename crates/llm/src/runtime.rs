@@ -329,7 +329,7 @@ impl Llm {
             let previous = self.decode(&ids[..ids.len() - 1])?;
             let chosen = Chosen {
                 id: next,
-                text: text[previous.len()..].to_string(),
+                text: new_text(finished(&text), finished(&previous)).to_string(),
                 // Resolved here rather than by the caller, because the
                 // tokenizer is here and an id means nothing without it.
                 top: top.into_iter().map(|r| self.candidate(r)).collect(),
@@ -469,9 +469,83 @@ impl Llm {
     }
 }
 
+/// The part of a decode that is finished enough to send.
+///
+/// A character whose bytes are split across several tokens decodes, while it
+/// is still incomplete, to U+FFFD. That replacement character is the front
+/// half of something the next token completes, so sending it would put a
+/// `\u{FFFD}` in the stream that the real character then appears after. It is
+/// held back instead, and arrives as itself once the rest of it does.
+///
+/// A model that genuinely ends its output with U+FFFD loses it. That is the
+/// trade against every multi-byte character in every other generation.
+fn finished(text: &str) -> &str {
+    text.trim_end_matches('\u{FFFD}')
+}
+
+/// What `text` has that `previous` did not.
+///
+/// Not `text[previous.len()..]`, which is what this was and which panics.
+/// `previous` is not always a byte prefix of `text`: decoding `Hi 😊` a token
+/// at a time gives `Hi`, then `Hi \u{FFFD}` at six bytes, then `Hi 😊` at seven —
+/// so the previous length lands inside the emoji, and slicing a `str`
+/// anywhere but a character boundary is a panic.
+///
+/// Walking characters cannot land inside one, and the first place the two
+/// disagree is where the new text starts.
+fn new_text<'a>(text: &'a str, previous: &str) -> &'a str {
+    let mut previous = previous.chars();
+    for (i, c) in text.char_indices() {
+        if previous.next() != Some(c) {
+            return &text[i..];
+        }
+    }
+    ""
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Llm;
+    use super::{finished, new_text, Llm};
+
+    #[test]
+    fn new_text_is_what_the_last_token_added() {
+        assert_eq!(new_text("Hello world", "Hello"), " world");
+        assert_eq!(new_text("Hello", "Hello"), "");
+        assert_eq!(new_text("Hello", ""), "Hello");
+        // A decode that shrank: nothing to send, rather than a panic.
+        assert_eq!(new_text("Hi", "Hi there"), "");
+    }
+
+    #[test]
+    fn a_character_split_across_tokens_arrives_once_and_whole() {
+        // The real decodes of `Hi 😊`, which Qwen2.5 tokenises as
+        // [13048, 26525, 232]: the emoji's bytes arrive in two tokens, and
+        // the first of them decodes to a replacement character.
+        let steps = ["Hi", "Hi \u{FFFD}", "Hi 😊"];
+
+        // Why the old code died: 6 is not a character boundary in `Hi 😊`,
+        // it is inside the emoji, and `text[6..]` on that is a panic.
+        assert_eq!(steps[1].len(), 6);
+        assert_eq!(steps[2].len(), 7);
+        assert!(!steps[2].is_char_boundary(steps[1].len()));
+
+        let mut stream = String::new();
+        for i in 0..steps.len() {
+            let previous = if i == 0 { "" } else { steps[i - 1] };
+            stream.push_str(new_text(finished(steps[i]), finished(previous)));
+        }
+        assert_eq!(stream, "Hi 😊");
+        assert!(!stream.contains('\u{FFFD}'), "a half-decoded character reached the stream");
+    }
+
+    #[test]
+    fn an_incomplete_tail_is_held_back() {
+        assert_eq!(finished("Hi \u{FFFD}"), "Hi ");
+        assert_eq!(finished("Hi 😊"), "Hi 😊");
+        assert_eq!(finished(""), "");
+        // Nothing should leak if a decoder produces more than one of them.
+        assert_eq!(finished("ab\u{FFFD}\u{FFFD}"), "ab");
+    }
 
     #[test]
     fn common_prefix_finds_the_shared_history() {

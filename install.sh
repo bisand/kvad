@@ -164,6 +164,17 @@ is_loopback() {
     esac
 }
 
+# What a pid is running, as far as each platform will say. Linux's `ps
+# -o comm=` gives a short name, so /proc is asked first where it exists;
+# macOS has no /proc and answers with the full path.
+exe_of() { # pid
+    if [ -r "/proc/$1/exe" ]; then
+        readlink "/proc/$1/exe" 2>/dev/null
+    else
+        ps -o comm= -p "$1" 2>/dev/null
+    fi
+}
+
 # Whether something already holds this exact address. Worth knowing before
 # installing a unit with KeepAlive on it: kvad-serve would fail to bind, be
 # restarted, fail again, and do that forever while looking installed.
@@ -174,7 +185,18 @@ is_loopback() {
 # "is this port in use anywhere" called that a conflict and was wrong.
 address_taken() { # host port
     if have lsof; then
-        lsof -nP -iTCP@"$1":"$2" -sTCP:LISTEN >/dev/null 2>&1
+        # shellcheck disable=SC2086 # the pid list is split on purpose
+        pids=$(lsof -nP -iTCP@"$1":"$2" -sTCP:LISTEN -t 2>/dev/null) || return 1
+        [ -n "$pids" ] || return 1
+        for pid in $pids; do
+            # Our own service does not count. Upgrading in place leaves the
+            # old agent listening on the very address the new one wants, and
+            # installing the service boots it out before bootstrapping the
+            # replacement -- so the address is ours to take back. Calling it
+            # a conflict would refuse every upgrade, which is what it did.
+            [ "$(exe_of "$pid")" = "$PREFIX/kvad-serve" ] || return 0
+        done
+        return 1
     elif have ss; then
         ss -ltnH 2>/dev/null | awk -v a="$1:$2" '$4 == a { found = 1 } END { exit !found }'
     else
@@ -633,6 +655,16 @@ UNIT
     fi
 }
 
+# Kick a service that is already installed, so it runs the binary that is
+# now on disk.
+restart_service() {
+    if [ "$PLATFORM" = macos ]; then
+        launchctl kickstart -k "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1
+    else
+        systemctl --user restart kvad-serve.service >/dev/null 2>&1
+    fi
+}
+
 if [ -f "$SRC/kvad-serve" ]; then
     do_service=0
     case $WANT_SERVICE in
@@ -675,6 +707,25 @@ if [ -f "$SRC/kvad-serve" ]; then
     if [ "$do_service" -eq 1 ]; then
         step "Installing the background service"
         if [ "$PLATFORM" = macos ]; then write_launchd; else write_systemd; fi
+    elif [ -f "$(service_paths)" ]; then
+        # There is a service, and the binary underneath it has just been
+        # replaced. A running process keeps the file it started from, so
+        # without this the install finishes, reports the new version, and
+        # leaves the old one serving -- which is the sort of thing somebody
+        # only discovers when a bug they read the fix for is still there.
+        step "Restarting the service onto the new binaries"
+        if restart_service; then
+            say "  restarted $SERVICE_LABEL"
+        else
+            if [ "$PLATFORM" = macos ]; then
+                how="launchctl kickstart -k gui/$(id -u)/$SERVICE_LABEL"
+            else
+                how="systemctl --user restart kvad-serve"
+            fi
+            warn "could not restart $SERVICE_LABEL. It is still running the binary it
+  started with, not the one just installed. Restart it with:
+    $how"
+        fi
     fi
 fi
 

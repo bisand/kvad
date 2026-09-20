@@ -18,7 +18,7 @@
 //! — a crawl of the same name — and both move when it is.
 
 use crate::db::Db;
-use kvad::retrieve::{Hit, Index};
+use kvad::retrieve::{Index, Passage, RADIUS};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -97,8 +97,13 @@ fn pages_of(name: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-pub fn search(db: &Db, id: i64, question: &str, k: usize) -> Res<Vec<Hit>> {
-    Ok(index_for(db, id)?.search(question, k))
+/// The passages of a dataset that bear on a question.
+///
+/// Passages and not chunks: what a model is given has to read as prose, and
+/// three fragments of one section in score order do not. See
+/// [`kvad::retrieve::Passage`].
+pub fn search(db: &Db, id: i64, question: &str, k: usize) -> Res<Vec<Passage>> {
+    Ok(index_for(db, id)?.passages(question, k, RADIUS))
 }
 
 /// The instruction a model gets along with what was found.
@@ -116,11 +121,11 @@ Cite the page you used.";
 /// nothing matched — in which case the model should be told nothing rather
 /// than told nothing was found, and answer as it normally would.
 pub fn grounding(db: &Db, id: i64, question: &str, k: usize, budget: usize) -> Res<Option<String>> {
-    let hits = search(db, id, question, k)?;
-    if hits.is_empty() {
+    let passages = search(db, id, question, k)?;
+    if passages.is_empty() {
         return Ok(None);
     }
-    Ok(Some(format!("{INSTRUCTION}\n\n{}", kvad::retrieve::context(&hits, budget))))
+    Ok(Some(format!("{INSTRUCTION}\n\n{}", kvad::retrieve::context(&passages, budget))))
 }
 
 #[cfg(test)]

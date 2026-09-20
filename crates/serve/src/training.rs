@@ -430,11 +430,13 @@ async fn search(
     let k = q.k.unwrap_or(5).clamp(1, 50);
     let found = blocking(move || {
         let index = crate::retrieval::index_for(&db, id)?;
-        let hits = index.search(&q.q, k);
+        // What the model would be given, not the chunks behind it: a passage
+        // is the unit that gets read.
+        let passages = index.passages(&q.q, k, kvad::retrieve::RADIUS);
         Ok(json!({
             "chunks": index.len(),
             "vocabulary": index.vocabulary(),
-            "hits": hits,
+            "passages": passages,
         }))
     })
     .await

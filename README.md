@@ -668,6 +668,22 @@ anything specific, a passage now has to have matched something specific, and
 if it contains nothing specific the rule is not applied at all, because then
 a corpus entirely about vectors should still answer "vector".
 
+**Ranking wants small chunks and reading wants whole ones**, and they are not
+the same size. Asked what happens to a reference after a push, the three best
+hits were chunks 885, 886 and 888 of one section, handed over as three
+unrelated items in score order — and 887, between two of them, had not ranked
+at all. So a hit is grown to its neighbours and overlapping runs are merged:
+those five hits became two passages, one of them chunks 884–892, the whole
+section in order. Never across a page, because the chunk after the last one of
+a page is the first of another.
+
+A merged passage can outgrow the prompt budget, and the section above is 6,921
+characters against a budget of 4,000 — with the part that answers the question
+near the end, so cutting from the front removes precisely the answer. It is
+cut around the paragraph that earned the score instead, found by adding up
+what each of the question's words contributed to each paragraph: the same
+judgement the ranking made, applied one level down.
+
 **The part worth keeping is that the two halves are measured apart.** Whether
 the right passage comes back and whether the model then reads it properly are
 different questions that fail for different reasons. Asked what the book says

@@ -458,30 +458,32 @@
 
         {#if found}
           <p class="text-xs opacity-60">
-            {found.hits.length} of {found.chunks.toLocaleString()} passages, over a vocabulary of
+            {found.passages.length} passage{found.passages.length === 1 ? "" : "s"} out of
+            {found.chunks.toLocaleString()} chunks, over a vocabulary of
             {found.vocabulary.toLocaleString()} words.
-            {#if found.hits.length === 0}Nothing matched — the words in the question are not in
-              this corpus.{/if}
+            {#if found.passages.length === 0}Nothing matched — the words in the question are not
+              in this corpus.{/if}
           </p>
-          {#each found.hits as hit (hit.chunk.id)}
+          {#each found.passages as p (p.from)}
             <div class="border-base-300 rounded-box border p-3">
               <div class="flex flex-wrap items-baseline gap-2">
-                <span class="badge badge-sm badge-neutral">{hit.score.toFixed(2)}</span>
-                <span class="text-sm font-medium">{hit.chunk.heading}</span>
-                {#if hit.chunk.source}
-                  <a class="link link-hover truncate text-xs opacity-60" href={hit.chunk.source}
-                    >{hit.chunk.source}</a
-                  >
+                <span class="badge badge-sm badge-neutral">{p.score.toFixed(2)}</span>
+                <span class="text-sm font-medium">{p.heading}</span>
+                <span class="text-xs opacity-40">
+                  {p.from === p.to ? `chunk ${p.from}` : `chunks ${p.from}–${p.to}`}
+                </span>
+                {#if p.source}
+                  <a class="link link-hover truncate text-xs opacity-60" href={p.source}>{p.source}</a>
                 {/if}
               </div>
               <!-- Why this came back, which an embedding index could not say. -->
               <div class="mt-1 flex flex-wrap gap-1">
-                {#each hit.because.slice(0, 5) as [word, score] (word)}
+                {#each p.because.slice(0, 5) as [word, score] (word)}
                   <span class="badge badge-ghost badge-xs">{word} {score.toFixed(1)}</span>
                 {/each}
               </div>
               <p class="mt-2 max-h-32 overflow-y-auto text-xs whitespace-pre-wrap opacity-70">
-                {hit.chunk.text}
+                {p.text}
               </p>
             </div>
           {/each}

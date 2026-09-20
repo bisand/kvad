@@ -271,6 +271,100 @@ impl Index {
         self.postings.len()
     }
 
+    /// Which page a chunk is on, for deciding what may be merged with it.
+    ///
+    /// The source when a crawl recorded one, and the outermost heading
+    /// otherwise — an uploaded corpus has no pages but still has a shape.
+    fn page_of(&self, id: usize) -> (Option<&str>, &str) {
+        let chunk = &self.chunks[id];
+        let top = chunk.heading.split(" \u{203a} ").next().unwrap_or("");
+        (chunk.source.as_deref(), top)
+    }
+
+    /// The best passages for a question: the best chunks, grown to their
+    /// neighbours and merged where they touch.
+    ///
+    /// Never across a page: the chunk after the last one of a page is the
+    /// first of another, and dragging that in cites one page with another
+    /// page's words.
+    pub fn passages(&self, question: &str, k: usize, radius: usize) -> Vec<Passage> {
+        let hits = self.search(question, k);
+        if hits.is_empty() {
+            return Vec::new();
+        }
+
+        let mut spans: Vec<Passage> = hits
+            .iter()
+            .map(|hit| {
+                let page = self.page_of(hit.chunk.id);
+                let (mut from, mut to) = (hit.chunk.id, hit.chunk.id);
+                for _ in 0..radius {
+                    if from > 0 && self.page_of(from - 1) == page {
+                        from -= 1;
+                    }
+                    if to + 1 < self.chunks.len() && self.page_of(to + 1) == page {
+                        to += 1;
+                    }
+                }
+                Passage {
+                    heading: hit.chunk.heading.clone(),
+                    source: hit.chunk.source.clone(),
+                    text: String::new(),
+                    score: hit.score,
+                    because: hit.because.clone(),
+                    from,
+                    to,
+                    // The chunk itself, until the text is laid out below.
+                    focus: hit.chunk.id,
+                }
+            })
+            .collect();
+
+        // Touching counts as overlapping: two spans that meet end to end are
+        // one run of text, and a gap of nothing between them is not a gap.
+        // Still never across a page — growing each span stopped at the page,
+        // and merging two of them would walk straight over it.
+        spans.sort_by_key(|s| s.from);
+        let mut merged: Vec<Passage> = Vec::new();
+        for span in spans {
+            match merged.last_mut() {
+                Some(last)
+                    if span.from <= last.to + 1
+                        && self.page_of(span.from) == self.page_of(last.to) =>
+                {
+                    last.to = last.to.max(span.to);
+                    // The heading and the reason come from the best chunk in
+                    // the run, not from whichever one started earliest.
+                    if span.score > last.score {
+                        last.score = span.score;
+                        last.heading = span.heading;
+                        last.because = span.because;
+                        last.focus = span.focus;
+                    }
+                }
+                _ => merged.push(span),
+            }
+        }
+
+        for passage in &mut merged {
+            let mut text = String::new();
+            let mut chunk_at = 0;
+            for chunk in &self.chunks[passage.from..=passage.to] {
+                if chunk.id == passage.focus {
+                    chunk_at = text.chars().count();
+                }
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&chunk.text);
+            }
+            passage.focus = earned(&text, &passage.because).unwrap_or(chunk_at);
+            passage.text = text;
+        }
+        merged.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.from.cmp(&b.from)));
+        merged
+    }
+
     /// The `k` best chunks for a question, best first.
     ///
     /// BM25. For each word of the question: how rare it is across the corpus
@@ -335,21 +429,157 @@ impl Index {
     }
 }
 
-/// Lay hits out for a prompt, stopping at `budget` characters.
+/// A run of adjacent chunks, handed to a model as one piece.
 ///
-/// Each one keeps its heading and its source, because a model given a source
-/// will cite it and a model given none will invent one.
-pub fn context(hits: &[Hit], budget: usize) -> String {
+/// Ranking wants small chunks and reading wants whole ones, and they are not
+/// the same size. Measured on the Rust book: asked what happens to a
+/// reference after a push, the three best hits were chunks 885, 886 and 888
+/// of one section, arriving as three unrelated items in score order — and the
+/// model answered from the first, which was about something else. The section
+/// they came from says it properly, in order, and the passage that finished
+/// the explanation had not ranked at all.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Passage {
+    pub heading: String,
+    pub source: Option<String>,
+    pub text: String,
+    /// The best score of any chunk in it, and what earned that.
+    pub score: f32,
+    pub because: Vec<(String, f32)>,
+    /// The chunks it covers, first and last inclusive.
+    pub from: usize,
+    pub to: usize,
+    /// Where in `text` the paragraph that earned the score begins.
+    ///
+    /// A passage too long for the budget is cut around this rather than from
+    /// the front. The whole section on reading vector elements is 6,921
+    /// characters and the part about the borrow checker is near the end of
+    /// it, so a budget of 4,000 taken from the beginning removes precisely
+    /// the answer and leaves the model the paragraphs before it.
+    ///
+    /// A paragraph and not the chunk it is in: a chunk is up to [`TARGET`]
+    /// characters, which at this budget is most of what there is room for,
+    /// so cutting around the chunk's first line lands somewhere arbitrary
+    /// inside it.
+    pub focus: usize,
+}
+
+/// How many chunks either side of a hit to take with it.
+///
+/// One. The case this exists for is an explanation that runs over a boundary,
+/// and an explanation two chunks away from anything that matched is not about
+/// the question.
+pub const RADIUS: usize = 1;
+
+/// Lay passages out for a prompt, stopping at `budget` characters.
+///
+/// Each keeps its heading and its source, because a model given a source will
+/// cite it and a model given none will invent one.
+///
+/// A first passage too big for the whole budget is cut at a paragraph rather
+/// than dropped: half an explanation is worth more than no explanation, and
+/// dropping it would send the model the question with nothing attached, which
+/// is the case it answers from memory.
+pub fn context(passages: &[Passage], budget: usize) -> String {
     let mut out = String::new();
-    for hit in hits {
-        let source = hit.chunk.source.as_deref().unwrap_or("the corpus");
-        let piece = format!("[{}]\n(from {})\n{}\n\n", hit.chunk.heading, source, hit.chunk.text);
-        if out.chars().count() + piece.chars().count() > budget && !out.is_empty() {
+    for passage in passages {
+        let source = passage.source.as_deref().unwrap_or("the corpus");
+        let head = format!("[{}]\n(from {})\n", passage.heading, source);
+        let room = budget.saturating_sub(out.chars().count() + head.chars().count());
+        if passage.text.chars().count() > room {
+            if !out.is_empty() {
+                break;
+            }
+            let trimmed = around(&passage.text, passage.focus, room);
+            if trimmed.is_empty() {
+                break;
+            }
+            out.push_str(&head);
+            out.push_str(&trimmed);
             break;
         }
-        out.push_str(&piece);
+        out.push_str(&head);
+        out.push_str(&passage.text);
+        out.push_str("\n\n");
     }
     out.trim_end().to_string()
+}
+
+/// Where the paragraph that earned the score begins, in characters.
+///
+/// The words are the question's, with what each contributed to this
+/// passage's score; a paragraph is worth the sum of the ones it holds. Using
+/// the scores rather than counting matches is what makes a paragraph with the
+/// rare word beat one with three common ones — which is the same judgement
+/// the ranking made to pick this passage in the first place.
+fn earned(text: &str, because: &[(String, f32)]) -> Option<usize> {
+    let mut at = 0;
+    let mut best: Option<(f32, usize)> = None;
+    for para in text.split("\n\n") {
+        let lower = para.to_lowercase();
+        let score: f32 = because
+            .iter()
+            .filter(|(word, _)| words(&lower).any(|w| &w == word))
+            .map(|(_, score)| score)
+            .sum();
+        if score > best.map_or(0.0, |(s, _)| s) {
+            best = Some((score, at));
+        }
+        at += para.chars().count() + 2;
+    }
+    best.map(|(_, at)| at)
+}
+
+/// As much of `text` as fits in `room`, around the paragraph at `focus`.
+///
+/// Grows outwards from there a paragraph at a time, forwards first — what
+/// follows the matching passage explains it more often than what precedes it —
+/// so the part that earned the hit is always in what comes back.
+fn around(text: &str, focus: usize, room: usize) -> String {
+    let paragraphs: Vec<&str> = text.split("\n\n").collect();
+    // Which paragraph `focus` lands in.
+    let mut at = 0;
+    let mut seen = 0;
+    for (i, para) in paragraphs.iter().enumerate() {
+        if seen > focus {
+            break;
+        }
+        (at, seen) = (i, seen + para.chars().count() + 2);
+    }
+
+    let (mut first, mut last) = (at, at);
+    let mut taken = paragraphs[at].chars().count();
+    if taken > room {
+        // One paragraph is already too much. Better half of the right one
+        // than all of the wrong one: cut it at a line.
+        let mut out = String::new();
+        for line in paragraphs[at].lines() {
+            if out.chars().count() + line.chars().count() > room {
+                break;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        return out.trim_end().to_string();
+    }
+
+    loop {
+        let forward = (last + 1 < paragraphs.len())
+            .then(|| paragraphs[last + 1].chars().count() + 2)
+            .filter(|n| taken + n <= room);
+        if let Some(n) = forward {
+            (last, taken) = (last + 1, taken + n);
+            continue;
+        }
+        let back = (first > 0)
+            .then(|| paragraphs[first - 1].chars().count() + 2)
+            .filter(|n| taken + n <= room);
+        match back {
+            Some(n) => (first, taken) = (first - 1, taken + n),
+            None => break,
+        }
+    }
+    paragraphs[first..=last].join("\n\n")
 }
 
 #[cfg(test)]
@@ -523,20 +753,85 @@ let v: Vec<i32> = Vec::new();
         assert!(all.contains("let x39 = 39;"));
     }
 
+    /// Ranking wants small chunks and reading wants whole ones. A hit is
+    /// grown to its neighbours so that an explanation running over a boundary
+    /// arrives in one piece — but never past the page it is on, because the
+    /// chunk after the last one of a page is the first of another.
+    #[test]
+    fn a_passage_grows_to_its_neighbours_and_stops_at_the_page() {
+        let index = index();
+        // `stack` is in chunk 1 alone. Chunk 0 is the same page and comes
+        // with it; chunk 2 is a different page and does not.
+        let passages = index.passages("stack", 5, RADIUS);
+        assert_eq!(passages.len(), 1);
+        assert_eq!((passages[0].from, passages[0].to), (0, 1));
+        assert!(passages[0].text.contains("manages memory"), "the neighbour was left behind");
+        assert!(passages[0].text.contains("stack stores values"));
+        assert!(!passages[0].text.contains("empty vector"), "it walked into the next page");
+        // Named after the chunk that earned it, not the one it starts at.
+        assert_eq!(passages[0].heading, "Ownership \u{203a} The Stack and the Heap");
+    }
+
+    /// Two hits on the same page become one run of text; a hit on another
+    /// page stays its own, even when the two are next to each other.
+    #[test]
+    fn touching_passages_merge_and_pages_still_do_not() {
+        let index = index();
+        let passages = index.passages("vector stack memory", 5, RADIUS);
+        assert_eq!(passages.len(), 2, "{:?}", passages.iter().map(|p| (p.from, p.to)).collect::<Vec<_>>());
+        let spans: Vec<(usize, usize)> = passages.iter().map(|p| (p.from, p.to)).collect();
+        assert!(spans.contains(&(0, 1)), "the two chunks of one page did not merge: {spans:?}");
+        assert!(spans.contains(&(2, 2)), "the other page was swallowed: {spans:?}");
+        // No chunk is in two passages, so nothing is sent twice.
+        assert!(passages[0].to < passages[1].from || passages[1].to < passages[0].from);
+    }
+
+    /// A budget smaller than the passage must not remove the answer.
+    ///
+    /// The whole section on reading vector elements is 6,921 characters and
+    /// the part about the borrow checker is near the end of it, so a budget
+    /// of 4,000 taken from the front keeps the paragraphs before the answer
+    /// and drops the answer.
+    #[test]
+    fn a_passage_too_long_for_the_budget_is_cut_around_the_answer() {
+        let mut corpus = String::from("# Long Page\n\n");
+        for i in 0..30 {
+            corpus.push_str(&format!("Filler paragraph {i} about nothing in particular at all.\n\n"));
+        }
+        corpus.push_str("The borrowchecker forbids this entirely.\n\n");
+        for i in 30..60 {
+            corpus.push_str(&format!("Filler paragraph {i} about nothing in particular at all.\n\n"));
+        }
+
+        let index = Index::build(chunk(&corpus, &[]));
+        let passages = index.passages("borrowchecker", 5, RADIUS);
+        assert_eq!(passages.len(), 1);
+        assert!(passages[0].text.chars().count() > 600, "the passage should not fit in the budget");
+
+        let prompt = context(&passages, 600);
+        assert!(prompt.chars().count() <= 600, "the budget was {} over", prompt.chars().count());
+        assert!(
+            prompt.contains("The borrowchecker forbids this entirely."),
+            "the budget removed the answer:\n{prompt}"
+        );
+        // And it is not simply the front of the passage.
+        assert!(!prompt.contains("Filler paragraph 0 "), "it was cut from the front after all");
+    }
+
     #[test]
     fn a_prompt_gets_the_source_and_stops_at_its_budget() {
-        // One word per chunk, so that there is more than one hit to trim.
-        let hits = index().search("vector stack memory", 3);
-        assert_eq!(hits.len(), 3, "the corpus has three chunks and this asks for all of them");
+        let hits = index().passages("vector stack memory", 3, RADIUS);
+        assert_eq!(hits.len(), 2);
 
         let prompt = context(&hits, 10_000);
         assert!(prompt.contains("https://x.test/ch08.html"));
         assert!(prompt.contains("Creating a Vector"));
 
-        // A budget for one chunk takes one, and never nothing: a prompt with
-        // no context at all is a question the model will answer from memory.
-        let tight = context(&hits, 50);
+        // A budget for one passage takes one, and never nothing: a prompt
+        // with no context at all is a question the model answers from memory.
+        let tight = context(&hits, 200);
         assert!(!tight.is_empty());
         assert!(tight.chars().count() < prompt.chars().count());
+        assert!(tight.chars().count() <= 200, "the budget was {} over", tight.chars().count());
     }
 }

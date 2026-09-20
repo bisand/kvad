@@ -36,18 +36,31 @@ fn main() {
         built - chunked
     );
 
+    // `ask CORPUS '#887'` prints that chunk instead of searching: the way to
+    // find out what a gap in the results actually contained.
+    if let Some(id) = question.strip_prefix('#').and_then(|n| n.parse::<usize>().ok()) {
+        for chunk in retrieve::chunk(&corpus, &pages).iter().skip(id.saturating_sub(1)).take(3) {
+            println!("#{}  {}\n{}\n", chunk.id, chunk.heading, chunk.text);
+        }
+        return;
+    }
+
     let asked = std::time::Instant::now();
-    let hits = index.search(question, k);
+    // Passages and not chunks: this is what a model would be handed.
+    let passages = index.passages(question, k, retrieve::RADIUS);
     println!("searched in {:?}\n", asked.elapsed());
 
-    for hit in &hits {
+    for passage in &passages {
         let why: Vec<String> =
-            hit.because.iter().take(4).map(|(w, s)| format!("{w} {s:.2}")).collect();
-        println!("{:>7.2}  {}", hit.score, hit.chunk.heading);
-        println!("         {}", hit.chunk.source.as_deref().unwrap_or("-"));
-        println!("         {}", why.join(", "));
-        let first = hit.chunk.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-        println!("         {}\n", first.chars().take(90).collect::<String>());
+            passage.because.iter().take(4).map(|(w, s)| format!("{w} {s:.2}")).collect();
+        let span = match passage.from == passage.to {
+            true => format!("#{}", passage.from),
+            false => format!("#{}-{}", passage.from, passage.to),
+        };
+        println!("{:>7.2}  {span:>10}  {}", passage.score, passage.heading);
+        println!("            {}", passage.source.as_deref().unwrap_or("-"));
+        println!("            {}", why.join(", "));
+        println!("            {} characters\n", passage.text.chars().count());
     }
 }
 

@@ -11,7 +11,11 @@ import { api, sse } from "./api.js";
 import { toasts } from "./toasts.svelte.js";
 
 /** What the sampler does when nobody touches the controls. Matches the server. */
-export const DEFAULTS = { temperature: 0.7, top_p: 0.95, top_k: 40, max_tokens: 512 };
+// 1024 rather than 512 because of reasoning models. Qwen3 writes its working
+// before its answer, and on a grounded question that working alone ran to
+// about 650 tokens — at 512 the reply is a thinking block and an empty
+// bubble, which reads as a bug and is a budget.
+export const DEFAULTS = { temperature: 0.7, top_p: 0.95, top_k: 40, max_tokens: 1024 };
 
 class Chat {
   /** Every conversation, newest first. */

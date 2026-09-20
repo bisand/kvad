@@ -26,6 +26,7 @@ pub fn routes() -> Router<State> {
         .route("/api/datasets/crawl", post(start_crawl))
         .route("/api/datasets/{id}", get(dataset).delete(remove_dataset))
         .route("/api/datasets/{id}/check", get(check))
+        .route("/api/datasets/{id}/search", get(search))
         // Uploads are text and the store has its own limit; axum's default of
         // 2 MB would refuse a corpus long before that.
         .layer(DefaultBodyLimit::max(datasets::MAX_BYTES + 1024))
@@ -398,9 +399,47 @@ async fn remove_dataset(
 ) -> Result<Json<serde_json::Value>, Fail> {
     let db = state.db.clone();
     match blocking(move || datasets::delete(&db, id)).await? {
-        true => Ok(Json(json!({ "deleted": id }))),
+        true => {
+            crate::retrieval::forget(id);
+            Ok(Json(json!({ "deleted": id })))
+        }
         false => Err(Fail::missing(format!("there is no dataset {id}"))),
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct Question {
+    q: String,
+    #[serde(default)]
+    k: Option<usize>,
+}
+
+/// What this dataset has to say about a question.
+///
+/// The half of retrieval that can be judged on its own. Whether the right
+/// passage comes back and whether a model then reads it properly are
+/// different questions that fail for different reasons, and only the first
+/// one has an answer you can look at.
+async fn search(
+    _: Admin,
+    St(state): St<State>,
+    Path(id): Path<i64>,
+    Query(q): Query<Question>,
+) -> Result<Json<serde_json::Value>, Fail> {
+    let db = state.db.clone();
+    let k = q.k.unwrap_or(5).clamp(1, 50);
+    let found = blocking(move || {
+        let index = crate::retrieval::index_for(&db, id)?;
+        let hits = index.search(&q.q, k);
+        Ok(json!({
+            "chunks": index.len(),
+            "vocabulary": index.vocabulary(),
+            "hits": hits,
+        }))
+    })
+    .await
+    .map_err(|e| Fail::bad(e.1))?;
+    Ok(Json(found))
 }
 
 #[derive(serde::Deserialize)]

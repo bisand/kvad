@@ -382,6 +382,18 @@ pub const ENDPOINTS: &[Endpoint] = &[
         body: None, produces: JSON, events: &[],
     },
 
+    Endpoint {
+        method: "get", path: "/api/datasets/{id}/search", tag: "Datasets", access: Access::Admin,
+        summary: "Find the passages that bear on a question",
+        description: "BM25 over the passages the dataset splits into, built when first asked \
+                      and kept until the file changes. Each hit carries its heading, the page \
+                      it came from when a crawl recorded one, and what each word of the \
+                      question contributed to its score. `dataset` on a completion does the \
+                      same search and puts the result in front of the model.",
+        query: &[("q", true, "The question."), ("k", false, "How many passages (default 5).")],
+        body: None, produces: JSON, events: &[],
+    },
+
     // -- Evals --------------------------------------------------------------
     Endpoint {
         method: "get", path: "/api/evals/suites", tag: "Evals", access: Access::SignedIn,

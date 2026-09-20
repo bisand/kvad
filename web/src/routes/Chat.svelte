@@ -1,6 +1,7 @@
 <script>
   import { chat, describeStats, DEFAULTS } from "../lib/chat.svelte.js";
   import { models } from "../lib/models.svelte.js";
+  import { api } from "../lib/api.js";
   import { navigate } from "../lib/router.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
 
@@ -11,12 +12,20 @@
   const DOWNLOAD = "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3";
 
   let draft = $state("");
+  /// Corpora to answer from, and the one chosen. Empty for anyone who is not
+  /// an administrator, because reading a dataset is an administrator's to do
+  /// — so the picker simply does not appear rather than appearing and failing.
+  let datasets = $state([]);
+  let groundIn = $state(null);
   let showSettings = $state(false);
   let systemDraft = $state("");
   let transcript;
 
   $effect(() => {
     models.refresh();
+    api("/api/datasets")
+      .then((list) => (datasets = list.filter((d) => d.present)))
+      .catch(() => {});
     // Opening the newest conversation rather than an empty pane: arriving
     // here almost always means carrying on with the last thing. Everything
     // after the `await` is untracked, so reading `chat.list` here does not
@@ -49,7 +58,7 @@
     const text = draft;
     draft = "";
     pinned = true;
-    chat.send(text, models.loaded?.repo);
+    chat.send(text, models.loaded?.repo, groundIn);
   }
 
   function onKeydown(event) {
@@ -175,6 +184,21 @@
 
     <!-- The box. -->
     <form class="border-base-300 flex items-end gap-2 border-t p-3" onsubmit={submit}>
+      {#if datasets.length}
+        <!-- Not training: the model learns nothing. The server searches this
+             corpus with the question and puts the passages it finds in front
+             of the model, which then reads them. -->
+        <select
+          class="select select-sm w-40 shrink-0"
+          bind:value={groundIn}
+          title="Answer from a dataset"
+        >
+          <option value={null}>no dataset</option>
+          {#each datasets as d (d.id)}
+            <option value={d.id}>{d.name}</option>
+          {/each}
+        </select>
+      {/if}
       <textarea
         class="textarea min-h-12 w-full grow resize-none"
         rows="1"

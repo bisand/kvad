@@ -538,7 +538,10 @@ pub fn run(
     // The text of every page kept, by hash, so that the same page under two
     // addresses is in the corpus once.
     let mut already: HashMap<u64, String> = HashMap::new();
-    let mut body = String::new();
+    // Pages are kept apart and joined at the end, because the heading a page
+    // gets depends on what every *other* page is called: see `shared_suffix`.
+    let mut kept: Vec<String> = Vec::new();
+    let mut collected = 0usize;
     let mut at = 0;
 
     while at < queue.len() {
@@ -550,7 +553,7 @@ pub fn run(
             stopped = Some(format!("the limit of {} pages", request.max_pages));
             break;
         }
-        if body.len() >= request.max_bytes {
+        if collected >= request.max_bytes {
             stopped = Some(format!(
                 "the limit of {}",
                 crate::hub::human_bytes(request.max_bytes as u64)
@@ -567,7 +570,7 @@ pub fn run(
             std::thread::sleep(Duration::from_millis(request.delay_ms));
         }
 
-        let room = request.max_bytes.saturating_sub(body.len()).max(4096);
+        let room = request.max_bytes.saturating_sub(collected).max(4096);
         let fetched = match fetch(&agent, &scope, &url, room) {
             Ok(fetched) => fetched,
             Err(e) => {
@@ -602,7 +605,13 @@ pub fn run(
                 .and_then(|b| fetched.url.join(b).ok())
                 .unwrap_or_else(|| fetched.url.clone());
             for href in &page.links {
-                let Ok(next) = base.join(href) else { continue };
+                let Ok(mut next) = base.join(href) else { continue };
+                // `key` strips this for the `seen` set, but the URL that gets
+                // queued is the URL that gets fetched and recorded — so a
+                // page first linked to as `ch04.html#clone` was cited, in the
+                // manifest and in every answer built from it, by a heading
+                // halfway down itself.
+                next.set_fragment(None);
                 if !scope.allows(&next) || !seen.insert(key(&next)) {
                     continue;
                 }
@@ -644,17 +653,8 @@ pub fn run(
             true => fetched.url.path().to_string(),
             false => page.title.clone(),
         };
-        // One heading per page, so that the corpus reads as a document rather
-        // than as a pile — but only where the page does not already start
-        // with one of its own. mdBook titles its pages `Ownership - The Rust
-        // Programming Language` and then opens with `# Ownership`, and both
-        // of those in a row is one too many. The address is in neither: it is
-        // in the manifest, where it is provenance rather than something to
-        // learn to write.
-        match text.starts_with('#') {
-            true => body.push_str(&format!("\n\n{text}\n")),
-            false => body.push_str(&format!("\n\n# {title}\n\n{text}\n")),
-        }
+        kept.push(text.to_string());
+        collected += text.len();
         pages.push(Fetched { url: fetched.url.to_string(), title: title.clone(), characters: text.chars().count() });
 
         let total = (pages.len() + queue.len() - at).min(request.max_pages);
@@ -670,6 +670,19 @@ pub fn run(
     }
 
     say(Note::Say(format!("{} pages read; cleaning up the text", pages.len())));
+
+    // One `#` per page, so that the corpus is a document with a shape rather
+    // than a pile — and so that anything reading it afterwards can tell where
+    // one page ended and the next began. Only a page that already opens with
+    // a *top-level* heading keeps its own: `starts_with('#')` was true of
+    // `##` as well, and mdBook opens most of its chapters with one, so 85 of
+    // the Rust book's 111 pages were silently filed as subsections of
+    // whichever page came before them.
+    //
+    // The address is in neither heading: it is in the manifest, where it is
+    // provenance rather than something for a model to learn to write.
+    let body = assemble(&pages, &kept);
+
     let (text, mapped) = clean::normalise(&body);
     let (text, dropped) = clean::drop_rare(&text, request.drop_rare);
     let alphabet = clean::histogram(&text);
@@ -691,6 +704,93 @@ pub fn run(
         request: request.clone(),
     };
     Ok(Crawled { text, manifest })
+}
+
+/// Join the pages into one document, each under a heading of its own.
+///
+/// Only a page that already opens with a *top-level* heading keeps its own.
+/// `starts_with('#')` was true of `##` as well, and mdBook opens most of its
+/// chapters with one — so 85 of the Rust book's 111 pages were filed as
+/// subsections of whichever page happened to come before them, and anything
+/// reading the corpus afterwards attributed them to the wrong chapter.
+fn assemble(pages: &[Fetched], texts: &[String]) -> String {
+    let titles: Vec<&str> = pages.iter().map(|p| p.title.as_str()).collect();
+    let suffix = shared_suffix(&titles);
+    let mut body = String::new();
+    for (page, text) in pages.iter().zip(texts) {
+        match text.starts_with("# ") {
+            true => body.push_str(&format!("\n\n{text}\n")),
+            false => {
+                let heading = heading(&page.title, &suffix);
+                // A page whose first heading already says what the title says
+                // does not need both: mdBook writes `<title>What is
+                // Ownership?</title>` and then an `<h2>What Is Ownership?</h2>`,
+                // which came out as `What is Ownership? > What Is Ownership?`.
+                let text = without_repeat(text, &heading);
+                body.push_str(&format!("\n\n# {heading}\n\n{text}\n"))
+            }
+        }
+    }
+    body
+}
+
+/// The page's text with its opening heading removed, when that heading says
+/// the same thing as the title it is about to be given.
+///
+/// Compared on letters and digits alone, because the two come from different
+/// places and disagree about capitalisation and punctuation more often than
+/// they agree: a `<title>` is written for a browser tab and an `<h1>` for the
+/// page.
+fn without_repeat<'a>(text: &'a str, heading: &str) -> &'a str {
+    let Some(first) = text.lines().next() else { return text };
+    let hashes = first.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return text;
+    }
+    let letters = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    match letters(&first[hashes..]) == letters(heading) {
+        true => text[first.len()..].trim_start_matches('\n'),
+        false => text,
+    }
+}
+
+/// The tail every page's title shares, if they share one.
+///
+/// A site puts its own name on every page — "Ownership - The Rust Programming
+/// Language" — which is useful in a browser tab and is noise repeated once a
+/// page in a corpus. Found rather than guessed: the separator-led tail that
+/// most of the pages agree on. A crawl of one page has nothing to compare and
+/// keeps its whole title.
+fn shared_suffix(titles: &[&str]) -> Option<String> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for title in titles {
+        for separator in [" - ", " — ", " – ", " | ", " · ", " :: "] {
+            if let Some(at) = title.rfind(separator) {
+                *counts.entry(&title[at..]).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n > 1 && n * 2 > titles.len())
+        .max_by_key(|(tail, n)| (*n, tail.len()))
+        .map(|(tail, _)| tail.to_string())
+}
+
+/// A page's title with the site's name off the end of it.
+///
+/// Never down to nothing: a page actually called "The Rust Programming
+/// Language" on a site of that name keeps it, because an empty heading is
+/// worse than a repeated one.
+fn heading(title: &str, suffix: &Option<String>) -> String {
+    let short = match suffix {
+        Some(suffix) => title.strip_suffix(suffix.as_str()).unwrap_or(title),
+        None => title,
+    };
+    match short.trim().is_empty() {
+        true => title.trim().to_string(),
+        false => short.trim().to_string(),
+    }
 }
 
 /// Today, as `2026-09-20T11:03:12Z`.
@@ -762,6 +862,70 @@ mod tests {
         assert!(!suggested_name("https://x.test/a/b?q=1#z").contains(['/', '?', '#']));
         assert_eq!(suggested_name("https://x.test/"), "x.test");
         assert_eq!(suggested_name("not a url"), "");
+    }
+
+    /// Every page needs a heading of its own, or the corpus has no page
+    /// boundaries in it and a citation lands on the wrong chapter.
+    #[test]
+    fn a_page_that_opens_with_a_subheading_still_gets_a_heading() {
+        let page = |title: &str| Fetched { url: "u".into(), title: title.into(), characters: 0 };
+        let pages = [
+            page("Guessing Game - The Rust Programming Language"),
+            page("What Is Ownership? - The Rust Programming Language"),
+            page("The Rust Programming Language"),
+        ];
+        let texts = [
+            "# Guessing Game\n\nLet us play.".to_string(),
+            "## What Is Ownership?\n\nOwnership is a set of rules.".to_string(),
+            "Just prose, no heading at all.".to_string(),
+        ];
+
+        let body = assemble(&pages, &texts);
+        let headings: Vec<&str> = body.lines().filter(|l| l.starts_with("# ")).collect();
+        assert_eq!(
+            headings,
+            ["# Guessing Game", "# What Is Ownership?", "# The Rust Programming Language"],
+            "one top-level heading per page, whatever the page opened with"
+        );
+        // The one that had its own kept it, rather than being given a second.
+        assert_eq!(body.matches("Guessing Game").count(), 1);
+        // And the site's name is off the end of the ones that were given one.
+        assert!(!body.contains("# What Is Ownership? - The"));
+        // A title that is only the site's name keeps it: an empty heading is
+        // worse than a repeated one.
+        assert!(body.contains("# The Rust Programming Language"));
+    }
+
+    /// The same thing said twice, once for a browser tab and once for the
+    /// page, with the capitals in different places.
+    #[test]
+    fn a_page_is_not_given_a_heading_it_already_has() {
+        let page = |title: &str| Fetched { url: "u".into(), title: title.into(), characters: 0 };
+        let pages = [page("What is Ownership?"), page("Storing Lists"), page("Plain")];
+        let texts = [
+            "## What Is Ownership?\n\nOwnership is a set of rules.".to_string(),
+            "## Storing Lists of Values\n\nA different heading entirely.".to_string(),
+            "No heading at all here.".to_string(),
+        ];
+
+        let body = assemble(&pages, &texts);
+        assert_eq!(body.matches("Ownership?").count(), 1, "said twice: {body}");
+        // A heading that is genuinely different is kept, at its own level.
+        assert!(body.contains("# Storing Lists\n"));
+        assert!(body.contains("## Storing Lists of Values"));
+        assert!(body.contains("# Plain\n"));
+    }
+
+    #[test]
+    fn the_site_name_is_found_rather_than_guessed() {
+        let titles = ["A - Docs", "B - Docs", "C - Docs", "D"];
+        assert_eq!(shared_suffix(&titles).as_deref(), Some(" - Docs"));
+        assert_eq!(heading("A - Docs", &shared_suffix(&titles)), "A");
+
+        // Nothing shared, nothing stripped.
+        assert_eq!(shared_suffix(&["A - One", "B - Two", "C - Three"]), None);
+        assert_eq!(shared_suffix(&["Only one page"]), None);
+        assert_eq!(heading("A - One", &None), "A - One");
     }
 
     #[test]

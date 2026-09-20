@@ -127,7 +127,7 @@ class Chat {
   }
 
   /** Ask, stream the reply, then save both halves. */
-  async send(text, model) {
+  async send(text, model, dataset = null) {
     if (this.sending) return;
     const question = text.trim();
     if (!question) return;
@@ -148,7 +148,16 @@ class Chat {
       await this.#save("user", question, null, true);
       await sse(
         "/v1/chat/completions",
-        { model, messages: turns, stream: true, ...this.sampler },
+        // `dataset` is kvad's own: the server searches it with the question
+        // and puts what it finds in front of the model. Left out entirely
+        // when there is none, so the request stays a plain OpenAI one.
+        {
+          model,
+          messages: turns,
+          stream: true,
+          ...(dataset ? { dataset } : {}),
+          ...this.sampler,
+        },
         {
           message: (data) => {
             if (data === "[DONE]") return;

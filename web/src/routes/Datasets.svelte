@@ -144,6 +144,27 @@
   const counted = $derived(text ? [...text].length : 0);
   const distinct = $derived(text ? new Set(text).size : 0);
 
+  // Searching one.
+  let searchIn = $state(null);
+  let question = $state("");
+  let searching = $state(false);
+  let found = $state(null);
+
+  async function ask(event) {
+    event.preventDefault();
+    if (!searchIn || !question.trim()) return;
+    searching = true;
+    try {
+      found = await api(
+        `/api/datasets/${searchIn}/search?q=${encodeURIComponent(question.trim())}&k=5`,
+      );
+    } catch (e) {
+      toasts.error(e.message);
+      found = null;
+    }
+    searching = false;
+  }
+
   const live = $derived(crawl?.job.state === "running" || crawl?.job.state === "queued");
   const result = $derived(crawl?.job.result ?? null);
 
@@ -402,6 +423,78 @@
     {/if}
   </section>
 </div>
+
+<!-- Retrieval, on its own. Whether the right passage comes back and whether
+     a model then reads it properly are different questions that fail for
+     different reasons, and only the first one has an answer you can look at. -->
+{#if training.datasets.length}
+  <div class="mx-auto mt-6 flex max-w-4xl flex-col gap-6">
+    <section class="card bg-base-100 border-base-300 border">
+      <form class="card-body gap-3 p-4" onsubmit={ask}>
+        <h2 class="text-sm font-medium opacity-60">Search a dataset</h2>
+        <div class="flex flex-wrap items-end gap-2">
+          <fieldset class="fieldset">
+            <legend class="fieldset-legend">In</legend>
+            <select class="select select-sm w-56" bind:value={searchIn}>
+              <option value={null} disabled>choose one</option>
+              {#each training.datasets as d (d.id)}
+                <option value={d.id}>{d.name}</option>
+              {/each}
+            </select>
+          </fieldset>
+          <fieldset class="fieldset grow">
+            <legend class="fieldset-legend">Question</legend>
+            <input
+              class="input input-sm w-full"
+              bind:value={question}
+              placeholder="what is on the stack"
+            />
+          </fieldset>
+          <button class="btn btn-sm" disabled={searching || !searchIn || !question.trim()}>
+            {#if searching}<span class="loading loading-spinner loading-xs"></span>{/if}
+            Search
+          </button>
+        </div>
+
+        {#if found}
+          <p class="text-xs opacity-60">
+            {found.hits.length} of {found.chunks.toLocaleString()} passages, over a vocabulary of
+            {found.vocabulary.toLocaleString()} words.
+            {#if found.hits.length === 0}Nothing matched — the words in the question are not in
+              this corpus.{/if}
+          </p>
+          {#each found.hits as hit (hit.chunk.id)}
+            <div class="border-base-300 rounded-box border p-3">
+              <div class="flex flex-wrap items-baseline gap-2">
+                <span class="badge badge-sm badge-neutral">{hit.score.toFixed(2)}</span>
+                <span class="text-sm font-medium">{hit.chunk.heading}</span>
+                {#if hit.chunk.source}
+                  <a class="link link-hover truncate text-xs opacity-60" href={hit.chunk.source}
+                    >{hit.chunk.source}</a
+                  >
+                {/if}
+              </div>
+              <!-- Why this came back, which an embedding index could not say. -->
+              <div class="mt-1 flex flex-wrap gap-1">
+                {#each hit.because.slice(0, 5) as [word, score] (word)}
+                  <span class="badge badge-ghost badge-xs">{word} {score.toFixed(1)}</span>
+                {/each}
+              </div>
+              <p class="mt-2 max-h-32 overflow-y-auto text-xs whitespace-pre-wrap opacity-70">
+                {hit.chunk.text}
+              </p>
+            </div>
+          {/each}
+        {:else}
+          <p class="text-xs opacity-60">
+            BM25 over the passages a dataset splits into, built when asked and kept until the file
+            changes. The badges under each hit are what each word of the question contributed.
+          </p>
+        {/if}
+      </form>
+    </section>
+  </div>
+{/if}
 
 {#if confirming}
   <div class="modal modal-open" role="dialog">

@@ -21,8 +21,9 @@
 //! 8. [`service`] — the same engine driven from another thread, which is what
 //!    a terminal UI and a server both need.
 //!
-//! [`crawl`] is off to one side: no tensors in it at all, just the way a
-//! corpus gets made out of a documentation site.
+//! [`crawl`] and [`retrieve`] are off to one side: no tensors in either, just
+//! the way a corpus gets made out of a documentation site and the way the
+//! part of it that answers a question gets found again.
 
 pub mod chat;
 pub mod crawl;
@@ -31,6 +32,7 @@ pub mod machine;
 pub mod model;
 pub mod qcache;
 pub mod quant;
+pub mod retrieve;
 pub mod runtime;
 pub mod service;
 pub mod simd;

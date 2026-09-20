@@ -89,6 +89,11 @@ impl Fail {
     pub fn internal(why: impl Into<String>) -> Self {
         Fail(StatusCode::INTERNAL_SERVER_ERROR, why.into())
     }
+    /// Signed in, and not allowed this. Distinct from [`crate::auth::Denied`],
+    /// which answers a request that failed to say who it was at all.
+    pub fn denied(why: impl Into<String>) -> Self {
+        Fail(StatusCode::FORBIDDEN, why.into())
+    }
 }
 
 impl IntoResponse for Fail {

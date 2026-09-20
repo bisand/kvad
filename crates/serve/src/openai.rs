@@ -84,7 +84,24 @@ pub struct Completions {
     max_tokens: Option<usize>,
     #[serde(default)]
     seed: Option<u64>,
+    /// Answer from this dataset: search it with the last thing the user
+    /// said, and put what comes back in front of the model.
+    ///
+    /// Not OpenAI's either. It is the answer to "can I add knowledge to a
+    /// model" that does not involve training one: the model learns nothing
+    /// and reads something.
+    #[serde(default)]
+    dataset: Option<i64>,
 }
+
+/// How much of a dataset to put in front of the model, in characters.
+///
+/// About a thousand tokens at four characters each — comfortable inside the
+/// 2k context of the smallest instruction-tuned model here, and a small share
+/// of a larger one's. Five chunks, because the sixth is rarely better than
+/// the first and always costs the same.
+const GROUNDING_BUDGET: usize = 4_000;
+const GROUNDING_CHUNKS: usize = 5;
 
 #[derive(serde::Deserialize)]
 pub struct Turn {
@@ -133,12 +150,42 @@ impl Completions {
 }
 
 pub async fn completions(
-    _: Identity,
+    who: Identity,
     St(state): St<State>,
     Json(body): Json<Completions>,
 ) -> Result<Response, Fail> {
     let sampling = body.sampling()?;
-    let turns = body.turns()?;
+    let mut turns = body.turns()?;
+
+    // Retrieval goes in front of everything else the conversation says, so
+    // that a system prompt the user wrote still has the last word on tone.
+    if let Some(dataset) = body.dataset {
+        // Everything else that reads a corpus is behind `Admin` — the
+        // preview, the search, the listing — and an answer built out of one
+        // is that corpus read aloud. A different gate here would be a way
+        // around the others.
+        if !who.is_admin() {
+            return Err(Fail::denied("answering from a dataset is an administrator's to ask for"));
+        }
+        let question = body
+            .messages
+            .iter()
+            .rev()
+            .find(|t| t.role == "user")
+            .map(|t| t.content.clone())
+            .ok_or_else(|| Fail::bad("answering from a dataset needs a question to search it with"))?;
+        let db = state.db.clone();
+        let found = blocking(move || {
+            crate::retrieval::grounding(&db, dataset, &question, GROUNDING_CHUNKS, GROUNDING_BUDGET)
+        })
+        .await
+        .map_err(|e| Fail::bad(e.1))?;
+        // Nothing matched: the model is told nothing rather than told that
+        // nothing was found, and answers as it otherwise would.
+        if let Some(grounding) = found {
+            turns.insert(0, Message::system(&grounding));
+        }
+    }
 
     let loaded = match (&body.model, state.engine.loaded()) {
         (None, Some(l)) => l,

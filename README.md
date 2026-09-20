@@ -619,6 +619,67 @@ because "fetch this URL for me" is the shape of request that otherwise reads a
 cloud metadata endpoint into a file. That check is of the name and not of the
 socket, which a resolver of our own would close and nothing less will.
 
+### Answering from a corpus, without training one
+
+Training cannot put facts into these models. A character model has nowhere to
+keep them, and the downloaded models cannot be trained here at all — there is
+no backward pass for those architectures, only a forward one. So the corpus a
+crawl produces is useful the other way round: keep the text, find the part of
+it that bears on the question, and put that in the prompt. The model learns
+nothing and reads something.
+
+```
+kvad crawl → dataset → chunks → BM25 → the five best passages + the question
+                                                ↓
+                       an instruction-tuned model, which reads them
+```
+
+**The index is arithmetic, not a second model.** The modern answer is
+embeddings, which would mean adding a BERT-class encoder — a whole
+architecture, not a feature — to be worse at the thing a documentation corpus
+is made of. `Vec<T>`, `unwrap`, `trpl::join` are not fuzzy concepts to be
+matched by meaning; they are strings, and a question containing one is nearly
+always about it. BM25 is thirty years old, is four lines of arithmetic, and
+can say *why* each passage came back, which an embedding cannot do at all.
+
+There is no stop-word list, because a word in every chunk has an inverse
+document frequency near zero and changes no ranking — and a hand-kept list
+would be wrong for a corpus about the word `if`. There is no `chunks` table
+and no migration either: the Rust book chunks in 7 ms and indexes in 14 ms,
+which is less than the round trip that asked for it, so the index is built on
+demand and kept until the file under it changes.
+
+**Two bugs this found in the crawler, both by looking at output.** Citations
+pointed at the wrong chapter, because `text.starts_with('#')` is true of `##`
+as well — mdBook opens most chapters with an `<h2>`, so 85 of the book's 111
+pages had no heading of their own and were filed under whichever page came
+before them. 26 top-level headings for 111 pages. And the URLs carried the
+`#fragment` of whichever link first pointed at them, so a page was cited by a
+heading halfway down itself.
+
+**And two in the ranking.** Asked "how do I make a vector", the top result was
+a chapter on I/O with no vector in it — because the cutting rule turns `I/O`
+into the word `i`, almost no passage contains a lone `i`, and BM25 pays well
+for rare words: `i` scored 5.1 against `vector`'s 5.0. Single characters are
+dropped now, in the question and in the index; `Box<T>` is found by `box`.
+Separately, a passage that matched only the question's common words was
+scoring 21% of the best hit on a small corpus — so if a question contains
+anything specific, a passage now has to have matched something specific, and
+if it contains nothing specific the rule is not applied at all, because then
+a corpus entirely about vectors should still answer "vector".
+
+**The part worth keeping is that the two halves are measured apart.** Whether
+the right passage comes back and whether the model then reads it properly are
+different questions that fail for different reasons. Asked what the book says
+about using a reference to an element after pushing to a vector, the
+ungrounded 0.5B model invented a "reference to the vector's capacity", which
+is not a thing. Grounded, it stopped inventing — and answered a different
+question, about indexing past the end. The search endpoint says which of those
+happened: all five passages were from the right section of ch08-01, and the
+one about the borrow checker was ranked second. Retrieval was right and the
+reader picked wrong. Without a way to ask the two questions separately, that is
+indistinguishable from "RAG does not work".
+
 ### One tool: `kvad train`
 
 ```bash

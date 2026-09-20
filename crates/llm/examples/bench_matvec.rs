@@ -72,15 +72,27 @@ fn bench_batch(label: &str, rows: usize, cols: usize, m: usize) {
 
     println!("\n{label}  [{rows} x {cols}] x {m} tokens");
     let f32w = Weight::quantize(t.clone(), Precision::F32);
-    let w = Weight::quantize(t, Precision::Q8);
+    let q8w = Weight::quantize(t.clone(), Precision::Q8);
+    let q4w = Weight::quantize(t, Precision::Q4);
     let mut baseline = 0.0f64;
-    for (name, allow) in [("f32 gemm", false), ("q8 sdot", false), ("q8 smmla", true)] {
+    // Both quantised layouts, both kernels. q4 reaches SMMLA by unpacking a
+    // row pair of nibbles to `i8`; the `sdot` rows are the row-at-a-time
+    // fallback, which is what a CPU without i8mm would run.
+    for (name, allow) in [
+        ("f32 gemm", false),
+        ("q8 sdot", false),
+        ("q8 smmla", true),
+        ("q4 sdot", false),
+        ("q4 smmla", true),
+    ] {
         let is_f32 = name.starts_with("f32");
         let run = || {
             if is_f32 {
                 f32w.matmul_bt_with(&xs, m, None, false)
+            } else if name.starts_with("q8") {
+                q8w.matmul_bt_with(&xs, m, None, allow)
             } else {
-                w.matmul_bt_with(&xs, m, None, allow)
+                q4w.matmul_bt_with(&xs, m, None, allow)
             }
         };
         for _ in 0..2 {

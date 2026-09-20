@@ -1196,6 +1196,60 @@ still decoding faster. In the server's own benchmark, time to first token at q4
 moved from 41 ms to 33.8 against q8's 34.3 — a difference that has stopped
 existing.
 
+#### Checking that, after the decode kernel turned up a five-fold hole
+
+[The 4-bit decode kernel](#the-nibble-kernel-the-compiler-would-not-write) was
+5x off from what the source suggested, and the section above makes the same
+kind of claim about prefill on a noisier measurement — so it is worth asking
+whether prefill has a hole of its own. It does not, and the way that was
+established is the point.
+
+The first problem was that nothing measured it. `bench_batch` had rows for
+`f32 gemm`, `q8 sdot` and `q8 smmla` and no q4 at all: the benchmark's blind
+spot was exactly where the question lived. With q4 in it, and swept across the
+batch size rather than measured at one:
+
+| m | q8 `SMMLA` | q4 `SMMLA` | q8 `SDOT` | q4 `SDOT` |
+|---|---|---|---|---|
+| 2 | 77.9 | 71.6 | 71.1 | 66.7 |
+| 8 | 153.6 | 151.6 | 130.5 | 131.2 |
+| 32 | 285.4 | 279.7 | 141.9 | 146.1 |
+| 64 | 306.3 | 306.0 | 161.0 | 161.5 |
+| 128 | 319.7 | 309.6 | 207.4 | 210.8 |
+
+GMAC/s on `mlp.down`, `[896 x 4864]`. q4 is level with q8 from `m = 8` up and
+at worst 8% behind at `m = 2`, where the unpack is amortised across exactly one
+pass of the kernel. `SMMLA` beats the row-at-a-time path at every batch size,
+so the `m >= 2` gate is right too. End to end, 685 tokens on Qwen2.5-0.5B, six
+rounds interleaved: **q4 1.34 s against q8 1.36 s.**
+
+And the disassembly says why there was nothing to find. The nibble unpack
+compiles to `ldr q` / `and.16b` / `usra.16b` / two `str q` — sixteen bytes in,
+thirty-two out, fully vectorised. The split packing is the reason: the low
+nibbles of sixteen bytes *are* sixteen consecutive weights, so unpacking writes
+two contiguous runs and never scatters. The decode kernel's problem was never
+that nibbles are awkward; it was one `zext` in a reduction the vectoriser was
+looking at.
+
+**One thing did change, in the path nobody was looking at.** A CPU without
+`i8mm` prefills on `row_dot`, which calls the same block-dot the decode kernel
+replaced. So the decode work lifted prefill too, on hardware that cannot reach
+`SMMLA` at all — `KVAD_NO_DOTPROD=1` against it, `m = 64`:
+
+| | q4 `SDOT` before | after | | vs q8 |
+|---|---|---|---|---|
+| `mlp.down` | 117.1 | **161.5** | 1.38x | 0.75x → 1.00x |
+| `q_proj` | 95.3 | **138.1** | 1.45x | 0.73x → 1.02x |
+
+On `q_proj` that also puts q4 ahead of the f32 GEMM (138.1 against 134.9),
+which the section above notes was the one shape where quantisation lost on the
+fallback. It no longer does.
+
+So: no kernel written here, and the measurement that would have caught it if
+there were is now in the benchmark instead of absent from it. Worth writing
+down at the same length as a fix, because "we looked and there was nothing"
+is only useful if you can see how hard anyone looked.
+
 ### The bug worth stealing
 
 The first version of the `SMMLA` kernel was **slower than the `SDOT` path it

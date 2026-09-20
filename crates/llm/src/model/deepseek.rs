@@ -73,7 +73,7 @@
 use super::{Architecture, CacheShape, Json, KvCache, Spec, Transformer};
 use crate::qcache::Source;
 use crate::quant::Weight;
-use crate::tensor::{rms_norm, softmax_inplace, swiglu_inplace, Rope};
+use crate::tensor::{dot, rms_norm, softmax_inplace, swiglu_inplace, Rope};
 use rayon::prelude::*;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -762,16 +762,12 @@ impl Model {
                     let n = pos0 + i + 1;
                     scores.clear();
                     for t in 0..n {
+                        // The latent is 512 wide here, so a running sum would
+                        // be a 512-long chain of dependent adds per position.
                         let c = &cs[t * lat..(t + 1) * lat];
-                        let mut dot = 0.0f32;
-                        for j in 0..lat {
-                            dot += q_lat[j] * c[j];
-                        }
                         let pe = &k_pe[t * rope_dim..(t + 1) * rope_dim];
-                        for j in 0..rope_dim {
-                            dot += q_pe[j] * pe[j];
-                        }
-                        scores.push(dot * mla.softmax_scale);
+                        let d = dot(&q_lat, c) + dot(q_pe, pe);
+                        scores.push(d * mla.softmax_scale);
                     }
                     softmax_inplace(&mut scores);
 

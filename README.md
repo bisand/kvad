@@ -1250,6 +1250,95 @@ there were is now in the benchmark instead of absent from it. Worth writing
 down at the same length as a fix, because "we looked and there was nothing"
 is only useful if you can see how hard anyone looked.
 
+### The KV cache, and a fix that was slower than the bug
+
+The [roadmap](#where-to-go-next) has called the KV cache the next bottleneck for
+a while, on the grounds that it is the only part of a decode step that grows
+with the conversation. Everything else — every matmul, all 169 of them — is the
+same size at position 10 and at position 4000. So it is worth knowing what it
+actually costs, and until `bench_attend` existed nothing measured it.
+
+`attend` scores this token's query against every cached key. The loop was
+written the obvious way:
+
+```rust
+let mut dot = 0.0f32;
+for i in 0..hd {
+    dot += q_head[i] * k_head[i];
+}
+```
+
+One running sum — which [`tensor::matvec_bt`](crates/llm/src/tensor.rs), in the
+next file along, already carries a comment warning against: *"four lanes, not
+one running sum: a single chain would stall on FMA latency rather than run at
+its throughput."* DeepSeek's latent attention had the same loop over a
+512-wide vector, so its chain was 512 dependent adds long.
+
+**Then the fix turned out to be slower than the bug.** Four lanes, the form the
+repo already uses, on a 64-long dot over a 2048-entry cache, one core:
+
+| | |
+|---|---|
+| one running sum *(what shipped)* | 17.6 us |
+| four lanes | 22.8 us |
+| **eight lanes** | **6.3 us** |
+
+The disassembly says why, and it is not what the comment assumes. LLVM cannot
+reorder float additions, but nothing stops it vectorising the *multiplies*: the
+scalar loop compiles to four `FMUL.4S` and a chain of scalar `FADD`s, and
+because consecutive positions are independent, the out-of-order engine overlaps
+those chains across `t`. Four lanes replaces that with a single 128-bit
+accumulator carried around the loop — one vector FMA per iteration, each
+waiting on the last, and nothing to overlap it with. Eight lanes is two
+independent chains, which is the first shape that actually beats doing nothing.
+
+So the rule is not "lanes are better than a running sum". It is *two
+accumulators or more*, and four lanes only looks like a fix because a 128-bit
+vector makes it look like four.
+
+`tensor::dot` is now eight lanes and shared, and `attend` and DeepSeek's MLA
+call it instead of writing the loop out. Both versions of `attend` live in
+[`bench_attend`](crates/llm/examples/bench_attend.rs), alternating in one
+process and checked against each other every round:
+
+| ctx | running sum | eight lanes | | cache/layer | attention alone |
+|---|---|---|---|---|---|
+| **Qwen2.5-0.5B shape** — 14 heads, 2 KV, `head_dim` 64, 24 layers ||||||
+| 512 | 22.2 us | 18.6 | 1.19x | 0.52 MB | 0.45 ms/token |
+| 2048 | 74.8 | 60.3 | 1.24x | 2.10 MB | 1.45 |
+| 8192 | 332.3 | 248.1 | **1.34x** | 8.39 MB | 5.95 |
+| **Llama-8B shape** — 32 heads, 8 KV, `head_dim` 128, 32 layers ||||||
+| 128 | 49.6 | 37.2 | **1.33x** | 1.05 MB | 1.19 |
+| 512 | 148.8 | 108.3 | **1.37x** | 4.19 MB | 3.47 |
+| 2048 | 505.4 | 420.3 | 1.20x | 16.78 MB | 13.45 |
+| 8192 | 2293.1 | 2275.6 | **1.01x** | 67.11 MB | 72.82 |
+
+**The last row is the more useful result.** At 67 MB of cache per layer the fix
+buys nothing at all, because the loop has stopped being latency-bound and
+become DRAM-bound — and the last column says why that matters: attention alone
+is 73 ms per token there, which is most of the token.
+
+**What it is worth end to end is smaller, and today unmeasurable.** Attention
+is a minority of a decode step at these lengths — 1.45 ms of a ~12 ms token at
+2048 on Qwen — so 1.24x of it predicts about 3%. Driving a real session at 4096
+tokens of context, five rounds alternating, that is what the paired rounds
+suggested (1.00x, 1.06x, 1.02x, 1.06x, 1.05x) — but the control, the same
+measurement at 64 tokens of context where the fix has almost nothing to do,
+swung 0.88x to 1.03x across those same rounds. The control's noise is wider than the effect, so
+the honest answer is that this machine could not resolve it, and the isolated
+numbers above are the claim. It gets decisive at long context on a big model,
+and that is exactly where the second finding says the fix stops helping.
+
+Which is the argument for the paged cache, arrived at from the measurement
+rather than from the memory figure. Under grouped-query attention each cached
+key is read **once per query head in its group** — seven times on Qwen, four on
+that Llama shape — because `attend` parallelises over query heads and each one
+walks the cache for itself. The bytes are shared; the reads are not. Fixing
+that means restructuring attention around the KV head rather than the query
+head, with the softmax split across position blocks, which is a different and
+much larger change than a dot product. It is now a measured number instead of
+an assumption, which is the part that was missing.
+
 ### The bug worth stealing
 
 The first version of the `SMMLA` kernel was **slower than the `SDOT` path it
@@ -1916,9 +2005,17 @@ own number below. The rest:
 appending, which is 805 MB at Qwen's full context and cannot be shared between
 sequences or reclaimed in pieces. Paging it into fixed blocks is what makes
 several conversations fit in the memory of one, and it is a prerequisite for
-everything below. It is also the next thing the profiler will be pointed at:
-at 112 tok/s the cache is a larger share of each token than it was at 35.
-Quantising it is a second, separate win.
+everything below. Quantising it is a second, separate win.
+
+This one has now been profiled rather than assumed, and the number that came
+back was not the one this paragraph expected — see
+[the KV cache](#the-kv-cache-and-a-fix-that-was-slower-than-the-bug). The
+cheap half is done: the attention score loop was a single float accumulator
+chain and is now eight, worth up to 1.37x of `attend`. The expensive half is
+that grouped-query attention reads each cached key once per query head in its
+group, so the traffic is several times the cache size, and past a few tens of
+megabytes per layer that is the whole cost. Restructuring around the KV head
+is the real work, and it is a different shape of change from anything above.
 
 This one now has a gauge. The dashboard reports the cache twice over — what it
 holds at this moment, and what the same conversation would cost at full context

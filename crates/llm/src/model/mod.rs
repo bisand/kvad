@@ -37,7 +37,7 @@ pub mod llama;
 
 pub use arch::{Arch, Architecture};
 
-use crate::tensor::softmax_inplace;
+use crate::tensor::{dot, softmax_inplace};
 use crate::weights::read_json;
 use rayon::prelude::*;
 use std::path::Path;
@@ -400,12 +400,12 @@ pub fn attend(spec: &Spec, q: &[f32], k_cache: &[f32], v_cache: &[f32], n_positi
             scores.clear();
             for t in 0..n_positions {
                 let base = t * kv_dim + kv_off;
-                let k_head = &k_cache[base..base + hd];
-                let mut dot = 0.0f32;
-                for i in 0..hd {
-                    dot += q_head[i] * k_head[i];
-                }
-                scores.push(dot * scale);
+                // [`crate::tensor::dot`] rather than a running sum written
+                // out here. This is the only loop in a decode step whose
+                // length grows with the conversation, so the difference
+                // between FMA latency and FMA throughput is the difference
+                // between a long chat staying fast and not.
+                scores.push(dot(q_head, &k_cache[base..base + hd]) * scale);
             }
             softmax_inplace(&mut scores);
 

@@ -457,6 +457,16 @@ on. The numbers that replace the table wait for the cable; nothing between
 here and Phase 4 is blocked on them. What must not happen is the table being
 filled in from whichever link is to hand.
 
+`scripts/bench-link.py` is the stopgap that needs no engine and nothing
+installed on either machine: `--find` to locate a peer over a cable,
+`--listen` on one end and `--connect` on the other, a sweep from 1 KB to
+8 MB interleaved across rounds so that no size records one stretch of a
+busy machine, and the link identified before any number is printed. It
+measures a round trip rather than one-way bandwidth, because a stage
+boundary is a round trip and because an iperf3 figure would describe this
+link's ceiling while saying nothing about what a 32 KB hop pays before its
+first byte moves. `kvad cluster ping` should keep that shape.
+
 **Phase 1 — split the model, in one process.** `Shard`, the three-method
 `Transformer`, shard-aware `load` and `KvCache` for GPT-2, Llama and DeepSeek.
 `LocalStage` and `PipelineSession` with every stage local. No sockets. Test:

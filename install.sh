@@ -164,10 +164,28 @@ is_loopback() {
     esac
 }
 
-# Whether something already answers on that port. Worth knowing before
+# Whether something already holds this exact address. Worth knowing before
 # installing a unit with KeepAlive on it: kvad-serve would fail to bind, be
 # restarted, fail again, and do that forever while looking installed.
-port_taken() {
+#
+# The address matters, not just the port. A listener on `*:8080` does not
+# stop a bind of `127.0.0.1:8080` — Rust sets SO_REUSEADDR, and an ssh
+# forward on the wildcard happily coexists with a server on loopback. Asking
+# "is this port in use anywhere" called that a conflict and was wrong.
+address_taken() { # host port
+    if have lsof; then
+        lsof -nP -iTCP@"$1":"$2" -sTCP:LISTEN >/dev/null 2>&1
+    elif have ss; then
+        ss -ltnH 2>/dev/null | awk -v a="$1:$2" '$4 == a { found = 1 } END { exit !found }'
+    else
+        return 1
+    fi
+}
+
+# Anything at all on the port, whatever address it is bound to. Not a
+# conflict, but worth mentioning: it is why a server can come up and still
+# not be the thing answering on someone else's interface.
+port_busy() {
     if have lsof; then
         lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
     elif have ss; then
@@ -204,10 +222,14 @@ choose_bind() {
   the bundled kvad.example.toml says how."
             ask "Use $candidate anyway?" n n || continue
         fi
-        if port_taken "$bind_port"; then
-            warn "something is already listening on port $bind_port. Two servers cannot
-  share it, so kvad-serve would fail to bind and be restarted in a loop."
-            ask "Use port $bind_port anyway?" n n || continue
+        if address_taken "$bind_host" "$bind_port"; then
+            warn "something is already listening on $candidate itself. Two servers
+  cannot share one address, so kvad-serve would fail to bind and be
+  restarted in a loop."
+            ask "Use $candidate anyway?" n n || continue
+        elif port_busy "$bind_port"; then
+            say "  ${DIM}note: something else is on port $bind_port at another address."
+            say "  That does not stop this one binding $candidate.${R}"
         fi
         SERVICE_BIND=$candidate
         return 0
@@ -613,7 +635,6 @@ UNIT
 
 if [ -f "$SRC/kvad-serve" ]; then
     do_service=0
-    was_asked=0
     case $WANT_SERVICE in
         yes) do_service=1 ;;
         no)  do_service=0 ;;
@@ -621,18 +642,15 @@ if [ -f "$SRC/kvad-serve" ]; then
             say ""
             say "${B}kvad-serve${R} is the HTTP API and web UI."
             say "It can start automatically when you log in, or you can run it by hand."
-            if ask "Start kvad-serve at login?" n; then
-                do_service=1
-                was_asked=1
-            fi
+            ask "Start kvad-serve at login?" n && do_service=1
             ;;
     esac
 
-    # Somebody who was asked whether gets asked where, unless they already
-    # said with --bind. A run driven by flags is not interrupted by either
-    # question: it gets the checks below instead, which decline rather than
-    # ask.
-    if [ "$do_service" -eq 1 ] && [ "$was_asked" -eq 1 ] && [ "$BIND_GIVEN" -eq 0 ]; then
+    # Anyone installing a service at a terminal gets asked where it listens,
+    # including someone who passed --service. That flag answers "whether",
+    # and saying yes to a service is not saying yes to port 8080. Only
+    # --bind, which names an address, skips the question.
+    if [ "$do_service" -eq 1 ] && [ "$BIND_GIVEN" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
         choose_bind || do_service=0
     elif [ "$do_service" -eq 1 ]; then
         # Both of these produce a unit that looks installed and never serves
@@ -646,11 +664,11 @@ if [ -f "$SRC/kvad-serve" ]; then
   $PREFIX/kvad-serve --help and the bundled kvad.example.toml say how."
             ask "Install the service anyway?" n n || do_service=0
         fi
-        if [ "$do_service" -eq 1 ] && port_taken "$bind_port"; then
+        if [ "$do_service" -eq 1 ] && address_taken "$bind_host" "$bind_port"; then
             say ""
-            warn "something is already listening on port $bind_port. Two servers cannot
-  share it, so kvad-serve would fail to bind and be restarted in a loop.
-  Pick another with --bind, or stop what is there first."
+            warn "something is already listening on $SERVICE_BIND itself. Two servers
+  cannot share one address, so kvad-serve would fail to bind and be
+  restarted in a loop. Pick another with --bind, or stop what is there."
             ask "Install the service anyway?" n n || do_service=0
         fi
     fi

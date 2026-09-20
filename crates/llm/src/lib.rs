@@ -20,8 +20,12 @@
 //!    loop with the models given names and a home.
 //! 8. [`service`] — the same engine driven from another thread, which is what
 //!    a terminal UI and a server both need.
+//!
+//! [`crawl`] is off to one side: no tensors in it at all, just the way a
+//! corpus gets made out of a documentation site.
 
 pub mod chat;
+pub mod crawl;
 pub mod hub;
 pub mod machine;
 pub mod model;

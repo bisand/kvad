@@ -44,7 +44,6 @@ mod chat;
 mod compare;
 mod config;
 mod conversations;
-mod crawl;
 mod datasets;
 mod db;
 mod engine;

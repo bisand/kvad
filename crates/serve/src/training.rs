@@ -355,16 +355,16 @@ async fn upload(
 async fn start_crawl(
     who: Admin,
     St(state): St<State>,
-    Json(body): Json<crate::crawl::Request>,
+    Json(body): Json<kvad::crawl::Request>,
 ) -> Result<Json<Job>, Fail> {
     let request = body.sane();
     datasets::check_name(request.name.trim()).map_err(Fail::bad)?;
-    let request = crate::crawl::Request { name: request.name.trim().to_string(), ..request };
+    let request = kvad::crawl::Request { name: request.name.trim().to_string(), ..request };
     let jobs = state.jobs.clone();
     blocking(move || {
         // Before the job exists: an address that cannot be fetched is this
         // request's answer, not a row that fails a second after it is made.
-        crate::crawl::check(&request)?;
+        kvad::crawl::check(&request)?;
         jobs::crawl(&jobs, request, who.0.id)
     })
     .await

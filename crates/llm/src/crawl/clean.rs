@@ -11,13 +11,13 @@
 //! hundred distinct characters, of which the last two hundred were seen once
 //! each. Those rows never train — they get a handful of gradient updates
 //! between them — and they are the rows that make an existing model refuse
-//! the text entirely, because [`crate::datasets::unseen`] is exactly the
-//! question "does this corpus contain a character your tokeniser has never
+//! the text entirely: what `--from` asks of a corpus before it will continue
+//! a model is exactly "does this contain a character your tokeniser has never
 //! met".
 //!
 //! So: [`normalise`] maps what has an ASCII spelling onto it, and
-//! [`drop_rare`] removes the tail that is left. Both are reported — the job's
-//! result says what was mapped and what was dropped — because silently
+//! [`drop_rare`] removes the tail that is left. Both are reported — the
+//! manifest says what was mapped and what was dropped — because silently
 //! editing somebody's corpus is worse than a big alphabet.
 
 /// Characters that are never dropped however rare they are.

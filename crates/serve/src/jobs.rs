@@ -436,7 +436,7 @@ pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>) -> Res<Job> {
 /// onto the same name, which would be two crawls writing one file.
 pub fn crawl(
     jobs: &Arc<Jobs>,
-    request: crate::crawl::Request,
+    request: kvad::crawl::Request,
     owner: Option<i64>,
 ) -> Res<Job> {
     let taken = jobs.db.with(|c| {
@@ -458,11 +458,11 @@ pub fn crawl(
     let db = jobs.db.clone();
 
     std::thread::Builder::new().name(format!("kvad-crawl-{id}")).spawn(move || {
-        let mut say = |note: crate::crawl::Note| match note {
-            crate::crawl::Note::Say(message) => {
+        let mut say = |note: kvad::crawl::Note| match note {
+            kvad::crawl::Note::Say(message) => {
                 let _ = events.send(Update::Status { message });
             }
-            crate::crawl::Note::Page { url, title, done, total } => {
+            kvad::crawl::Note::Page { url, title, done, total } => {
                 // The bar and the line under it: how far along, and what it
                 // is reading, which is the half anybody actually watches.
                 let _ = events.send(Update::Progress { done, total });
@@ -474,7 +474,7 @@ pub fn crawl(
             }
         };
 
-        let outcome = crate::crawl::run(&request, &mut say, &cancel)
+        let outcome = kvad::crawl::run(&request, &mut say, &cancel)
             .and_then(|crawled| keep(&db, &request, &crawled, owner));
 
         // A stopped crawl keeps the pages it read, the same bargain a stopped
@@ -499,8 +499,8 @@ pub fn crawl(
 /// much better than no corpus at all after twenty minutes of fetching.
 fn keep(
     db: &Db,
-    request: &crate::crawl::Request,
-    crawled: &crate::crawl::Crawled,
+    request: &kvad::crawl::Request,
+    crawled: &kvad::crawl::Crawled,
     owner: Option<i64>,
 ) -> Res<serde_json::Value> {
     let dataset =

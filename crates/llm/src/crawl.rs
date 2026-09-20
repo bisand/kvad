@@ -1,9 +1,9 @@
 //! Turning a documentation site into a corpus.
 //!
-//! Somebody types `https://doc.rust-lang.org/book/`, and a job walks it,
-//! reads the prose out of every page, and writes one text file that
-//! [`crate::datasets`] then owns like any other. The file on disk is still
-//! the truth; this is a different way of getting one there.
+//! Somebody types `https://doc.rust-lang.org/book/`, and this walks it, reads
+//! the prose out of every page, and comes back with one text file that
+//! [`crate::train`] can read. `kvad crawl` writes it where it is told; the
+//! server makes a dataset of it. Neither of them is the crawl.
 //!
 //! # Where it stops
 //!
@@ -24,11 +24,11 @@
 //!
 //! # What comes back
 //!
-//! Two files. `datasets/<name>` is the text, which is what training reads,
-//! and `datasets/<name>.crawl.json` is the manifest: the address of every
-//! page in the order they were fetched, what was skipped and why, and what
-//! the cleaning pass changed. In six months that manifest is the difference
-//! between "a corpus" and "this corpus, from here, on that day".
+//! [`Crawled`]: the text, and a [`Manifest`] — the address of every page in
+//! the order they were fetched, what was skipped and why, and what the
+//! cleaning pass changed. Both callers write the manifest beside the text,
+//! because in six months it is the difference between "a corpus" and "this
+//! corpus, from here, on that day".
 
 mod clean;
 mod html;
@@ -98,6 +98,20 @@ fn default_rare() -> usize {
 }
 
 impl Request {
+    /// A request for one address, with the defaults both front ends start
+    /// from. The name is a suggestion; see [`suggested_name`].
+    pub fn new(url: &str) -> Request {
+        Request {
+            url: url.trim().to_string(),
+            name: suggested_name(url),
+            same_host: false,
+            max_pages: default_pages(),
+            max_bytes: default_bytes(),
+            delay_ms: default_delay(),
+            drop_rare: default_rare(),
+        }
+    }
+
     /// Clamp what a form can ask for to what this is willing to do.
     ///
     /// Not validation — nothing here is a refusal — but a crawl with no delay
@@ -105,7 +119,7 @@ impl Request {
     /// person filling in the form is not the person it would happen to.
     pub fn sane(mut self) -> Self {
         self.max_pages = self.max_pages.clamp(1, 5_000);
-        self.max_bytes = self.max_bytes.clamp(1024, crate::datasets::MAX_BYTES);
+        self.max_bytes = self.max_bytes.clamp(1024, crate::train::MAX_CORPUS_BYTES);
         self.delay_ms = self.delay_ms.clamp(50, 10_000);
         self.drop_rare = self.drop_rare.min(1_000);
         self
@@ -161,6 +175,36 @@ pub enum Note {
     /// growing — and never more than the page limit.
     Page { url: String, title: String, done: usize, total: usize },
     Say(String),
+}
+
+/// A name for the corpus an address would produce.
+///
+/// `https://doc.rust-lang.org/book/` becomes `doc.rust-lang.org-book`. Both
+/// front ends suggest a name and both let it be typed over, so the rule is
+/// here rather than in either of them — and it only has to be a good
+/// suggestion, because what is a legal name is the caller's to say.
+pub fn suggested_name(url: &str) -> String {
+    let Ok(url) = Url::parse(url.trim()) else { return String::new() };
+    let mut parts: Vec<String> = vec![url.host_str().unwrap_or("corpus").to_string()];
+    parts.extend(url.path().split('/').filter(|p| !p.is_empty()).map(str::to_string));
+    if let Some(last) = parts.last_mut() {
+        // The extension says how the page was served, not what is in it.
+        for ext in [".html", ".htm", ".php", ".md", ".txt"] {
+            if let Some(stem) = last.strip_suffix(ext) {
+                *last = stem.to_string();
+                break;
+            }
+        }
+    }
+    let joined: String = parts
+        .join("-")
+        .chars()
+        .map(|c| match c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            true => c,
+            false => '-',
+        })
+        .collect();
+    joined.trim_start_matches(['.', '-']).chars().take(96).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +553,7 @@ pub fn run(
         if body.len() >= request.max_bytes {
             stopped = Some(format!(
                 "the limit of {}",
-                kvad::hub::human_bytes(request.max_bytes as u64)
+                crate::hub::human_bytes(request.max_bytes as u64)
             ));
             break;
         }
@@ -708,6 +752,19 @@ mod tests {
     }
 
     #[test]
+    fn an_address_suggests_what_to_call_what_comes_back() {
+        assert_eq!(suggested_name("https://doc.rust-lang.org/book/"), "doc.rust-lang.org-book");
+        assert_eq!(
+            suggested_name("https://doc.rust-lang.org/book/ch03-01-variables.html"),
+            "doc.rust-lang.org-book-ch03-01-variables"
+        );
+        // Nothing that could be a path, and nothing that could start a flag.
+        assert!(!suggested_name("https://x.test/a/b?q=1#z").contains(['/', '?', '#']));
+        assert_eq!(suggested_name("https://x.test/"), "x.test");
+        assert_eq!(suggested_name("not a url"), "");
+    }
+
+    #[test]
     fn a_fragment_is_a_place_on_a_page_not_another_page() {
         let one = key(&Url::parse("https://x.test/a.html#install").unwrap());
         assert_eq!(one, "https://x.test/a.html");
@@ -779,7 +836,7 @@ mod tests {
         }
         .sane();
         assert_eq!(wild.max_pages, 5_000);
-        assert_eq!(wild.max_bytes, crate::datasets::MAX_BYTES);
+        assert_eq!(wild.max_bytes, crate::train::MAX_CORPUS_BYTES);
         assert_eq!(wild.delay_ms, 50);
         assert_eq!(wild.drop_rare, 1_000);
     }

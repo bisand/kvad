@@ -545,6 +545,80 @@ order they are added in. (The sum is in `f64` for a different reason, and that
 one is real — on a hundred thousand gradients of 1e-3, `f64` gives the correct
 0.3162278 and `f32` gives 0.3160589.)
 
+### Where the text comes from: `kvad crawl`
+
+```bash
+kvad crawl https://doc.rust-lang.org/book/        # writes doc.rust-lang.org-book.txt
+kvad train --data doc.rust-lang.org-book.txt --name rustbook
+```
+
+`--data corpus.txt` assumes somebody has a corpus. `scripts/get-text.sh`
+fetches tiny Shakespeare and that is the whole of the supply, so `kvad crawl`
+reads a documentation site into a text file instead — and the Datasets page in
+the web UI does the same thing as a job you can watch.
+
+**The scope is the directory, not the domain.** This is the decision the
+feature turns on. `doc.rust-lang.org/book/` links into `/std/` on nearly every
+page, so a crawl that stayed on the domain comes back with the whole of the
+standard library's rustdoc — tens of thousands of pages of generated
+signatures, which is not what anyone meant by "the book". Links are followed
+under the starting address's own directory: `/book/` for that address, and
+`/book/` still for `/book/ch03-00-common-programming-concepts.html`.
+`--same-host` widens it for the sites that are one book at their root.
+
+The extractor is a tag scanner rather than a parser or a dependency, because a
+documentation site is one program's output from one template. Headings, lists,
+tables and fenced code blocks with their language survive; `<script>` is read
+as raw text so that `a < b` in JavaScript is not a tag; `<nav>`, `<footer>`
+and `id`/`class`/`role` furniture are dropped by token. Links are collected
+from the *whole* document and the text only from the furniture-free part — a
+book's table of contents is its sidebar, and a crawler that dropped the
+sidebar before looking for links fetches one page and stops.
+
+**Then the part that decides whether any of it is trainable.** A character
+tokeniser gives an id to every distinct character and the model gets a row per
+id, so the alphabet is a hyperparameter, and the web is bad at keeping it
+small: three kinds of quotation mark, two kinds of dash, a non-breaking space
+before every unit, one emoji in a warning box. Typography is mapped onto ASCII
+— not NFKD, which would also take the accents off `blåbær` — and what is left
+of the tail is dropped by count. Ten pages of the book:
+
+```
+10 pages, 99,684 characters, 95 distinct
+277 characters mapped onto ASCII (237 of them ’ → '), one emoji dropped
+```
+
+Six pages come out at 81 distinct characters, every one of them ASCII, against
+the 101 of this README. The threshold is an absolute count and not a share of
+the corpus, because that is what the number means: a row of an embedding table
+seen eight times is untrained whether the text around it is 5 kB or 5 MB. It
+started at 3 and is 10, from measuring — at 3, a 325,334-character crawl still
+kept about forty rows for the Japanese, Hindi, Hebrew and Cyrillic in one
+chapter's "hello world" examples, seen three to fifteen times each. ASCII is
+never dropped however rare it is.
+
+**Pointing it at the real thing is what found the bugs.** `class="header"` was
+in the furniture list, and that is exactly how mdBook and rustdoc mark every
+heading's anchor: every heading on every page was being deleted, and the
+orphaned `# ` then landed on the paragraph below. The same first run produced
+1,319,972 characters from three pages, because `/book/` and
+`/book/title-page.html` are one page at two addresses and `print.html` is the
+entire book again. Pages are deduplicated by the hash of their text now, and
+`print.html` and rustdoc's `all.html` are passed over by name.
+
+Beside the text goes `<file>.crawl.json`: the start address, the scope, every
+page in the order it was fetched, what was skipped and why, what the cleaning
+pass changed, and the alphabet it ended with. In six months that is the
+difference between "a corpus" and "this corpus, from here, on that day".
+
+`robots.txt` is obeyed, there is a pause between requests, and the crawl stops
+at a number of pages and a number of bytes — a crawler an admin session can
+point at a stranger's server should be boring. Addresses resolving to
+loopback, RFC1918 or link-local are refused and rechecked on every redirect,
+because "fetch this URL for me" is the shape of request that otherwise reads a
+cloud metadata endpoint into a file. That check is of the name and not of the
+socket, which a resolver of our own would close and nothing less will.
+
 ### One tool: `kvad train`
 
 ```bash

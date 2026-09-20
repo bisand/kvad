@@ -42,9 +42,3 @@ toml = "1.1.6"
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-# The crawler's two. `ureq` is what `kvad` already downloads weights with, and
-# `url` is already in the tree under `openidconnect`: resolving `../ch01.html`
-# against the page that linked it is exactly the fiddly, security-relevant
-# arithmetic worth not doing by hand.
-ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
-url = "2.5.8"

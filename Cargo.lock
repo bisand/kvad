@@ -2434,6 +2434,7 @@ dependencies = [
  "serde_json",
  "tokenizers 0.23.2",
  "ureq",
+ "url",
 ]
 
 [[package]]
@@ -2471,8 +2472,6 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "ureq",
- "url",
 ]
 
 [[package]]

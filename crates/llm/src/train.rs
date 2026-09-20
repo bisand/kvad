@@ -40,6 +40,15 @@ use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// The largest corpus a run will take.
+///
+/// `nanograd` holds the whole of it in memory as a `Vec<usize>`, eight bytes
+/// a character, so 64 MB of text is half a gigabyte before training starts.
+/// The limit is about this machine, not about taste — and it is here rather
+/// than beside either of the two things that enforce it, an upload and a
+/// crawl, because it is a fact about the training loop and they would drift.
+pub const MAX_CORPUS_BYTES: usize = 64 * 1024 * 1024;
+
 /// A model shape, under a name somebody might pick without reading a paper.
 ///
 /// Three sizes rather than five flags. `train_text` in `nanograd` still takes

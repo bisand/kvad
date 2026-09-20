@@ -2,6 +2,7 @@
 //!
 //!     kvad search QUERY      find models on the Hub, flagging which we can run
 //!     kvad pull REPO         download a model into the local cache
+//!     kvad crawl URL         read a documentation site into a text file
 //!     kvad train --data F    train a model of your own, from a text file
 //!     kvad ls                list downloaded and trained models
 //!     kvad use REPO          set the default model
@@ -20,6 +21,7 @@
 //! repo id. See `kvad::weights`.
 
 use kvad::chat::Message;
+use kvad::crawl;
 use kvad::hub::{self, State};
 use kvad::model::{KvCache, Spec};
 use kvad::qcache;
@@ -29,6 +31,7 @@ use kvad::train;
 use kvad::sampler::Sampler;
 use kvad::weights;
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -50,6 +53,13 @@ struct Args {
     top_p: f32,
     seed: u64,
     quant: Precision,
+    /// `crawl` only.
+    out: Option<String>,
+    pages: Option<usize>,
+    megabytes: Option<f64>,
+    pause: Option<u64>,
+    drop_rare: Option<usize>,
+    same_host: bool,
     /// `train` only.
     data: Option<String>,
     from: Option<String>,
@@ -80,6 +90,12 @@ impl Default for Args {
             top_p: 0.95,
             seed: 7,
             quant: Precision::F32,
+            out: None,
+            pages: None,
+            megabytes: None,
+            pause: None,
+            drop_rare: None,
+            same_host: false,
             data: None,
             from: None,
             name: None,
@@ -103,6 +119,7 @@ fn usage() -> ! {
          commands:\n  \
            search QUERY        find models on the Hub\n  \
            pull REPO           download a model\n  \
+           crawl URL           read a documentation site into a text file\n  \
            train               train a model of your own from a text file\n  \
            ls                  list downloaded and trained models\n  \
            use MODEL           set the default model\n  \
@@ -125,6 +142,18 @@ fn usage() -> ! {
            --seed N            sampling seed (default 7)\n  \
            --quant f32|q8|q4   quantise weights on load (default f32)\n  \
            --greedy            shorthand for --temperature 0\n\n\
+         kvad crawl options:\n  \
+           --out FILE          where to write it (default: a name from the address)\n  \
+           --pages N           most pages to read (default 400)\n  \
+           --mb F              most text to collect (default 16)\n  \
+           --pause MS          wait between requests (default 250)\n  \
+           --drop-rare N       drop characters seen fewer than N times (default 10)\n  \
+           --same-host         follow links anywhere on the host, not just under\n  \
+           \u{20}                   the address's own directory\n\n\
+         Links are followed under the starting address's directory only, because\n\
+         `/book/` links into the standard library's documentation on nearly every page\n\
+         and that is a hundred times the book. robots.txt is obeyed. Ctrl-C stops it\n\
+         and loses what it has read; the web UI's Stop keeps it.\n\n\
          kvad train options:\n  \
            --data FILE         plain text to learn from (required)\n  \
            --name NAME         what to call it; one word, no `/`\n  \
@@ -165,7 +194,7 @@ fn parse_args() -> Args {
     }
 
     // Subcommands that take a bare positional argument.
-    if matches!(a.command.as_str(), "search" | "pull" | "use" | "rm" | "cache") {
+    if matches!(a.command.as_str(), "search" | "pull" | "use" | "rm" | "cache" | "crawl") {
         let mut words = Vec::new();
         while let Some(w) = argv.get(i) {
             if w.starts_with("--") {
@@ -183,6 +212,11 @@ fn parse_args() -> Args {
         let flag = argv[i].clone();
         if flag == "--greedy" {
             a.temperature = 0.0;
+            i += 1;
+            continue;
+        }
+        if flag == "--same-host" {
+            a.same_host = true;
             i += 1;
             continue;
         }
@@ -205,6 +239,11 @@ fn parse_args() -> Args {
             "--top-k" => a.top_k = num() as usize,
             "--top-p" => a.top_p = num() as f32,
             "--seed" => a.seed = num() as u64,
+            "--out" => a.out = Some(value.clone()),
+            "--pages" => a.pages = Some(num() as usize),
+            "--mb" => a.megabytes = Some(num()),
+            "--pause" => a.pause = Some(num() as u64),
+            "--drop-rare" => a.drop_rare = Some(num() as usize),
             "--data" => a.data = Some(value.clone()),
             "--from" => a.from = Some(value.clone()),
             "--name" => a.name = Some(value.clone()),
@@ -373,6 +412,7 @@ fn main() -> Res<()> {
             Ok(())
         }
         "search" => search(args),
+        "crawl" => crawl_site(args),
         "train" => train_model(args),
         "pull" => pull(args),
         "ls" => list_local(),
@@ -391,6 +431,94 @@ fn main() -> Res<()> {
 // ---------------------------------------------------------------------------
 // Model management
 // ---------------------------------------------------------------------------
+
+/// `kvad crawl` — the other way to get something to train on.
+///
+/// Writes two files: the text, and the manifest beside it. It does not make a
+/// dataset, because datasets are rows in the server's database and this
+/// binary has no business opening it; what it makes is a file, which is what
+/// `kvad train --data` wanted all along.
+fn crawl_site(args: Args) -> Res<()> {
+    let Some(url) = args.target.clone() else {
+        eprintln!("usage: kvad crawl URL [--out FILE]");
+        eprintln!("       kvad crawl https://doc.rust-lang.org/book/");
+        std::process::exit(2);
+    };
+
+    let out = PathBuf::from(args.out.clone().unwrap_or_else(|| {
+        match crawl::suggested_name(&url).as_str() {
+            "" => "corpus.txt".to_string(),
+            name => format!("{name}.txt"),
+        }
+    }));
+    // The manifest is named after the file and not after the site, so that
+    // two crawls into one directory cannot quietly share one record.
+    let manifest = PathBuf::from(format!("{}.crawl.json", out.display()));
+
+    let defaults = crawl::Request::new(&url);
+    let request = crawl::Request {
+        name: out.file_stem().map_or(String::new(), |s| s.to_string_lossy().into_owned()),
+        same_host: args.same_host,
+        max_pages: args.pages.unwrap_or(defaults.max_pages),
+        max_bytes: args
+            .megabytes
+            .map_or(defaults.max_bytes, |mb| (mb * 1024.0 * 1024.0).max(1024.0) as usize),
+        delay_ms: args.pause.unwrap_or(defaults.delay_ms),
+        drop_rare: args.drop_rare.unwrap_or(defaults.drop_rare),
+        ..defaults
+    }
+    .sane();
+
+    // Before a single request: an address that cannot be fetched is worth
+    // saying now rather than after the first connection times out.
+    crawl::check(&request)?;
+    if out.exists() {
+        println!("overwriting {}", out.display());
+    }
+
+    let mut last = 0;
+    let mut say = |note: crawl::Note| match note {
+        crawl::Note::Say(message) => println!("{message}"),
+        crawl::Note::Page { title, done, total, .. } => {
+            // The total is a guess that grows as links turn up, so it is
+            // printed every time rather than remembered from the first page.
+            let width = total.to_string().len();
+            println!("  {done:>width$}/{total}  {title}");
+            last = done;
+        }
+    };
+
+    let crawled = crawl::run(&request, &mut say, &std::sync::atomic::AtomicBool::new(false))?;
+    let manifest_json = serde_json::to_vec_pretty(&crawled.manifest)?;
+    std::fs::write(&out, &crawled.text)
+        .map_err(|e| format!("could not write {}: {e}", out.display()))?;
+    std::fs::write(&manifest, manifest_json)
+        .map_err(|e| format!("could not write {}: {e}", manifest.display()))?;
+
+    let m = &crawled.manifest;
+    println!();
+    println!("wrote {} ({})", out.display(), hub::human_bytes(crawled.text.len() as u64));
+    println!("  {} pages, {} characters, {} distinct", m.pages.len(), m.characters, m.distinct);
+    if !m.skipped.is_empty() {
+        println!("  {} skipped, and why is in the manifest", m.skipped.len());
+    }
+    if let Some(stopped) = &m.stopped {
+        println!("  stopped at {stopped}");
+    }
+    let mapped: usize = m.mapped.iter().map(|c| c.count).sum();
+    if mapped > 0 || !m.dropped.is_empty() {
+        println!(
+            "  {mapped} characters mapped onto ASCII, {} dropped as too rare",
+            m.dropped.len()
+        );
+    }
+    println!("  {}", manifest.display());
+    println!();
+    // The whole point of the file. `--name` is left blank on purpose: naming
+    // a model is a decision, and a suggested one would be taken.
+    println!("  kvad train --data {} --name NAME", out.display());
+    Ok(())
+}
 
 /// `kvad train` — the one command that makes a model instead of fetching one.
 fn train_model(args: Args) -> Res<()> {

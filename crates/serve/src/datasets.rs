@@ -24,12 +24,9 @@ use std::path::PathBuf;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// The largest file that may be uploaded.
-///
-/// `nanograd` holds the whole corpus in memory as a `Vec<usize>`, eight bytes
-/// a character, so 64 MB of text is half a gigabyte before training starts.
-/// The limit is about this machine, not about taste.
-pub const MAX_BYTES: usize = 64 * 1024 * 1024;
+/// The largest file that may be uploaded: what a training run can hold, and
+/// the reason for the number is [`kvad::train::MAX_CORPUS_BYTES`]'s to give.
+pub const MAX_BYTES: usize = kvad::train::MAX_CORPUS_BYTES;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Dataset {

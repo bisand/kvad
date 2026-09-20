@@ -340,17 +340,37 @@ fn streamed(
         // The first chunk announces the role and carries no text, which is
         // what OpenAI's stream does and what clients look for.
         let mut opened = false;
+        // A reasoning model's working, told apart from its answer as it
+        // arrives. See `kvad::chat::Thinking` for why this cannot be a split
+        // at the end.
+        let mut thinking = kvad::chat::Thinking::new();
+        let mut delta_of = move |working: &str, answer: &str| {
+            let mut delta = json!({});
+            if !working.is_empty() {
+                delta["reasoning_content"] = json!(working);
+            }
+            if !answer.is_empty() {
+                delta["content"] = json!(answer);
+            }
+            if delta.as_object().is_some_and(|d| d.is_empty()) {
+                return None;
+            }
+            if !std::mem::replace(&mut opened, true) {
+                delta["role"] = json!("assistant");
+            }
+            Some(delta)
+        };
+
         while let Some(piece) = pieces.recv().await {
             let event = match piece {
                 // A `Chose` is a token that also says what it was chosen
                 // from. Chat never asks for that — it is the playground's
                 // request — so the two are the same thing here.
                 Piece::Token(text) | Piece::Chose(Chosen { text, .. }) => {
-                    let first = !std::mem::replace(&mut opened, true);
-                    let delta = match first {
-                        true => json!({ "role": "assistant", "content": text }),
-                        false => json!({ "content": text }),
-                    };
+                    let (working, answer) = thinking.feed(&text);
+                    // Both empty means the text is held back as a possible
+                    // tag, and there is nothing to send yet.
+                    let Some(delta) = delta_of(&working, &answer) else { continue };
                     Event::default().data(chunk(delta, None, json!({})).to_string())
                 }
                 Piece::Done(stats) => {
@@ -361,6 +381,16 @@ fn streamed(
                         started.elapsed(),
                         measured(&stats),
                     );
+                    // Anything still held back — a trace the budget cut off
+                    // mid-thought — goes before the chunk that ends the
+                    // stream, rather than being dropped with it.
+                    let (working, answer) = thinking.finish();
+                    if let Some(delta) = delta_of(&working, &answer) {
+                        let chunk = chunk(delta, None, json!({})).to_string();
+                        if events.send(Event::default().data(chunk)).await.is_err() {
+                            return;
+                        }
+                    }
                     Event::default().data(
                         chunk(
                             json!({}),
@@ -403,9 +433,15 @@ async fn whole(
     started: std::time::Instant,
 ) -> Result<Json<serde_json::Value>, Fail> {
     let mut text = String::new();
+    let mut working = String::new();
+    let mut thinking = kvad::chat::Thinking::new();
     while let Some(piece) = pieces.recv().await {
         match piece {
-            Piece::Token(t) | Piece::Chose(Chosen { text: t, .. }) => text.push_str(&t),
+            Piece::Token(t) | Piece::Chose(Chosen { text: t, .. }) => {
+                let (w, a) = thinking.feed(&t);
+                working.push_str(&w);
+                text.push_str(&a);
+            }
             Piece::Failed(why) => {
                 metrics.record("POST", ROUTE, 500, started.elapsed());
                 return Err(Fail::internal(why));
@@ -418,6 +454,15 @@ async fn whole(
                     started.elapsed(),
                     measured(&stats),
                 );
+                let (w, a) = thinking.finish();
+                working.push_str(&w);
+                text.push_str(&a);
+                let mut message = json!({ "role": "assistant", "content": text });
+                // Only when there was one: a field that is always present and
+                // usually empty teaches a client to ignore it.
+                if !working.is_empty() {
+                    message["reasoning_content"] = json!(working);
+                }
                 return Ok(Json(json!({
                     "id": id,
                     "object": "chat.completion",
@@ -425,7 +470,7 @@ async fn whole(
                     "model": loaded.repo,
                     "choices": [{
                         "index": 0,
-                        "message": { "role": "assistant", "content": text },
+                        "message": message,
                         "finish_reason": "stop",
                     }],
                     "usage": usage(&stats),

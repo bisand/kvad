@@ -43,6 +43,7 @@
   $effect(() => {
     // Touch what should re-run this.
     void chat.streaming;
+    void chat.thinking;
     void chat.messages.length;
     if (pinned && transcript) transcript.scrollTop = transcript.scrollHeight;
   });
@@ -167,6 +168,23 @@
 
       {#if chat.streaming !== null}
         <div class="chat chat-start">
+          <!-- A reasoning model's working, collapsed. It is worth being able
+               to read — it is where a model catches itself following the
+               wrong passage — but it is not the answer, and it is often
+               longer. Open while there is nothing else to show, closed once
+               the answer starts. -->
+          {#if chat.thinking}
+            <details class="chat-header mb-1 w-full" open={chat.streaming === ""}>
+              <summary class="cursor-pointer text-xs opacity-50">
+                Thinking{chat.streaming === "" ? "…" : ""}
+              </summary>
+              <div
+                class="border-base-300 bg-base-200 rounded-box mt-1 max-h-48 overflow-y-auto border p-2 text-xs whitespace-pre-wrap opacity-70"
+              >
+                {chat.thinking}
+              </div>
+            </details>
+          {/if}
           <div class="chat-bubble whitespace-pre-wrap">
             {chat.streaming}{#if chat.streaming === ""}<span
                 class="loading loading-dots loading-sm align-middle"

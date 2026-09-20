@@ -202,3 +202,240 @@ impl ChatTemplate {
         })?)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reasoning traces
+// ---------------------------------------------------------------------------
+
+/// The tags a reasoning model wraps its working in.
+const OPEN: &str = "<think>";
+const CLOSE: &str = "</think>";
+
+/// Where a reply is, between those tags.
+enum Where {
+    /// Nothing but whitespace so far, and an opening tag still possible.
+    Before,
+    Inside,
+    /// Past the trace, or established that there is not one.
+    After,
+}
+
+/// Separating a reasoning model's working from its answer, as it streams.
+///
+/// Qwen3 and its relatives open a reply with `<think>`, reason in the open,
+/// close with `</think>`, and then answer. Handed to a client as one string
+/// that is the whole reply, which is how it arrives from the engine, the
+/// working reads as part of the answer — and it is not: it contradicts
+/// itself, changes its mind, and is often longer than what follows.
+///
+/// # Why this is a state machine and not a `split`
+///
+/// The reply arrives a token at a time and a tag is several tokens: `<`,
+/// `think`, `>`. So text that might still become a tag is held back until it
+/// either completes one or cannot, and everything else goes out immediately —
+/// a client that waited for the whole reply to split it would lose the
+/// streaming it came for.
+///
+/// # Only at the beginning
+///
+/// A `<think>` after the model has already said something is not a trace,
+/// it is a model writing about tags — this file's own documentation would
+/// parse as one. So the opening tag counts only before any other text, and
+/// once something else has arrived the rest of the reply is the answer,
+/// literal tags and all. Nothing is ever dropped either way.
+pub struct Thinking {
+    held: String,
+    at: Where,
+}
+
+impl Default for Thinking {
+    fn default() -> Self {
+        Thinking::new()
+    }
+}
+
+impl Thinking {
+    pub fn new() -> Thinking {
+        Thinking { held: String::new(), at: Where::Before }
+    }
+
+    /// Feed a piece of the reply. Returns what of it is working, and what of
+    /// it is answer — either may be empty, and both are empty for a piece
+    /// held back as a possible tag.
+    pub fn feed(&mut self, text: &str) -> (String, String) {
+        self.held.push_str(text);
+        let (mut working, mut answer) = (String::new(), String::new());
+        loop {
+            match self.at {
+                Where::After => {
+                    answer.push_str(&self.held);
+                    self.held.clear();
+                    return (working, answer);
+                }
+                Where::Before => match self.held.find(OPEN) {
+                    // The same rule as below, and it has to be in both: a tag
+                    // can arrive in the piece that also carries the text
+                    // before it, and then the text before it decides.
+                    Some(at) if !self.held[..at].trim().is_empty() => {
+                        answer.push_str(&self.held);
+                        self.held.clear();
+                        self.at = Where::After;
+                        return (working, answer);
+                    }
+                    Some(at) => {
+                        answer.push_str(&self.held[..at]);
+                        self.held = self.held[at + OPEN.len()..].to_string();
+                        self.at = Where::Inside;
+                    }
+                    None => {
+                        let keep = self.held.len() - partial(&self.held, OPEN);
+                        // Anything but whitespace before a tag means there is
+                        // no trace here and there will not be one.
+                        if !self.held[..keep].trim().is_empty() {
+                            answer.push_str(&self.held);
+                            self.held.clear();
+                            self.at = Where::After;
+                            return (working, answer);
+                        }
+                        answer.push_str(&self.held[..keep]);
+                        self.held = self.held[keep..].to_string();
+                        return (working, answer);
+                    }
+                },
+                Where::Inside => match self.held.find(CLOSE) {
+                    Some(at) => {
+                        working.push_str(&self.held[..at]);
+                        self.held = self.held[at + CLOSE.len()..].to_string();
+                        self.at = Where::After;
+                    }
+                    None => {
+                        let keep = self.held.len() - partial(&self.held, CLOSE);
+                        working.push_str(&self.held[..keep]);
+                        self.held = self.held[keep..].to_string();
+                        return (working, answer);
+                    }
+                },
+            }
+        }
+    }
+
+    /// End of the reply: whatever is still held back.
+    ///
+    /// A trace with no closing tag — the budget ran out mid-thought, which
+    /// for a small reasoning model is common — is still the trace, and is
+    /// returned as one rather than thrown away or shown as an answer.
+    pub fn finish(&mut self) -> (String, String) {
+        let rest = std::mem::take(&mut self.held);
+        match self.at {
+            Where::Inside => (rest, String::new()),
+            _ => (String::new(), rest),
+        }
+    }
+
+    /// Whether a trace was opened and never closed.
+    pub fn unfinished(&self) -> bool {
+        matches!(self.at, Where::Inside)
+    }
+}
+
+/// How much of the end of `s` could still become the start of `tag`.
+fn partial(s: &str, tag: &str) -> usize {
+    let most = (tag.len() - 1).min(s.len());
+    (1..=most)
+        .rev()
+        .find(|n| s.is_char_boundary(s.len() - n) && tag.starts_with(&s[s.len() - n..]))
+        .unwrap_or(0)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeding the same reply whole and a character at a time has to give the
+    /// same answer, because the stream is the case this exists for: a tag is
+    /// several tokens and arrives in pieces.
+    #[test]
+    fn a_trace_splits_the_same_however_it_arrives() {
+        let reply = "<think>I should check the listing.</think>The borrow checker rejects it.";
+        assert_eq!(
+            whole(reply),
+            ("I should check the listing.".to_string(), "The borrow checker rejects it.".to_string())
+        );
+        assert_eq!(by_char(reply), whole(reply), "the stream split differently");
+    }
+
+    #[test]
+    fn a_reply_with_no_trace_is_all_answer() {
+        for reply in ["Just an answer.", "  leading space then text", ""] {
+            let (working, answer) = whole(reply);
+            assert!(working.is_empty(), "{reply:?} invented a trace");
+            assert_eq!(answer, reply);
+            assert_eq!(by_char(reply).1, reply);
+        }
+    }
+
+    /// A small reasoning model runs out of budget mid-thought often enough
+    /// that this is the ordinary case and not the strange one.
+    #[test]
+    fn a_trace_that_never_closes_is_still_a_trace() {
+        let mut thinking = Thinking::new();
+        let (working, answer) = thinking.feed("<think>I should check whether");
+        assert_eq!(working, "I should check whether");
+        assert!(answer.is_empty());
+        assert!(thinking.unfinished());
+        assert_eq!(thinking.finish(), (String::new(), String::new()));
+    }
+
+    /// This module's own documentation mentions the tag. A model writing
+    /// about reasoning models must not be parsed as one.
+    #[test]
+    fn a_tag_after_the_answer_has_started_is_just_text() {
+        let reply = "Reasoning models open with <think> and close with </think>.";
+        let (working, answer) = whole(reply);
+        assert!(working.is_empty());
+        assert_eq!(answer, reply, "the tags were eaten");
+        assert_eq!(by_char(reply).1, reply);
+    }
+
+    /// Whatever the split, every character comes out of one side or the
+    /// other. A streamed reply may be cut anywhere, including inside a tag.
+    #[test]
+    fn nothing_is_lost_at_any_boundary() {
+        let reply = "<think>abc</think>def";
+        for at in 0..=reply.len() {
+            if !reply.is_char_boundary(at) {
+                continue;
+            }
+            let mut thinking = Thinking::new();
+            let (w1, a1) = thinking.feed(&reply[..at]);
+            let (w2, a2) = thinking.feed(&reply[at..]);
+            let (w3, a3) = thinking.finish();
+            assert_eq!(format!("{w1}{w2}{w3}"), "abc", "cut at {at}");
+            assert_eq!(format!("{a1}{a2}{a3}"), "def", "cut at {at}");
+        }
+    }
+
+    fn whole(reply: &str) -> (String, String) {
+        let mut thinking = Thinking::new();
+        let (mut working, mut answer) = thinking.feed(reply);
+        let (w, a) = thinking.finish();
+        working.push_str(&w);
+        answer.push_str(&a);
+        (working, answer)
+    }
+
+    fn by_char(reply: &str) -> (String, String) {
+        let mut thinking = Thinking::new();
+        let (mut working, mut answer) = (String::new(), String::new());
+        for c in reply.chars() {
+            let (w, a) = thinking.feed(&c.to_string());
+            working.push_str(&w);
+            answer.push_str(&a);
+        }
+        let (w, a) = thinking.finish();
+        working.push_str(&w);
+        answer.push_str(&a);
+        (working, answer)
+    }
+}

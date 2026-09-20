@@ -2031,6 +2031,35 @@ documentation at `/api`. Four authentication modes (`none`, `local`, `basic`,
 `docs/ui-plan.md` is the plan it was built from, and each phase in it records
 what that phase measured and which of its open questions closed.
 
+### A reasoning model's working is not its answer
+
+Qwen3 and its relatives open a reply with `<think>`, reason in the open, close
+with `</think>`, and then answer. Handed to a client as one string, which is
+how it arrives from the engine, the working reads as part of the answer — and
+it is not: it contradicts itself, changes its mind, and is routinely longer
+than what follows. Measured on one grounded question: 2,591 characters of
+working against 284 of answer.
+
+So the server tells them apart as they stream, and sends the working as
+`reasoning_content` — the field DeepSeek's API established and clients
+recognise — leaving `content` the answer. It cannot be a split at the end,
+because a tag is several tokens (`<`, `think`, `>`) and a client that waited
+for the whole reply to divide it would lose the streaming it came for. Text
+that might still become a tag is held back; everything else goes out at once.
+
+Two rules worth stating. A `<think>` after the model has already said
+something is not a trace, it is a model writing about tags — the paragraph
+above would parse as one — so the opening tag counts only before any other
+text. And a trace the token budget cut off mid-thought is still a trace, and
+arrives as one rather than as an answer, which for a small reasoning model is
+the ordinary case: at 400 tokens, Qwen3-0.6B spent all of them thinking and
+never reached an answer at all.
+
+The web UI shows it collapsed above the reply, open while there is nothing
+else to show. It is worth being able to read — it is where a model can be seen
+catching itself following the wrong passage — but it is not kept: the message
+saved to the conversation is the answer.
+
 ### One model at a time, said out loud
 
 The engine holds one loaded model and runs one generation at a time. Every

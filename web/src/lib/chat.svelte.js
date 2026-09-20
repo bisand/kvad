@@ -21,6 +21,14 @@ class Chat {
   messages = $state([]);
   /** The reply as it arrives, before it is a message. */
   streaming = $state(null);
+  /**
+   * A reasoning model's working, as it arrives.
+   *
+   * Shown while the reply is being written and then dropped: the working is
+   * scaffolding, it contradicts itself on the way to an answer, and it is
+   * often longer than the answer. The message that is kept is the answer.
+   */
+  thinking = $state(null);
   sending = $state(false);
   sampler = $state({ ...DEFAULTS });
 
@@ -139,6 +147,7 @@ class Chat {
     this.#abort = new AbortController();
 
     let reply = "";
+    let working = "";
     let stats = null;
     let failed = null;
 
@@ -162,9 +171,15 @@ class Chat {
           message: (data) => {
             if (data === "[DONE]") return;
             const chunk = JSON.parse(data);
-            const piece = chunk.choices?.[0]?.delta?.content;
-            if (piece) {
-              reply += piece;
+            const delta = chunk.choices?.[0]?.delta;
+            // The server tells the two apart as they stream; see
+            // `kvad::chat::Thinking`.
+            if (delta?.reasoning_content) {
+              working += delta.reasoning_content;
+              this.thinking = working;
+            }
+            if (delta?.content) {
+              reply += delta.content;
               this.streaming = reply;
             }
             if (chunk.kvad) {
@@ -192,6 +207,7 @@ class Chat {
     } finally {
       this.#abort = null;
       this.streaming = null;
+      this.thinking = null;
       this.sending = false;
     }
 

@@ -87,7 +87,7 @@ Arithmetic and commonly reported figures, to be replaced in Phase 0:
 | 10 GbE | 10 Gb/s | ~0.1–0.2 ms | ideal |
 | 1 GbE | 1 Gb/s | ~0.3 ms | fine for decode, slows long prefill |
 | Wi-Fi | varies | 2–10 ms, jittery | works, not recommended |
-| USB 2 NCM — a charging cable | 0.48 Gb/s nominal | 1.34 ms mean, measured 2026-09-20 | a trap, not a choice; see *A development rig* |
+| USB 2 NCM — a charging cable | 0.30 Gb/s measured | 1.1 ms empty, 2.7 ms for 32 KB | a trap, not a choice; see *A development rig* |
 
 Things worth knowing before buying cables:
 
@@ -347,10 +347,10 @@ chips differing is of no interest to TCP.
   interface appears — `en12` here, not a bridge member and with no entry in
   System Settings — takes a self-assigned `169.254.x.x`, answers `ping6` on
   its link-local address and carries TCP; SSH to the other Mac over it works
-  first try. Everything a connectivity test would check passes. It is a 480
-  Mb/s link whose round trip averaged 1.34 ms over 50 packets, best 0.93,
-  worst 7.03: slower than the gigabit Ethernet row above, and about a
-  hundredth of what the two ports could do. A worker would run on it and
+  first try. Everything a connectivity test would check passes. What it is:
+  302 Mb/s one way, 63% of the 480 the nominal rate promises, and an empty
+  hop of about 1.1 ms — slower than the gigabit Ethernet row above and about
+  a hundredth of what the two ports could do. A worker would run on it and
   simply be slow, which is the failure this plan is least able to see. Three
   checks tell the truth where `ifconfig` does not:
 
@@ -372,14 +372,32 @@ chips differing is of no interest to TCP.
   waits for the real cable is every *number* — the table above, Phase 0's
   replacement of it, and Phase 4 entirely.
 
-  Being slow is briefly an advantage. A 32 KB hop costs the 1.34 ms of
-  measured round trip plus, arithmetically, 0.55 ms at the nominal rate.
-  That is visible in the tok/s of a small model, where Thunderbolt would
-  hide it inside a millisecond — so a hop that happens when it should not,
-  or twice where it should happen once, is loud on this cable and quiet on
-  the good one. Prefill is the reverse: 2 MB is at least 33 ms at the
-  nominal rate, and the effective rate has not been measured at all, so
-  pipelined prefill cannot be judged here.
+  Measured over that cable on 2026-09-20 with `scripts/bench-link.py`,
+  medians of ten interleaved rounds after a discarded warm-up, every median
+  within 4% of its own minimum:
+
+  | frame | round trip | link rate |
+  |---|---|---|
+  | 32 KB — a decode hop | 2.71 ms | 193 Mb/s |
+  | 2 MB — a prefill chunk | 108.9 ms | 308 Mb/s |
+  | fitted | 1.10 ms empty + 314 Mb/s | 302 Mb/s one way over 64 MB |
+
+  Being slow is briefly an advantage. A 2.7 ms decode hop is plainly visible
+  in the tok/s of a small model, where Thunderbolt would hide it inside a
+  millisecond, so a hop that happens when it should not — or twice where it
+  should happen once — is loud on this cable and quiet on the good one.
+  Prefill is the reverse: 109 ms the round trip and 54 each way, against the
+  1 ms this plan expects of Thunderbolt and the 17 of gigabit, so pipelined
+  prefill cannot be judged on this cable at all.
+
+  One thing worth knowing before trusting a run. The first sweep after the
+  Air woke and the cable came back reported 22.6 ms at 32 KB — a median, not
+  a stray sample, and above its own 128 KB row, which is impossible. It has
+  not reproduced in two runs since, at any size. A freshly re-established NCM
+  link wants more warm-up than the one round the tool discards; until that is
+  understood, a number from the first sweep after a reconnect should be
+  thrown away rather than recorded.
+
 - With the right cable, System Settings → Network → Thunderbolt Bridge shows
   a self-assigned `169.254.x.x` address on each side. The firewall may ask
   about incoming connections the first time a worker listens.

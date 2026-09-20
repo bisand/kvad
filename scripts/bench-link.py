@@ -57,6 +57,21 @@ SIZES = [1 << 10, 1 << 12, 1 << 14, DECODE_HOP, 1 << 17, 1 << 19, PREFILL_CHUNK,
 HEADER = struct.Struct("!cQ")
 
 
+def parse_sizes(text: str) -> list[int]:
+    """`16k,32k,2m` into bytes, for looking closely at one part of the sweep.
+
+    The default sweep is spaced widely enough to find a crossover and too
+    widely to describe one. When a size misbehaves, the answer is more sizes
+    around it, not more repetitions of the same one.
+    """
+    out = []
+    for word in text.split(","):
+        word = word.strip().lower()
+        scale = {"k": 1 << 10, "m": 1 << 20}.get(word[-1:], 1)
+        out.append(int(float(word.rstrip("km")) * scale))
+    return out
+
+
 def sh(*cmd: str, timeout: float = 30.0) -> str:
     """Run a command, returning its output or "" if it fails for any reason.
 
@@ -239,7 +254,7 @@ def one_way(conn: socket.socket, payload: bytes) -> float:
     return (time.perf_counter_ns() - start) / 1e6
 
 
-def sweep(conn: socket.socket, rounds: int) -> dict[int, list[float]]:
+def sweep(conn: socket.socket, rounds: int, sizes: list[int]) -> dict[int, list[float]]:
     """Walk every size once per round, not every round once per size.
 
     Load on these machines swings enough to move absolute timings by a
@@ -248,10 +263,10 @@ def sweep(conn: socket.socket, rounds: int) -> dict[int, list[float]]:
     whole run. The first round is discarded: it pays for neighbour discovery,
     for the window opening, and for the buffers growing to fit.
     """
-    blobs = {n: os.urandom(n) for n in SIZES}  # not zeros, in case anything compresses
-    samples: dict[int, list[float]] = {n: [] for n in SIZES}
+    blobs = {n: os.urandom(n) for n in sizes}  # not zeros, in case anything compresses
+    samples: dict[int, list[float]] = {n: [] for n in sizes}
     for r in range(rounds + 1):
-        for n in SIZES:
+        for n in sizes:
             ms = round_trip(conn, blobs[n])
             if r:
                 samples[n].append(ms)
@@ -260,7 +275,7 @@ def sweep(conn: socket.socket, rounds: int) -> dict[int, list[float]]:
     return samples
 
 
-def fit(samples: dict[int, list[float]]) -> tuple[float, float]:
+def fit(samples: dict[int, list[float]], sizes: list[int]) -> tuple[float, float]:
     """Least squares of median round trip against size: `rtt = a + 2*bytes/B`.
 
     `a` is what a hop costs carrying nothing, which is the number decode
@@ -269,8 +284,8 @@ def fit(samples: dict[int, list[float]]) -> tuple[float, float]:
     lives on. Quoting either alone describes the link wrongly, which is most
     of why the table in the plan has two columns.
     """
-    xs = [float(n) for n in SIZES]
-    ys = [statistics.median(samples[n]) for n in SIZES]
+    xs = [float(n) for n in sizes]
+    ys = [statistics.median(samples[n]) for n in sizes]
     mx, my = statistics.fmean(xs), statistics.fmean(ys)
     sxx = sum((x - mx) ** 2 for x in xs)
     sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
@@ -280,7 +295,7 @@ def fit(samples: dict[int, list[float]]) -> tuple[float, float]:
     return intercept, bandwidth
 
 
-def measure(host: str, port: int, rounds: int, stream_mb: int) -> int:
+def measure(host: str, port: int, rounds: int, stream_mb: int, sizes: list[int]) -> int:
     iface = host.partition("%")[2].partition("]")[0]
     if iface:
         identify(iface)
@@ -296,21 +311,22 @@ def measure(host: str, port: int, rounds: int, stream_mb: int) -> int:
     conn.settimeout(30.0)
     conn.connect(sockaddr)
 
-    samples = sweep(conn, rounds)
+    samples = sweep(conn, rounds, sizes)
     stream = one_way(conn, os.urandom(stream_mb << 20))
     conn.close()
 
     print()
-    print("| bytes | round trip, median | min | link rate, 2x bytes / rtt |")
-    print("|---|---|---|---|")
-    for n in SIZES:
+    print("| bytes | round trip, median | min | link rate, 2x bytes / rtt | median/min |")
+    print("|---|---|---|---|---|")
+    for n in sizes:
         med, low = statistics.median(samples[n]), min(samples[n])
         rate = 2 * n * 8 / (med / 1000) / 1e6
         note = {DECODE_HOP: " (decode hop)", PREFILL_CHUNK: " (prefill chunk)"}.get(n, "")
         label = f"{n >> 10} KB" if n < (1 << 20) else f"{n >> 20} MB"
-        print(f"| {label}{note} | {med:.3f} ms | {low:.3f} ms | {rate:.0f} Mb/s |")
+        spread = f" | {med / low:.1f}x" if med > low * 1.5 else " |"
+        print(f"| {label}{note} | {med:.3f} ms | {low:.3f} ms | {rate:.0f} Mb/s{spread}")
 
-    a, b = fit(samples)
+    a, b = fit(samples, sizes)
     ceiling = stream_mb * (1 << 20) * 8 / (stream / 1000) / 1e6
     print()
     print(f"empty-hop latency   {a:.3f} ms      (fitted intercept)")
@@ -337,6 +353,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--rounds", type=int, default=7, help="after one discarded warm-up")
     ap.add_argument("--stream-mb", type=int, default=64)
+    ap.add_argument("--sizes", type=parse_sizes, default=SIZES,
+                    help="frame sizes to sweep, e.g. 16k,24k,32k,48k,64k")
     args = ap.parse_args()
 
     if args.find:
@@ -347,7 +365,7 @@ def main() -> int:
     if args.listen:
         return serve(args.port)
     if args.connect:
-        return measure(args.connect, args.port, args.rounds, args.stream_mb)
+        return measure(args.connect, args.port, args.rounds, args.stream_mb, args.sizes)
     ap.print_help()
     return 2
 

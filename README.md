@@ -98,7 +98,12 @@ curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh 
 
 `--prefix DIR`, `--version vX.Y.Z` and `--uninstall` do what they look like;
 `--uninstall` removes the binaries and the service and leaves your models and
-conversations alone. `sh install.sh --help` lists the rest.
+conversations alone. `--bind HOST:PORT` sets the address the background
+service listens on, which defaults to `127.0.0.1:8080` — the installer checks
+before writing a unit that something is not already on that port, and that
+the address is a loopback one, because `kvad-serve` refuses a non-loopback
+bind with no auth mode and launchd would restart it forever. `sh install.sh
+--help` lists the rest.
 
 macOS gets all four binaries. Linux gets `kvad` and a CPU-only `kvad-serve`:
 `kvad-tui` and `kvad-gpu` both link candle against Metal, which is not a thing

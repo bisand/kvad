@@ -28,7 +28,9 @@ set -eu
 
 REPO="bisand/kvad"
 SERVICE_LABEL="net.kvad.serve"
-SERVICE_BIND="127.0.0.1:8080"
+SERVICE_BIND="${KVAD_BIND:-127.0.0.1:8080}"
+BIND_GIVEN=0
+[ -n "${KVAD_BIND:-}" ] && BIND_GIVEN=1
 
 # ---------------------------------------------------------------- output --
 
@@ -97,6 +99,46 @@ ask() {
     done
 }
 
+# ---------------------------------------------------------------- address --
+
+# HOST:PORT, with IPv6 in brackets the way every other tool spells it. The
+# port is split off the right so `[::1]:8080` divides where you would expect.
+check_bind() {
+    addr=$1
+    case $addr in
+        *:*) ;;
+        *) die "--bind wants HOST:PORT, for example 127.0.0.1:8080 (got '$addr')" ;;
+    esac
+    bind_port=${addr##*:}
+    bind_host=${addr%:*}
+    case $bind_port in
+        ''|*[!0-9]*) die "--bind: '$bind_port' is not a port number" ;;
+    esac
+    [ "$bind_port" -ge 1 ] && [ "$bind_port" -le 65535 ] ||
+        die "--bind: port $bind_port is outside 1-65535"
+    [ -n "$bind_host" ] || die "--bind: no host in '$addr'"
+}
+
+is_loopback() {
+    case $1 in
+        127.*|localhost|'[::1]'|::1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Whether something already answers on that port. Worth knowing before
+# installing a unit with KeepAlive on it: kvad-serve would fail to bind, be
+# restarted, fail again, and do that forever while looking installed.
+port_taken() {
+    if have lsof; then
+        lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+    elif have ss; then
+        ss -ltnH 2>/dev/null | awk '{print $4}' | grep -q "[:.]$1$"
+    else
+        return 1
+    fi
+}
+
 # ------------------------------------------------------------- arguments --
 
 PREFIX="${KVAD_INSTALL_DIR:-$HOME/.local/bin}"
@@ -111,6 +153,8 @@ install.sh — install kvad on macOS or Linux
 
     --prefix DIR     where the binaries go (default: ~/.local/bin)
     --version TAG    a release to install, e.g. v0.1.0 (default: the latest)
+    --bind ADDR      address the background service listens on
+                     (default: 127.0.0.1:8080)
     --service        install the background service without asking
     --no-service     skip it without asking
     --add-path       add the install directory to PATH without asking
@@ -119,13 +163,15 @@ install.sh — install kvad on macOS or Linux
     --uninstall      remove the binaries and the service, keep models and data
     -h, --help
 
-Environment: KVAD_INSTALL_DIR, KVAD_VERSION, GITHUB_TOKEN (for rate limits).
+Environment: KVAD_INSTALL_DIR, KVAD_VERSION, KVAD_BIND, GITHUB_TOKEN (rate limits).
 USAGE
     exit 2
 }
 
 while [ $# -gt 0 ]; do
     case $1 in
+        --bind)        [ $# -ge 2 ] || die "--bind needs HOST:PORT"; SERVICE_BIND=$2; BIND_GIVEN=1; shift 2 ;;
+        --bind=*)      SERVICE_BIND=${1#*=}; BIND_GIVEN=1; shift ;;
         --prefix)      [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX=$2; shift 2 ;;
         --version)     [ $# -ge 2 ] || die "--version needs a tag"; VERSION=$2; shift 2 ;;
         --prefix=*)    PREFIX=${1#*=}; shift ;;
@@ -140,6 +186,10 @@ while [ $# -gt 0 ]; do
         *)             say "unknown option: $1"; usage ;;
     esac
 done
+
+# A malformed address should cost nothing to find out about, and the service
+# section is on the far side of a 30 MB download.
+check_bind "$SERVICE_BIND"
 
 # ---------------------------------------------------------------- machine --
 
@@ -499,6 +549,26 @@ if [ -f "$SRC/kvad-serve" ]; then
             ;;
     esac
     if [ "$do_service" -eq 1 ]; then
+        # Both of these produce a unit that looks installed and never serves
+        # anything, so they are worth a question rather than a surprise.
+        if ! is_loopback "$bind_host"; then
+            say ""
+            warn "$SERVICE_BIND is not a loopback address, and kvad-serve refuses a
+  non-loopback bind while auth.mode is \"none\" — which is the default. The
+  service would fail to start and be restarted for as long as it is loaded.
+  Set an auth mode first in ${XDG_CONFIG_HOME:-$HOME/.config}/kvad/kvad.toml;
+  $PREFIX/kvad-serve --help and the bundled kvad.example.toml say how."
+            ask "Install the service anyway?" n n || do_service=0
+        fi
+        if [ "$do_service" -eq 1 ] && port_taken "$bind_port"; then
+            say ""
+            warn "something is already listening on port $bind_port. Two servers cannot
+  share it, so kvad-serve would fail to bind and be restarted in a loop.
+  Pick another with --bind, or stop what is there first."
+            ask "Install the service anyway?" n n || do_service=0
+        fi
+    fi
+    if [ "$do_service" -eq 1 ]; then
         step "Installing the background service"
         if [ "$PLATFORM" = macos ]; then write_launchd; else write_systemd; fi
     fi
@@ -514,7 +584,11 @@ say "  ${B}kvad chat${R}                              talk to it"
 if [ -f "$SRC/kvad-tui" ]; then
     say "  ${B}kvad-tui${R}                               browse and chat in the terminal"
 fi
-say "  ${B}kvad serve${R}                             the API and web UI on http://$SERVICE_BIND"
+if [ "$BIND_GIVEN" -eq 1 ]; then
+    say "  ${B}kvad serve --bind $SERVICE_BIND${R}   the API and web UI"
+else
+    say "  ${B}kvad serve${R}                             the API and web UI on http://$SERVICE_BIND"
+fi
 say ""
 say "Models go in ${XDG_DATA_HOME:-$HOME/.local/share}/kvad, configuration in"
 say "${XDG_CONFIG_HOME:-$HOME/.config}/kvad. Uninstall with this script and --uninstall."

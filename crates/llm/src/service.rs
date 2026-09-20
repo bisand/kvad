@@ -94,7 +94,12 @@ pub struct Sampling {
 
 impl Default for Sampling {
     fn default() -> Self {
-        Sampling { temperature: 0.7, top_k: 40, top_p: 0.95, seed: None, max_tokens: 512 }
+        // 1024 rather than 512 because of reasoning models. Qwen3 writes its
+        // working before its answer, and on a grounded question that working
+        // alone ran to about 650 tokens — so at 512 a request that names no
+        // limit gets a trace and no answer. Measured: at 400 the same model
+        // spent every token thinking and never reached one.
+        Sampling { temperature: 0.7, top_k: 40, top_p: 0.95, seed: None, max_tokens: 1024 }
     }
 }
 

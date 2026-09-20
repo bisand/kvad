@@ -91,6 +91,7 @@ fn usage() -> ! {
     --bind ADDR     address to listen on, e.g. 127.0.0.1:8080
     --db PATH       SQLite database file
     --insecure      allow a non-loopback bind with no authentication
+    -V, --version   print the version and exit
     -h, --help",
         config::default_path().display()
     );
@@ -105,6 +106,10 @@ fn parse_args() -> Args {
         let flag = argv[i].as_str();
         if matches!(flag, "-h" | "--help") {
             usage();
+        }
+        if matches!(flag, "-V" | "--version") {
+            println!("kvad-serve {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
         }
         if flag == "--insecure" {
             a.insecure = true;

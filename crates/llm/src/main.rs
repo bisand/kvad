@@ -130,6 +130,7 @@ fn usage() -> ! {
            run                 one-shot completion\n  \
            chat                interactive conversation\n  \
            serve [...]         HTTP server and web UI; options are passed through\n\n\
+         -V, --version         print the version and exit\n\n\
          options:\n  \
            --model MODEL       a name trained here, a directory, or a Hub repo id\n  \
            \u{20}                   (default: active, else {DEFAULT_MODEL})\n  \
@@ -372,6 +373,14 @@ fn main() -> Res<()> {
     let mut raw = std::env::args_os().skip(1);
     if raw.next().is_some_and(|first| first == "serve") {
         serve(raw.collect());
+    }
+
+    // Before parsing too, and for the same reason the installer wants it:
+    // "what is on this machine already" has to be answerable by a binary
+    // that may be older than whatever is asking.
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("kvad {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
     }
 
     let args = parse_args();

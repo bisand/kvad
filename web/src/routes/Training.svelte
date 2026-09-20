@@ -282,7 +282,14 @@
 
             {#if open.job.result}
               <p class="text-xs opacity-70">
-                {#if measured(open.job.result)}
+                {#if open.job.result.improved === false}
+                  <!-- A continuation that helped nothing. Reporting a kept
+                       step here would name a step whose model was never
+                       written; the model is the one the run started from. -->
+                  Nothing beat the model it continued ({open.job.result.best_val.toFixed(3)});
+                  the best checkpoint reached
+                  {open.job.result.reached?.toFixed(3) ?? "nothing"}, so nothing was written ·
+                {:else if measured(open.job.result)}
                   Kept step {open.job.result.best_step.toLocaleString()}: validation loss
                   {open.job.result.best_val.toFixed(3)} (the last step measured
                   {open.job.result.last_val.toFixed(3)}) ·

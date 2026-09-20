@@ -375,6 +375,20 @@ pub struct Training {
     /// Where to write the model whenever validation loss improves. `None`
     /// trains and keeps nothing.
     pub save: Option<std::path::PathBuf>,
+    /// Whether `model` arrives already trained, as it does for a `kvad train
+    /// --from` continuation.
+    ///
+    /// It decides what the first checkpoint has to beat, and the two answers
+    /// are not the same promise. A new model has nothing worth keeping, so
+    /// the bar starts at infinity and the first checkpoint always writes. A
+    /// continuation *is* the model in `save` — so starting its bar at
+    /// infinity means the first checkpoint overwrites it whatever it scored,
+    /// and a run that helped nothing left you worse off than before it.
+    ///
+    /// True measures the model that arrived and makes its own loss the bar,
+    /// which costs one validation pass and makes "keeps the best model" true
+    /// across a continuation rather than only within a run.
+    pub already_trained: bool,
     /// Set from another thread to end the run early. `None` is a run that
     /// cannot be stopped, which is what a command line wants: Ctrl-C.
     ///
@@ -399,6 +413,7 @@ impl Default for Training {
             eval_windows: 50,
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
             save: None,
+            already_trained: false,
             stop: None,
         }
     }
@@ -418,6 +433,11 @@ impl Training {
 
 /// What a run says about itself while it runs.
 pub enum Report<'a> {
+    /// What the model handed to the run already scores, sent once and before
+    /// the first step. Only for a continuation — see
+    /// [`Training::already_trained`] — where it is the number every
+    /// checkpoint is then measured against.
+    Baseline { val_loss: f32 },
     /// How fast this machine is turning out to be, and what the rest of the
     /// run will cost at that rate. Sent once, early — the point of it is to
     /// arrive while there is still something to be done about the answer.
@@ -441,14 +461,34 @@ pub enum Report<'a> {
 /// What a finished run leaves behind.
 #[derive(Debug)]
 pub struct Trained {
+    /// The loss of the model that is now on disk. For a continuation that
+    /// improved nothing this is the loss of the model that arrived, which is
+    /// still the one there.
     pub best_val: f32,
+    /// The step whose model was written, or 0 for "the one that arrived, and
+    /// nothing was written". See [`Trained::improved`].
     pub best_step: usize,
+    /// The lowest validation loss this run measured, whether or not it beat
+    /// the model the run started from. The same as `best_val` unless nothing
+    /// did — and the number to report when nothing did, because "the best
+    /// this run reached" is the question being asked at that point.
+    pub reached: f32,
     pub last_val: f32,
     pub elapsed_secs: f32,
     /// True if [`Training::stop`] was raised and the run ended before its
     /// last step. The numbers above are still the truth about what happened;
     /// they are just about a shorter run than the one that was asked for.
     pub stopped: bool,
+}
+
+impl Trained {
+    /// Whether any checkpoint beat the model the run started from.
+    ///
+    /// False only for a continuation that helped nothing: nothing was
+    /// written, and the model in `save` is the one that arrived.
+    pub fn improved(&self) -> bool {
+        self.best_step > 0
+    }
 }
 
 /// Steps to time before reporting a pace. Ten is enough for an estimate good
@@ -499,9 +539,20 @@ pub fn train(
     // Characters seen after `steps` steps: every window is `context` of them,
     // and there are `batch` windows to a step.
     let chars = |steps: usize| (steps * batch * context) as f32;
+    // What a checkpoint has to beat, measured before the clock starts so that
+    // a continuation's extra validation pass is not charged to the pace
+    // estimate. Step 0 is the model that arrived; see `Training::already_trained`.
+    let (mut best_val, mut best_step) = match cfg.already_trained {
+        true => (evaluate(model, &corpus.val, cfg.eval_windows, &mut Rng::new(EVAL_SEED)), 0),
+        false => (f32::INFINITY, 0),
+    };
+    if cfg.already_trained {
+        report(Report::Baseline { val_loss: best_val });
+    }
+
     let started = std::time::Instant::now();
     let (mut running, mut since) = (0.0, 0);
-    let (mut best_val, mut best_step) = (f32::INFINITY, 0);
+    let mut reached = f32::INFINITY;
     let mut last_val = f32::INFINITY;
 
     let stopped = |cfg: &Training| cfg.stop.as_deref().is_some_and(|s| s.load(Ordering::Relaxed));
@@ -531,6 +582,7 @@ pub fn train(
 
         if step % eval_every == 0 || step == cfg.steps {
             let val = evaluate(model, &corpus.val, cfg.eval_windows, &mut Rng::new(EVAL_SEED));
+            reached = reached.min(val);
             let best = val < best_val;
             if best {
                 (best_val, best_step) = (val, step);
@@ -560,6 +612,7 @@ pub fn train(
     Ok(Trained {
         best_val,
         best_step,
+        reached,
         last_val,
         elapsed_secs: started.elapsed().as_secs_f32(),
         stopped: ended_early,
@@ -1070,6 +1123,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A continuation that helps nothing must change nothing.
+    ///
+    /// "Keeps the best model, not the last" was true within a run and false
+    /// across one. The bar started at infinity on every run, including a
+    /// `--from` continuation — and a continuation *is* the model in `save`,
+    /// so its first checkpoint always wrote, whatever it scored. A run that
+    /// only made the model worse replaced a good model with a worse one, and
+    /// the good one was gone.
+    ///
+    /// The same text as the test above, for the same reason: on a corpus
+    /// that contradicts its own validation split, training can only make
+    /// validation worse, so every checkpoint of the second run is worse than
+    /// the model it started from. Nothing may be written, and the bytes on
+    /// disk say so better than any loss does.
+    #[test]
+    fn a_continuation_that_helps_nothing_writes_nothing() {
+        let (tok, corpus) = a_text_and_its_contradiction();
+        let config = GptConfig { vocab: tok.vocab(), ..TINY };
+        let mut fresh = Gpt::new(config, &mut Rng::new(4));
+        let dir = scratch("continued");
+
+        let cfg = Training {
+            steps: 240,
+            batch: 4,
+            lr: 1e-2,
+            eval_every: 40,
+            eval_windows: 20,
+            threads: 1,
+            save: Some(dir.clone()),
+            ..Training::default()
+        };
+
+        // A first run: a new model, so the bar starts at infinity and the
+        // first checkpoint writes. That is right, and stays right.
+        let first = train(&mut fresh, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |_| {}).unwrap();
+        assert!(first.improved() && first.best_step > 0, "the first run wrote nothing");
+        assert_eq!(first.best_val, first.reached, "with no model to beat, the best is the best");
+        let kept = std::fs::read(dir.join("model.safetensors")).unwrap();
+
+        // Now continue what is on disk — the best step, not the step the
+        // first run ended on.
+        let mut continued = crate::checkpoint::load(&dir).unwrap();
+        let again = Training { already_trained: true, ..cfg.clone() };
+        let mut baseline = None;
+        let second = train(&mut continued, &tok, &corpus, &again, &mut Rng::new(6), &mut |report| {
+            if let Report::Baseline { val_loss } = report {
+                baseline = Some(val_loss);
+            }
+        })
+        .unwrap();
+
+        // The bar is the model that arrived, and it is the same number the
+        // first run reported for it: saving and loading lost nothing, and
+        // the measurement is the same measurement.
+        assert_eq!(baseline, Some(second.best_val), "the bar was not the model that arrived");
+        assert_eq!(baseline, Some(first.best_val), "a saved model scores differently when loaded");
+
+        // Nothing beat it, so nothing was written and step 0 says so.
+        assert!(!second.improved(), "step {} was written over a better model", second.best_step);
+        assert_eq!(second.best_step, 0);
+        assert!(
+            second.reached > second.best_val,
+            "this text was supposed to make it worse: reached {} against the bar {}",
+            second.reached,
+            second.best_val
+        );
+        assert_eq!(
+            std::fs::read(dir.join("model.safetensors")).unwrap(),
+            kept,
+            "the model on disk was replaced by a worse one"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Evaluating draws windows from a generator of its own, so asking more
     /// often cannot change the answer. Before that it shared the training
     /// generator, and `--eval-every 100` and `--eval-every 250` trained two
@@ -1243,6 +1371,7 @@ mod tests {
                 eval_windows: 5,
                 threads: 1,
                 save: None,
+                already_trained: false,
                 stop: None,
             };
             train(&mut model, &tok, &corpus, &cfg, &mut Rng::new(5), &mut |_| {}).unwrap();
@@ -1299,6 +1428,8 @@ mod tests {
                 pace.push((chars_per_sec, remaining_secs));
             }
             Report::Step { step, .. } => latest = step,
+            // A new model, so there is no baseline to report.
+            Report::Baseline { val_loss } => panic!("a fresh run measured a baseline of {val_loss}"),
         })
         .unwrap();
 

@@ -128,13 +128,29 @@ pub struct Summary {
     pub handle: String,
     pub dir: PathBuf,
     pub params: usize,
+    /// The loss of the model now in `dir`. For a continuation that improved
+    /// nothing, the loss of the model that was already there.
     pub best_val: f32,
+    /// The step whose model was written, or 0 for "nothing was written, and
+    /// the model in `dir` is the one this run started from".
     pub best_step: usize,
+    /// The best this run measured, whether or not it beat what was already
+    /// there. Worth reporting when `best_step` is 0 and `best_val` is not
+    /// about this run at all.
+    pub reached: f32,
     pub last_val: f32,
     pub elapsed_secs: f32,
     /// True if [`Options::cancel`] was raised and the run ended early. The
     /// model in `dir` is still the best step it reached.
     pub stopped: bool,
+}
+
+impl Summary {
+    /// Whether any checkpoint beat the model the run started from, and so
+    /// whether anything was written. See [`Summary::best_step`].
+    pub fn improved(&self) -> bool {
+        self.best_step > 0
+    }
 }
 
 /// Where a run's model will be written, and what it will then be called.
@@ -264,11 +280,20 @@ pub fn run_watched(
     let cfg = Training {
         save: Some(dir.clone()),
         stop: opts.cancel.clone(),
+        // The model this run starts from is already on disk, so what a
+        // checkpoint has to beat is that model rather than nothing at all.
+        already_trained: opts.from.is_some(),
         ..opts.training.clone()
     };
     let prompt = tok.encode("\n").ok().filter(|ids| !ids.is_empty()).unwrap_or_else(|| vec![0]);
     let mut sampler = Rng::new(opts.seed ^ 0x5a5a);
     let done = text::train(&mut model, &tok, &corpus, &cfg, &mut rng, &mut |report| match report {
+        Report::Baseline { val_loss } => {
+            out(&format!(
+                "the model you are continuing scores {val_loss:.3} on this text; nothing \
+                 worse than that will be written over it"
+            ));
+        }
         Report::Pace { chars_per_sec, remaining_secs } => {
             watch(Event::Pace { chars_per_sec, remaining_secs });
             // Only worth interrupting a terminal for when the answer is long
@@ -310,6 +335,7 @@ pub fn run_watched(
         params: model.param_count(),
         best_val: done.best_val,
         best_step: done.best_step,
+        reached: done.reached,
         last_val: done.last_val,
         elapsed_secs: done.elapsed_secs,
         stopped: done.stopped,

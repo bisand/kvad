@@ -238,6 +238,13 @@ fn main() -> std::io::Result<()> {
             println!("at {chars_per_sec:.0} chars/s here, about {} to go\n", human_secs(remaining_secs));
         }
         Report::Pace { .. } => {}
+        // Unreachable from here: this binary always starts a new model, so
+        // `already_trained` is never set. It is written out rather than
+        // waved away with a wildcard, so that the day it grows a `--from`
+        // the number turns up instead of being swallowed.
+        Report::Baseline { val_loss } => {
+            println!("the model being continued scores {val_loss:.3}; a checkpoint has to beat that\n");
+        }
         Report::Step { step, train_loss, val_loss, best, saved, elapsed_secs, chars_per_sec, model } => {
             let mark = if saved { "  *saved" } else if best { "  *best" } else { "" };
             println!(

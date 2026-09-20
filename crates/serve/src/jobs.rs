@@ -672,6 +672,11 @@ pub fn train(
                         "measured": summary.best_val.is_finite(),
                         "best_val": finite(summary.best_val),
                         "best_step": summary.best_step,
+                        // False for a continuation no checkpoint improved on:
+                        // `best_val` is then the model that was already there
+                        // and `reached` is the best this run managed.
+                        "improved": summary.improved(),
+                        "reached": finite(summary.reached),
                         "last_val": finite(summary.last_val),
                         "elapsed_secs": summary.elapsed_secs,
                         "stopped": summary.stopped,

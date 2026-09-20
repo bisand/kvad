@@ -597,6 +597,28 @@ fn train_model(args: Args) -> Res<()> {
     }
 
     let summary = train::run(&opts, &mut |line| println!("{line}"))?;
+
+    // Step 0 is "nothing was written": a continuation where no checkpoint
+    // beat the model it started from. Reporting a kept step there would name
+    // a step whose model is not on disk and never was.
+    if !summary.improved() {
+        let reached = match summary.reached.is_finite() {
+            true => format!("the best checkpoint here reached {:.3}", summary.reached),
+            false => "no checkpoint was measured".to_string(),
+        };
+        println!(
+            "\nnothing beat the model this run started from: it scores {:.3}, and {reached}.",
+            summary.best_val
+        );
+        let from = opts.from.as_deref().unwrap_or(&summary.handle);
+        match &opts.name {
+            Some(name) => println!("Nothing was written: `{name}` was not created and `{from}` is untouched."),
+            None => println!("Nothing was written, and `{from}` is untouched."),
+        }
+        println!("\nrun it with:  kvad run --model {from} --prompt \"...\"");
+        return Ok(());
+    }
+
     println!(
         "\nkept step {} of {}: validation loss {:.3} (the last step measured {:.3})",
         summary.best_step, opts.training.steps, summary.best_val, summary.last_val

@@ -663,6 +663,26 @@ early stopping done by keeping the best rather than by halting: the run still
 finishes and still prints, so the overfitting stays visible instead of being
 hidden by a loop that quietly gave up.
 
+That promise used to stop at the edge of a run. The bar a checkpoint has to
+beat started at infinity every time, including for a `--from` continuation —
+and a continuation *is* the model it would overwrite, so its first checkpoint
+always wrote, whatever it scored. Caught in the act while continuing a model
+trained on the Rust book: a run restarts the learning-rate schedule, spends its
+warm-up climbing back to the peak rate, and so measures *worse* than the model
+it started from for the first several hundred steps. Validation went 1.152 to
+1.253, and 1.253 was saved over the 1.152. That run recovered; a run that was
+interrupted, or one that simply never helped, left you holding a worse model
+than you started with and no way back.
+
+A continuation now measures the model it was handed before step 1 and makes
+that its bar, which costs one validation pass and buys the whole promise: a
+continuation that helps nothing changes nothing, and says so — `nothing beat
+the model this run started from: it scores 0.796, and the best checkpoint here
+reached 34.307`. The test is a corpus that contradicts its own validation
+split, where training can only make validation worse, and it asserts on the
+bytes of `model.safetensors` rather than on a loss: the file has to be the same
+file afterwards.
+
 That comparison only means something if the two losses are measured on the
 same windows, and they were not: evaluation drew from the training generator,
 so every checkpoint scored a different sample — and, worse, `--eval-every 100`

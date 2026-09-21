@@ -535,6 +535,41 @@ pub fn parse_dtype(s: &str) -> Option<DType> {
     }
 }
 
+/// Build whichever architecture the config named, as a [`Session`].
+///
+/// The CPU engine has a registry for this and looks nothing up by hand; here
+/// there are two arms, because there are two architectures and adding a third
+/// should be a visible act rather than a line in a table. What both share is
+/// the vocabulary in [`crate::common`] — and, more to the point, the check
+/// that the checkpoint has nothing left in it that the loader never asked for.
+pub fn session(
+    paths: &[std::path::PathBuf],
+    spec: &Spec,
+    dtype: DType,
+    quant: Option<GgmlDType>,
+    device: Device,
+) -> Res<Box<dyn Session>> {
+    let arch = &spec.arch;
+    if arch.is("llama") {
+        return Ok(Box::new(GpuLlama::load(paths, spec.clone(), dtype, quant, device)?));
+    }
+    if arch.is("gpt2") {
+        return Ok(Box::new(crate::gpt2::GpuGpt2::load(paths, spec.clone(), dtype, quant, device)?));
+    }
+    Err(format!(
+        "the GPU backend implements {}; `{arch}` is not one of them.\n\
+         Run it on the CPU engine instead:  kvad run",
+        supported()
+    )
+    .into())
+}
+
+/// The architectures this backend can run, for an error message that does not
+/// have to be kept in step by hand.
+pub fn supported() -> String {
+    "the Llama family and GPT-2".to_string()
+}
+
 /// Pick the best device available, unless one was named.
 pub fn pick_device(name: Option<&str>) -> Res<Device> {
     let want = name.unwrap_or("auto").to_ascii_lowercase();

@@ -12,10 +12,8 @@ use kvad_gpu::model;
 
 use kvad::chat::Message;
 use kvad::hub::State;
-use kvad::model::Session;
 use kvad::runtime::Llm;
 use kvad::sampler::Sampler;
-use kvad_gpu::model::GpuLlama;
 use std::io::{BufRead, Write};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -145,16 +143,7 @@ fn load(args: &Args) -> Res<Llm> {
     // No watcher: a terminal has the progress lines and wants no bar.
     let watch = kvad::weights::Watcher::none();
     let llm = Llm::load_custom(&repo, &mut |m| eprintln!("  {m}"), &watch, &mut |files, spec, _| {
-        if !spec.arch.is("llama") {
-            return Err(format!(
-                "the GPU backend implements the Llama family only; `{}` is {}.\n\
-                 Run it on the CPU engine instead:  kvad run --model {repo}",
-                repo, spec.arch
-            )
-            .into());
-        }
-        let m = GpuLlama::load(&files.weights, spec.clone(), dtype, quant, device.clone())?;
-        Ok(Box::new(m) as Box<dyn Session>)
+        model::session(&files.weights, spec, dtype, quant, device.clone())
     })?;
 
     eprintln!("  {}", llm.spec.summary());

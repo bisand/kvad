@@ -28,7 +28,7 @@ Five crates, meant to be read in order:
 |---|---|---|
 | [`nervus`](crates/nervus) | A neural network and backpropagation, from scratch. Trains on MNIST. | **none** |
 | [`kvad`](crates/llm) | Transformer inference from scratch. Four architectures, real HuggingFace weights. | hub client, tokenizer, safetensors |
-| [`kvad-gpu`](crates/gpu) | The same Llama forward pass on the GPU, in candle. | candle (Metal/CUDA) |
+| [`kvad-gpu`](crates/gpu) | The same three forward passes on the GPU, in candle. | candle (Metal/CUDA) |
 | [`kvad-tui`](crates/tui) | Terminal app: browse, download, activate, chat. | ratatui |
 | [`kvad-serve`](crates/serve) | HTTP server and web UI: manage, train, score, benchmark, watch. | axum, rusqlite, Svelte |
 
@@ -1847,6 +1847,16 @@ kvad-gpu chat
 [`llama.rs`](crates/llm/src/model/llama.rs): the structure is line for line the
 same, and every operation is one you already wrote.
 
+It is three forward passes now rather than one.
+[`gpt2.rs`](crates/gpu/src/gpt2.rs) and
+[`deepseek.rs`](crates/gpu/src/deepseek.rs) sit beside it, with
+[`common.rs`](crates/gpu/src/common.rs) holding what they share — which is a
+shorter list than it looks: two weight layouts behind one `forward`, an
+embedding table that is dense or quantised, and the reader every checkpoint is
+loaded through. `session` picks which one from the config, and that same list
+is what the server asks before it offers the GPU as a default, rather than
+keeping a copy of the answer.
+
 - `matvec_bt` becomes `Tensor::matmul`.
 - The loop over attention heads becomes one batched matmul over a
   `[1, n_head, seq, head_dim]` tensor.
@@ -1889,8 +1899,13 @@ thing you think it is about.
 Metal `f32` runs at about two thirds of bf16's rate, for exactly double the
 memory. `bf16` is the default because it is also what the checkpoints ship as.
 
-The GPU backend covers the **Llama family only**; GPT-2 stays on the CPU engine,
-and asking for it says so rather than failing obscurely.
+The GPU backend covers **the Llama family, GPT-2 and DeepSeek V2/V3** — three
+of the four architectures the CPU engine has. `deepseek_v3` is the fourth:
+[`deepseek.rs`](crates/gpu/src/deepseek.rs) implements it and
+[`session`](crates/gpu/src/model.rs) has no arm that routes a V3 checkpoint to
+it, so asking for one on the GPU says which architectures there are rather
+than failing obscurely. One list answers that, and the server asks it rather
+than keeping a copy.
 
 ### Quantised weights on the GPU
 

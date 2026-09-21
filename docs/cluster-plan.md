@@ -119,7 +119,9 @@ The protocol does not care what is on the other end; the kernels do.
   chapter and a prerequisite for a PC being worth adding.
 - **NVIDIA rigs.** `kvad-gpu` is candle with the `metal` feature hard-wired.
   candle has a `cuda` feature, so this is a Cargo feature and a device
-  constructor rather than a rewrite — but `GpuLlama` is Llama only. A rig's
+  constructor rather than a rewrite. The architecture gap that used to sit
+  here is closed: the backend runs the Llama family, GPT-2 and DeepSeek V2
+  as of v0.2.0, and `deepseek_v3` is one dispatch arm away. A rig's
   x1 PCIe risers, fatal for most multi-GPU work, do not matter here: only
   activations cross them. Its usual Celeron and 4–8 GB of system RAM do
   matter: loading is slow, and the CPU path is useless on it.

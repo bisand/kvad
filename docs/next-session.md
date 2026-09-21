@@ -100,7 +100,8 @@ character tokeniser is written as BPE with an empty merge list.
 
 **4. Llama's pieces in `nervus`.** `RmsNorm` exists with its backward.
 SwiGLU and RoPE do not. With them a model can be saved in Llama layout, which
-the GPU backend (`crates/gpu`, Llama only) can run.
+the GPU backend (`crates/gpu`) can run — it covers the Llama family, GPT-2 and
+DeepSeek V2 as of v0.2.0.
 
 **5. LoRA on real models** — `kvad tune qwen2.5-0.5b --data chats.jsonl`, then
 `kvad chat --adapter`. This is what "custom model" means in practice, and it

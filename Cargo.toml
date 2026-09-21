@@ -3,11 +3,14 @@ resolver = "2"
 members = ["crates/nervus", "crates/llm", "crates/tui", "crates/gpu", "crates/serve"]
 
 [workspace.package]
-# The one place a version number is written. Every crate inherits it with
+# What every crate here ships as, bar one. They inherit it with
 # `version.workspace = true`, and the release workflow rewrites this line
 # from the tag of the GitHub release being published — so what a binary
 # reports for `--version` is what the release says it is, and there is no
 # second copy to forget.
+#
+# The exception is `nervus`, which is published to crates.io by itself and
+# carries its own version for its own reasons; see its manifest.
 version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"

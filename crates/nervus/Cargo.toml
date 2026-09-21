@@ -1,6 +1,16 @@
 [package]
 name = "nervus"
-version.workspace = true
+# Not `version.workspace = true`, and the only member that opts out. This
+# crate is published to crates.io on its own, where a version number is a
+# promise about *this* API — not about which kvad release happened to be
+# current when it went out. The workspace was at 0.1.2 by the time the
+# crate was first published, and starting a library at 0.1.2 would claim
+# two releases nobody can install.
+#
+# The cost: the release workflow stamps `[workspace.package]` only, so
+# this line does not move on its own. Bump it here when this crate's API
+# changes, which is a different question from when kvad ships.
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

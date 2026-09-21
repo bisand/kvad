@@ -16,7 +16,9 @@
 # * The version is rewritten into `[workspace.package]` from the tag, and —
 #   once the release has its files — committed back to master, so the branch
 #   says what the last release was. One line to rewrite, because every crate
-#   inherits it with `version.workspace = true`.
+#   that ships in a tarball inherits it with `version.workspace = true`.
+#   `nervus` does not — it is published to crates.io on its own cadence and
+#   sets its own version, so nothing here stamps it.
 #
 #   The builds still come from the tag, not from that commit. A release is a
 #   statement about the code at a tag, and master may have moved on since it

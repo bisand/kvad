@@ -95,7 +95,7 @@ pub struct QCache {
 }
 
 /// The backend a load uses when the request does not name one.
-fn default_backend(db: &crate::db::Db) -> String {
+pub fn default_backend(db: &crate::db::Db) -> String {
     let stored = db.setting(BACKEND_KEY).ok().flatten();
     let stored = stored.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     match crate::engine::parse(stored) {

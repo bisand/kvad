@@ -384,15 +384,11 @@ pub async fn completions(
             // but it is slow, and a client that did not mean it should be
             // told why it waited.
             let db = state.db.clone();
-            let backend = blocking(move || {
-                Ok(db
-                    .setting("models.backend")
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_else(|| "cpu-q8".into()))
-            })
-            .await?;
+            // The same answer the Models page would give, from the same
+            // function: a load started from here and a load started from
+            // there must not disagree about what "the default backend"
+            // means.
+            let backend = blocking(move || Ok(crate::models::default_backend(&db))).await?;
             let backend = crate::engine::parse(&backend)
                 .unwrap_or(kvad::service::Backend::Cpu(kvad::quant::Precision::Q8));
             let (progress, _ignored) = tokio::sync::mpsc::channel(1);

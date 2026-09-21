@@ -11,7 +11,7 @@ members = ["crates/nervus", "crates/llm", "crates/tui", "crates/gpu", "crates/se
 #
 # The exception is `nervus`, which is published to crates.io by itself and
 # carries its own version for its own reasons; see its manifest.
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"

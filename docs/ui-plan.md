@@ -201,7 +201,7 @@ Not settled here, because nothing needed it yet: open decision 2, whether the
 GPU backend is in the server's build. `kvad-serve` has no engine and so no
 `Loader` to choose one for.
 
-Also worth knowing: the default bind is `127.0.0.1:8080`, which is a
+Also worth knowing: the default bind is `127.0.0.1:5823`, which is a
 well-contended port. `--bind` or `server.bind` moves it.
 
 **Phase 2 — models and chat. Done.**

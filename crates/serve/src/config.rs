@@ -15,6 +15,24 @@
 //! [`Config::check`].
 
 use std::net::{IpAddr, SocketAddr};
+
+/// The port this server listens on when nobody says otherwise.
+///
+/// `KVAD` on a phone keypad, which is the only reason it is memorable and a
+/// good enough one. What matters more is what it is not: 8080 was the old
+/// default and is the most contended port on a developer's machine — Tomcat,
+/// llama.cpp, LocalAI, Open WebUI, and every reverse proxy and ssh tunnel
+/// anybody has ever left running. The machine this was changed on already
+/// had something answering there.
+///
+/// Checked rather than guessed: unassigned in IANA's registry — 5820 is the
+/// nearest neighbour — and in `/etc/services`, absent from Chrome's blocked
+/// port list, since a web UI on a blocked port is a page that will not load,
+/// and well below the ephemeral range, so the operating system will not hand
+/// it to somebody's outgoing connection first. It collides with none of
+/// Ollama (11434), LM Studio (1234), vLLM (8000), SGLang (30000), ComfyUI
+/// (8188), text-generation-webui (7860) or GPT4All (4891).
+pub const DEFAULT_PORT: u16 = 5823;
 use std::path::{Path, PathBuf};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -170,7 +188,7 @@ pub enum Mode {
 
 impl Default for Server {
     fn default() -> Self {
-        Server { bind: SocketAddr::from(([127, 0, 0, 1], 8080)), autoload: true }
+        Server { bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)), autoload: true }
     }
 }
 
@@ -270,7 +288,7 @@ mod tests {
         let missing = std::env::temp_dir().join("kvad-no-such-config.toml");
         let _ = std::fs::remove_file(&missing);
         let cfg = Config::load(&missing).unwrap();
-        assert_eq!(cfg.server.bind.port(), 8080);
+        assert_eq!(cfg.server.bind.port(), DEFAULT_PORT);
         assert_eq!(cfg.auth.mode, Mode::None);
         assert!(is_loopback(&cfg.server.bind));
         assert!(cfg.server.autoload, "a service should come back ready by default");
@@ -290,7 +308,7 @@ mod tests {
         std::fs::write(&path, "[server]\nautoload = false\n").unwrap();
         let cfg = Config::load(&path).unwrap();
         assert!(!cfg.server.autoload);
-        assert_eq!(cfg.server.bind.port(), 8080, "the bind default was lost");
+        assert_eq!(cfg.server.bind.port(), DEFAULT_PORT, "the bind default was lost");
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -310,7 +328,7 @@ mod tests {
         let mut cfg = Config::default();
         assert!(cfg.check(false).is_ok(), "loopback with no auth is the ordinary case");
 
-        for address in ["0.0.0.0:8080", "[::]:8080", "192.168.1.10:8080"] {
+        for address in ["0.0.0.0:5823", "[::]:5823", "192.168.1.10:5823"] {
             cfg.server.bind = address.parse().unwrap();
             let err = cfg.check(false).unwrap_err().to_string();
             assert!(err.contains("--insecure"), "{address}: {err}");
@@ -318,7 +336,7 @@ mod tests {
         }
 
         // Loopback in either family is still loopback.
-        for address in ["127.0.0.1:8080", "[::1]:8080"] {
+        for address in ["127.0.0.1:5823", "[::1]:5823"] {
             cfg.server.bind = address.parse().unwrap();
             assert!(cfg.check(false).is_ok(), "{address}");
         }
@@ -404,7 +422,7 @@ mod tests {
             &path,
             r#"
 [server]
-bind = "0.0.0.0:8080"
+bind = "0.0.0.0:5823"
 [auth]
 mode = "oidc"
 [auth.oidc]
@@ -425,7 +443,7 @@ allow_domains = ["example.com"]
     #[test]
     fn a_mode_with_accounts_may_face_the_network() {
         let mut cfg = Config::default();
-        cfg.server.bind = "0.0.0.0:8080".parse().unwrap();
+        cfg.server.bind = "0.0.0.0:5823".parse().unwrap();
         for mode in [Mode::Local, Mode::Basic] {
             cfg.auth.mode = mode;
             assert!(cfg.check(false).is_ok(), "{mode} was refused");

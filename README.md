@@ -87,7 +87,7 @@ Prebuilt binaries from the latest [release](https://github.com/bisand/kvad/relea
 checked against that release's `SHA256SUMS` and put in `~/.local/bin`. It asks
 whether to add that directory to your `PATH`, whether `kvad-serve` should
 start when you log in, and — if it should — what address and what port it
-listens on, `127.0.0.1` and `8080` by default. Those are two questions rather
+listens on, `127.0.0.1` and `5823` by default. Those are two questions rather
 than one because they are two different mistakes. It asks on `/dev/tty`, so
 the questions survive being piped into `sh`. Nothing needs root.
 
@@ -143,7 +143,7 @@ cargo run --release -p kvad-gpu -- run --prompt "Why is the sky blue?"
 cargo run --release -p kvad-tui
 
 cd web && npm ci && npm run build && cd ..   # once, for the web UI
-cargo run --release -p kvad-serve            # then http://127.0.0.1:8080
+cargo run --release -p kvad-serve            # then http://127.0.0.1:5823
 ```
 
 Verified on an M5 Pro:
@@ -2127,8 +2127,8 @@ state management — good Rust, no ML. Build it last.
 ```bash
 cd web && npm ci && npm run build && cd ..
 cargo build --release -p kvad-serve
-kvad serve                         # loopback on 8080, no auth
-kvad serve --bind 0.0.0.0:8080     # needs an auth mode, or --insecure
+kvad serve                         # loopback on 5823, no auth
+kvad serve --bind 0.0.0.0:5823     # needs an auth mode, or --insecure
 ```
 
 One binary. `rust-embed` bakes `web/dist` into it, so there is nothing to copy

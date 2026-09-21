@@ -12,7 +12,7 @@
 [server]
 # Loopback by default. Binding anything else with auth.mode = "none" is
 # refused: everyone who could reach the address would be an administrator.
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:5823"
 
 # Load the active model as soon as the server is listening, rather than
 # waiting for the first request to pay for it — tens of seconds, or ninety

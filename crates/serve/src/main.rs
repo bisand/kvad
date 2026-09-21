@@ -1,7 +1,7 @@
 //! `kvad-serve`: the HTTP server, and the web UI it carries.
 //!
-//!     kvad-serve                          loopback on 8080, no auth
-//!     kvad-serve --bind 0.0.0.0:8080      needs an auth mode, or --insecure
+//!     kvad-serve                          loopback on 5823, no auth
+//!     kvad-serve --bind 0.0.0.0:5823      needs an auth mode, or --insecure
 //!     kvad-serve --config path/kvad.toml
 //!
 //! It loads config, opens and migrates a database, decides who a request is
@@ -88,7 +88,7 @@ fn usage() -> ! {
         "kvad-serve — HTTP server and web UI for kvad
 
     --config PATH   configuration file (default: {})
-    --bind ADDR     address to listen on, e.g. 127.0.0.1:8080
+    --bind ADDR     address to listen on, e.g. 127.0.0.1:5823
     --db PATH       SQLite database file
     --insecure      allow a non-loopback bind with no authentication
     -V, --version   print the version and exit

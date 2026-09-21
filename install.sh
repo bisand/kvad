@@ -41,7 +41,7 @@ SERVICE_LABEL="net.kvad.serve"
 # field with a colon in it, and when it is wrong, which half is wrong answers
 # itself.
 DEFAULT_HOST=127.0.0.1
-DEFAULT_PORT=8080
+DEFAULT_PORT=5823
 SERVICE_HOST=$DEFAULT_HOST
 SERVICE_PORT=$DEFAULT_PORT
 HOST_GIVEN=0
@@ -199,7 +199,7 @@ port_valid() {
 
 # HOST:PORT taken apart, for the places that still speak it: --bind, KVAD_BIND,
 # and the ExecStart line of a unit this script wrote earlier. The port comes
-# off the right and the brackets come off the host, so `[::1]:8080` divides
+# off the right and the brackets come off the host, so `[::1]:5823` divides
 # where you would expect. Sets bind_host and bind_port.
 split_bind() {
     BIND_ERROR=""
@@ -207,7 +207,7 @@ split_bind() {
         '['*']:'*) bind_port=${1##*:}; bind_host=${1%:*}
                    bind_host=${bind_host#\[}; bind_host=${bind_host%\]} ;;
         *:*)       bind_port=${1##*:}; bind_host=${1%:*} ;;
-        *) BIND_ERROR="'$1' is not HOST:PORT, for example 127.0.0.1:8080"; return 1 ;;
+        *) BIND_ERROR="'$1' is not HOST:PORT, for example 127.0.0.1:5823"; return 1 ;;
     esac
     host_valid "$bind_host" && port_valid "$bind_port"
 }
@@ -259,8 +259,8 @@ exe_of() { # pid
 # installing a unit with KeepAlive on it: kvad-serve would fail to bind, be
 # restarted, fail again, and do that forever while looking installed.
 #
-# The address matters, not just the port. A listener on `*:8080` does not
-# stop a bind of `127.0.0.1:8080` — Rust sets SO_REUSEADDR, and an ssh
+# The address matters, not just the port. A listener on `*:5823` does not
+# stop a bind of `127.0.0.1:5823` — Rust sets SO_REUSEADDR, and an ssh
 # forward on the wildcard happily coexists with a server on loopback. Asking
 # "is this port in use anywhere" called that a conflict and was wrong.
 address_taken() { # host port
@@ -429,7 +429,7 @@ install.sh — install kvad on macOS or Linux
     --version TAG    a release to install, e.g. v0.1.0 (default: the latest)
     --host ADDR      address the background service listens on
                      (default: 127.0.0.1, or the one it already listens on)
-    --port PORT      the port it listens on (default: 8080, likewise)
+    --port PORT      the port it listens on (default: 5823, likewise)
     --bind HOST:PORT both at once, for a habit that is hard to break
     --service        install the background service without asking
     --no-service     skip it without asking
@@ -598,7 +598,7 @@ resume_service() {
 }
 
 # The address a service that is already installed was given. An upgrade that
-# quietly moved the server back to 127.0.0.1:8080 is a server that stopped
+# quietly moved the server back to 127.0.0.1:5823 is a server that stopped
 # answering where the rest of the machine expects it — so what is on disk is
 # the default from here on. A flag still wins, and so does an answer at the
 # prompt.
@@ -975,7 +975,7 @@ if [ -f "$SRC/kvad-serve" ]; then
 
     # Anyone installing a service at a terminal gets asked where it listens,
     # including someone who passed --service. That flag answers "whether",
-    # and saying yes to a service is not saying yes to port 8080.
+    # and saying yes to a service is not saying yes to port 5823.
     #
     # Two things skip the question. Naming either half with --host, --port
     # or --bind, which is an answer already — and an answer about one half

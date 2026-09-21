@@ -2303,11 +2303,28 @@ path is refused before the request rather than after it (8 ms), and every way
 of not knowing — offline, no such repo, an architecture this build has no
 implementation of — comes back the same and still means the CPU.
 
-The interesting number is not in the medians. GPU time-to-first-token on the
-first round of the first run was **6.9 seconds**, against 22 ms for every
-round after it — Metal compiling its pipelines, once per process. A stored
-setting still wins over all of this, because somebody choosing a backend has
-a reason — and it wins early enough that the Hub is never asked.
+One number in that table nearly became a paragraph of its own. The first run
+had a GPU round with a time to first token of **6.9 seconds** against a 22 ms
+median, which read as Metal compiling its pipelines once per process — a real
+effect, plausibly placed, and worth designing around: with the server loading
+a model at startup, that cost would land on whoever sent the first request.
+
+It did not reproduce. The same benchmark on an idle machine put the GPU's
+worst round at 24 ms and returned both decode medians within 1% of the first
+run's. What the first run actually showed was a slow round in *both* variants
+— the CPU's worst was 145 ms against its own 35 ms median — and a cost
+belonging to Metal does not appear on a CPU sample. Something else on the
+machine was busy, and one sample from each variant caught it. The explanation
+was invented to fit a single outlier, and the outlier was noise.
+
+So the medians stand, the default stands, and the warm-up that was going to
+absorb those 6.9 seconds is not written. Three of this README's numbers were
+once wrong in exactly this way, which is why the page that produced the table
+interleaves its rounds and prints the range beside the median: the range is
+what said this was worth re-running.
+
+A stored setting still wins over all of this, because somebody choosing a
+backend has a reason — and it wins early enough that the Hub is never asked.
 
 ### What it measures, and what it refuses to
 

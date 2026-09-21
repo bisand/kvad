@@ -197,6 +197,58 @@ pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
         .collect())
 }
 
+/// What the Hub says one repo's architecture is, without downloading it.
+///
+/// The same `config.model_type` [`search`] reads, asked about one model rather
+/// than a query: a metadata request, a few hundred bytes, and not a single
+/// byte of weights. It exists so that a caller deciding *how* to run a model
+/// it has never seen can find out rather than guess — the server choosing a
+/// backend for a repo somebody has just named.
+///
+/// Every way of not knowing is `None`: no network, a repo that does not exist,
+/// one that ships no `config.json`, and a `model_type` this build has no
+/// architecture for. They are the same answer to the caller, which is "assume
+/// nothing", and the caller has no channel to report them on anyway.
+///
+/// The five-second budget is the point of the timeout. This is a question
+/// asked on the way to something slower, and an answer that takes longer than
+/// that is worth less than the default it is refining.
+pub fn remote_arch(id: &str) -> Option<Arch> {
+    let path = repo_path(id)?;
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(3)))
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build(),
+    );
+    let url = format!("https://huggingface.co/api/models/{path}?expand[]=config");
+    let body = agent.get(&url).call().ok()?.body_mut().read_to_string().ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let model_type = json.get("config")?.get("model_type")?.as_str()?;
+    Arch::from_model_type(model_type)
+}
+
+/// `id` as a path under `/api/models/`, or `None` if it is not shaped like a
+/// repo id at all.
+///
+/// The check is the point rather than a formality: this id arrives in an HTTP
+/// request body, and it is about to be pasted into a URL. A repo id is
+/// `owner/name` and both halves are drawn from a small alphabet, so anything
+/// carrying a `..`, a second slash, a query string or a space is not one —
+/// and a caller asking about `./out/readme` gets `None` here rather than a
+/// round trip to be told there is no such repo.
+fn repo_path(id: &str) -> Option<String> {
+    let (owner, name) = id.split_once('/')?;
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 96
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            && s != "."
+            && s != ".."
+    };
+    (plain(owner) && plain(name)).then(|| format!("{owner}/{name}"))
+}
+
 /// A model already downloaded to the local cache.
 #[derive(Debug, Clone)]
 pub struct LocalModel {
@@ -524,6 +576,47 @@ mod tests {
         // Anything unrecognised counts as a byte rather than as nothing, so an
         // unknown dtype understates rather than vanishing.
         assert_eq!(dtype_bytes("SOMETHING_NEW"), 1);
+    }
+
+    /// The id in a repo lookup comes out of an HTTP request body and goes
+    /// into a URL, so the shape check is a boundary and not a nicety.
+    ///
+    /// It doubles as the answer to "is this a Hub repo at all": a path, a
+    /// bare name, or a trained model asked about here is refused before any
+    /// request is made rather than after one comes back empty.
+    #[test]
+    fn only_something_shaped_like_a_repo_id_is_asked_about() {
+        assert_eq!(repo_path("Qwen/Qwen3-0.6B").as_deref(), Some("Qwen/Qwen3-0.6B"));
+        assert_eq!(repo_path("openai-community/gpt2").as_deref(), Some("openai-community/gpt2"));
+        for not_one in [
+            "",
+            "shakespeare",           // trained here, no owner
+            "./out/readme",          // a path
+            "/Users/someone/model",  // an absolute path
+            "owner/name/extra",      // too many segments
+            "owner/../../etc",       // traversal
+            "owner/na me",           // a space
+            "owner/name?expand[]=x", // a query of its own
+            "owner/",
+            "/name",
+        ] {
+            assert!(repo_path(not_one).is_none(), "`{not_one}` should not become a URL");
+        }
+    }
+
+    /// The lookup itself, against the real Hub.
+    ///
+    /// Ignored by default for the same reason the crawler's is: a test that
+    /// reaches the network is testing the network. Run it when this function
+    /// changes, or when the Hub's API does.
+    #[test]
+    #[ignore = "fetches from the network"]
+    fn the_hub_can_say_what_a_model_is_without_downloading_it() {
+        assert_eq!(remote_arch("Qwen/Qwen3-0.6B"), Arch::from_model_type("qwen3"));
+        assert_eq!(remote_arch("openai-community/gpt2"), Arch::from_model_type("gpt2"));
+        // No such repo, and no such architecture: both are "assume nothing".
+        assert!(remote_arch("nobody/has-this-model-at-all-9f3c").is_none());
+        assert!(remote_arch("openai/whisper-tiny").is_none());
     }
 
     #[test]

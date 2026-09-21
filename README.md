@@ -2282,11 +2282,32 @@ dispatches on rather than a second copy of it. And it stays at q8 on both
 sides, so the comparison is the same arithmetic in two places: bf16 on the
 GPU is twice the memory and, on this machine, no faster than the CPU's q8.
 
+**The model nobody has downloaded yet.** Asking which architecture a model is
+only works for a model whose config is on this disk, and the first load of
+anything is the case where it is not. The two ways of knowing nothing were
+sharing a spelling — `None`, from an `Option<Arch>`, meant both "the picker is
+asking what this build likes in general" and "somebody named a repo this
+machine has never seen" — and the second was quietly getting the first's
+answer. So a model about to be downloaded for the first time was being offered
+the GPU on no evidence at all, which for a `whisper` or a `gemma` is a default
+that cannot load.
+
+Separating them made the honest answer `cpu-q8`, and the honest answer was
+annoying: every model's first load on the slow backend, then the right one
+ever after. The Hub knows, though, and it will say so for the price of a
+metadata request — `config.model_type`, a few hundred bytes, the same field
+the search page already reads. So `hub::remote_arch` asks. Measured: about
+0.9 s, on the way to a download of several gigabytes, and only when nothing
+local can answer and nobody has stored a choice. A repo id that is really a
+path is refused before the request rather than after it (8 ms), and every way
+of not knowing — offline, no such repo, an architecture this build has no
+implementation of — comes back the same and still means the CPU.
+
 The interesting number is not in the medians. GPU time-to-first-token on the
 first round of the first run was **6.9 seconds**, against 22 ms for every
 round after it — Metal compiling its pipelines, once per process. A stored
 setting still wins over all of this, because somebody choosing a backend has
-a reason.
+a reason — and it wins early enough that the Hub is never asked.
 
 ### What it measures, and what it refuses to
 

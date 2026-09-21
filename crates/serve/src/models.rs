@@ -103,9 +103,26 @@ pub struct QCache {
 ///
 /// `repo` is the model about to be loaded, where there is one. It decides
 /// nothing but the architecture, and the architecture decides only whether
-/// the GPU is an option: a model this build cannot read the config of, or
-/// has not downloaded yet, gets the backend that works for everything.
+/// the GPU is an option.
+///
+/// Blocking, and for a repo that is not on this disk it may spend a Hub round
+/// trip finding out what that repo is — see [`known_about`]. Callers already
+/// run it on a blocking thread; the point is that it is on the way to a load,
+/// where seconds are the unit.
 pub fn default_backend(db: &crate::db::Db, repo: Option<&str>) -> String {
+    backend_for(db, repo, hub::remote_arch)
+}
+
+/// [`default_backend`], with the Hub lookup handed in.
+///
+/// Only so the tests can have both of its answers without a network. Note
+/// that `ask` is never reached when somebody has stored a choice, which is
+/// what keeps a configured server from calling out at all.
+fn backend_for(
+    db: &crate::db::Db,
+    repo: Option<&str>,
+    ask: impl FnOnce(&str) -> Option<kvad::model::Arch>,
+) -> String {
     let stored = db.setting(BACKEND_KEY).ok().flatten();
     let stored = stored.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     match crate::engine::parse(stored) {
@@ -113,19 +130,32 @@ pub fn default_backend(db: &crate::db::Db, repo: Option<&str>) -> String {
         // `--no-default-features` binary — is treated as unset rather than as
         // an error every load has to explain.
         Some(b) => crate::engine::id_of(b),
-        None => crate::engine::id_of(crate::engine::preferred(known_about(repo))),
+        None => crate::engine::id_of(crate::engine::preferred(known_about(repo, ask))),
     }
 }
 
-/// What this machine can say about `repo` before anything is loaded.
+/// What can be said about `repo` before anything is loaded.
 ///
-/// The two ways of knowing nothing are different and [`For`] keeps them
-/// apart: no model named at all is the picker's question, and a model named
-/// but not downloaded is a config nobody here has read — the ordinary case
-/// for a load that pulls first.
-fn known_about(repo: Option<&str>) -> For {
+/// Three sources, cheapest first. A model on this disk has a config that has
+/// already been read. A model named but not downloaded has one on the Hub,
+/// and asking costs a metadata request — worth it, because the alternative is
+/// assuming the worst about every model the moment before downloading it, and
+/// that assumption is the difference between a first load on the GPU and a
+/// first load on the CPU. Anything else leaves nothing to go on: a path or a
+/// trained name is not a repo id and [`hub::remote_arch`] refuses it without
+/// a request, and a Hub that cannot be reached says nothing either.
+///
+/// The two ways of knowing nothing stay apart, because [`For::Anything`] is
+/// the picker asking what this build likes and [`For::Unknown`] is a specific
+/// model nobody can describe.
+fn known_about(repo: Option<&str>, ask: impl FnOnce(&str) -> Option<kvad::model::Arch>) -> For {
     let Some(repo) = repo else { return For::Anything };
-    match hub::find_local(repo).or_else(|| hub::find_trained(repo)).and_then(|m| m.arch) {
+    if let Some(arch) =
+        hub::find_local(repo).or_else(|| hub::find_trained(repo)).and_then(|m| m.arch)
+    {
+        return For::This(arch);
+    }
+    match ask(repo) {
         Some(arch) => For::This(arch),
         None => For::Unknown,
     }
@@ -531,13 +561,40 @@ mod tests {
         assert_eq!(default_backend(&db, None), prefers);
     }
 
-    /// A model nobody has downloaded has no config to read, and guessing the
-    /// GPU for it would be a default that fails to load.
+    /// A model nobody has downloaded is asked about, not guessed at — and
+    /// when nobody can say what it is, it gets the backend that loads
+    /// anything.
+    ///
+    /// The Hub lookup is handed in here so that both of its answers can be
+    /// had without a network. A test that reached huggingface.co would be
+    /// testing the network.
     #[test]
-    fn a_model_this_machine_does_not_have_gets_the_backend_that_always_works() {
+    fn a_model_this_machine_does_not_have_is_asked_about_not_guessed_at() {
         let db = crate::db::Db::in_memory().unwrap();
-        assert_eq!(default_backend(&db, Some("nobody/has-this-model")), "cpu-q8");
-        assert!(matches!(known_about(Some("nobody/has-this-model")), For::Unknown));
-        assert!(matches!(known_about(None), For::Anything));
+        let llama = kvad::model::Arch::require("llama");
+
+        // Nobody can say what it is: offline, or no such repo. Guessing the
+        // GPU here would be a default that fails to load.
+        assert_eq!(backend_for(&db, Some("nobody/has-this-model"), |_| None), "cpu-q8");
+        assert!(matches!(known_about(Some("nobody/has-this-model"), |_| None), For::Unknown));
+
+        // Not downloaded, and the Hub knows what it is, which is enough to
+        // choose properly rather than conservatively.
+        assert_eq!(
+            backend_for(&db, Some("somebody/a-llama"), |_| Some(llama)),
+            crate::engine::id_of(crate::engine::preferred(For::This(llama))),
+        );
+
+        // A stored choice is a choice, and settles it before anyone is asked.
+        db.set_setting(BACKEND_KEY, &json!("cpu-f32")).unwrap();
+        let answer = backend_for(&db, Some("somebody/a-llama"), |_| {
+            panic!("asked the Hub about a model somebody had already chosen a backend for")
+        });
+        assert_eq!(answer, "cpu-f32");
+
+        assert!(matches!(
+            known_about(None, |_| panic!("asked the Hub about no model in particular")),
+            For::Anything
+        ));
     }
 }

@@ -329,14 +329,22 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
 /// deleted since it was set, or be a GPU model in a build without one, and
 /// neither is a reason for a server that is otherwise fine to refuse to run.
 fn autoload(state: &auth::State, repo: String) {
-    let backend = match engine::parse(&models::default_backend(&state.db, Some(&repo))) {
-        Some(backend) => backend,
+    let scheduler = std::sync::Arc::clone(&state.engine);
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        // Inside the task rather than before it, because deciding the backend
+        // reads the disk and, for a model that is not on it, asks the Hub what
+        // that model is. Neither belongs on the thread that is supposed to be
+        // getting the server listening.
+        let named = repo.clone();
+        let Ok(chosen) = api::blocking(move || Ok(models::default_backend(&db, Some(&named)))).await
+        else {
+            return;
+        };
         // `default_backend` only ever answers with a backend this build can
         // parse, so this is unreachable rather than a case worth handling.
-        None => return,
-    };
-    let scheduler = std::sync::Arc::clone(&state.engine);
-    tokio::spawn(async move {
+        let Some(backend) = engine::parse(&chosen) else { return };
+
         // Progress goes nowhere, but it has to go somewhere: the load writes
         // to this channel as it reads files, and a receiver that has been
         // dropped would have it writing into a closed pipe for the whole

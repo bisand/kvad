@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "A neural network and backpropagation implemented from scratch, with zero dependencies."
+description = "Neural network training from scratch: transformers, AdamW, safetensors, zero dependencies."
 
 # No dependencies. Deliberately. Every float that moves in this crate
 # moves because of code in this crate.

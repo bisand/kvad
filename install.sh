@@ -609,17 +609,41 @@ write_launchd() {
 </dict>
 </plist>
 PLIST
-    # bootout first: bootstrap fails on an already-loaded label, and an
-    # upgrade is the common case here.
-    launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true
-    if launchctl bootstrap "gui/$(id -u)" "$unit" 2>/dev/null ||
-       launchctl load -w "$unit" 2>/dev/null; then
+    domain="gui/$(id -u)"
+
+    # bootout first, because bootstrap fails on a label that is already
+    # there, and an upgrade is the common case. It is asynchronous: it
+    # returns while the job is still on its way out, and bootstrapping into
+    # that gap fails. So wait for launchd to actually let go of the label.
+    if launchctl print "$domain/$SERVICE_LABEL" >/dev/null 2>&1; then
+        launchctl bootout "$domain/$SERVICE_LABEL" >/dev/null 2>&1 || true
+        waited=0
+        while launchctl print "$domain/$SERVICE_LABEL" >/dev/null 2>&1; do
+            waited=$((waited + 1))
+            if [ "$waited" -ge 50 ]; then
+                warn "the old $SERVICE_LABEL is still loaded after five seconds;
+  loading the new one may fail. Boot it out yourself with:
+    launchctl bootout $domain/$SERVICE_LABEL"
+                break
+            fi
+            sleep 0.1
+        done
+    fi
+
+    launchctl bootstrap "$domain" "$unit" >/dev/null 2>&1 ||
+        launchctl load -w "$unit" >/dev/null 2>&1 || true
+
+    # Asked rather than inferred from an exit status, because `launchctl
+    # load -w` prints "Load failed: 5: Input/output error" and then exits 0.
+    # Trusting it meant reporting a loaded service while nothing was loaded
+    # and nothing was listening.
+    if launchctl print "$domain/$SERVICE_LABEL" >/dev/null 2>&1; then
         say "  loaded $SERVICE_LABEL"
         say "  logs: $logs/kvad-serve.log"
-        say "  ${DIM}stop it with: launchctl bootout gui/$(id -u)/$SERVICE_LABEL${R}"
+        say "  ${DIM}stop it with: launchctl bootout $domain/$SERVICE_LABEL${R}"
     else
-        warn "wrote $unit but launchctl would not load it; load it yourself with:
-    launchctl bootstrap gui/$(id -u) $unit"
+        warn "wrote $unit, but launchd did not take it. Load it yourself with:
+    launchctl bootstrap $domain $unit"
     fi
 }
 

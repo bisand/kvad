@@ -31,7 +31,7 @@ use crate::common::{
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
-use kvad::model::{Session, Spec};
+use kvad::model::{Arch, Session, Spec};
 use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -568,10 +568,29 @@ pub fn session(
     .into())
 }
 
+/// The architectures this backend has an implementation for, by the id the
+/// engine gives them.
+///
+/// One list, because there are now two questions about it. `session` answers
+/// "can you run this?" by trying, and a caller that has to decide *before*
+/// committing — the server picking a default backend — asks [`supports`].
+/// Two lists would be a server that offers the GPU for a model this cannot
+/// load.
+///
+/// `deepseek.rs` implements V3 as well, and V3 is not here: the dispatch
+/// below has no arm for it, so no V3 checkpoint reaches that code. The arm
+/// and this list go together when it gets one.
+const IMPLEMENTED: [&str; 3] = ["llama", "gpt2", "deepseek_v2"];
+
+/// Whether this backend can run `arch`, asked before anything is loaded.
+pub fn supports(arch: Arch) -> bool {
+    IMPLEMENTED.iter().any(|id| arch.is(id))
+}
+
 /// The architectures this backend can run, for an error message that does not
 /// have to be kept in step by hand.
 pub fn supported() -> String {
-    "the Llama family, GPT-2 and DeepSeek V2/V3".to_string()
+    IMPLEMENTED.join(", ")
 }
 
 /// Pick the best device available, unless one was named.
@@ -588,8 +607,24 @@ pub fn pick_device(name: Option<&str>) -> Res<Device> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kvad::model::Arch;
     use std::collections::HashMap;
+
+    /// What `supports` promises is what `session` has an arm for. Asked as a
+    /// test because the promise is made to a caller that acts on it before
+    /// there is a model to try — the server offers the GPU as a default on
+    /// the strength of this answer.
+    #[test]
+    fn the_predicate_and_the_dispatch_name_the_same_architectures() {
+        for id in IMPLEMENTED {
+            assert!(supports(Arch::require(id)), "{id} is listed and not supported");
+        }
+        // Not an assertion about what *should* be: `deepseek.rs` runs V3 and
+        // the dispatch has no arm for it, so a caller must not be told the
+        // GPU will take one. This fails the day an arm is added, which is
+        // the day this list changes.
+        assert!(!supports(Arch::require("deepseek_v3")));
+        assert!(supported().contains("deepseek_v2"));
+    }
 
     /// A model small enough to build from random numbers, with every
     /// dimension a multiple of 32 so the quantisers will take it.

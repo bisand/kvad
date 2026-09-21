@@ -121,7 +121,13 @@ impl GpuGpt2 {
             &[("hidden size", e), ("MLP width", inter), ("fused QKV width", 3 * e)],
         )?;
 
-        let load_dev = if quant.is_some() { Device::Cpu } else { device.clone() };
+        // The checkpoint is mapped on the host in both modes, and each
+        // tensor is moved to the device once it is in its final form —
+        // quantised into blocks, or transposed. Reading straight onto the
+        // device instead costs a second full copy of every dense weight
+        // while its transpose is built, which is what put a 7B over this
+        // machine's GPU budget; see `Loader::proj`.
+        let load_dev = Device::Cpu;
         // SAFETY: candle memory-maps the checkpoints; they are read-only cache
         // entries that nothing else writes while we hold them.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(paths, load_dtype, &load_dev)? };

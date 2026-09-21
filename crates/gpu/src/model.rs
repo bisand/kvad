@@ -131,11 +131,13 @@ impl GpuLlama {
             ],
         )?;
 
-        // The quantiser reads from host memory, so in that mode the checkpoint
-        // is mapped on the CPU and each tensor is quantised *onto* the device
-        // one at a time. Without quantisation the weights go straight to the
-        // device in their final form.
-        let load_dev = if quant.is_some() { Device::Cpu } else { device.clone() };
+        // The checkpoint is mapped on the host in both modes, and each
+        // tensor is moved to the device once it is in its final form —
+        // quantised into blocks, or transposed. Reading straight onto the
+        // device instead costs a second full copy of every dense weight
+        // while its transpose is built, which is what put a 7B over this
+        // machine's GPU budget; see `Loader::proj`.
+        let load_dev = Device::Cpu;
 
         // SAFETY: candle memory-maps the checkpoints; they are read-only cache
         // entries that nothing else writes while we hold them.
@@ -202,6 +204,10 @@ impl GpuLlama {
         let angles = positions.matmul(&inv)?;
         let cos = angles.cos()?.to_dtype(compute)?;
         let sin = angles.sin()?.to_dtype(compute)?;
+
+        // Wait for the device before handing the model over. See
+        // [`settled`].
+        settled(&device)?;
 
         Ok(GpuLlama {
             kv: (0..spec.n_layer).map(|_| None).collect(),
@@ -375,6 +381,35 @@ impl GpuLlama {
         let head = if self.tied { 0 } else { self.head.bytes() };
         blocks + self.embed.bytes() + head + per(&self.final_norm)
     }
+}
+
+/// Block until the device has finished everything the load queued.
+///
+/// # Why a load ends with a wait
+///
+/// candle queues Metal work and hands back tensors before it has run. If a
+/// command buffer fails, the failure is recorded on the buffer and the
+/// tensors it should have written are simply left as they were — zeros. No
+/// error is returned to the caller, because as far as the caller is
+/// concerned the work has not happened yet.
+///
+/// A dense load of Qwen2.5-Coder-7B hit exactly that. The load needed twice
+/// the model's size on the device (fixed since; see [`Loader::proj`]), the
+/// copy that builds the output head died of
+/// `kIOGPUCommandBufferCallbackErrorOutOfMemory`, and the head stayed all
+/// zeros. Every layer then computed correctly, the final logits were exactly
+/// `0.0`, the sampler's argmax returned token 0, and the server answered a
+/// page of `!!!!!!!!` with HTTP 200. What gave it away was that printing the
+/// head during the load *fixed* it: a debug line calls `max_all()`, a
+/// readback synchronises, and synchronising is what surfaces the error.
+///
+/// So the wait is not an optimisation barrier or a correctness fix for the
+/// arithmetic. It is the point at which a load that failed is allowed to say
+/// so. Microseconds against the seconds a load already takes, paid once, in
+/// exchange for never again serving a model that is quietly half zeros.
+fn settled(device: &Device) -> Res<()> {
+    device.synchronize()?;
+    Ok(())
 }
 
 /// Attention for one layer: `softmax(q k^T * scale + mask) v`.
@@ -744,6 +779,214 @@ pub(crate) mod tests {
         assert!(!fused(&dev, hd, 16));
     }
 
+    /// The dense path on a real GPU, which nothing else here exercises.
+    ///
+    /// Every other agreement test in this file loads with `Device::Cpu`,
+    /// because that is the device every machine has. That covers the
+    /// arithmetic and none of the Metal, and it leaves the one combination
+    /// the server actually shipped as a default — dense weights on a GPU —
+    /// checked by nobody. A 7B model loaded `gpu-bf16` answered `!!!!!!!!`.
+    #[test]
+    fn dense_weights_on_a_real_gpu_agree_with_the_cpu_engine() {
+        use kvad::model::Transformer;
+
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device: the dense GPU path is not exercised here");
+            return;
+        };
+        let tokens = [1u32, 2, 3, 4];
+        // Qwen2 — the family the server defaults to — is untied and carries
+        // attention biases, and `tiny_spec` is neither, so a model that only
+        // has what `tiny_spec` has would not have found this.
+        for tie in [true, false] {
+            let mut spec = tiny_spec();
+            spec.tie_embeddings = tie;
+            let e = spec.n_embd;
+            let (qd, kvd) = (spec.n_head * spec.head_dim, spec.kv_dim());
+            let bias = |n: usize| {
+                (
+                    String::new(),
+                    Tensor::randn(0f32, 0.1f32, n, &Device::Cpu).unwrap(),
+                )
+                    .1
+            };
+            let extra = vec![
+                ("model.layers.0.self_attn.q_proj.bias".to_string(), bias(qd)),
+                ("model.layers.0.self_attn.k_proj.bias".to_string(), bias(kvd)),
+                ("model.layers.0.self_attn.v_proj.bias".to_string(), bias(kvd)),
+            ];
+            let _ = e;
+            let path = write_tensors(&spec, !tie, &extra, &format!("dense-on-gpu-{tie}"));
+
+            let mut cache = kvad::model::KvCache::new(&spec);
+            let ours = cpu_model(&path, &spec).forward_batch(&tokens, &mut cache);
+
+            for (what, dtype, quant) in [
+                ("dense f32", DType::F32, None),
+                ("dense bf16", DType::BF16, None),
+                ("q8", DType::F32, Some(GgmlDType::Q8_0)),
+            ] {
+                let mut gpu = GpuLlama::load(
+                    std::slice::from_ref(&path),
+                    spec.clone(),
+                    dtype,
+                    quant,
+                    dev.clone(),
+                    &Vault::off(),
+                )
+                .unwrap();
+                let theirs = gpu.forward(&tokens).unwrap();
+                assert_eq!(theirs.len(), ours.len(), "{what}, tied {tie}");
+                let worst =
+                    theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                // bf16 carries eight bits of mantissa and q8 is lossy on
+                // purpose, so only f32 is held to a rounding error.
+                let allow = match what {
+                    "dense f32" => 1e-3,
+                    _ => 5e-1,
+                };
+                assert!(
+                    worst < allow,
+                    "{what} on Metal, tied {tie}: differs from the CPU engine by {worst}"
+                );
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// A checkpoint in more than one file, which nothing else here builds.
+    ///
+    /// The server's default model ships as four shards and every model in
+    /// these tests is a single file, so the sharded path has never been
+    /// compared against anything. Dense weights on a GPU from a sharded
+    /// checkpoint is the exact combination that answered `!!!!!!!!`.
+    #[test]
+    fn a_sharded_checkpoint_loads_the_same_model_as_one_file() {
+        use kvad::model::Transformer;
+
+        let tokens = [1u32, 2, 3, 4];
+        for tie in [true, false] {
+            let mut spec = tiny_spec();
+            spec.tie_embeddings = tie;
+            let shards = write_shards(&spec, !tie, &format!("sharded-{tie}"));
+
+            let mut cache = kvad::model::KvCache::new(&spec);
+            let ckpt = kvad::weights::Checkpoint::open(&shards).unwrap();
+            let src = kvad::qcache::Live::new(&ckpt, kvad::quant::Precision::F32);
+            let ours = kvad::model::llama::Model::load(&src, spec.clone())
+                .unwrap()
+                .forward_batch(&tokens, &mut cache);
+
+            let devices = match Device::new_metal(0) {
+                Ok(gpu) => vec![("cpu device", Device::Cpu), ("metal", gpu)],
+                Err(_) => vec![("cpu device", Device::Cpu)],
+            };
+            for (where_, dev) in devices {
+                for (what, dtype, quant) in [
+                    ("dense f32", DType::F32, None),
+                    ("q8", DType::F32, Some(GgmlDType::Q8_0)),
+                ] {
+                    let mut gpu = GpuLlama::load(
+                        &shards,
+                        spec.clone(),
+                        dtype,
+                        quant,
+                        dev.clone(),
+                        &Vault::off(),
+                    )
+                    .unwrap();
+                    let theirs = gpu.forward(&tokens).unwrap();
+                    let worst = theirs
+                        .iter()
+                        .zip(&ours)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    let allow = if quant.is_some() { 5e-1 } else { 1e-3 };
+                    assert!(
+                        worst < allow,
+                        "{what} on {where_}, tied {tie}, from two shards: \
+                         differs from the CPU engine by {worst}"
+                    );
+                }
+            }
+            for p in shards {
+                std::fs::remove_file(&p).unwrap();
+            }
+        }
+    }
+
+    /// A checkpoint stored in bf16, which is how every real one ships.
+    ///
+    /// These tests write f32 tensors, so a dense load has never had to
+    /// convert on the way in — and a quantised load never converts on the
+    /// device, because it reads to the CPU and quantises there. That leaves
+    /// "bf16 on disk, dense, onto a GPU" untested, which is what the server
+    /// does when somebody picks `gpu-bf16`.
+    #[test]
+    fn a_bf16_checkpoint_loads_the_same_model_as_an_f32_one() {
+        use kvad::model::Transformer;
+
+        let tokens = [1u32, 2, 3, 4];
+        let spec = tiny_spec();
+        let f32_path = write_checkpoint(&spec, true, "as-f32");
+
+        // The same weights, rounded to bf16 and saved that way.
+        let all = candle_core::safetensors::load(&f32_path, &Device::Cpu).unwrap();
+        let narrowed: HashMap<String, Tensor> = all
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_dtype(DType::BF16).unwrap()))
+            .collect();
+        let bf16_path = std::env::temp_dir()
+            .join(format!("gpu-tiny-{}-as-bf16.safetensors", std::process::id()));
+        candle_core::safetensors::save(&narrowed, &bf16_path).unwrap();
+
+        // The reference is the CPU engine on the *rounded* weights, so what
+        // is left is the loading and not the rounding.
+        let ckpt = kvad::weights::Checkpoint::open(std::slice::from_ref(&bf16_path)).unwrap();
+        let src = kvad::qcache::Live::new(&ckpt, kvad::quant::Precision::F32);
+        let mut cache = kvad::model::KvCache::new(&spec);
+        let ours = kvad::model::llama::Model::load(&src, spec.clone())
+            .unwrap()
+            .forward_batch(&tokens, &mut cache);
+
+        let devices = match Device::new_metal(0) {
+            Ok(gpu) => vec![("cpu device", Device::Cpu), ("metal", gpu)],
+            Err(_) => vec![("cpu device", Device::Cpu)],
+        };
+        for (where_, dev) in devices {
+            for (what, dtype, allow) in [
+                ("dense f32", DType::F32, 1e-3f32),
+                ("dense bf16", DType::BF16, 5e-1),
+            ] {
+                // candle has no bf16 matmul on the CPU — `kvad-gpu --device
+                // cpu --dtype bf16` fails outright rather than quietly, so
+                // there is nothing here to compare.
+                if dtype == DType::BF16 && dev.is_cpu() {
+                    continue;
+                }
+                let mut gpu = GpuLlama::load(
+                    std::slice::from_ref(&bf16_path),
+                    spec.clone(),
+                    dtype,
+                    None,
+                    dev.clone(),
+                    &Vault::off(),
+                )
+                .unwrap();
+                let theirs = gpu.forward(&tokens).unwrap();
+                let worst =
+                    theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                assert!(
+                    worst < allow,
+                    "{what} on {where_} from a bf16 file: differs by {worst}"
+                );
+            }
+        }
+
+        std::fs::remove_file(&f32_path).unwrap();
+        std::fs::remove_file(&bf16_path).unwrap();
+    }
+
     /// A model small enough to build from random numbers, with every
     /// dimension a multiple of 32 so the quantisers will take it.
     pub(crate) fn tiny_spec() -> Spec {
@@ -815,6 +1058,44 @@ pub(crate) mod tests {
         ));
         candle_core::safetensors::save(&t, &path).unwrap();
         path
+    }
+
+    /// The same checkpoint, split across two files the way HuggingFace shards
+    /// anything over about 5 GB.
+    ///
+    /// Every model these tests build is one file, and every model the server
+    /// is pointed at in anger is several: Qwen2.5-Coder-7B ships four. The
+    /// loader takes `&[PathBuf]` and hands the lot to one `VarBuilder`, so
+    /// the difference is supposed to be invisible — which is exactly the kind
+    /// of "supposed to" worth a test.
+    pub(crate) fn write_shards(
+        spec: &Spec,
+        own_head: bool,
+        tag: &str,
+    ) -> Vec<std::path::PathBuf> {
+        let one = write_tensors(spec, own_head, &[], &format!("{tag}-whole"));
+        let all = candle_core::safetensors::load(&one, &Device::Cpu).unwrap();
+        std::fs::remove_file(&one).unwrap();
+
+        // Split the way a real shard boundary falls: the embedding table is
+        // the biggest single tensor and lands alone in the first file, and
+        // `lm_head.weight` ends up in the last one, far from it.
+        let mut first: HashMap<String, Tensor> = HashMap::new();
+        let mut second: HashMap<String, Tensor> = HashMap::new();
+        for (name, tensor) in all {
+            match name.contains("embed_tokens") {
+                true => first.insert(name, tensor),
+                false => second.insert(name, tensor),
+            };
+        }
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let paths: Vec<std::path::PathBuf> = (1..=2)
+            .map(|n| dir.join(format!("gpu-tiny-{pid}-{tag}-{own_head}-0000{n}-of-00002.safetensors")))
+            .collect();
+        candle_core::safetensors::save(&first, &paths[0]).unwrap();
+        candle_core::safetensors::save(&second, &paths[1]).unwrap();
+        paths
     }
 
     /// The hand-written engine on the same checkpoint. Owned, so the mapped

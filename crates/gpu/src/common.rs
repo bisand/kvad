@@ -161,11 +161,27 @@ impl<'v> Loader<'v> {
         stored: Stored,
     ) -> Res<Proj> {
         let Some(_) = self.quant else {
+            // Transposed on the host and moved once, never transposed on the
+            // device. `.t()?.contiguous()?` allocates a second buffer the
+            // size of the first, and doing that on the GPU means the source
+            // and the copy are both device-resident until the source drops —
+            // a peak of two full models. Qwen2.5-Coder-7B in bf16 is 15.2 GB,
+            // so that peak was 30.4 GB, and the command buffer died of
+            // `kIOGPUCommandBufferCallbackErrorOutOfMemory` on a machine with
+            // 41 GB free. Nobody was reading command buffer status, so the
+            // failed copy left its destination zeroed: the output head came
+            // out all zeros, every logit was 0.0, argmax returned token 0 and
+            // the server answered `!!!!!!!!` with HTTP 200.
+            //
+            // The quantised path never had this problem, and the comment in
+            // `GpuLlama::load` says why in as many words — it reads to the
+            // host and hands the device one finished tensor at a time. This
+            // is the dense path doing the same.
             let w = match stored {
                 Stored::OutIn => vb.get((out, inp), name)?.t()?.contiguous()?,
                 Stored::InOut => vb.get((inp, out), name)?,
             };
-            return Ok(Proj::Dense(w));
+            return Ok(Proj::Dense(w.to_device(&self.device)?));
         };
         Ok(Proj::Quant(QMatMul::from_qtensor(self.quantized(vb, name, out, inp, stored)?)?))
     }
@@ -249,12 +265,15 @@ pub(crate) fn embedding(
         // Dense keeps two copies: `index_select` wants `[vocab, n_embd]` and
         // `matmul` wants the transpose, and neither is cheap to fake from the
         // other.
+        // As in `Loader::proj`: the transpose happens on the host, so the
+        // device is never asked to hold the table and its transpose at once.
         let table = at.get((vocab, e), name)?;
         let w = match untied {
             false => table.clone(),
             true => root.get((vocab, e), "lm_head.weight").map_err(|_| no_head())?,
         };
-        return Ok((Embed::Dense(table), Proj::Dense(w.t()?.contiguous()?), false));
+        let head = w.t()?.contiguous()?.to_device(&ld.device)?;
+        return Ok((Embed::Dense(table.to_device(&ld.device)?), Proj::Dense(head), false));
     };
 
     // The arrangement this replaced, kept behind a flag so the difference it

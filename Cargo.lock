@@ -2422,7 +2422,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "kvad"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hf-hub",
  "memmap2",
@@ -2439,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "kvad-gpu"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "kvad-serve"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "axum",
@@ -2476,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "kvad-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kvad",
  "kvad-gpu",
@@ -2787,7 +2787,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "nanograd"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "nom"

@@ -121,10 +121,6 @@ impl GpuLlama {
         let load_dtype = if quant.is_some() { DType::F32 } else { dtype };
         let compute = load_dtype;
 
-        // The quantiser reads from host memory, so in that mode the checkpoint
-        // is mapped on the CPU and each tensor is quantised *onto* the device
-        // one at a time. Without quantisation the weights go straight to the
-        // device in their final form.
         check_block(
             quant,
             &[
@@ -135,6 +131,10 @@ impl GpuLlama {
             ],
         )?;
 
+        // The quantiser reads from host memory, so in that mode the checkpoint
+        // is mapped on the CPU and each tensor is quantised *onto* the device
+        // one at a time. Without quantisation the weights go straight to the
+        // device in their final form.
         let load_dev = if quant.is_some() { Device::Cpu } else { device.clone() };
 
         // SAFETY: candle memory-maps the checkpoints; they are read-only cache
@@ -248,7 +248,6 @@ impl GpuLlama {
         let spec = &self.spec;
         let hd = spec.head_dim;
         let (n_head, n_kv) = (spec.n_head, spec.n_kv_head);
-        let group = spec.group_size();
         let pos0 = self.pos;
         let scale = 1.0 / (hd as f64).sqrt();
 
@@ -297,30 +296,7 @@ impl GpuLlama {
             };
             self.kv[i] = Some((k.clone(), v.clone()));
 
-            // Fold the query heads onto their KV head rather than copying
-            // the KV head out once per query head. `repeat_kv` was 9 ms a
-            // layer at 6.5k of context and the transpose behind it another
-            // 7 ms, against 0.4 ms for the matmul they were shaping data
-            // for — 28 layers of that is most of a 640 ms token. Reshaping
-            // Q instead costs nothing: heads are laid out `kv * group + g`,
-            // which is exactly `[kv][group][m]` already, so the same bytes
-            // read as the grouped rows the matmul wants.
-            let seq = k.dim(2)?;
-            let kt = k.transpose(2, 3)?.contiguous()?;
-            let qg = q.reshape((1, n_kv, group * m, hd))?;
-            let mut att = (qg.matmul(&kt)? * scale)?;
-            if let Some(msk) = &mask {
-                // The mask is per query row, and the rows are grouped by KV
-                // head here. Back to head-major to add it, and back again.
-                att = att
-                    .reshape((1, n_head, m, seq))?
-                    .broadcast_add(msk)?
-                    .reshape((1, n_kv, group * m, seq))?;
-            }
-            let att = ops::softmax_last_dim(&att)?;
-
-            let out = att.matmul(&v.contiguous()?)?;
-            let out = out.reshape((1, n_head, m, hd))?;
+            let out = attention(&q, &k, &v, mask.as_ref(), scale)?;
             let out = out.transpose(1, 2)?.reshape((m, n_head * hd))?;
             x = (x + linear(&out, &blk.o, None)?)?;
 
@@ -401,6 +377,137 @@ impl GpuLlama {
     }
 }
 
+/// Attention for one layer: `softmax(q k^T * scale + mask) v`.
+///
+/// `q` is `[1, n_head, m, head_dim]`, `k` and `v` are
+/// `[1, n_kv_head, seq, head_dim]`, and the answer is `[1, n_head, m,
+/// head_dim]`. `mask` being `Some` means the batch is wide enough for one
+/// query to see another's future, which is also the question the fused
+/// kernel asks.
+///
+/// # Two implementations of the same line
+///
+/// Metal has MLX's flash-attention kernel behind [`ops::sdpa`], and it is
+/// worth reaching for because the obvious implementation's cost is not in
+/// its two matmuls. At 512 queries against 6.6k of cache the score matrix is
+/// 382 MB, and the three elementwise passes over it — scale, mask, softmax —
+/// read and write 2.3 GB between them. The fused kernel writes it nowhere:
+/// it walks K and V in blocks, keeping a running softmax in threadgroup
+/// memory, so only the `[m, head_dim]` answer is ever a buffer.
+///
+/// One layer of Qwen2.5-Coder-7B on an M5 Pro, f32, from
+/// `examples/prefill_cost`:
+///
+/// | queries | cache | written out | fused   | score matrix |
+/// |--------:|------:|------------:|--------:|-------------:|
+/// |     512 |   512 |     3.37 ms | 0.47 ms |        29 MB |
+/// |     512 |  2560 |    18.23 ms | 3.34 ms |       147 MB |
+/// |     512 |  6656 |    45.19 ms | 8.94 ms |       382 MB |
+///
+/// End to end on that model, a 6,519-token prompt, three interleaved rounds:
+/// prefill 20.55 s -> 15.28 s and decode 15.2 -> 23.2 tokens a second. The
+/// rest of the prefill is the seven weight matrices, which run at about 80%
+/// of this machine's f32 peak and are not going to get faster.
+///
+/// It also takes grouped-query attention as it is — `k` and `v` keep their
+/// own head count — and applies the causal mask itself, aligned so the last
+/// query row sees all of the cache. That is exactly what chunked prefill
+/// wants, so on this path neither `causal_mask` nor the transpose of K is
+/// built at all.
+///
+/// The written-out path below is still the one this backend runs on a CPU
+/// device, and on any head dimension the kernel was not compiled for. It is
+/// not a translation of the fused one — it is the original, and
+/// `the_fused_kernel_agrees_with_the_written_out_one` is what says they are
+/// the same function.
+fn attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+) -> candle_core::Result<Tensor> {
+    let (_, _, m, hd) = q.dims4()?;
+    if fused(q.device(), hd, m) {
+        return ops::sdpa(q, k, v, None, mask.is_some(), scale as f32, 1.0);
+    }
+    written_out(q, k, v, mask, scale)
+}
+
+/// Attention with the score matrix written down, as [`attention`] describes.
+fn written_out(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+) -> candle_core::Result<Tensor> {
+    let (_, n_head, m, hd) = q.dims4()?;
+    let n_kv = k.dim(1)?;
+
+    // Fold the query heads onto their KV head rather than copying the KV
+    // head out once per query head. `repeat_kv` was 9 ms a layer at 6.5k of
+    // context and the transpose behind it another 7 ms, against 0.4 ms for
+    // the matmul they were shaping data for — 28 layers of that is most of a
+    // 640 ms token. Reshaping Q instead costs nothing: heads are laid out
+    // `kv * group + g`, which is exactly `[kv][group][m]` already, so the
+    // same bytes read as the grouped rows the matmul wants.
+    let group = n_head / n_kv;
+    let seq = k.dim(2)?;
+    let kt = k.transpose(2, 3)?.contiguous()?;
+    let qg = q.reshape((1, n_kv, group * m, hd))?;
+    let mut att = (qg.matmul(&kt)? * scale)?;
+    if let Some(msk) = mask {
+        // The mask is per query row, and the rows are grouped by KV head
+        // here. Back to head-major to add it, and back again.
+        att = att
+            .reshape((1, n_head, m, seq))?
+            .broadcast_add(msk)?
+            .reshape((1, n_kv, group * m, seq))?;
+    }
+    let att = ops::softmax_last_dim(&att)?;
+    att.matmul(&v.contiguous()?)?.reshape((1, n_head, m, hd))
+}
+
+/// Whether [`ops::sdpa`] can be trusted with this device, head dimension and
+/// batch width.
+///
+/// Asked rather than tried, because `sdpa` reports an unsupported *shape* as
+/// an error, and a fallback that runs on an error path would turn every
+/// future mistake in this file into a silent slowdown. The wrong *answers*
+/// below it would not report at all.
+///
+/// # Why the batch width is a question
+///
+/// The kernel's causal masking is wrong unless `m` is a multiple of its query
+/// tile, and it is wrong quietly. It bounds the KV blocks a query tile has to
+/// visit by `ceil((n_tiles * 32 + kv_len - m) / bk)` and never clamps that to
+/// the number of blocks that exist, so a tile that is not full reaches past
+/// the end of the cache. The elementwise causal test inside the last block
+/// usually — not always — throws the overrun away again, which is exactly the
+/// kind of bug that looks like it works.
+///
+/// A multiple of 32 makes the bound come out at `ceil(kv_len / bk)` exactly,
+/// which is right by construction rather than by luck. `m == 1` is a
+/// different kernel with no causal path at all: one query against a cache
+/// that is all past, so there is nothing to mask. Checked against the
+/// written-out path over 816 shapes across head dimensions 32, 64 and 128 —
+/// no disagreement where this returns true, and 446 shapes where it refuses a
+/// kernel that would in fact have been right. Refusing costs speed; allowing
+/// costs correctness.
+///
+/// The head dimensions are the ones the kernel is compiled for. f32 is left
+/// out at 512 because a threadgroup's share of it exceeds Metal's 32 KB.
+fn fused(device: &Device, head_dim: usize, m: usize) -> bool {
+    device.is_metal()
+        && matches!(head_dim, 32 | 64 | 72 | 80 | 96 | 128 | 256)
+        && (m == 1 || m % QUERY_TILE == 0)
+}
+
+/// The fused kernel's query tile, which [`fused`] needs `m` to be a multiple
+/// of and [`Session::forward`] therefore cuts its chunks to.
+const QUERY_TILE: usize = 32;
+
 impl Session for GpuLlama {
     fn spec(&self) -> &Spec {
         &self.spec
@@ -408,10 +515,20 @@ impl Session for GpuLlama {
 
     fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
         // Chunked so that a long prompt does not allocate an attention matrix
-        // of `[heads, m, m]` all at once.
+        // of `[heads, m, m]` all at once — and, on Metal, so that every chunk
+        // but one is a width [`fused`] will take.
+        //
+        // The odd-sized chunk goes first rather than last. A prompt is almost
+        // never a multiple of `PREFILL_CHUNK`, so one chunk is always ragged,
+        // and the last chunk is the expensive one: it attends to the whole
+        // prompt. Reading the remainder first leaves that chunk — and every
+        // chunk after the first — exactly `PREFILL_CHUNK` wide.
         let mut logits = Vec::new();
-        for part in tokens.chunks(PREFILL_CHUNK) {
-            logits = self.run(part)?;
+        let (ragged, whole) = tokens.split_at(tokens.len() % PREFILL_CHUNK);
+        for part in std::iter::once(ragged).chain(whole.chunks(PREFILL_CHUNK)) {
+            if !part.is_empty() {
+                logits = self.run(part)?;
+            }
         }
         Ok(logits)
     }
@@ -437,6 +554,11 @@ impl Session for GpuLlama {
     }
 }
 
+/// How many prompt tokens go through the forward pass at a time.
+///
+/// A multiple of [`QUERY_TILE`], or the fused attention kernel would be
+/// refused on every chunk and the written-out path would run the whole
+/// prefill.
 const PREFILL_CHUNK: usize = 512;
 
 
@@ -572,6 +694,54 @@ pub(crate) mod tests {
         // the day this list changes.
         assert!(!supports(Arch::require("deepseek_v3")));
         assert!(supported().contains("deepseek_v2"));
+    }
+
+    /// The fused kernel and the written-out attention are the same function.
+    ///
+    /// Only one of them ever runs: [`fused`] picks by device, and this
+    /// machine takes whichever branch it takes. Nothing else in this file can
+    /// notice the two drifting apart, because nothing else calls both — so
+    /// this does, on the shapes where they differ most. `m = 1` is the vector
+    /// kernel against a cache, `pos0 > 0` is a prefill chunk whose causal
+    /// mask has to line up with the end of that cache rather than its start,
+    /// and `n_head > n_kv_head` means both paths have to group the same way.
+    #[test]
+    fn the_fused_kernel_agrees_with_the_written_out_one() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device: the fused attention path is not exercised here");
+            return;
+        };
+        let (n_head, n_kv, hd) = (4usize, 2usize, 32usize);
+        let scale = 1.0 / (hd as f64).sqrt();
+
+        // Widths the gate allows, against caches that put the causal
+        // boundary in every position within a key tile. `m = 1` is the
+        // vector kernel, the rest are the tiled one.
+        for (m, pos0) in [(1usize, 0usize), (1, 37), (32, 0), (32, 15), (32, 96), (64, 33)] {
+            // Or the two calls below are the same call, and this passes by
+            // comparing the written-out path with itself.
+            assert!(fused(&dev, hd, m), "m {m} is not taking the fused path");
+            let seq = pos0 + m;
+            let q = Tensor::randn(0f32, 1f32, (1, n_head, m, hd), &dev).unwrap();
+            let k = Tensor::randn(0f32, 1f32, (1, n_kv, seq, hd), &dev).unwrap();
+            let v = Tensor::randn(0f32, 1f32, (1, n_kv, seq, hd), &dev).unwrap();
+            let mask = (m > 1).then(|| causal_mask(m, pos0, &dev, DType::F32).unwrap());
+
+            let one = attention(&q, &k, &v, mask.as_ref(), scale).unwrap();
+            let two = written_out(&q, &k, &v, mask.as_ref(), scale).unwrap();
+            assert_eq!(one.dims(), two.dims(), "m {m}, pos0 {pos0}");
+
+            let one = one.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let two = two.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let worst = one.iter().zip(&two).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(worst < 1e-5, "m {m}, pos0 {pos0}: they differ by {worst}");
+        }
+
+        // And the width the gate refuses is refused: 16 queries against a
+        // 32-long cache is one of the shapes the kernel gets wrong, so a
+        // `fused` that ever starts allowing it should fail here rather than
+        // in someone's answer.
+        assert!(!fused(&dev, hd, 16));
     }
 
     /// A model small enough to build from random numbers, with every

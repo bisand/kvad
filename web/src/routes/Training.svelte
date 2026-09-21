@@ -256,7 +256,11 @@
             </div>
 
             {#if open.metrics.length}
-              <LossChart metrics={open.metrics} bestStep={training.bestStep} />
+              <LossChart
+                metrics={open.metrics}
+                bestStep={training.bestStep}
+                steps={open.job.params?.steps}
+              />
               {#key open.metrics.length}
                 <p class="text-xs opacity-60">
                   {open.metrics.length} checkpoint{open.metrics.length === 1 ? "" : "s"} ·

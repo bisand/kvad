@@ -12,7 +12,7 @@
   import uPlot from "uplot";
   import "uplot/dist/uPlot.min.css";
 
-  let { metrics = [], bestStep = null } = $props();
+  let { metrics = [], bestStep = null, steps = null } = $props();
 
   let host;
   let chart = null;
@@ -44,7 +44,19 @@
         padding: [12, 12, 0, 0],
         legend: { live: true },
         cursor: { y: false },
-        scales: { x: { time: false } },
+        scales: {
+          x: {
+            time: false,
+            // The axis is the whole run, not the part of it that has
+            // happened yet. Letting uPlot fit the data meant the axis
+            // rescaled every time a checkpoint landed — 0–200 at step 100,
+            // 100–200 at step 200 — so the curve kept changing shape while
+            // somebody watched it, which is the one thing a live chart is
+            // for. Read at draw time rather than baked in, so a rebuild is
+            // not needed when a different run is opened.
+            range: (u, lo, hi) => (steps > 0 ? [0, steps] : [lo, hi]),
+          },
+        },
         axes: [
           { stroke: ink, grid: { stroke: line }, ticks: { stroke: line }, label: "step" },
           { stroke: ink, grid: { stroke: line }, ticks: { stroke: line }, label: "loss" },

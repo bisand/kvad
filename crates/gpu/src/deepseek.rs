@@ -23,8 +23,8 @@
 //! being a list of small matmuls and become one axis of a batched one.
 //!
 //! So the cache holds `c` (512 wide) and `k_pe` (64), *shared by every head*,
-//! and nothing else. That is the architecture, and it is why this file has no
-//! `repeat_kv`.
+//! and nothing else. That is the architecture, and it is why this file never
+//! makes a per-head copy of the shared key.
 //!
 //! # The two rotations that are not the usual one
 //!

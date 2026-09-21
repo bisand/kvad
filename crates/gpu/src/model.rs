@@ -104,21 +104,6 @@ fn norm_heads(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> candle_core::Res
     }
 }
 
-/// Grouped-query attention: give every query head a copy of its KV head.
-///
-/// The hand-written version indexed into the shared head and never materialised
-/// the copies. Here it is cheaper to expand, because the result feeds a batched
-/// matmul that wants one KV head per query head.
-fn repeat_kv(x: &Tensor, group: usize) -> candle_core::Result<Tensor> {
-    if group == 1 {
-        return Ok(x.clone());
-    }
-    let (b, kv_heads, seq, hd) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, kv_heads, group, seq, hd))?
-        .reshape((b, kv_heads * group, seq, hd))
-}
-
 impl GpuLlama {
     pub fn load(
         paths: &[std::path::PathBuf],
@@ -312,16 +297,30 @@ impl GpuLlama {
             };
             self.kv[i] = Some((k.clone(), v.clone()));
 
-            let kx = repeat_kv(&k, group)?;
-            let vx = repeat_kv(&v, group)?;
-
-            let mut att = (q.matmul(&kx.transpose(2, 3)?.contiguous()?)? * scale)?;
+            // Fold the query heads onto their KV head rather than copying
+            // the KV head out once per query head. `repeat_kv` was 9 ms a
+            // layer at 6.5k of context and the transpose behind it another
+            // 7 ms, against 0.4 ms for the matmul they were shaping data
+            // for — 28 layers of that is most of a 640 ms token. Reshaping
+            // Q instead costs nothing: heads are laid out `kv * group + g`,
+            // which is exactly `[kv][group][m]` already, so the same bytes
+            // read as the grouped rows the matmul wants.
+            let seq = k.dim(2)?;
+            let kt = k.transpose(2, 3)?.contiguous()?;
+            let qg = q.reshape((1, n_kv, group * m, hd))?;
+            let mut att = (qg.matmul(&kt)? * scale)?;
             if let Some(msk) = &mask {
-                att = att.broadcast_add(msk)?;
+                // The mask is per query row, and the rows are grouped by KV
+                // head here. Back to head-major to add it, and back again.
+                att = att
+                    .reshape((1, n_head, m, seq))?
+                    .broadcast_add(msk)?
+                    .reshape((1, n_kv, group * m, seq))?;
             }
             let att = ops::softmax_last_dim(&att)?;
 
-            let out = att.matmul(&vx)?;
+            let out = att.matmul(&v.contiguous()?)?;
+            let out = out.reshape((1, n_head, m, hd))?;
             let out = out.transpose(1, 2)?.reshape((m, n_head * hd))?;
             x = (x + linear(&out, &blk.o, None)?)?;
 
@@ -681,6 +680,52 @@ pub(crate) mod tests {
 
         assert_eq!(theirs.len(), ours.len());
         theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+    }
+
+    /// Decoding a token at a time has to give what one pass over the whole
+    /// prompt gives.
+    ///
+    /// GPT-2 and DeepSeek both had this test and the Llama family did not,
+    /// which left the most-used path in this file checked only as a prefill:
+    /// `engines_differ_by` runs one `forward` over several tokens and never
+    /// asks the cache a second question. The grouped-query attention here
+    /// folds query heads onto their KV head, so `m = 1` against a cache and
+    /// `m = 4` in one go take visibly different routes through the same
+    /// reshapes, and only one of them was covered.
+    ///
+    /// The spec is 2 query heads to 1 KV head, so the folding is exercised
+    /// rather than being the identity it becomes at `group = 1`.
+    #[test]
+    fn the_cache_agrees_with_a_single_pass() {
+        let spec = tiny_spec();
+        assert!(spec.n_head > spec.n_kv_head, "this test is about grouped-query attention");
+        let path = write_checkpoint(&spec, true, "llama-cache");
+        let load = || {
+            GpuLlama::load(
+                std::slice::from_ref(&path),
+                spec.clone(),
+                DType::F32,
+                None,
+                Device::Cpu,
+                &Vault::off(),
+            )
+            .unwrap()
+        };
+
+        let mut at_once = load();
+        let whole = at_once.forward(&[1, 2, 3, 4]).unwrap();
+
+        let mut stepped = load();
+        let mut last = Vec::new();
+        for t in [1u32, 2, 3, 4] {
+            last = stepped.forward(&[t]).unwrap();
+        }
+
+        let worst = whole.iter().zip(&last).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(worst < 1e-4, "the cache changes the answer by {worst}");
+        assert_eq!(stepped.cached(), 4);
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// The bug this backend shipped with, and the only check that would have

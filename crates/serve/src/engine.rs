@@ -35,22 +35,52 @@ pub fn loader() -> Loader {
 /// | Qwen2.5-0.5B | 117.0 tok/s | 209.6 tok/s |
 /// | DeepSeek-V2-Lite | 13.6 tok/s | 37.7 tok/s |
 ///
-/// `None` means no particular model — the picker asking what this build
-/// prefers in general. A model whose architecture the GPU backend has no
-/// implementation for gets the CPU, because a default that fails to load is
-/// worse than one that is slower, and [`kvad_gpu::model::supports`] is the
-/// same list the loader dispatches on.
+/// A model whose architecture the GPU backend has no implementation for gets
+/// the CPU, because a default that fails to load is worse than one that is
+/// slower, and [`kvad_gpu::model::supports`] is the same list the loader
+/// dispatches on. [`For`] says how much is known.
 ///
 /// q8 on both sides, so this is the same arithmetic in two places rather
 /// than a quantisation trade. bf16 on the GPU is not offered as a default:
 /// it is twice the memory and, on this machine, no faster than the CPU's q8.
-pub fn preferred(arch: Option<Arch>) -> Backend {
+pub fn preferred(what: For) -> Backend {
     #[cfg(feature = "gpu")]
-    if arch.is_none_or(kvad_gpu::model::supports) {
+    if match what {
+        // Nobody named a model, so there is nothing to rule the GPU out.
+        For::Anything => true,
+        For::This(arch) => kvad_gpu::model::supports(arch),
+        // Named, and this machine has never read its config. Its architecture
+        // is whatever the download turns out to hold, and the GPU backend does
+        // not implement all of them.
+        For::Unknown => false,
+    } {
         return Backend::Gpu(kvad::service::GpuMode::Q8);
     }
-    let _ = arch;
+    let _ = what;
     Backend::Cpu(Precision::Q8)
+}
+
+/// How much is known about the model a backend is being chosen for.
+///
+/// Three questions, and the bug this replaced was two of them sharing a
+/// spelling. The architecture used to arrive as an `Option<Arch>`, and `None`
+/// meant both "no model was named" — the picker asking what this build likes
+/// in general — and "a model was named that this machine has never seen".
+/// Those want opposite answers, so an `Option` could not carry them: the
+/// second was getting the first's, which is how naming an undownloaded model
+/// came to default to a backend that might not be able to load it.
+#[derive(Clone, Copy)]
+pub enum For {
+    /// No model in particular.
+    Anything,
+    /// A model on this disk, whose config names this architecture.
+    ///
+    /// Carried but not read in a build without a GPU backend, where there is
+    /// nothing for an architecture to decide: everything gets the CPU.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    This(Arch),
+    /// A model named but not downloaded, so there is no config to read.
+    Unknown,
 }
 
 /// Every backend this build can be asked for, for the picker in the UI.
@@ -130,17 +160,27 @@ mod tests {
     /// backend cannot load.
     #[test]
     fn the_preferred_backend_is_one_this_build_can_load() {
-        for arch in [None, Some(Arch::require("llama")), Some(Arch::require("deepseek_v3"))] {
-            let id = id_of(preferred(arch));
+        let cases = [
+            For::Anything,
+            For::This(Arch::require("llama")),
+            For::This(Arch::require("deepseek_v3")),
+            For::Unknown,
+        ];
+        for what in cases {
+            let id = id_of(preferred(what));
             assert!(parse(&id).is_some(), "preferred `{id}` and could not parse it");
         }
         assert_eq!(
-            id_of(preferred(Some(Arch::require("llama")))),
+            id_of(preferred(For::This(Arch::require("llama")))),
             if cfg!(feature = "gpu") { "gpu-q8" } else { "cpu-q8" },
         );
         // No GPU implementation of V3, so no GPU default for it — even in a
         // build that has the GPU backend.
-        assert_eq!(id_of(preferred(Some(Arch::require("deepseek_v3")))), "cpu-q8");
+        assert_eq!(id_of(preferred(For::This(Arch::require("deepseek_v3")))), "cpu-q8");
+        // And knowing nothing about a named model is not the same as being
+        // asked about no model: the architecture arrives with the download,
+        // and the engine reads one the GPU backend has no implementation for.
+        assert_eq!(id_of(preferred(For::Unknown)), "cpu-q8");
     }
 
     /// Whatever the picker offers, the server must be able to load. The two

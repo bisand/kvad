@@ -15,6 +15,7 @@
 
 use crate::api::{blocking, Fail};
 use crate::auth::{Admin, Identity, State};
+use crate::engine::For;
 use axum::extract::{Query, State as St};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -112,18 +113,22 @@ pub fn default_backend(db: &crate::db::Db, repo: Option<&str>) -> String {
         // `--no-default-features` binary — is treated as unset rather than as
         // an error every load has to explain.
         Some(b) => crate::engine::id_of(b),
-        None => crate::engine::id_of(crate::engine::preferred(arch_of(repo))),
+        None => crate::engine::id_of(crate::engine::preferred(known_about(repo))),
     }
 }
 
-/// The architecture of a model on this disk, if it is on this disk and its
-/// config can be read.
+/// What this machine can say about `repo` before anything is loaded.
 ///
-/// `None` for a model named but not downloaded, which is the ordinary case
+/// The two ways of knowing nothing are different and [`For`] keeps them
+/// apart: no model named at all is the picker's question, and a model named
+/// but not downloaded is a config nobody here has read — the ordinary case
 /// for a load that pulls first.
-fn arch_of(repo: Option<&str>) -> Option<kvad::model::Arch> {
-    let repo = repo?;
-    hub::find_local(repo).or_else(|| hub::find_trained(repo)).and_then(|m| m.arch)
+fn known_about(repo: Option<&str>) -> For {
+    let Some(repo) = repo else { return For::Anything };
+    match hub::find_local(repo).or_else(|| hub::find_trained(repo)).and_then(|m| m.arch) {
+        Some(arch) => For::This(arch),
+        None => For::Unknown,
+    }
 }
 
 /// Readable by anyone signed in, because the Chat page needs to know what is
@@ -512,7 +517,7 @@ mod tests {
         let db = crate::db::Db::in_memory().unwrap();
         // Nothing stored and no model named: the build's preference, which
         // is the GPU where there is one.
-        let prefers = crate::engine::id_of(crate::engine::preferred(None));
+        let prefers = crate::engine::id_of(crate::engine::preferred(For::Anything));
         assert_eq!(default_backend(&db, None), prefers);
 
         db.set_setting(BACKEND_KEY, &json!("cpu-f32")).unwrap();
@@ -532,7 +537,7 @@ mod tests {
     fn a_model_this_machine_does_not_have_gets_the_backend_that_always_works() {
         let db = crate::db::Db::in_memory().unwrap();
         assert_eq!(default_backend(&db, Some("nobody/has-this-model")), "cpu-q8");
-        assert!(arch_of(Some("nobody/has-this-model")).is_none());
-        assert!(arch_of(None).is_none());
+        assert!(matches!(known_about(Some("nobody/has-this-model")), For::Unknown));
+        assert!(matches!(known_about(None), For::Anything));
     }
 }

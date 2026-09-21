@@ -327,7 +327,18 @@ fn at(tiny: &Tiny, tag: &str, precision: Precision) -> (Box<dyn Transformer>, Sp
     write_safetensors(&path, &tiny.tensors);
     let ckpt = Checkpoint::open(std::slice::from_ref(&path)).unwrap();
     let spec = Spec::from_config(Json::new(tiny.config.clone())).unwrap();
-    let model = deepseek::Model::load(&Live::new(&ckpt, precision), spec.clone()).unwrap();
+    let live = Live::new(&ckpt, precision);
+    let model = deepseek::Model::load(&live, spec.clone()).unwrap();
+
+    // Every fixture, every flavour: nothing in the file goes unread. Checking it
+    // here rather than in a test of its own means each new shape this file
+    // learns to build — V2, V3, the compressed query, the fp8 variant — is
+    // covered the day it is added. A weight nobody reads is a piece of the model
+    // that is not running, and this is the largest architecture here, so it is
+    // the one with the most places to lose one.
+    let unread = live.unread();
+    assert!(unread.is_empty(), "{tag}: the loader never read {unread:?}");
+
     let _ = std::fs::remove_file(&path);
     (Box::new(model), spec)
 }
@@ -767,6 +778,42 @@ fn a_truncated_cache_continues_correctly() {
     assert_eq!(reused.values(0).len(), 3 * t.lat);
     let got = model.forward_batch(&tokens[3..], &mut reused);
     close(&got, &want, "after truncation");
+}
+
+/// V3's multi-token-prediction head must be passed over in silence, not
+/// stumbled over.
+///
+/// It is a training-time device the module header says is not implemented, and
+/// its weights sit in the checkpoint all the same: a whole extra block, an
+/// embedding table and two norms, filed at `layers.{n_layer}`. The check that
+/// names tensors nobody read cannot tell *skipped on purpose* from *forgotten*
+/// by itself, so the loader has to say which — and if it stops saying so, every
+/// real V3 checkpoint fails to load rather than running as it does today.
+#[test]
+fn v3s_extra_prediction_head_is_skipped_on_purpose() {
+    let mut t = tiny(Flavour::V3);
+    let mtp = t.n_layer; // the head's block sits one past the last real layer.
+    t.config["num_nextn_predict_layers"] = serde_json::json!(1);
+
+    // The shapes do not matter — nothing reads them. Their presence does.
+    let hidden = t.hidden;
+    let p = format!("model.layers.{mtp}");
+    let mut r = Rng(0x9999_8888_7777_6666);
+    for (name, m) in [
+        (format!("{p}.embed_tokens.weight"), r.matrix(t.vocab, hidden)),
+        (format!("{p}.enorm.weight"), r.matrix(1, hidden)),
+        (format!("{p}.hnorm.weight"), r.matrix(1, hidden)),
+        (format!("{p}.eh_proj.weight"), r.matrix(hidden, 2 * hidden)),
+        (format!("{p}.shared_head.norm.weight"), r.matrix(1, hidden)),
+        (format!("{p}.shared_head.head.weight"), r.matrix(t.vocab, hidden)),
+        (format!("{p}.input_layernorm.weight"), r.matrix(1, hidden)),
+    ] {
+        t.tensors.insert(name, m);
+    }
+
+    // `at` asserts that nothing was left unread, which is the whole point.
+    let (model, spec) = at(&t, "mtp", Precision::F32);
+    assert_eq!(model.spec().n_layer, spec.n_layer, "the extra block is not a layer");
 }
 
 /// fp8 checkpoints are refused where somebody can still do something about

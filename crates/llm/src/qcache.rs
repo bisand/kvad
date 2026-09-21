@@ -74,6 +74,7 @@ use crate::quant::{Parts, Precision, Weight, BLOCK};
 use crate::tensor::Tensor;
 use crate::weights::{Checkpoint, ModelFiles};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::collections::HashMap;
 use std::io::Write;
 use std::marker::PhantomData;
@@ -86,11 +87,20 @@ const MAGIC: &[u8; 8] = b"NANOQ\x00\x00\x01";
 /// Where the first array may start. Also the alignment every array gets.
 const ALIGN: usize = 64;
 
-/// Bump this when the bytes stop meaning what they used to.
+/// Bump this when the bytes stop meaning what they used to, **or when a loader
+/// starts reading a tensor it used to ignore**.
 ///
 /// Version 1 is the first format. If the quantiser changes — a different
 /// scale rule, a different packing order, a different [`BLOCK`] — this must
 /// change too, or old files will be read as if they were new ones.
+///
+/// The second half of that rule is newer, and is the one that is easy to
+/// forget. A cache holds what the build that wrote it read, so a build that
+/// learns to read one more weight will not find it in an old cache — and for an
+/// *optional* weight, [`Source::try_vector`] answers `None` and the model
+/// quietly runs without it. That is the same silence [`Live::unread`] exists to
+/// end, arriving by a route that check cannot see: it compares against the
+/// checkpoint, and a mapped cache never opens one.
 pub const VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -219,6 +229,58 @@ pub trait Source {
     /// rounding error in both size and cost.
     fn vector(&self, name: &str) -> Res<Vec<f32>>;
     fn try_vector(&self, name: &str) -> Option<Vec<f32>>;
+
+    /// Note a tensor this architecture knows about and deliberately does not
+    /// read, so that [`Live`]'s check for weights nobody wanted does not
+    /// mistake a decision for an omission.
+    ///
+    /// The duplicate output head in a tied checkpoint is one. The default does
+    /// nothing, which is right for a source reading a cache file: it contains
+    /// what was recorded and nothing else.
+    fn skip(&self, _name: &str) {}
+
+    /// The same, for a whole subtree of tensors at once.
+    ///
+    /// DeepSeek V3's multi-token-prediction head is the case this exists for: a
+    /// complete extra transformer block, an embedding table and two norms, all
+    /// filed under `layers.{n_layer}` and up. It is a training-time device and
+    /// nothing here needs it to run the model.
+    ///
+    /// By prefix rather than by name because the alternative is a list of those
+    /// tensors kept in this crate, and a list that has to be remembered is what
+    /// went wrong in the first place.
+    fn skip_under(&self, _prefix: &str) {}
+}
+
+/// The output head: its own matrix, or `None` when the model ties it to the
+/// embedding table.
+///
+/// One function rather than the same `match` in three architectures, because all
+/// three wrote it the same way and so shared its two faults.
+///
+/// Tying is the *config's* statement about the model. `tie_word_embeddings`
+/// means the head **is** the table, whatever else the file carries: Qwen3-0.6B
+/// ships an `lm_head.weight` byte-identical to `embed_tokens.weight`, stating
+/// one matrix twice, and HuggingFace overwrites the stored copy when it ties.
+/// So the flag decides, and the redundant copy is skipped by name.
+///
+/// And an untied model with no head of its own is a broken checkpoint. This
+/// used to fall through to the embedding table, which is a different model from
+/// the one the config describes, run at full speed without a word.
+pub fn head(src: &dyn Source, spec: &Spec, name: &str) -> Res<Option<Weight>> {
+    if spec.tie_embeddings {
+        src.skip(name);
+        return Ok(None);
+    }
+    match src.try_matrix(name) {
+        Some(w) => Ok(Some(w)),
+        None => Err(format!(
+            "this model does not tie its embeddings, so it needs its own `{name}`, and the \
+             checkpoint has none.\nIf it is meant to be tied, its config is missing \
+             `tie_word_embeddings: true`."
+        )
+        .into()),
+    }
 }
 
 /// The name a sliced weight is cached under.
@@ -259,11 +321,28 @@ pub struct Live<'a> {
     out: RefCell<Option<Writer>>,
     /// Why recording stopped, if it did.
     failure: RefCell<Option<String>>,
+    /// Every checkpoint tensor an architecture asked about, by the name the
+    /// file files it under rather than the name it was asked for — the two
+    /// differ by a prefix, and only the former can be compared against
+    /// [`Checkpoint::names`].
+    ///
+    /// The point is [`Live::unread`]. A weight nobody reads is a piece of the
+    /// model that is not running, and nothing else notices: a loader asks for
+    /// what it knows about and a checkpoint has no opinion about the rest. That
+    /// is how the GPU backend ran a Llama forward pass over a Qwen3 model at
+    /// full speed, and it could as easily happen here.
+    seen: RefCell<HashSet<String>>,
 }
 
 impl<'a> Live<'a> {
     pub fn new(ckpt: &'a Checkpoint, precision: Precision) -> Self {
-        Live { ckpt, precision, out: RefCell::new(None), failure: RefCell::new(None) }
+        Live {
+            ckpt,
+            precision,
+            out: RefCell::new(None),
+            failure: RefCell::new(None),
+            seen: RefCell::new(HashSet::new()),
+        }
     }
 
     /// Start recording to `path`. Writes go to a temporary file and are moved
@@ -280,7 +359,7 @@ impl<'a> Live<'a> {
     /// cache and is otherwise ignored. It must never change what this load
     /// returns: the cache is an optimisation, and an optimisation that can
     /// silently drop a weight matrix is a correctness bug.
-    fn record(&self, write: impl FnOnce(&mut Writer) -> Res<()>) {
+    fn tee(&self, write: impl FnOnce(&mut Writer) -> Res<()>) {
         let mut out = self.out.borrow_mut();
         let failed = match out.as_mut() {
             Some(writer) => write(writer).err(),
@@ -290,6 +369,35 @@ impl<'a> Live<'a> {
             *self.failure.borrow_mut() = Some(e.to_string());
             *out = None; // drops the Writer, which removes the partial file
         }
+    }
+
+    /// Note that some architecture asked about `name`, under whichever spelling
+    /// this checkpoint files it.
+    ///
+    /// Called by every read, and on its own from [`Source::skip`] for a tensor
+    /// deliberately passed over. A name the checkpoint does not have records
+    /// nothing, which is right: there is no such tensor to leave unread.
+    fn record(&self, name: &str) {
+        if let Some(key) = self.ckpt.resolve(name) {
+            self.seen.borrow_mut().insert(key.to_string());
+        }
+    }
+
+    /// Checkpoint tensors that nothing asked about, derived buffers aside.
+    ///
+    /// Call it after the architecture has finished loading. Anything here is a
+    /// weight this build does not implement, which is worth failing over: it is
+    /// a wrong answer at full speed rather than an error.
+    pub fn unread(&self) -> Vec<String> {
+        let seen = self.seen.borrow();
+        let mut left: Vec<String> = self
+            .ckpt
+            .names()
+            .filter(|n| !seen.contains(*n) && !crate::weights::derived(n))
+            .map(str::to_string)
+            .collect();
+        left.sort();
+        left
     }
 
     /// Why nothing was cached, when nothing was.
@@ -313,47 +421,64 @@ impl<'a> Live<'a> {
 
 impl Source for Live<'_> {
     fn matrix(&self, name: &str) -> Res<Weight> {
+        self.record(name);
         let w = self.quantized(self.ckpt.get(name)?);
-        self.record(|out| out.put_weight(name, &w));
+        self.tee(|out| out.put_weight(name, &w));
         Ok(w)
     }
 
     fn try_matrix(&self, name: &str) -> Option<Weight> {
+        self.record(name);
         let w = self.quantized(self.ckpt.try_get(name)?);
-        self.record(|out| out.put_weight(name, &w));
+        self.tee(|out| out.put_weight(name, &w));
         Some(w)
     }
 
     fn matrix_t(&self, name: &str) -> Res<Weight> {
+        self.record(name);
         let w = self.quantized(self.ckpt.get(name)?.transposed());
-        self.record(|out| out.put_weight(name, &w));
+        self.tee(|out| out.put_weight(name, &w));
         Ok(w)
     }
 
     fn matrix_rows(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
+        self.record(name);
         let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?);
         let as_name = slice_name(name, start, count, false);
-        self.record(|out| out.put_weight(&as_name, &w));
+        self.tee(|out| out.put_weight(&as_name, &w));
         Ok(w)
     }
 
     fn matrix_rows_t(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
+        self.record(name);
         let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?.transposed());
         let as_name = slice_name(name, start, count, true);
-        self.record(|out| out.put_weight(&as_name, &w));
+        self.tee(|out| out.put_weight(&as_name, &w));
         Ok(w)
     }
 
     fn vector(&self, name: &str) -> Res<Vec<f32>> {
+        self.record(name);
         let v = self.ckpt.get_flat(name)?;
-        self.record(|out| out.put_vector(name, &v));
+        self.tee(|out| out.put_vector(name, &v));
         Ok(v)
     }
 
     fn try_vector(&self, name: &str) -> Option<Vec<f32>> {
+        self.record(name);
         let v = self.ckpt.try_get_flat(name)?;
-        self.record(|out| out.put_vector(name, &v));
+        self.tee(|out| out.put_vector(name, &v));
         Some(v)
+    }
+
+    fn skip(&self, name: &str) {
+        self.record(name);
+    }
+
+    fn skip_under(&self, prefix: &str) {
+        let names: Vec<String> =
+            self.ckpt.names_under(prefix).into_iter().map(str::to_string).collect();
+        self.seen.borrow_mut().extend(names);
     }
 }
 
@@ -853,6 +978,23 @@ pub fn load(
     }
 
     let model = build(&live, spec)?;
+
+    // Before `finish`, so a refused load leaves no cache behind: dropping the
+    // `Writer` removes the partial file.
+    let left = live.unread();
+    if !left.is_empty() {
+        return Err(format!(
+            "this checkpoint holds {} tensor(s) that the `{}` loader never reads:\n  {}\n\
+             A weight nobody reads is a piece of the model that is not running — a wrong \
+             answer\nat full speed rather than an error: this build does not implement all \
+             of this model.",
+            left.len(),
+            spec.arch,
+            crate::weights::collapsed(&left).join("\n  "),
+        )
+        .into());
+    }
+
     match live.finish(repo, &files.weights, spec) {
         Ok(Some(bytes)) => progress(&format!("cached for next time ({} MB)", bytes / 1_000_000)),
         Ok(None) => {

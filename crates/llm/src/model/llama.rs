@@ -23,7 +23,7 @@
 //! than an error, which is why the counting test in the README exists.
 
 use super::{attend, Architecture, KvCache, Spec, Transformer};
-use crate::qcache::Source;
+use crate::qcache::{head, Source};
 use crate::quant::Weight;
 use crate::tensor::{rms_norm, swiglu_inplace, Rope};
 
@@ -135,10 +135,7 @@ impl Model {
             });
         }
 
-        let lm_head = match spec.tie_embeddings {
-            true => None,
-            false => src.try_matrix("lm_head.weight"),
-        };
+        let lm_head = head(src, &spec, "lm_head.weight")?;
 
         Ok(Model {
             embed: src.matrix("embed_tokens.weight")?,

@@ -391,6 +391,68 @@ pub fn fetch_watched(
     })
 }
 
+/// Names a checkpoint may hold that are not weights, so leaving them unread is
+/// correct rather than a gap in the implementation.
+///
+/// Both are constants an engine builds for itself. `rotary_emb.inv_freq` is the
+/// RoPE frequency table, which Llama-2-era exports saved as a buffer and every
+/// loader here computes from `rope_theta`. GPT-2's `attn.bias` is its causal
+/// mask — a lower-triangular block of ones the size of the context window,
+/// stored because `torch` had nowhere else to put it.
+///
+/// The list is exact on purpose. Anything not here that nobody reads is a piece
+/// of the model that is not running.
+pub fn derived(name: &str) -> bool {
+    name.ends_with("rotary_emb.inv_freq")
+        || name.ends_with("attn.bias")
+        || name.ends_with("attn.masked_bias")
+}
+
+/// The same names with every numeric path segment collapsed to `*`, each line
+/// carrying a count when it stands for more than one tensor.
+///
+/// For naming what a loader did not read. Twenty-eight layers means twenty-eight
+/// copies of one omission, and a message that lists them all buries the single
+/// fact worth reading — DeepSeek-V2-Lite would put sixty-four experts on top of
+/// that. Shared by both engines because the complaint is the same on either.
+pub fn collapsed(names: &[String]) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for name in names {
+        let key: String = name
+            .split('.')
+            .map(|part| match !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+                true => "*",
+                false => part,
+            })
+            .collect::<Vec<_>>()
+            .join(".");
+        match counts.get_mut(&key) {
+            Some(n) => *n += 1,
+            None => {
+                counts.insert(key.clone(), 1);
+                order.push(key);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|k| match counts[&k] {
+            1 => k,
+            n => format!("{k}  ({n} tensors)"),
+        })
+        .collect()
+}
+
+/// The spellings a checkpoint might file `name` under.
+///
+/// GPT-2 saves `wte.weight` or `transformer.wte.weight` depending on which
+/// Python class wrote it, and the Llama family puts `model.` in front of
+/// everything but `lm_head.weight`.
+fn spellings(name: &str) -> [String; 3] {
+    [name.to_string(), format!("transformer.{name}"), format!("model.{name}")]
+}
+
 /// One or more safetensors files, presented as a single namespace.
 pub struct Checkpoint {
     maps: Vec<memmap2::Mmap>,
@@ -424,18 +486,32 @@ impl Checkpoint {
         self.index.keys().map(|s| s.as_str())
     }
 
-    /// Look a tensor up, converting to `f32`.
+    /// The name this checkpoint actually files `name` under, if it has it.
     ///
     /// Checkpoints disagree about prefixes — GPT-2 saves `wte.weight` or
-    /// `transformer.wte.weight` depending on which Python class wrote it — so
-    /// a few spellings are tried before giving up.
+    /// `transformer.wte.weight` depending on which Python class wrote it — so a
+    /// few spellings are tried before giving up. Which one won matters to
+    /// anything comparing what was read against [`Checkpoint::names`], so the
+    /// search is its own function rather than a local in `try_get`.
+    pub fn resolve(&self, name: &str) -> Option<&str> {
+        spellings(name)
+            .into_iter()
+            .find_map(|c| self.index.get_key_value(c.as_str()).map(|(k, _)| k.as_str()))
+    }
+
+    /// Every tensor filed somewhere under `prefix`, whatever prefix the file
+    /// itself puts in front of it.
+    ///
+    /// For naming a whole subtree at once — a part of a model this build
+    /// knowingly does not run. See [`crate::qcache::Source::skip_under`].
+    pub fn names_under(&self, prefix: &str) -> Vec<&str> {
+        let want = spellings(prefix);
+        self.names().filter(|n| want.iter().any(|w| n.starts_with(w.as_str()))).collect()
+    }
+
+    /// Look a tensor up, converting to `f32`.
     pub fn try_get(&self, name: &str) -> Option<Tensor> {
-        let candidates = [
-            name.to_string(),
-            format!("transformer.{name}"),
-            format!("model.{name}"),
-        ];
-        let key = candidates.iter().find(|c| self.index.contains_key(*c))?;
+        let key = self.resolve(name)?;
         let st = SafeTensors::deserialize(&self.maps[self.index[key]]).ok()?;
         let view = st.tensor(key).ok()?;
 

@@ -29,7 +29,7 @@ use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
 use kvad::model::{Session, Spec};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -265,58 +265,13 @@ impl<'a> Reader<'a> {
 /// wrong.
 fn unread(paths: &[std::path::PathBuf], seen: &HashSet<String>) -> Res<Vec<String>> {
     let ckpt = kvad::weights::Checkpoint::open(paths)?;
-    let mut left: Vec<String> =
-        ckpt.names().filter(|n| !seen.contains(*n) && !derived(n)).map(str::to_string).collect();
+    let mut left: Vec<String> = ckpt
+        .names()
+        .filter(|n| !seen.contains(*n) && !kvad::weights::derived(n))
+        .map(str::to_string)
+        .collect();
     left.sort();
     Ok(left)
-}
-
-/// Names that are in the file but are not weights — recomputed here instead, so
-/// leaving them unread is correct.
-///
-/// `rotary_emb.inv_freq` is the one that matters: Llama-2-era exports saved the
-/// rotation frequencies as a buffer, and this loader builds them from
-/// `rope_theta`. A guard that refused a checkpoint over a *derived* tensor
-/// would be doing harm.
-fn derived(name: &str) -> bool {
-    name.ends_with("rotary_emb.inv_freq")
-}
-
-/// The unread names as lines for an error, with layer indices collapsed.
-///
-/// Twenty-eight layers means twenty-eight copies of one omission, and a message
-/// that lists them all buries the single fact worth reading.
-fn summarise(names: &[String]) -> Vec<String> {
-    let mut order: Vec<String> = Vec::new();
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for name in names {
-        let key = collapse(name);
-        match counts.get_mut(&key) {
-            Some(n) => *n += 1,
-            None => {
-                counts.insert(key.clone(), 1);
-                order.push(key);
-            }
-        }
-    }
-    order
-        .into_iter()
-        .map(|k| match counts[&k] {
-            1 => k,
-            n => format!("{k}  ({n} tensors)"),
-        })
-        .collect()
-}
-
-/// `layers.7.self_attn.q_norm.weight` -> `layers.*.self_attn.q_norm.weight`.
-fn collapse(name: &str) -> String {
-    name.split('.')
-        .map(|part| match !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
-            true => "*",
-            false => part,
-        })
-        .collect::<Vec<_>>()
-        .join(".")
 }
 
 /// `y = proj(x) (+ b)`.
@@ -530,7 +485,7 @@ impl GpuLlama {
                  answer at full speed rather than an error, which is how Qwen3's per-head Q/K\n\
                  norms were missed. Run it on the CPU engine instead:  kvad run",
                 left.len(),
-                summarise(&left).join("\n  ")
+                kvad::weights::collapsed(&left).join("\n  ")
             )
             .into());
         }

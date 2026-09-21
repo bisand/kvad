@@ -12,7 +12,7 @@
 //! learned vector per slot in the context window.
 
 use super::{attend, Architecture, KvCache, Spec, Transformer};
-use crate::qcache::Source;
+use crate::qcache::{head, Source};
 use crate::quant::Weight;
 use crate::tensor::{gelu_inplace, layer_norm};
 
@@ -105,9 +105,16 @@ impl Model {
             });
         }
 
-        let (lm_head, lm_head_b) = match spec.tie_embeddings {
-            true => (None, None),
-            false => (src.try_matrix("lm_head.weight"), src.try_vector("lm_head.bias")),
+        let lm_head = head(src, &spec, "lm_head.weight")?;
+        // The bias stays optional even in an untied model, because GPT-2 itself
+        // has none: `lm_head` there is the embedding table applied backwards,
+        // and a table has no bias to apply with it.
+        let lm_head_b = match spec.tie_embeddings {
+            true => {
+                src.skip("lm_head.bias");
+                None
+            }
+            false => src.try_vector("lm_head.bias"),
         };
 
         Ok(Model {

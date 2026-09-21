@@ -71,7 +71,7 @@
 //! needed to run the model. Its weights are skipped.
 
 use super::{Architecture, CacheShape, Json, KvCache, Spec, Transformer};
-use crate::qcache::Source;
+use crate::qcache::{head, Source};
 use crate::quant::Weight;
 use crate::tensor::{dot, rms_norm, softmax_inplace, swiglu_inplace, Rope};
 use rayon::prelude::*;
@@ -621,10 +621,18 @@ impl Model {
             });
         }
 
-        let lm_head = match spec.tie_embeddings {
-            true => None,
-            false => src.try_matrix("lm_head.weight"),
-        };
+        // V3's multi-token-prediction head, which the module header explains is
+        // not implemented: one whole extra block per predicted token, filed at
+        // `layers.{n_layer}` and up. Saying so is not decoration — *deliberately
+        // not read* and *forgotten* look identical from outside a loader, and
+        // the check that runs after this would otherwise refuse every V3
+        // checkpoint for carrying weights nobody wanted.
+        let mtp = spec.config.num(&["num_nextn_predict_layers"]).unwrap_or(0);
+        for i in spec.n_layer..spec.n_layer + mtp {
+            src.skip_under(&format!("layers.{i}."));
+        }
+
+        let lm_head = head(src, &spec, "lm_head.weight")?;
         let rope = build_rope(mla.qk_rope, spec.n_ctx, spec.rope_theta, &spec.config)?;
 
         Ok(Model {
@@ -878,6 +886,7 @@ impl Transformer for Model {
     fn param_count(&self) -> usize {
         self.embed.param_count()
             + self.lm_head.as_ref().map_or(0, |h| h.param_count())
+            + self.final_norm.len()
             + self.blocks.iter().map(|b| b.param_count()).sum::<usize>()
     }
 

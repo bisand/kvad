@@ -130,6 +130,11 @@ pub struct Completions {
     tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     max_tokens: Option<usize>,
+    /// What OpenAI renamed `max_tokens` to, and what the newer clients send.
+    /// Both are accepted and mean the same thing here; a client that sends
+    /// both gets `max_tokens`, which is the one it also sent on purpose.
+    #[serde(default)]
+    max_completion_tokens: Option<usize>,
     #[serde(default)]
     seed: Option<u64>,
     /// Answer from this dataset: search it with the last thing the user
@@ -254,7 +259,7 @@ impl Completions {
         if !(0.0..=1.0).contains(&top_p) {
             return Err(Fail::bad("top_p is between 0 and 1"));
         }
-        let max_tokens = self.max_tokens.unwrap_or(d.max_tokens);
+        let max_tokens = self.max_tokens.or(self.max_completion_tokens).unwrap_or(d.max_tokens);
         if max_tokens == 0 {
             return Err(Fail::bad("max_tokens of 0 would generate nothing"));
         }
@@ -827,6 +832,14 @@ mod tests {
         }));
         let s = asked.sampling().unwrap();
         assert_eq!((s.temperature, s.top_p, s.top_k, s.seed, s.max_tokens), (0.0, 0.5, 3, Some(42), 16));
+
+        // The newer spelling, which is what an editor's agent sends. Ignoring
+        // it would mean honouring the engine's default instead of the
+        // client's limit, which a client has no way to notice.
+        let renamed = request(json!({
+            "messages": [{ "role": "user", "content": "hi" }], "max_completion_tokens": 24,
+        }));
+        assert_eq!(renamed.sampling().unwrap().max_tokens, 24);
 
         // A cap, so one request cannot ask the engine for an afternoon.
         let huge = request(json!({ "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 1_000_000 }));

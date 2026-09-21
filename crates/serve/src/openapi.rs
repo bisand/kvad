@@ -200,7 +200,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       which this engine does not do.",
         query: &[], body: json_body("OpenAI's request: `{ messages, stream?, \
                                      temperature?, top_p?, max_tokens?, seed?, \
-                                     tools?, tool_choice? }`."),
+                                     max_completion_tokens?, tools?, tool_choice? }`."),
         produces: "application/json or text/event-stream",
         events: &[("message", "An OpenAI chunk, or the literal `[DONE]`.")],
     },

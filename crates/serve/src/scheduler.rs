@@ -38,6 +38,10 @@ pub struct Loaded {
     pub summary: String,
     pub params: usize,
     pub instruct: bool,
+    /// Whether this model can be offered tools — a fact about its chat
+    /// template, reported so that a client finds out before it asks for a
+    /// call rather than after it gets a paragraph instead of one.
+    pub tools: bool,
     pub backend: String,
     pub weight_bytes: usize,
     /// The longest conversation this model can hold.
@@ -77,7 +81,12 @@ type Answer<T> = oneshot::Sender<Result<T, String>>;
 enum Job {
     Load { repo: String, backend: Backend, progress: tokio_mpsc::Sender<Progress>, done: Answer<Loaded> },
     Unload { done: Answer<Option<String>> },
-    Chat { messages: Vec<Message>, sampling: Sampling, out: tokio_mpsc::Sender<Piece> },
+    Chat {
+        messages: Vec<Message>,
+        tools: Vec<serde_json::Value>,
+        sampling: Sampling,
+        out: tokio_mpsc::Sender<Piece>,
+    },
     Complete {
         prompt: String,
         sampling: Sampling,
@@ -188,13 +197,14 @@ impl Scheduler {
     pub fn chat(
         &self,
         messages: Vec<Message>,
+        tools: Vec<serde_json::Value>,
         sampling: Sampling,
     ) -> Result<tokio_mpsc::Receiver<Piece>, String> {
         // Bounded, so a client that reads slowly slows the generation down
         // rather than filling memory with tokens it has not asked for. 64 is
         // a second or so of decoding at the rates this engine reaches.
         let (out, rx) = tokio_mpsc::channel(64);
-        self.submit(Job::Chat { messages, sampling, out })?;
+        self.submit(Job::Chat { messages, tools, sampling, out })?;
         Ok(rx)
     }
 
@@ -278,8 +288,8 @@ fn run(
                 let _ = done.send(was);
             }
 
-            Job::Chat { messages, sampling, out } => {
-                engine.send(Cmd::Chat { messages, sampling });
+            Job::Chat { messages, tools, sampling, out } => {
+                engine.send(Cmd::Chat { messages, tools, sampling });
                 if let Some(stats) = drain_chat(&engine.rx, &out) {
                     // What the cache holds now: the prompt it prefilled plus
                     // everything it generated.
@@ -325,6 +335,7 @@ fn drain_load(rx: &Receiver<Evt>, progress: &tokio_mpsc::Sender<Progress>) -> Re
                 summary,
                 params,
                 instruct,
+                tools,
                 backend,
                 weight_bytes,
                 n_ctx,
@@ -335,6 +346,7 @@ fn drain_load(rx: &Receiver<Evt>, progress: &tokio_mpsc::Sender<Progress>) -> Re
                     summary,
                     params,
                     instruct,
+                    tools,
                     backend,
                     weight_bytes,
                     n_ctx,
@@ -488,7 +500,7 @@ mod tests {
     async fn chatting_without_a_model_fails_the_stream() {
         let sched = refusing();
         let mut pieces = sched
-            .chat(vec![Message::user("hello")], Sampling::default())
+            .chat(vec![Message::user("hello")], Vec::new(), Sampling::default())
             .expect("the scheduler refused to queue the job");
         let piece = pieces.recv().await.expect("the stream ended with nothing in it");
         match piece {

@@ -224,11 +224,25 @@ impl Llm {
     ///
     /// Falls back to the raw last message for base models, which have no
     /// template and no notion of turns.
-    pub fn encode_chat(&self, messages: &[Message]) -> Res<Vec<u32>> {
+    ///
+    /// `tools` is what the caller is offering the model this turn; pass an
+    /// empty slice for a conversation with none. Whether the template has
+    /// anywhere to put them is [`Llm::takes_tools`], and a caller that cares
+    /// asks before generating rather than after.
+    pub fn encode_chat(&self, messages: &[Message], tools: &[serde_json::Value]) -> Res<Vec<u32>> {
         match &self.chat {
-            Some(t) => self.encode(&t.render(messages, true)?),
+            Some(t) => self.encode(&t.render(messages, tools, true)?),
             None => self.encode(messages.last().map(|m| m.content.as_str()).unwrap_or("")),
         }
+    }
+
+    /// Whether this model's template can be told about tools at all.
+    ///
+    /// False for every base model, which has no template, and for the
+    /// instruct models trained before tool calling was a thing anyone
+    /// expected of them.
+    pub fn takes_tools(&self) -> bool {
+        self.chat.as_ref().is_some_and(|t| t.takes_tools())
     }
 
     /// Where this model runs, e.g. `cpu q8` or `metal bf16`.

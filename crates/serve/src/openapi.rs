@@ -185,16 +185,27 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       `text/event-stream` in OpenAI's chunk format, ending with \
                       `[DONE]`; otherwise one JSON object. Per-generation numbers — \
                       prefill and decode rates, cached tokens — are in an extension \
-                      field, which is how this server's own UI gets them.",
+                      field, which is how this server's own UI gets them.\n\n\
+                      `tools` go to the model's own chat template and the calls it \
+                      writes come back as `tool_calls`, with a `finish_reason` of \
+                      `tool_calls`; send the results as `tool` messages carrying the \
+                      same ids. A model whose template has no place for tools is \
+                      refused rather than quietly answering in prose — `tools` on \
+                      `/v1/models` says which those are. `tool_choice` is `auto` or \
+                      `none`: forcing a call would need the sampler constrained, \
+                      which this engine does not do.",
         query: &[], body: json_body("OpenAI's request: `{ messages, stream?, \
-                                     temperature?, top_p?, max_tokens?, seed? }`."),
+                                     temperature?, top_p?, max_tokens?, seed?, \
+                                     tools?, tool_choice? }`."),
         produces: "application/json or text/event-stream",
         events: &[("message", "An OpenAI chunk, or the literal `[DONE]`.")],
     },
     Endpoint {
         method: "get", path: "/v1/models", tag: "Chat", access: Access::SignedIn,
-        summary: "What is loaded, in OpenAI's shape",
-        description: "One entry, because the engine holds one model.",
+        summary: "Every model this machine has, in OpenAI's shape",
+        description: "One entry per model on disk. Each carries a `kvad` object \
+                      beside OpenAI's fields saying whether that model's chat \
+                      template can be offered tools.",
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {

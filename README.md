@@ -56,7 +56,8 @@ had any room for, which is why architectures are
 [plugin modules](#six-years-of-architecture-progress-as-a-table) now rather
 than arms in a `match`.
 
-There is now an HTTP API and a web UI around it: OpenAI-compatible completions,
+There is now an HTTP API and a web UI around it: OpenAI-compatible completions
+— including tool calling, so an agent like OpenCode drives it as a provider —
 plus model management, training, evals, benchmarks and monitoring. None of that
 makes it a fast server, and it is built not to pretend otherwise — requests
 queue behind one another because the engine runs one generation at a time, and
@@ -85,18 +86,26 @@ curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh
 Prebuilt binaries from the latest [release](https://github.com/bisand/kvad/releases),
 checked against that release's `SHA256SUMS` and put in `~/.local/bin`. It asks
 whether to add that directory to your `PATH`, whether `kvad-serve` should
-start when you log in, and — if it should — what address it listens on, with
-`127.0.0.1:8080` offered as the default. It asks on `/dev/tty`, so the
-questions survive being piped into `sh`. Nothing needs root.
+start when you log in, and — if it should — what address and what port it
+listens on, `127.0.0.1` and `8080` by default. Those are two questions rather
+than one because they are two different mistakes. It asks on `/dev/tty`, so
+the questions survive being piped into `sh`. Nothing needs root.
 
 Say an address it cannot serve from and it says why and asks again, rather
 than installing a service that cannot start: a port something else already
 holds, or a non-loopback address, which `kvad-serve` refuses while no auth
 mode is configured.
 
-For a machine with nobody watching, `--yes` never opens a terminal and
-answers both questions the quiet way — binaries and nothing else. Ask for
-the rest explicitly:
+Run the same command again to upgrade. An upgrade keeps the address the
+service is already installed with, rather than quietly moving it back to the
+default — it says what that address is and offers to keep it. It also stops
+the service before replacing the binaries underneath it, and starts it again
+afterwards, whether or not the unit file itself was rewritten.
+
+For a machine with nobody watching, `--yes` never opens a terminal and takes
+the quiet answer to every question: on a fresh machine, binaries and nothing
+else; on one that already runs the service, the same service pointed at the
+new binaries. Ask for the rest explicitly:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh -s -- --yes --service
@@ -104,9 +113,9 @@ curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh 
 
 `--prefix DIR`, `--version vX.Y.Z` and `--uninstall` do what they look like;
 `--uninstall` removes the binaries and the service and leaves your models and
-conversations alone. `--bind HOST:PORT` answers the address
-question ahead of time, for a run that should not stop to ask. `sh install.sh
---help` lists the rest.
+conversations alone. `--host ADDR` and `--port N` answer the address
+questions ahead of time, for a run that should not stop to ask — `--bind
+HOST:PORT` still says both at once. `sh install.sh --help` lists the rest.
 
 macOS gets all four binaries. Linux gets `kvad` and a CPU-only `kvad-serve`:
 `kvad-tui` and `kvad-gpu` both link candle against Metal, which is not a thing
@@ -2103,6 +2112,62 @@ The web UI shows it collapsed above the reply, open while there is nothing
 else to show. It is worth being able to read — it is where a model can be seen
 catching itself following the wrong passage — but it is not kept: the message
 saved to the conversation is the answer.
+
+### Tool calls, and the model that cannot make one
+
+An agentic client — OpenCode, or anything else built on the OpenAI
+libraries — is not asking for prose. It sends a list of functions it is
+willing to run and expects the model to answer with a call, runs it, and
+sends the result back for the next turn. Without that, a coding agent
+pointed at this server could talk about a file and never read one.
+
+None of it is a protocol the engine invents. The tools go into the model's
+**own chat template**, which writes them into a system block in the wording
+that model was fine-tuned on — Qwen's is a `<tools>` list and an instruction
+to answer inside `<tool_call>` tags — and the call comes back as text like
+any other token. So the work is at both ends of the template: hand it the
+schemas, and parse the tags out of the reply.
+
+Parsing them out has the same shape as separating a reasoning trace, and for
+the same reason: a tag is several tokens, so text that might still become one
+is held back and everything else streams. What differs is the middle. A trace
+is text to forward as it arrives; a call is JSON that has to be complete
+before it is even known to *be* a call, so the block is buffered whole and
+sent as one delta. Two rules follow from not wanting to lose anything: a
+block whose JSON does not parse comes back out as content, tags and all, and
+so does one the token budget cut off before it closed.
+
+The rule that is easy to get wrong is when to look at all. `<tool_call>` in a
+reply is a call only if tools were offered — otherwise it is a model writing
+about the format, which the paragraph above would do. There is no position
+rule that could tell them apart the way `<think>` has one, because a real
+call legitimately follows text. So the parser runs only for a request that
+offered tools, and for every other request the reply is untouched.
+
+**Two refusals rather than two pretences.** A model whose template never
+mentions `tools` renders exactly the same prompt whether or not any were
+offered: the model is never told they exist and answers in prose, which a
+client cannot tell apart from a model that considered the tools and declined.
+That is a 400 naming the model, and `/v1/models` reports a `tools` flag per
+model so a client can choose one before it loads anything — of what is on
+this machine, the Qwens can and SmolLM2, the DeepSeeks and the GPT-2s cannot.
+The other refusal is `tool_choice`: `auto` and `none` are honest, `required`
+and a named function would need the sampler constrained to the tokens that
+open a call, and that is not written.
+
+It works on a model small enough to be surprising. Qwen2.5-0.5B-Instruct, at
+q8 on the CPU, reads "what is the weather in Oslo?" with one function on
+offer and answers `get_weather({"city":"Oslo"})` in 20 tokens, then takes the
+result back and says it is 7 degrees and raining. Pointed at the same
+endpoint, OpenCode runs its own read tool and answers out of the file. That
+is not a coding agent worth using — at 0.5B nothing is — but it is the whole
+loop, and the protocol above it does not care how big the model is.
+
+One gap worth naming rather than papering over: the parser reads the
+Hermes-style `<tool_call>` format that Qwen and most open models adopted, and
+not Llama 3.1's bare object or DeepSeek's own markers. A model whose template
+documents a different format will not be understood, and adding one is a case
+in this parser rather than a redesign.
 
 ### One model at a time, said out loud
 

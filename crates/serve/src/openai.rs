@@ -17,6 +17,22 @@
 //! does, because a client that asks for a model and gets somebody else's
 //! answer is worse than a client that waits. Omitting `model` uses whatever
 //! is loaded.
+//!
+//! # Tools
+//!
+//! `tools` are passed to the model's own chat template, which writes them
+//! into a system block in whatever wording that model was trained on, and the
+//! calls it writes back are parsed out of the reply as it streams — see
+//! [`kvad::chat::ToolCalls`]. What arrives at the client is OpenAI's shape:
+//! `tool_calls` on the message, `finish_reason` of `tool_calls`, and the same
+//! ids handed back on the `tool` messages of the next turn.
+//!
+//! Two refusals rather than two pretences. A model whose template has no
+//! place for tools cannot be offered them: the tools would vanish silently
+//! and the reply would be a paragraph where the client expected a call. And
+//! `tool_choice` beyond `auto` and `none` — `required`, or a named function —
+//! would need the sampler to be constrained to the tokens that open a call,
+//! which is real work and is not done here.
 
 use crate::api::{blocking, Fail};
 use crate::models::{sse, stream};
@@ -33,16 +49,19 @@ use serde_json::json;
 
 pub async fn models(_: Identity) -> Result<Json<serde_json::Value>, Fail> {
     let found = blocking(move || {
-        let mut all: Vec<(String, bool)> = kvad::hub::local_models()
+        let listed = |trained: bool| {
+            move |m: kvad::hub::LocalModel| (m.id.clone(), trained, takes_tools(&m))
+        };
+        let mut all: Vec<(String, bool, bool)> = kvad::hub::local_models()
             .into_iter()
             .filter(|m| m.complete && m.arch.is_some())
-            .map(|m| (m.id, false))
+            .map(listed(false))
             .collect();
         all.extend(
             kvad::hub::trained_models()
                 .into_iter()
                 .filter(|m| m.complete && m.arch.is_some())
-                .map(|m| (m.id, true)),
+                .map(listed(true)),
         );
         Ok(all)
     })
@@ -52,7 +71,7 @@ pub async fn models(_: Identity) -> Result<Json<serde_json::Value>, Fail> {
         "object": "list",
         "data": found
             .into_iter()
-            .map(|(id, trained)| json!({
+            .map(|(id, trained, tools)| json!({
                 "id": id,
                 "object": "model",
                 // The field is required and means "when was this published".
@@ -60,9 +79,28 @@ pub async fn models(_: Identity) -> Result<Json<serde_json::Value>, Fail> {
                 // number invented to look like a date.
                 "created": 0,
                 "owned_by": if trained { "kvad" } else { "huggingface" },
+                // OpenAI's model object says nothing about what a model can
+                // do, because there the answer is in the documentation. Here
+                // it is a property of the checkpoint on this disk, and a
+                // client picking a model for an agent needs it before it
+                // picks — so it goes in the extension field, beside the one
+                // on a completion.
+                "kvad": { "tools": tools },
             }))
             .collect::<Vec<_>>(),
     })))
+}
+
+/// Whether a model on disk could be offered tools, read from its template.
+///
+/// Costs a small JSON read and a template compile per model, on a route that
+/// is already doing a directory walk. The alternative is loading the model,
+/// which is tens of seconds and the thing a client is consulting this list to
+/// avoid.
+fn takes_tools(model: &kvad::hub::LocalModel) -> bool {
+    kvad::hub::model_file(&model.path, "tokenizer_config.json")
+        .and_then(|p| kvad::chat::ChatTemplate::from_tokenizer_config(&p).ok().flatten())
+        .is_some_and(|t| t.takes_tools())
 }
 
 #[derive(serde::Deserialize)]
@@ -80,6 +118,16 @@ pub struct Completions {
     /// put it. A client that does not send one gets the default.
     #[serde(default)]
     top_k: Option<usize>,
+    /// The functions the client is offering this turn, in OpenAI's shape.
+    /// Passed to the model's template untouched: every template that takes
+    /// them dumps them with `tojson`, so a field this server has never heard
+    /// of still reaches the model.
+    #[serde(default)]
+    tools: Vec<serde_json::Value>,
+    /// `auto` or `none`. See the module docs for why the other two are
+    /// refused rather than ignored.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
@@ -118,7 +166,81 @@ fn grounding_budget(n_ctx: usize) -> usize {
 #[derive(serde::Deserialize)]
 pub struct Turn {
     role: String,
-    content: String,
+    /// Absent on an assistant turn that did nothing but call a tool, where
+    /// OpenAI sends `null`.
+    #[serde(default)]
+    content: Option<Content>,
+    #[serde(default)]
+    tool_calls: Vec<RequestedCall>,
+    /// On a `tool` message: which call this is the result of.
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    /// On a `tool` message: which tool produced it.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A message's content: a string, or the list of parts a client sends when
+/// there is more than one thing in the turn.
+///
+/// The second spelling is not an improvement on the first, it is what the
+/// mainstream client libraries emit as soon as a message has an attachment
+/// in it, and a server that took only strings would refuse them for a
+/// difference the model never sees.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<Part>),
+}
+
+#[derive(serde::Deserialize)]
+pub struct Part {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: String,
+}
+
+impl Content {
+    /// The text of it, or a refusal naming what could not be read.
+    ///
+    /// Anything that is not text — an image, audio, a file — is refused
+    /// rather than dropped: this engine has no vision tower, and a client
+    /// that sent a picture and got an answer about the sentence beside it
+    /// would have no way of telling.
+    fn text(&self) -> Result<String, Fail> {
+        match self {
+            Content::Text(text) => Ok(text.clone()),
+            Content::Parts(parts) => {
+                if let Some(other) = parts.iter().find(|p| p.kind != "text") {
+                    return Err(Fail::bad(format!(
+                        "a message part of type `{}`: this engine reads text",
+                        other.kind
+                    )));
+                }
+                Ok(parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join(""))
+            }
+        }
+    }
+}
+
+/// A call on the way *back* in: what the assistant said last turn, echoed by
+/// the client so the model can see its own call beside the result.
+#[derive(serde::Deserialize)]
+pub struct RequestedCall {
+    #[serde(default)]
+    id: Option<String>,
+    function: RequestedFunction,
+}
+
+#[derive(serde::Deserialize)]
+pub struct RequestedFunction {
+    name: String,
+    /// JSON text by the specification. Some clients send the object itself,
+    /// which is the same information and is accepted as it arrives.
+    #[serde(default)]
+    arguments: serde_json::Value,
 }
 
 impl Completions {
@@ -151,11 +273,90 @@ impl Completions {
         }
         self.messages
             .iter()
-            .map(|t| match t.role.as_str() {
-                "system" => Ok(Message::system(&t.content)),
-                "user" => Ok(Message::user(&t.content)),
-                "assistant" => Ok(Message::assistant(&t.content)),
-                other => Err(Fail::bad(format!("`{other}` is not a role a message can have"))),
+            .enumerate()
+            .map(|(i, t)| {
+                // A turn that only called a tool has no content, and that is
+                // not the same as an empty one: the template renders the
+                // calls and nothing else.
+                let content = match &t.content {
+                    Some(c) => c.text()?,
+                    None => String::new(),
+                };
+                match t.role.as_str() {
+                    "system" => Ok(Message::system(content)),
+                    "user" => Ok(Message::user(content)),
+                    "assistant" if t.tool_calls.is_empty() => Ok(Message::assistant(content)),
+                    "assistant" => Ok(Message::calls(content, t.calls(i))),
+                    "tool" => Ok(Message::tool(content, t.tool_call_id.clone(), t.name.clone())),
+                    other => Err(Fail::bad(format!("`{other}` is not a role a message can have"))),
+                }
+            })
+            .collect()
+    }
+
+    /// The tools to offer the model, once `tool_choice` has had its say.
+    ///
+    /// Refusals rather than silent nonsense: a tool with no name is not a
+    /// tool, and a `tool_choice` this engine cannot honour is told so here
+    /// instead of being discovered by a client waiting for a call that was
+    /// never going to come.
+    fn tools(&self) -> Result<Vec<serde_json::Value>, Fail> {
+        match self.tool_choice.as_ref().and_then(|c| c.as_str()) {
+            // `none` means the tools are context, not an invitation. Dropping
+            // them entirely is the honest reading: the model is told about no
+            // tools and so calls none.
+            Some("none") => return Ok(Vec::new()),
+            None | Some("auto") => {}
+            Some(other) => {
+                return Err(Fail::bad(format!(
+                    "tool_choice `{other}` would need the sampler constrained to a call; \
+                     this engine offers `auto` and `none`"
+                )))
+            }
+        }
+        // An object is a named function, which is the same refusal.
+        if self.tool_choice.as_ref().is_some_and(|c| c.is_object()) {
+            return Err(Fail::bad(
+                "naming a tool in tool_choice would need the sampler constrained to a call; \
+                 this engine offers `auto` and `none`",
+            ));
+        }
+        for tool in &self.tools {
+            let named = tool
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| !n.trim().is_empty());
+            if !named {
+                return Err(Fail::bad("every tool needs a `function.name`"));
+            }
+        }
+        Ok(self.tools.clone())
+    }
+}
+
+impl Turn {
+    /// This turn's calls, in the engine's shape.
+    ///
+    /// A client that left an id out gets one made up, because the template
+    /// may print it and the next turn's `tool` message will refer to it. The
+    /// message's position makes it unique within the conversation, which is
+    /// as far as an id has to reach.
+    fn calls(&self, at: usize) -> Vec<kvad::chat::ToolCall> {
+        self.tool_calls
+            .iter()
+            .enumerate()
+            .map(|(n, c)| {
+                let id = c.id.clone().unwrap_or_else(|| format!("call_{at}_{n}"));
+                let arguments = match &c.function.arguments {
+                    serde_json::Value::Null => "{}".to_string(),
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                kvad::chat::ToolCall::new(
+                    id,
+                    kvad::chat::Called { name: c.function.name.clone(), arguments },
+                )
             })
             .collect()
     }
@@ -168,6 +369,7 @@ pub async fn completions(
 ) -> Result<Response, Fail> {
     let sampling = body.sampling()?;
     let mut turns = body.turns()?;
+    let tools = body.tools()?;
 
 
     let loaded = match (&body.model, state.engine.loaded()) {
@@ -202,6 +404,18 @@ pub async fn completions(
         }
     };
 
+    // Asked for a call from a model that cannot make one. The template is
+    // where tools live, so a model whose template never mentions them would
+    // be handed the conversation with the tools quietly missing and would
+    // answer in prose — which a client cannot tell apart from a model that
+    // considered the tools and declined.
+    if !tools.is_empty() && !loaded.tools {
+        return Err(Fail::bad(format!(
+            "{}'s chat template has no place for tools, so it cannot be asked to call one",
+            loaded.repo
+        )));
+    }
+
     // Retrieval goes in front of everything else the conversation says, so
     // that a system prompt the user wrote still has the last word on tone.
     // After the load, because how much may be put in front of the model is a
@@ -214,12 +428,15 @@ pub async fn completions(
         if !who.is_admin() {
             return Err(Fail::denied("answering from a dataset is an administrator's to ask for"));
         }
-        let question = body
-            .messages
+        // The turns rather than the request's own messages: by here the
+        // content has been read out of whichever shape it arrived in, and
+        // searching a corpus with the wrong one of the two would be a bug
+        // that only showed up for one kind of client.
+        let question = turns
             .iter()
             .rev()
-            .find(|t| t.role == "user")
-            .map(|t| t.content.clone())
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
             .ok_or_else(|| Fail::bad("answering from a dataset needs a question to search it with"))?;
         let db = state.db.clone();
         let budget = grounding_budget(loaded.n_ctx);
@@ -235,7 +452,8 @@ pub async fn completions(
         }
     }
 
-    let pieces = state.engine.chat(turns, sampling).map_err(Fail::internal)?;
+    let offered = !tools.is_empty();
+    let pieces = state.engine.chat(turns, tools, sampling).map_err(Fail::internal)?;
     let id = format!("chatcmpl-{}", now_millis());
     let metrics = state.metrics.clone();
     // Timed from here rather than by the middleware: for a streamed reply the
@@ -244,8 +462,8 @@ pub async fn completions(
     let started = std::time::Instant::now();
 
     let mut response = match body.stream {
-        true => streamed(id, loaded, pieces, metrics, started).into_response(),
-        false => whole(id, loaded, pieces, metrics, started).await?.into_response(),
+        true => streamed(id, loaded, pieces, metrics, started, offered).into_response(),
+        false => whole(id, loaded, pieces, metrics, started, offered).await?.into_response(),
     };
     response.extensions_mut().insert(crate::watching::RecordedItself);
     Ok(response)
@@ -304,6 +522,27 @@ fn extension(stats: &Stats, loaded: &crate::scheduler::Loaded) -> serde_json::Va
     })
 }
 
+/// A tool call's id.
+///
+/// Unique within the conversation, which is the whole job: the client hands
+/// the same id back on the `tool` message carrying the result. Derived from
+/// the completion's own id so that a call can be traced to the reply it came
+/// from in a log.
+fn call_id(completion: &str, index: usize) -> String {
+    format!("call_{}_{index}", completion.trim_start_matches("chatcmpl-"))
+}
+
+/// One call in OpenAI's shape. `index` is what a streaming client uses to
+/// assemble the deltas; a whole reply carries it too, and it is ignored.
+fn wire_call(completion: &str, index: usize, call: &kvad::chat::Called) -> serde_json::Value {
+    json!({
+        "index": index,
+        "id": call_id(completion, index),
+        "type": "function",
+        "function": { "name": call.name, "arguments": call.arguments },
+    })
+}
+
 fn usage(stats: &Stats) -> serde_json::Value {
     json!({
         "prompt_tokens": stats.prompt_tokens,
@@ -318,6 +557,10 @@ fn streamed(
     mut pieces: tokio::sync::mpsc::Receiver<Piece>,
     metrics: std::sync::Arc<crate::metrics::Metrics>,
     started: std::time::Instant,
+    // `offered` is whether this request offered tools, and so whether
+    // `<tool_call>` in the reply is a call rather than a model writing
+    // about one.
+    offered: bool,
 ) -> impl IntoResponse {
     let (events, rx) = tokio::sync::mpsc::channel::<Event>(64);
     let created = now_secs();
@@ -344,13 +587,21 @@ fn streamed(
         // arrives. See `kvad::chat::Thinking` for why this cannot be a split
         // at the end.
         let mut thinking = kvad::chat::Thinking::new();
-        let mut delta_of = move |working: &str, answer: &str| {
+        // And the calls out of what is left, when any were offered.
+        let mut parsing = offered.then(kvad::chat::ToolCalls::new);
+        // How many calls have gone out, which is also the next one's index.
+        let mut sent = 0usize;
+        let completion = id.clone();
+        let mut delta_of = move |working: &str, answer: &str, calls: &[serde_json::Value]| {
             let mut delta = json!({});
             if !working.is_empty() {
                 delta["reasoning_content"] = json!(working);
             }
             if !answer.is_empty() {
                 delta["content"] = json!(answer);
+            }
+            if !calls.is_empty() {
+                delta["tool_calls"] = json!(calls);
             }
             if delta.as_object().is_some_and(|d| d.is_empty()) {
                 return None;
@@ -368,9 +619,26 @@ fn streamed(
                 // request — so the two are the same thing here.
                 Piece::Token(text) | Piece::Chose(Chosen { text, .. }) => {
                     let (working, answer) = thinking.feed(&text);
-                    // Both empty means the text is held back as a possible
+                    let (answer, found) = match &mut parsing {
+                        Some(p) => p.feed(&answer),
+                        None => (answer, Vec::new()),
+                    };
+                    // A call goes out whole, once its closing tag has
+                    // arrived. OpenAI's format allows the arguments to be
+                    // streamed in fragments; there is nothing to stream
+                    // here, because the JSON had to be complete before it
+                    // could be known to be a call at all.
+                    let calls: Vec<_> = found
+                        .iter()
+                        .map(|c| {
+                            let one = wire_call(&completion, sent, c);
+                            sent += 1;
+                            one
+                        })
+                        .collect();
+                    // All empty means the text is held back as a possible
                     // tag, and there is nothing to send yet.
-                    let Some(delta) = delta_of(&working, &answer) else { continue };
+                    let Some(delta) = delta_of(&working, &answer, &calls) else { continue };
                     Event::default().data(chunk(delta, None, json!({})).to_string())
                 }
                 Piece::Done(stats) => {
@@ -382,10 +650,28 @@ fn streamed(
                         measured(&stats),
                     );
                     // Anything still held back — a trace the budget cut off
-                    // mid-thought — goes before the chunk that ends the
-                    // stream, rather than being dropped with it.
+                    // mid-thought, a call whose closing tag never came —
+                    // goes before the chunk that ends the stream, rather
+                    // than being dropped with it.
                     let (working, answer) = thinking.finish();
-                    if let Some(delta) = delta_of(&working, &answer) {
+                    let (mut answer, mut found) = match &mut parsing {
+                        Some(p) => p.feed(&answer),
+                        None => (answer, Vec::new()),
+                    };
+                    if let Some(p) = &mut parsing {
+                        let (rest, last) = p.finish();
+                        answer.push_str(&rest);
+                        found.extend(last);
+                    }
+                    let calls: Vec<_> = found
+                        .iter()
+                        .map(|c| {
+                            let one = wire_call(&completion, sent, c);
+                            sent += 1;
+                            one
+                        })
+                        .collect();
+                    if let Some(delta) = delta_of(&working, &answer, &calls) {
                         let chunk = chunk(delta, None, json!({})).to_string();
                         if events.send(Event::default().data(chunk)).await.is_err() {
                             return;
@@ -394,7 +680,9 @@ fn streamed(
                     Event::default().data(
                         chunk(
                             json!({}),
-                            Some("stop"),
+                            // The reply ended in a call, so the client's turn
+                            // is to run it rather than to show an answer.
+                            Some(if sent > 0 { "tool_calls" } else { "stop" }),
                             json!({ "usage": usage(&stats), "kvad": extension(&stats, &loaded) }),
                         )
                         .to_string(),
@@ -431,16 +719,32 @@ async fn whole(
     mut pieces: tokio::sync::mpsc::Receiver<Piece>,
     metrics: std::sync::Arc<crate::metrics::Metrics>,
     started: std::time::Instant,
+    offered: bool,
 ) -> Result<Json<serde_json::Value>, Fail> {
     let mut text = String::new();
     let mut working = String::new();
     let mut thinking = kvad::chat::Thinking::new();
+    // The same two passes the stream makes, for the same reason: a reply is
+    // assembled here from the pieces either way, so doing it differently
+    // would be a second answer to the same question.
+    let mut parsing = offered.then(kvad::chat::ToolCalls::new);
+    let mut found: Vec<kvad::chat::Called> = Vec::new();
+    let take = |parsing: &mut Option<kvad::chat::ToolCalls>,
+                    found: &mut Vec<kvad::chat::Called>,
+                    answer: String| match parsing {
+        Some(p) => {
+            let (content, calls) = p.feed(&answer);
+            found.extend(calls);
+            content
+        }
+        None => answer,
+    };
     while let Some(piece) = pieces.recv().await {
         match piece {
             Piece::Token(t) | Piece::Chose(Chosen { text: t, .. }) => {
                 let (w, a) = thinking.feed(&t);
                 working.push_str(&w);
-                text.push_str(&a);
+                text.push_str(&take(&mut parsing, &mut found, a));
             }
             Piece::Failed(why) => {
                 metrics.record("POST", ROUTE, 500, started.elapsed());
@@ -456,12 +760,31 @@ async fn whole(
                 );
                 let (w, a) = thinking.finish();
                 working.push_str(&w);
-                text.push_str(&a);
+                text.push_str(&take(&mut parsing, &mut found, a));
+                if let Some(p) = &mut parsing {
+                    let (rest, last) = p.finish();
+                    text.push_str(&rest);
+                    found.extend(last);
+                }
                 let mut message = json!({ "role": "assistant", "content": text });
                 // Only when there was one: a field that is always present and
                 // usually empty teaches a client to ignore it.
                 if !working.is_empty() {
                     message["reasoning_content"] = json!(working);
+                }
+                if !found.is_empty() {
+                    let calls: Vec<_> = found
+                        .iter()
+                        .enumerate()
+                        .map(|(n, c)| wire_call(&id, n, c))
+                        .collect();
+                    message["tool_calls"] = json!(calls);
+                    // A call and nothing else: OpenAI sends a null content
+                    // there rather than an empty string, and clients test
+                    // for it.
+                    if text.is_empty() {
+                        message["content"] = serde_json::Value::Null;
+                    }
                 }
                 return Ok(Json(json!({
                     "id": id,
@@ -471,7 +794,7 @@ async fn whole(
                     "choices": [{
                         "index": 0,
                         "message": message,
-                        "finish_reason": "stop",
+                        "finish_reason": if found.is_empty() { "stop" } else { "tool_calls" },
                     }],
                     "usage": usage(&stats),
                     "kvad": extension(&stats, &loaded),
@@ -534,6 +857,109 @@ mod tests {
         assert_eq!(good.turns().unwrap().len(), 2);
     }
 
+    /// An agentic client sends back what the model called and what the tool
+    /// answered. Both have to survive the round trip, because the model is
+    /// about to read its own call beside the result.
+    #[test]
+    fn a_tool_round_trip_becomes_a_conversation() {
+        let body = request(json!({ "messages": [
+            { "role": "user", "content": "what is in main.rs?" },
+            { "role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_abc", "type": "function",
+                "function": { "name": "read", "arguments": "{\"path\":\"main.rs\"}" },
+            }] },
+            { "role": "tool", "tool_call_id": "call_abc", "name": "read", "content": "fn main() {}" },
+        ] }));
+        let turns = body.turns().unwrap();
+        assert_eq!(turns.len(), 3);
+
+        let called = &turns[1];
+        assert_eq!(called.content, "", "a call-only turn is empty, not absent");
+        assert_eq!(called.tool_calls.len(), 1);
+        assert_eq!(called.tool_calls[0].id, "call_abc");
+        assert_eq!(called.tool_calls[0].kind, "function");
+        assert_eq!(called.tool_calls[0].function.name, "read");
+        assert_eq!(called.tool_calls[0].function.arguments, r#"{"path":"main.rs"}"#);
+
+        let result = &turns[2];
+        assert_eq!(result.role, "tool");
+        assert_eq!(result.content, "fn main() {}");
+        assert_eq!(result.tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(result.name.as_deref(), Some("read"));
+    }
+
+    /// The client libraries send a list of parts as soon as a message has
+    /// more than one thing in it. Text parts join; anything else is refused
+    /// by name rather than quietly dropped.
+    #[test]
+    fn content_arrives_as_a_string_or_as_parts() {
+        let parts = request(json!({ "messages": [
+            { "role": "user", "content": [
+                { "type": "text", "text": "read this: " },
+                { "type": "text", "text": "fn main() {}" },
+            ] },
+        ] }));
+        assert_eq!(parts.turns().unwrap()[0].content, "read this: fn main() {}");
+
+        let picture = request(json!({ "messages": [
+            { "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "x" } }] },
+        ] }));
+        let err = picture.turns().unwrap_err();
+        assert!(err.1.contains("image_url"), "{}", err.1);
+    }
+
+    /// What this engine can honour, and what it says instead of pretending.
+    #[test]
+    fn tool_choice_is_honoured_or_refused() {
+        let offered = json!([{ "type": "function", "function": { "name": "read" } }]);
+        let with = |choice: serde_json::Value| {
+            request(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "tools": offered, "tool_choice": choice,
+            }))
+        };
+
+        let auto = request(json!({
+            "messages": [{ "role": "user", "content": "hi" }], "tools": offered,
+        }));
+        assert_eq!(auto.tools().unwrap().len(), 1, "tools with no choice are on offer");
+        assert_eq!(with(json!("auto")).tools().unwrap().len(), 1);
+
+        // `none` means they are not on offer at all, so the model is never
+        // told about them and cannot call one.
+        assert!(with(json!("none")).tools().unwrap().is_empty());
+
+        for refused in [json!("required"), json!({ "type": "function", "function": { "name": "read" } })] {
+            let err = with(refused.clone()).tools().unwrap_err();
+            assert!(err.1.contains("sampler"), "{refused} was accepted: {}", err.1);
+        }
+
+        // A tool with no name is not a tool, and the model would be handed a
+        // function it cannot call.
+        let nameless = request(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": { "description": "does things" } }],
+        }));
+        assert!(nameless.tools().is_err());
+    }
+
+    /// The id is the client's handle on a call: it comes back on the `tool`
+    /// message, so it has to be unique within a conversation and stable
+    /// between the streamed and the whole reading of the same reply.
+    #[test]
+    fn a_call_on_the_wire_carries_an_id_and_an_index() {
+        let called = kvad::chat::Called { name: "read".into(), arguments: r#"{"a":1}"#.into() };
+        let first = wire_call("chatcmpl-42", 0, &called);
+        assert_eq!(first["id"], json!("call_42_0"));
+        assert_eq!(first["index"], json!(0));
+        assert_eq!(first["type"], json!("function"));
+        assert_eq!(first["function"]["name"], json!("read"));
+        // Text, not an object: the client hands it to somebody else's
+        // function and this server does not re-spell it.
+        assert_eq!(first["function"]["arguments"], json!(r#"{"a":1}"#));
+        assert_ne!(wire_call("chatcmpl-42", 1, &called)["id"], first["id"]);
+    }
+
     /// The extension carries what OpenAI's schema has nowhere to put, and the
     /// rates are derived rather than left for a client to work out.
     #[test]
@@ -543,6 +969,7 @@ mod tests {
             summary: String::new(),
             params: 0,
             instruct: true,
+            tools: true,
             backend: "cpu q8".into(),
             weight_bytes: 0,
             n_ctx: 2048,

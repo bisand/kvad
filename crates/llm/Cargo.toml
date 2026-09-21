@@ -18,7 +18,11 @@ arch-deepseek = []
 [dependencies]
 hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
 memmap2 = "0.9.11"
-minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "serde"] }
+# `json` is not decoration: every chat template that takes tools writes them
+# out with the `tojson` filter, and without the feature the render fails at
+# request time with "unknown filter" — on the one code path a plain
+# conversation never reaches.
+minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "json", "serde"] }
 nervus = { path = "../nervus" }
 rayon = "1.10.0"
 safetensors = "0.8"

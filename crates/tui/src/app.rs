@@ -370,6 +370,9 @@ impl App {
                 self.scroll = u16::MAX;
                 engine.send(Cmd::Chat {
                     messages: self.messages.clone(),
+                    // The terminal app has no tools to offer: there is
+                    // nothing here for a model to call.
+                    tools: Vec::new(),
                     sampling: Default::default(),
                 });
             }

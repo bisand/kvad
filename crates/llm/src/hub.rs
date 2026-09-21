@@ -307,15 +307,27 @@ pub fn find_trained(name: &str) -> Option<LocalModel> {
     trained_models().into_iter().find(|m| m.id == name)
 }
 
-fn find_config(model_dir: &Path) -> Option<PathBuf> {
-    let snapshots = model_dir.join("snapshots");
-    for rev in std::fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
-        let candidate = rev.path().join("config.json");
-        if candidate.exists() {
+/// One named file belonging to a model, wherever that model keeps it.
+///
+/// A downloaded model is a cache entry whose real names live under
+/// `snapshots/<revision>/`; a trained one is a plain directory. A caller that
+/// wants the tokenizer config should not have to know which kind it has.
+pub fn model_file(model_dir: &Path, name: &str) -> Option<PathBuf> {
+    let direct = model_dir.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    for rev in std::fs::read_dir(model_dir.join("snapshots")).ok()?.filter_map(|e| e.ok()) {
+        let candidate = rev.path().join(name);
+        if candidate.is_file() {
             return Some(candidate);
         }
     }
     None
+}
+
+fn find_config(model_dir: &Path) -> Option<PathBuf> {
+    model_file(model_dir, "config.json")
 }
 
 /// The human-readable file names in a cache entry.

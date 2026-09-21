@@ -48,7 +48,13 @@ pub enum Cmd {
     /// Not the same as loading something else: a server needs to be able to
     /// give the memory back without being told what to spend it on next.
     Unload,
-    Chat { messages: Vec<Message>, sampling: Sampling },
+    /// Reply to a conversation, optionally with tools on offer.
+    ///
+    /// `tools` is a list of function schemas in OpenAI's shape, passed to the
+    /// model's template untouched. A model whose template ignores them —
+    /// [`crate::runtime::Llm::takes_tools`] — generates the same reply it
+    /// would have without them, so a caller that means it checks first.
+    Chat { messages: Vec<Message>, tools: Vec<serde_json::Value>, sampling: Sampling },
     /// Continue a prompt, with no chat template anywhere near it.
     ///
     /// The base-model view of a model, which for an instruct model is a
@@ -166,6 +172,10 @@ pub enum Evt {
         summary: String,
         params: usize,
         instruct: bool,
+        /// Whether this model's template has anywhere to put tools, and so
+        /// whether it can be asked to call one. See
+        /// [`crate::runtime::Llm::takes_tools`].
+        tools: bool,
         backend: String,
         weight_bytes: usize,
         /// The longest conversation this model can hold.
@@ -341,6 +351,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                             summary: llm.spec.summary(),
                             params: llm.param_count,
                             instruct: llm.is_instruct(),
+                            tools: llm.takes_tools(),
                             backend: llm.backend(),
                             weight_bytes: llm.weight_bytes,
                             n_ctx: llm.spec.n_ctx,
@@ -357,13 +368,13 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 }
             }
 
-            Cmd::Chat { messages, sampling } => {
+            Cmd::Chat { messages, tools, sampling } => {
                 let Some(s) = session.as_mut() else {
                     say("no model loaded");
                     continue;
                 };
                 aim(s, &sampling);
-                let ids = match s.llm.encode_chat(&messages) {
+                let ids = match s.llm.encode_chat(&messages, &tools) {
                     Ok(ids) => ids,
                     Err(e) => {
                         fail(e);

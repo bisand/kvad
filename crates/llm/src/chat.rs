@@ -34,26 +34,92 @@ use std::path::Path;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// The tools this assistant turn asked for, if it asked for any.
+    ///
+    /// Empty and absent are the same thing to a template — `{%- if
+    /// message.tool_calls %}` — so an empty list is left out rather than
+    /// rendered as one, which keeps a plain conversation's JSON exactly what
+    /// it was before tools existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// Which call a `tool` message is the result of. Qwen's template ignores
+    /// it and Mistral's prints it; it is the client's id either way, carried
+    /// through untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// The tool that produced a `tool` message, for the templates that name
+    /// it in the transcript.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// One call, in the shape OpenAI gave it and the templates read.
+///
+/// `arguments` is JSON *text*, not a parsed object, because that is what
+/// OpenAI's wire format carries and what the model wrote. Parsing it here to
+/// serialise it again would mean this engine deciding how to spell a number
+/// the client is about to hand to somebody else's function.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    /// Always `function`. The field exists because OpenAI's schema has it and
+    /// templates test it; there is no second kind.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: Called,
+}
+
+/// A call with no id yet: what the model actually wrote.
+///
+/// The id is the wire format's, not the model's — it exists so a client can
+/// match a result to a call — so it is minted where the wire format is, and
+/// this is what the parser produces.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Called {
+    pub name: String,
+    /// The arguments as JSON text, e.g. `{"path":"src/main.rs"}`.
+    pub arguments: String,
+}
+
+impl ToolCall {
+    pub fn new(id: impl Into<String>, called: Called) -> Self {
+        ToolCall { id: id.into(), kind: "function".into(), function: called }
+    }
 }
 
 impl Message {
+    fn of(role: &str, content: impl Into<String>) -> Self {
+        Message { role: role.into(), content: content.into(), ..Message::default() }
+    }
     pub fn system(content: impl Into<String>) -> Self {
-        Message { role: "system".into(), content: content.into() }
+        Message::of("system", content)
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Message { role: "user".into(), content: content.into() }
+        Message::of("user", content)
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Message { role: "assistant".into(), content: content.into() }
+        Message::of("assistant", content)
+    }
+    /// An assistant turn that called tools. The content is whatever it said
+    /// alongside the calls, which for most models is nothing.
+    pub fn calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Message { tool_calls, ..Message::of("assistant", content) }
+    }
+    /// What a tool answered, on its way back to the model.
+    pub fn tool(content: impl Into<String>, id: Option<String>, name: Option<String>) -> Self {
+        Message { tool_call_id: id, name, ..Message::of("tool", content) }
     }
 }
 
 pub struct ChatTemplate {
     env: Environment<'static>,
+    /// The template's own source, kept so that [`ChatTemplate::takes_tools`]
+    /// can be answered without rendering anything.
+    source: String,
     bos: Option<String>,
     eos: Option<String>,
 }
@@ -171,6 +237,7 @@ impl ChatTemplate {
             "2026-01-01".to_string()
         });
         env.set_unknown_method_callback(python_string_methods);
+        let source = template.clone();
         env.add_template_owned("chat", template)?;
 
         let token_text = |key: &str| -> Option<String> {
@@ -183,19 +250,46 @@ impl ChatTemplate {
 
         Ok(Some(ChatTemplate {
             env,
+            source,
             bos: token_text("bos_token"),
             eos: token_text("eos_token"),
         }))
+    }
+
+    /// Whether this model's template has anywhere to put tools.
+    ///
+    /// A template that never mentions `tools` renders the same string whether
+    /// or not any were offered, so the model is never told the tools exist
+    /// and cannot call them. That is worth knowing *before* generating a
+    /// reply: the alternative is a client that offered a function, waited for
+    /// a call, and got a paragraph.
+    ///
+    /// Read off the source rather than by rendering, because rendering needs
+    /// a conversation and this is a fact about the model.
+    pub fn takes_tools(&self) -> bool {
+        self.source.contains("tools")
     }
 
     /// Render a conversation into the exact string the model expects.
     ///
     /// `add_generation_prompt` appends the opening marker for the assistant's
     /// turn — the cue that says "your line now".
-    pub fn render(&self, messages: &[Message], add_generation_prompt: bool) -> Res<String> {
+    ///
+    /// `tools` is the list of function schemas the client is offering, in
+    /// OpenAI's shape, and goes in verbatim: every template that takes them
+    /// dumps them with `tojson` into a system block of its own wording. An
+    /// empty list is falsy in Jinja, which is why a conversation with no
+    /// tools renders exactly as it did before there were any.
+    pub fn render(
+        &self,
+        messages: &[Message],
+        tools: &[serde_json::Value],
+        add_generation_prompt: bool,
+    ) -> Res<String> {
         let tmpl = self.env.get_template("chat")?;
         Ok(tmpl.render(minijinja::context! {
             messages => Value::from_serialize(messages),
+            tools => Value::from_serialize(tools),
             add_generation_prompt => add_generation_prompt,
             bos_token => self.bos.clone().unwrap_or_default(),
             eos_token => self.eos.clone().unwrap_or_default(),
@@ -348,6 +442,137 @@ fn partial(s: &str, tag: &str) -> usize {
 }
 
 
+// ---------------------------------------------------------------------------
+// Tool calls
+// ---------------------------------------------------------------------------
+
+/// The tags a model wraps a call in.
+///
+/// Hermes' format, which Qwen adopted and most open models followed: the call
+/// is a JSON object between these, `{"name": …, "arguments": {…}}`. It is not
+/// universal — Llama 3.1 emits a bare object, DeepSeek has markers of its own
+/// — and this parses the one its templates ask for. A model whose template
+/// documents a different format will not be understood, which is a gap worth
+/// naming rather than papering over with four half-tested parsers.
+const CALL_OPEN: &str = "<tool_call>";
+const CALL_CLOSE: &str = "</tool_call>";
+
+/// Pulling tool calls out of a reply as it streams.
+///
+/// The same problem as [`Thinking`] and the same shape of answer: a tag is
+/// several tokens, so text that might still become one is held back and
+/// everything else goes out at once. What differs is what happens inside the
+/// tags — a trace is text to be forwarded, a call is JSON to be parsed, so
+/// the block is buffered whole rather than streamed through.
+///
+/// # Only when tools were offered
+///
+/// A model that was offered no tools cannot be calling one, and a reply that
+/// contains `<tool_call>` anyway is a model writing about the format — this
+/// paragraph would parse as one. So the caller runs this only for a request
+/// that offered tools; unlike [`Thinking`], there is no position rule that
+/// could tell the two apart, because a real call legitimately follows text.
+///
+/// # Nothing is dropped
+///
+/// A block whose JSON does not parse, and a block the token budget cut off
+/// before it closed, both come back out as content, tags and all. A client
+/// then sees what the model wrote and can say so, which is worth more than a
+/// reply that silently lost a paragraph.
+pub struct ToolCalls {
+    held: String,
+    inside: bool,
+}
+
+impl Default for ToolCalls {
+    fn default() -> Self {
+        ToolCalls::new()
+    }
+}
+
+impl ToolCalls {
+    pub fn new() -> ToolCalls {
+        ToolCalls { held: String::new(), inside: false }
+    }
+
+    /// Feed a piece of the reply. Returns what of it is content, and any
+    /// calls that finished in it — both may be empty.
+    pub fn feed(&mut self, text: &str) -> (String, Vec<Called>) {
+        self.held.push_str(text);
+        let (mut content, mut calls) = (String::new(), Vec::new());
+        loop {
+            match (self.inside, self.held.find(if self.inside { CALL_CLOSE } else { CALL_OPEN })) {
+                (false, Some(at)) => {
+                    content.push_str(&self.held[..at]);
+                    self.held = self.held[at + CALL_OPEN.len()..].to_string();
+                    self.inside = true;
+                }
+                (false, None) => {
+                    let keep = self.held.len() - partial(&self.held, CALL_OPEN);
+                    content.push_str(&self.held[..keep]);
+                    self.held = self.held[keep..].to_string();
+                    return (content, calls);
+                }
+                (true, Some(at)) => {
+                    let body = self.held[..at].to_string();
+                    self.held = self.held[at + CALL_CLOSE.len()..].to_string();
+                    self.inside = false;
+                    match parse_call(&body) {
+                        Some(call) => calls.push(call),
+                        None => content.push_str(&format!("{CALL_OPEN}{body}{CALL_CLOSE}")),
+                    }
+                }
+                // An open block: hold everything until it closes. Nothing of
+                // a call can be sent early — half a JSON object is not half
+                // an answer, it is nothing.
+                (true, None) => return (content, calls),
+            }
+        }
+    }
+
+    /// End of the reply: whatever is still held back.
+    pub fn finish(&mut self) -> (String, Vec<Called>) {
+        let rest = std::mem::take(&mut self.held);
+        if !std::mem::replace(&mut self.inside, false) {
+            return (rest, Vec::new());
+        }
+        // A call the budget cut off. Occasionally the model wrote the whole
+        // object and only the closing tag is missing, which is a call; more
+        // often it is a fragment, which is text.
+        match parse_call(&rest) {
+            Some(call) => (String::new(), vec![call]),
+            None => (format!("{CALL_OPEN}{rest}"), Vec::new()),
+        }
+    }
+
+    /// Whether a call was opened and never closed.
+    pub fn unfinished(&self) -> bool {
+        self.inside
+    }
+}
+
+/// One `<tool_call>` block's contents, if they are a call.
+///
+/// `arguments` comes back as text in every case, because that is what the
+/// wire format carries. An object is re-serialised — compactly, and this is
+/// the one place the spelling changes — and a string is passed through,
+/// which is the double-encoding some fine-tunes emit.
+fn parse_call(body: &str) -> Option<Called> {
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let name = value.get("name")?.as_str()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let arguments = match value.get("arguments") {
+        // A call with no arguments is a call. The field is required by the
+        // format and left out by models anyway.
+        None => "{}".to_string(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+    };
+    Some(Called { name, arguments })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +639,182 @@ mod tests {
             assert_eq!(format!("{w1}{w2}{w3}"), "abc", "cut at {at}");
             assert_eq!(format!("{a1}{a2}{a3}"), "def", "cut at {at}");
         }
+    }
+
+    // -- tool calls ---------------------------------------------------------
+
+    /// The stream is the case this exists for, so the two readings have to
+    /// agree: a tag is several tokens and arrives in pieces.
+    #[test]
+    fn a_call_is_found_the_same_however_it_arrives() {
+        let reply = "Let me look.\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"src/main.rs\"}}\n</tool_call>";
+        let (content, calls) = calls_of(reply);
+        assert_eq!(content, "Let me look.\n");
+        assert_eq!(
+            calls,
+            vec![Called { name: "read".into(), arguments: r#"{"path":"src/main.rs"}"#.into() }]
+        );
+        assert_eq!(calls_by_char(reply), (content, calls), "the stream parsed differently");
+    }
+
+    /// Models offered several tools answer with several calls, and a client
+    /// that got only the first would run half the turn.
+    #[test]
+    fn every_call_in_a_reply_comes_back() {
+        let reply = "<tool_call>{\"name\": \"ls\", \"arguments\": {}}</tool_call>\
+                     <tool_call>{\"name\": \"cat\", \"arguments\": {\"f\": 1}}</tool_call>";
+        let (content, calls) = calls_of(reply);
+        assert!(content.is_empty(), "{content:?}");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1], Called { name: "cat".into(), arguments: r#"{"f":1}"#.into() });
+        assert_eq!(calls_by_char(reply).1, calls);
+    }
+
+    /// Arguments are text on the wire whichever way the model wrote them:
+    /// an object is compacted, and a string that is itself JSON — which
+    /// some fine-tunes emit — is passed through as it stands.
+    #[test]
+    fn arguments_are_always_json_text() {
+        let (_, object) = calls_of(r#"<tool_call>{"name": "f", "arguments": {"a": [1, 2]}}</tool_call>"#);
+        assert_eq!(object[0].arguments, r#"{"a":[1,2]}"#);
+
+        let (_, double) = calls_of(r#"<tool_call>{"name": "f", "arguments": "{\"a\": 1}"}</tool_call>"#);
+        assert_eq!(double[0].arguments, r#"{"a": 1}"#);
+
+        let (_, none) = calls_of(r#"<tool_call>{"name": "f"}</tool_call>"#);
+        assert_eq!(none[0].arguments, "{}");
+    }
+
+    /// A block that is not a call is text. Nothing a model wrote is dropped
+    /// because this module failed to understand it.
+    #[test]
+    fn a_block_that_does_not_parse_is_content() {
+        for reply in [
+            "<tool_call>{\"name\": \"f\", </tool_call>",   // cut off
+            "<tool_call>not json at all</tool_call>",      // never was
+            "<tool_call>{\"arguments\": {}}</tool_call>",   // nothing named
+        ] {
+            let (content, calls) = calls_of(reply);
+            assert!(calls.is_empty(), "{reply:?} parsed as a call");
+            assert_eq!(content, reply, "{reply:?} lost text");
+            assert_eq!(calls_by_char(reply).0, reply);
+        }
+    }
+
+    /// The budget ran out mid-call. If the object is whole it is a call, and
+    /// otherwise it is the text the model got as far as writing.
+    #[test]
+    fn a_call_that_never_closes() {
+        let mut parser = ToolCalls::new();
+        let (content, calls) = parser.feed("<tool_call>{\"name\": \"ls\", \"arguments\": {}}");
+        assert!(content.is_empty() && calls.is_empty(), "a call was sent before it closed");
+        assert!(parser.unfinished());
+        assert_eq!(parser.finish().1, vec![Called { name: "ls".into(), arguments: "{}".into() }]);
+
+        let mut cut = ToolCalls::new();
+        cut.feed("<tool_call>{\"name\": \"l");
+        assert_eq!(cut.finish(), ("<tool_call>{\"name\": \"l".to_string(), Vec::new()));
+    }
+
+    /// A streamed reply may be cut anywhere, including inside either tag and
+    /// inside the JSON. Every character has to end up on one side or the
+    /// other, and the call has to be the same call.
+    #[test]
+    fn no_split_changes_the_answer() {
+        let reply = "before<tool_call>{\"name\": \"f\", \"arguments\": {\"x\": 1}}</tool_call>after";
+        let (whole_content, whole_calls) = calls_of(reply);
+        for at in 0..=reply.len() {
+            if !reply.is_char_boundary(at) {
+                continue;
+            }
+            let mut parser = ToolCalls::new();
+            let (c1, mut calls) = parser.feed(&reply[..at]);
+            let (c2, more) = parser.feed(&reply[at..]);
+            let (c3, last) = parser.finish();
+            calls.extend(more);
+            calls.extend(last);
+            assert_eq!(format!("{c1}{c2}{c3}"), whole_content, "cut at {at}");
+            assert_eq!(calls, whole_calls, "cut at {at}");
+        }
+    }
+
+    /// Tools reach the model, and what the model called reaches the next
+    /// turn's prompt. Rendered against a template of this file's own rather
+    /// than a downloaded one, so the test says what it depends on.
+    #[test]
+    fn a_template_is_given_the_tools_and_the_calls() {
+        let template = "\
+            {%- if tools %}TOOLS:{% for t in tools %} {{ t.function.name }} {{ t | tojson }}{% endfor %}\n{% endif %}\
+            {%- for m in messages %}\
+            {{- m.role }}: {{ m.content }}\
+            {%- for c in m.tool_calls %} CALL {{ c.function.name }}{{ c.function.arguments }}{% endfor %}\
+            {%- if m.tool_call_id %} (for {{ m.tool_call_id }}){% endif %}\n\
+            {%- endfor %}\
+            {%- if add_generation_prompt %}assistant:{% endif %}";
+        let dir = std::env::temp_dir().join(format!("kvad-tooltmpl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokenizer_config.json");
+        std::fs::write(&path, serde_json::json!({ "chat_template": template }).to_string()).unwrap();
+        let chat = ChatTemplate::from_tokenizer_config(&path).unwrap().expect("no template read");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(chat.takes_tools());
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "read", "parameters": { "type": "object" } },
+        })];
+        let conversation = [
+            Message::user("what is in main.rs?"),
+            Message::calls(
+                "",
+                vec![ToolCall::new(
+                    "call_1",
+                    Called { name: "read".into(), arguments: r#"{"path":"main.rs"}"#.into() },
+                )],
+            ),
+            Message::tool("fn main() {}", Some("call_1".into()), Some("read".into())),
+        ];
+
+        let with = chat.render(&conversation, &tools, true).unwrap();
+        assert!(with.starts_with("TOOLS: read "), "the tools never reached the template: {with}");
+        // Through `tojson`, which is how every real template writes them out
+        // and which is a minijinja feature this crate has to ask for. The
+        // filter is missing from a default build and the render then fails
+        // at request time, on the one path a conversation without tools
+        // never reaches.
+        assert!(with.contains("parameters"), "the schema was not rendered: {with}");
+        assert!(with.contains(r#"CALL read{"path":"main.rs"}"#), "{with}");
+        assert!(with.contains("tool: fn main() {} (for call_1)"), "{with}");
+        assert!(with.ends_with("assistant:"), "{with}");
+
+        // And with none offered the model is told about none — an empty list
+        // is falsy in Jinja, which is what keeps a plain conversation's
+        // prompt byte-for-byte what it was before tools existed.
+        let without = chat.render(&conversation, &[], true).unwrap();
+        assert!(!without.contains("TOOLS"), "{without}");
+    }
+
+    fn calls_of(reply: &str) -> (String, Vec<Called>) {
+        let mut parser = ToolCalls::new();
+        let (mut content, mut calls) = parser.feed(reply);
+        let (rest, last) = parser.finish();
+        content.push_str(&rest);
+        calls.extend(last);
+        (content, calls)
+    }
+
+    fn calls_by_char(reply: &str) -> (String, Vec<Called>) {
+        let mut parser = ToolCalls::new();
+        let (mut content, mut calls) = (String::new(), Vec::new());
+        for c in reply.chars() {
+            let (text, found) = parser.feed(&c.to_string());
+            content.push_str(&text);
+            calls.extend(found);
+        }
+        let (rest, last) = parser.finish();
+        content.push_str(&rest);
+        calls.extend(last);
+        (content, calls)
     }
 
     fn whole(reply: &str) -> (String, String) {

@@ -918,7 +918,7 @@ fn run(args: Args) -> Res<()> {
             messages.push(Message::system(s.clone()));
         }
         messages.push(Message::user(prompt.clone()));
-        llm.encode_chat(&messages)?
+        llm.encode_chat(&messages, &[])?
     } else {
         print!("{prompt}");
         std::io::stdout().flush()?;
@@ -981,7 +981,7 @@ fn chat(args: Args) -> Res<()> {
         }
 
         messages.push(Message::user(line));
-        let ids = llm.encode_chat(&messages)?;
+        let ids = llm.encode_chat(&messages, &[])?;
 
         // The cache lives in the session and survives between turns: only the
         // newest message is prefilled, not the whole transcript.

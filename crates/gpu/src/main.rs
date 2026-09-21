@@ -205,7 +205,7 @@ fn run(args: Args) -> Res<()> {
             messages.push(Message::system(s.clone()));
         }
         messages.push(Message::user(prompt.clone()));
-        llm.encode_chat(&messages)?
+        llm.encode_chat(&messages, &[])?
     } else {
         print!("{prompt}");
         std::io::stdout().flush()?;
@@ -266,7 +266,7 @@ fn chat(args: Args) -> Res<()> {
         }
 
         messages.push(Message::user(line));
-        let ids = llm.encode_chat(&messages)?;
+        let ids = llm.encode_chat(&messages, &[])?;
         let mut reply = String::new();
         let (stats, _) = llm.generate(&ids, &mut sampler, args.max_tokens, |piece| {
             print!("{piece}");

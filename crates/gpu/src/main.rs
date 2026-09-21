@@ -168,15 +168,24 @@ fn load(args: &Args) -> Res<Llm> {
     Ok(llm)
 }
 
-fn main() -> Res<()> {
+// Reporting the error rather than returning it from `main`, because returning
+// it prints the `Debug` form — and for a `Box<dyn Error>` made from a `String`
+// that is the quoted, backslash-escaped spelling. The loader's errors are
+// several lines of prose meant to be read: the unread-tensor guard names the
+// weights it found, and the quantiser names the block size that does not fit.
+fn main() {
     let args = parse_args();
-    match args.command.as_str() {
+    let done = match args.command.as_str() {
         "run" => run(args),
         "chat" => chat(args),
         other => {
             eprintln!("unknown command `{other}`");
             usage();
         }
+    };
+    if let Err(e) = done {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     }
 }
 

@@ -28,6 +28,9 @@ use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
 use kvad::model::{Session, Spec};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -129,6 +132,16 @@ struct Block {
     v: Proj,
     v_b: Option<Tensor>,
     o: Proj,
+    /// Qwen3's per-head RMSNorm on the queries and the keys, applied after the
+    /// projection and *before* RoPE. One vector of `head_dim`, shared by every
+    /// head.
+    ///
+    /// Absent in Llama and Qwen2. Nothing in the checkpoint announces which
+    /// one is loading, so the presence of these weights *is* the test — which
+    /// also means forgetting to read them is silent, and produces a model that
+    /// runs at full speed and talks nonsense.
+    q_norm: Option<Tensor>,
+    k_norm: Option<Tensor>,
     mlp_norm: Tensor,
     gate: Proj,
     up: Proj,
@@ -163,12 +176,158 @@ fn dense_embedding() -> bool {
     matches!(std::env::var("KVAD_GPU_DENSE_EMBED").as_deref(), Ok("1") | Ok("true"))
 }
 
+// ---------------------------------------------------------------------------
+// Reading the checkpoint, and noticing what was not read
+// ---------------------------------------------------------------------------
+
+/// A [`VarBuilder`] that remembers every name it was asked for.
+///
+/// The bug this exists to prevent was not a wrong answer but a question never
+/// asked: Qwen3's `self_attn.q_norm.weight` sat in the checkpoint unread, and a
+/// `VarBuilder` has no opinion about tensors nobody wants. The model loaded,
+/// reported the right parameter count, ran at full speed, and talked nonsense.
+///
+/// So every read goes through here and the names pile up in one set, which
+/// [`unread`] subtracts from the checkpoint's own list at the end of the load.
+/// The set is shared by `Rc` rather than copied, so however deep the prefixes
+/// nest there is one record — and the only way to add a weight to this backend
+/// is to read it through a `Reader`, which registers it without being asked to.
+struct Reader<'a> {
+    vb: VarBuilder<'a>,
+    seen: Rc<RefCell<HashSet<String>>>,
+}
+
+impl<'a> Reader<'a> {
+    fn new(vb: VarBuilder<'a>) -> Self {
+        Reader { vb, seen: Rc::new(RefCell::new(HashSet::new())) }
+    }
+
+    /// Descend into a prefix, keeping the shared record.
+    fn pp(&self, s: impl std::fmt::Display) -> Self {
+        Reader { vb: self.vb.pp(s.to_string()), seen: Rc::clone(&self.seen) }
+    }
+
+    /// The name this read is really about, prefixes and all — the spelling the
+    /// checkpoint uses, and so the one worth recording.
+    fn full(&self, name: &str) -> String {
+        let prefix = self.vb.prefix();
+        if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}.{name}")
+        }
+    }
+
+    fn get(
+        &self,
+        shape: impl Into<candle_core::Shape>,
+        name: &str,
+    ) -> candle_core::Result<Tensor> {
+        self.seen.borrow_mut().insert(self.full(name));
+        self.vb.get(shape, name)
+    }
+
+    /// A tensor this model may not have: a bias Qwen2 carries and Llama does
+    /// not, an untied output head.
+    ///
+    /// Recorded whether or not it is there, because the set means *names this
+    /// backend knows about*, not *names it found*. A bias that is absent is
+    /// absent from the checkpoint too, so recording it costs nothing — and
+    /// recording only the hits would make every optional weight in every model
+    /// that lacks it look unread.
+    fn try_get(&self, shape: impl Into<candle_core::Shape>, name: &str) -> Option<Tensor> {
+        self.get(shape, name).ok()
+    }
+
+    fn seen(&self) -> HashSet<String> {
+        self.seen.borrow().clone()
+    }
+}
+
+/// Tensors the checkpoint holds that nothing in [`GpuLlama::load`] asked for.
+///
+/// Reopening the files costs one pass over the safetensors headers and reads no
+/// tensor data — a rounding error against the load itself. The names come from
+/// the file rather than from a list kept in this crate, which is the whole
+/// point: a list would have to be remembered, and forgetting is what went
+/// wrong.
+fn unread(paths: &[std::path::PathBuf], seen: &HashSet<String>) -> Res<Vec<String>> {
+    let ckpt = kvad::weights::Checkpoint::open(paths)?;
+    let mut left: Vec<String> =
+        ckpt.names().filter(|n| !seen.contains(*n) && !derived(n)).map(str::to_string).collect();
+    left.sort();
+    Ok(left)
+}
+
+/// Names that are in the file but are not weights — recomputed here instead, so
+/// leaving them unread is correct.
+///
+/// `rotary_emb.inv_freq` is the one that matters: Llama-2-era exports saved the
+/// rotation frequencies as a buffer, and this loader builds them from
+/// `rope_theta`. A guard that refused a checkpoint over a *derived* tensor
+/// would be doing harm.
+fn derived(name: &str) -> bool {
+    name.ends_with("rotary_emb.inv_freq")
+}
+
+/// The unread names as lines for an error, with layer indices collapsed.
+///
+/// Twenty-eight layers means twenty-eight copies of one omission, and a message
+/// that lists them all buries the single fact worth reading.
+fn summarise(names: &[String]) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for name in names {
+        let key = collapse(name);
+        match counts.get_mut(&key) {
+            Some(n) => *n += 1,
+            None => {
+                counts.insert(key.clone(), 1);
+                order.push(key);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|k| match counts[&k] {
+            1 => k,
+            n => format!("{k}  ({n} tensors)"),
+        })
+        .collect()
+}
+
+/// `layers.7.self_attn.q_norm.weight` -> `layers.*.self_attn.q_norm.weight`.
+fn collapse(name: &str) -> String {
+    name.split('.')
+        .map(|part| match !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+            true => "*",
+            false => part,
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// `y = proj(x) (+ b)`.
 fn linear(x: &Tensor, w: &Proj, b: Option<&Tensor>) -> candle_core::Result<Tensor> {
     let y = w.forward(x)?;
     match b {
         Some(b) => y.broadcast_add(b),
         None => Ok(y),
+    }
+}
+
+/// RMSNorm every head of a projection shaped `[.., heads, head_dim]`, if this
+/// model has the weights for it.
+///
+/// The mirror of `norm_heads` in [`kvad::model::llama`], and much shorter for
+/// one reason: `rms_norm` normalises along the last axis, so putting the heads
+/// on the axis before it turns a loop over heads into a single kernel call.
+///
+/// `None` is every other model in this family, and costs one branch per layer.
+fn norm_heads(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> candle_core::Result<Tensor> {
+    match weight {
+        None => Ok(x.clone()),
+        Some(w) => ops::rms_norm(&x.contiguous()?, w, eps),
     }
 }
 
@@ -236,6 +395,7 @@ impl GpuLlama {
         // SAFETY: candle memory-maps the checkpoints; they are read-only cache
         // entries that nothing else writes while we hold them.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(paths, load_dtype, &load_dev)? };
+        let vb = Reader::new(vb);
 
         // Dense tensors (norms, embeddings) still have to make the trip.
         let to_dev = |t: Tensor| -> Res<Tensor> { Ok(t.to_device(&device)?) };
@@ -247,7 +407,7 @@ impl GpuLlama {
         // HuggingFace stores `nn.Linear` weights as [out, in]. Dense matmuls
         // want the transpose; quantised ones want it exactly as stored.
         let dev = device.clone();
-        let load_t = move |vb: &VarBuilder, name: &str, out: usize, inp: usize| -> Res<Proj> {
+        let load_t = move |vb: &Reader<'_>, name: &str, out: usize, inp: usize| -> Res<Proj> {
             let w = vb.get((out, inp), name)?;
             Ok(match quant {
                 None => Proj::Dense(w.t()?.contiguous()?),
@@ -265,12 +425,14 @@ impl GpuLlama {
             blocks.push(Block {
                 attn_norm: to_dev(l.get(e, "input_layernorm.weight")?)?,
                 q: load_t(&attn, "q_proj.weight", qd, e)?,
-                q_b: attn.get(qd, "q_proj.bias").ok().map(&to_dev).transpose()?,
+                q_b: attn.try_get(qd, "q_proj.bias").map(&to_dev).transpose()?,
                 k: load_t(&attn, "k_proj.weight", kvd, e)?,
-                k_b: attn.get(kvd, "k_proj.bias").ok().map(&to_dev).transpose()?,
+                k_b: attn.try_get(kvd, "k_proj.bias").map(&to_dev).transpose()?,
                 v: load_t(&attn, "v_proj.weight", kvd, e)?,
-                v_b: attn.get(kvd, "v_proj.bias").ok().map(&to_dev).transpose()?,
+                v_b: attn.try_get(kvd, "v_proj.bias").map(&to_dev).transpose()?,
                 o: load_t(&attn, "o_proj.weight", e, qd)?,
+                q_norm: attn.try_get(hd, "q_norm.weight").map(&to_dev).transpose()?,
+                k_norm: attn.try_get(hd, "k_norm.weight").map(&to_dev).transpose()?,
                 mlp_norm: to_dev(l.get(e, "post_attention_layernorm.weight")?)?,
                 gate: load_t(&mlp, "gate_proj.weight", spec.intermediate, e)?,
                 up: load_t(&mlp, "up_proj.weight", spec.intermediate, e)?,
@@ -281,7 +443,7 @@ impl GpuLlama {
         // The table, and the output head — which is the same matrix again
         // unless the model says otherwise.
         let table = model.get((spec.vocab_size, e), "embed_tokens.weight")?;
-        let own_head = vb.get((spec.vocab_size, e), "lm_head.weight").ok();
+        let own_head = vb.try_get((spec.vocab_size, e), "lm_head.weight");
 
         let mut tied = false;
         let (embed, head) = match quant {
@@ -314,6 +476,23 @@ impl GpuLlama {
             }
         };
 
+        let final_norm = to_dev(model.get(e, "norm.weight")?)?;
+
+        // Everything has been read, so anything left in the file is a part of
+        // this model that is not running.
+        let left = unread(paths, &vb.seen())?;
+        if !left.is_empty() {
+            return Err(format!(
+                "this checkpoint holds {} tensor(s) that the GPU backend never reads:\n  {}\n\
+                 A weight nobody reads is a piece of the model that is not running — a wrong\n\
+                 answer at full speed rather than an error, which is how Qwen3's per-head Q/K\n\
+                 norms were missed. Run it on the CPU engine instead:  kvad run",
+                left.len(),
+                summarise(&left).join("\n  ")
+            )
+            .into());
+        }
+
         // The same rotation table as `Rope::new`, built once on the device.
         let half = hd / 2;
         let inv: Vec<f32> = (0..half)
@@ -332,7 +511,7 @@ impl GpuLlama {
             embed,
             head,
             tied,
-            final_norm: to_dev(model.get(e, "norm.weight")?)?,
+            final_norm,
             cos,
             sin,
             device,
@@ -416,10 +595,22 @@ impl GpuLlama {
             let k = linear(&h, &blk.k, blk.k_b.as_ref())?;
             let v = linear(&h, &blk.v, blk.v_b.as_ref())?;
 
-            // [m, heads * hd] -> [1, heads, m, hd], which is what the rotary
-            // kernel and the batched attention matmuls want.
-            let q = q.reshape((1, m, n_head, hd))?.transpose(1, 2)?.contiguous()?;
-            let k = k.reshape((1, m, n_kv, hd))?.transpose(1, 2)?.contiguous()?;
+            // [m, heads * hd] -> [1, m, heads, hd]: the heads are split out
+            // with `hd` still last, which is the layout the per-head norm
+            // below wants.
+            let q = q.reshape((1, m, n_head, hd))?;
+            let k = k.reshape((1, m, n_kv, hd))?;
+
+            // Qwen3 normalises each head of Q and K here, between the
+            // projection and the rotation. Nothing else in this family does,
+            // and for everything else this is a no-op.
+            let q = norm_heads(&q, blk.q_norm.as_ref(), spec.eps)?;
+            let k = norm_heads(&k, blk.k_norm.as_ref(), spec.eps)?;
+
+            // -> [1, heads, m, hd], which is what the rotary kernel and the
+            // batched attention matmuls want.
+            let q = q.transpose(1, 2)?.contiguous()?;
+            let k = k.transpose(1, 2)?.contiguous()?;
             let v = v.reshape((1, m, n_kv, hd))?.transpose(1, 2)?.contiguous()?;
 
             let q = rotary_emb::rope(&q, &cos, &sin)?;
@@ -632,6 +823,17 @@ mod tests {
     /// Write a checkpoint the loader will accept, with or without its own
     /// output head.
     fn write_checkpoint(spec: &Spec, own_head: bool, tag: &str) -> std::path::PathBuf {
+        write_tensors(spec, own_head, &[], tag)
+    }
+
+    /// The same, plus tensors the base Llama layout does not have: Qwen3's
+    /// per-head norms, or something this backend does not implement at all.
+    fn write_tensors(
+        spec: &Spec,
+        own_head: bool,
+        extra: &[(String, Tensor)],
+        tag: &str,
+    ) -> std::path::PathBuf {
         let d = Device::Cpu;
         let (e, i) = (spec.n_embd, spec.intermediate);
         let (qd, kvd) = (spec.n_head * spec.head_dim, spec.kv_dim());
@@ -656,6 +858,9 @@ mod tests {
         if own_head {
             t.insert("lm_head.weight".into(), rand(spec.vocab_size, e));
         }
+        for (name, tensor) in extra {
+            t.insert(name.clone(), tensor.clone());
+        }
 
         // Unique per test as well as per process: the tests run in parallel
         // and would otherwise delete each other's checkpoints.
@@ -665,6 +870,113 @@ mod tests {
         ));
         candle_core::safetensors::save(&t, &path).unwrap();
         path
+    }
+
+    /// The bug this backend shipped with, and the only check that would have
+    /// caught it.
+    ///
+    /// Qwen3 puts an RMSNorm on every attention head's query and key. This
+    /// loader did not read the weights for it, so it ran a Llama forward pass
+    /// on a Qwen3 model: full speed, right parameter count, nonsense output.
+    /// Nothing inside one engine can notice that — "a Llama forward pass" is
+    /// what both engines think they are doing — so the test is agreement with
+    /// the hand-written CPU one, which had the norms all along.
+    ///
+    /// The norm weights are deliberately random. All-ones is the trap: it makes
+    /// the *scale* of the normalisation the identity, so a backend that skipped
+    /// the whole operation would still look close enough to pass.
+    #[test]
+    fn per_head_norms_agree_with_the_cpu_engine() {
+        use kvad::model::Transformer;
+
+        let spec = tiny_spec();
+        let d = Device::Cpu;
+        let norms: Vec<(String, Tensor)> = ["q_norm", "k_norm"]
+            .iter()
+            .map(|n| {
+                let w = Tensor::randn(1f32, 0.3f32, spec.head_dim, &d).unwrap();
+                (format!("model.layers.0.self_attn.{n}.weight"), w)
+            })
+            .collect();
+        let path = write_tensors(&spec, false, &norms, "qk-norm");
+        let tokens = [1u32, 2, 3];
+
+        let mut gpu = GpuLlama::load(
+            std::slice::from_ref(&path),
+            spec.clone(),
+            DType::F32,
+            None,
+            Device::Cpu,
+        )
+        .unwrap();
+        let theirs = gpu.forward(&tokens).unwrap();
+
+        let ckpt = kvad::weights::Checkpoint::open(std::slice::from_ref(&path)).unwrap();
+        let src = kvad::qcache::Live::new(&ckpt, kvad::quant::Precision::F32);
+        let cpu = kvad::model::llama::Model::load(&src, spec.clone()).unwrap();
+        let mut cache = kvad::model::KvCache::new(&spec);
+        let ours = cpu.forward_batch(&tokens, &mut cache);
+
+        assert_eq!(theirs.len(), ours.len());
+        // Both are f32; they differ only in the order the sums happen in.
+        let worst = theirs
+            .iter()
+            .zip(&ours)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-4, "logits disagree by {worst}");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A weight this backend does not read must stop the load rather than
+    /// quietly change the answer.
+    ///
+    /// The general form of the Qwen3 bug: a `VarBuilder` answers the questions
+    /// it is asked and says nothing about the rest, so *not implemented* and
+    /// *implemented correctly* looked identical from outside the loader.
+    #[test]
+    fn a_tensor_this_backend_never_reads_refuses_to_load() {
+        let spec = tiny_spec();
+        let extra = vec![(
+            "model.layers.0.self_attn.some_new_norm.weight".to_string(),
+            Tensor::ones(spec.head_dim, DType::F32, &Device::Cpu).unwrap(),
+        )];
+        let path = write_tensors(&spec, false, &extra, "unread");
+
+        // Not `expect_err`: a loaded model is not `Debug`, and the message is
+        // the thing under test anyway.
+        let err = match GpuLlama::load(
+            std::slice::from_ref(&path),
+            spec.clone(),
+            DType::F32,
+            None,
+            Device::Cpu,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a tensor this backend never reads must not load silently"),
+        };
+        assert!(err.contains("some_new_norm"), "unhelpful message: {err}");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Derived tensors are the exception, and must stay one: Llama-2-era
+    /// exports saved the RoPE frequencies as a buffer, and this loader computes
+    /// them from `rope_theta`. Refusing those checkpoints would be the guard
+    /// causing the harm it exists to prevent.
+    #[test]
+    fn a_saved_rope_table_is_not_an_unread_weight() {
+        let spec = tiny_spec();
+        let extra = vec![(
+            "model.layers.0.self_attn.rotary_emb.inv_freq".to_string(),
+            Tensor::ones(spec.head_dim / 2, DType::F32, &Device::Cpu).unwrap(),
+        )];
+        let path = write_tensors(&spec, false, &extra, "inv-freq");
+
+        GpuLlama::load(std::slice::from_ref(&path), spec, DType::F32, None, Device::Cpu).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// Tying is the common case and the one that saves the memory, but an

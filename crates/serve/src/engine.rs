@@ -59,7 +59,6 @@ pub fn parse(id: &str) -> Option<Backend> {
 
 #[cfg(feature = "gpu")]
 mod gpu {
-    use kvad::model::Session;
     use kvad::runtime::Llm;
     use kvad::service::GpuMode;
     use kvad::weights::Watcher;
@@ -76,24 +75,16 @@ mod gpu {
             GpuMode::Q8 => kvad_gpu::model::parse_quant("q8").expect("known quant"),
             GpuMode::Q4 => kvad_gpu::model::parse_quant("q4").expect("known quant"),
         };
+        // Which architecture this is, and whether there is a GPU
+        // implementation of it, is the GPU crate's question and is answered
+        // in one place: `session` dispatches on the config and names what it
+        // has if it cannot. The server kept its own copy of that answer
+        // until GPT-2 and DeepSeek arrived on the GPU and the CLI could run
+        // models this could not — a list in two places is a list that
+        // disagrees.
         Llm::load_custom(repo, progress, watch, &mut |files, spec, _| {
-            if !spec.arch.is("llama") {
-                return Err(format!(
-                    "the GPU backend implements the Llama family only; this model is {}. \
-                     Pick a CPU backend instead.",
-                    spec.arch
-                )
-                .into());
-            }
             let device = kvad_gpu::model::pick_device(None)?;
-            let m = kvad_gpu::model::GpuLlama::load(
-                &files.weights,
-                spec.clone(),
-                dtype,
-                quant,
-                device,
-            )?;
-            Ok(Box::new(m) as Box<dyn Session>)
+            kvad_gpu::model::session(&files.weights, spec, dtype, quant, device)
         })
     }
 }

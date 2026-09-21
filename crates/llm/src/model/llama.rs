@@ -251,6 +251,7 @@ impl Transformer for Model {
         });
         self.embed.param_count()
             + self.lm_head.as_ref().map_or(0, |h| h.param_count())
+            + self.final_norm.len()
             + per_block * self.blocks.len()
     }
 

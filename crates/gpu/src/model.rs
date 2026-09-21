@@ -218,12 +218,24 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Note that this backend knows about `name`.
+    ///
+    /// Every read calls this, and it is also called on its own for a tensor
+    /// this backend knows about and deliberately does not use: the duplicate
+    /// `lm_head.weight` in a tied checkpoint. Reading that one to satisfy the
+    /// guard would move 300 MB for nothing, and leaving it out would make the
+    /// guard refuse a model that is perfectly correct — so what the set records
+    /// is the *decision*, which is what it was always about.
+    fn record(&self, name: &str) {
+        self.seen.borrow_mut().insert(self.full(name));
+    }
+
     fn get(
         &self,
         shape: impl Into<candle_core::Shape>,
         name: &str,
     ) -> candle_core::Result<Tensor> {
-        self.seen.borrow_mut().insert(self.full(name));
+        self.record(name);
         self.vb.get(shape, name)
     }
 
@@ -443,7 +455,37 @@ impl GpuLlama {
         // The table, and the output head — which is the same matrix again
         // unless the model says otherwise.
         let table = model.get((spec.vocab_size, e), "embed_tokens.weight")?;
-        let own_head = vb.try_get((spec.vocab_size, e), "lm_head.weight");
+
+        // Whether the head is its own matrix is the *config's* statement, not
+        // the checkpoint's. `tie_word_embeddings` means `lm_head.weight` **is**
+        // `embed_tokens.weight`, so a file that carries both is saying one
+        // matrix twice — Qwen3-0.6B ships 297 MB of byte-identical duplicate,
+        // and HuggingFace itself overwrites the stored copy when it ties.
+        //
+        // Reading whichever tensor happened to be present is how this backend
+        // came to disagree with `llama.rs`, which reads the flag. They agreed on
+        // Qwen3 only because the duplicate holds the same numbers; a stale
+        // `lm_head` would have split them, and this side would have been wrong.
+        let own_head = match spec.tie_embeddings {
+            true => {
+                // Skipped on purpose, and recorded so the guard does not read
+                // that as an omission.
+                vb.record("lm_head.weight");
+                None
+            }
+            false => match vb.get((spec.vocab_size, e), "lm_head.weight") {
+                Ok(w) => Some(w),
+                Err(_) => {
+                    return Err(concat!(
+                        "this model does not tie its embeddings, so it needs its own ",
+                        "`lm_head.weight`, and the checkpoint has none.\n",
+                        "If it is meant to be tied, its config is missing ",
+                        "`tie_word_embeddings: true`."
+                    )
+                    .into())
+                }
+            },
+        };
 
         let mut tied = false;
         let (embed, head) = match quant {
@@ -668,7 +710,17 @@ impl GpuLlama {
                     + n(&b.mlp_norm)
             })
             .sum();
-        blocks + self.embed.params() + n(&self.final_norm)
+        // A head that is not counted is a head nobody notices is missing. It
+        // is a separate parameter exactly when the model does not tie — and how
+        // many copies of it *this* backend keeps is a question about
+        // allocations, so `tied` is the wrong flag to ask here. Using it would
+        // make a dense load and a quantised load of one model report different
+        // parameter counts.
+        let head = match self.spec.tie_embeddings {
+            true => 0,
+            false => self.head.params(),
+        };
+        blocks + self.embed.params() + head + n(&self.final_norm)
     }
 
     fn memory_bytes(&self) -> usize {
@@ -872,6 +924,34 @@ mod tests {
         path
     }
 
+    /// The hand-written engine on the same checkpoint. Owned, so the mapped
+    /// file and the quantising source it was built through can both go away.
+    fn cpu_model(path: &std::path::PathBuf, spec: &Spec) -> kvad::model::llama::Model {
+        let ckpt = kvad::weights::Checkpoint::open(std::slice::from_ref(path)).unwrap();
+        let src = kvad::qcache::Live::new(&ckpt, kvad::quant::Precision::F32);
+        kvad::model::llama::Model::load(&src, spec.clone()).unwrap()
+    }
+
+    /// The largest disagreement between the two engines on one checkpoint.
+    ///
+    /// Both in f32, so what is left is the order the sums happen in — anything
+    /// above a rounding error means they are running different models, which is
+    /// the only way one engine can tell that the other is wrong.
+    fn engines_differ_by(path: &std::path::PathBuf, spec: &Spec, tokens: &[u32]) -> f32 {
+        use kvad::model::Transformer;
+
+        let mut gpu =
+            GpuLlama::load(std::slice::from_ref(path), spec.clone(), DType::F32, None, Device::Cpu)
+                .unwrap();
+        let theirs = gpu.forward(tokens).unwrap();
+
+        let mut cache = kvad::model::KvCache::new(spec);
+        let ours = cpu_model(path, spec).forward_batch(tokens, &mut cache);
+
+        assert_eq!(theirs.len(), ours.len());
+        theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+    }
+
     /// The bug this backend shipped with, and the only check that would have
     /// caught it.
     ///
@@ -887,8 +967,6 @@ mod tests {
     /// the whole operation would still look close enough to pass.
     #[test]
     fn per_head_norms_agree_with_the_cpu_engine() {
-        use kvad::model::Transformer;
-
         let spec = tiny_spec();
         let d = Device::Cpu;
         let norms: Vec<(String, Tensor)> = ["q_norm", "k_norm"]
@@ -899,32 +977,57 @@ mod tests {
             })
             .collect();
         let path = write_tensors(&spec, false, &norms, "qk-norm");
-        let tokens = [1u32, 2, 3];
 
-        let mut gpu = GpuLlama::load(
+        let worst = engines_differ_by(&path, &spec, &[1, 2, 3]);
+        assert!(worst < 1e-4, "logits disagree by {worst}");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A tied model's output head is its embedding table, whatever else the
+    /// file happens to contain.
+    ///
+    /// `tie_word_embeddings` says the two *are* one matrix, so a checkpoint
+    /// carrying both is stating it twice — Qwen3-0.6B ships 297 MB of
+    /// byte-identical duplicate. This backend used to believe the file and
+    /// `llama.rs` the config, and they agreed only because those bytes matched.
+    /// Here they deliberately do not: the head in this checkpoint is random and
+    /// unrelated, so an engine that reads it lands somewhere else entirely.
+    #[test]
+    fn a_tied_model_ignores_a_duplicate_output_head() {
+        let spec = tiny_spec();
+        assert!(spec.tie_embeddings, "this test is about what tying means");
+
+        let path = write_checkpoint(&spec, true, "tied-duplicate-head");
+        let worst = engines_differ_by(&path, &spec, &[1, 2, 3]);
+        assert!(worst < 1e-4, "logits disagree by {worst}");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// An untied model with no head of its own is a broken checkpoint, and must
+    /// say so rather than quietly borrowing the embedding table.
+    ///
+    /// The old code reached for `lm_head.weight`, shrugged when it was missing
+    /// and used the table — which is a different model from the one the config
+    /// describes, run at full speed without a word.
+    #[test]
+    fn an_untied_model_without_a_head_says_so() {
+        let mut spec = tiny_spec();
+        spec.tie_embeddings = false;
+        let path = write_checkpoint(&spec, false, "untied-headless");
+
+        let err = match GpuLlama::load(
             std::slice::from_ref(&path),
             spec.clone(),
             DType::F32,
             None,
             Device::Cpu,
-        )
-        .unwrap();
-        let theirs = gpu.forward(&tokens).unwrap();
-
-        let ckpt = kvad::weights::Checkpoint::open(std::slice::from_ref(&path)).unwrap();
-        let src = kvad::qcache::Live::new(&ckpt, kvad::quant::Precision::F32);
-        let cpu = kvad::model::llama::Model::load(&src, spec.clone()).unwrap();
-        let mut cache = kvad::model::KvCache::new(&spec);
-        let ours = cpu.forward_batch(&tokens, &mut cache);
-
-        assert_eq!(theirs.len(), ours.len());
-        // Both are f32; they differ only in the order the sums happen in.
-        let worst = theirs
-            .iter()
-            .zip(&ours)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        assert!(worst < 1e-4, "logits disagree by {worst}");
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an untied model with no `lm_head.weight` must not load"),
+        };
+        assert!(err.contains("lm_head.weight"), "unhelpful message: {err}");
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -982,11 +1085,21 @@ mod tests {
     /// Tying is the common case and the one that saves the memory, but an
     /// untied model must still load — and must *not* be reported as sharing
     /// storage it does not share.
+    ///
+    /// The loop is over the *config*, not over what the file contains, which is
+    /// the thing this backend used to get backwards. The parameter count is
+    /// checked against the hand-written engine in the same breath: a head that
+    /// nobody counts is a head nobody notices is missing, and this one went
+    /// uncounted in every model that has one.
     #[test]
     fn tied_and_untied_models_both_run() {
-        let spec = tiny_spec();
-        for own_head in [false, true] {
-            let path = write_checkpoint(&spec, own_head, "both-run");
+        use kvad::model::Transformer;
+
+        for tie in [true, false] {
+            let mut spec = tiny_spec();
+            spec.tie_embeddings = tie;
+            // An untied model carries its own head; a tied one must not need to.
+            let path = write_checkpoint(&spec, !tie, "both-run");
             let mut m = GpuLlama::load(
                 std::slice::from_ref(&path),
                 spec.clone(),
@@ -996,7 +1109,9 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(m.tied, !own_head);
+            assert_eq!(m.tied, tie, "tying is the config's statement, not the file's");
+            assert_eq!(m.param_count(), cpu_model(&path, &spec).param_count());
+
             let logits = m.forward(&[1, 2, 3]).unwrap();
             assert_eq!(logits.len(), spec.vocab_size);
             assert!(logits.iter().all(|v| v.is_finite()));

@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Neural network training from scratch: transformers, AdamW, safetensors, zero dependencies."
+repository = "https://github.com/bisand/kvad"
+readme = "README.md"
+keywords = ["neural-network", "transformer", "gpt", "training", "machine-learning"]
+categories = ["science", "algorithms"]
 
 # No dependencies. Deliberately. Every float that moves in this crate
 # moves because of code in this crate.

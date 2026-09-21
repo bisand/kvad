@@ -7,6 +7,9 @@
 import { api, sse } from "./api.js";
 import { toasts } from "./toasts.svelte.js";
 
+/** States a job does not come back from. */
+const FINISHED = ["done", "failed", "cancelled"];
+
 class Training {
   jobs = $state([]);
   datasets = $state([]);
@@ -53,7 +56,13 @@ class Training {
     this.log = [];
 
     const stop = new AbortController();
-    this.#watching = { id, stop };
+    // Whether this run ending would be news. Opening one from the list
+    // replays its whole history, the `ended` event included, and a toast
+    // saying a run finished is about something that has just happened — not
+    // about a row somebody clicked to read a chart they already know the end
+    // of. The panel says what state it is in either way, and shows the error
+    // for a failure, so nothing is lost by staying quiet.
+    this.#watching = { id, stop, announce: !FINISHED.includes(job.state) };
 
     sse(
       `/api/jobs/${id}/events`,
@@ -103,8 +112,10 @@ class Training {
       case "ended": {
         const id = this.open.job.id;
         this.open.job = { ...this.open.job, state: u.state, error: u.error ?? null };
-        if (u.state === "failed") toasts.error(u.error ?? "the run failed");
-        else if (u.state === "done") toasts.success(`${this.open.job.label} finished.`);
+        if (this.#watching?.announce) {
+          if (u.state === "failed") toasts.error(u.error ?? "the run failed");
+          else if (u.state === "done") toasts.success(`${this.open.job.label} finished.`);
+        }
         // The row now carries the result and the timings, which the stream
         // does not: read it back rather than reconstruct it here.
         api(`/api/jobs/${id}`)

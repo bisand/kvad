@@ -14,6 +14,17 @@
 # refused: everyone who could reach the address would be an administrator.
 bind = "127.0.0.1:8080"
 
+# Load the active model as soon as the server is listening, rather than
+# waiting for the first request to pay for it — tens of seconds, or ninety
+# for DeepSeek-V2-Lite. A service that comes back after a reboot comes back
+# ready, and the load is a job on the queue like any other, so a request that
+# arrives meanwhile waits for it instead of starting a second one.
+#
+# The cost is honest rather than hidden: the model is in memory a minute
+# after boot whether or not anybody turns up. Set false to spend that memory
+# only when something asks.
+# autoload = true
+
 [database]
 # Defaults to $XDG_DATA_HOME/kvad/kvad.db. Data rather than cache: what is in
 # it — conversations, training runs, API keys — cannot be downloaded again.

@@ -2183,6 +2183,17 @@ rather than implying a race. **Training is not queued behind chat, or chat
 behind training** — that one was measured rather than assumed, and the
 measurement is below.
 
+And **a restart puts the model back**. The engine holds nothing until
+something asks, which for a service means the first request after a reboot
+pays the load — tens of seconds, ninety for DeepSeek-V2-Lite — or is refused
+outright for naming no model. So the server loads whatever was active as soon
+as it is listening, in the background and as a job on the same queue: the
+address is answering while it happens, the Models page shows it arriving, and
+a request that turns up meanwhile waits for that load rather than starting a
+second one. The cost is the honest one and is stated where it is configured —
+the model is in memory a minute after boot whether or not anybody turns up,
+and `[server] autoload = false` spends that memory only when something asks.
+
 ### What it measures, and what it refuses to
 
 Three numbers on this page have been wrong before, which is why the server has

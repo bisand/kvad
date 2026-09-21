@@ -252,6 +252,14 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
         }
     });
 
+    // What the autoload will do, worked out before the address is printed so
+    // that the startup block can say so, and acted on after — the server is
+    // answering by then, and a load takes tens of seconds.
+    let bring_back = match cfg.server.autoload {
+        true => kvad::hub::State::active(),
+        false => None,
+    };
+
     let listener = tokio::net::TcpListener::bind(cfg.server.bind).await.map_err(|e| {
         format!("could not bind {}: {e}", cfg.server.bind)
     })?;
@@ -275,6 +283,9 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
         "  backends   {}",
         engine::available().iter().map(|c| c.id.clone()).collect::<Vec<_>>().join(", ")
     );
+    if let Some(repo) = &bring_back {
+        println!("  autoload   {repo}, in the background");
+    }
     if !assets::is_embedded() {
         println!("  web UI     not built into this binary — open the address above to see how");
     }
@@ -297,9 +308,52 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
         tracing::info!("{orphans} job(s) were interrupted by a restart and are marked failed");
     }
 
+    if let Some(repo) = bring_back {
+        autoload(&state, repo);
+    }
+
     axum::serve(listener, app).with_graceful_shutdown(interrupted()).await?;
     println!("stopped");
     Ok(())
+}
+
+/// Put the active model back in memory, without making anyone wait for it.
+///
+/// A job on the scheduler like any other, which is what makes this safe: a
+/// request that arrives while the load is running queues behind it instead
+/// of starting a second load of its own, and the queue depth on the
+/// dashboard counts it. The server is already listening and answering — the
+/// Models page will show the load arriving — so nothing here blocks startup.
+///
+/// A failure is a log line and not a crash. The active model may have been
+/// deleted since it was set, or be a GPU model in a build without one, and
+/// neither is a reason for a server that is otherwise fine to refuse to run.
+fn autoload(state: &auth::State, repo: String) {
+    let backend = match engine::parse(&models::default_backend(&state.db)) {
+        Some(backend) => backend,
+        // `default_backend` only ever answers with a backend this build can
+        // parse, so this is unreachable rather than a case worth handling.
+        None => return,
+    };
+    let scheduler = std::sync::Arc::clone(&state.engine);
+    tokio::spawn(async move {
+        // Progress goes nowhere, but it has to go somewhere: the load writes
+        // to this channel as it reads files, and a receiver that has been
+        // dropped would have it writing into a closed pipe for the whole
+        // load.
+        let (progress, mut arriving) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while arriving.recv().await.is_some() {} });
+        let started = std::time::Instant::now();
+        match scheduler.load(repo.clone(), backend, progress).await {
+            Ok(loaded) => tracing::info!(
+                "autoloaded {} on {} in {:.1}s",
+                loaded.repo,
+                loaded.backend,
+                started.elapsed().as_secs_f32()
+            ),
+            Err(why) => tracing::warn!("could not autoload {repo}: {why}"),
+        }
+    });
 }
 
 /// Resolves on Ctrl-C, so an in-flight request finishes rather than being cut.

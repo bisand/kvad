@@ -258,6 +258,13 @@ pub struct LocalModel {
     /// Read from the cached config.json, so this is authoritative rather than
     /// a guess.
     pub arch: Option<Arch>,
+    /// What that config called itself, whether or not this build has an
+    /// architecture for it.
+    ///
+    /// Kept beside `arch` for the same reason [`HubModel`] keeps it: the two
+    /// ways `arch` can be `None` want different things said about them, and
+    /// "there is no config to read" is not "this build cannot run that".
+    pub model_type: Option<String>,
     pub complete: bool,
 }
 
@@ -293,18 +300,15 @@ pub fn local_models() -> Vec<LocalModel> {
             let path = entry.path();
             let bytes = dir_size(&path);
             let files = snapshot_files(&path);
-            let arch = find_config(&path)
+            let model_type = find_config(&path)
                 .and_then(|c| crate::weights::read_json(&c).ok())
-                .and_then(|j| {
-                    j.get("model_type")
-                        .and_then(|m| m.as_str())
-                        .and_then(Arch::from_model_type)
-                });
+                .and_then(|j| j.get("model_type")?.as_str().map(str::to_string));
             Some(LocalModel {
                 id,
                 path,
                 bytes,
-                arch,
+                arch: model_type.as_deref().and_then(Arch::from_model_type),
+                model_type,
                 // A cache entry with a config but no weights is a half-finished
                 // `info` call, not a usable model.
                 complete: files.iter().any(|f| f.ends_with(".safetensors")),
@@ -338,12 +342,14 @@ pub fn trained_models() -> Vec<LocalModel> {
         .map(|entry| {
             let path = entry.path();
             let config = path.join("config.json");
+            let model_type = crate::weights::read_json(&config)
+                .ok()
+                .and_then(|j| j.get("model_type")?.as_str().map(str::to_string));
             LocalModel {
                 id: entry.file_name().to_string_lossy().into_owned(),
                 bytes: dir_size(&path),
-                arch: crate::weights::read_json(&config).ok().and_then(|j| {
-                    j.get("model_type").and_then(|m| m.as_str()).and_then(Arch::from_model_type)
-                }),
+                arch: model_type.as_deref().and_then(Arch::from_model_type),
+                model_type,
                 // A directory left behind by a run that was stopped before
                 // its first checkpoint has a tokeniser and no weights.
                 complete: path.join("model.safetensors").is_file() && config.is_file(),

@@ -52,12 +52,24 @@ pub struct Model {
 }
 
 fn describe(m: &hub::LocalModel, trained: bool) -> Model {
-    let blocker = match (m.arch, m.complete) {
-        (None, _) => Some("this engine runs GPT-2 and the Llama family; this is neither".into()),
-        (_, false) => Some(match trained {
+    // Ordered by how specific the answer is. A half-finished download is the
+    // likeliest reason a directory here cannot be run, and it used to be
+    // answered with the architecture message instead — the GPTQ repo that has
+    // only its `model.safetensors.index.json` was being told it was the wrong
+    // kind of model rather than an unfinished one.
+    let blocker = match (m.complete, &m.model_type, m.arch) {
+        (false, _, _) => Some(match trained {
             true => "no weights yet — the run was stopped before its first checkpoint".into(),
             false => "the download did not finish".to_string(),
         }),
+        (_, None, _) => Some("no config.json, so there is nothing to say what this is".into()),
+        // Named by the list the loader dispatches on rather than by a copy of
+        // it kept here, which is how this came to be offering GPT-2 and the
+        // Llama family long after DeepSeek arrived.
+        (_, Some(t), None) => Some(format!(
+            "`{t}` is not an architecture this build runs; it runs {}",
+            kvad::model::arch::supported()
+        )),
         _ => None,
     };
     Model {
@@ -516,27 +528,55 @@ mod tests {
     use kvad::model::Arch;
     use std::path::PathBuf;
 
-    fn local(id: &str, arch: Option<Arch>, complete: bool) -> hub::LocalModel {
-        hub::LocalModel { id: id.into(), path: PathBuf::new(), bytes: 1, arch, complete }
+    /// `arch` is derived from `model_type` exactly as `local_models` derives
+    /// it, so a test cannot disagree with the registry about which types this
+    /// build answers to.
+    fn local(id: &str, model_type: Option<&str>, complete: bool) -> hub::LocalModel {
+        hub::LocalModel {
+            id: id.into(),
+            path: PathBuf::new(),
+            bytes: 1,
+            arch: model_type.and_then(Arch::from_model_type),
+            model_type: model_type.map(str::to_string),
+            complete,
+        }
     }
 
     /// Every unrunnable model says why in a sentence somebody can act on, and
-    /// a trained one gets a different sentence from a downloaded one: you
-    /// cannot re-download a model you trained.
+    /// the three reasons are three sentences.
+    ///
+    /// The one that was wrong is the fourth case below. A directory with no
+    /// config and no weights — the ordinary shape of an interrupted download,
+    /// and what `Qwen2.5-Coder-7B-Instruct-GPTQ-Int4` looked like on this
+    /// machine — has no `model_type` either, so it was matching the
+    /// architecture arm and being told it was the wrong kind of model rather
+    /// than an unfinished one.
     #[test]
     fn a_model_that_cannot_run_says_why() {
-        let good = describe(&local("a/b", Some(Arch::require("llama")), true), false);
+        let good = describe(&local("a/b", Some("llama"), true), false);
         assert!(good.runnable && good.blocker.is_none());
         assert_eq!(good.arch.as_deref(), Some("llama"));
 
-        let strange = describe(&local("a/b", None, true), false);
+        // Downloaded, readable, and something this build has no loader for.
+        // It names the model's own `model_type` and the list the loader
+        // dispatches on, rather than a sentence kept here about which
+        // architectures existed when it was written.
+        let strange = describe(&local("a/b", Some("whisper"), true), false);
         assert!(!strange.runnable);
-        assert!(strange.blocker.unwrap().contains("neither"));
+        let why = strange.blocker.unwrap();
+        assert!(why.contains("`whisper`"), "{why}");
+        assert!(why.contains("llama") && why.contains("gpt2"), "{why}");
 
-        let half = describe(&local("a/b", Some(Arch::require("gpt2")), false), false);
+        let nothing = describe(&local("a/b", None, true), false);
+        assert!(nothing.blocker.unwrap().contains("no config.json"));
+
+        let interrupted = describe(&local("a/b", None, false), false);
+        assert!(interrupted.blocker.unwrap().contains("download did not finish"));
+
+        let half = describe(&local("a/b", Some("gpt2"), false), false);
         assert!(half.blocker.unwrap().contains("download did not finish"));
 
-        let stopped = describe(&local("mine", Some(Arch::require("gpt2")), false), true);
+        let stopped = describe(&local("mine", Some("gpt2"), false), true);
         assert!(stopped.blocker.unwrap().contains("first checkpoint"));
     }
 

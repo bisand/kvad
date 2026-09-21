@@ -25,14 +25,14 @@
 //! framework's matmul does not care.
 
 use crate::common::{
-    causal_mask, check_block, dense_embedding, label, linear, unread, unread_error, Embed, Proj,
-    Reader,
+    causal_mask, check_block, embedding, label, linear, unread, unread_error, Embed, Loader, Proj,
+    Reader, Stored,
 };
-use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use crate::qcache::Vault;
+use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
 use kvad::model::{Arch, Session, Spec};
-use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -126,6 +126,7 @@ impl GpuLlama {
         dtype: DType,
         quant: Option<GgmlDType>,
         device: Device,
+        cache: &Vault,
     ) -> Res<Self> {
         // Quantising reads f32 and produces blocks, so in that mode the
         // weights arrive as f32 and each one is converted and dropped in turn
@@ -163,17 +164,12 @@ impl GpuLlama {
         let (qd, kvd) = (spec.n_head * hd, spec.kv_dim());
         let model = vb.pp("model");
 
-        // HuggingFace stores `nn.Linear` weights as [out, in]. Dense matmuls
-        // want the transpose; quantised ones want it exactly as stored.
-        let dev = device.clone();
-        let load_t = move |vb: &Reader<'_>, name: &str, out: usize, inp: usize| -> Res<Proj> {
-            let w = vb.get((out, inp), name)?;
-            Ok(match quant {
-                None => Proj::Dense(w.t()?.contiguous()?),
-                Some(gd) => Proj::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(
-                    &w, gd, &dev,
-                )?)?),
-            })
+        // HuggingFace stores `nn.Linear` weights as [out, in]. Who transposes
+        // and when is `Stored`'s business now; this loader only says which way
+        // round the file has it.
+        let ld = Loader::new(quant, device.clone(), cache);
+        let load_t = |vb: &Reader<'_>, name: &str, out: usize, inp: usize| -> Res<Proj> {
+            ld.proj(vb, name, out, inp, Stored::OutIn)
         };
 
         let mut blocks = Vec::with_capacity(spec.n_layer);
@@ -199,71 +195,7 @@ impl GpuLlama {
             });
         }
 
-        // The table, and the output head — which is the same matrix again
-        // unless the model says otherwise.
-        let table = model.get((spec.vocab_size, e), "embed_tokens.weight")?;
-
-        // Whether the head is its own matrix is the *config's* statement, not
-        // the checkpoint's. `tie_word_embeddings` means `lm_head.weight` **is**
-        // `embed_tokens.weight`, so a file that carries both is saying one
-        // matrix twice — Qwen3-0.6B ships 297 MB of byte-identical duplicate,
-        // and HuggingFace itself overwrites the stored copy when it ties.
-        //
-        // Reading whichever tensor happened to be present is how this backend
-        // came to disagree with `llama.rs`, which reads the flag. They agreed on
-        // Qwen3 only because the duplicate holds the same numbers; a stale
-        // `lm_head` would have split them, and this side would have been wrong.
-        let own_head = match spec.tie_embeddings {
-            true => {
-                // Skipped on purpose, and recorded so the guard does not read
-                // that as an omission.
-                vb.record("lm_head.weight");
-                None
-            }
-            false => match vb.get((spec.vocab_size, e), "lm_head.weight") {
-                Ok(w) => Some(w),
-                Err(_) => {
-                    return Err(concat!(
-                        "this model does not tie its embeddings, so it needs its own ",
-                        "`lm_head.weight`, and the checkpoint has none.\n",
-                        "If it is meant to be tied, its config is missing ",
-                        "`tie_word_embeddings: true`."
-                    )
-                    .into())
-                }
-            },
-        };
-
-        let mut tied = false;
-        let (embed, head) = match quant {
-            None => {
-                // Dense keeps two copies: `index_select` wants
-                // `[vocab, n_embd]` and `matmul` wants the transpose, and
-                // neither is cheap to fake from the other.
-                let w = own_head.unwrap_or_else(|| table.clone());
-                (Embed::Dense(to_dev(table)?), Proj::Dense(to_dev(w.t()?.contiguous()?)?))
-            }
-            // The arrangement this replaced, kept behind a flag so the
-            // difference it makes is one environment variable wide: a dense
-            // half-precision table, and the head quantised separately from it.
-            Some(gd) if dense_embedding() => {
-                let w = own_head.unwrap_or_else(|| table.clone());
-                let head = QMatMul::from_qtensor(QTensor::quantize_onto(&w, gd, &device)?)?;
-                (Embed::Dense(to_dev(table.to_dtype(DType::BF16)?)?), Proj::Quant(head))
-            }
-            Some(gd) => {
-                let q = Arc::new(QTensor::quantize_onto(&table, gd, &device)?);
-                let head = match own_head {
-                    Some(w) => QMatMul::from_qtensor(QTensor::quantize_onto(&w, gd, &device)?)?,
-                    // Tied, and now in one layout: one allocation, two uses.
-                    None => {
-                        tied = true;
-                        QMatMul::from_arc(Arc::clone(&q))?
-                    }
-                };
-                (Embed::Quant(q), Proj::Quant(head))
-            }
-        };
+        let (embed, head, tied) = embedding(&ld, &vb, &model, "embed_tokens.weight", &spec)?;
 
         let final_norm = to_dev(model.get(e, "norm.weight")?)?;
 
@@ -538,34 +470,51 @@ pub fn parse_dtype(s: &str) -> Option<DType> {
 /// Build whichever architecture the config named, as a [`Session`].
 ///
 /// The CPU engine has a registry for this and looks nothing up by hand; here
-/// there are two arms, because there are two architectures and adding a third
-/// should be a visible act rather than a line in a table. What both share is
-/// the vocabulary in [`crate::common`] — and, more to the point, the check
-/// that the checkpoint has nothing left in it that the loader never asked for.
+/// there is a branch per architecture, because adding one should be a visible
+/// act rather than a line in a table. What they share is the vocabulary in
+/// [`crate::common`] — the check that the checkpoint has nothing left in it
+/// that the loader never asked for, and the cache that means the loader does
+/// not quantise the same weights twice.
 pub fn session(
+    repo: &str,
     paths: &[std::path::PathBuf],
     spec: &Spec,
     dtype: DType,
     quant: Option<GgmlDType>,
     device: Device,
+    progress: &mut dyn FnMut(&str),
 ) -> Res<Box<dyn Session>> {
     let arch = &spec.arch;
-    if arch.is("llama") {
-        return Ok(Box::new(GpuLlama::load(paths, spec.clone(), dtype, quant, device)?));
+    if !supports(*arch) {
+        return Err(format!(
+            "the GPU backend implements {}; `{arch}` is not one of them.\n\
+             Run it on the CPU engine instead:  kvad run",
+            supported()
+        )
+        .into());
     }
-    if arch.is("gpt2") {
-        return Ok(Box::new(crate::gpt2::GpuGpt2::load(paths, spec.clone(), dtype, quant, device)?));
-    }
-    if arch.is("deepseek_v2") {
-        let m = crate::deepseek::GpuDeepSeek::load(paths, spec.clone(), dtype, quant, device)?;
-        return Ok(Box::new(m));
-    }
-    Err(format!(
-        "the GPU backend implements {}; `{arch}` is not one of them.\n\
-         Run it on the CPU engine instead:  kvad run",
-        supported()
-    )
-    .into())
+
+    // Opened before the load and closed after it, because both of its
+    // questions are answered by the load: a file is only whole once every
+    // weight has been through it, and a mapped file is only known to be
+    // missing something once the architecture has finished asking.
+    let mut cache = Vault::open(repo, paths, spec, quant, progress);
+    let session: Box<dyn Session> = if arch.is("llama") {
+        Box::new(GpuLlama::load(paths, spec.clone(), dtype, quant, device, &cache)?)
+    } else if arch.is("gpt2") {
+        Box::new(crate::gpt2::GpuGpt2::load(paths, spec.clone(), dtype, quant, device, &cache)?)
+    } else {
+        Box::new(crate::deepseek::GpuDeepSeek::load(
+            paths,
+            spec.clone(),
+            dtype,
+            quant,
+            device,
+            &cache,
+        )?)
+    };
+    cache.finish(progress);
+    Ok(session)
 }
 
 /// The architectures this backend has an implementation for, by the id the
@@ -605,7 +554,7 @@ pub fn pick_device(name: Option<&str>) -> Res<Device> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
 
@@ -628,7 +577,7 @@ mod tests {
 
     /// A model small enough to build from random numbers, with every
     /// dimension a multiple of 32 so the quantisers will take it.
-    fn tiny_spec() -> Spec {
+    pub(crate) fn tiny_spec() -> Spec {
         Spec {
             arch: Arch::require("llama"),
             n_layer: 1,
@@ -655,7 +604,7 @@ mod tests {
 
     /// The same, plus tensors the base Llama layout does not have: Qwen3's
     /// per-head norms, or something this backend does not implement at all.
-    fn write_tensors(
+    pub(crate) fn write_tensors(
         spec: &Spec,
         own_head: bool,
         extra: &[(String, Tensor)],
@@ -716,8 +665,15 @@ mod tests {
         use kvad::model::Transformer;
 
         let mut gpu =
-            GpuLlama::load(std::slice::from_ref(path), spec.clone(), DType::F32, None, Device::Cpu)
-                .unwrap();
+            GpuLlama::load(
+                std::slice::from_ref(path),
+                spec.clone(),
+                DType::F32,
+                None,
+                Device::Cpu,
+                &Vault::off(),
+            )
+            .unwrap();
         let theirs = gpu.forward(tokens).unwrap();
 
         let mut cache = kvad::model::KvCache::new(spec);
@@ -769,6 +725,7 @@ mod tests {
             DType::F32,
             None,
             Device::Cpu,
+            &Vault::off(),
         )
         .unwrap();
         let cpu = cpu_model(&path, &spec);
@@ -819,6 +776,7 @@ mod tests {
             DType::F32,
             None,
             Device::Cpu,
+            &Vault::off(),
         ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("an untied model with no `lm_head.weight` must not load"),
@@ -851,6 +809,7 @@ mod tests {
             DType::F32,
             None,
             Device::Cpu,
+            &Vault::off(),
         ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a tensor this backend never reads must not load silently"),
@@ -873,7 +832,9 @@ mod tests {
         )];
         let path = write_tensors(&spec, false, &extra, "inv-freq");
 
-        GpuLlama::load(std::slice::from_ref(&path), spec, DType::F32, None, Device::Cpu).unwrap();
+        let none = Vault::off();
+        GpuLlama::load(std::slice::from_ref(&path), spec, DType::F32, None, Device::Cpu, &none)
+            .unwrap();
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -902,6 +863,7 @@ mod tests {
                 DType::F32,
                 Some(GgmlDType::Q8_0),
                 Device::Cpu,
+                &Vault::off(),
             )
             .unwrap();
 
@@ -929,6 +891,7 @@ mod tests {
                 DType::F32,
                 quant,
                 Device::Cpu,
+                &Vault::off(),
             )
             .unwrap()
         };

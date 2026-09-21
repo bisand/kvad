@@ -55,14 +55,15 @@
 //! sixty-four run and fifty-eight are never touched.
 
 use crate::common::{
-    causal_mask, check_block, dense_embedding, label, unread, unread_error, Embed, Proj, Reader,
+    causal_mask, check_block, embedding, label, unread, unread_error, Embed, Loader, Proj, Reader,
+    Stored,
 };
-use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use crate::qcache::Vault;
+use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
 use kvad::model::deepseek::{build_rope, Layout, Mla, Router};
 use kvad::model::{Session, Spec};
-use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -159,6 +160,7 @@ impl GpuDeepSeek {
         dtype: DType,
         quant: Option<GgmlDType>,
         device: Device,
+        cache: &Vault,
     ) -> Res<Self> {
         let mla = Mla::read(&spec.config, spec.n_head)?;
         let router = Router::read(&spec)?;
@@ -190,17 +192,11 @@ impl GpuDeepSeek {
         let model = vb.pp("model");
 
         let to_dev = |t: Tensor| -> Res<Tensor> { Ok(t.to_device(&device)?) };
-        let dev = device.clone();
-        // HuggingFace stores `nn.Linear` as [out, in]: dense wants the
-        // transpose, quantised wants it as stored. Same rule as `model.rs`.
-        let load_t = move |vb: &Reader<'_>, name: &str, out: usize, inp: usize| -> Res<Proj> {
-            let w = vb.get((out, inp), name)?;
-            Ok(match quant {
-                None => Proj::Dense(w.t()?.contiguous()?),
-                Some(gd) => Proj::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(
-                    &w, gd, &dev,
-                )?)?),
-            })
+        // HuggingFace stores `nn.Linear` as [out, in]. Same rule as
+        // `model.rs`, and now the same code.
+        let ld = Loader::new(quant, device.clone(), cache);
+        let load_t = |vb: &Reader<'_>, name: &str, out: usize, inp: usize| -> Res<Proj> {
+            ld.proj(vb, name, out, inp, Stored::OutIn)
         };
         let ffn = |vb: &Reader<'_>, width: usize| -> Res<Ffn> {
             Ok(Ffn {
@@ -281,49 +277,7 @@ impl GpuDeepSeek {
             model.skip_under(&format!("layers.{i}."));
         }
 
-        let table = model.get((spec.vocab_size, e), "embed_tokens.weight")?;
-        let own_head = match spec.tie_embeddings {
-            true => {
-                vb.record("lm_head.weight");
-                None
-            }
-            false => match vb.get((spec.vocab_size, e), "lm_head.weight") {
-                Ok(w) => Some(w),
-                Err(_) => {
-                    return Err(concat!(
-                        "this model does not tie its embeddings, so it needs its own ",
-                        "`lm_head.weight`, and the checkpoint has none.\n",
-                        "If it is meant to be tied, its config is missing ",
-                        "`tie_word_embeddings: true`."
-                    )
-                    .into())
-                }
-            },
-        };
-
-        let mut tied = false;
-        let (embed, head) = match quant {
-            None => {
-                let w = own_head.unwrap_or_else(|| table.clone());
-                (Embed::Dense(to_dev(table)?), Proj::Dense(to_dev(w.t()?.contiguous()?)?))
-            }
-            Some(gd) if dense_embedding() => {
-                let w = own_head.unwrap_or_else(|| table.clone());
-                let h = QMatMul::from_qtensor(QTensor::quantize_onto(&w, gd, &device)?)?;
-                (Embed::Dense(to_dev(table.to_dtype(DType::BF16)?)?), Proj::Quant(h))
-            }
-            Some(gd) => {
-                let q = Arc::new(QTensor::quantize_onto(&table, gd, &device)?);
-                let h = match own_head {
-                    Some(w) => QMatMul::from_qtensor(QTensor::quantize_onto(&w, gd, &device)?)?,
-                    None => {
-                        tied = true;
-                        QMatMul::from_arc(Arc::clone(&q))?
-                    }
-                };
-                (Embed::Quant(q), Proj::Quant(h))
-            }
-        };
+        let (embed, head, tied) = embedding(&ld, &vb, &model, "embed_tokens.weight", &spec)?;
 
         let final_norm = to_dev(model.get(e, "norm.weight")?)?;
 
@@ -767,6 +721,7 @@ mod tests {
             DType::F32,
             None,
             Device::Cpu,
+            &Vault::off(),
         )
         .unwrap();
         let mine = gpu.forward(tokens).unwrap();
@@ -906,6 +861,7 @@ mod tests {
                 DType::F32,
                 None,
                 Device::Cpu,
+                &Vault::off(),
             )
             .unwrap()
         };
@@ -931,6 +887,7 @@ mod tests {
             DType::F32,
             None,
             Device::Cpu,
+            &Vault::off(),
         )
         .unwrap();
         assert_eq!(gpu.param_count(), cpu_model(&path, &spec).param_count());
@@ -972,7 +929,8 @@ mod tests {
                 spec.clone(),
                 DType::F32,
                 None,
-                Device::Cpu
+                Device::Cpu,
+                &Vault::off(),
             )
             .is_ok(),
             "a head this build knowingly does not run must not refuse the load"
@@ -1000,6 +958,7 @@ mod tests {
             DType::F32,
             None,
             Device::Cpu,
+            &Vault::off(),
         ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a weight nobody reads must not load quietly"),

@@ -1748,9 +1748,10 @@ tokenizer. The dominant cost is now the Hub client resolving file paths —
 Which is the usual shape of these things: remove the obvious cost and the
 bottleneck moves somewhere you were not looking.
 
-The GPU backend does not use this. candle's `quantize_onto` takes about 0.2 s
-for the same model — fast enough not to be worth a second format, and its
-natural on-disk form would be GGUF rather than ours.
+The GPU backend used to be exempt from all this, on the grounds that candle's
+`quantize_onto` takes about 0.2 s for the same model — fast enough not to be
+worth a second format. That was true of the model it was measured on and of no
+other: [it does not survive a 16B checkpoint](#the-quantising-done-once-over-there-too).
 
 ### The floor under everything
 
@@ -2004,6 +2005,71 @@ one row at a time since quantisation was added, and the tied head has always
 been the same `Weight` — the hand-written version got here by the path of least
 resistance, because one type did both jobs. The framework version duplicated
 precisely because its two operations wanted two different types.
+
+### The quantising, done once over there too
+
+The CPU engine got a cache of pre-quantised weights
+[some way back](#doing-the-quantising-once), and this backend did not, because
+candle quantises Qwen2.5-0.5B in about 0.2 s and 0.2 s is not a problem worth a
+file format. That judgement was correct and it did not scale: the same code on
+DeepSeek-V2-Lite spends **66 seconds** turning 15.7 billion bf16 weights into
+4-bit blocks, every single load, and throws the result away on exit.
+
+So [`crates/gpu/src/qcache.rs`](crates/gpu/src/qcache.rs) writes them out.
+Steady state, three runs each way, both orders:
+
+| model | quantise | map | file | |
+|---|---|---|---|---|
+| GPT-2-medium q8 | 1.7 s | 0.8 s | 358 MB | 2.1x |
+| Qwen2.5-0.5B q8 | 1.2 s | 0.9 s | 500 MB | 1.3x |
+| Qwen3-0.6B q8 | 1.3 s | 0.9 s | 604 MB | 1.4x |
+| DeepSeek-coder-7B q8 | 6.6 s | 2.8 s | 6.8 GB | 2.4x |
+| **DeepSeek-V2-Lite q4** | **65.5 s** | **3.9 s** | 8.2 GB | **17x** |
+
+Those are whole-process times and the small ones are mostly floor — about
+0.7 s of it is the Hub client resolving five file paths, which the CPU section
+already noticed is the thing left standing once the weights stop costing
+anything. The row that matters is the last one.
+
+**Same box, different contents.** The file is the same `.nq` container: magic,
+data section, a JSON header at the end, a `u64` saying where the header starts.
+What goes in it is not the same bytes. Both engines call their eight-bit format
+`q8` and they disagree about what that means — ours carries an `f32` scale per
+32 weights in the order `quant.rs` reads, GGML's carries an `f16` — so handing
+one to the other would be a model made of noise. They are told apart by name
+before anything else: `Qwen--Qwen3-0.6B.q8.nq` and
+`Qwen--Qwen3-0.6B.gpu-q8.nq`, in one directory, both listed by `kvad cache` and
+both forgotten by `kvad cache <repo>`. `Container` and `Writer` moved out of
+`qcache.rs` to be shared, which is the whole of the code reuse: a second copy of
+the trailer arithmetic is a second place for it to be wrong.
+
+**The part that got simpler.** The CPU cache has to stamp the checkpoint's
+entire tensor list into every file, because a mapped cache never reopens a
+checkpoint — so a build that learns to read one more *optional* weight gets
+`None` back and runs without it, at full speed, saying nothing. That was
+[the last route by which an unread weight could hide](#doing-the-quantising-once).
+
+This one has no such problem, and the reason is that it caches *less*. Only the
+quantised matrices go in the file. The norms, the biases and DeepSeek's two
+dense halves of `kv_b_proj` still come from the checkpoint, which therefore is
+still open, which means a name the file does not hold is simply quantised from
+the source on the spot. A miss is answered rather than survived. The file is
+then deleted at the end of that load, so the next one writes a complete one, and
+the unread-tensor guard goes on subtracting from the *checkpoint's* list exactly
+as it did before — a cache hit records the name it answered, so a weight served
+from disk still counts as read.
+
+That also means there is nothing to cache at `--quant none`: the checkpoint
+already is the weights, and a copy of them would be a copy of the checkpoint.
+The same rule the CPU cache applies at f32.
+
+**Where the win is, and is not.** It is in the arithmetic, not the I/O. Run the
+two arrangements alternately on a machine whose page cache cannot hold both the
+29 GB checkpoint and the 8.2 GB cache file, and V2-Lite still wins (66 s to
+17 s) while DeepSeek-coder-7B comes out even: the smaller file is being read
+cold either way, and 6.9B parameters is only a few seconds of quantising to
+save. Load the same model twice in a row — which is what a cache is for — and
+the table above is what you get.
 
 ### One trait, two backends
 

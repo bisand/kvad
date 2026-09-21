@@ -142,9 +142,12 @@ fn load(args: &Args) -> Res<Llm> {
     let t0 = std::time::Instant::now();
     // No watcher: a terminal has the progress lines and wants no bar.
     let watch = kvad::weights::Watcher::none();
-    let llm = Llm::load_custom(&repo, &mut |m| eprintln!("  {m}"), &watch, &mut |files, spec, _| {
-        model::session(&files.weights, spec, dtype, quant, device.clone())
-    })?;
+    // What the quantised-weight cache files this model under.
+    let id = kvad::weights::model_id(&repo);
+    let llm =
+        Llm::load_custom(&repo, &mut |m| eprintln!("  {m}"), &watch, &mut |files, spec, progress| {
+            model::session(&id, &files.weights, spec, dtype, quant, device.clone(), progress)
+        })?;
 
     eprintln!("  {}", llm.spec.summary());
     eprintln!(

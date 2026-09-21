@@ -11,9 +11,11 @@
 //! going unread while the model ran at full speed — is a bug about a *loader*,
 //! and a second loader is a second chance to make it.
 
-use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use crate::qcache::Vault;
+use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::VarBuilder;
+use kvad::model::Spec;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -111,6 +113,191 @@ impl Embed {    /// Row `ids[i]` of the table, per element of `ids`.
 /// measuring what quantising it is worth.
 pub(crate) fn dense_embedding() -> bool {
     matches!(std::env::var("KVAD_GPU_DENSE_EMBED").as_deref(), Ok("1") | Ok("true"))
+}
+
+// ---------------------------------------------------------------------------
+// Turning a stored matrix into one of the two layouts above
+// ---------------------------------------------------------------------------
+
+/// Which way round the checkpoint wrote a matrix.
+///
+/// HuggingFace's `nn.Linear` stores `[out, in]`; GPT-2's `Conv1D` stores
+/// `[in, out]`. Both end up in the same two destinations — a dense matmul
+/// wants `[in, out]`, `QMatMul` wants `[out, in]` — so exactly one of the two
+/// transposes, and which one is the *only* thing these two spellings disagree
+/// about. Saying that once here is worth more than saying it twice: the GPT-2
+/// loader had a paragraph explaining that its transpose was the opposite of
+/// every other loader's, which is a comment that exists because the code was
+/// two copies of one rule.
+#[derive(Clone, Copy)]
+pub(crate) enum Stored {
+    OutIn,
+    InOut,
+}
+
+/// Where the weights come from, and what is done to them on the way in.
+///
+/// One of these per load, carrying the three answers every matrix needs — the
+/// quantisation, the device, and the cache — so that an architecture's loader
+/// asks for `q_proj.weight` and says nothing about any of them.
+pub(crate) struct Loader<'v> {
+    pub(crate) quant: Option<GgmlDType>,
+    pub(crate) device: Device,
+    vault: &'v Vault,
+}
+
+impl<'v> Loader<'v> {
+    pub(crate) fn new(quant: Option<GgmlDType>, device: Device, vault: &'v Vault) -> Self {
+        Loader { quant, device, vault }
+    }
+
+    /// One projection matrix, in whichever layout this load will use it.
+    pub(crate) fn proj(
+        &self,
+        vb: &Reader<'_>,
+        name: &str,
+        out: usize,
+        inp: usize,
+        stored: Stored,
+    ) -> Res<Proj> {
+        let Some(_) = self.quant else {
+            let w = match stored {
+                Stored::OutIn => vb.get((out, inp), name)?.t()?.contiguous()?,
+                Stored::InOut => vb.get((inp, out), name)?,
+            };
+            return Ok(Proj::Dense(w));
+        };
+        Ok(Proj::Quant(QMatMul::from_qtensor(self.quantized(vb, name, out, inp, stored)?)?))
+    }
+
+    /// One matrix in blocks: read back from the cache, or quantised and filed.
+    ///
+    /// A `QTensor` keeps `[out, in]` whichever way the checkpoint spelled it,
+    /// so one name means one blob and a `Conv1D` model and a `Linear` one cache
+    /// alike.
+    pub(crate) fn quantized(
+        &self,
+        vb: &Reader<'_>,
+        name: &str,
+        out: usize,
+        inp: usize,
+        stored: Stored,
+    ) -> Res<QTensor> {
+        let gd = self.quant.ok_or("asked for blocks on a load that is not quantised")?;
+        let full = vb.full(name);
+        if let Some(q) = self.vault.get(&full, (out, inp), &self.device) {
+            // The cache answered and the checkpoint still gets the credit:
+            // what [`unread`] subtracts is the names this loader asked about,
+            // not the ones it happened to read bytes for.
+            vb.record(name);
+            return Ok(q);
+        }
+        let w = match stored {
+            Stored::OutIn => vb.get((out, inp), name)?,
+            Stored::InOut => vb.get((inp, out), name)?.t()?.contiguous()?,
+        };
+
+        // Candle quantises on the host even when the destination is a GPU, so
+        // going by way of the CPU costs nothing that `quantize_onto` does not
+        // also spend — and it hands over the blocks the cache wants without
+        // reading them back off the device afterwards.
+        let cpu = QTensor::quantize(&w, gd)?;
+        let blocks = cpu.data()?;
+        self.vault.put(&full, (out, inp), &blocks);
+        if self.device.is_cpu() {
+            drop(blocks);
+            return Ok(cpu);
+        }
+        Ok(QTensor::new(QStorage::from_data(blocks, &self.device, gd)?, (out, inp))?)
+    }
+}
+
+/// The token table and the output head, which are usually one matrix.
+///
+/// The same forty lines stood in all three architectures here, which is two
+/// chances to get tying wrong. `at` is where the table lives — under `model`
+/// for Llama and DeepSeek, at the root for GPT-2 — and `root` is where an
+/// untied head would be. Returns the two, and whether they share storage.
+pub(crate) fn embedding(
+    ld: &Loader<'_>,
+    root: &Reader<'_>,
+    at: &Reader<'_>,
+    name: &str,
+    spec: &Spec,
+) -> Res<(Embed, Proj, bool)> {
+    let (vocab, e) = (spec.vocab_size, spec.n_embd);
+
+    // Whether the head is its own matrix is the *config's* statement, not the
+    // checkpoint's. `tie_word_embeddings` means `lm_head.weight` **is** the
+    // table, so a file that carries both is saying one matrix twice —
+    // Qwen3-0.6B ships 297 MB of byte-identical duplicate, and HuggingFace
+    // itself overwrites the stored copy when it ties. Reading whichever tensor
+    // happened to be present is how this backend came to disagree with
+    // `llama.rs`, which reads the flag.
+    //
+    // And an untied model with no head of its own is a broken checkpoint:
+    // falling through to the table would run a different model from the one
+    // the config describes, at full speed and without a word.
+    let untied = !spec.tie_embeddings;
+    if !untied {
+        // Skipped on purpose, and recorded so the guard does not read that as
+        // an omission.
+        root.record("lm_head.weight");
+    }
+
+    let Some(gd) = ld.quant else {
+        // Dense keeps two copies: `index_select` wants `[vocab, n_embd]` and
+        // `matmul` wants the transpose, and neither is cheap to fake from the
+        // other.
+        let table = at.get((vocab, e), name)?;
+        let w = match untied {
+            false => table.clone(),
+            true => root.get((vocab, e), "lm_head.weight").map_err(|_| no_head())?,
+        };
+        return Ok((Embed::Dense(table), Proj::Dense(w.t()?.contiguous()?), false));
+    };
+
+    // The arrangement this replaced, kept behind a flag so the difference it
+    // makes is one environment variable wide: a dense half-precision table,
+    // and the head quantised separately from it. Not cached, because a
+    // measurement wants to be measuring the thing and not a file written by an
+    // earlier run of it.
+    if dense_embedding() {
+        let table = at.get((vocab, e), name)?;
+        let w = match untied {
+            false => table.clone(),
+            true => root.get((vocab, e), "lm_head.weight").map_err(|_| no_head())?,
+        };
+        let head = QTensor::quantize_onto(&w, gd, &ld.device)?;
+        let table = table.to_dtype(DType::BF16)?.to_device(&ld.device)?;
+        return Ok((Embed::Dense(table), Proj::Quant(QMatMul::from_qtensor(head)?), false));
+    }
+
+    // Quantised, the lookup table and the matmul want the same bytes, so a
+    // tied model gets one allocation and two uses.
+    let q = Arc::new(ld.quantized(at, name, vocab, e, Stored::OutIn)?);
+    match untied {
+        true => {
+            let w = ld
+                .quantized(root, "lm_head.weight", vocab, e, Stored::OutIn)
+                .map_err(|_| no_head())?;
+            Ok((Embed::Quant(q), Proj::Quant(QMatMul::from_qtensor(w)?), false))
+        }
+        false => {
+            let head = QMatMul::from_arc(Arc::clone(&q))?;
+            Ok((Embed::Quant(q), Proj::Quant(head), true))
+        }
+    }
+}
+
+fn no_head() -> String {
+    concat!(
+        "this model does not tie its embeddings, so it needs its own ",
+        "`lm_head.weight`, and the checkpoint has none.\n",
+        "If it is meant to be tied, its config is missing ",
+        "`tie_word_embeddings: true`."
+    )
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------

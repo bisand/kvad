@@ -6,7 +6,6 @@
 //! and this is the TUI's — CPU backends straight through to the core's own,
 //! GPU ones through `kvad_gpu`.
 
-use kvad::model::Session;
 use kvad::runtime::Llm;
 use kvad::service::{cpu_loader, Backend, GpuMode, Loader};
 use kvad::weights::Watcher;
@@ -32,25 +31,22 @@ fn load_on_gpu(
         GpuMode::Q8 => kvad_gpu::model::parse_quant("q8").expect("known quant"),
         GpuMode::Q4 => kvad_gpu::model::parse_quant("q4").expect("known quant"),
     };
-    Llm::load_custom(repo, progress, watch, &mut |files, spec, _| {
-        // The GPU backend covers the Llama family only; the error names the
-        // alternative rather than just failing.
-        if !spec.arch.is("llama") {
+    let id = kvad::weights::model_id(repo);
+    Llm::load_custom(repo, progress, watch, &mut |files, spec, progress| {
+        // Which architectures the GPU backend has is its question, answered in
+        // one place. This kept its own copy of the answer, and the copy said
+        // "the Llama family only" long after GPT-2 and DeepSeek arrived there;
+        // what is local to this screen is only the way out of it.
+        if !kvad_gpu::model::supports(spec.arch) {
             return Err(format!(
-                "the GPU backend implements the Llama family only; this model is {}. \
+                "the GPU backend implements {}; this model is {}. \
                  Press p to pick a CPU backend.",
+                kvad_gpu::model::supported(),
                 spec.arch
             )
             .into());
         }
         let device = kvad_gpu::model::pick_device(None)?;
-        let m = kvad_gpu::model::GpuLlama::load(
-            &files.weights,
-            spec.clone(),
-            dtype,
-            quant,
-            device,
-        )?;
-        Ok(Box::new(m) as Box<dyn Session>)
+        kvad_gpu::model::session(&id, &files.weights, spec, dtype, quant, device, progress)
     })
 }

@@ -113,9 +113,10 @@ mod gpu {
         // until GPT-2 and DeepSeek arrived on the GPU and the CLI could run
         // models this could not — a list in two places is a list that
         // disagrees.
-        Llm::load_custom(repo, progress, watch, &mut |files, spec, _| {
+        let id = kvad::weights::model_id(repo);
+        Llm::load_custom(repo, progress, watch, &mut |files, spec, progress| {
             let device = kvad_gpu::model::pick_device(None)?;
-            kvad_gpu::model::session(&files.weights, spec, dtype, quant, device)
+            kvad_gpu::model::session(&id, &files.weights, spec, dtype, quant, device, progress)
         })
     }
 }

@@ -34,14 +34,14 @@
 //! full speed and says something else.
 
 use crate::common::{
-    causal_mask, check_block, dense_embedding, label, linear, unread, unread_error, Embed, Proj,
-    Reader,
+    causal_mask, check_block, embedding, label, linear, unread, unread_error, Embed, Loader, Proj,
+    Reader, Stored,
 };
-use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use crate::qcache::Vault;
+use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, VarBuilder};
 use kvad::model::{Session, Spec};
-use std::sync::Arc;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -109,6 +109,7 @@ impl GpuGpt2 {
         dtype: DType,
         quant: Option<GgmlDType>,
         device: Device,
+        cache: &Vault,
     ) -> Res<Self> {
         let load_dtype = if quant.is_some() { DType::F32 } else { dtype };
         let compute = load_dtype;
@@ -134,20 +135,13 @@ impl GpuGpt2 {
             })
         };
 
-        // `Conv1D` stores `[in, out]`. See the module header for why that means
-        // this transposes in the quantised path and not in the dense one, which
-        // is the opposite of every other loader here.
-        let dev = device.clone();
-        let load_c = move |vb: &Reader<'_>, name: &str, inp: usize, out: usize| -> Res<Proj> {
-            let w = vb.get((inp, out), name)?;
-            Ok(match quant {
-                None => Proj::Dense(w),
-                Some(gd) => Proj::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(
-                    &w.t()?.contiguous()?,
-                    gd,
-                    &dev,
-                )?)?),
-            })
+        // `Conv1D` stores `[in, out]`, which is the transpose of what every
+        // other loader here reads. That used to be a paragraph in this file
+        // about transposing in the quantised path and not in the dense one;
+        // it is `Stored::InOut` now, and the rule lives in one place.
+        let ld = Loader::new(quant, device.clone(), cache);
+        let load_c = |vb: &Reader<'_>, name: &str, inp: usize, out: usize| -> Res<Proj> {
+            ld.proj(vb, name, out, inp, Stored::InOut)
         };
 
         let mut blocks = Vec::with_capacity(spec.n_layer);
@@ -169,58 +163,18 @@ impl GpuGpt2 {
             });
         }
 
-        let table = vb.get((spec.vocab_size, e), "wte.weight")?;
+        let (wte, head, tied) = embedding(&ld, &vb, &vb, "wte.weight", &spec)?;
         let wpe = to_dev(vb.get((spec.n_ctx, e), "wpe.weight")?.to_dtype(compute)?)?;
 
-        // As in `llama.rs` and on the Llama side of this backend: tying is the
-        // config's statement about the model, not the checkpoint's. GPT-2 ties
-        // and ships no head at all; a model trained here may untie and ship one
-        // with a bias beside it.
-        let (own_head, head_b) = match spec.tie_embeddings {
+        // GPT-2 ties and ships no head at all; a model trained here may untie
+        // and ship one with a bias beside it, which `embedding` has no opinion
+        // about because no other architecture here has one.
+        let head_b = match spec.tie_embeddings {
             true => {
-                vb.record("lm_head.weight");
                 vb.record("lm_head.bias");
-                (None, None)
+                None
             }
-            false => {
-                let w = vb.get((spec.vocab_size, e), "lm_head.weight").map_err(|_| {
-                    concat!(
-                        "this model does not tie its embeddings, so it needs its own ",
-                        "`lm_head.weight`, and the checkpoint has none.\n",
-                        "If it is meant to be tied, its config is missing ",
-                        "`tie_word_embeddings: true`."
-                    )
-                })?;
-                let b = vb.try_get(spec.vocab_size, "lm_head.bias").map(&to_dev).transpose()?;
-                (Some(w), b)
-            }
-        };
-
-        // `lm_head.weight` is `[vocab, n_embd]` like the table, which is
-        // `nn.Linear`'s layout and not `Conv1D`'s — so from here on this is the
-        // same arrangement the Llama loader makes, for the same reasons.
-        let mut tied = false;
-        let (wte, head) = match quant {
-            None => {
-                let w = own_head.clone().unwrap_or_else(|| table.clone());
-                (Embed::Dense(to_dev(table)?), Proj::Dense(to_dev(w.t()?.contiguous()?)?))
-            }
-            Some(gd) if dense_embedding() => {
-                let w = own_head.clone().unwrap_or_else(|| table.clone());
-                let head = QMatMul::from_qtensor(QTensor::quantize_onto(&w, gd, &device)?)?;
-                (Embed::Dense(to_dev(table.to_dtype(DType::BF16)?)?), Proj::Quant(head))
-            }
-            Some(gd) => {
-                let q = Arc::new(QTensor::quantize_onto(&table, gd, &device)?);
-                let head = match &own_head {
-                    Some(w) => QMatMul::from_qtensor(QTensor::quantize_onto(w, gd, &device)?)?,
-                    None => {
-                        tied = true;
-                        QMatMul::from_arc(Arc::clone(&q))?
-                    }
-                };
-                (Embed::Quant(q), Proj::Quant(head))
-            }
+            false => vb.try_get(spec.vocab_size, "lm_head.bias").map(&to_dev).transpose()?,
         };
 
         let ln_f = norm(&vb, "ln_f")?;
@@ -439,14 +393,14 @@ impl Session for GpuGpt2 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use kvad::model::{Arch, Transformer};
     use std::collections::HashMap;
 
     /// Small enough to build from random numbers, and every dimension a
     /// multiple of 32 so the quantisers will take it.
-    fn tiny_spec(tie: bool) -> Spec {
+    pub(crate) fn tiny_spec(tie: bool) -> Spec {
         Spec {
             arch: Arch::require("gpt2"),
             n_layer: 2,
@@ -468,7 +422,11 @@ mod tests {
     /// A GPT-2 checkpoint in the layout the real ones use: `Conv1D` weights
     /// stored `[in, out]`, a bias beside every projection, and the causal mask
     /// `torch` had nowhere else to put.
-    fn write_tensors(spec: &Spec, extra: &[(String, Tensor)], tag: &str) -> std::path::PathBuf {
+    pub(crate) fn write_tensors(
+        spec: &Spec,
+        extra: &[(String, Tensor)],
+        tag: &str,
+    ) -> std::path::PathBuf {
         let d = Device::Cpu;
         let (e, i) = (spec.n_embd, spec.intermediate);
         let scaled =
@@ -545,8 +503,15 @@ mod tests {
     /// check that can catch a transposed matrix or a dropped bias.
     fn engines_differ_by(path: &std::path::PathBuf, spec: &Spec, tokens: &[u32]) -> f32 {
         let mut gpu =
-            GpuGpt2::load(std::slice::from_ref(path), spec.clone(), DType::F32, None, Device::Cpu)
-                .unwrap();
+            GpuGpt2::load(
+                std::slice::from_ref(path),
+                spec.clone(),
+                DType::F32,
+                None,
+                Device::Cpu,
+                &Vault::off(),
+            )
+            .unwrap();
         let mine = gpu.forward(tokens).unwrap();
 
         let cpu = cpu_model(path, spec);
@@ -596,6 +561,7 @@ mod tests {
                 DType::F32,
                 None,
                 Device::Cpu,
+                &Vault::off(),
             )
             .unwrap()
         };
@@ -630,6 +596,7 @@ mod tests {
                 DType::F32,
                 None,
                 Device::Cpu,
+                &Vault::off(),
             )
             .unwrap();
             assert_eq!(gpu.param_count(), cpu_model(&path, &spec).param_count());
@@ -679,7 +646,8 @@ mod tests {
             spec.clone(),
             DType::F32,
             None,
-            Device::Cpu
+            Device::Cpu,
+            &Vault::off(),
         )
         .is_ok());
         std::fs::remove_file(&path).unwrap();
@@ -701,6 +669,7 @@ mod tests {
             DType::F32,
             None,
             Device::Cpu,
+            &Vault::off(),
         ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a weight nobody reads must not load quietly"),
@@ -724,6 +693,7 @@ mod tests {
             DType::F32,
             None,
             Device::Cpu,
+            &Vault::off(),
         ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("an untied model with no `lm_head.weight` must not load"),

@@ -329,7 +329,7 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
 /// deleted since it was set, or be a GPU model in a build without one, and
 /// neither is a reason for a server that is otherwise fine to refuse to run.
 fn autoload(state: &auth::State, repo: String) {
-    let backend = match engine::parse(&models::default_backend(&state.db)) {
+    let backend = match engine::parse(&models::default_backend(&state.db, Some(&repo))) {
         Some(backend) => backend,
         // `default_backend` only ever answers with a backend this build can
         // parse, so this is unreachable rather than a case worth handling.

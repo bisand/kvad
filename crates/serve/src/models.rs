@@ -95,7 +95,16 @@ pub struct QCache {
 }
 
 /// The backend a load uses when the request does not name one.
-pub fn default_backend(db: &crate::db::Db) -> String {
+///
+/// A stored setting is somebody's choice and wins. With none, the answer is
+/// what this build prefers for this model — see [`crate::engine::preferred`],
+/// which is where the measurements are.
+///
+/// `repo` is the model about to be loaded, where there is one. It decides
+/// nothing but the architecture, and the architecture decides only whether
+/// the GPU is an option: a model this build cannot read the config of, or
+/// has not downloaded yet, gets the backend that works for everything.
+pub fn default_backend(db: &crate::db::Db, repo: Option<&str>) -> String {
     let stored = db.setting(BACKEND_KEY).ok().flatten();
     let stored = stored.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     match crate::engine::parse(stored) {
@@ -103,8 +112,18 @@ pub fn default_backend(db: &crate::db::Db) -> String {
         // `--no-default-features` binary — is treated as unset rather than as
         // an error every load has to explain.
         Some(b) => crate::engine::id_of(b),
-        None => crate::engine::id_of(kvad::service::Backend::Cpu(kvad::quant::Precision::Q8)),
+        None => crate::engine::id_of(crate::engine::preferred(arch_of(repo))),
     }
+}
+
+/// The architecture of a model on this disk, if it is on this disk and its
+/// config can be read.
+///
+/// `None` for a model named but not downloaded, which is the ordinary case
+/// for a load that pulls first.
+fn arch_of(repo: Option<&str>) -> Option<kvad::model::Arch> {
+    let repo = repo?;
+    hub::find_local(repo).or_else(|| hub::find_trained(repo)).and_then(|m| m.arch)
 }
 
 /// Readable by anyone signed in, because the Chat page needs to know what is
@@ -118,7 +137,9 @@ pub async fn list(_: Identity, St(state): St<State>) -> Result<Json<Listing>, Fa
             hub::trained_models(),
             kvad::qcache::entries(),
             hub::State::active(),
-            default_backend(&db),
+            // No model in hand: the picker is asking what this build
+            // prefers in general.
+            default_backend(&db, None),
         ))
     })
     .await?;
@@ -248,7 +269,8 @@ pub async fn load(
         Some(id) => id.clone(),
         None => {
             let db = state.db.clone();
-            blocking(move || Ok(default_backend(&db))).await?
+            let named = repo.clone();
+            blocking(move || Ok(default_backend(&db, Some(&named)))).await?
         }
     };
     let backend = crate::engine::parse(&wanted).ok_or_else(|| {
@@ -474,20 +496,33 @@ mod tests {
     }
 
     /// An unset, unreadable or impossible stored backend all mean the same
-    /// thing: use the one that works everywhere.
+    /// thing: fall back to what this build prefers rather than fail.
     #[test]
     fn the_default_backend_falls_back_rather_than_failing() {
         let db = crate::db::Db::in_memory().unwrap();
-        assert_eq!(default_backend(&db), "cpu-q8");
+        // Nothing stored and no model named: the build's preference, which
+        // is the GPU where there is one.
+        let prefers = crate::engine::id_of(crate::engine::preferred(None));
+        assert_eq!(default_backend(&db, None), prefers);
 
         db.set_setting(BACKEND_KEY, &json!("cpu-f32")).unwrap();
-        assert_eq!(default_backend(&db), "cpu-f32");
+        assert_eq!(default_backend(&db, None), "cpu-f32", "a chosen backend is a choice");
 
         db.set_setting(BACKEND_KEY, &json!("nonsense")).unwrap();
-        assert_eq!(default_backend(&db), "cpu-q8");
+        assert_eq!(default_backend(&db, None), prefers);
 
         // Not a string at all — something wrote the wrong shape.
         db.set_setting(BACKEND_KEY, &json!(17)).unwrap();
-        assert_eq!(default_backend(&db), "cpu-q8");
+        assert_eq!(default_backend(&db, None), prefers);
+    }
+
+    /// A model nobody has downloaded has no config to read, and guessing the
+    /// GPU for it would be a default that fails to load.
+    #[test]
+    fn a_model_this_machine_does_not_have_gets_the_backend_that_always_works() {
+        let db = crate::db::Db::in_memory().unwrap();
+        assert_eq!(default_backend(&db, Some("nobody/has-this-model")), "cpu-q8");
+        assert!(arch_of(Some("nobody/has-this-model")).is_none());
+        assert!(arch_of(None).is_none());
     }
 }

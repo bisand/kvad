@@ -6,6 +6,8 @@
 //! server's, and it is the only file that knows whether this build has a GPU
 //! backend in it.
 
+use kvad::model::Arch;
+use kvad::quant::Precision;
 use kvad::service::{Backend, Loader};
 
 /// A loader for whatever this build can run.
@@ -20,6 +22,35 @@ pub fn loader() -> Loader {
     }
     #[cfg(not(feature = "gpu"))]
     kvad::service::cpu_loader()
+}
+
+/// The backend to use when nobody has said which.
+///
+/// The GPU where there is one and it can run this architecture, and the CPU
+/// otherwise. Measured on an M5 Pro at q8, medians of interleaved rounds:
+///
+/// | model | cpu-q8 | gpu-q8 |
+/// |---|---|---|
+/// | GPT-2 medium | 127.9 tok/s | 292.5 tok/s |
+/// | Qwen2.5-0.5B | 117.0 tok/s | 209.6 tok/s |
+/// | DeepSeek-V2-Lite | 13.6 tok/s | 37.7 tok/s |
+///
+/// `None` means no particular model — the picker asking what this build
+/// prefers in general. A model whose architecture the GPU backend has no
+/// implementation for gets the CPU, because a default that fails to load is
+/// worse than one that is slower, and [`kvad_gpu::model::supports`] is the
+/// same list the loader dispatches on.
+///
+/// q8 on both sides, so this is the same arithmetic in two places rather
+/// than a quantisation trade. bf16 on the GPU is not offered as a default:
+/// it is twice the memory and, on this machine, no faster than the CPU's q8.
+pub fn preferred(arch: Option<Arch>) -> Backend {
+    #[cfg(feature = "gpu")]
+    if arch.is_none_or(kvad_gpu::model::supports) {
+        return Backend::Gpu(kvad::service::GpuMode::Q8);
+    }
+    let _ = arch;
+    Backend::Cpu(Precision::Q8)
 }
 
 /// Every backend this build can be asked for, for the picker in the UI.
@@ -92,6 +123,24 @@ mod gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The preference is a backend this build actually has, whichever build
+    /// this is, and it never offers the GPU for an architecture the GPU
+    /// backend cannot load.
+    #[test]
+    fn the_preferred_backend_is_one_this_build_can_load() {
+        for arch in [None, Some(Arch::require("llama")), Some(Arch::require("deepseek_v3"))] {
+            let id = id_of(preferred(arch));
+            assert!(parse(&id).is_some(), "preferred `{id}` and could not parse it");
+        }
+        assert_eq!(
+            id_of(preferred(Some(Arch::require("llama")))),
+            if cfg!(feature = "gpu") { "gpu-q8" } else { "cpu-q8" },
+        );
+        // No GPU implementation of V3, so no GPU default for it — even in a
+        // build that has the GPU backend.
+        assert_eq!(id_of(preferred(Some(Arch::require("deepseek_v3")))), "cpu-q8");
+    }
 
     /// Whatever the picker offers, the server must be able to load. The two
     /// come from the same filter so that they cannot disagree.

@@ -2194,6 +2194,34 @@ second one. The cost is the honest one and is stated where it is configured —
 the model is in memory a minute after boot whether or not anybody turns up,
 and `[server] autoload = false` spends that memory only when something asks.
 
+### The default backend is the one that is faster here
+
+Which backend a load uses when nobody picks one used to be `cpu-q8`, from
+back when the GPU ran the Llama family and nothing else. It now runs GPT-2
+and DeepSeek too, so the question was worth re-asking — and worth asking the
+benchmark page rather than the intuition. Medians of interleaved rounds, 64
+tokens, q8 on both sides, on an M5 Pro:
+
+| model | architecture | cpu-q8 | gpu-q8 | |
+|---|---|---|---|---|
+| GPT-2 medium | gpt2 | 127.9 tok/s | 292.5 tok/s | 2.29x |
+| Qwen2.5-0.5B | llama | 117.0 tok/s | 209.6 tok/s | 1.79x |
+| DeepSeek-V2-Lite | deepseek_v2 | 13.6 tok/s | 37.7 tok/s | 2.77x |
+
+So the default prefers the GPU — with two qualifications that the numbers
+themselves put there. It asks the GPU backend whether it has an
+implementation of *this* architecture, because a default that fails to load
+is worse than one that is slower, and that answer is the same list the loader
+dispatches on rather than a second copy of it. And it stays at q8 on both
+sides, so the comparison is the same arithmetic in two places: bf16 on the
+GPU is twice the memory and, on this machine, no faster than the CPU's q8.
+
+The interesting number is not in the medians. GPU time-to-first-token on the
+first round of the first run was **6.9 seconds**, against 22 ms for every
+round after it — Metal compiling its pipelines, once per process. A stored
+setting still wins over all of this, because somebody choosing a backend has
+a reason.
+
 ### What it measures, and what it refuses to
 
 Three numbers on this page have been wrong before, which is why the server has

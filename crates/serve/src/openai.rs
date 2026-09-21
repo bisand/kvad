@@ -388,7 +388,9 @@ pub async fn completions(
             // function: a load started from here and a load started from
             // there must not disagree about what "the default backend"
             // means.
-            let backend = blocking(move || Ok(crate::models::default_backend(&db))).await?;
+            let named = wanted.clone();
+            let backend =
+                blocking(move || Ok(crate::models::default_backend(&db, Some(&named)))).await?;
             let backend = crate::engine::parse(&backend)
                 .unwrap_or(kvad::service::Backend::Cpu(kvad::quant::Precision::Q8));
             let (progress, _ignored) = tokio::sync::mpsc::channel(1);

@@ -15,7 +15,7 @@ import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 // Where axum is listening. Matches `server.bind`'s default in kvad.toml.
-const API = process.env.KVAD_API ?? "http://127.0.0.1:8080";
+const API = process.env.KVAD_API ?? "http://127.0.0.1:5823";
 
 // `dist` has to exist even when empty, or `rust-embed` fails to compile and
 // `cargo test` needs npm after all. `.gitkeep` is what makes git carry an

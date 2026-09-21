@@ -285,7 +285,7 @@ jobs:
 
           It asks before putting anything on your PATH or starting anything at
           login, and if the server should start at login it asks what address to
-          listen on, offering \`127.0.0.1:8080\`. Name one it cannot serve from — an
+          listen on, offering \`127.0.0.1:5823\`. Name one it cannot serve from — an
           address something already holds, or a non-loopback one, which
           \`kvad-serve\` refuses while no auth mode is configured — and it says why
           and asks again, rather than installing a service that cannot start.
@@ -293,7 +293,7 @@ jobs:
           For a machine with nobody watching, \`--yes\` never opens a terminal and
           answers every question the quiet way: binaries only, nothing added to
           your shell and nothing started. Ask for the rest explicitly, \`--bind\`
-          included, since a run that cannot stop to ask would otherwise take 8080:
+          included, since a run that cannot stop to ask would otherwise take 5823:
 
           \`\`\`
           curl -fsSL https://raw.githubusercontent.com/$repo/master/install.sh | sh -s -- --yes --service --bind 127.0.0.1:8123

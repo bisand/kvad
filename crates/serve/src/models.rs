@@ -249,8 +249,9 @@ pub async fn search(
 #[derive(serde::Deserialize)]
 pub struct LoadRequest {
     repo: String,
-    /// A backend id from the listing, e.g. `cpu-q8`. Omitted means whichever
-    /// was used last.
+    /// A backend id from the listing, e.g. `cpu-q8`. Naming one chooses it
+    /// and remembers it; omitting it uses whichever was chosen last, or —
+    /// with nothing ever chosen — what this build prefers for this model.
     #[serde(default)]
     backend: Option<String>,
 }
@@ -280,11 +281,20 @@ pub async fn load(
         ))
     })?;
 
+    // Remembered only when the request named one. A backend that was worked
+    // out from `default_backend` is not a choice anybody made, and storing
+    // it would turn this machine's preference into this machine's setting —
+    // after which the preference stops being consulted, and a model whose
+    // architecture wants a different answer gets the one the last load
+    // happened to use.
+    //
     // Remembered before the load rather than after, so that a load which
     // fails halfway still leaves the picker showing what was asked for.
-    let db = state.db.clone();
-    let remember = crate::engine::id_of(backend);
-    blocking(move || db.set_setting(BACKEND_KEY, &json!(remember))).await?;
+    if body.backend.is_some() {
+        let db = state.db.clone();
+        let remember = crate::engine::id_of(backend);
+        blocking(move || db.set_setting(BACKEND_KEY, &json!(remember))).await?;
+    }
 
     let (progress, updates) = tokio::sync::mpsc::channel(64);
     let engine = state.engine.clone();

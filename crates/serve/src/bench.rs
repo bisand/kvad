@@ -14,6 +14,21 @@
 //! The ordering is in [`crate::compare`]: a round visits every variant once,
 //! and a run is several rounds, so drift shows up as a trend rather than as a
 //! winner.
+//!
+//! # Where interleaving stops helping
+//!
+//! It assumes the variants can coexist. Two that are each a large fraction of
+//! this machine's memory cannot: while one holds its weights, the other's are
+//! evicted, and the round that follows measures them being read off the disk
+//! again. Measured on DeepSeek-V2-Lite, 17 GB a side on a 48 GB machine, the
+//! CPU variant reads 13.6 tok/s interleaved against the GPU and 26.7 tok/s in
+//! a run of its own — the same engine, twice, and the interleaved number is
+//! the wrong one.
+//!
+//! This page does not detect that, and there is no obvious number to check it
+//! against: what matters is the sum of the resident sets, which neither
+//! variant knows before it loads. Until it does, a comparison whose variants
+//! are each a third of RAM belongs in two runs.
 
 use crate::api::{blocking, Fail};
 use crate::auth::{Admin, Identity, State};

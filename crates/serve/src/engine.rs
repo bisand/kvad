@@ -33,7 +33,14 @@ pub fn loader() -> Loader {
 /// |---|---|---|
 /// | GPT-2 medium | 127.9 tok/s | 292.5 tok/s |
 /// | Qwen2.5-0.5B | 117.0 tok/s | 209.6 tok/s |
-/// | DeepSeek-V2-Lite | 13.6 tok/s | 37.7 tok/s |
+/// | DeepSeek-V2-Lite | 26.7 tok/s | 39.1 tok/s |
+///
+/// The last row was run as two separate benchmarks rather than one
+/// interleaved pair: at 17 GB a side on a 48 GB machine, the GPU variant
+/// evicts the CPU variant's memory-mapped weights between rounds, and the
+/// CPU then reads them off the disk while it decodes. Interleaved it reads
+/// 13.6 rather than 26.7, which is a measurement of the memory and not of
+/// the backend.
 ///
 /// A model whose architecture the GPU backend has no implementation for gets
 /// the CPU, because a default that fails to load is worse than one that is

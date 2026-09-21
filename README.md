@@ -2287,7 +2287,26 @@ tokens, q8 on both sides, on an M5 Pro:
 |---|---|---|---|---|
 | GPT-2 medium | gpt2 | 127.9 tok/s | 292.5 tok/s | 2.29x |
 | Qwen2.5-0.5B | llama | 117.0 tok/s | 209.6 tok/s | 1.79x |
-| DeepSeek-V2-Lite | deepseek_v2 | 13.6 tok/s | 37.7 tok/s | 2.77x |
+| DeepSeek-V2-Lite | deepseek_v2 | 26.7 tok/s | 39.1 tok/s | 1.46x |
+
+The last row is measured differently from the two above it, and the reason is
+worth more than the row. Interleaved against each other the same way, it read
+13.6 against 37.7 — a 2.77x that this README printed and a release note
+published before anybody checked it. DeepSeek-V2-Lite is 17 GB on either
+backend, and this machine has 48: while the GPU variant holds its copy in
+Metal buffers, the CPU variant's memory-mapped weights are evicted, and the
+next CPU round faults them back off the disk as it decodes. The CPU was not
+being measured. It was being paged.
+
+Measured one at a time it is 26.7 against 39.1, which agrees with the 23.4
+[measured elsewhere in this README](#the-one-that-needed-its-own-file) for a model that is
+loaded and left alone.
+
+**So the protocol that exists to defeat drift can cause it.** Interleaving is
+right when the variants are small enough to coexist, and wrong the moment two
+of them together do not fit in memory — at which point each round is measuring
+the other variant's footprint. The benchmark page does not know that, and a
+run whose variants are each a third of RAM should be run as two runs.
 
 So the default prefers the GPU — with two qualifications that the numbers
 themselves put there. It asks the GPU backend whether it has an

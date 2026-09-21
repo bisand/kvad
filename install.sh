@@ -19,7 +19,14 @@
 #
 # --yes never opens the terminal, and answers every question the quiet way:
 # install the binaries and touch nothing else — no shell rc edited, no service
-# started. Ask for those explicitly with --add-path and --service.
+# started. Ask for those explicitly with --add-path and --service. A machine
+# that already runs the service is the exception: there the quiet answer is to
+# keep running it, on the binaries just installed.
+#
+# Upgrading keeps what the previous install decided: the service goes on
+# listening on the address it was given, unless --host or --port says
+# otherwise. It is also stopped before its binaries are replaced and started
+# again afterwards, so nothing keeps serving from a file that has moved.
 #
 # Nothing here needs root. Nothing here writes outside $HOME unless you point
 # --prefix somewhere else.
@@ -28,9 +35,28 @@ set -eu
 
 REPO="bisand/kvad"
 SERVICE_LABEL="net.kvad.serve"
-SERVICE_BIND="${KVAD_BIND:-127.0.0.1:8080}"
-BIND_GIVEN=0
-[ -n "${KVAD_BIND:-}" ] && BIND_GIVEN=1
+
+# The address is carried as two fields and only joined where something needs
+# the HOST:PORT spelling. One field at a time is harder to get wrong than one
+# field with a colon in it, and when it is wrong, which half is wrong answers
+# itself.
+DEFAULT_HOST=127.0.0.1
+DEFAULT_PORT=8080
+SERVICE_HOST=$DEFAULT_HOST
+SERVICE_PORT=$DEFAULT_PORT
+HOST_GIVEN=0
+PORT_GIVEN=0
+
+# Set when the address was read off a service that is already installed,
+# which changes what there is to ask: somebody upgrading answered this
+# question the first time round. The host is tracked separately, because it
+# is the half the warnings below are about.
+BIND_FROM_UNIT=0
+HOST_FROM_UNIT=0
+
+# Set when an address has already been through the "would this actually
+# start" questions, so they are not asked twice about the same address.
+BIND_CHECKED=0
 
 # ---------------------------------------------------------------- output --
 
@@ -122,44 +148,98 @@ ask_value() {
 
 # ---------------------------------------------------------------- address --
 
-# HOST:PORT, with IPv6 in brackets the way every other tool spells it. The
-# port is split off the right so `[::1]:8080` divides where you would expect.
+# The two halves joined for something that needs them as one string: a unit
+# file, a URL, a message. IPv6 gets its brackets back here and nowhere else,
+# so everything in between handles a bare host.
+join_bind() { # host port
+    case $1 in
+        *:*) printf '[%s]:%s\n' "$1" "$2" ;;
+        *)   printf '%s:%s\n' "$1" "$2" ;;
+    esac
+}
+
+bind_addr() { join_bind "$SERVICE_HOST" "$SERVICE_PORT"; }
+
+# A host this script is willing to write into a unit file. Not a hostname
+# grammar — the server does the real parsing — just enough to catch what
+# would otherwise become a unit that looks installed and cannot start.
 #
-# Reports rather than exits: a wrong flag should stop the run, but a typo at a
-# prompt should only mean being asked again, and both need the same rules.
-# Sets bind_host and bind_port, which the checks below read.
-bind_valid() {
-    addr=$1
+# Reports rather than exits: a wrong flag should stop the run, but a typo at
+# a prompt should only mean being asked again, and both need the same rules.
+host_valid() {
     BIND_ERROR=""
-    case $addr in
-        *:*) ;;
-        *) BIND_ERROR="'$addr' is not HOST:PORT, for example 127.0.0.1:8080"; return 1 ;;
+    case $1 in
+        '')            BIND_ERROR="the host is empty" ;;
+        *://*)         BIND_ERROR="'$1' is a URL; the host on its own is enough, for example 127.0.0.1" ;;
+        */*)           BIND_ERROR="'$1' is not a host; a path does not belong in it" ;;
+        *[[:space:]]*) BIND_ERROR="'$1' has a space in it" ;;
+        # Two colons or more is IPv6. Exactly one is a port that came along
+        # when it was not asked for, and whose digits are not digits — the
+        # prompt takes a well-formed HOST:PORT apart before it gets here.
+        *:*:*) return 0 ;;
+        *:*)   BIND_ERROR="'$1' has a colon in it but is not an IPv6 address; the port is a separate answer" ;;
+        *) return 0 ;;
     esac
-    bind_port=${addr##*:}
-    bind_host=${addr%:*}
-    case $bind_port in
-        ''|*[!0-9]*) BIND_ERROR="'$bind_port' is not a port number"; return 1 ;;
+    return 1
+}
+
+# 1-65535. Port 0 is a real thing to bind — it means "any free port" — but
+# a service at an address nobody can predict is not a service.
+port_valid() {
+    BIND_ERROR=""
+    case $1 in
+        ''|*[!0-9]*) BIND_ERROR="'$1' is not a port number"; return 1 ;;
     esac
-    if [ "$bind_port" -lt 1 ] || [ "$bind_port" -gt 65535 ]; then
-        BIND_ERROR="port $bind_port is outside 1-65535"
-        return 1
-    fi
-    if [ -z "$bind_host" ]; then
-        BIND_ERROR="no host in '$addr'"
+    if [ "$1" -lt 1 ] || [ "$1" -gt 65535 ]; then
+        BIND_ERROR="port $1 is outside 1-65535"
         return 1
     fi
     return 0
 }
 
-# The same rules, for an address that came from a flag: there is nobody to
-# ask again, so a bad one ends the run.
-check_bind() {
-    bind_valid "$1" || die "--bind: $BIND_ERROR"
+# HOST:PORT taken apart, for the places that still speak it: --bind, KVAD_BIND,
+# and the ExecStart line of a unit this script wrote earlier. The port comes
+# off the right and the brackets come off the host, so `[::1]:8080` divides
+# where you would expect. Sets bind_host and bind_port.
+split_bind() {
+    BIND_ERROR=""
+    case $1 in
+        '['*']:'*) bind_port=${1##*:}; bind_host=${1%:*}
+                   bind_host=${bind_host#\[}; bind_host=${bind_host%\]} ;;
+        *:*)       bind_port=${1##*:}; bind_host=${1%:*} ;;
+        *) BIND_ERROR="'$1' is not HOST:PORT, for example 127.0.0.1:8080"; return 1 ;;
+    esac
+    host_valid "$bind_host" && port_valid "$bind_port"
+}
+
+# What somebody typed at the host prompt: a host, or the whole HOST:PORT they
+# have typed into address fields for twenty years. Taking that apart is
+# friendlier than rejecting it, and the one ambiguous case — a bare IPv6
+# literal, which is nothing but colons — is told apart by counting them:
+# a single colon with digits to its right is a port, anything else is v6.
+# Sets answer_host, and answer_port when one came along.
+split_host_answer() {
+    answer_host=$1
+    answer_port=""
+    case $1 in
+        '['*']')   answer_host=${1#\[}; answer_host=${answer_host%\]} ;;
+        '['*']:'*) answer_port=${1##*:}; answer_host=${1%:*}
+                   answer_host=${answer_host#\[}; answer_host=${answer_host%\]} ;;
+        *:*:*)     ;;
+        *:[0-9]*)  answer_port=${1##*:}; answer_host=${1%:*} ;;
+    esac
+}
+
+# HOST:PORT from --bind, which still means both halves at once.
+set_bind() {
+    split_bind "$1" || die "--bind: $BIND_ERROR"
+    SERVICE_HOST=$bind_host; HOST_GIVEN=1
+    SERVICE_PORT=$bind_port; PORT_GIVEN=1
 }
 
 is_loopback() {
     case $1 in
-        127.*|localhost|'[::1]'|::1) return 0 ;;
+        127.*|localhost|::1|'[::1]') return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -184,21 +264,27 @@ exe_of() { # pid
 # forward on the wildcard happily coexists with a server on loopback. Asking
 # "is this port in use anywhere" called that a conflict and was wrong.
 address_taken() { # host port
+    # Both tools spell an IPv6 address with brackets; everything else in
+    # this script keeps the host bare, so they go back on here.
+    case $1 in
+        *:*) taken_host="[$1]" ;;
+        *)   taken_host=$1 ;;
+    esac
     if have lsof; then
         # shellcheck disable=SC2086 # the pid list is split on purpose
-        pids=$(lsof -nP -iTCP@"$1":"$2" -sTCP:LISTEN -t 2>/dev/null) || return 1
+        pids=$(lsof -nP -iTCP@"$taken_host":"$2" -sTCP:LISTEN -t 2>/dev/null) || return 1
         [ -n "$pids" ] || return 1
         for pid in $pids; do
-            # Our own service does not count. Upgrading in place leaves the
-            # old agent listening on the very address the new one wants, and
-            # installing the service boots it out before bootstrapping the
-            # replacement -- so the address is ours to take back. Calling it
-            # a conflict would refuse every upgrade, which is what it did.
+            # Our own service does not count. It is stopped before the
+            # binaries are replaced, so this is mostly a server somebody
+            # started by hand — but an agent that outlived its bootout is
+            # still ours to take the address back from, and calling that a
+            # conflict refused every upgrade, which is what it did.
             [ "$(exe_of "$pid")" = "$PREFIX/kvad-serve" ] || return 0
         done
         return 1
     elif have ss; then
-        ss -ltnH 2>/dev/null | awk -v a="$1:$2" '$4 == a { found = 1 } END { exit !found }'
+        ss -ltnH 2>/dev/null | awk -v a="$taken_host:$2" '$4 == a { found = 1 } END { exit !found }'
     else
         return 1
     fi
@@ -217,8 +303,37 @@ port_busy() {
     fi
 }
 
+# The two ways an address produces a unit that looks installed and never
+# serves anything. Both are worth a question rather than a surprise.
+# Returns 1 when the person would rather not.
+bind_objections() { # 1 if the host is the one the service already uses
+    addr=$(bind_addr)
+    # A remembered host does not get the lecture. Somebody chose it, and an
+    # auth mode it is allowed to bind under is already in the config file —
+    # if it were not, the service would have been failing since long before
+    # this upgrade came along.
+    if [ "${1:-0}" -eq 0 ] && ! is_loopback "$SERVICE_HOST"; then
+        say ""
+        warn "$addr is not a loopback address, and kvad-serve refuses a
+  non-loopback bind while auth.mode is \"none\" — which is the default. The
+  service would fail to start and be restarted for as long as it is loaded.
+  Set an auth mode first in ${XDG_CONFIG_HOME:-$HOME/.config}/kvad/kvad.toml;
+  $PREFIX/kvad-serve --help and the bundled kvad.example.toml say how."
+        ask "Install the service anyway?" n n || return 1
+    fi
+    if address_taken "$SERVICE_HOST" "$SERVICE_PORT"; then
+        say ""
+        warn "something is already listening on $addr itself. Two servers
+  cannot share one address, so kvad-serve would fail to bind and be
+  restarted in a loop. Pick another with --host or --port, or stop what is
+  there."
+        ask "Install the service anyway?" n n || return 1
+    fi
+    return 0
+}
+
 # Ask where the service should listen, and keep asking while the answer would
-# produce one that cannot start. "Pick another with --bind" is useless advice
+# produce one that cannot start. "Pick another with --port" is useless advice
 # halfway through a run: the person is right here, so offer them the choice
 # instead of sending them back to the shell.
 #
@@ -227,16 +342,37 @@ port_busy() {
 choose_bind() {
     while :; do
         [ "$INTERACTIVE" -eq 1 ] || return 1
-        ask_value "Address for kvad-serve to listen on" "$SERVICE_BIND"
-        # Held as a candidate until every check has passed. An address that
+        ask_value "Address for kvad-serve to listen on" "$SERVICE_HOST"
+        split_host_answer "$VALUE"
+        # Held as candidates until every check has passed. An address that
         # was just rejected must not become the default that Enter accepts,
         # or declining it walks straight back into the same warning.
-        candidate=$VALUE
-        if ! bind_valid "$candidate"; then
+        candidate_host=$answer_host
+        if ! host_valid "$candidate_host"; then
             say "  $BIND_ERROR"
             continue
         fi
-        if ! is_loopback "$bind_host"; then
+        if [ -n "$answer_port" ]; then
+            candidate_port=$answer_port
+            if ! port_valid "$candidate_port"; then
+                say "  $BIND_ERROR"
+                continue
+            fi
+            say "  ${DIM}port $candidate_port, from the address you typed${R}"
+        else
+            candidate_port=""
+            while [ -z "$candidate_port" ]; do
+                [ "$INTERACTIVE" -eq 1 ] || return 1
+                ask_value "Port" "$SERVICE_PORT"
+                if port_valid "$VALUE"; then
+                    candidate_port=$VALUE
+                else
+                    say "  $BIND_ERROR"
+                fi
+            done
+        fi
+        candidate=$(join_bind "$candidate_host" "$candidate_port")
+        if ! is_loopback "$candidate_host"; then
             warn "$candidate is not a loopback address, and kvad-serve refuses a
   non-loopback bind while auth.mode is \"none\" — which is the default. The
   service would fail to start and be restarted for as long as it is loaded.
@@ -244,16 +380,18 @@ choose_bind() {
   the bundled kvad.example.toml says how."
             ask "Use $candidate anyway?" n n || continue
         fi
-        if address_taken "$bind_host" "$bind_port"; then
+        if address_taken "$candidate_host" "$candidate_port"; then
             warn "something is already listening on $candidate itself. Two servers
   cannot share one address, so kvad-serve would fail to bind and be
   restarted in a loop."
             ask "Use $candidate anyway?" n n || continue
-        elif port_busy "$bind_port"; then
-            say "  ${DIM}note: something else is on port $bind_port at another address."
+        elif port_busy "$candidate_port"; then
+            say "  ${DIM}note: something else is on port $candidate_port at another address."
             say "  That does not stop this one binding $candidate.${R}"
         fi
-        SERVICE_BIND=$candidate
+        SERVICE_HOST=$candidate_host
+        SERVICE_PORT=$candidate_port
+        BIND_CHECKED=1
         return 0
     done
 }
@@ -266,14 +404,33 @@ WANT_SERVICE=ask
 WANT_PATH=ask
 UNINSTALL=0
 
+# KVAD_BIND is the spelling this script started with, and somebody's second
+# machine is still set up that way. It is read first, so KVAD_HOST and
+# KVAD_PORT can override either half of it.
+if [ -n "${KVAD_BIND:-}" ]; then
+    split_bind "$KVAD_BIND" || die "KVAD_BIND: $BIND_ERROR"
+    SERVICE_HOST=$bind_host; HOST_GIVEN=1
+    SERVICE_PORT=$bind_port; PORT_GIVEN=1
+fi
+if [ -n "${KVAD_HOST:-}" ]; then
+    SERVICE_HOST=$KVAD_HOST; HOST_GIVEN=1
+    host_valid "$SERVICE_HOST" || die "KVAD_HOST: $BIND_ERROR"
+fi
+if [ -n "${KVAD_PORT:-}" ]; then
+    SERVICE_PORT=$KVAD_PORT; PORT_GIVEN=1
+    port_valid "$SERVICE_PORT" || die "KVAD_PORT: $BIND_ERROR"
+fi
+
 usage() {
     cat >&2 <<'USAGE'
 install.sh — install kvad on macOS or Linux
 
     --prefix DIR     where the binaries go (default: ~/.local/bin)
     --version TAG    a release to install, e.g. v0.1.0 (default: the latest)
-    --bind ADDR      address the background service listens on
-                     (default: 127.0.0.1:8080)
+    --host ADDR      address the background service listens on
+                     (default: 127.0.0.1, or the one it already listens on)
+    --port PORT      the port it listens on (default: 8080, likewise)
+    --bind HOST:PORT both at once, for a habit that is hard to break
     --service        install the background service without asking
     --no-service     skip it without asking
     --add-path       add the install directory to PATH without asking
@@ -282,15 +439,28 @@ install.sh — install kvad on macOS or Linux
     --uninstall      remove the binaries and the service, keep models and data
     -h, --help
 
-Environment: KVAD_INSTALL_DIR, KVAD_VERSION, KVAD_BIND, GITHUB_TOKEN (rate limits).
+Environment: KVAD_INSTALL_DIR, KVAD_VERSION, KVAD_HOST, KVAD_PORT, KVAD_BIND,
+GITHUB_TOKEN (rate limits).
 USAGE
     exit 2
 }
 
+# A malformed address should cost nothing to find out about, and the service
+# section is on the far side of a 30 MB download. Checked as each one
+# arrives, so the complaint names the flag that was wrong rather than the
+# address the two of them added up to.
 while [ $# -gt 0 ]; do
     case $1 in
-        --bind)        [ $# -ge 2 ] || die "--bind needs HOST:PORT"; SERVICE_BIND=$2; BIND_GIVEN=1; shift 2 ;;
-        --bind=*)      SERVICE_BIND=${1#*=}; BIND_GIVEN=1; shift ;;
+        --host)        [ $# -ge 2 ] || die "--host needs an address"; SERVICE_HOST=$2; HOST_GIVEN=1
+                       host_valid "$SERVICE_HOST" || die "--host: $BIND_ERROR"; shift 2 ;;
+        --host=*)      SERVICE_HOST=${1#*=}; HOST_GIVEN=1
+                       host_valid "$SERVICE_HOST" || die "--host: $BIND_ERROR"; shift ;;
+        --port)        [ $# -ge 2 ] || die "--port needs a port number"; SERVICE_PORT=$2; PORT_GIVEN=1
+                       port_valid "$SERVICE_PORT" || die "--port: $BIND_ERROR"; shift 2 ;;
+        --port=*)      SERVICE_PORT=${1#*=}; PORT_GIVEN=1
+                       port_valid "$SERVICE_PORT" || die "--port: $BIND_ERROR"; shift ;;
+        --bind)        [ $# -ge 2 ] || die "--bind needs HOST:PORT"; set_bind "$2"; shift 2 ;;
+        --bind=*)      set_bind "${1#*=}"; shift ;;
         --prefix)      [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX=$2; shift 2 ;;
         --version)     [ $# -ge 2 ] || die "--version needs a tag"; VERSION=$2; shift 2 ;;
         --prefix=*)    PREFIX=${1#*=}; shift ;;
@@ -305,10 +475,6 @@ while [ $# -gt 0 ]; do
         *)             say "unknown option: $1"; usage ;;
     esac
 done
-
-# A malformed address should cost nothing to find out about, and the service
-# section is on the far side of a 30 MB download.
-check_bind "$SERVICE_BIND"
 
 # ---------------------------------------------------------------- machine --
 
@@ -346,6 +512,33 @@ service_paths() {
     fi
 }
 
+# Whether the service manager currently has the job, as opposed to there
+# merely being a unit file on disk. The two come apart often enough —
+# somebody stopped it by hand, a bootout that did not take — that guessing
+# from the file is guessing.
+service_loaded() {
+    if [ "$PLATFORM" = macos ]; then
+        launchctl print "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1
+    else
+        have systemctl && systemctl --user is-active --quiet kvad-serve.service
+    fi
+}
+
+# `launchctl bootout` returns while the job is still on its way out, and
+# anything that touches the label in that gap fails. Wait for launchd to
+# actually let go of it — five seconds, then give up and say so, because an
+# install that hangs on a job that is never leaving is worse than one that
+# tells you about it. Returns 1 if the label is still there.
+await_unloaded() {
+    waited=0
+    while launchctl print "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1; do
+        waited=$((waited + 1))
+        [ "$waited" -ge 50 ] && return 1
+        sleep 0.1
+    done
+    return 0
+}
+
 stop_service() {
     unit=$(service_paths)
     [ -f "$unit" ] || return 0
@@ -358,6 +551,71 @@ stop_service() {
     fi
     rm -f "$unit"
     say "  removed $unit"
+}
+
+# Stop a running service before the files under it move.
+#
+# A process keeps running from the binary it started with, so an install that
+# only replaces files leaves the old version serving — on the address the
+# new one is about to claim, and against a database the new one may have
+# migrated on its way past. Out of the way first, back afterwards.
+SERVICE_WAS_LOADED=0
+suspend_service() {
+    [ -f "$(service_paths)" ] || return 0
+    service_loaded || return 0
+    SERVICE_WAS_LOADED=1
+    step "Stopping $SERVICE_LABEL before replacing its binaries"
+    if [ "$PLATFORM" = macos ]; then
+        launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1 || true
+        await_unloaded || true
+    else
+        systemctl --user stop kvad-serve.service >/dev/null 2>&1 || true
+    fi
+    if service_loaded; then
+        if [ "$PLATFORM" = macos ]; then
+            how="launchctl bootout gui/$(id -u)/$SERVICE_LABEL"
+        else
+            how="systemctl --user stop kvad-serve"
+        fi
+        warn "$SERVICE_LABEL did not stop. The install continues, but the old
+  server is still running from the binaries being replaced. Stop it with:
+    $how"
+    else
+        say "  stopped"
+    fi
+}
+
+# Put back what suspend_service took away, for the run that replaced the
+# binaries and was not asked to rewrite the unit.
+resume_service() {
+    if [ "$PLATFORM" = macos ]; then
+        launchctl bootstrap "gui/$(id -u)" "$(service_paths)" >/dev/null 2>&1 ||
+            launchctl load -w "$(service_paths)" >/dev/null 2>&1 || true
+    else
+        systemctl --user start kvad-serve.service >/dev/null 2>&1 || true
+    fi
+    service_loaded
+}
+
+# The address a service that is already installed was given. An upgrade that
+# quietly moved the server back to 127.0.0.1:8080 is a server that stopped
+# answering where the rest of the machine expects it — so what is on disk is
+# the default from here on. A flag still wins, and so does an answer at the
+# prompt.
+installed_bind() {
+    unit=$(service_paths)
+    [ -f "$unit" ] || return 1
+    if [ "$PLATFORM" = macos ]; then
+        # Every <string> in the file, one to a line — with grep rather than
+        # a line-oriented sed, because a plist somebody reformatted by hand
+        # can put the whole ProgramArguments array on one line and still be
+        # the plist launchd is running. The address is the one after --bind.
+        grep -o '<string>[^<]*</string>' "$unit" |
+            sed 's|<string>\(.*\)</string>|\1|' |
+            awk 'prev == "--bind" { print; exit } { prev = $0 }'
+    else
+        sed -n 's/^ExecStart=.*--bind[ =]\([^ ]*\).*/\1/p' "$unit" | head -n 1
+    fi
 }
 
 if [ "$UNINSTALL" -eq 1 ]; then
@@ -378,6 +636,21 @@ if [ "$UNINSTALL" -eq 1 ]; then
     say "  ${XDG_CONFIG_HOME:-$HOME/.config}/kvad"
     say "Delete those directories to remove them too."
     exit 0
+fi
+
+# What the machine already decided, for the halves nobody named this time.
+# Read before anything is downloaded, so that a run which never gets as far
+# as the service section has still worked out what it would have said.
+if [ "$HOST_GIVEN" -eq 0 ] || [ "$PORT_GIVEN" -eq 0 ]; then
+    previous=$(installed_bind 2>/dev/null || true)
+    if [ -n "$previous" ] && split_bind "$previous"; then
+        [ "$HOST_GIVEN" -eq 1 ] || { SERVICE_HOST=$bind_host; HOST_FROM_UNIT=1; }
+        [ "$PORT_GIVEN" -eq 1 ] || SERVICE_PORT=$bind_port
+        BIND_FROM_UNIT=1
+    elif [ -n "$previous" ]; then
+        warn "the installed service listens on '$previous', which this script
+  cannot make sense of. Falling back to $(bind_addr)."
+    fi
 fi
 
 # -------------------------------------------------------------- download --
@@ -492,12 +765,17 @@ if [ -e "$PREFIX/kvad" ]; then
     ask "Replace it with $VERSION?" y || { say "Left alone."; exit 0; }
 fi
 
-step "Installing into $PREFIX"
 mkdir -p "$PREFIX" || die "could not create $PREFIX"
 [ -w "$PREFIX" ] || die "$PREFIX is not writable by this user.
   Pick somewhere else with --prefix DIR, or fix its permissions. This script
   deliberately does not use sudo."
 
+# After the checks that can still refuse, and before the first byte moves:
+# stopping somebody's server for an install that was going to fail on
+# permissions anyway would be rude.
+suspend_service
+
+step "Installing into $PREFIX"
 for name in $BINARIES; do
     # Install to a temporary name and rename, so a running kvad-serve is
     # replaced atomically instead of being overwritten under its own feet.
@@ -586,6 +864,7 @@ fi
 write_launchd() {
     unit=$(service_paths)
     logs="$HOME/Library/Logs/kvad"
+    addr=$(bind_addr)
     mkdir -p "$(dirname "$unit")" "$logs"
     cat > "$unit" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -597,7 +876,7 @@ write_launchd() {
     <array>
         <string>$PREFIX/kvad-serve</string>
         <string>--bind</string>
-        <string>$SERVICE_BIND</string>
+        <string>$addr</string>
     </array>
     <key>RunAtLoad</key>          <true/>
     <key>KeepAlive</key>
@@ -612,22 +891,14 @@ PLIST
     domain="gui/$(id -u)"
 
     # bootout first, because bootstrap fails on a label that is already
-    # there, and an upgrade is the common case. It is asynchronous: it
-    # returns while the job is still on its way out, and bootstrapping into
-    # that gap fails. So wait for launchd to actually let go of the label.
+    # there. Usually a no-op by now — suspend_service got there first — but
+    # not when the service was loaded and not running, or when somebody
+    # brought it back while this was downloading.
     if launchctl print "$domain/$SERVICE_LABEL" >/dev/null 2>&1; then
         launchctl bootout "$domain/$SERVICE_LABEL" >/dev/null 2>&1 || true
-        waited=0
-        while launchctl print "$domain/$SERVICE_LABEL" >/dev/null 2>&1; do
-            waited=$((waited + 1))
-            if [ "$waited" -ge 50 ]; then
-                warn "the old $SERVICE_LABEL is still loaded after five seconds;
+        await_unloaded || warn "the old $SERVICE_LABEL is still loaded after five seconds;
   loading the new one may fail. Boot it out yourself with:
     launchctl bootout $domain/$SERVICE_LABEL"
-                break
-            fi
-            sleep 0.1
-        done
     fi
 
     launchctl bootstrap "$domain" "$unit" >/dev/null 2>&1 ||
@@ -649,6 +920,7 @@ PLIST
 
 write_systemd() {
     unit=$(service_paths)
+    addr=$(bind_addr)
     mkdir -p "$(dirname "$unit")"
     cat > "$unit" <<UNIT
 [Unit]
@@ -656,7 +928,7 @@ Description=kvad — HTTP server and web UI
 After=network.target
 
 [Service]
-ExecStart=$PREFIX/kvad-serve --bind $SERVICE_BIND
+ExecStart=$PREFIX/kvad-serve --bind $addr
 Restart=on-failure
 RestartSec=5
 
@@ -679,16 +951,6 @@ UNIT
     fi
 }
 
-# Kick a service that is already installed, so it runs the binary that is
-# now on disk.
-restart_service() {
-    if [ "$PLATFORM" = macos ]; then
-        launchctl kickstart -k "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1
-    else
-        systemctl --user restart kvad-serve.service >/dev/null 2>&1
-    fi
-}
-
 if [ -f "$SRC/kvad-serve" ]; then
     do_service=0
     case $WANT_SERVICE in
@@ -696,60 +958,69 @@ if [ -f "$SRC/kvad-serve" ]; then
         no)  do_service=0 ;;
         *)
             say ""
-            say "${B}kvad-serve${R} is the HTTP API and web UI."
-            say "It can start automatically when you log in, or you can run it by hand."
-            ask "Start kvad-serve at login?" n && do_service=1
+            if [ -f "$(service_paths)" ]; then
+                # An upgrade, and the question is no longer whether to have a
+                # service. Saying no here still puts the running one back;
+                # saying yes rewrites the unit, which is how it picks up a
+                # new --prefix or a new address.
+                say "${B}kvad-serve${R} is already installed as a background service."
+                ask "Update it for $VERSION?" y y && do_service=1
+            else
+                say "${B}kvad-serve${R} is the HTTP API and web UI."
+                say "It can start automatically when you log in, or you can run it by hand."
+                ask "Start kvad-serve at login?" n && do_service=1
+            fi
             ;;
     esac
 
     # Anyone installing a service at a terminal gets asked where it listens,
     # including someone who passed --service. That flag answers "whether",
-    # and saying yes to a service is not saying yes to port 8080. Only
-    # --bind, which names an address, skips the question.
-    if [ "$do_service" -eq 1 ] && [ "$BIND_GIVEN" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
-        choose_bind || do_service=0
-    elif [ "$do_service" -eq 1 ]; then
-        # Both of these produce a unit that looks installed and never serves
-        # anything, so they are worth a question rather than a surprise.
-        if ! is_loopback "$bind_host"; then
+    # and saying yes to a service is not saying yes to port 8080.
+    #
+    # Two things skip the question. Naming either half with --host, --port
+    # or --bind, which is an answer already — and an answer about one half
+    # settles the other, which is whatever it was going to be anyway. And a
+    # service that is already installed, which was asked once and has been
+    # answering there ever since: an upgrade offers to keep its address
+    # rather than asking again.
+    if [ "$do_service" -eq 1 ] && [ "$INTERACTIVE" -eq 1 ] &&
+       [ "$HOST_GIVEN" -eq 0 ] && [ "$PORT_GIVEN" -eq 0 ]; then
+        if [ "$BIND_FROM_UNIT" -eq 1 ]; then
             say ""
-            warn "$SERVICE_BIND is not a loopback address, and kvad-serve refuses a
-  non-loopback bind while auth.mode is \"none\" — which is the default. The
-  service would fail to start and be restarted for as long as it is loaded.
-  Set an auth mode first in ${XDG_CONFIG_HOME:-$HOME/.config}/kvad/kvad.toml;
-  $PREFIX/kvad-serve --help and the bundled kvad.example.toml say how."
-            ask "Install the service anyway?" n n || do_service=0
-        fi
-        if [ "$do_service" -eq 1 ] && address_taken "$bind_host" "$bind_port"; then
-            say ""
-            warn "something is already listening on $SERVICE_BIND itself. Two servers
-  cannot share one address, so kvad-serve would fail to bind and be
-  restarted in a loop. Pick another with --bind, or stop what is there."
-            ask "Install the service anyway?" n n || do_service=0
+            say "The installed service listens on ${B}$(bind_addr)${R}."
+            ask "Keep that address?" y y || choose_bind || do_service=0
+        else
+            choose_bind || do_service=0
         fi
     fi
+
+    # Every address that did not come out of choose_bind, which asks these as
+    # it goes: a flag, an environment variable, a unit file kept as it was.
+    if [ "$do_service" -eq 1 ] && [ "$BIND_CHECKED" -eq 0 ]; then
+        bind_objections "$HOST_FROM_UNIT" || do_service=0
+    fi
+
     if [ "$do_service" -eq 1 ]; then
         step "Installing the background service"
         if [ "$PLATFORM" = macos ]; then write_launchd; else write_systemd; fi
-    elif [ -f "$(service_paths)" ]; then
-        # There is a service, and the binary underneath it has just been
-        # replaced. A running process keeps the file it started from, so
-        # without this the install finishes, reports the new version, and
-        # leaves the old one serving -- which is the sort of thing somebody
-        # only discovers when a bug they read the fix for is still there.
-        step "Restarting the service onto the new binaries"
-        if restart_service; then
-            say "  restarted $SERVICE_LABEL"
+    elif [ "$SERVICE_WAS_LOADED" -eq 1 ]; then
+        # Stopped a few steps up so its binaries could be replaced. Whatever
+        # was just declined, it was not "turn my server off".
+        step "Starting the service again on the new binaries"
+        if resume_service; then
+            say "  $SERVICE_LABEL is listening on $(bind_addr)"
         else
             if [ "$PLATFORM" = macos ]; then
-                how="launchctl kickstart -k gui/$(id -u)/$SERVICE_LABEL"
+                how="launchctl bootstrap gui/$(id -u) $(service_paths)"
             else
-                how="systemctl --user restart kvad-serve"
+                how="systemctl --user start kvad-serve"
             fi
-            warn "could not restart $SERVICE_LABEL. It is still running the binary it
-  started with, not the one just installed. Restart it with:
+            warn "could not start $SERVICE_LABEL again. It is installed and stopped.
+  Start it with:
     $how"
         fi
+    elif [ -f "$(service_paths)" ]; then
+        say "  ${DIM}$SERVICE_LABEL is installed but was not running; left that way.${R}"
     fi
 fi
 
@@ -763,10 +1034,10 @@ say "  ${B}kvad chat${R}                              talk to it"
 if [ -f "$SRC/kvad-tui" ]; then
     say "  ${B}kvad-tui${R}                               browse and chat in the terminal"
 fi
-if [ "$BIND_GIVEN" -eq 1 ]; then
-    say "  ${B}kvad serve --bind $SERVICE_BIND${R}   the API and web UI"
+if [ "$(bind_addr)" = "$DEFAULT_HOST:$DEFAULT_PORT" ]; then
+    say "  ${B}kvad serve${R}                             the API and web UI on http://$(bind_addr)"
 else
-    say "  ${B}kvad serve${R}                             the API and web UI on http://$SERVICE_BIND"
+    say "  ${B}kvad serve --bind $(bind_addr)${R}   the API and web UI"
 fi
 say ""
 say "Models go in ${XDG_DATA_HOME:-$HOME/.local/share}/kvad, configuration in"

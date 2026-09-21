@@ -2422,7 +2422,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "kvad"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hf-hub",
  "memmap2",
@@ -2439,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "kvad-gpu"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "kvad-serve"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "axum",
@@ -2476,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "kvad-tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kvad",
  "kvad-gpu",

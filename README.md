@@ -2318,7 +2318,15 @@ machine was busy, and one sample from each variant caught it. The explanation
 was invented to fit a single outlier, and the outlier was noise.
 
 So the medians stand, the default stands, and the warm-up that was going to
-absorb those 6.9 seconds is not written. Three of this README's numbers were
+absorb those 6.9 seconds is not written — this time on a measurement rather
+than on a failure to reproduce one. Fifteen loads per backend, three
+generations after each, alternating which backend led: the first generation
+of the whole process and the first generation after the fifteenth load are
+the same to within noise (22.2 ms against 22.8 ms on the GPU), and a
+once-per-process cost is the only thing a warm-up at startup could have
+removed. What is left is ~14 ms on the first generation after any load,
+which is larger on the CPU than on the GPU — the KV cache filling, not Metal
+compiling. Three of this README's numbers were
 once wrong in exactly this way, which is why the page that produced the table
 interleaves its rounds and prints the range beside the median: the range is
 what said this was worth re-running.

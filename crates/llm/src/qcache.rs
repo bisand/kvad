@@ -60,6 +60,9 @@
 //! * The source checkpoint's file names and sizes are recorded, so a
 //!   re-download or a different revision does not get served from the old
 //!   cache.
+//! * The checkpoint's whole tensor list is stamped in, so a build that reads
+//!   one more weight than the build that wrote the file can tell — without
+//!   opening a checkpoint, which is the one thing this path exists not to do.
 //!
 //! Anything that fails a check is rebuilt, loudly.
 //!
@@ -72,9 +75,8 @@
 use crate::model::{Spec, Transformer};
 use crate::quant::{Parts, Precision, Weight, BLOCK};
 use crate::tensor::Tensor;
-use crate::weights::{Checkpoint, ModelFiles};
+use crate::weights::{Audit, Checkpoint, ModelFiles};
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::collections::HashMap;
 use std::io::Write;
 use std::marker::PhantomData;
@@ -87,21 +89,28 @@ const MAGIC: &[u8; 8] = b"NANOQ\x00\x00\x01";
 /// Where the first array may start. Also the alignment every array gets.
 const ALIGN: usize = 64;
 
-/// Bump this when the bytes stop meaning what they used to, **or when a loader
-/// starts reading a tensor it used to ignore**.
+/// Bump this when the bytes stop meaning what they used to.
 ///
-/// Version 1 is the first format. If the quantiser changes — a different
-/// scale rule, a different packing order, a different [`BLOCK`] — this must
-/// change too, or old files will be read as if they were new ones.
+/// If the quantiser changes — a different scale rule, a different packing
+/// order, a different [`BLOCK`] — this must change too, or old files will be
+/// read as if they were new ones. Version 1 was the first format; version 2
+/// added the `checkpoint` stamp below.
 ///
-/// The second half of that rule is newer, and is the one that is easy to
-/// forget. A cache holds what the build that wrote it read, so a build that
-/// learns to read one more weight will not find it in an old cache — and for an
-/// *optional* weight, [`Source::try_vector`] answers `None` and the model
-/// quietly runs without it. That is the same silence [`Live::unread`] exists to
-/// end, arriving by a route that check cannot see: it compares against the
-/// checkpoint, and a mapped cache never opens one.
-pub const VERSION: u32 = 1;
+/// It is deliberately not also the answer to a *loader* that changes, though it
+/// was for a while. A cache holds what the build that wrote it read, so a build
+/// that learns to read one more weight does not find it in an old cache — and
+/// for an *optional* weight [`Source::try_vector`] answers `None` and the model
+/// quietly runs without it, which is the silence the unread check exists to end.
+/// That check subtracts from what the checkpoint holds, and a mapped cache never
+/// opens a checkpoint: so the rule was to bump this constant whenever a loader
+/// started reading something it used to ignore, and to remember to.
+///
+/// The file carries the answer now. Every cache stamps in the checkpoint's
+/// complete tensor list — a few hundred kilobytes against a multi-gigabyte
+/// file — and [`Mapped`] audits itself against that stamp exactly as [`Live`]
+/// audits itself against the real thing. A cache found to be missing a weight
+/// this build wants is a stale cache, and stale caches were always rebuilt.
+pub const VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Store: owned or mapped, the same either way
@@ -231,12 +240,12 @@ pub trait Source {
     fn try_vector(&self, name: &str) -> Option<Vec<f32>>;
 
     /// Note a tensor this architecture knows about and deliberately does not
-    /// read, so that [`Live`]'s check for weights nobody wanted does not
-    /// mistake a decision for an omission.
+    /// read, so that the check for weights nobody wanted does not mistake a
+    /// decision for an omission.
     ///
     /// The duplicate output head in a tied checkpoint is one. The default does
-    /// nothing, which is right for a source reading a cache file: it contains
-    /// what was recorded and nothing else.
+    /// nothing, for a source with nothing to compare against; both sources here
+    /// override it.
     fn skip(&self, _name: &str) {}
 
     /// The same, for a whole subtree of tensors at once.
@@ -321,17 +330,8 @@ pub struct Live<'a> {
     out: RefCell<Option<Writer>>,
     /// Why recording stopped, if it did.
     failure: RefCell<Option<String>>,
-    /// Every checkpoint tensor an architecture asked about, by the name the
-    /// file files it under rather than the name it was asked for — the two
-    /// differ by a prefix, and only the former can be compared against
-    /// [`Checkpoint::names`].
-    ///
-    /// The point is [`Live::unread`]. A weight nobody reads is a piece of the
-    /// model that is not running, and nothing else notices: a loader asks for
-    /// what it knows about and a checkpoint has no opinion about the rest. That
-    /// is how the GPU backend ran a Llama forward pass over a Qwen3 model at
-    /// full speed, and it could as easily happen here.
-    seen: RefCell<HashSet<String>>,
+    /// What this checkpoint holds, against what an architecture asked for.
+    audit: Audit,
 }
 
 impl<'a> Live<'a> {
@@ -341,7 +341,7 @@ impl<'a> Live<'a> {
             precision,
             out: RefCell::new(None),
             failure: RefCell::new(None),
-            seen: RefCell::new(HashSet::new()),
+            audit: Audit::new(ckpt.names().map(str::to_string)),
         }
     }
 
@@ -371,33 +371,18 @@ impl<'a> Live<'a> {
         }
     }
 
-    /// Note that some architecture asked about `name`, under whichever spelling
-    /// this checkpoint files it.
-    ///
-    /// Called by every read, and on its own from [`Source::skip`] for a tensor
-    /// deliberately passed over. A name the checkpoint does not have records
-    /// nothing, which is right: there is no such tensor to leave unread.
-    fn record(&self, name: &str) {
-        if let Some(key) = self.ckpt.resolve(name) {
-            self.seen.borrow_mut().insert(key.to_string());
-        }
-    }
-
     /// Checkpoint tensors that nothing asked about, derived buffers aside.
     ///
     /// Call it after the architecture has finished loading. Anything here is a
     /// weight this build does not implement, which is worth failing over: it is
     /// a wrong answer at full speed rather than an error.
+    ///
+    /// Recording happens as each tensor is *asked for* rather than as it comes
+    /// back, which is right here and wrong for [`Mapped`]: a checkpoint either
+    /// holds a tensor or does not, and a name that resolves is a tensor that is
+    /// there.
     pub fn unread(&self) -> Vec<String> {
-        let seen = self.seen.borrow();
-        let mut left: Vec<String> = self
-            .ckpt
-            .names()
-            .filter(|n| !seen.contains(*n) && !crate::weights::derived(n))
-            .map(str::to_string)
-            .collect();
-        left.sort();
-        left
+        self.audit.unread()
     }
 
     /// Why nothing was cached, when nothing was.
@@ -411,7 +396,14 @@ impl<'a> Live<'a> {
         let Some(writer) = self.out.get_mut().take() else {
             return Ok(None);
         };
-        writer.finish(header(repo, files, spec, self.precision)?).map(Some)
+        let mut header = header(repo, files, spec, self.precision)?;
+        // The checkpoint's whole tensor list, not just the part that was read.
+        // A later load of this file can then ask what [`Live::unread`] asks
+        // without opening the checkpoint — see [`VERSION`]. Everything is
+        // stamped, derived buffers included, so what counts as derived stays a
+        // decision this build makes rather than one baked into old files.
+        header["checkpoint"] = serde_json::json!(self.audit.names());
+        writer.finish(header).map(Some)
     }
 
     fn quantized(&self, t: Tensor) -> Weight {
@@ -421,28 +413,28 @@ impl<'a> Live<'a> {
 
 impl Source for Live<'_> {
     fn matrix(&self, name: &str) -> Res<Weight> {
-        self.record(name);
+        self.audit.saw(name);
         let w = self.quantized(self.ckpt.get(name)?);
         self.tee(|out| out.put_weight(name, &w));
         Ok(w)
     }
 
     fn try_matrix(&self, name: &str) -> Option<Weight> {
-        self.record(name);
+        self.audit.saw(name);
         let w = self.quantized(self.ckpt.try_get(name)?);
         self.tee(|out| out.put_weight(name, &w));
         Some(w)
     }
 
     fn matrix_t(&self, name: &str) -> Res<Weight> {
-        self.record(name);
+        self.audit.saw(name);
         let w = self.quantized(self.ckpt.get(name)?.transposed());
         self.tee(|out| out.put_weight(name, &w));
         Ok(w)
     }
 
     fn matrix_rows(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
-        self.record(name);
+        self.audit.saw(name);
         let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?);
         let as_name = slice_name(name, start, count, false);
         self.tee(|out| out.put_weight(&as_name, &w));
@@ -450,7 +442,7 @@ impl Source for Live<'_> {
     }
 
     fn matrix_rows_t(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
-        self.record(name);
+        self.audit.saw(name);
         let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?.transposed());
         let as_name = slice_name(name, start, count, true);
         self.tee(|out| out.put_weight(&as_name, &w));
@@ -458,27 +450,25 @@ impl Source for Live<'_> {
     }
 
     fn vector(&self, name: &str) -> Res<Vec<f32>> {
-        self.record(name);
+        self.audit.saw(name);
         let v = self.ckpt.get_flat(name)?;
         self.tee(|out| out.put_vector(name, &v));
         Ok(v)
     }
 
     fn try_vector(&self, name: &str) -> Option<Vec<f32>> {
-        self.record(name);
+        self.audit.saw(name);
         let v = self.ckpt.try_get_flat(name)?;
         self.tee(|out| out.put_vector(name, &v));
         Some(v)
     }
 
     fn skip(&self, name: &str) {
-        self.record(name);
+        self.audit.saw(name);
     }
 
     fn skip_under(&self, prefix: &str) {
-        let names: Vec<String> =
-            self.ckpt.names_under(prefix).into_iter().map(str::to_string).collect();
-        self.seen.borrow_mut().extend(names);
+        self.audit.saw_under(prefix);
     }
 }
 
@@ -499,6 +489,14 @@ enum Entry {
 pub struct Mapped {
     map: Arc<memmap2::Mmap>,
     entries: HashMap<String, Entry>,
+    /// The checkpoint's tensor list as it was when this file was written,
+    /// against what an architecture has since asked for.
+    ///
+    /// Not the *cache's* list: comparing a file against itself would only ever
+    /// find what the last build already found. The point is to catch the build
+    /// after that one — the one that learns to read a weight this file was
+    /// written without.
+    audit: Audit,
 }
 
 impl Mapped {
@@ -547,7 +545,13 @@ impl Mapped {
             entries.insert(name.clone(), parse_entry(entry)?);
         }
 
-        Ok(Some(Mapped { map: Arc::new(map), entries }))
+        let stamp = json.get("checkpoint").and_then(|c| c.as_array()).ok_or("no `checkpoint`")?;
+        let names = stamp
+            .iter()
+            .map(|n| n.as_str().map(str::to_string).ok_or("`checkpoint` is not a list of names"))
+            .collect::<Result<Vec<String>, _>>()?;
+
+        Ok(Some(Mapped { map: Arc::new(map), entries, audit: Audit::new(names) }))
     }
 
     /// Bytes on disk.
@@ -583,47 +587,89 @@ impl Mapped {
     fn f32s(&self, span: Span) -> Res<Store<f32>> {
         Store::mapped(&self.map, span.0, span.1)
     }
+
+    /// Checkpoint tensors this file was written without, that something has
+    /// since asked for — by the names the checkpoint used, not the cache's own.
+    ///
+    /// Empty for a cache written by this build. Anything here means the file is
+    /// behind the code: see [`VERSION`], and [`load`], which rebuilds.
+    pub fn unread(&self) -> Vec<String> {
+        self.audit.unread()
+    }
 }
 
+// Every one of these records the tensor *after* the answer comes back, and
+// records the name it was asked for rather than the name it was filed under: a
+// slice of a matrix is one read of that matrix, however many pieces the engine
+// wants it in.
+//
+// Recording on the answer rather than the question is the difference that makes
+// the stamp worth having. `Live` may record either way, because a checkpoint
+// either holds a tensor or does not. A cache file can be missing something the
+// checkpoint had — that is the whole case this exists to catch — so here it is
+// the answer that counts, and an `Option` that comes back `None` records
+// nothing.
 impl Source for Mapped {
     fn matrix(&self, name: &str) -> Res<Weight> {
-        self.build(name)
+        let w = self.build(name)?;
+        self.audit.saw(name);
+        Ok(w)
     }
 
     fn matrix_rows(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
-        self.build(&slice_name(name, start, count, false))
+        let w = self.build(&slice_name(name, start, count, false))?;
+        self.audit.saw(name);
+        Ok(w)
     }
 
     fn matrix_rows_t(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
-        self.build(&slice_name(name, start, count, true))
+        let w = self.build(&slice_name(name, start, count, true))?;
+        self.audit.saw(name);
+        Ok(w)
     }
 
     fn try_matrix(&self, name: &str) -> Option<Weight> {
-        // Absent from the file means absent from the model: the run that
-        // wrote it asked the same question and got nothing.
-        self.build(name).ok()
+        // Absent from the file no longer has to mean absent from the model: it
+        // may be a weight the run that wrote this did not know to ask for. The
+        // audit is what tells those apart, and it is the checkpoint's list that
+        // settles it.
+        let w = self.build(name).ok()?;
+        self.audit.saw(name);
+        Some(w)
     }
 
     fn matrix_t(&self, name: &str) -> Res<Weight> {
         // Already transposed when it was written.
-        self.build(name)
+        let w = self.build(name)?;
+        self.audit.saw(name);
+        Ok(w)
     }
 
     fn vector(&self, name: &str) -> Res<Vec<f32>> {
-        match self.entries.get(name) {
-            Some(Entry::F32 { shape, data }) if shape.0 == 1 => Ok(self.f32s(*data)?.to_vec()),
-            Some(_) => Err(format!("`{name}` is a quantised matrix, not a vector").into()),
-            None => Err(format!("`{name}` not in the cache").into()),
-        }
+        let v = match self.entries.get(name) {
+            Some(Entry::F32 { shape, data }) if shape.0 == 1 => self.f32s(*data)?.to_vec(),
+            Some(_) => return Err(format!("`{name}` is a quantised matrix, not a vector").into()),
+            None => return Err(format!("`{name}` not in the cache").into()),
+        };
+        self.audit.saw(name);
+        Ok(v)
     }
 
     fn try_vector(&self, name: &str) -> Option<Vec<f32>> {
-        match self.entries.get(name) {
-            Some(Entry::F32 { shape, data }) if shape.0 == 1 => {
-                Some(self.f32s(*data).ok()?.to_vec())
-            }
-            _ => None,
-        }
+        let v = match self.entries.get(name) {
+            Some(Entry::F32 { shape, data }) if shape.0 == 1 => self.f32s(*data).ok()?.to_vec(),
+            _ => return None,
+        };
+        self.audit.saw(name);
+        Some(v)
+    }
+
+    fn skip(&self, name: &str) {
+        self.audit.saw(name);
+    }
+
+    fn skip_under(&self, prefix: &str) {
+        self.audit.saw_under(prefix);
     }
 }
 
@@ -936,6 +982,13 @@ fn enabled() -> bool {
 /// 2. No cache, or an invalid one — quantise from the checkpoint and write
 ///    one out on the way past.
 /// 3. f32, or caching disabled — quantise nothing, cache nothing.
+///
+/// Both routes end the same way: what the file holds, minus what the
+/// architecture asked for, had better be nothing. On the checkpoint route that
+/// is a load that refuses, because the missing piece is a piece of the model
+/// this build does not run. On the cache route it is a rebuild, because the
+/// missing piece is one the *previous build* did not run, and a cache that is
+/// behind the code is a stale cache like any other.
 pub fn load(
     repo: &str,
     files: &ModelFiles,
@@ -954,7 +1007,25 @@ pub fn load(
             Ok(Some(cache)) => {
                 let mb = cache.bytes() / 1_000_000;
                 progress(&format!("mapping {precision} weights ({mb} MB)"));
-                return build(&cache, spec);
+                match build(&cache, spec) {
+                    // A cache that cannot build the model it was written for is
+                    // one this build has outgrown too — the same fact as below,
+                    // arriving as an error rather than as a silence because the
+                    // loader requires that tensor rather than merely accepting
+                    // it. Anything else wrong with the spec fails again on the
+                    // checkpoint, and is reported from there.
+                    Err(e) => progress(&format!("stale {precision} cache: {e}")),
+                    // Only knowable now: the question is what the architecture
+                    // asked for, and it has only just finished asking.
+                    Ok(model) => match cache.unread() {
+                        left if left.is_empty() => return Ok(model),
+                        left => progress(&format!(
+                            "stale {precision} cache: written by a build that did not read {}",
+                            crate::weights::collapsed(&left).join(", "),
+                        )),
+                    },
+                }
+                rebuilding = true;
             }
             Ok(None) => {}
             Err(e) => {
@@ -980,7 +1051,10 @@ pub fn load(
     let model = build(&live, spec)?;
 
     // Before `finish`, so a refused load leaves no cache behind: dropping the
-    // `Writer` removes the partial file.
+    // `Writer` removes the partial file. And after the cache route above, which
+    // sends a file this build has outgrown back through here — so a checkpoint
+    // that really does hold something unimplemented is refused either way,
+    // rather than only on a first load.
     let left = live.unread();
     if !left.is_empty() {
         return Err(format!(
@@ -1047,6 +1121,14 @@ mod tests {
         }
     }
 
+    /// A header as [`Live::finish`] writes one: what [`header`] holds, plus the
+    /// checkpoint's tensor list. These tests assemble files by hand rather than
+    /// by loading a model, so they say for themselves what the checkpoint held.
+    fn stamped(mut h: serde_json::Value, checkpoint: &[&str]) -> serde_json::Value {
+        h["checkpoint"] = serde_json::json!(checkpoint);
+        h
+    }
+
     /// Everything a weight knows must survive the round trip: the codes, the
     /// scales, the shape, and therefore the product it computes.
     #[test]
@@ -1060,7 +1142,7 @@ mod tests {
             let mut w = Writer::create(&path).unwrap();
             w.put_weight("a", &before).unwrap();
             w.put_vector("norm", &[1.0, 2.0, 3.0]).unwrap();
-            w.finish(header("r", &[], &spec(), precision).unwrap()).unwrap();
+            w.finish(stamped(header("r", &[], &spec(), precision).unwrap(), &[])).unwrap();
 
             let cache = Mapped::open(&path, "r", &[], &spec(), precision).unwrap().unwrap();
             let after = cache.matrix("a").unwrap();
@@ -1092,7 +1174,7 @@ mod tests {
 
         std::fs::write(&weights, [1u8; 64]).unwrap();
         let w = Writer::create(&cache).unwrap();
-        w.finish(header("out/model", &files, &spec(), Precision::Q8).unwrap()).unwrap();
+        w.finish(stamped(header("out/model", &files, &spec(), Precision::Q8).unwrap(), &[])).unwrap();
         assert!(Mapped::open(&cache, "out/model", &files, &spec(), Precision::Q8).unwrap().is_some());
 
         // Same length, different floats, saved a second later. The time is
@@ -1118,7 +1200,7 @@ mod tests {
     fn stale_caches_are_rejected() {
         let path = tmp("stale");
         let w = Writer::create(&path).unwrap();
-        w.finish(header("repo-a", &[], &spec(), Precision::Q8).unwrap()).unwrap();
+        w.finish(stamped(header("repo-a", &[], &spec(), Precision::Q8).unwrap(), &[])).unwrap();
 
         // Same everything: fine.
         assert!(Mapped::open(&path, "repo-a", &[], &spec(), Precision::Q8).unwrap().is_some());
@@ -1154,7 +1236,7 @@ mod tests {
         w.put_vector("a", &[1.0]).unwrap();
         w.put(&[1u8, 2, 3]).unwrap();
         w.put_vector("b", &[2.0, 3.0]).unwrap();
-        w.finish(header("r", &[], &spec(), Precision::Q8).unwrap()).unwrap();
+        w.finish(stamped(header("r", &[], &spec(), Precision::Q8).unwrap(), &[])).unwrap();
 
         let cache = Mapped::open(&path, "r", &[], &spec(), Precision::Q8).unwrap().unwrap();
         for name in ["a", "b"] {
@@ -1194,7 +1276,7 @@ mod tests {
     fn the_listing_reads_the_name_from_the_header() {
         let path = tmp("named");
         let w = Writer::create(&path).unwrap();
-        w.finish(header("/home/me/out/my--model", &[], &spec(), Precision::Q8).unwrap()).unwrap();
+        w.finish(stamped(header("/home/me/out/my--model", &[], &spec(), Precision::Q8).unwrap(), &[])).unwrap();
         assert_eq!(repo_of(&path).as_deref(), Some("/home/me/out/my--model"));
 
         std::fs::write(&path, b"not a cache file at all").unwrap();
@@ -1203,4 +1285,91 @@ mod tests {
         assert_eq!(repo_of(&path), None);
         std::fs::remove_file(&path).unwrap();
     }
+
+    /// The blind spot the stamp exists for: a cache written by a build that
+    /// never read one of the checkpoint's weights, handed to a build that does.
+    ///
+    /// Nothing inside the file says anything is missing — by its own account it
+    /// is complete, and `try_vector` answering `None` is exactly what an
+    /// optional weight the model genuinely lacks looks like. Only the
+    /// checkpoint's own list can tell those apart, so the file carries a copy of
+    /// it. This is the Qwen3 bug arriving by its last remaining route.
+    #[test]
+    fn a_cache_written_without_a_weight_still_names_it() {
+        let path = tmp("outgrown");
+        let mut w = Writer::create(&path).unwrap();
+        // What the writing build read: one norm. What the checkpoint held: that,
+        // a per-head norm it had never heard of, and a buffer nobody reads.
+        w.put_vector("layers.0.input_layernorm.weight", &[1.0]).unwrap();
+        w.finish(stamped(
+            header("r", &[], &spec(), Precision::Q8).unwrap(),
+            &[
+                "model.layers.0.input_layernorm.weight",
+                "model.layers.0.self_attn.q_norm.weight",
+                "model.layers.0.self_attn.rotary_emb.inv_freq",
+            ],
+        ))
+        .unwrap();
+
+        let cache = Mapped::open(&path, "r", &[], &spec(), Precision::Q8).unwrap().unwrap();
+        cache.vector("layers.0.input_layernorm.weight").unwrap();
+        // The new build asks, and gets the silence. The name survives it.
+        assert!(cache.try_vector("layers.0.self_attn.q_norm.weight").is_none());
+        assert_eq!(cache.unread(), ["model.layers.0.self_attn.q_norm.weight"]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// And the cases that must not be mistaken for that one, since a check that
+    /// cried about them would be worse than no check: a weight that is read, a
+    /// tie passed over by name, a subtree passed over by prefix, and the derived
+    /// buffers no engine here ever stores.
+    #[test]
+    fn a_cache_the_loader_covers_is_not_stale() {
+        let path = tmp("covered");
+        let mut w = Writer::create(&path).unwrap();
+        w.put_vector("layers.0.input_layernorm.weight", &[1.0]).unwrap();
+        w.finish(stamped(
+            header("r", &[], &spec(), Precision::Q8).unwrap(),
+            &[
+                "model.layers.0.input_layernorm.weight",
+                "lm_head.weight",
+                "model.layers.1.enorm.weight",
+                "model.layers.1.eh_proj.weight",
+                "h.0.attn.bias",
+            ],
+        ))
+        .unwrap();
+
+        let cache = Mapped::open(&path, "r", &[], &spec(), Precision::Q8).unwrap().unwrap();
+        cache.vector("layers.0.input_layernorm.weight").unwrap();
+        cache.skip("lm_head.weight");
+        cache.skip_under("layers.1.");
+        assert!(cache.unread().is_empty(), "left over: {:?}", cache.unread());
+
+        // Take the prefix away and the subtree is an omission again, which is
+        // what makes the call above load-bearing rather than decoration.
+        let fresh = Mapped::open(&path, "r", &[], &spec(), Precision::Q8).unwrap().unwrap();
+        fresh.vector("layers.0.input_layernorm.weight").unwrap();
+        fresh.skip("lm_head.weight");
+        assert_eq!(fresh.unread().len(), 2);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A file written before the stamp existed cannot be checked, and a check
+    /// that quietly does not apply is the thing being fixed. [`VERSION`] is what
+    /// retires those files; this is the belt to its braces.
+    #[test]
+    fn a_cache_with_no_tensor_list_is_not_read() {
+        let path = tmp("unstamped");
+        let w = Writer::create(&path).unwrap();
+        w.finish(header("r", &[], &spec(), Precision::Q8).unwrap()).unwrap();
+
+        let error = Mapped::open(&path, "r", &[], &spec(), Precision::Q8).err().unwrap();
+        assert!(error.to_string().contains("checkpoint"), "{error}");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
 }

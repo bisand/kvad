@@ -14,13 +14,20 @@
 //! underneath all three, and because the two things it has to tell apart —
 //! GPT-2's stored causal mask and a tied model's duplicate output head — live
 //! in different families.
+//!
+//! The last test is about the route that check could not see. A quantised cache
+//! file holds what the build that wrote it read and never opens a checkpoint
+//! again, so a build that learns to read one more *optional* weight asks a cache
+//! that has never heard of it and is answered `None` — the same silence, one
+//! remove away. Every cache file now stamps in the checkpoint's own tensor list
+//! so the same subtraction can be done against it.
 
 use kvad::model::{Json, Spec};
 use kvad::qcache::Live;
 use kvad::quant::Precision;
-use kvad::weights::Checkpoint;
+use kvad::weights::{Checkpoint, ModelFiles};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A tensor to write: `[rows, cols]`, or `[cols]` when `rows` is 1.
 struct Mat {
@@ -256,4 +263,98 @@ fn an_untied_gpt2_without_a_head_says_so() {
     let err = load_and_list("gpt2-headless", config, t)
         .expect_err("an untied GPT-2 with no `lm_head.weight` must not load");
     assert!(err.contains("lm_head.weight"), "unhelpful message: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// The same question, asked of a cache file
+// ---------------------------------------------------------------------------
+
+/// Take one tensor back out of a cache file, leaving the stamped checkpoint list
+/// alone: exactly the file a build that never read that tensor would have
+/// written.
+///
+/// The header may be rewritten in place at any length, because what fixes its
+/// position is the offset in the last eight bytes rather than the end of the
+/// file. The tensor's bytes stay where they are with nothing pointing at them,
+/// which is also what a real such file would look like — minus a few kilobytes
+/// nobody would have written.
+fn forget_from_cache(path: &Path, drop: &str) {
+    let bytes = std::fs::read(path).unwrap();
+    let n = bytes.len();
+    let at = u64::from_le_bytes(bytes[n - 8..].try_into().unwrap()) as usize;
+    let mut json: serde_json::Value = serde_json::from_slice(&bytes[at..n - 8]).unwrap();
+    let gone = json["tensors"].as_object_mut().unwrap().remove(drop);
+    assert!(gone.is_some(), "`{drop}` was not in the cache to begin with");
+
+    let mut out = bytes[..at].to_vec();
+    out.extend_from_slice(&serde_json::to_vec(&json).unwrap());
+    out.extend_from_slice(&(at as u64).to_le_bytes());
+    std::fs::write(path, out).unwrap();
+}
+
+/// A cache written by a build that read less than this one does must be rebuilt,
+/// not served.
+///
+/// This is the Qwen3 bug by its last route, end to end through the ordinary
+/// load. The first load quantises and records; the file is then edited into what
+/// the build before the per-head norms would have written; and the load after
+/// that has to notice, say which weight, and go back to the checkpoint — rather
+/// than run a model with two norms missing at full speed.
+#[test]
+fn a_cache_behind_the_code_is_rebuilt_not_served() {
+    let dir = std::env::temp_dir().join(format!("kvad-nq-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("KVAD_QUANT_CACHE", &dir);
+
+    let repo = "test/qwen3-cache";
+    let weights = dir.join("model.safetensors");
+    let (config, t) = qwen3(true);
+    write_safetensors(&weights, &t);
+    let spec = Spec::from_config(Json::new(config)).unwrap();
+    // `load` reads the weights and nothing else; the rest of a `ModelFiles` is
+    // the tokenizer's business.
+    let files = ModelFiles {
+        weights: vec![weights.clone()],
+        tokenizer: dir.join("tokenizer.json"),
+        config: dir.join("config.json"),
+        tokenizer_config: None,
+        generation_config: None,
+    };
+
+    let load = || {
+        let mut log: Vec<String> = Vec::new();
+        let model = kvad::qcache::load(repo, &files, &spec, Precision::Q8, &mut |m| {
+            log.push(m.to_string())
+        });
+        (model.map(|m| m.param_count()).map_err(|e| e.to_string()), log.join(" | "))
+    };
+
+    // First load: from the checkpoint, writing the cache on the way past.
+    let (first, log) = load();
+    assert!(log.contains("quantising"), "{log}");
+    assert!(log.contains("cached for next time"), "{log}");
+
+    // Second: mapped, and nothing to say about it.
+    let (second, log) = load();
+    assert_eq!(second, first);
+    assert!(log.contains("mapping"), "{log}");
+    assert!(!log.contains("stale"), "a cache this build wrote is not stale: {log}");
+
+    // Now make it the file an older build would have written.
+    let cache = kvad::qcache::path_for(repo, Precision::Q8);
+    forget_from_cache(&cache, "layers.0.self_attn.q_norm.weight");
+
+    let (third, log) = load();
+    assert_eq!(third, first, "the rebuilt model must be the model");
+    assert!(log.contains("stale"), "{log}");
+    assert!(log.contains("q_norm"), "it should say which weight: {log}");
+    assert!(log.contains("rebuilding"), "{log}");
+
+    // And the rebuild is a rebuild: the next load is quiet again.
+    let (fourth, log) = load();
+    assert_eq!(fourth, first);
+    assert!(log.contains("mapping") && !log.contains("stale"), "{log}");
+
+    std::env::remove_var("KVAD_QUANT_CACHE");
+    let _ = std::fs::remove_dir_all(&dir);
 }

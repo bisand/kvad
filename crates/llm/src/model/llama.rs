@@ -235,6 +235,12 @@ impl Transformer for Model {
     }
 
     fn param_count(&self) -> usize {
+        // The optional vectors count too, and they are where a family differs:
+        // Qwen2 has the attention biases and Qwen3 has the per-head norms. A
+        // count that skipped them would come out the same whether the model had
+        // them or not — the uncounted output head again, far smaller and
+        // just as wrong.
+        let opt = |v: &Option<Vec<f32>>| v.as_ref().map_or(0, Vec::len);
         let per_block = self.blocks.first().map_or(0, |b| {
             b.q_w.param_count()
                 + b.k_w.param_count()
@@ -245,6 +251,11 @@ impl Transformer for Model {
                 + b.down_w.param_count()
                 + b.attn_norm.len()
                 + b.mlp_norm.len()
+                + opt(&b.q_b)
+                + opt(&b.k_b)
+                + opt(&b.v_b)
+                + opt(&b.q_norm)
+                + opt(&b.k_norm)
         });
         self.embed.param_count()
             + self.lm_head.as_ref().map_or(0, |h| h.param_count())

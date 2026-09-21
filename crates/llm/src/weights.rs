@@ -47,7 +47,8 @@
 
 use crate::tensor::Tensor;
 use safetensors::{Dtype, SafeTensors};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -444,6 +445,92 @@ pub fn collapsed(names: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// What a checkpoint holds, and which of it a loader has asked for.
+///
+/// A weight nobody reads is a piece of the model that is not running, and
+/// nothing else notices: a loader asks for what it knows about, and a file has
+/// no opinion about the rest. That is how the GPU backend ran a Llama forward
+/// pass over a Qwen3 model at full speed, saying nothing. [`Audit::unread`] is
+/// the subtraction that ends it — what the file holds, minus what was asked
+/// for, minus the buffers in [`derived`] that no engine here reads on purpose.
+///
+/// It is built from a list of names rather than from a [`Checkpoint`] because
+/// there are two places that list can come from, and both need the same
+/// arithmetic: the checkpoint itself, when one is open, and the copy of its
+/// tensor list stamped into a quantised cache file, when it is not. Without the
+/// second the check has a blind spot the size of the cache — see
+/// [`crate::qcache::VERSION`].
+pub struct Audit {
+    have: HashSet<String>,
+    seen: RefCell<HashSet<String>>,
+}
+
+impl Audit {
+    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+        Audit { have: names.into_iter().collect(), seen: RefCell::new(HashSet::new()) }
+    }
+
+    /// Every name, sorted — for stamping one of these lists into a file, and
+    /// for reading it back out with `jq`.
+    pub fn names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.have.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// The spelling this list files `name` under, if it has it at all.
+    ///
+    /// Which spelling won is the whole point: a loader asks for
+    /// `layers.0.mlp.down_proj.weight` and the file answers to
+    /// `model.layers.0.mlp.down_proj.weight`, and only the latter can be
+    /// subtracted from [`Audit::names`].
+    fn resolve(&self, name: &str) -> Option<&str> {
+        spellings(name).into_iter().find_map(|c| self.have.get(c.as_str()).map(String::as_str))
+    }
+
+    /// Note that something asked about `name`.
+    ///
+    /// A name this list does not hold records nothing, which is right: there is
+    /// no such tensor here to leave unread.
+    pub fn saw(&self, name: &str) {
+        if let Some(key) = self.resolve(name) {
+            self.seen.borrow_mut().insert(key.to_string());
+        }
+    }
+
+    /// The same for a whole subtree at once, whatever prefix the file itself
+    /// puts in front of it.
+    ///
+    /// For naming a part of a model this build knowingly does not run. See
+    /// [`crate::qcache::Source::skip_under`].
+    pub fn saw_under(&self, prefix: &str) {
+        let want = spellings(prefix);
+        let under: Vec<String> = self
+            .have
+            .iter()
+            .filter(|n| want.iter().any(|w| n.starts_with(w.as_str())))
+            .cloned()
+            .collect();
+        self.seen.borrow_mut().extend(under);
+    }
+
+    /// Everything nothing asked about, derived buffers aside.
+    ///
+    /// Call it once the architecture has finished loading. Anything here is a
+    /// weight that is not running.
+    pub fn unread(&self) -> Vec<String> {
+        let seen = self.seen.borrow();
+        let mut left: Vec<String> = self
+            .have
+            .iter()
+            .filter(|n| !seen.contains(*n) && !derived(n))
+            .cloned()
+            .collect();
+        left.sort();
+        left
+    }
+}
+
 /// The spellings a checkpoint might file `name` under.
 ///
 /// GPT-2 saves `wte.weight` or `transformer.wte.weight` depending on which
@@ -490,23 +577,11 @@ impl Checkpoint {
     ///
     /// Checkpoints disagree about prefixes — GPT-2 saves `wte.weight` or
     /// `transformer.wte.weight` depending on which Python class wrote it — so a
-    /// few spellings are tried before giving up. Which one won matters to
-    /// anything comparing what was read against [`Checkpoint::names`], so the
-    /// search is its own function rather than a local in `try_get`.
+    /// few spellings are tried before giving up.
     pub fn resolve(&self, name: &str) -> Option<&str> {
         spellings(name)
             .into_iter()
             .find_map(|c| self.index.get_key_value(c.as_str()).map(|(k, _)| k.as_str()))
-    }
-
-    /// Every tensor filed somewhere under `prefix`, whatever prefix the file
-    /// itself puts in front of it.
-    ///
-    /// For naming a whole subtree at once — a part of a model this build
-    /// knowingly does not run. See [`crate::qcache::Source::skip_under`].
-    pub fn names_under(&self, prefix: &str) -> Vec<&str> {
-        let want = spellings(prefix);
-        self.names().filter(|n| want.iter().any(|w| n.starts_with(w.as_str()))).collect()
     }
 
     /// Look a tensor up, converting to `f32`.

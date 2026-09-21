@@ -650,6 +650,10 @@ impl GpuLlama {
 
     fn params(&self) -> usize {
         let n = |t: &Tensor| t.elem_count();
+        // As on the CPU: the optional vectors are exactly the ones that differ
+        // between Qwen2 and Qwen3, so leaving them out would report the same
+        // count for a model that has them and one that does not.
+        let opt = |t: &Option<Tensor>| t.as_ref().map_or(0, n);
         let blocks: usize = self
             .blocks
             .iter()
@@ -663,6 +667,11 @@ impl GpuLlama {
                     + b.down.params()
                     + n(&b.attn_norm)
                     + n(&b.mlp_norm)
+                    + opt(&b.q_b)
+                    + opt(&b.k_b)
+                    + opt(&b.v_b)
+                    + opt(&b.q_norm)
+                    + opt(&b.k_norm)
             })
             .sum();
         // A head that is not counted is a head nobody notices is missing. It
@@ -922,6 +931,8 @@ mod tests {
     /// the whole operation would still look close enough to pass.
     #[test]
     fn per_head_norms_agree_with_the_cpu_engine() {
+        use kvad::model::Transformer;
+
         let spec = tiny_spec();
         let d = Device::Cpu;
         let norms: Vec<(String, Tensor)> = ["q_norm", "k_norm"]
@@ -932,11 +943,30 @@ mod tests {
             })
             .collect();
         let path = write_tensors(&spec, false, &norms, "qk-norm");
+        // The same model without them, for the count below.
+        let plain = write_tensors(&spec, false, &[], "qk-norm-absent");
 
         let worst = engines_differ_by(&path, &spec, &[1, 2, 3]);
         assert!(worst < 1e-4, "logits disagree by {worst}");
 
+        // The norms are parameters, and both engines have to say so. A weight
+        // left out of the count is a weight nobody notices is missing — which
+        // is the shape of the bug this whole test is about, one field over.
+        let gpu = GpuLlama::load(
+            std::slice::from_ref(&path),
+            spec.clone(),
+            DType::F32,
+            None,
+            Device::Cpu,
+        )
+        .unwrap();
+        let cpu = cpu_model(&path, &spec);
+        assert_eq!(gpu.param_count(), cpu.param_count());
+        // And counted, not merely counted alike: two vectors per layer.
+        assert_eq!(cpu.param_count() - cpu_model(&plain, &spec).param_count(), 2 * spec.head_dim);
+
         std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&plain).unwrap();
     }
 
     /// A tied model's output head is its embedding table, whatever else the

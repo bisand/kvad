@@ -878,11 +878,11 @@ fn cache(args: Args) -> Res<()> {
         println!("nothing pre-quantised yet.");
         println!("the first `kvad run --quant q8` writes a file here; later runs map it.");
     } else {
-        println!("{:<46} {:<6} {:>10}", "MODEL", "QUANT", "SIZE");
+        println!("{:<44} {:<8} {:>10}", "MODEL", "QUANT", "SIZE");
         let mut total = 0;
         for (_, repo, precision, bytes) in &entries {
             let size = hub::human_bytes(*bytes);
-            println!("{:<46} {:<6} {:>10}", truncate(repo, 45), precision, size);
+            println!("{:<44} {:<8} {:>10}", truncate(repo, 43), precision, size);
             total += bytes;
         }
         println!("\n{} file(s), {}", entries.len(), hub::human_bytes(total));

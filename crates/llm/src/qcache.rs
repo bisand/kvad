@@ -487,7 +487,7 @@ enum Entry {
 
 /// A cache file, mapped.
 pub struct Mapped {
-    map: Arc<memmap2::Mmap>,
+    file: Container,
     entries: HashMap<String, Entry>,
     /// The checkpoint's tensor list as it was when this file was written,
     /// against what an architecture has since asked for.
@@ -511,24 +511,10 @@ impl Mapped {
         spec: &Spec,
         precision: Precision,
     ) -> Res<Option<Self>> {
-        if !path.exists() {
+        let Some(file) = Container::open(path)? else {
             return Ok(None);
-        }
-        let file = std::fs::File::open(path)?;
-        // SAFETY: read-only, and the same caveat as every other mmap here.
-        let map = unsafe { memmap2::Mmap::map(&file)? };
-        if map.len() < ALIGN + 8 || &map[..8] != MAGIC {
-            return Err("not a quantised-weight file".into());
-        }
-
-        // The header length lives in the last eight bytes; the header sits
-        // just before them.
-        let n = map.len();
-        let at = u64::from_le_bytes(map[n - 8..].try_into().unwrap()) as usize;
-        if at < ALIGN || at > n - 8 {
-            return Err("header offset is out of range".into());
-        }
-        let json: serde_json::Value = serde_json::from_slice(&map[at..n - 8])?;
+        };
+        let json = file.header();
 
         let want = header(repo, files, spec, precision)?;
         for key in ["version", "precision", "block", "repo", "spec", "sources"] {
@@ -551,12 +537,12 @@ impl Mapped {
             .map(|n| n.as_str().map(str::to_string).ok_or("`checkpoint` is not a list of names"))
             .collect::<Result<Vec<String>, _>>()?;
 
-        Ok(Some(Mapped { map: Arc::new(map), entries, audit: Audit::new(names) }))
+        Ok(Some(Mapped { file, entries, audit: Audit::new(names) }))
     }
 
     /// Bytes on disk.
     pub fn bytes(&self) -> usize {
-        self.map.len()
+        self.file.bytes()
     }
 
     fn build(&self, name: &str) -> Res<Weight> {
@@ -572,20 +558,20 @@ impl Mapped {
             Entry::Q8 { shape, scales, qs } => Weight::from_q8(
                 shape.0,
                 shape.1,
-                Store::mapped(&self.map, scales.0, scales.1)?,
-                Store::mapped(&self.map, qs.0, qs.1)?,
+                Store::mapped(self.file.map(), scales.0, scales.1)?,
+                Store::mapped(self.file.map(), qs.0, qs.1)?,
             ),
             Entry::Q4 { shape, scales, qs } => Weight::from_q4(
                 shape.0,
                 shape.1,
-                Store::mapped(&self.map, scales.0, scales.1)?,
-                Store::mapped(&self.map, qs.0, qs.1)?,
+                Store::mapped(self.file.map(), scales.0, scales.1)?,
+                Store::mapped(self.file.map(), qs.0, qs.1)?,
             ),
         }
     }
 
     fn f32s(&self, span: Span) -> Res<Store<f32>> {
-        Store::mapped(&self.map, span.0, span.1)
+        Store::mapped(self.file.map(), span.0, span.1)
     }
 
     /// Checkpoint tensors this file was written without, that something has
@@ -701,10 +687,88 @@ fn parse_entry(v: &serde_json::Value) -> Res<Entry> {
 }
 
 // ---------------------------------------------------------------------------
+// The container: the format, without an opinion about the payload
+// ---------------------------------------------------------------------------
+
+/// A cache file, checked and mapped, before anything has been made of it.
+///
+/// The format is one thing; what the arrays mean is another. This is the
+/// format — the magic, the trailing offset, the JSON header, and the rule that
+/// every array begins on an [`ALIGN`] boundary — and it has two payloads.
+/// [`Mapped`] reads this engine's own blocks out of one. The GPU backend
+/// stores candle's, which are different bytes in the same box.
+///
+/// Sharing exactly this much is deliberate. A second copy of the trailer
+/// arithmetic is a second place for it to be wrong; a second *format* would
+/// mean `kvad cache` could list only half of what is in its own directory.
+pub struct Container {
+    map: Arc<memmap2::Mmap>,
+    header: serde_json::Value,
+}
+
+impl Container {
+    /// Map `path`, or `Ok(None)` when there is no such file.
+    ///
+    /// `Err` means the file is there and is not one of ours. That is a
+    /// different thing from a file that is ours and is out of date: this looks
+    /// at the shape of the container and never at the meaning of the header,
+    /// which is the caller's to judge.
+    pub fn open(path: &Path) -> Res<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let file = std::fs::File::open(path)?;
+        // SAFETY: read-only, and the same caveat as every other mmap here.
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        if map.len() < ALIGN + 8 || &map[..8] != MAGIC {
+            return Err("not a quantised-weight file".into());
+        }
+
+        // The header length lives in the last eight bytes; the header sits
+        // just before them.
+        let n = map.len();
+        let at = u64::from_le_bytes(map[n - 8..].try_into().unwrap()) as usize;
+        if at < ALIGN || at > n - 8 {
+            return Err("header offset is out of range".into());
+        }
+        let header: serde_json::Value = serde_json::from_slice(&map[at..n - 8])?;
+        Ok(Some(Container { map: Arc::new(map), header }))
+    }
+
+    pub fn header(&self) -> &serde_json::Value {
+        &self.header
+    }
+
+    /// Bytes on disk.
+    pub fn bytes(&self) -> usize {
+        self.map.len()
+    }
+
+    /// The mapping itself, for a reader that hands out windows onto it.
+    pub fn map(&self) -> &Arc<memmap2::Mmap> {
+        &self.map
+    }
+
+    /// `len` bytes at `off`, if the file is long enough to hold them.
+    ///
+    /// The bounds check is the whole point. Offsets come out of a JSON header
+    /// that a truncated write or a foreign tool could have left inconsistent
+    /// with the data section, and the alternative to checking is a slice past
+    /// the end of a mapping, which is a segmentation fault rather than an
+    /// error message.
+    pub fn slice(&self, off: usize, len: usize) -> Res<&[u8]> {
+        let end = off.checked_add(len).ok_or("array span overflows")?;
+        self.map
+            .get(off..end)
+            .ok_or_else(|| format!("array at {off}..{end} runs past the end of the file").into())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The writer
 // ---------------------------------------------------------------------------
 
-struct Writer {
+pub struct Writer {
     file: std::io::BufWriter<std::fs::File>,
     tmp: PathBuf,
     final_path: PathBuf,
@@ -718,7 +782,7 @@ struct Writer {
 }
 
 impl Writer {
-    fn create(path: &Path) -> Res<Self> {
+    pub fn create(path: &Path) -> Res<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -749,6 +813,27 @@ impl Writer {
         self.file.write_all(bytes)?;
         self.at += bytes.len();
         Ok(serde_json::json!([off, v.len()]))
+    }
+
+    /// Append one blob of bytes, and say where it landed.
+    ///
+    /// What [`Writer::put_weight`] does for this engine's own arrays, for a
+    /// caller whose arrays this module has no opinion about: the GPU backend
+    /// hands over candle's quantised blocks, already packed, and describes
+    /// them in its own entry.
+    pub fn put_bytes(&mut self, v: &[u8]) -> Res<serde_json::Value> {
+        self.put(v)
+    }
+
+    /// Record one named entry in the header's tensor table.
+    pub fn set(&mut self, name: &str, entry: serde_json::Value) {
+        self.tensors.insert(name.to_string(), entry);
+    }
+
+    /// Whether this name has been written already — tied weights are stored
+    /// once and named twice.
+    pub fn has(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
     }
 
     fn put_weight(&mut self, name: &str, w: &Weight) -> Res<()> {
@@ -785,7 +870,7 @@ impl Writer {
     }
 
     /// Write the header, then its offset, then move the file into place.
-    fn finish(mut self, mut header: serde_json::Value) -> Res<u64> {
+    pub fn finish(mut self, mut header: serde_json::Value) -> Res<u64> {
         header["tensors"] = serde_json::Value::Object(std::mem::take(&mut self.tensors));
         let json = serde_json::to_vec(&header)?;
 
@@ -843,6 +928,18 @@ fn identify(path: &Path) -> Res<String> {
     Ok(format!("bytes:{} modified:{modified}", meta.len()))
 }
 
+/// Which checkpoint files this cache was built from, and which versions of
+/// them — the part of the header that decides whether a re-download has
+/// happened underneath us.
+pub fn sources(files: &[PathBuf]) -> Res<serde_json::Value> {
+    let mut sources = Vec::new();
+    for path in files {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        sources.push(serde_json::json!([name, identify(path)?]));
+    }
+    Ok(serde_json::Value::Array(sources))
+}
+
 /// Everything that has to match for a cache file to be reusable.
 fn header(
     repo: &str,
@@ -850,11 +947,7 @@ fn header(
     spec: &Spec,
     precision: Precision,
 ) -> Res<serde_json::Value> {
-    let mut sources = Vec::new();
-    for path in files {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        sources.push(serde_json::json!([name, identify(path)?]));
-    }
+    let sources = sources(files)?;
     Ok(serde_json::json!({
         "format": "nanollm-quant",
         "version": VERSION,
@@ -898,7 +991,17 @@ fn home() -> PathBuf {
 
 /// The cache file for one model at one precision.
 pub fn path_for(repo: &str, precision: Precision) -> PathBuf {
-    cache_root().join(file_name_for(repo, precision))
+    path_for_tag(repo, &precision.to_string())
+}
+
+/// The same, for a payload this module does not define.
+///
+/// `tag` is what `kvad cache` prints in its QUANT column and what keeps two
+/// backends' files apart in one directory: this engine writes `q8`, the GPU
+/// backend writes `gpu-q8`, and the bytes behind those two names have nothing
+/// to do with each other.
+pub fn path_for_tag(repo: &str, tag: &str) -> PathBuf {
+    cache_root().join(file_name_for(repo, tag))
 }
 
 /// A repo id becomes its own file name, which is what makes the directory
@@ -908,16 +1011,16 @@ pub fn path_for(repo: &str, precision: Precision) -> PathBuf {
 /// two different paths collide. So it is filed under its last component, for
 /// the human, and a hash of the whole path, for correctness. Nothing reads
 /// the model's name back out of the file name; the header has it.
-fn file_name_for(repo: &str, precision: Precision) -> String {
+fn file_name_for(repo: &str, tag: &str) -> String {
     let path = Path::new(repo);
     if !path.is_absolute() {
-        return format!("{}.{precision}.nq", repo.replace('/', "--"));
+        return format!("{}.{tag}.nq", repo.replace('/', "--"));
     }
     // FNV-1a: five lines, and unlike the standard library's hasher, promised
     // to give the same answer after the next compiler upgrade.
     let hash = repo.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
     let last = path.file_name().and_then(|n| n.to_str()).unwrap_or("model");
-    format!("local--{last}-{hash:016x}.{precision}.nq")
+    format!("local--{last}-{hash:016x}.{tag}.nq")
 }
 
 /// The model a cache file says it belongs to, read from its header.
@@ -970,7 +1073,9 @@ pub fn forget(repo: &str) -> usize {
         .count()
 }
 
-fn enabled() -> bool {
+/// One switch for every backend's cache, because somebody turning this off is
+/// turning off *the cache*, not one engine's half of it.
+pub fn enabled() -> bool {
     !matches!(std::env::var("KVAD_NO_QCACHE").as_deref(), Ok("1") | Ok("true"))
 }
 
@@ -1258,7 +1363,7 @@ mod tests {
 
     #[test]
     fn a_directory_is_filed_under_its_whole_path() {
-        let name = |repo: &str| file_name_for(repo, Precision::Q8);
+        let name = |repo: &str| file_name_for(repo, "q8");
         // Readable, and a legal file name however deep the directory is.
         let deep = format!("/{}/readme", "a-long-directory-name/".repeat(30));
         assert!(name(&deep).starts_with("local--readme-") && name(&deep).len() < 64, "{}", name(&deep));

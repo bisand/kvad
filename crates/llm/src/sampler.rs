@@ -16,7 +16,7 @@
 //!   it is confident.
 
 use crate::tensor::softmax_inplace;
-use nanograd::rng::Rng;
+use nervus::rng::Rng;
 
 pub struct Sampler {
     pub temperature: f32,

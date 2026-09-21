@@ -6,7 +6,7 @@
 # model tutorial trains on, so there are plenty of loss curves to compare
 # against. Any plain text file works just as well:
 #
-#     cargo run --release -p nanograd --bin train_text -- --data my.txt
+#     cargo run --release -p nervus --bin train_text -- --data my.txt
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

@@ -177,7 +177,7 @@ async fn options(_: Admin, St(state): St<State>) -> Result<Json<Options>, Fail> 
     let jobs = state.jobs.clone();
     let (continuable, training) =
         blocking(move || Ok((datasets::continuable_models(), jobs.training()))).await?;
-    let d = nanograd::text::Training::default();
+    let d = nervus::text::Training::default();
     Ok(Json(Options {
         sizes: kvad::train::SIZES.iter().map(|s| Size { name: s.name, shape: s.shape() }).collect(),
         continuable,
@@ -276,8 +276,8 @@ async fn start(
             }
         }
 
-        let d = nanograd::text::Training::default();
-        let training = nanograd::text::Training {
+        let d = nervus::text::Training::default();
+        let training = nervus::text::Training {
             steps: body.steps.unwrap_or(d.steps).clamp(1, 1_000_000),
             lr: body.lr.unwrap_or(d.lr),
             eval_every: body.eval_every.unwrap_or(d.eval_every).max(1),

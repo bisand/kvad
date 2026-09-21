@@ -1,4 +1,4 @@
-//! # nanograd
+//! # nervus
 //!
 //! A neural network, its training loop, and backpropagation, written from
 //! scratch with no dependencies at all.
@@ -18,7 +18,7 @@
 //! 11. [`checkpoint`] — a trained model on disk, laid out so that `kvad` can run it.
 //!     ([`json`] is there because it has to be; it teaches nothing about networks.)
 //!
-//! Then run `cargo test -p nanograd`: the gradient check in `nn` verifies the
+//! Then run `cargo test -p nervus`: the gradient check in `nn` verifies the
 //! hand-derived derivatives against numerically measured ones.
 
 pub mod attention;

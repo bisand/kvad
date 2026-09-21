@@ -209,7 +209,7 @@ class Training {
 
 export const training = new Training();
 
-/** Seconds as something to read. Mirrors `nanograd::text::human_secs`. */
+/** Seconds as something to read. Mirrors `nervus::text::human_secs`. */
 export function humanSecs(secs) {
   const s = Math.max(0, Math.round(secs));
   if (s < 60) return `${s}s`;

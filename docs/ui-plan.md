@@ -156,7 +156,7 @@ committed.
   `weights::Watcher` is an `Arc<dyn Fn>` where every other progress callback
   here is a `&mut dyn FnMut`.
 - Training takes a cancel flag: `train::Options::cancel`, copied into
-  `nanograd::text::Training::stop` and read once a step rather than once a
+  `nervus::text::Training::stop` and read once a step rather than once a
   checkpoint — checkpoints are hundreds of steps apart and a stop button that
   takes a minute to answer is one nobody believes. A stopped run reports
   `stopped: true` and leaves the best model it reached on disk, because saving
@@ -354,7 +354,7 @@ rather than pretending otherwise.
   scoring wants all of them. `forward_batch_all` runs the output head over the
   whole batch as one matmul, which measured about 430 tokens a second against
   114 for decoding — the same arithmetic, a quarter of the memory traffic. It
-  is checked against `nanograd`'s own logits at every position, which is the
+  is checked against `nervus`'s own logits at every position, which is the
   same second-implementation argument the checkpoint test rests on.
 - **A round visits every variant once**, and a run is several rounds. The
   alternative — five of A then five of B — blames the model for anything that
@@ -434,7 +434,7 @@ is a bug whatever else it proves.
 
 ## Testing
 
-- API tests run against a tiny `nanograd`-trained model, as the journey test
+- API tests run against a tiny `nervus`-trained model, as the journey test
   does, so CI needs no downloads. Built in Phase 6: `compare.rs` trains a
   two-layer GPT on "the cat sat on the mat", saves it, and runs a real prompt
   suite, a real benchmark and a real perplexity job against it through the

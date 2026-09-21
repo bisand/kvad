@@ -23,7 +23,7 @@
 //!
 //! Wherever a repo id is accepted, a directory is too: if the name given is a
 //! directory that exists, it is read in place and nothing is fetched. That is
-//! how a model trained by this repository's own `nanograd` gets here, and the
+//! how a model trained by this repository's own `nervus` gets here, and the
 //! rule — an existing directory wins over a repo of the same name — is the one
 //! `transformers` uses, so nobody has to learn a second one. The directory
 //! holds what a Hub repo would: `config.json`, `tokenizer.json`, and either

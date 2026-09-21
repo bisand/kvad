@@ -26,7 +26,7 @@ Five crates, meant to be read in order:
 
 | Crate | What it is | Dependencies |
 |---|---|---|
-| [`nanograd`](crates/nanograd) | A neural network and backpropagation, from scratch. Trains on MNIST. | **none** |
+| [`nervus`](crates/nervus) | A neural network and backpropagation, from scratch. Trains on MNIST. | **none** |
 | [`kvad`](crates/llm) | Transformer inference from scratch. Four architectures, real HuggingFace weights. | hub client, tokenizer, safetensors |
 | [`kvad-gpu`](crates/gpu) | The same Llama forward pass on the GPU, in candle. | candle (Metal/CUDA) |
 | [`kvad-tui`](crates/tui) | Terminal app: browse, download, activate, chat. | ratatui |
@@ -125,8 +125,8 @@ From a checkout, with Rust and (for the web UI) Node installed:
 ```bash
 ./scripts/get-mnist.sh
 cargo test                                      # includes a gradient check
-cargo run --release -p nanograd --bin train_mnist
-cargo run --release -p nanograd --bin train_text -- --data README.md
+cargo run --release -p nervus --bin train_mnist
+cargo run --release -p nervus --bin train_text -- --data README.md
 cargo run --release -p kvad -- train --data README.md --name readme
 cargo run --release -p kvad -- run --model readme --prompt "## "
 cargo run --release -p kvad -- run --prompt "Why is the sky blue?"
@@ -154,45 +154,45 @@ The sky appears blue because of the way our eyes detect light. [...]
 
 ---
 
-## Crate 1: `nanograd` — where the learning actually happens
+## Crate 1: `nervus` — where the learning actually happens
 
 Zero dependencies. Read in this order:
 
-1. **[`matrix.rs`](crates/nanograd/src/matrix.rs)** — three matrix products.
+1. **[`matrix.rs`](crates/nervus/src/matrix.rs)** — three matrix products.
    `A@B` forward, `Aᵀ@B` for weight gradients, `A@Bᵀ` for input gradients.
-2. **[`nn.rs`](crates/nanograd/src/nn.rs)** — the important one. Every layer
+2. **[`nn.rs`](crates/nervus/src/nn.rs)** — the important one. Every layer
    implements `forward(x) -> y` and `backward(dL/dy) -> dL/dx`. Chaining the
    second one backwards *is* backpropagation.
-3. **[`bin/train_mnist.rs`](crates/nanograd/src/bin/train_mnist.rs)** — the
+3. **[`bin/train_mnist.rs`](crates/nervus/src/bin/train_mnist.rs)** — the
    training loop: predict, score, blame, adjust.
-4. **[`attention.rs`](crates/nanograd/src/attention.rs)** — causal
+4. **[`attention.rs`](crates/nervus/src/attention.rs)** — causal
    self-attention, forward and backward. Read it after the rest: it is three
    `Linear` layers and two of the products from step 1, and the only new
    derivative in it is the softmax's.
-5. **[`norm.rs`](crates/nanograd/src/norm.rs)** — LayerNorm and RMSNorm. The
+5. **[`norm.rs`](crates/nervus/src/norm.rs)** — LayerNorm and RMSNorm. The
    forward pass is two lines; the file is about the backward pass, and the
    argument that gets you there without the algebra: a normalised row cannot
    see its input being shifted or stretched, so the gradient must have no
    component in those directions. LayerNorm ignores both and subtracts two
    projections. RMSNorm ignores only the stretch and subtracts one.
-6. **[`embedding.rs`](crates/nanograd/src/embedding.rs)** — token ids to
+6. **[`embedding.rs`](crates/nervus/src/embedding.rs)** — token ids to
    vectors. A lookup does not look differentiable, but it is a `Linear` layer
    fed one-hot rows with the multiplications by zero skipped, so its backward
    pass is `Linear`'s with the same shortcut: add each gradient row into the
    table row its token selected. Add, not assign — a token used three times is
    to blame three times.
-7. **[`block.rs`](crates/nanograd/src/block.rs)** — the residual connection,
+7. **[`block.rs`](crates/nervus/src/block.rs)** — the residual connection,
    `y = x + f(x)`, and the transformer block, which is two of them. The backward
    pass is `dx = dy + f.backward(dy)`, and the first term is the point: whatever
    the branch does to the gradient, `dy` also reaches the layer below untouched.
    One test makes it concrete — 24 layers that each pass back about a tenth of
    their gradient deliver 3e-22 of it in a chain, and 1.5 of it with the `x +`.
-8. **[`model.rs`](crates/nanograd/src/model.rs)** — a GPT. Token and position
+8. **[`model.rs`](crates/nervus/src/model.rs)** — a GPT. Token and position
    embeddings, a stack of blocks, a final norm, a head. Almost no new code,
    because almost nothing is new; what is new is why positions are needed at
    all, and how a model should be initialised so that it starts out ignorant
    rather than confidently wrong.
-9. **[`optim.rs`](crates/nanograd/src/optim.rs)** — AdamW. SGD has one learning
+9. **[`optim.rs`](crates/nervus/src/optim.rs)** — AdamW. SGD has one learning
    rate for a model whose gradients differ by orders of magnitude between
    tensors. Adam divides each parameter's gradient by how large that
    parameter's gradients usually are, and the size cancels: scale every
@@ -200,27 +200,27 @@ Zero dependencies. Read in this order:
    and consistency, and `lr` comes to mean "how far a parameter may move per
    step". It lives outside the layers — they own parameters and gradients, it
    owns its running averages — and reaches them through `params()`.
-10. **[`text.rs`](crates/nanograd/src/text.rs)** and
-    **[`bin/train_text.rs`](crates/nanograd/src/bin/train_text.rs)** — from a
+10. **[`text.rs`](crates/nervus/src/text.rs)** and
+    **[`bin/train_text.rs`](crates/nervus/src/bin/train_text.rs)** — from a
     text file to a model that writes. Nobody labels this data: the target at
     every position is the character that comes next, so one window of text is
     a whole batch of examples and a megabyte holds a million windows. Then
     generation, which is only "predict, draw, append, ask again" — and which
     recomputes every earlier position for every new character, the waste the
     KV cache in crate 2 exists to remove.
-11. **[`checkpoint.rs`](crates/nanograd/src/checkpoint.rs)** — the trained
+11. **[`checkpoint.rs`](crates/nervus/src/checkpoint.rs)** — the trained
     model on disk. A model is a list of named arrays of floats and nothing
     else, so the only decision in saving one is which names — and those are a
     contract with whoever reads the file. This crate uses GPT-2's, so what it
     writes is a GPT-2 checkpoint that crate 2 loads with the code it uses for
-    OpenAI's. ([`json.rs`](crates/nanograd/src/json.rs) is there because the
+    OpenAI's. ([`json.rs`](crates/nervus/src/json.rs) is there because the
     files are JSON and the crate has no dependencies. It teaches nothing about
     networks; skip it.)
 
 ### The test worth running first
 
 ```bash
-cargo test -p nanograd analytic_gradient_matches_numerical
+cargo test -p nervus analytic_gradient_matches_numerical
 ```
 
 It nudges one weight by ±0.001, measures how the loss actually moves, and checks
@@ -313,8 +313,8 @@ reaches 98%.
 
 ```bash
 ./scripts/get-text.sh        # tiny Shakespeare, 1.1 MB; or bring your own
-cargo run --release -p nanograd --bin train_text
-cargo run --release -p nanograd --bin train_text -- --data README.md
+cargo run --release -p nervus --bin train_text
+cargo run --release -p nervus --bin train_text -- --data README.md
 ```
 
 Any plain text works. The numbers below are from the second command — this
@@ -379,7 +379,7 @@ which is how every run in this repository worked before
 ### Keeping what it learned
 
 ```bash
-alias train_text="cargo run --release -p nanograd --bin train_text --"
+alias train_text="cargo run --release -p nervus --bin train_text --"
 train_text --data README.md --save out/readme
 train_text --load out/readme --steps 0 --prompt "## "     # just write
 train_text --load out/readme --data README.md --steps 500 --save out/more
@@ -396,8 +396,8 @@ Saving and loading back bit for bit is tested, and proves less than it seems
 to. A writer and a reader that share a misunderstanding — query and key in the
 wrong thirds of GPT-2's fused matrix, say — agree with each other perfectly.
 The only real test of a file format is a second implementation, and this
-repository has one: [a test in crate 2](crates/llm/tests/nanograd_checkpoint.rs)
-saves a `nanograd` model, loads it with the GPT-2 code written to run OpenAI's
+repository has one: [a test in crate 2](crates/llm/tests/nervus_checkpoint.rs)
+saves a `nervus` model, loads it with the GPT-2 code written to run OpenAI's
 weights, and requires the same logits at every position. They agree to 5e-7 of
 their size. Of 22 mistakes made on purpose, the round trip missed the ones made
 the same way in both directions; that test caught every one that touched the
@@ -444,7 +444,7 @@ computes, and so it may not reorder that sum; each addition waited for the one
 before it. The disassembly showed the multiplications vectorised four at a
 time and the additions done singly, in a chain. The fix is to say in the code
 that the order is free — keep eight running sums and add them up at the end
-([`matrix.rs`](crates/nanograd/src/matrix.rs)). Four sums did nothing; 16 and
+([`matrix.rs`](crates/nervus/src/matrix.rs)). Four sums did nothing; 16 and
 32 were slower than 8, because attention's vectors are 16 long and a chunk that
 does not fill falls to the slow loop. GELU was computing each `tanh` twice,
 forward and again backward, and now keeps it.
@@ -511,7 +511,7 @@ every seed is bad. The bad seed was the first sign of a ceiling the runs were
 already pressed against.
 
 That is the shape warm-up predicts. Read
-[`optim.rs`](crates/nanograd/src/optim.rs) on bias correction again: it exists
+[`optim.rs`](crates/nervus/src/optim.rs) on bias correction again: it exists
 so that the *first* step moves every parameter by the full `lr`, in the
 direction of a gradient estimated from one batch, and `v` is an average of one
 sample. Adam is at its most confident exactly when it knows least. Nothing
@@ -787,7 +787,7 @@ and a name may never have one. A directory still wins, which is the rule
 `transformers` uses.
 
 The training loop itself did not move house so much as move down a floor. It
-lives in [`nanograd::text::train`](crates/nanograd/src/text.rs) now, where
+lives in [`nervus::text::train`](crates/nervus/src/text.rs) now, where
 both front ends call it: `train_text` still takes `--layers`, `--d-model`,
 `--heads` and `--context` one at a time, for seeing what each of them does,
 and `kvad train` takes `--size` instead, along with `--warmup`, `--decay-to` and
@@ -916,8 +916,8 @@ code path as a model from the Hub — the same loader, tokeniser, KV cache and
 quantised kernels — so the 117K model gets `--quant q8` for free. (How fast it
 is cannot honestly be said: its context holds 64 tokens, the run is over in
 about 20 ms, and six of them measured anywhere from 970 to 5,600 tokens a
-second.) With sampling off, the engine and `nanograd` wrote the same 61
-characters for each of three trained models; [a test](crates/llm/tests/nanograd_checkpoint.rs)
+second.) With sampling off, the engine and `nervus` wrote the same 61
+characters for each of three trained models; [a test](crates/llm/tests/nervus_checkpoint.rs)
 makes that journey on every run, from a text to a trained model to a directory
 to the engine's output.
 
@@ -2194,7 +2194,7 @@ all generation ever wants, and every intermediate row is computed and dropped.
 Scoring text wants all of them. `forward_batch_all` runs the output head over
 the whole batch as one matmul instead: about 430 tokens a second, against 114
 for decoding — the same arithmetic, a quarter of the memory traffic. It is
-checked against `nanograd`'s own logits at every position, which is the same
+checked against `nervus`'s own logits at every position, which is the same
 second-implementation argument the checkpoint test rests on.
 
 ### Testing
@@ -2229,17 +2229,17 @@ have to show that it worked.
 
 **1. Train your own.** A character-level transformer, 10–30M parameters, on a
 corpus you pick. Backprop through attention
-([`attention.rs`](crates/nanograd/src/attention.rs)) and through LayerNorm and
-RMSNorm ([`norm.rs`](crates/nanograd/src/norm.rs)), and the embedding
-([`embedding.rs`](crates/nanograd/src/embedding.rs)), and the block that wires
+([`attention.rs`](crates/nervus/src/attention.rs)) and through LayerNorm and
+RMSNorm ([`norm.rs`](crates/nervus/src/norm.rs)), and the embedding
+([`embedding.rs`](crates/nervus/src/embedding.rs)), and the block that wires
 them together with GELU and residual connections
-([`block.rs`](crates/nanograd/src/block.rs)) are done, and so is the GPT that
-stacks them ([`model.rs`](crates/nanograd/src/model.rs)): gradient-checked end
+([`block.rs`](crates/nervus/src/block.rs)) are done, and so is the GPT that
+stacks them ([`model.rs`](crates/nervus/src/model.rs)): gradient-checked end
 to end, and able to memorise a sequence, as are AdamW
-([`optim.rs`](crates/nanograd/src/optim.rs)) and a training loop over a text
-file with sampling ([`text.rs`](crates/nanograd/src/text.rs)). So this step
+([`optim.rs`](crates/nervus/src/optim.rs)) and a training loop over a text
+file with sampling ([`text.rs`](crates/nervus/src/text.rs)). So this step
 works, at 117 thousand parameters rather than 10 million, and the result is
-saved as a GPT-2 checkpoint ([`checkpoint.rs`](crates/nanograd/src/checkpoint.rs))
+saved as a GPT-2 checkpoint ([`checkpoint.rs`](crates/nervus/src/checkpoint.rs))
 from which the `kvad` engine computes the same logits. What stands between the
 two sizes is speed, which is nine times what it was — about 190,000 characters
 a second across the cores — and still a hand-written loop on a CPU: a 10M
@@ -2247,7 +2247,7 @@ parameter model is some eighty times the arithmetic per character. Nothing
 stands between the two crates any more, nor between the two commands:
 `kvad train --data FILE --name NAME` trains, `kvad run --model NAME` runs, and
 `kvad ls` lists. Llama's SwiGLU and RoPE are not written. The gradient check from crate 1 is how
-you will debug each one — extend `nanograd` (hard, most educational) or use
+you will debug each one — extend `nervus` (hard, most educational) or use
 [`burn`](https://github.com/tracel-ai/burn).
 
 Step 1 also has better tooling than it did. A run is a job on the server now,

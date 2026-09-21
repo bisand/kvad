@@ -16,7 +16,7 @@
 //! 5. [`chat`]    — why an instruction-tuned model needs exact marker tokens.
 //! 6. [`quant`]   — making the weights smaller, and the kernels that read
 //!    them, then [`qcache`] — doing that work once instead of every load.
-//! 7. [`train`]   — `kvad train`, which is the `nanograd` crate's training
+//! 7. [`train`]   — `kvad train`, which is the `nervus` crate's training
 //!    loop with the models given names and a home.
 //! 8. [`service`] — the same engine driven from another thread, which is what
 //!    a terminal UI and a server both need.

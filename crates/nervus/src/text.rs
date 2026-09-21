@@ -728,7 +728,7 @@ mod tests {
     fn a_saved_tokeniser_gives_every_character_its_old_id() {
         let text = "tab\t newline\n \"quotes\" back\\slash \u{1} é → 😀";
         let tok = CharTokenizer::from_text(text);
-        let dir = std::env::temp_dir().join(format!("nanograd-tokeniser-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nervus-tokeniser-{}", std::process::id()));
         tok.save(&dir).unwrap();
         let back = CharTokenizer::load(&dir).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1068,7 +1068,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nanograd-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nervus-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

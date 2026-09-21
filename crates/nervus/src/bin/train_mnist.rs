@@ -1,12 +1,12 @@
 //! Train a multilayer perceptron to recognise handwritten digits.
 //!
-//!     cargo run --release -p nanograd --bin train_mnist
+//!     cargo run --release -p nervus --bin train_mnist
 //!
 //! Options: --epochs N --batch N --lr F --hidden N --seed N
 
-use nanograd::mnist;
-use nanograd::nn::{softmax_cross_entropy, Mlp};
-use nanograd::rng::Rng;
+use nervus::mnist;
+use nervus::nn::{softmax_cross_entropy, Mlp};
+use nervus::rng::Rng;
 use std::path::PathBuf;
 use std::time::Instant;
 

@@ -824,7 +824,7 @@ impl Drop for Writer {
 /// length.
 ///
 /// A file that is not a symlink is a model somebody put there, and the likely
-/// somebody is `nanograd`, saving over its last attempt. Size alone is
+/// somebody is `nervus`, saving over its last attempt. Size alone is
 /// useless for that: the size of a checkpoint is decided by the architecture,
 /// so a retrained model is the same length *to the byte*, and the cache
 /// happily served the weights of the model it replaced. So it is the size and

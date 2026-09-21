@@ -964,7 +964,7 @@ impl QActivation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nanograd::rng::Rng;
+    use nervus::rng::Rng;
 
     fn random_tensor(rows: usize, cols: usize, seed: u64) -> Tensor {
         let mut rng = Rng::new(seed);

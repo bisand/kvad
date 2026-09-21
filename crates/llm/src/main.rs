@@ -546,8 +546,8 @@ fn train_model(args: Args) -> Res<()> {
         }),
     };
 
-    let d = nanograd::text::Training::default();
-    let training = nanograd::text::Training {
+    let d = nervus::text::Training::default();
+    let training = nervus::text::Training {
         steps: args.steps.unwrap_or(d.steps),
         batch: args.batch.unwrap_or(d.batch),
         lr: args.lr.unwrap_or(d.lr),

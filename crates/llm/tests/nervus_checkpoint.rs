@@ -1,13 +1,13 @@
-//! A model saved by `nanograd` is a GPT-2 checkpoint, and this is the test
+//! A model saved by `nervus` is a GPT-2 checkpoint, and this is the test
 //! that says so.
 //!
-//! `nanograd` can save a model and load it back bit for bit, and that proves
+//! `nervus` can save a model and load it back bit for bit, and that proves
 //! less than it seems to: a writer and a reader that share a misunderstanding
 //! — query and key in the wrong thirds of the fused matrix, a head transposed
 //! the wrong way — agree with each other perfectly. The only real check of a
 //! file format is a second implementation. Here there is one: this crate's
 //! GPT-2, written to run OpenAI's weights and knowing nothing about
-//! `nanograd`. Both are handed the same tokens, and have to produce the same
+//! `nervus`. Both are handed the same tokens, and have to produce the same
 //! logits.
 
 use kvad::model::gpt2;
@@ -17,11 +17,11 @@ use kvad::quant::Precision;
 use kvad::runtime::Llm;
 use kvad::sampler::Sampler;
 use kvad::weights::{self, Checkpoint, ModelFiles};
-use nanograd::checkpoint;
-use nanograd::model::{Gpt, GptConfig};
-use nanograd::optim::AdamW;
-use nanograd::rng::Rng;
-use nanograd::text::{generate, train_step, CharTokenizer};
+use nervus::checkpoint;
+use nervus::model::{Gpt, GptConfig};
+use nervus::optim::AdamW;
+use nervus::rng::Rng;
+use nervus::text::{generate, train_step, CharTokenizer};
 use std::path::PathBuf;
 
 const CONFIG: GptConfig = GptConfig { vocab: 23, context: 12, d_model: 16, n_heads: 4, n_layers: 3 };
@@ -61,7 +61,7 @@ fn gap(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[test]
-fn the_engine_computes_what_nanograd_computes() {
+fn the_engine_computes_what_nervus_computes() {
     let dir = scratch("logits");
     let mut trained = model();
     checkpoint::save(&dir, &mut trained).unwrap();
@@ -96,7 +96,7 @@ fn the_engine_computes_what_nanograd_computes() {
 
     // The scoring path, which keeps every row rather than the last. It is the
     // same batch through the same blocks with the output head run over all of
-    // it, so every position must match what `nanograd` computed — and unlike
+    // it, so every position must match what `nervus` computed — and unlike
     // the two checks above, this one compares the whole matrix.
     let all = engine.forward_batch_all(&tokens, &mut KvCache::new(&spec));
     assert_eq!(all.len(), IDS.len() * spec.vocab_size);
@@ -109,7 +109,7 @@ fn the_engine_computes_what_nanograd_computes() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The same question about the tokeniser: `nanograd` writes a `tokenizer.json`
+/// The same question about the tokeniser: `nervus` writes a `tokenizer.json`
 /// and claims the `tokenizers` library reads it as a character tokeniser.
 #[test]
 fn the_tokenizers_library_agrees_on_every_id() {
@@ -117,7 +117,7 @@ fn the_tokenizers_library_agrees_on_every_id() {
     let dir = scratch("tokenizer");
     let ours = CharTokenizer::from_text(text);
     ours.save(&dir).unwrap();
-    let theirs = tokenizers::Tokenizer::from_file(dir.join(nanograd::text::TOKENIZER_FILE)).unwrap();
+    let theirs = tokenizers::Tokenizer::from_file(dir.join(nervus::text::TOKENIZER_FILE)).unwrap();
 
     let ids = ours.encode(text).unwrap();
     let encoded = theirs.encode(text, false).unwrap();

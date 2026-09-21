@@ -13,7 +13,7 @@
 //! resolve.
 use kvad::model::{attend, Json, Spec};
 use kvad::tensor::softmax_inplace;
-use nanograd::rng::Rng;
+use nervus::rng::Rng;
 use rayon::prelude::*;
 use std::time::Instant;
 

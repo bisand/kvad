@@ -18,7 +18,7 @@
 //! fix is one edit rather than a dozen rounds of the same message.
 
 use crate::db::Db;
-use nanograd::text::CharTokenizer;
+use nervus::text::CharTokenizer;
 use rusqlite::{params, OptionalExtension};
 use std::path::PathBuf;
 
@@ -287,7 +287,7 @@ mod tests {
         // reported only the first.
         let missing = unseen(name, "a cab, a zebra!").unwrap();
         assert_eq!(missing, ['!', ',', 'e', 'r', 'z'], "sorted, so the message reads the same way twice");
-        assert!(nanograd::text::CharTokenizer::load(&dir).unwrap().encode("a cab, a zebra!").is_err());
+        assert!(nervus::text::CharTokenizer::load(&dir).unwrap().encode("a cab, a zebra!").is_err());
 
         assert!(unseen("no/such/model", "x").is_err());
         std::fs::remove_dir_all(&dir).unwrap();

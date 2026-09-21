@@ -19,7 +19,7 @@ arch-deepseek = []
 hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
 memmap2 = "0.9.11"
 minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "serde"] }
-nanograd = { path = "../nanograd" }
+nervus = { path = "../nervus" }
 rayon = "1.10.0"
 safetensors = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }

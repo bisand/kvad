@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nanograd", "crates/llm", "crates/tui", "crates/gpu", "crates/serve"]
+members = ["crates/nervus", "crates/llm", "crates/tui", "crates/gpu", "crates/serve"]
 
 [workspace.package]
 # The one place a version number is written. Every crate inherits it with

@@ -64,7 +64,7 @@ pub struct Model {
     wpe: Weight,
     /// A separate output head, `[vocab, n_embd]`, and its bias. No GPT-2 that
     /// OpenAI released has either. A checkpoint written by this repository's
-    /// own `nanograd` has both, and says so with `tie_word_embeddings: false`.
+    /// own `nervus` has both, and says so with `tie_word_embeddings: false`.
     lm_head: Option<Weight>,
     lm_head_b: Option<Vec<f32>>,
     blocks: Vec<Block>,

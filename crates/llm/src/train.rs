@@ -1,9 +1,9 @@
 //! `kvad train`: a text file in, a model with a name out.
 //!
 //! The learning itself is not here. Every float that moves is moved by
-//! `nanograd`, which has no dependencies and is meant to be read; this module
+//! `nervus`, which has no dependencies and is meant to be read; this module
 //! is the part that turns a command line into a call to
-//! [`nanograd::text::train`] and the result into a model the rest of `kvad`
+//! [`nervus::text::train`] and the result into a model the rest of `kvad`
 //! can find by name.
 //!
 //! # A name, not a path
@@ -30,10 +30,10 @@
 //!   the first 50 steps that cost 0.06 and 0.04 of training loss on two seeds
 //!   and nothing on a third, with nothing visible by step 100.
 
-use nanograd::checkpoint;
-use nanograd::model::{Gpt, GptConfig};
-use nanograd::rng::Rng;
-use nanograd::text::{self, CharTokenizer, Corpus, Report, Training};
+use nervus::checkpoint;
+use nervus::model::{Gpt, GptConfig};
+use nervus::rng::Rng;
+use nervus::text::{self, CharTokenizer, Corpus, Report, Training};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// The largest corpus a run will take.
 ///
-/// `nanograd` holds the whole of it in memory as a `Vec<usize>`, eight bytes
+/// `nervus` holds the whole of it in memory as a `Vec<usize>`, eight bytes
 /// a character, so 64 MB of text is half a gigabyte before training starts.
 /// The limit is about this machine, not about taste — and it is here rather
 /// than beside either of the two things that enforce it, an upload and a
@@ -51,7 +51,7 @@ pub const MAX_CORPUS_BYTES: usize = 64 * 1024 * 1024;
 
 /// A model shape, under a name somebody might pick without reading a paper.
 ///
-/// Three sizes rather than five flags. `train_text` in `nanograd` still takes
+/// Three sizes rather than five flags. `train_text` in `nervus` still takes
 /// `--layers`, `--d-model`, `--heads` and `--context` one by one, for anyone
 /// who wants to see what each of them does.
 pub struct Size {
@@ -99,7 +99,7 @@ pub struct Options {
     pub sample: usize,
     pub temperature: f32,
     /// Raised from another thread to end the run early; see
-    /// [`nanograd::text::Training::stop`], which this is copied into. A
+    /// [`nervus::text::Training::stop`], which this is copied into. A
     /// command line leaves it `None` and uses Ctrl-C; a server cannot, because
     /// the run it is cancelling is one of several things the process is doing.
     pub cancel: Option<Arc<AtomicBool>>,

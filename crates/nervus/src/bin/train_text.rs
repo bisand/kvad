@@ -2,7 +2,7 @@
 //! learn to write.
 //!
 //!     ./scripts/get-text.sh
-//!     cargo run --release -p nanograd --bin train_text
+//!     cargo run --release -p nervus --bin train_text
 //!
 //! Any plain text file will do: `--data path/to/file.txt`.
 //!
@@ -35,13 +35,13 @@
 //! the validation loss improves, the directory is rewritten. See
 //! `text::Training` for why, and for what "best" means after a `--load`.
 //!
-//! This binary is the `nanograd` way in. The same loop, with trained models
+//! This binary is the `nervus` way in. The same loop, with trained models
 //! given names and a home of their own, is `kvad train`.
 
-use nanograd::checkpoint;
-use nanograd::model::{Gpt, GptConfig};
-use nanograd::rng::Rng;
-use nanograd::text::{
+use nervus::checkpoint;
+use nervus::model::{Gpt, GptConfig};
+use nervus::rng::Rng;
+use nervus::text::{
     evaluate, generate, human_secs, train, unigram_loss, CharTokenizer, Corpus, Report, Training,
 };
 use std::path::PathBuf;

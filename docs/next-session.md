@@ -3,7 +3,7 @@
 Written 2026-09-19, by the session that built `kvad train` and then measured
 the learning-rate schedule, on top of the handoff written at commit `45a323e`
 by the session before it. Read this whole
-file before touching anything, then read the README's "Crate 1: `nanograd`"
+file before touching anything, then read the README's "Crate 1: `nervus`"
 section, which records every measurement referred to here.
 
 ## What the owner wants
@@ -13,7 +13,7 @@ to use in terms of training new models or add new training sets to existing
 models, if that's even possible."* Everything below serves that sentence. Kvad
 has two jobs — teach how LLMs work from scratch, and be a serious inference
 engine — and the training track belongs to the first job. Hand-written
-arithmetic is preferred over frameworks; `nanograd` has zero dependencies and
+arithmetic is preferred over frameworks; `nervus` has zero dependencies and
 must keep zero.
 
 He directs the work one step at a time ("commit this, then do X next"). Do one
@@ -34,7 +34,7 @@ kvad ls ; kvad use shakespeare ; kvad rm shakespeare ; kvad-tui shakespeare
 
 | Piece | File | Commit |
 |---|---|---|
-| attention, norms, embedding, block, GPT, all with backward | `crates/nanograd/src/{attention,norm,embedding,block,model}.rs` | up to `dece24d` |
+| attention, norms, embedding, block, GPT, all with backward | `crates/nervus/src/{attention,norm,embedding,block,model}.rs` | up to `dece24d` |
 | AdamW, outside the layers | `optim.rs` | `288c559` |
 | tokeniser, windows, `train_step`, `generate`, `Replicas` | `text.rs` | `09a4770`, `45a323e` |
 | the training loop as a library function, best-model saving | `text.rs::train` | `510b077` |
@@ -42,7 +42,7 @@ kvad ls ; kvad use shakespeare ; kvad rm shakespeare ; kvad-tui shakespeare
 | safetensors + GPT-2 layout, `tokenizer.json`, `json.rs` | `checkpoint.rs`, `text.rs` | `d10c21b` |
 | engine loads a directory; stale-cache fix | `crates/llm/src/{weights,qcache,runtime,main}.rs` | `b8e70af` |
 | the models home, names, `kvad train` | `crates/llm/src/{weights,hub,train,main}.rs` | `510b077` |
-| cross-crate proof: same logits, same greedy text | `crates/llm/tests/nanograd_checkpoint.rs` | `d10c21b`, `b8e70af` |
+| cross-crate proof: same logits, same greedy text | `crates/llm/tests/nervus_checkpoint.rs` | `d10c21b`, `b8e70af` |
 | the same journey by name | `crates/llm/tests/trained_models.rs` | `510b077` |
 
 Numbers to measure against (M5 Pro, 6 fast + 12 slow cores, batch 16, medians
@@ -98,14 +98,14 @@ it never saw, where BPE with byte fallback has. Training BPE is a teaching
 chapter of its own, and `tokenizer.json` is already the right container: the
 character tokeniser is written as BPE with an empty merge list.
 
-**4. Llama's pieces in `nanograd`.** `RmsNorm` exists with its backward.
+**4. Llama's pieces in `nervus`.** `RmsNorm` exists with its backward.
 SwiGLU and RoPE do not. With them a model can be saved in Llama layout, which
 the GPU backend (`crates/gpu`, Llama only) can run.
 
 **5. LoRA on real models** — `kvad tune qwen2.5-0.5b --data chats.jsonl`, then
 `kvad chat --adapter`. This is what "custom model" means in practice, and it
 is the largest item. It needs: `read_safetensors` to read BF16 and F16 (it
-reads F32 only); loading a real checkpoint into `nanograd` (tied heads, Llama
+reads F32 only); loading a real checkpoint into `nervus` (tied heads, Llama
 layout, GQA); item 4's backward passes; low-rank adapters with frozen base
 weights; the chat template applied to training data. Work out the FLOPs
 honestly before promising anything — training cost is about
@@ -147,8 +147,8 @@ Still open from before:
   was fixed in `d10c21b`).
 - `crates/llm/src/quant.rs:125` has a broken doc link to `Weight::matvec`, so
   `cargo doc -p kvad` fails under `-D warnings`. Pre-existing clippy warnings
-  in `simd.rs`, `tensor.rs`, `quant.rs`, `model/mod.rs`, `nanograd/matrix.rs`,
-  `nanograd/nn.rs` and `main.rs`. This session added none.
+  in `simd.rs`, `tensor.rs`, `quant.rs`, `model/mod.rs`, `nervus/matrix.rs`,
+  `nervus/nn.rs` and `main.rs`. This session added none.
 - `kvad-tui DIR` builds and goes through the normal load path, but was never
   driven interactively.
 - In the engine a prompt character outside the vocabulary is dropped silently
@@ -198,9 +198,9 @@ foo` matches the shell command that is grepping for `foo`, so a
 `until ! pgrep -f script.py; do sleep; done` loop waits on itself forever; wait
 on a pid.
 
-**Docs teach.** Every `nanograd` file opens with "the one idea in this file",
+**Docs teach.** Every `nervus` file opens with "the one idea in this file",
 says why before how, and reports what was measured. Test names are sentences.
-Match the surrounding density. `nanograd` keeps zero dependencies.
+Match the surrounding density. `nervus` keeps zero dependencies.
 
 **The working tree may be shared** with another session — there was an
 untracked `docs/ui-plan.md` in it this time that belonged to someone else.

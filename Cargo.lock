@@ -2427,7 +2427,7 @@ dependencies = [
  "hf-hub",
  "memmap2",
  "minijinja",
- "nanograd",
+ "nervus",
  "rayon",
  "safetensors 0.8.0",
  "serde",
@@ -2458,7 +2458,7 @@ dependencies = [
  "kvad-gpu",
  "libc",
  "mime_guess",
- "nanograd",
+ "nervus",
  "openidconnect",
  "rusqlite",
  "rust-embed",
@@ -2786,7 +2786,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
-name = "nanograd"
+name = "nervus"
 version = "0.1.2"
 
 [[package]]

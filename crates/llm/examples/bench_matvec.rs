@@ -7,7 +7,7 @@
 
 use kvad::quant::{Precision, Weight};
 use kvad::tensor::Tensor;
-use nanograd::rng::Rng;
+use nervus::rng::Rng;
 use std::time::Instant;
 
 fn bench(label: &str, rows: usize, cols: usize) {

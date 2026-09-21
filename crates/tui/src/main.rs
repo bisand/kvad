@@ -3,7 +3,7 @@
 //!     cargo run --release -p kvad-tui
 //!     cargo run --release -p kvad-tui -- out/readme    # open with a model loading
 //!
-//! The argument is a repo id or a directory, such as one `nanograd`'s
+//! The argument is a repo id or a directory, such as one `nervus`'s
 //! `train_text --save` wrote.
 //!
 //! Three threads' worth of concerns, kept apart:

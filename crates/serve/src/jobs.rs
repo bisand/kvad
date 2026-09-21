@@ -10,7 +10,7 @@
 //!
 //! [`crate::scheduler`] exists because the *engine* can do one thing at a
 //! time and somebody has to own its channel. These jobs are not engine work —
-//! a download is network and disk, and training runs on `nanograd`'s own
+//! a download is network and disk, and training runs on `nervus`'s own
 //! threads — so putting them behind that queue would make a download wait for
 //! a generation for no reason. What they need instead is a place to live and
 //! a way to be watched, which is this.
@@ -580,7 +580,7 @@ pub fn train(
     let db = jobs.db.clone();
     std::thread::Builder::new()
         .name(format!("kvad-train-{id}"))
-        // `nanograd` recurses through the model twice per step and holds the
+        // `nervus` recurses through the model twice per step and holds the
         // graph on the stack; 8 MB for the same reason the engine thread has
         // it.
         .stack_size(8 * 1024 * 1024)

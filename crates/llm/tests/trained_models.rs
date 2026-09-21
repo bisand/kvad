@@ -3,7 +3,7 @@
 //!
 //! The test that matters is the last one: train through `kvad train`, then
 //! load the result by its bare name through the ordinary engine path and
-//! require the same characters out as `nanograd` writes. That is the journey
+//! require the same characters out as `nervus` writes. That is the journey
 //! a person makes, and it crosses every piece this feature touches — the
 //! models home, name resolution, the checkpoint, the tokeniser, and the
 //! engine's KV cache.
@@ -19,9 +19,9 @@ use kvad::runtime::Llm;
 use kvad::sampler::Sampler;
 use kvad::train;
 use kvad::weights;
-use nanograd::checkpoint;
-use nanograd::rng::Rng;
-use nanograd::text::{self, CharTokenizer};
+use nervus::checkpoint;
+use nervus::rng::Rng;
+use nervus::text::{self, CharTokenizer};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once};
@@ -66,7 +66,7 @@ fn options(data: PathBuf, name: &str) -> train::Options {
         name: Some(name.to_string()),
         sample: 0,
         seed: 3,
-        training: nanograd::text::Training {
+        training: nervus::text::Training {
             steps: 300,
             batch: 4,
             lr: 3e-3,
@@ -142,7 +142,7 @@ fn a_directory_that_exists_wins_over_a_name_and_a_name_over_the_hub() {
 }
 
 /// The whole of `kvad train --name NAME` followed by `kvad run --model NAME`:
-/// a text file in, and the engine writing the same characters `nanograd`
+/// a text file in, and the engine writing the same characters `nervus`
 /// writes from the same weights.
 #[test]
 fn a_model_trained_by_name_runs_by_name() {
@@ -160,7 +160,7 @@ fn a_model_trained_by_name_runs_by_name() {
     // It is listed, by name, as a model trained here rather than downloaded.
     assert!(kvad::hub::trained_models().iter().any(|m| m.id == name && m.complete));
 
-    // What `nanograd` writes from the saved weights...
+    // What `nervus` writes from the saved weights...
     let mut model = checkpoint::load(&summary.dir).unwrap();
     let tok = CharTokenizer::load(&summary.dir).unwrap();
     let prompt = "the cat";

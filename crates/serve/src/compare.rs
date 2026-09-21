@@ -568,16 +568,16 @@ mod tests {
 
     /// A real model, trained here, in about a second.
     ///
-    /// The plan asks for the API tests to run against a `nanograd`-trained
+    /// The plan asks for the API tests to run against a `nervus`-trained
     /// model rather than a downloaded one, so that CI needs no network and no
     /// gigabytes. Everything below this line is the real engine: the real
     /// loader, the real scheduler, the real tokenizer.
     pub fn tiny_model(name: &str) -> PathBuf {
         somewhere_harmless();
-        use nanograd::model::{Gpt, GptConfig};
-        use nanograd::optim::AdamW;
-        use nanograd::rng::Rng;
-        use nanograd::text::{train_step, CharTokenizer};
+        use nervus::model::{Gpt, GptConfig};
+        use nervus::optim::AdamW;
+        use nervus::rng::Rng;
+        use nervus::text::{train_step, CharTokenizer};
 
         let text = "the cat sat on the mat. ".repeat(40);
         let tok = CharTokenizer::from_text(&text);
@@ -595,7 +595,7 @@ mod tests {
         let dir = std::env::temp_dir()
             .join(format!("kvad-serve-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        nanograd::checkpoint::save(&dir, &mut model).unwrap();
+        nervus::checkpoint::save(&dir, &mut model).unwrap();
         tok.save(&dir).unwrap();
         dir
     }

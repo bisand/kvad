@@ -169,12 +169,12 @@ class Models {
     await this.refresh();
   }
 
-  async forgetQuantised(repo) {
+  /** One row of the quantised-weights table: this model at this precision. */
+  async forgetQuantised(repo, precision) {
+    const where = `repo=${encodeURIComponent(repo)}&precision=${encodeURIComponent(precision)}`;
     try {
-      const { files } = await api(`/api/qcache?repo=${encodeURIComponent(repo)}`, {
-        method: "DELETE",
-      });
-      toasts.info(`Threw away ${files} quantised file${files === 1 ? "" : "s"} for ${repo}.`);
+      await api(`/api/qcache?${where}`, { method: "DELETE" });
+      toasts.info(`Threw away the ${precision} weights for ${repo}.`);
     } catch (e) {
       toasts.error(e.message);
     }

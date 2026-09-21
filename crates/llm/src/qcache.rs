@@ -1065,11 +1065,29 @@ pub fn entries() -> Vec<(PathBuf, String, String, u64)> {
 }
 
 /// Delete every cache file belonging to `repo`. Returns how many went.
+///
+/// What a *model* going away means: `kvad rm` and the server's delete both
+/// call it, because weights derived from a checkpoint that is no longer there
+/// have nothing left to be checked against.
 pub fn forget(repo: &str) -> usize {
+    forget_where(|r, _| r == repo)
+}
+
+/// Delete one file: `repo` at one precision, by the tag [`entries`] reports.
+///
+/// Every row in a listing is its own file, so throwing one away should throw
+/// one away. The server's button used to call [`forget`] with whichever row
+/// was clicked, which deleted the model's q4 and q8 together — and now its
+/// `gpu-q8` as well, since a second backend files here too.
+pub fn forget_one(repo: &str, precision: &str) -> usize {
+    forget_where(|r, p| r == repo && p == precision)
+}
+
+fn forget_where(want: impl Fn(&str, &str) -> bool) -> usize {
     entries()
         .into_iter()
-        .filter(|(_, r, _, _)| r == repo)
-        .filter(|(p, _, _, _)| std::fs::remove_file(p).is_ok())
+        .filter(|(_, repo, precision, _)| want(repo, precision))
+        .filter(|(path, ..)| std::fs::remove_file(path).is_ok())
         .count()
 }
 
@@ -1205,6 +1223,48 @@ mod tests {
         let p = std::env::temp_dir().join(format!("nq-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// `KVAD_QUANT_CACHE` is one variable for the whole process, so the tests
+    /// that redirect it take turns.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A cache directory of this test's own, and the root pointed at it until
+    /// the guard goes.
+    struct Root {
+        path: PathBuf,
+        _turn: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Root {
+        fn new(name: &str) -> Self {
+            // A poisoned lock means another test panicked, not that this
+            // directory is unusable.
+            let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            let path =
+                std::env::temp_dir().join(format!("nq-root-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            std::env::set_var("KVAD_QUANT_CACHE", &path);
+            Root { path, _turn: turn }
+        }
+
+        /// An empty but well-formed cache file for `repo` at `tag`.
+        fn put(&self, repo: &str, tag: &str) -> PathBuf {
+            let path = path_for_tag(repo, tag);
+            let w = Writer::create(&path).unwrap();
+            let mut h = header(repo, &[], &spec(), Precision::Q8).unwrap();
+            h["precision"] = serde_json::json!(tag);
+            w.finish(stamped(h, &[])).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            std::env::remove_var("KVAD_QUANT_CACHE");
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     fn spec() -> Spec {
@@ -1355,10 +1415,62 @@ mod tests {
 
     #[test]
     fn cache_paths_are_derived_from_the_repo_id() {
-        std::env::set_var("KVAD_QUANT_CACHE", "/tmp/qc");
+        let root = Root::new("paths");
         let p = path_for("Qwen/Qwen2.5-0.5B-Instruct", Precision::Q8);
-        assert_eq!(p, PathBuf::from("/tmp/qc/Qwen--Qwen2.5-0.5B-Instruct.q8.nq"));
-        std::env::remove_var("KVAD_QUANT_CACHE");
+        assert_eq!(p, root.path.join("Qwen--Qwen2.5-0.5B-Instruct.q8.nq"));
+        assert_eq!(
+            path_for_tag("Qwen/Qwen2.5-0.5B-Instruct", "gpu-q8"),
+            root.path.join("Qwen--Qwen2.5-0.5B-Instruct.gpu-q8.nq"),
+        );
+    }
+
+    /// Forgetting one row forgets one file.
+    ///
+    /// Every entry in a listing is its own file, and the server's button used
+    /// to hand whichever row was clicked to [`forget`] — which deletes the
+    /// model's q4 and q8 together, and, since the GPU backend started filing
+    /// here too, its `gpu-q8` with them. Three rows vanishing when one was
+    /// clicked is a small loss (they rebuild) and a confusing one.
+    #[test]
+    fn forgetting_one_precision_leaves_the_others() {
+        let root = Root::new("forget");
+        let mine = "someone/a-model";
+        let other = "someone/another";
+        for (repo, tag) in
+            [(mine, "q4"), (mine, "q8"), (mine, "gpu-q8"), (other, "q8"), (other, "gpu-q8")]
+        {
+            root.put(repo, tag);
+        }
+        let listed = |repo: &str| -> Vec<String> {
+            let mut tags: Vec<String> = entries()
+                .into_iter()
+                .filter(|(_, r, ..)| r == repo)
+                .map(|(_, _, precision, _)| precision)
+                .collect();
+            tags.sort();
+            tags
+        };
+        assert_eq!(listed(mine), ["gpu-q8", "q4", "q8"]);
+
+        // The GPU file and the CPU file of the same name are two files, and
+        // one of them is what was asked for.
+        assert_eq!(forget_one(mine, "gpu-q8"), 1);
+        assert_eq!(listed(mine), ["q4", "q8"]);
+        assert_eq!(forget_one(mine, "q8"), 1);
+        assert_eq!(listed(mine), ["q4"]);
+
+        // Another model's files were never in question.
+        assert_eq!(listed(other), ["gpu-q8", "q8"]);
+
+        // A row that has already gone deletes nothing rather than everything.
+        assert_eq!(forget_one(mine, "q8"), 0);
+        assert_eq!(listed(mine), ["q4"]);
+
+        // And forgetting the *model* still takes all of it, which is what
+        // deleting a checkpoint means.
+        assert_eq!(forget(mine), 1);
+        assert!(listed(mine).is_empty());
+        assert_eq!(listed(other), ["gpu-q8", "q8"]);
     }
 
     #[test]

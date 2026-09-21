@@ -170,9 +170,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         method: "delete", path: "/api/qcache", tag: "Models", access: Access::Admin,
-        summary: "Forget pre-quantised weights",
-        description: "They rebuild on the next load, more slowly. Nothing is lost but time.",
-        query: &[("repo", true, "The model whose cached weights to delete.")],
+        summary: "Forget one file of pre-quantised weights",
+        description: "One model at one precision, which is one file. It rebuilds on the \
+                      next load at that precision, more slowly. Nothing is lost but time.",
+        query: &[
+            ("repo", true, "The model whose cached weights to delete."),
+            ("precision", true, "Which file, by the tag the listing shows: `q8`, `gpu-q4`."),
+        ],
         body: None, produces: JSON, events: &[],
     },
 

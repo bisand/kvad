@@ -321,7 +321,8 @@
       <h2 class="mb-1 text-sm font-medium opacity-60">Quantised weights</h2>
       <p class="mb-2 text-xs opacity-60">
         Weights quantised once and reused, so a load maps a file instead of recomputing.
-        Deleting one costs the next load some seconds and nothing else.
+        Each row is a file of its own; forgetting one costs the next load at that precision
+        some seconds and nothing else.
       </p>
       <div class="overflow-x-auto">
         <table class="table table-sm">
@@ -332,7 +333,10 @@
                 <td class="whitespace-nowrap"><span class="badge badge-sm">{q.precision}</span></td>
                 <td class="text-sm whitespace-nowrap opacity-70">{humanBytes(q.bytes)}</td>
                 <td class="text-right">
-                  <button class="btn btn-xs btn-ghost" onclick={() => models.forgetQuantised(q.repo)}>
+                  <button
+                    class="btn btn-xs btn-ghost"
+                    onclick={() => models.forgetQuantised(q.repo, q.precision)}
+                  >
                     Forget
                   </button>
                 </td>

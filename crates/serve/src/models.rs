@@ -488,17 +488,36 @@ pub async fn remove(
 #[derive(serde::Deserialize)]
 pub struct RepoQuery {
     repo: String,
+    /// Which of that model's files, by the tag the listing shows: `q8`,
+    /// `gpu-q4`.
+    ///
+    /// Required, and deliberately. Every row in the listing is its own file,
+    /// and an endpoint that deletes all of them when a caller forgets a
+    /// parameter is the bug this field exists to close — the button used to
+    /// send the repo alone, so throwing away one row threw away every
+    /// precision that model had been quantised at.
+    precision: String,
 }
 
-/// Throw away the pre-quantised weights for a model. They rebuild on the next
-/// load, more slowly; nothing is lost but time.
+/// Throw away one file of pre-quantised weights: a model at one precision.
+/// It rebuilds on the next load at that precision, more slowly; nothing is
+/// lost but time.
 pub async fn forget_qcache(
     _: Admin,
     Query(query): Query<RepoQuery>,
 ) -> Result<Json<serde_json::Value>, Fail> {
-    let repo = query.repo.clone();
-    let files = blocking(move || Ok(kvad::qcache::forget(&repo))).await?;
-    Ok(Json(json!({ "repo": query.repo, "files": files })))
+    let (repo, precision) = (query.repo.clone(), query.precision.clone());
+    let files = blocking(move || Ok(kvad::qcache::forget_one(&repo, &precision))).await?;
+    if files == 0 {
+        // The row came from a listing, so nothing there means somebody else
+        // got to it first. Saying so beats reporting a deletion that did not
+        // happen.
+        return Err(Fail::missing(format!(
+            "there is no {} cache for {}",
+            query.precision, query.repo
+        )));
+    }
+    Ok(Json(json!({ "repo": query.repo, "precision": query.precision, "files": files })))
 }
 
 /// One SSE event, named, carrying JSON.

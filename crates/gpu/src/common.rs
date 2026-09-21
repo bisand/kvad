@@ -132,16 +132,32 @@ pub(crate) fn dense_embedding() -> bool {
 pub(crate) struct Reader<'a> {
     vb: VarBuilder<'a>,
     seen: Rc<RefCell<HashSet<String>>>,
+    /// Whole subtrees this backend knows about and does not implement, by the
+    /// prefix the checkpoint files them under.
+    ///
+    /// By prefix rather than by name because the alternative is a list of those
+    /// tensors kept in this crate, and a list that has to be remembered is what
+    /// went wrong in the first place. DeepSeek V3's multi-token-prediction head
+    /// is the case this exists for.
+    skipped: Rc<RefCell<Vec<String>>>,
 }
 
 impl<'a> Reader<'a> {
     pub(crate) fn new(vb: VarBuilder<'a>) -> Self {
-        Reader { vb, seen: Rc::new(RefCell::new(HashSet::new())) }
+        Reader {
+            vb,
+            seen: Rc::new(RefCell::new(HashSet::new())),
+            skipped: Rc::new(RefCell::new(Vec::new())),
+        }
     }
 
     /// Descend into a prefix, keeping the shared record.
     pub(crate) fn pp(&self, s: impl std::fmt::Display) -> Self {
-        Reader { vb: self.vb.pp(s.to_string()), seen: Rc::clone(&self.seen) }
+        Reader {
+            vb: self.vb.pp(s.to_string()),
+            seen: Rc::clone(&self.seen),
+            skipped: Rc::clone(&self.skipped),
+        }
     }
 
     /// The name this read is really about, prefixes and all — the spelling the
@@ -188,10 +204,21 @@ impl<'a> Reader<'a> {
         self.get(shape, name).ok()
     }
 
+    /// Note a whole subtree this backend deliberately does not implement.
+    ///
+    /// `prefix` is relative to this reader, so a prefix under `model` reads the
+    /// same here as the names around it do.
+    pub(crate) fn skip_under(&self, prefix: &str) {
+        self.skipped.borrow_mut().push(self.full(prefix));
+    }
+
     pub(crate) fn seen(&self) -> HashSet<String> {
         self.seen.borrow().clone()
     }
 
+    pub(crate) fn skipped(&self) -> Vec<String> {
+        self.skipped.borrow().clone()
+    }
 }
 
 /// Tensors the checkpoint holds that nothing in [`GpuLlama::load`] asked for.
@@ -201,11 +228,16 @@ impl<'a> Reader<'a> {
 /// the file rather than from a list kept in this crate, which is the whole
 /// point: a list would have to be remembered, and forgetting is what went
 /// wrong.
-pub(crate) fn unread(paths: &[std::path::PathBuf], seen: &HashSet<String>) -> Res<Vec<String>> {
+pub(crate) fn unread(
+    paths: &[std::path::PathBuf],
+    seen: &HashSet<String>,
+    skipped: &[String],
+) -> Res<Vec<String>> {
     let ckpt = kvad::weights::Checkpoint::open(paths)?;
     let mut left: Vec<String> = ckpt
         .names()
         .filter(|n| !seen.contains(*n) && !kvad::weights::derived(n))
+        .filter(|n| !skipped.iter().any(|p| n.starts_with(p.as_str())))
         .map(str::to_string)
         .collect();
     left.sort();

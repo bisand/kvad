@@ -269,7 +269,7 @@ impl GpuLlama {
 
         // Everything has been read, so anything left in the file is a part of
         // this model that is not running.
-        let left = unread(paths, &vb.seen())?;
+        let left = unread(paths, &vb.seen(), &vb.skipped())?;
         if !left.is_empty() {
             return Err(unread_error("llama", &left).into());
         }
@@ -556,6 +556,10 @@ pub fn session(
     if arch.is("gpt2") {
         return Ok(Box::new(crate::gpt2::GpuGpt2::load(paths, spec.clone(), dtype, quant, device)?));
     }
+    if arch.is("deepseek_v2") {
+        let m = crate::deepseek::GpuDeepSeek::load(paths, spec.clone(), dtype, quant, device)?;
+        return Ok(Box::new(m));
+    }
     Err(format!(
         "the GPU backend implements {}; `{arch}` is not one of them.\n\
          Run it on the CPU engine instead:  kvad run",
@@ -567,7 +571,7 @@ pub fn session(
 /// The architectures this backend can run, for an error message that does not
 /// have to be kept in step by hand.
 pub fn supported() -> String {
-    "the Llama family and GPT-2".to_string()
+    "the Llama family, GPT-2 and DeepSeek V2/V3".to_string()
 }
 
 /// Pick the best device available, unless one was named.

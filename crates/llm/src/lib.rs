@@ -25,6 +25,14 @@
 //! the way a corpus gets made out of a documentation site and the way the
 //! part of it that answers a question gets found again.
 
+/// The `serde_json` this crate was built against.
+///
+/// [`model::Json::new`] takes a `serde_json::Value`, so anything constructing a
+/// [`model::Spec`] by hand needs the crate — and needs *this* copy of it, since
+/// two versions of `serde_json` in one build are two unrelated `Value` types
+/// that do not convert. Re-exported so a caller cannot pick the wrong one.
+pub use serde_json;
+
 pub mod chat;
 pub mod crawl;
 pub mod hub;

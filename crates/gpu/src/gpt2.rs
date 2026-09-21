@@ -225,7 +225,7 @@ impl GpuGpt2 {
 
         let ln_f = norm(&vb, "ln_f")?;
 
-        let left = unread(paths, &vb.seen())?;
+        let left = unread(paths, &vb.seen(), &vb.skipped())?;
         if !left.is_empty() {
             return Err(unread_error("gpt2", &left).into());
         }

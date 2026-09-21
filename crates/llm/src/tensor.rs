@@ -351,6 +351,17 @@ pub struct Rope {
 }
 
 impl Rope {
+    /// The tables themselves: cosines, sines, and the width of one row.
+    ///
+    /// For a backend that rotates with somebody else's kernel and needs the
+    /// numbers rather than the loop. What must not be duplicated is how the
+    /// frequencies were *chosen* — YaRN's interpolation is a property of the
+    /// model, and a second implementation of it is a second thing to get
+    /// wrong — so this hands over the answer.
+    pub fn tables(&self) -> (&[f32], &[f32], usize) {
+        (&self.cos, &self.sin, self.half)
+    }
+
     pub fn new(head_dim: usize, max_positions: usize, theta: f32) -> Self {
         let half = head_dim / 2;
         let mut cos = Vec::with_capacity(max_positions * half);

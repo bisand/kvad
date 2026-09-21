@@ -107,27 +107,27 @@ pub static V3: Architecture = Architecture {
 
 /// The dimensions MLA has and ordinary attention does not.
 #[derive(Debug, Clone, Copy)]
-struct Mla {
-    n_head: usize,
+pub struct Mla {
+    pub n_head: usize,
     /// Per head, the part of the query and key that carries content and is
     /// absorbed into the projection matrices.
-    qk_nope: usize,
+    pub qk_nope: usize,
     /// Per head, the part that carries position and is rotated. Shared by
     /// every head on the key side — one rotated vector per position, not one
     /// per head.
-    qk_rope: usize,
-    v_head: usize,
+    pub qk_rope: usize,
+    pub v_head: usize,
     /// Width of the compressed vector that is all the cache holds.
-    kv_lora: usize,
+    pub kv_lora: usize,
     /// V3 compresses the query too, through a rank of this width, to save
     /// parameters. V2-Lite does not (`q_lora_rank: null`).
-    q_lora: Option<usize>,
+    pub q_lora: Option<usize>,
     /// `1/sqrt(qk_nope + qk_rope)`, times YaRN's correction when there is one.
-    softmax_scale: f32,
+    pub softmax_scale: f32,
 }
 
 impl Mla {
-    fn read(config: &Json, n_head: usize) -> Res<Self> {
+    pub fn read(config: &Json, n_head: usize) -> Res<Self> {
         let qk_nope = config.need("qk_nope_head_dim")?;
         let qk_rope = config.need("qk_rope_head_dim")?;
         let mut softmax_scale = 1.0 / ((qk_nope + qk_rope) as f32).sqrt();
@@ -159,8 +159,36 @@ impl Mla {
 
     /// Width of one head's query: content part then position part, in that
     /// order, which is how the checkpoint stores it.
-    fn q_head(&self) -> usize {
+    pub fn q_head(&self) -> usize {
         self.qk_nope + self.qk_rope
+    }
+}
+
+/// Which layers are a mixture and which are an ordinary MLP.
+///
+/// Public because a second backend has to reach the same answer, and reading
+/// three config keys in two places is how two backends come to disagree about
+/// what a checkpoint contains.
+pub struct Layout {
+    /// The first few layers are ordinary. The router needs a residual stream
+    /// that already means something, and at layer zero it does not.
+    pub first_dense: usize,
+    pub moe_every: usize,
+    pub n_shared: usize,
+}
+
+impl Layout {
+    pub fn read(config: &Json) -> Self {
+        Layout {
+            first_dense: config.num(&["first_k_dense_replace"]).unwrap_or(0),
+            moe_every: config.num(&["moe_layer_freq"]).unwrap_or(1).max(1),
+            n_shared: config.num(&["n_shared_experts"]).unwrap_or(0),
+        }
+    }
+
+    /// Whether layer `i` routes.
+    pub fn is_moe(&self, i: usize, n_experts: usize) -> bool {
+        n_experts > 0 && i >= self.first_dense && i % self.moe_every == 0
     }
 }
 
@@ -226,7 +254,7 @@ fn correction_dim(rotations: f32, dim: usize, base: f32, trained: f32) -> f32 {
 /// This is why a 4k model reads 160k: not by being told a bigger number, but
 /// by moving only the frequencies that would otherwise be extrapolated past
 /// anything they were trained on.
-fn build_rope(dim: usize, max_positions: usize, theta: f32, config: &Json) -> Res<Rope> {
+pub fn build_rope(dim: usize, max_positions: usize, theta: f32, config: &Json) -> Res<Rope> {
     let half = dim / 2;
     let extra: Vec<f32> = (0..half)
         .map(|i| 1.0 / theta.powf(2.0 * i as f32 / dim as f32))
@@ -319,9 +347,9 @@ enum Select {
 
 /// How a token's experts are chosen, and with what weights.
 #[derive(Debug, Clone)]
-struct Router {
-    n_experts: usize,
-    top_k: usize,
+pub struct Router {
+    pub n_experts: usize,
+    pub top_k: usize,
     n_group: usize,
     topk_group: usize,
     scoring: Scoring,
@@ -335,7 +363,7 @@ struct Router {
 }
 
 impl Router {
-    fn read(spec: &Spec) -> Res<Self> {
+    pub fn read(spec: &Spec) -> Res<Self> {
         let c = &spec.config;
         let scoring = match c.text("scoring_func").unwrap_or("softmax") {
             "softmax" => Scoring::Softmax,
@@ -362,7 +390,7 @@ impl Router {
     }
 
     /// Which experts run for one token, and how much each one counts.
-    fn route(&self, logits: &[f32], bias: Option<&[f32]>, out: &mut Vec<(usize, f32)>) {
+    pub fn route(&self, logits: &[f32], bias: Option<&[f32]>, out: &mut Vec<(usize, f32)>) {
         let mut scores = logits.to_vec();
         match self.scoring {
             Scoring::Softmax => softmax_inplace(&mut scores),
@@ -559,9 +587,7 @@ impl Model {
         let mla = Mla::read(&spec.config, spec.n_head)?;
         let router = Router::read(&spec)?;
         let c = &spec.config;
-        let first_dense = c.num(&["first_k_dense_replace"]).unwrap_or(0);
-        let moe_every = c.num(&["moe_layer_freq"]).unwrap_or(1).max(1);
-        let n_shared = c.num(&["n_shared_experts"]).unwrap_or(0);
+        let Layout { first_dense, moe_every, n_shared } = Layout::read(c);
 
         let mut blocks = Vec::with_capacity(spec.n_layer);
         for i in 0..spec.n_layer {
@@ -598,7 +624,7 @@ impl Model {
                 o: src.matrix(&p("self_attn.o_proj.weight"))?,
             };
 
-            let is_moe = router.n_experts > 0 && i >= first_dense && i % moe_every == 0;
+            let is_moe = Layout { first_dense, moe_every, n_shared }.is_moe(i, router.n_experts);
             let mlp = match is_moe {
                 false => Mlp::Dense(Ffn::load(src, &p("mlp"))?),
                 true => Mlp::Moe(Moe {

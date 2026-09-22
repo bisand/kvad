@@ -33,7 +33,11 @@ openidconnect = { version = "4.0.1", default-features = false, features = ["reqw
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = "8.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# `preserve_order` so a client's tool schemas keep the order it sent them in,
+# all the way to the prompt. The reason is written out in `kvad`'s manifest,
+# which renders them; this is where they are parsed, and the sorting would
+# happen here.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 subtle = "2.6.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net"] }

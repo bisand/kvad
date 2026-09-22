@@ -22,12 +22,23 @@ memmap2 = "0.9.11"
 # out with the `tojson` filter, and without the feature the render fails at
 # request time with "unknown filter" — on the one code path a plain
 # conversation never reaches.
-minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "json", "serde"] }
+#
+# `preserve_order` for the same filter, and it takes both this and
+# serde_json's: the schema is parsed by one and rendered by the other, and
+# either one's default map sorts the keys before the model sees them.
+minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "json", "preserve_order", "serde"] }
 nervus = { path = "../nervus" }
 rayon = "1.10.0"
 safetensors = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# `preserve_order` because a tool schema reaches the model as text. Every
+# chat template dumps the schemas the client sent with `tojson`, and a `Value`
+# backed by a BTreeMap sorts the keys on the way: OpenAI's
+# `{"type": …, "function": {"name", "description", "parameters"}}` came out as
+# `{"function": {"description", "name", "parameters"}, "type": …}`. The
+# information is the same and the prompt is not, and the prompt is what the
+# model was tuned on. See minijinja above: it takes the feature on both.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
 # Resolving `../ch01.html` against the page that linked it, for `crawl`: fiddly

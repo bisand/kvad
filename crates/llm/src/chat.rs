@@ -761,7 +761,11 @@ mod tests {
         assert!(chat.takes_tools());
         let tools = vec![serde_json::json!({
             "type": "function",
-            "function": { "name": "read", "parameters": { "type": "object" } },
+            "function": {
+                "name": "read",
+                "description": "Read a file",
+                "parameters": { "type": "object" },
+            },
         })];
         let conversation = [
             Message::user("what is in main.rs?"),
@@ -783,6 +787,16 @@ mod tests {
         // at request time, on the one path a conversation without tools
         // never reaches.
         assert!(with.contains("parameters"), "the schema was not rendered: {with}");
+        // In the order the client wrote it, which is the order the model was
+        // tuned on. Both minijinja and serde_json sort a map's keys unless
+        // told not to, and sorted is a different prompt: `type` last,
+        // `description` before `name`. Same schema, and not the same text.
+        assert!(
+            with.contains(
+                r#"{"type":"function","function":{"name":"read","description":"Read a file""#
+            ),
+            "the schema's keys were reordered: {with}"
+        );
         assert!(with.contains(r#"CALL read{"path":"main.rs"}"#), "{with}");
         assert!(with.contains("tool: fn main() {} (for call_1)"), "{with}");
         assert!(with.ends_with("assistant:"), "{with}");

@@ -28,6 +28,7 @@
 
 use super::Json;
 use crate::qcache::Source;
+use crate::residency;
 use crate::quant::Weight;
 use crate::tensor::{softmax_inplace, swiglu_inplace};
 
@@ -36,6 +37,21 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 // ---------------------------------------------------------------------------
 // Which layers route
 // ---------------------------------------------------------------------------
+
+/// The block number out of a weight prefix: `model.layers.3.mlp` is 3.
+///
+/// Every family spells it the same way, because every family's checkpoint
+/// was written by the same PyTorch idiom. A prefix that does not say is not
+/// worth failing a load over — it costs a residency trace its layer
+/// numbering and nothing else — so this answers zero and says nothing.
+fn layer_of(prefix: &str) -> usize {
+    prefix
+        .split('.')
+        .skip_while(|part| *part != "layers")
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
 
 /// The expert that runs for every token, whatever the router says.
 ///
@@ -458,6 +474,14 @@ pub struct Moe {
     pub experts: Vec<Ffn>,
     /// Runs for every token, whatever the router says.
     pub shared: Option<SharedExpert>,
+    /// Which block this is.
+    ///
+    /// Not used by the arithmetic, and kept anyway: this block's expert 5
+    /// and the one above's expert 5 are different weights that share a
+    /// number, so anything reasoning about experts as *storage* — which of
+    /// them is resident, which would have to be read back — has to be able
+    /// to tell them apart. See [`crate::residency`].
+    pub layer: usize,
 }
 
 impl Moe {
@@ -479,6 +503,7 @@ impl Moe {
                 .map(|e| Ffn::load(src, &format!("{prefix}.experts.{e}")))
                 .collect::<Res<Vec<_>>>()?,
             shared: SharedExpert::load(src, prefix, shared)?,
+            layer: layer_of(prefix),
         })
     }
 
@@ -496,13 +521,19 @@ impl Moe {
 
         let mut picks = Vec::with_capacity(router.top_k);
         let mut by_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+        // Off unless `KVAD_EXPERT_TRACE` is set, and a branch per token
+        // when it is not. The router is the only place that knows which
+        // experts were wanted, so it is the only place to ask.
+        let mut trace = residency::Trace::start(m);
         for i in 0..m {
             router
                 .route(&logits[i * n..(i + 1) * n], self.bias.as_deref(), &mut picks);
+            trace.token(&picks);
             for &(expert, weight) in &picks {
                 by_expert[expert].push((i, weight));
             }
         }
+        trace.finish(self.layer, n, self.experts.first().map_or(0, Ffn::bytes));
 
         let mut out = match &self.shared {
             // Every token, so it is one batched pass and needs no grouping.

@@ -40,6 +40,7 @@ pub mod machine;
 pub mod model;
 pub mod qcache;
 pub mod quant;
+pub mod residency;
 pub mod retrieve;
 pub mod runtime;
 pub mod service;

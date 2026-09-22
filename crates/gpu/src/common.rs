@@ -398,6 +398,31 @@ impl<'a> Reader<'a> {
         self.vb.get(shape, name)
     }
 
+    /// A depthwise convolution's filters, as `[channels, kernel]`.
+    ///
+    /// PyTorch stores a `Conv1d` with `groups = channels` as
+    /// `[channels, 1, kernel]` — the middle axis is the input channels *per
+    /// group*, which is one, and it carries nothing. The test fixtures write
+    /// the two-dimensional spelling and the real checkpoints write the three,
+    /// so both are accepted and the caller gets the shape it can use.
+    pub(crate) fn conv(
+        &self,
+        channels: usize,
+        kernel: usize,
+        name: &str,
+    ) -> candle_core::Result<Tensor> {
+        match self.get((channels, kernel), name) {
+            Ok(t) => Ok(t),
+            Err(flat) => match self.vb.get((channels, 1, kernel), name) {
+                Ok(t) => t.reshape((channels, kernel)),
+                // The two-dimensional read is the one worth reporting: a
+                // checkpoint that has neither shape has the wrong width, and
+                // that is what the caller needs to be told.
+                Err(_) => Err(flat),
+            },
+        }
+    }
+
     /// A tensor this model may not have: a bias Qwen2 carries and Llama does
     /// not, an untied output head.
     ///

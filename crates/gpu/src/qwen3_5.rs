@@ -1,4 +1,4 @@
-//! Qwen3.5 / Qwen3.8 on the GPU: a state per layer instead of a cache.
+//! Qwen3.5, Qwen3.8 and Qwen3-Next on the GPU: a state per layer, not a cache.
 //!
 //! Read this next to [`kvad::model::qwen3_5`], which explains what a gated
 //! delta net is and why three layers in four have one. The arithmetic is the
@@ -24,20 +24,99 @@ use crate::common::{
     check_block, embedding, label, linear, unread, unread_error, Embed, Loader, Proj, Reader,
     Stored,
 };
+use crate::ffn::{Ffn, Mlp, Moe};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
-use kvad::model::qwen3_5::{Delta, Kind};
+use kvad::model::ffn::{Layout, Router};
+use kvad::model::qwen3_5::{Delta, Family, Kind};
 use kvad::model::{Session, Spec};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// How a checkpoint spells the delta net's input projections. The mirror of
+/// [`kvad::model::qwen3_5`]'s: Qwen3.5 writes four matrices in head order,
+/// Qwen3-Next writes two with the heads interleaved.
+enum Inputs {
+    Split { qkv: Proj, z: Proj, b: Proj, a: Proj },
+    Fused { qkvz: Proj, ba: Proj },
+}
+
+impl Inputs {
+    fn load(ld: &Loader, vb: &Reader<'_>, e: usize, d: &Delta, family: Family) -> Res<Self> {
+        let p = |name: &str, out: usize| ld.proj(vb, name, out, e, Stored::OutIn);
+        Ok(match family {
+            Family::Qwen35 => Inputs::Split {
+                qkv: p("in_proj_qkv.weight", d.conv_dim)?,
+                z: p("in_proj_z.weight", d.value_dim)?,
+                b: p("in_proj_b.weight", d.n_v_head)?,
+                a: p("in_proj_a.weight", d.n_v_head)?,
+            },
+            Family::Next => Inputs::Fused {
+                qkvz: p("in_proj_qkvz.weight", d.key_dim * 2 + d.value_dim * 2)?,
+                ba: p("in_proj_ba.weight", d.n_v_head * 2)?,
+            },
+        })
+    }
+
+    /// `(qkv, z, b, a)` for one token: the convolution's input as
+    /// `[conv_dim, 1]`, the output gate as `[v_heads, v_head]`, and the write
+    /// strength and decay as `[v_heads]` in f32.
+    ///
+    /// Qwen3-Next's two matrices are laid out one *key* head at a time, which
+    /// is a `[n_k_head, stride]` view and four `narrow`s — the reshape the
+    /// split spelling has to do by hand falls out of the layout here.
+    fn project(&self, h: &Tensor, d: &Delta) -> Res<(Tensor, Tensor, Tensor, Tensor)> {
+        let (nv, kh, vh, group) = (d.n_v_head, d.k_head, d.v_head, d.group());
+        Ok(match self {
+            Inputs::Split { qkv, z, b, a } => (
+                qkv.forward(h)?.reshape((d.conv_dim, 1))?,
+                z.forward(h)?.reshape((nv, vh))?,
+                b.forward(h)?.reshape(nv)?.to_dtype(DType::F32)?,
+                a.forward(h)?.reshape(nv)?.to_dtype(DType::F32)?,
+            ),
+            Inputs::Fused { qkvz, ba } => {
+                let wide = group * vh;
+                let m = qkvz.forward(h)?.reshape((d.n_k_head, 2 * kh + 2 * wide))?;
+                let part = |at: usize, n: usize| m.narrow(1, at, n)?.contiguous();
+                let qkv = Tensor::cat(
+                    &[
+                        part(0, kh)?.flatten_all()?,
+                        part(kh, kh)?.flatten_all()?,
+                        part(2 * kh, wide)?.flatten_all()?,
+                    ],
+                    0,
+                )?
+                .reshape((d.conv_dim, 1))?;
+                let z = part(2 * kh + wide, wide)?.reshape((nv, vh))?;
+
+                let m = ba.forward(h)?.reshape((d.n_k_head, 2 * group))?;
+                let part = |at: usize| m.narrow(1, at, group)?.contiguous()?.reshape(nv);
+                (qkv, z, part(0)?.to_dtype(DType::F32)?, part(group)?.to_dtype(DType::F32)?)
+            }
+        })
+    }
+
+    fn params(&self) -> usize {
+        match self {
+            Inputs::Split { qkv, z, b, a } => {
+                qkv.params() + z.params() + b.params() + a.params()
+            }
+            Inputs::Fused { qkvz, ba } => qkvz.params() + ba.params(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Inputs::Split { qkv, z, b, a } => qkv.bytes() + z.bytes() + b.bytes() + a.bytes(),
+            Inputs::Fused { qkvz, ba } => qkvz.bytes() + ba.bytes(),
+        }
+    }
+}
+
 struct DeltaNet {
-    in_qkv: Proj,
-    in_z: Proj,
-    in_b: Proj,
-    in_a: Proj,
+    inputs: Inputs,
     /// `[conv_dim, kernel]`, one filter per channel.
     conv: Tensor,
     dt_bias: Tensor,
@@ -66,9 +145,7 @@ struct Block {
     attn_norm: Tensor,
     mixer: Mixer,
     mlp_norm: Tensor,
-    gate: Proj,
-    up: Proj,
-    down: Proj,
+    mlp: Mlp,
 }
 
 /// What one linear layer carries between tokens.
@@ -112,31 +189,50 @@ impl GpuQwen35 {
     ) -> Res<Self> {
         let delta = Delta::read(&spec.config)?;
         let kinds = kvad::model::qwen3_5::layer_kinds(&spec.config, spec.n_layer)?;
+        let family = Family::of(&spec);
+        // The same two questions the CPU loader asks, asked the same way, so
+        // the two backends cannot disagree about which layers route.
+        let routed = match Router::count(&spec.config) {
+            None => None,
+            Some(_) => Some((Router::read(&spec.config)?, Layout::read(&spec.config))),
+        };
+        let expert = spec.config.num(&["moe_intermediate_size"]).unwrap_or(spec.intermediate);
         let load_dtype = if quant.is_some() { DType::F32 } else { dtype };
         let compute = load_dtype;
         let (e, hd) = (spec.n_embd, spec.head_dim);
         let (qd, kvd) = (spec.n_head * hd, spec.kv_dim());
 
-        check_block(
-            quant,
-            &[
-                ("hidden size", e),
-                ("MLP width", spec.intermediate),
-                ("attention output", qd),
-                ("KV width", kvd),
-                ("linear key width", delta.key_dim),
-                ("linear value width", delta.value_dim),
-            ],
-        )?;
+        let mut widths = vec![
+            ("hidden size", e),
+            ("MLP width", spec.intermediate),
+            ("attention output", qd),
+            ("KV width", kvd),
+            ("linear key width", delta.key_dim),
+            ("linear value width", delta.value_dim),
+        ];
+        if let Some((_, layout)) = &routed {
+            // An expert is far narrower than a dense layer — 512 against 5120
+            // on Qwen3-Next — and it is the expert's width the quantiser's
+            // block size has to divide.
+            widths.push(("expert width", expert));
+            let shared = layout.shared.width(expert);
+            if shared > 0 {
+                widths.push(("shared expert width", shared));
+            }
+        }
+        check_block(quant, &widths)?;
 
         let load_dev = Device::Cpu;
         // SAFETY: candle memory-maps the checkpoints; they are read-only cache
         // entries that nothing else writes while we hold them.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(paths, load_dtype, &load_dev)? };
         let vb = Reader::new(vb);
-        // One level deeper than every other family: the text model is part of
-        // a multimodal wrapper.
-        let model = vb.pp("model").pp("language_model");
+        // Qwen3.5 is one level deeper than every other family — its text
+        // model is part of a multimodal wrapper — and Qwen3-Next is not.
+        let model = match family.prefix() {
+            "" => vb.pp("model"),
+            _ => vb.pp("model").pp("language_model"),
+        };
 
         let to_dev = |t: Tensor| -> Res<Tensor> { Ok(t.to_device(&device)?) };
         // This family's plain RMSNorm scales by `1 + w`: the stored vector is
@@ -175,12 +271,9 @@ impl GpuQwen35 {
                     let la = l.pp("linear_attn");
                     let a_log = la.get(delta.n_v_head, "A_log")?;
                     Mixer::Linear(Box::new(DeltaNet {
-                        in_qkv: load_t(&la, "in_proj_qkv.weight", delta.conv_dim, e)?,
-                        in_z: load_t(&la, "in_proj_z.weight", delta.value_dim, e)?,
-                        in_b: load_t(&la, "in_proj_b.weight", delta.n_v_head, e)?,
-                        in_a: load_t(&la, "in_proj_a.weight", delta.n_v_head, e)?,
+                        inputs: Inputs::load(&ld, &la, e, &delta, family)?,
                         conv: to_dev(
-                            la.get((delta.conv_dim, delta.conv), "conv1d.weight")?
+                            la.conv(delta.conv_dim, delta.conv, "conv1d.weight")?
                                 .to_dtype(compute)?,
                         )?,
                         dt_bias: to_dev(la.get(delta.n_v_head, "dt_bias")?.to_dtype(DType::F32)?)?,
@@ -194,24 +287,29 @@ impl GpuQwen35 {
                 attn_norm: offset(l.get(e, "input_layernorm.weight")?)?,
                 mixer,
                 mlp_norm: offset(l.get(e, "post_attention_layernorm.weight")?)?,
-                gate: load_t(&mlp, "gate_proj.weight", spec.intermediate, e)?,
-                up: load_t(&mlp, "up_proj.weight", spec.intermediate, e)?,
-                down: load_t(&mlp, "down_proj.weight", e, spec.intermediate)?,
+                mlp: match &routed {
+                    Some((router, layout)) if layout.is_moe(i, router.n_experts) => {
+                        Mlp::Moe(Box::new(Moe::load(&ld, &mlp, e, expert, router, layout.shared)?))
+                    }
+                    _ => Mlp::Dense(Ffn::load(&ld, &mlp, e, spec.intermediate)?),
+                },
             });
         }
 
-        // The vision tower and the multi-token-prediction head, neither of
-        // which this runs. Named rather than ignored, so the check below can
-        // tell a decision from an omission.
-        vb.skip_under("model.visual.");
+        // The parts this does not run. Named rather than ignored, so the check
+        // below can tell a decision from an omission. Both families ship a
+        // multi-token-prediction head; the vision tower is Qwen3.5's alone.
         vb.skip_under("mtp.");
+        if family == Family::Qwen35 {
+            vb.skip_under("model.visual.");
+        }
 
         let (embed, head, tied) = embedding(&ld, &vb, &model, "embed_tokens.weight", &spec)?;
         let final_norm = offset(model.get(e, "norm.weight")?)?;
 
         let left = unread(paths, &vb.seen(), &vb.skipped())?;
         if !left.is_empty() {
-            return Err(unread_error("qwen3_5", &left).into());
+            return Err(unread_error(spec.arch.id(), &left).into());
         }
 
         // Partial RoPE: only the first `rope_dim` of each head rotates.
@@ -272,7 +370,7 @@ impl GpuQwen35 {
         // The window already holds the previous `kernel − 1` inputs, so
         // appending this one makes the whole filter's view, and dropping the
         // oldest column afterwards is the slide.
-        let qkv = net.in_qkv.forward(h)?.reshape((d.conv_dim, 1))?;
+        let (qkv, z, b, a) = net.inputs.project(h, d)?;
         let state = self.state[layer].as_ref().ok_or("linear layer has no state")?;
         let window = Tensor::cat(&[&state.conv, &qkv], 1)?;
         let conved = window.mul(&net.conv)?.sum(1)?;
@@ -291,10 +389,6 @@ impl GpuQwen35 {
         let q = Self::l2(&spread(&q)?)?;
         let q = (q * (1.0 / (kh as f64).sqrt()))?;
         let k = Self::l2(&spread(&k)?)?;
-
-        let z = net.in_z.forward(h)?.reshape((nv, vh))?;
-        let b = net.in_b.forward(h)?.reshape(nv)?.to_dtype(DType::F32)?;
-        let a = net.in_a.forward(h)?.reshape(nv)?.to_dtype(DType::F32)?;
 
         let beta = ops::sigmoid(&b)?;
         // `softplus`, and then the decay. Both in f32 whatever the activations
@@ -409,9 +503,7 @@ impl GpuQwen35 {
 
                 let b = &self.blocks[l];
                 let h = ops::rms_norm(&x, &b.mlp_norm, spec.eps)?;
-                let gate = ops::silu(&linear(&h, &b.gate, None)?)?;
-                let up = linear(&h, &b.up, None)?;
-                x = (x + linear(&(gate * up)?, &b.down, None)?)?;
+                x = (x + b.mlp.forward(&h, 1, spec.n_embd)?)?;
             }
             self.pos += 1;
 
@@ -463,10 +555,7 @@ impl GpuQwen35 {
                             + n(&a.k_norm)
                     }
                     Mixer::Linear(d) => {
-                        d.in_qkv.params()
-                            + d.in_z.params()
-                            + d.in_b.params()
-                            + d.in_a.params()
+                        d.inputs.params()
                             + n(&d.conv)
                             + n(&d.dt_bias)
                             + n(&d.neg_a)
@@ -475,9 +564,7 @@ impl GpuQwen35 {
                     }
                 };
                 mixer
-                    + b.gate.params()
-                    + b.up.params()
-                    + b.down.params()
+                    + b.mlp.params()
                     + n(&b.attn_norm)
                     + n(&b.mlp_norm)
             })
@@ -497,16 +584,9 @@ impl GpuQwen35 {
             .map(|b| {
                 let mixer = match &b.mixer {
                     Mixer::Full(a) => a.q.bytes() + a.k.bytes() + a.v.bytes() + a.o.bytes(),
-                    Mixer::Linear(d) => {
-                        d.in_qkv.bytes()
-                            + d.in_z.bytes()
-                            + d.in_b.bytes()
-                            + d.in_a.bytes()
-                            + per(&d.conv)
-                            + d.out.bytes()
-                    }
+                    Mixer::Linear(d) => d.inputs.bytes() + per(&d.conv) + d.out.bytes(),
                 };
-                mixer + b.gate.bytes() + b.up.bytes() + b.down.bytes()
+                mixer + b.mlp.bytes()
             })
             .sum();
         let head = if self.tied { 0 } else { self.head.bytes() };
@@ -567,23 +647,27 @@ mod tests {
     use kvad::serde_json;
     use std::collections::HashMap;
 
-    /// A Qwen3.8 small enough to build from random numbers, with both kinds of
+    /// A model small enough to build from random numbers, with both kinds of
     /// layer and every width a multiple of 32 so the quantisers will take it.
-    /// `tag` because these tests run in parallel and would otherwise
-    /// delete each other's checkpoints.
-    fn tiny(tag: &str) -> (Spec, std::path::PathBuf) {
+    ///
+    /// `next` picks the other family in this module: the same mixer with its
+    /// inputs fused one key head at a time, a mixture instead of an MLP, and
+    /// its decoder where every Llama keeps one. `tag` because these tests run
+    /// in parallel and would otherwise delete each other's checkpoints.
+    fn tiny_of(next: bool, tag: &str) -> (Spec, std::path::PathBuf) {
         let (e, hd, nh, nkv) = (64usize, 32usize, 4usize, 2usize);
         let (nk, nv, kh, vh, conv) = (2usize, 4usize, 32usize, 32usize, 4usize);
         let (n_layer, vocab, inter) = (4usize, 64usize, 128usize);
+        let (n_experts, top_k, expert, shared) = (8usize, 2usize, 32usize, 32usize);
         let (key_dim, value_dim) = (nk * kh, nv * vh);
         let conv_dim = key_dim * 2 + value_dim;
         let kinds: Vec<&str> = (0..n_layer)
             .map(|i| if (i + 1) % 4 == 0 { "full_attention" } else { "linear_attention" })
             .collect();
 
-        let spec = Spec::from_config(Json::new(serde_json::json!({
-            "model_type": "qwen3_5",
-            "text_config": {
+        let config = match next {
+            true => serde_json::json!({
+                "model_type": "qwen3_next",
                 "num_hidden_layers": n_layer,
                 "num_attention_heads": nh,
                 "num_key_value_heads": nkv,
@@ -593,37 +677,89 @@ mod tests {
                 "vocab_size": vocab,
                 "max_position_embeddings": 64,
                 "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.5,
                 "tie_word_embeddings": false,
-                "layer_types": kinds,
+                "full_attention_interval": 4,
                 "linear_num_key_heads": nk,
                 "linear_num_value_heads": nv,
                 "linear_key_head_dim": kh,
                 "linear_value_head_dim": vh,
                 "linear_conv_kernel_dim": conv,
-                "rope_parameters": {
-                    "rope_type": "default",
-                    "rope_theta": 1000000.0,
-                    "partial_rotary_factor": 0.5,
+                "num_experts": n_experts,
+                "num_experts_per_tok": top_k,
+                "moe_intermediate_size": expert,
+                "shared_expert_intermediate_size": shared,
+                "norm_topk_prob": true,
+                "decoder_sparse_step": 1,
+                "mlp_only_layers": [],
+            }),
+            false => serde_json::json!({
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "num_hidden_layers": n_layer,
+                    "num_attention_heads": nh,
+                    "num_key_value_heads": nkv,
+                    "head_dim": hd,
+                    "hidden_size": e,
+                    "intermediate_size": inter,
+                    "vocab_size": vocab,
+                    "max_position_embeddings": 64,
+                    "rms_norm_eps": 1e-6,
+                    "tie_word_embeddings": false,
+                    "layer_types": kinds,
+                    "linear_num_key_heads": nk,
+                    "linear_num_value_heads": nv,
+                    "linear_key_head_dim": kh,
+                    "linear_value_head_dim": vh,
+                    "linear_conv_kernel_dim": conv,
+                    "rope_parameters": {
+                        "rope_type": "default",
+                        "rope_theta": 1000000.0,
+                        "partial_rotary_factor": 0.5,
+                    },
                 },
-            },
-        })))
-        .unwrap();
+            }),
+        };
+        let spec = Spec::from_config(Json::new(config)).unwrap();
 
         let d = Device::Cpu;
         let rand = |r: usize, c: usize| Tensor::randn(0f32, 0.05f32, (r, c), &d).unwrap();
         let vec1 = |n: usize| Tensor::randn(0f32, 0.05f32, n, &d).unwrap();
+        let root = match next {
+            true => "model",
+            false => "model.language_model",
+        };
 
         let mut t: HashMap<String, Tensor> = HashMap::new();
-        t.insert("model.language_model.embed_tokens.weight".into(), rand(vocab, e));
-        t.insert("model.language_model.norm.weight".into(), vec1(e));
+        t.insert(format!("{root}.embed_tokens.weight"), rand(vocab, e));
+        t.insert(format!("{root}.norm.weight"), vec1(e));
         t.insert("lm_head.weight".into(), rand(vocab, e));
         for (i, kind) in kinds.iter().enumerate() {
-            let p = format!("model.language_model.layers.{i}");
+            let p = format!("{root}.layers.{i}");
             t.insert(format!("{p}.input_layernorm.weight"), vec1(e));
             t.insert(format!("{p}.post_attention_layernorm.weight"), vec1(e));
-            t.insert(format!("{p}.mlp.gate_proj.weight"), rand(inter, e));
-            t.insert(format!("{p}.mlp.up_proj.weight"), rand(inter, e));
-            t.insert(format!("{p}.mlp.down_proj.weight"), rand(e, inter));
+            match next {
+                false => {
+                    t.insert(format!("{p}.mlp.gate_proj.weight"), rand(inter, e));
+                    t.insert(format!("{p}.mlp.up_proj.weight"), rand(inter, e));
+                    t.insert(format!("{p}.mlp.down_proj.weight"), rand(e, inter));
+                }
+                true => {
+                    t.insert(format!("{p}.mlp.gate.weight"), rand(n_experts, e));
+                    for x in 0..n_experts {
+                        let m = format!("{p}.mlp.experts.{x}");
+                        t.insert(format!("{m}.gate_proj.weight"), rand(expert, e));
+                        t.insert(format!("{m}.up_proj.weight"), rand(expert, e));
+                        t.insert(format!("{m}.down_proj.weight"), rand(e, expert));
+                    }
+                    let m = format!("{p}.mlp.shared_expert");
+                    t.insert(format!("{m}.gate_proj.weight"), rand(shared, e));
+                    t.insert(format!("{m}.up_proj.weight"), rand(shared, e));
+                    t.insert(format!("{m}.down_proj.weight"), rand(e, shared));
+                    t.insert(format!("{p}.mlp.shared_expert_gate.weight"), rand(1, e));
+                }
+            }
             match *kind {
                 "full_attention" => {
                     let q = format!("{p}.self_attn");
@@ -636,10 +772,21 @@ mod tests {
                 }
                 _ => {
                     let q = format!("{p}.linear_attn");
-                    t.insert(format!("{q}.in_proj_qkv.weight"), rand(conv_dim, e));
-                    t.insert(format!("{q}.in_proj_z.weight"), rand(value_dim, e));
-                    t.insert(format!("{q}.in_proj_b.weight"), rand(nv, e));
-                    t.insert(format!("{q}.in_proj_a.weight"), rand(nv, e));
+                    match next {
+                        true => {
+                            t.insert(
+                                format!("{q}.in_proj_qkvz.weight"),
+                                rand(key_dim * 2 + value_dim * 2, e),
+                            );
+                            t.insert(format!("{q}.in_proj_ba.weight"), rand(nv * 2, e));
+                        }
+                        false => {
+                            t.insert(format!("{q}.in_proj_qkv.weight"), rand(conv_dim, e));
+                            t.insert(format!("{q}.in_proj_z.weight"), rand(value_dim, e));
+                            t.insert(format!("{q}.in_proj_b.weight"), rand(nv, e));
+                            t.insert(format!("{q}.in_proj_a.weight"), rand(nv, e));
+                        }
+                    }
                     t.insert(format!("{q}.conv1d.weight"), rand(conv_dim, conv));
                     t.insert(format!("{q}.dt_bias"), vec1(nv));
                     t.insert(format!("{q}.A_log"), vec1(nv));
@@ -655,19 +802,16 @@ mod tests {
         (spec, path)
     }
 
-    /// The gated delta net on this backend against the hand-written one.
-    ///
-    /// Both in f32, so what is left is the order the sums happen in. The two
-    /// implementations share the layer layout and nothing else: the
-    /// recurrence is a loop over heads there and six broadcasts here, and a
-    /// disagreement means one of them is running a different model.
-    #[test]
-    fn the_hybrid_agrees_with_the_cpu_engine() {
-        let (spec, path) = tiny("agree");
-        let tokens = [3u32, 17, 8, 31, 4];
+    fn tiny(tag: &str) -> (Spec, std::path::PathBuf) {
+        tiny_of(false, tag)
+    }
 
-        let mut cache = kvad::model::KvCache::new(&spec);
-        let ckpt = kvad::weights::Checkpoint::open(std::slice::from_ref(&path)).unwrap();
+    /// The same widths, run against the CPU engine on every device there is.
+    fn both_backends_agree(spec: &Spec, path: &std::path::Path, what: &str) {
+        let tokens = [3u32, 17, 8, 31, 4];
+        let mut cache = kvad::model::KvCache::new(spec);
+        let ckpt = kvad::weights::Checkpoint::open(std::slice::from_ref(&path.to_path_buf()))
+            .unwrap();
         let src = kvad::qcache::Live::new(&ckpt, kvad::quant::Precision::F32);
         let ours = kvad::model::qwen3_5::Model::load(&src, spec.clone())
             .unwrap()
@@ -679,7 +823,7 @@ mod tests {
         };
         for (where_, dev) in devices {
             let mut gpu = GpuQwen35::load(
-                std::slice::from_ref(&path),
+                std::slice::from_ref(&path.to_path_buf()),
                 spec.clone(),
                 DType::F32,
                 None,
@@ -690,8 +834,33 @@ mod tests {
             let theirs = gpu.forward(&tokens).unwrap();
             assert_eq!(theirs.len(), ours.len(), "on {where_}");
             let worst = theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-            assert!(worst < 1e-3, "the hybrid on {where_} differs from the CPU engine by {worst}");
+            assert!(worst < 1e-3, "{what} on {where_} differs from the CPU engine by {worst}");
         }
+    }
+
+    /// The gated delta net on this backend against the hand-written one.
+    ///
+    /// Both in f32, so what is left is the order the sums happen in. The two
+    /// implementations share the layer layout and nothing else: the
+    /// recurrence is a loop over heads there and six broadcasts here, and a
+    /// disagreement means one of them is running a different model.
+    #[test]
+    fn the_hybrid_agrees_with_the_cpu_engine() {
+        let (spec, path) = tiny("agree");
+        both_backends_agree(&spec, &path, "the hybrid");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Qwen3-Next's spelling of the same mixer, with a mixture behind it.
+    ///
+    /// The fused input projections are four `narrow`s here and a loop of
+    /// `copy_from_slice` on the CPU, and the router runs on the host in both —
+    /// so a disagreement is in the deinterleaving, which is the one thing this
+    /// family adds that is easy to get silently backwards.
+    #[test]
+    fn the_next_spelling_agrees_with_the_cpu_engine() {
+        let (spec, path) = tiny_of(true, "next");
+        both_backends_agree(&spec, &path, "Qwen3-Next");
         std::fs::remove_file(&path).unwrap();
     }
 

@@ -584,24 +584,47 @@ impl Checkpoint {
             .find_map(|c| self.index.get_key_value(c.as_str()).map(|(k, _)| k.as_str()))
     }
 
-    /// Look a tensor up, converting to `f32`.
+    /// Look a tensor up, converting to `f32`, or `None` if it is not there.
     pub fn try_get(&self, name: &str) -> Option<Tensor> {
-        let key = self.resolve(name)?;
-        let st = SafeTensors::deserialize(&self.maps[self.index[key]]).ok()?;
-        let view = st.tensor(key).ok()?;
-
-        let shape = view.shape();
-        let (rows, cols) = match shape.len() {
-            1 => (1, shape[0]),
-            2 => (shape[0], shape[1]),
-            _ => return None,
-        };
-        Some(Tensor::new(rows, cols, decode(view.data(), view.dtype())?))
+        self.read(name).ok().flatten()
     }
 
     pub fn get(&self, name: &str) -> Res<Tensor> {
-        self.try_get(name)
-            .ok_or_else(|| format!("tensor `{name}` not found in checkpoint").into())
+        match self.read(name)? {
+            Some(t) => Ok(t),
+            None => Err(format!("tensor `{name}` not found in checkpoint").into()),
+        }
+    }
+
+    /// `Ok(None)` when the checkpoint does not have it, and an error when it
+    /// does and this cannot read it.
+    ///
+    /// Two different problems, reported as the same one until a real
+    /// Qwen3-Next turned up: its depthwise convolutions are stored
+    /// `[channels, 1, kernel]`, this read rank three and gave up, and the
+    /// error said the tensor was *missing* from a file it was sitting in.
+    fn read(&self, name: &str) -> Res<Option<Tensor>> {
+        let Some(key) = self.resolve(name) else { return Ok(None) };
+        let st = SafeTensors::deserialize(&self.maps[self.index[key]])?;
+        let view = st.tensor(key)?;
+
+        let (rows, cols) = match view.shape() {
+            [n] => (1, *n),
+            [r, c] => (*r, *c),
+            // A depthwise convolution's filters. PyTorch stores a `Conv1d`
+            // with `groups = channels` as `[channels, 1, kernel]`: one filter
+            // per channel and no mixing, so the middle axis is the input
+            // channels *per group*, which is one. It carries nothing.
+            [r, 1, c] => (*r, *c),
+            other => {
+                return Err(format!("tensor `{name}` has shape {other:?}, which this cannot read")
+                    .into())
+            }
+        };
+        let data = decode(view.data(), view.dtype()).ok_or_else(|| {
+            format!("tensor `{name}` is stored as {:?}, which this cannot read", view.dtype())
+        })?;
+        Ok(Some(Tensor::new(rows, cols, data)))
     }
 
     /// For 1-D tensors, where the shape is noise.
@@ -667,6 +690,7 @@ pub fn read_json(path: &Path) -> Res<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::f16_to_f32;
+    use std::process;
 
     #[test]
     fn half_precision_conversion() {
@@ -678,5 +702,72 @@ mod tests {
         assert!(f16_to_f32(0x7c00).is_infinite());
         // Smallest positive subnormal: 2^-24.
         assert!((f16_to_f32(0x0001) - 5.960_464_5e-8).abs() < 1e-12);
+    }
+
+    /// A depthwise convolution's filters, as a real checkpoint stores them.
+    ///
+    /// PyTorch writes a `Conv1d` with `groups = channels` as
+    /// `[channels, 1, kernel]`. Every fixture in this repository writes the
+    /// two-dimensional spelling, because that is what the engine asks for, so
+    /// nothing else here would notice this going back.
+    #[test]
+    fn a_depthwise_convolution_reads_as_the_matrix_it_is() {
+        let path = std::env::temp_dir().join(format!("kvad-rank3-{}.safetensors", process::id()));
+        write(&path, &[("conv.weight", &[3, 1, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0][..])]);
+        let ckpt = super::Checkpoint::open(std::slice::from_ref(&path)).unwrap();
+
+        let t = ckpt.get("conv.weight").unwrap();
+        assert_eq!((t.rows, t.cols), (3, 2), "the middle axis carries nothing");
+        assert_eq!(t.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Absent and unreadable are different problems.
+    ///
+    /// They were the same message until a real Qwen3-Next arrived: rank three
+    /// fell through to `None` and the error said the tensor was missing from a
+    /// file it was sitting in, which sends a reader looking in the wrong
+    /// place.
+    #[test]
+    fn a_tensor_that_is_there_and_unreadable_does_not_say_it_is_missing() {
+        let path = std::env::temp_dir().join(format!("kvad-rank4-{}.safetensors", process::id()));
+        write(&path, &[("odd.weight", &[2, 1, 1, 2], &[1.0, 2.0, 3.0, 4.0][..])]);
+        let ckpt = super::Checkpoint::open(std::slice::from_ref(&path)).unwrap();
+
+        let err = ckpt.get("odd.weight").unwrap_err().to_string();
+        assert!(err.contains("shape"), "{err}");
+        assert!(!err.contains("not found"), "{err}");
+        assert!(ckpt.try_get("odd.weight").is_none(), "and still not usable");
+
+        let missing = ckpt.get("absent.weight").unwrap_err().to_string();
+        assert!(missing.contains("not found"), "{missing}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The smallest safetensors writer that will do: a header of shapes and
+    /// offsets, then f32 back to back.
+    fn write(path: &std::path::Path, tensors: &[(&str, &[usize], &[f32])]) {
+        let mut header = String::from("{");
+        let mut blob: Vec<u8> = Vec::new();
+        for (i, (name, shape, data)) in tensors.iter().enumerate() {
+            let start = blob.len();
+            for v in *data {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            let dims: Vec<String> = shape.iter().map(usize::to_string).collect();
+            if i > 0 {
+                header.push(',');
+            }
+            header.push_str(&format!(
+                "\"{name}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{start},{}]}}",
+                dims.join(","),
+                blob.len()
+            ));
+        }
+        header.push('}');
+        let mut out = (header.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&blob);
+        std::fs::write(path, out).unwrap();
     }
 }

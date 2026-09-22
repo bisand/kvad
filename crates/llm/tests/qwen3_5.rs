@@ -19,6 +19,7 @@
 //! a tautology. For this one it is the whole question, because the state
 //! carried between the two calls is the only thing tying them together.
 
+use kvad::model::ffn::{Layout, Router, Shared};
 use kvad::model::{Json, KvCache, Spec, Transformer};
 use kvad::qcache::Live;
 use kvad::quant::Precision;
@@ -44,21 +45,21 @@ impl Rng {
 
     fn matrix(&mut self, rows: usize, cols: usize) -> Mat {
         let data = (0..rows * cols).map(|_| self.next()).collect();
-        Mat { rows, cols, data }
+        Mat { rows, cols, data, vector: false }
     }
 
     /// A plain norm's weight, which this family stores as an offset from one
     /// and trains from zero.
     fn offsets(&mut self, n: usize) -> Mat {
         let data = (0..n).map(|_| self.next() * 0.2).collect();
-        Mat { rows: 1, cols: n, data }
+        Mat { rows: 1, cols: n, data, vector: true }
     }
 
     /// The gated norm's, and the delta net's scalars, which are scales rather
     /// than offsets and sit near one.
     fn ones(&mut self, n: usize) -> Mat {
         let data = (0..n).map(|_| 1.0 + self.next() * 0.1).collect();
-        Mat { rows: 1, cols: n, data }
+        Mat { rows: 1, cols: n, data, vector: true }
     }
 }
 
@@ -67,6 +68,14 @@ struct Mat {
     rows: usize,
     cols: usize,
     data: Vec<f32>,
+    /// Whether the checkpoint stores this as a 1-D tensor.
+    ///
+    /// Not the same question as `rows == 1`. Norms and biases are genuinely
+    /// one-dimensional; `shared_expert_gate.weight` is a matrix that happens
+    /// to have one row, and the published checkpoints store it as `[1,
+    /// hidden]`. Writing it flat would hand the loaders a shape the Hub never
+    /// ships.
+    vector: bool,
 }
 
 impl Mat {
@@ -88,9 +97,9 @@ fn write_safetensors(path: &PathBuf, tensors: &BTreeMap<String, Mat>) {
         for v in &m.data {
             blob.extend_from_slice(&v.to_le_bytes());
         }
-        let shape = match m.rows {
-            1 => format!("[{}]", m.cols),
-            r => format!("[{r},{}]", m.cols),
+        let shape = match m.vector {
+            true => format!("[{}]", m.cols),
+            false => format!("[{},{}]", m.rows, m.cols),
         };
         if i > 0 {
             header.push(',');
@@ -129,6 +138,16 @@ struct Tiny {
     conv: usize,
     eps: f32,
     theta: f32,
+    /// Where the decoder lives: `model.language_model.` for Qwen3.5, which
+    /// wraps its text model in a multimodal shell, and `model.` for
+    /// Qwen3-Next, which has nothing to wrap it in.
+    root: String,
+    /// Whether the delta net's inputs are written fused, one key head at a
+    /// time, as Qwen3-Next writes them.
+    fused: bool,
+    /// `(n_experts, top_k, expert_width, shared_width)`, or `None` for a dense
+    /// feed-forward.
+    moe: Option<(usize, usize, usize, usize)>,
 }
 
 /// A Qwen3.8 small enough to build from a seeded generator, with both kinds of
@@ -245,7 +264,113 @@ fn tiny_with(pattern: Option<&[&str]>) -> Tiny {
         conv,
         eps,
         theta,
+        root: "model.language_model.".into(),
+        fused: false,
+        moe: None,
     }
+}
+
+/// Qwen3-Next, at the same widths.
+///
+/// The same mixer under a different spelling — two fused input projections
+/// instead of four, laid out one key head at a time — and a mixture where
+/// Qwen3.8 has one MLP. Eight experts of two, with a gated shared one, which
+/// is the published shape at a size a test can hold.
+fn tiny_next() -> Tiny {
+    let mut t = tiny();
+    let (n_experts, top_k, expert, shared) = (8usize, 2usize, 32usize, 32usize);
+    let (hidden, key_dim, value_dim) = (t.hidden, t.n_k_head * t.k_head, t.n_v_head * t.v_head);
+    let group = t.n_v_head / t.n_k_head;
+
+    let mut r = Rng(0xFEED_BEEF_5EED_0001);
+    let mut w: BTreeMap<String, Mat> = BTreeMap::new();
+    w.insert("model.embed_tokens.weight".into(), r.matrix(t.vocab, hidden));
+    w.insert("model.norm.weight".into(), r.offsets(hidden));
+    w.insert("lm_head.weight".into(), r.matrix(t.vocab, hidden));
+
+    for l in 0..t.n_layer {
+        let p = format!("model.layers.{l}");
+        w.insert(format!("{p}.input_layernorm.weight"), r.offsets(hidden));
+        w.insert(format!("{p}.post_attention_layernorm.weight"), r.offsets(hidden));
+
+        // Every layer routes: `decoder_sparse_step` 1 and no `mlp_only_layers`,
+        // which is what both published Next checkpoints say.
+        w.insert(format!("{p}.mlp.gate.weight"), r.matrix(n_experts, hidden));
+        for x in 0..n_experts {
+            let e = format!("{p}.mlp.experts.{x}");
+            w.insert(format!("{e}.gate_proj.weight"), r.matrix(expert, hidden));
+            w.insert(format!("{e}.up_proj.weight"), r.matrix(expert, hidden));
+            w.insert(format!("{e}.down_proj.weight"), r.matrix(hidden, expert));
+        }
+        let e = format!("{p}.mlp.shared_expert");
+        w.insert(format!("{e}.gate_proj.weight"), r.matrix(shared, hidden));
+        w.insert(format!("{e}.up_proj.weight"), r.matrix(shared, hidden));
+        w.insert(format!("{e}.down_proj.weight"), r.matrix(hidden, shared));
+        w.insert(format!("{p}.mlp.shared_expert_gate.weight"), r.matrix(1, hidden));
+
+        match (l + 1) % 4 == 0 {
+            true => {
+                let q = format!("{p}.self_attn");
+                w.insert(
+                    format!("{q}.q_proj.weight"),
+                    r.matrix(t.n_head * t.head_dim * 2, hidden),
+                );
+                w.insert(format!("{q}.k_proj.weight"), r.matrix(t.n_kv * t.head_dim, hidden));
+                w.insert(format!("{q}.v_proj.weight"), r.matrix(t.n_kv * t.head_dim, hidden));
+                w.insert(format!("{q}.o_proj.weight"), r.matrix(hidden, t.n_head * t.head_dim));
+                w.insert(format!("{q}.q_norm.weight"), r.offsets(t.head_dim));
+                w.insert(format!("{q}.k_norm.weight"), r.offsets(t.head_dim));
+            }
+            false => {
+                let q = format!("{p}.linear_attn");
+                w.insert(
+                    format!("{q}.in_proj_qkvz.weight"),
+                    r.matrix(key_dim * 2 + value_dim * 2, hidden),
+                );
+                w.insert(format!("{q}.in_proj_ba.weight"), r.matrix(t.n_v_head * 2, hidden));
+                w.insert(format!("{q}.conv1d.weight"), r.matrix(key_dim * 2 + value_dim, t.conv));
+                w.insert(format!("{q}.dt_bias"), r.ones(t.n_v_head));
+                w.insert(format!("{q}.A_log"), r.ones(t.n_v_head));
+                w.insert(format!("{q}.norm.weight"), r.ones(t.v_head));
+                w.insert(format!("{q}.out_proj.weight"), r.matrix(hidden, value_dim));
+            }
+        }
+    }
+    let _ = group;
+
+    t.config = serde_json::json!({
+        "model_type": "qwen3_next",
+        "num_hidden_layers": t.n_layer,
+        "num_attention_heads": t.n_head,
+        "num_key_value_heads": t.n_kv,
+        "head_dim": t.head_dim,
+        "hidden_size": hidden,
+        "intermediate_size": 128,
+        "vocab_size": t.vocab,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": t.eps,
+        "rope_theta": t.theta,
+        "partial_rotary_factor": 0.5,
+        "tie_word_embeddings": false,
+        "full_attention_interval": 4,
+        "linear_num_key_heads": t.n_k_head,
+        "linear_num_value_heads": t.n_v_head,
+        "linear_key_head_dim": t.k_head,
+        "linear_value_head_dim": t.v_head,
+        "linear_conv_kernel_dim": t.conv,
+        "num_experts": n_experts,
+        "num_experts_per_tok": top_k,
+        "moe_intermediate_size": expert,
+        "shared_expert_intermediate_size": shared,
+        "norm_topk_prob": true,
+        "decoder_sparse_step": 1,
+        "mlp_only_layers": [],
+    });
+    t.tensors = w;
+    t.root = "model.".into();
+    t.fused = true;
+    t.moe = Some((n_experts, top_k, expert, shared));
+    t
 }
 
 fn engine(tiny: &Tiny, tag: &str) -> (Box<dyn Transformer>, Spec) {
@@ -293,6 +418,13 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+fn softmax(x: &[f32]) -> Vec<f32> {
+    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let e: Vec<f32> = x.iter().map(|v| (v - max).exp()).collect();
+    let sum: f32 = e.iter().sum();
+    e.into_iter().map(|v| v / sum).collect()
+}
+
 fn l2(v: &[f32]) -> Vec<f32> {
     let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
     v.iter().map(|x| x / n).collect()
@@ -316,7 +448,15 @@ fn rope(x: &mut [f32], pos: usize, dim: usize, theta: f32) {
 fn reference(t: &Tiny, tokens: &[u32]) -> Vec<Vec<f32>> {
     let w = &t.tensors;
     let get = |n: &str| w.get(n).unwrap_or_else(|| panic!("no tensor {n}"));
-    let embed = get("model.language_model.embed_tokens.weight");
+    let embed = get(&format!("{}embed_tokens.weight", t.root));
+
+    // One SwiGLU MLP: a dense layer, one expert, or the shared one.
+    let ffn = |prefix: &str, h: &[f32]| -> Vec<f32> {
+        let g = get(&format!("{prefix}.gate_proj.weight")).apply(h);
+        let u = get(&format!("{prefix}.up_proj.weight")).apply(h);
+        let act: Vec<f32> = g.iter().zip(&u).map(|(a, b)| silu(*a) * b).collect();
+        get(&format!("{prefix}.down_proj.weight")).apply(&act)
+    };
 
     let key_dim = t.n_k_head * t.k_head;
     let value_dim = t.n_v_head * t.v_head;
@@ -336,13 +476,51 @@ fn reference(t: &Tiny, tokens: &[u32]) -> Vec<Vec<f32>> {
         let mut x = embed.row(tok as usize).to_vec();
 
         for l in 0..t.n_layer {
-            let p = format!("model.language_model.layers.{l}");
+            let p = format!("{}layers.{l}", t.root);
             let h = rms_norm(&x, get(&format!("{p}.input_layernorm.weight")).row(0), t.eps);
             let linear = (l + 1) % 4 != 0;
 
             let mixed = if linear {
                 let q = format!("{p}.linear_attn");
-                let mut qkv = get(&format!("{q}.in_proj_qkv.weight")).apply(&h);
+                // Qwen3-Next writes q, k, v and z one *key* head at a time —
+                // each key head followed by the value heads that share it —
+                // where Qwen3.5 writes four matrices already in head order.
+                // Taken apart here from the reference's own split list, not
+                // from the engine's.
+                let (mut qkv, z, b, a) = match t.fused {
+                    false => (
+                        get(&format!("{q}.in_proj_qkv.weight")).apply(&h),
+                        get(&format!("{q}.in_proj_z.weight")).apply(&h),
+                        get(&format!("{q}.in_proj_b.weight")).apply(&h),
+                        get(&format!("{q}.in_proj_a.weight")).apply(&h),
+                    ),
+                    true => {
+                        let wide = group * t.v_head;
+                        let stride = 2 * t.k_head + 2 * wide;
+                        let mixed = get(&format!("{q}.in_proj_qkvz.weight")).apply(&h);
+                        let mut qkv = vec![0.0f32; conv_dim];
+                        let mut z = vec![0.0f32; value_dim];
+                        for g in 0..t.n_k_head {
+                            let row = &mixed[g * stride..(g + 1) * stride];
+                            let at = |n: usize| g * n..(g + 1) * n;
+                            qkv[at(t.k_head)].copy_from_slice(&row[..t.k_head]);
+                            let kat = key_dim + g * t.k_head..key_dim + (g + 1) * t.k_head;
+                            qkv[kat].copy_from_slice(&row[t.k_head..2 * t.k_head]);
+                            let vat = 2 * key_dim + g * wide..2 * key_dim + (g + 1) * wide;
+                            qkv[vat].copy_from_slice(&row[2 * t.k_head..2 * t.k_head + wide]);
+                            z[at(wide)].copy_from_slice(&row[2 * t.k_head + wide..]);
+                        }
+                        let mixed = get(&format!("{q}.in_proj_ba.weight")).apply(&h);
+                        let mut b = vec![0.0f32; t.n_v_head];
+                        let mut a = vec![0.0f32; t.n_v_head];
+                        for g in 0..t.n_k_head {
+                            let row = &mixed[g * 2 * group..(g + 1) * 2 * group];
+                            b[g * group..(g + 1) * group].copy_from_slice(&row[..group]);
+                            a[g * group..(g + 1) * group].copy_from_slice(&row[group..]);
+                        }
+                        (qkv, z, b, a)
+                    }
+                };
                 // depthwise causal convolution, then SiLU
                 let filters = get(&format!("{q}.conv1d.weight"));
                 let win = &mut conv_state[l];
@@ -366,9 +544,6 @@ fn reference(t: &Tiny, tokens: &[u32]) -> Vec<Vec<f32>> {
                 }
                 qkv = conved;
 
-                let z = get(&format!("{q}.in_proj_z.weight")).apply(&h);
-                let b = get(&format!("{q}.in_proj_b.weight")).apply(&h);
-                let a = get(&format!("{q}.in_proj_a.weight")).apply(&h);
                 let dt = get(&format!("{q}.dt_bias")).row(0).to_vec();
                 let a_log = get(&format!("{q}.A_log")).row(0).to_vec();
                 let nw = get(&format!("{q}.norm.weight")).row(0).to_vec();
@@ -482,16 +657,40 @@ fn reference(t: &Tiny, tokens: &[u32]) -> Vec<Vec<f32>> {
             }
 
             let h = rms_norm(&x, get(&format!("{p}.post_attention_layernorm.weight")).row(0), t.eps);
-            let g = get(&format!("{p}.mlp.gate_proj.weight")).apply(&h);
-            let u = get(&format!("{p}.mlp.up_proj.weight")).apply(&h);
-            let act: Vec<f32> = g.iter().zip(&u).map(|(a, b)| silu(*a) * b).collect();
-            let down = get(&format!("{p}.mlp.down_proj.weight")).apply(&act);
+            let down = match t.moe {
+                None => ffn(&format!("{p}.mlp"), &h),
+                // Softmax over every expert, the best `top_k`, those
+                // renormalised to sum to one — and a shared expert that runs
+                // whatever the router said, scaled by its own one-row gate.
+                Some((n_experts, top_k, _, _)) => {
+                    let probs = softmax(&get(&format!("{p}.mlp.gate.weight")).apply(&h));
+                    let mut order: Vec<usize> = (0..n_experts).collect();
+                    order.sort_by(|&i, &j| probs[j].total_cmp(&probs[i]));
+                    let chosen = &order[..top_k];
+                    let total: f32 = chosen.iter().map(|&i| probs[i]).sum();
+
+                    let gate = get(&format!("{p}.mlp.shared_expert_gate.weight")).apply(&h);
+                    let gate = sigmoid(gate[0]);
+                    let mut out = ffn(&format!("{p}.mlp.shared_expert"), &h);
+                    for o in out.iter_mut() {
+                        *o *= gate;
+                    }
+                    for &i in chosen {
+                        let y = ffn(&format!("{p}.mlp.experts.{i}"), &h);
+                        let weight = probs[i] / total;
+                        for (o, v) in out.iter_mut().zip(&y) {
+                            *o += weight * v;
+                        }
+                    }
+                    out
+                }
+            };
             for (xi, m) in x.iter_mut().zip(&down) {
                 *xi += m;
             }
         }
 
-        let h = rms_norm(&x, get("model.language_model.norm.weight").row(0), t.eps);
+        let h = rms_norm(&x, get(&format!("{}norm.weight", t.root)).row(0), t.eps);
         all.push(get("lm_head.weight").apply(&h));
     }
     all
@@ -616,6 +815,98 @@ fn the_output_head_is_the_full_vocabulary() {
     assert_eq!(spec.n_embd, t.hidden);
 }
 
+/// Qwen3-Next's spelling of the same mixer, against the formulas.
+///
+/// Two fused input projections instead of four, laid out one key head at a
+/// time, and a mixture behind them instead of an MLP. Everything between is
+/// the arithmetic the test above already checks, which is the claim this
+/// module is built on and therefore the one worth checking twice.
+#[test]
+fn qwen3_next_agrees_with_the_formulas_too() {
+    let t = tiny_next();
+    let tokens = [3u32, 17, 8, 31, 4];
+    let want = reference(&t, &tokens);
+
+    let (model, spec) = engine(&t, "next-agree");
+    let mut cache = KvCache::new(&spec);
+    let got = model.forward_batch(&tokens, &mut cache);
+    close(&got, want.last().unwrap(), "Qwen3-Next logits after five tokens");
+}
+
+/// Every position, because an interleaving read the wrong way round can still
+/// agree at position zero: the convolution has no history yet and the state is
+/// empty, so several of the ways to get this wrong are invisible there.
+#[test]
+fn every_qwen3_next_position_agrees_and_not_only_the_last() {
+    let t = tiny_next();
+    let tokens = [9u32, 1, 25, 13];
+    let want = reference(&t, &tokens);
+
+    let (model, spec) = engine(&t, "next-each");
+    let mut cache = KvCache::new(&spec);
+    for (i, &tok) in tokens.iter().enumerate() {
+        let got = model.forward(tok, &mut cache);
+        close(&got, &want[i], &format!("Qwen3-Next position {i}"));
+    }
+}
+
+/// The recurrent state carries across calls here too, with a mixture in the
+/// way. Worth its own run: the router reads the residual stream, so a state
+/// carried wrongly changes *which experts run*, not only by how much.
+#[test]
+fn a_qwen3_next_prompt_in_two_pieces_is_the_same_prompt() {
+    let t = tiny_next();
+    let tokens = [5u32, 12, 30, 7, 19, 2, 44];
+
+    let (whole, spec) = engine(&t, "next-whole");
+    let mut cache = KvCache::new(&spec);
+    let want = whole.forward_batch(&tokens, &mut cache);
+
+    let (split, spec2) = engine(&t, "next-split");
+    let mut cache2 = KvCache::new(&spec2);
+    split.forward_batch(&tokens[..3], &mut cache2);
+    let got = split.forward_batch(&tokens[3..], &mut cache2);
+
+    close(&got, &want, "seven tokens at once against three then four");
+}
+
+/// Qwen3-Next is this module's other family, and `Spec` should say so without
+/// being told twice.
+///
+/// The cache is the thing worth pinning: the two families have the same mixer,
+/// so they have the same shape of state, and a checkpoint that routed its way
+/// into the wrong layer pattern would still load.
+#[test]
+fn qwen3_next_is_the_same_hybrid_under_its_own_name() {
+    let t = tiny_next();
+    let (model, spec) = engine(&t, "next-shape");
+    assert!(spec.arch.is("qwen3_next"), "loaded as {}", spec.arch.id());
+
+    let key_dim = t.n_k_head * t.k_head;
+    let conv_dim = key_dim * 2 + t.n_v_head * t.v_head;
+    let state = conv_dim * (t.conv - 1) + t.n_v_head * t.k_head * t.v_head;
+    for l in 0..t.n_layer {
+        let shape = spec.cache.at(l);
+        match (l + 1) % 4 == 0 {
+            true => assert_eq!((shape.k, shape.state), (t.n_kv * t.head_dim, 0), "layer {l}"),
+            false => assert_eq!((shape.k + shape.v, shape.state), (0, state), "layer {l}"),
+        }
+    }
+
+    // Eight experts and a shared one per layer, which the dense sibling at the
+    // same widths does not have. If the mixture had quietly loaded as one MLP
+    // the model would still run.
+    let (n_experts, _, expert, shared) = t.moe.unwrap();
+    let per_layer = (n_experts * expert + shared) * t.hidden * 3
+        + n_experts * t.hidden
+        + t.hidden;
+    assert!(
+        model.param_count() > t.n_layer * per_layer,
+        "the experts do not seem to be loaded: {} parameters",
+        model.param_count()
+    );
+}
+
 /// Write this model and this engine's logits out, for `scripts/check-qwen3-5.py`
 /// to run the real implementation against.
 ///
@@ -642,9 +933,13 @@ fn write_a_fixture_for_the_reference_implementation() {
             other => panic!("KVAD_QWEN35_LAYERS takes `l` and `f`, not {other:?}"),
         })
         .collect();
-    let t = match pattern.is_empty() {
-        true => tiny(),
-        false => tiny_with(Some(&pattern)),
+    // `KVAD_QWEN35_FAMILY=next` writes the Qwen3-Next spelling instead, which
+    // the Python side runs through `Qwen3NextForCausalLM`.
+    let next = std::env::var("KVAD_QWEN35_FAMILY").is_ok_and(|v| v == "next");
+    let t = match (next, pattern.is_empty()) {
+        (true, _) => tiny_next(),
+        (false, true) => tiny(),
+        (false, false) => tiny_with(Some(&pattern)),
     };
     let out = std::path::Path::new(&dir);
     std::fs::create_dir_all(out).unwrap();
@@ -728,4 +1023,71 @@ fn the_published_27b_has_the_state_and_the_cache_we_say_it_does() {
     let grew = spec.cache.bytes(64, 1000) - spec.cache.bytes(64, 0);
     assert_eq!(grew, 16 * 2 * 4 * 256 * 1000 * 4);
     assert_eq!(spec.cache.bytes_per_token(64), 16 * 2 * 4 * 256 * 4);
+}
+
+/// Qwen3-Next-80B-A3B's and Qwen3-Coder-Next's own numbers, which are the same
+/// numbers: the two checkpoints differ in `rope_theta` and in whether they
+/// carry a multi-token-prediction head, and in nothing else this reads.
+///
+/// The config states `full_attention_interval` and no `layer_types`, so this
+/// is also the test that the rule and the list agree: 48 layers at an interval
+/// of four is 36 linear and 12 full, counting from one.
+#[test]
+fn the_published_80b_is_the_same_hybrid_with_a_mixture_behind_it() {
+    let config = serde_json::json!({
+        "model_type": "qwen3_next",
+        "num_hidden_layers": 48,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "hidden_size": 2048,
+        "intermediate_size": 5120,
+        "vocab_size": 151936,
+        "max_position_embeddings": 262144,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000000.0,
+        "partial_rotary_factor": 0.25,
+        "tie_word_embeddings": false,
+        "full_attention_interval": 4,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 512,
+        "num_experts_per_tok": 10,
+        "moe_intermediate_size": 512,
+        "shared_expert_intermediate_size": 512,
+        "norm_topk_prob": true,
+        "decoder_sparse_step": 1,
+        "mlp_only_layers": [],
+    });
+    let spec = Spec::from_config(Json::new(config.clone())).unwrap();
+    assert!(spec.arch.is("qwen3_next"), "loaded as {}", spec.arch.id());
+    // Flat, where Qwen3.5 keeps all of this under `text_config`.
+    assert_eq!((spec.n_layer, spec.n_embd, spec.head_dim), (48, 2048, 256));
+    assert_eq!(spec.rope_theta, 10_000_000.0);
+    // A quarter of a 256-wide head rotates; the other 192 carry no position.
+    assert_eq!(kvad::model::qwen3_5::rope_dim(&spec), 64);
+
+    let full = (0..48).filter(|&i| spec.cache.at(i).k > 0).count();
+    let linear = (0..48).filter(|&i| spec.cache.at(i).state > 0).count();
+    assert_eq!((full, linear), (12, 36));
+
+    // The state: 36 layers of a [32, 128, 128] matrix plus an 8192-channel
+    // convolution window three deep. Half Qwen3.8's, on a model three times
+    // the size, because the state is a property of the mixer and not of the
+    // parameter count.
+    let fixed = 36 * (8192 * 3 + 32 * 128 * 128) * 4;
+    assert_eq!(fixed, 79_036_416);
+    assert_eq!(spec.cache.bytes(48, 0), fixed);
+    assert_eq!(spec.cache.bytes_per_token(48), 12 * 2 * 2 * 256 * 4);
+
+    // Every layer routes, to ten of five hundred and twelve, and every layer
+    // also runs the shared expert whatever the router said.
+    let router = Router::read(&spec.config).unwrap();
+    let layout = Layout::read(&spec.config);
+    assert_eq!((router.n_experts, router.top_k), (512, 10));
+    assert!((0..48).all(|i| layout.is_moe(i, router.n_experts)));
+    assert_eq!(layout.shared, Shared::Gated(512));
 }

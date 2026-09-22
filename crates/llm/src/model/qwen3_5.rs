@@ -1,4 +1,4 @@
-//! Qwen3.5 and Qwen3.8: three layers in four keep a state instead of a cache.
+//! Qwen3.5, Qwen3.8, Qwen3-Next: three layers in four keep a state, not a cache.
 //!
 //! Read this as a diff against [`super::llama`]. The skeleton is unchanged —
 //! embed, then per layer `x = x + Mix(RMSNorm(x))` and
@@ -37,7 +37,9 @@
 //! The cost is constant. `S` is the same size at position one and position two
 //! hundred thousand, which is the whole argument: 48 layers of Qwen3.8 hold
 //! 157 MB of state whatever the context length, where 64 layers of ordinary
-//! attention would be paying per token for all of it.
+//! attention would be paying per token for all of it. Qwen3-Next holds 79 MB
+//! on a model three times the size, because the state is a property of the
+//! mixer and not of the parameter count.
 //!
 //! The price is that **the state cannot be rewound**. See
 //! [`KvCache::truncate`](super::KvCache::truncate), which is where this engine
@@ -55,14 +57,38 @@
 //! only the first 64 of each 256-wide head is rotated and the rest carries no
 //! position at all.
 //!
+//! # Two families, one mixer
+//!
+//! `qwen3_next` is here rather than in a file of its own, and that is a claim
+//! worth stating plainly: the two published implementations are identical
+//! across the convolution, the delta rule, the gated norm and the gated
+//! attention — every line of the arithmetic above. They differ in three
+//! places and nowhere else.
+//!
+//! - **Where the decoder lives.** Qwen3.5 is a
+//!   `Qwen3_5ForConditionalGeneration` and keeps its text model under
+//!   `language_model`, beside a vision tower. Qwen3-Next is text alone.
+//! - **How the inputs are spelled.** Qwen3.5 writes four projections in head
+//!   order. Qwen3-Next writes two, laid out one *key* head at a time — its
+//!   query, its key, then the values and gates of the value heads that share
+//!   them. See [`Inputs`].
+//! - **What follows the mixer.** Qwen3.8 is dense. Qwen3-Next routes every
+//!   layer to ten of five hundred and twelve, with a shared expert that runs
+//!   whatever the router said — and, unlike DeepSeek's, one that a token can
+//!   decline through a sigmoid gate.
+//!
+//! [`Family`] is that list, and the only branch either spelling costs the
+//! other is one match in the loader and one in the projection.
+//!
 //! # What is not here
 //!
-//! The vision tower, and the multi-token-prediction head. The checkpoint is a
-//! `Qwen3_5ForConditionalGeneration` and carries both; this reads
-//! `text_config` and skips the rest by name, because *deliberately not read*
-//! and *forgotten* look identical from outside a loader.
+//! The vision tower, and the multi-token-prediction head. Qwen3.5's checkpoint
+//! carries both and Qwen3-Next-80B carries the second; this reads
+//! `text_config` where there is one and skips the rest by name, because
+//! *deliberately not read* and *forgotten* look identical from outside a
+//! loader.
 
-use super::ffn::{Ffn, Mlp};
+use super::ffn::{Ffn, Layout, Mlp, Moe, Router};
 use super::{attend, Architecture, CacheLayout, CacheShape, KvCache, Spec, Transformer};
 use crate::qcache::{head, Source};
 use crate::quant::Weight;
@@ -79,9 +105,64 @@ pub static ARCH: Architecture = Architecture {
     load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
 };
 
+/// Qwen3-Next, and Qwen3-Coder-Next: the same mixer, with a mixture behind it.
+pub static NEXT: Architecture = Architecture {
+    id: "qwen3_next",
+    model_types: &["qwen3_next"],
+    about: "Qwen3-Next/Coder-Next: the same hybrid, 512 experts and a gated shared one",
+    configure,
+    load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
+};
+
 // ---------------------------------------------------------------------------
 // Shapes
 // ---------------------------------------------------------------------------
+
+/// Which of the two families in this module a checkpoint belongs to.
+///
+/// They differ in three places and nowhere else: where the decoder lives, how
+/// the delta net's inputs are spelled, and whether the feed-forward is one MLP
+/// or five hundred. Everything between — the convolution, the delta rule, the
+/// gated norm, the gated attention over a quarter-rotated head — is the same
+/// arithmetic, and the two reference implementations are identical across all
+/// of it, line for line. That is the reason this is an enum in one module and
+/// not a second file.
+///
+/// Public because the GPU backend has to reach the same answer, and two
+/// loaders deciding separately which family a checkpoint is is exactly how
+/// they come to disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// Qwen3.5 and Qwen3.8: a vision tower, a dense feed-forward, and four
+    /// separate input projections.
+    Qwen35,
+    /// Qwen3-Next and Qwen3-Coder-Next: text alone, a mixture, and two.
+    Next,
+}
+
+impl Family {
+    pub fn of(spec: &Spec) -> Self {
+        match spec.arch.is(NEXT.id) {
+            true => Family::Next,
+            false => Family::Qwen35,
+        }
+    }
+
+    /// Where the decoder lives in the checkpoint.
+    ///
+    /// Qwen3.5 ships as a `Qwen3_5ForConditionalGeneration`, so its text model
+    /// sits a level down under `language_model`, beside the vision tower.
+    /// Qwen3-Next is text and nothing else and puts its layers where every
+    /// Llama does — which is spelled as nothing at all here, because the
+    /// checkpoint reader already tries `model.` in front of whatever it is
+    /// asked for.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Family::Qwen35 => "language_model.",
+            Family::Next => "",
+        }
+    }
+}
 
 /// Which mixer a layer uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,17 +340,125 @@ fn offset_norm(src: &dyn Source, name: &str) -> Res<Vec<f32>> {
     Ok(v)
 }
 
+/// How a checkpoint spells the six things a delta net projects out of the
+/// token: query, key, value, the output gate `z`, the write strength `b` and
+/// the decay `a`.
+///
+/// Whichever spelling, this hands back the same four vectors — `q k v`
+/// concatenated in head order for the convolution to run over, then `z`, `b`
+/// and `a` — and the rest of the layer never learns which it was.
+enum Inputs {
+    /// Qwen3.5's: one matrix each, each already in head order.
+    Split {
+        /// `[conv_dim, hidden]`: query, key and value together, because one
+        /// convolution runs over all three.
+        qkv: Weight,
+        /// `[value_dim, hidden]`: the gate the output norm is multiplied by.
+        z: Weight,
+        /// `[n_v_head, hidden]` each, one number per head per token.
+        b: Weight,
+        a: Weight,
+    },
+    /// Qwen3-Next's: two matrices, laid out one *key* head at a time —
+    /// `q, k, v, z` for the first key head and the two value heads that share
+    /// it, then the second key head's, and `b, a` the same way.
+    ///
+    /// Taken apart per token rather than permuted once at load. The rows being
+    /// permuted belong to a matrix that may be quantised, and slicing those
+    /// apart is a kernel this engine does not have; the alternative costs one
+    /// pass over twelve thousand floats, against the `[12288, 2048]`
+    /// matrix-vector product that just produced them.
+    Fused {
+        /// `[key_dim * 2 + value_dim * 2, hidden]`.
+        qkvz: Weight,
+        /// `[n_v_head * 2, hidden]`.
+        ba: Weight,
+    },
+}
+
+impl Inputs {
+    fn load(src: &dyn Source, prefix: &str, family: Family) -> Res<Self> {
+        let n = |s: &str| format!("{prefix}.{s}.weight");
+        Ok(match family {
+            Family::Qwen35 => Inputs::Split {
+                qkv: src.matrix(&n("in_proj_qkv"))?,
+                z: src.matrix(&n("in_proj_z"))?,
+                b: src.matrix(&n("in_proj_b"))?,
+                a: src.matrix(&n("in_proj_a"))?,
+            },
+            Family::Next => Inputs::Fused {
+                qkvz: src.matrix(&n("in_proj_qkvz"))?,
+                ba: src.matrix(&n("in_proj_ba"))?,
+            },
+        })
+    }
+
+    /// `(qkv, z, b, a)` for one token, in head order whatever the checkpoint
+    /// did.
+    fn project(&self, h: &[f32], d: &Delta) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        match self {
+            Inputs::Split { qkv, z, b, a } => (
+                qkv.matvec_bt(h, None),
+                z.matvec_bt(h, None),
+                b.matvec_bt(h, None),
+                a.matvec_bt(h, None),
+            ),
+            Inputs::Fused { qkvz, ba } => {
+                let (group, fused) = (d.group(), qkvz.matvec_bt(h, None));
+                // One key head's share: its query, its key, and the values and
+                // gates of the `group` value heads that read them.
+                let stride = 2 * d.k_head + 2 * group * d.v_head;
+                let mut qkv = vec![0.0f32; d.conv_dim];
+                let mut z = vec![0.0f32; d.value_dim];
+                let (q_all, rest) = qkv.split_at_mut(d.key_dim);
+                let (k_all, v_all) = rest.split_at_mut(d.key_dim);
+                for kh in 0..d.n_k_head {
+                    let src = &fused[kh * stride..(kh + 1) * stride];
+                    let (q, src) = src.split_at(d.k_head);
+                    let (k, src) = src.split_at(d.k_head);
+                    let (v, gate) = src.split_at(group * d.v_head);
+                    q_all[kh * d.k_head..(kh + 1) * d.k_head].copy_from_slice(q);
+                    k_all[kh * d.k_head..(kh + 1) * d.k_head].copy_from_slice(k);
+                    // The value heads a key head owns are consecutive, so its
+                    // block lands whole.
+                    let (from, to) = (kh * group * d.v_head, (kh + 1) * group * d.v_head);
+                    v_all[from..to].copy_from_slice(v);
+                    z[from..to].copy_from_slice(gate);
+                }
+
+                let fused = ba.matvec_bt(h, None);
+                let mut b = vec![0.0f32; d.n_v_head];
+                let mut a = vec![0.0f32; d.n_v_head];
+                for kh in 0..d.n_k_head {
+                    let src = &fused[kh * 2 * group..(kh + 1) * 2 * group];
+                    b[kh * group..(kh + 1) * group].copy_from_slice(&src[..group]);
+                    a[kh * group..(kh + 1) * group].copy_from_slice(&src[group..]);
+                }
+                (qkv, z, b, a)
+            }
+        }
+    }
+
+    fn param_count(&self) -> usize {
+        match self {
+            Inputs::Split { qkv, z, b, a } => {
+                qkv.param_count() + z.param_count() + b.param_count() + a.param_count()
+            }
+            Inputs::Fused { qkvz, ba } => qkvz.param_count() + ba.param_count(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Inputs::Split { qkv, z, b, a } => qkv.bytes() + z.bytes() + b.bytes() + a.bytes(),
+            Inputs::Fused { qkvz, ba } => qkvz.bytes() + ba.bytes(),
+        }
+    }
+}
+
 /// A gated delta net's weights.
 struct DeltaNet {
-    /// `[conv_dim, hidden]`: query, key and value in one projection, because
-    /// one convolution runs over all three.
-    in_qkv: Weight,
-    /// `[value_dim, hidden]`: the gate the output norm is multiplied by.
-    in_z: Weight,
-    /// `[n_v_head, hidden]` each: the delta rule's write strength and the
-    /// state's decay, one number per head per token.
-    in_b: Weight,
-    in_a: Weight,
+    inputs: Inputs,
     /// `[conv_dim, kernel]`, depthwise: one filter per channel, no mixing.
     conv: Vec<f32>,
     dt_bias: Vec<f32>,
@@ -321,13 +510,20 @@ impl Model {
     pub fn load(src: &dyn Source, spec: Spec) -> Res<Self> {
         let delta = Delta::read(&spec.config)?;
         let kinds = layer_kinds(&spec.config, spec.n_layer)?;
-        let (hd, n_head, n_kv) = (spec.head_dim, spec.n_head, spec.n_kv_head);
+        let family = Family::of(&spec);
+        let root = family.prefix();
+
+        // Qwen3.8 is dense and Qwen3-Next routes; both of them are this
+        // module. `Router::count` is the question that can be asked of either,
+        // and the one that says which.
+        let routed = match Router::count(&spec.config) {
+            None => None,
+            Some(_) => Some((Router::read(&spec.config)?, Layout::read(&spec.config))),
+        };
 
         let mut blocks = Vec::with_capacity(spec.n_layer);
         for (i, kind) in kinds.iter().enumerate() {
-            // One level deeper than every other family: the text model is a
-            // part of a multimodal wrapper, and the checkpoint says so.
-            let p = |s: &str| format!("language_model.layers.{i}.{s}");
+            let p = |s: &str| format!("{root}layers.{i}.{s}");
             let mixer = match kind {
                 Kind::Full => Mixer::Full(Box::new(Attn {
                     q: src.matrix(&p("self_attn.q_proj.weight"))?,
@@ -338,10 +534,7 @@ impl Model {
                     k_norm: offset_norm(src, &p("self_attn.k_norm.weight"))?,
                 })),
                 Kind::Linear => Mixer::Linear(Box::new(DeltaNet {
-                    in_qkv: src.matrix(&p("linear_attn.in_proj_qkv.weight"))?,
-                    in_z: src.matrix(&p("linear_attn.in_proj_z.weight"))?,
-                    in_b: src.matrix(&p("linear_attn.in_proj_b.weight"))?,
-                    in_a: src.matrix(&p("linear_attn.in_proj_a.weight"))?,
+                    inputs: Inputs::load(src, &p("linear_attn"), family)?,
                     // Stored `[conv_dim, 1, kernel]` — depthwise, so the
                     // middle axis is 1 and the flat read is the filters back
                     // to back.
@@ -356,28 +549,39 @@ impl Model {
                 attn_norm: offset_norm(src, &p("input_layernorm.weight"))?,
                 mixer,
                 mlp_norm: offset_norm(src, &p("post_attention_layernorm.weight"))?,
-                mlp: Mlp::Dense(Ffn::load(src, &p("mlp"))?),
+                mlp: match &routed {
+                    Some((router, layout)) if layout.is_moe(i, router.n_experts) => {
+                        Mlp::Moe(Box::new(Moe::load(src, &p("mlp"), router, layout.shared)?))
+                    }
+                    _ => Mlp::Dense(Ffn::load(src, &p("mlp"))?),
+                },
             });
         }
 
-        // The two halves of this checkpoint that are deliberately not run.
-        // Saying so is not decoration: the check that follows a load would
-        // otherwise refuse every Qwen3.8 for carrying tensors nobody wanted,
-        // and a reader cannot tell "skipped" from "forgotten" without it.
-        src.skip_under("visual.");
-        src.skip_under("model.visual.");
+        // The parts of this checkpoint that are deliberately not run. Saying
+        // so is not decoration: the check that follows a load would otherwise
+        // refuse every one of these for carrying tensors nobody wanted, and a
+        // reader cannot tell "skipped" from "forgotten" without it.
+        //
+        // The multi-token-prediction head is a training-time device and both
+        // families ship one. The vision tower is Qwen3.5's alone, and naming
+        // it under Qwen3-Next would claim to have decided about something that
+        // is not there.
         src.skip_under("mtp.");
+        if family == Family::Qwen35 {
+            src.skip_under("visual.");
+            src.skip_under("model.visual.");
+        }
 
         let lm_head = head(src, &spec, "lm_head.weight")?;
         let rope_dim = rope_dim(&spec);
         let rope = Rope::new(rope_dim, spec.n_ctx, spec.rope_theta);
 
-        let _ = (hd, n_head, n_kv);
         Ok(Model {
-            embed: src.matrix("language_model.embed_tokens.weight")?,
+            embed: src.matrix(&format!("{root}embed_tokens.weight"))?,
             lm_head,
             blocks,
-            final_norm: offset_norm(src, "language_model.norm.weight")?,
+            final_norm: offset_norm(src, &format!("{root}norm.weight"))?,
             delta,
             kinds,
             rope,
@@ -401,7 +605,7 @@ impl Model {
     /// by the recurrent matrices — see [`Delta::state_len`].
     fn linear_step(&self, net: &DeltaNet, h: &[f32], state: &mut [f32]) -> Vec<f32> {
         let d = &self.delta;
-        let mut qkv = net.in_qkv.matvec_bt(h, None);
+        let (mut qkv, z, b, a) = net.inputs.project(h, d);
 
         // ---- the depthwise causal convolution ---------------------------
         //
@@ -442,10 +646,6 @@ impl Model {
 
         let (q_all, rest) = qkv.split_at(d.key_dim);
         let (k_all, v_all) = rest.split_at(d.key_dim);
-
-        let z = net.in_z.matvec_bt(h, None);
-        let b = net.in_b.matvec_bt(h, None);
-        let a = net.in_a.matvec_bt(h, None);
 
         let recurrent = &mut state[window..];
         let per_head = d.k_head * d.v_head;
@@ -584,10 +784,7 @@ impl Transformer for Model {
                             + a.k_norm.len()
                     }
                     Mixer::Linear(n) => {
-                        n.in_qkv.param_count()
-                            + n.in_z.param_count()
-                            + n.in_b.param_count()
-                            + n.in_a.param_count()
+                        n.inputs.param_count()
                             + n.conv.len()
                             + n.dt_bias.len()
                             + n.a_log.len()
@@ -608,13 +805,7 @@ impl Transformer for Model {
             .map(|b| {
                 let mixer = match &b.mixer {
                     Mixer::Full(a) => a.q.bytes() + a.k.bytes() + a.v.bytes() + a.o.bytes(),
-                    Mixer::Linear(n) => {
-                        n.in_qkv.bytes()
-                            + n.in_z.bytes()
-                            + n.in_b.bytes()
-                            + n.in_a.bytes()
-                            + n.out.bytes()
-                    }
+                    Mixer::Linear(n) => n.inputs.bytes() + n.out.bytes(),
                 };
                 mixer + b.mlp.bytes()
             })

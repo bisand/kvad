@@ -1192,6 +1192,67 @@ are different kinds of mistake. The same file, incidentally, uses the ordinary
 `w` convention for its gated norm — two conventions in one checkpoint, and
 nothing announces which is which.
 
+### The second family in the same file
+
+`qwen3_next` — Qwen3-Next-80B and Qwen3-Coder-Next — is the same mixer as
+Qwen3.8 with a mixture behind it, and it went into the same module rather than
+a new one. That was a finding, not a preference. Put the two published
+implementations side by side with the names normalised away and the diff is
+three things: where the decoder lives in the checkpoint, how the delta net's
+inputs are spelled, and whether the feed-forward is one MLP or five hundred and
+twelve. The convolution, the delta rule, the gated norm, the quarter-rotated
+gated attention — identical, line for line.
+
+So the module gained a three-line `Family` enum and two branches, and the
+second architecture cost about as much as the first one cost after it.
+
+The spelling is the part worth knowing about. Qwen3.5 writes four input
+projections, each already in head order. Qwen3-Next writes two, laid out one
+*key* head at a time — its query, its key, then the values and output gates of
+the value heads that share them — and the engine takes them apart per token
+rather than permuting the rows once at load, because those rows may be
+quantised and slicing a quantised matrix apart is a kernel this does not have.
+The cost is one pass over twelve thousand floats against the `[12288, 2048]`
+matrix-vector product that just produced them.
+
+The other difference is a shared expert with a mind of its own. DeepSeek's runs
+for every token and is added as it comes; Qwen3-Next's is scaled by
+`sigmoid(x · w)` first, so a token can decline it. Those are near enough alike
+that running either under the other's rule would load, run, and be wrong by an
+amount that varies per token — which is why
+[`Shared`](crates/llm/src/model/ffn.rs) is an enum with three variants rather
+than an `Option<usize>` with two meanings.
+
+And PyTorch settled it again, as it did for Qwen3.8. The Rust reference agrees
+with the engine, which proves the algebra and not the reading; `Qwen3NextForCausalLM`
+on the same fixture agrees to 4.7e-05 across every position, which proves the
+reading.
+
+### The shape a test fixture cannot have
+
+Neither of those two architectures had ever loaded a real checkpoint. The tests
+build their own, and the first real `qwen3_next` file refused to load:
+
+```text
+    Error: tensor `layers.0.linear_attn.conv1d.weight` not found in checkpoint
+```
+
+It was in the checkpoint. PyTorch stores a `Conv1d` with `groups = channels` as
+`[channels, 1, kernel]` — the middle axis is the input channels *per group*,
+which is one — and the loader read rank three, gave up, and reported the tensor
+as missing from a file it was sitting in. The fixtures write the
+two-dimensional spelling because that is the shape the engine wants, so nothing
+in the suite could have caught it.
+
+Two fixes, and the second is the one that matters. Accepting `[c, 1, k]` is a
+line. Separating *not there* from *there and unreadable* is the change that
+stops the next one of these being debugged from a wrong error message — a dtype
+this engine cannot decode used to report as a missing tensor too.
+
+The smallest real `qwen3_next` on the Hub is a 16 MB random-weight test model,
+and it is the one that found this. It says nothing sensible, and both backends
+say the same nothing, byte for byte.
+
 ### Base models versus instruction-tuned
 
 GPT-2 is a **base** model: pure next-token prediction, no instruction tuning.
@@ -1988,9 +2049,9 @@ thing you think it is about.
 Metal `f32` runs at about two thirds of bf16's rate, for exactly double the
 memory. `bf16` is the default because it is also what the checkpoints ship as.
 
-The GPU backend covers **the Llama family, GPT-2 and DeepSeek V2/V3** — three
-of the four architectures the CPU engine has. `deepseek_v3` is the fourth:
-[`deepseek.rs`](crates/gpu/src/deepseek.rs) implements it and
+The GPU backend covers **the Llama family, GPT-2, DeepSeek V2, Qwen3.5/3.8 and
+Qwen3-Next** — five of the six architectures the CPU engine has. `deepseek_v3`
+is the sixth: [`deepseek.rs`](crates/gpu/src/deepseek.rs) implements it and
 [`session`](crates/gpu/src/model.rs) has no arm that routes a V3 checkpoint to
 it, so asking for one on the GPU says which architectures there are rather
 than failing obscurely. One list answers that, and the server asks it rather

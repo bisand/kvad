@@ -677,7 +677,7 @@ pub fn session(
         Box::new(GpuLlama::load(paths, spec.clone(), dtype, quant, device, &cache)?)
     } else if arch.is("gpt2") {
         Box::new(crate::gpt2::GpuGpt2::load(paths, spec.clone(), dtype, quant, device, &cache)?)
-    } else if arch.is("qwen3_5") {
+    } else if arch.is("qwen3_5") || arch.is("qwen3_next") {
         Box::new(crate::qwen3_5::GpuQwen35::load(
             paths,
             spec.clone(),
@@ -712,7 +712,7 @@ pub fn session(
 /// `deepseek.rs` implements V3 as well, and V3 is not here: the dispatch
 /// below has no arm for it, so no V3 checkpoint reaches that code. The arm
 /// and this list go together when it gets one.
-const IMPLEMENTED: [&str; 4] = ["llama", "gpt2", "deepseek_v2", "qwen3_5"];
+const IMPLEMENTED: [&str; 5] = ["llama", "gpt2", "deepseek_v2", "qwen3_5", "qwen3_next"];
 
 /// Whether this backend can run `arch`, asked before anything is loaded.
 pub fn supports(arch: Arch) -> bool {

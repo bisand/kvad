@@ -558,8 +558,8 @@ impl ToolCalls {
                     // other, and a model writing about the format writes
                     // exactly that.
                     if let Some(open) = self.held[..at].find(CALL_OPEN) {
-                        if let Some(call) = parse_call(&self.held[..open]) {
-                            calls.push(call);
+                        if let Some(found) = parse_calls(&self.held[..open]) {
+                            calls.extend(found);
                             self.held = self.held[open + CALL_OPEN.len()..].to_string();
                             continue;
                         }
@@ -567,8 +567,8 @@ impl ToolCalls {
                     let body = self.held[..at].to_string();
                     self.held = self.held[at + CALL_CLOSE.len()..].to_string();
                     self.inside = false;
-                    match parse_call(&body) {
-                        Some(call) => calls.push(call),
+                    match parse_calls(&body) {
+                        Some(found) => calls.extend(found),
                         None => content.push_str(&format!("{CALL_OPEN}{body}{CALL_CLOSE}")),
                     }
                 }
@@ -592,9 +592,9 @@ impl ToolCalls {
         let mut calls = Vec::new();
         let mut rest = rest.as_str();
         while let Some(open) = rest.find(CALL_OPEN) {
-            match parse_call(&rest[..open]) {
-                Some(call) => {
-                    calls.push(call);
+            match parse_calls(&rest[..open]) {
+                Some(found) => {
+                    calls.extend(found);
                     rest = &rest[open + CALL_OPEN.len()..];
                 }
                 None => break,
@@ -603,9 +603,9 @@ impl ToolCalls {
         // A call the budget cut off. Occasionally the model wrote the whole
         // object and only the closing tag is missing, which is a call; more
         // often it is a fragment, which is text.
-        match parse_call(rest) {
-            Some(call) => {
-                calls.push(call);
+        match parse_calls(rest) {
+            Some(found) => {
+                calls.extend(found);
                 (String::new(), calls)
             }
             None => (format!("{CALL_OPEN}{rest}"), calls),
@@ -618,14 +618,36 @@ impl ToolCalls {
     }
 }
 
-/// One `<tool_call>` block's contents, if they are a call.
+/// One `<tool_call>` block's contents, if they are calls.
+///
+/// Usually one object. A model that means to make two calls sometimes writes
+/// both into one block with nothing between them but a newline — the opening
+/// tag is the token it drops, and it drops the same one whether there is a
+/// closing tag after the first call or not. Both objects are whole, so both
+/// are calls, and reading only the first would lose the second as surely as
+/// reading neither.
+///
+/// It stays an all-or-nothing answer: every value in the body has to parse
+/// and every one has to be a call, so a block that is a call followed by a
+/// sentence is still text, and so is a block that is a sentence. The caller
+/// hands those back with their tags on, which is what lets a client show what
+/// the model actually wrote.
+fn parse_calls(body: &str) -> Option<Vec<Called>> {
+    let values = serde_json::Deserializer::from_str(body.trim()).into_iter::<serde_json::Value>();
+    let mut calls = Vec::new();
+    for value in values {
+        calls.push(parse_call(&value.ok()?)?);
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+/// One object, if it is a call.
 ///
 /// `arguments` comes back as text in every case, because that is what the
 /// wire format carries. An object is re-serialised — compactly, and this is
 /// the one place the spelling changes — and a string is passed through,
 /// which is the double-encoding some fine-tunes emit.
-fn parse_call(body: &str) -> Option<Called> {
-    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+fn parse_call(value: &serde_json::Value) -> Option<Called> {
     let name = value.get("name")?.as_str()?.trim().to_string();
     if name.is_empty() {
         return None;
@@ -781,6 +803,28 @@ mod tests {
         let mut cut = ToolCalls::new();
         cut.feed("<tool_call>{\"name\": \"l");
         assert_eq!(cut.finish(), ("<tool_call>{\"name\": \"l".to_string(), Vec::new()));
+    }
+
+    /// Two calls in one block, with no tags at all between them. The same
+    /// omission as the test below and one token further: the model drops the
+    /// opening tag of the second call, and here it had already written the
+    /// closing tag of neither.
+    #[test]
+    fn two_calls_in_one_block() {
+        let reply = "I will fix it and check it.\n\
+                     <tool_call>\n{\"name\": \"edit\", \"arguments\": {\"path\": \"main.rs\"}}\n\
+                     {\"name\": \"bash\", \"arguments\": {\"command\": \"cargo fmt\"}}\n\
+                     </tool_call>";
+        let (content, calls) = calls_of(reply);
+        assert_eq!(content, "I will fix it and check it.\n");
+        assert_eq!(calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["edit", "bash"]);
+        assert_eq!(calls_by_char(reply), calls_of(reply), "the stream split differently");
+
+        // All of the body or none of it. A call and then a sentence is a
+        // model talking about a call, and it comes back with its tags on.
+        let mixed = "<tool_call>{\"name\": \"f\", \"arguments\": {}} and then run it</tool_call>";
+        assert!(calls_of(mixed).1.is_empty(), "{:?}", calls_of(mixed));
+        assert_eq!(calls_of(mixed).0, mixed);
     }
 
     /// Two calls and one closing tag, which is what a model writes when it

@@ -22,6 +22,11 @@
 //!                        idea and a bad one)
 //!     --ram GB           mark the capacities that would fit in this much
 //!     --gb A,B,C         capacities to try, instead of the default sweep
+//!     --pin-from OTHER   choose the pinned set from another trace's
+//!                        frequencies rather than this one's, which is the
+//!                        difference between a claim and a measurement:
+//!                        ranking on the trace you then score against asks
+//!                        the cache to predict a future it has already seen
 
 use kvad::residency::{Log, Outcome, Policy};
 
@@ -39,13 +44,22 @@ fn main() {
     let bandwidth = flag("--bandwidth").and_then(|v| v.parse::<f64>().ok()).unwrap_or(11.7) * GB;
     let ram = flag("--ram").and_then(|v| v.parse::<f64>().ok()).map(|g| g * GB);
 
-    let log = match Log::read(std::path::Path::new(path)) {
+    let read = |p: &str| match Log::read(std::path::Path::new(p)) {
         Ok(log) => log,
         Err(e) => {
-            eprintln!("could not read {path}: {e}");
+            eprintln!("could not read {p}: {e}");
             std::process::exit(1);
         }
     };
+    let log = read(path);
+    let profile = flag("--pin-from").map(|p| read(&p));
+    if let Some(other) = &profile {
+        if other.n_experts != log.n_experts {
+            eprintln!("--pin-from is a trace of a different model: {} experts, not {}",
+                other.n_experts, log.n_experts);
+            std::process::exit(1);
+        }
+    }
 
     let (layers, tokens) = (log.layers(), log.tokens());
     let expert = log.expert_bytes as f64;
@@ -97,7 +111,10 @@ fn main() {
     );
 
     for capacity in capacities {
-        let by: Vec<Outcome> = Policy::ALL.iter().map(|p| log.replay(*p, capacity)).collect();
+        let by: Vec<Outcome> = Policy::ALL
+            .iter()
+            .map(|p| log.replay_pinned_from(*p, capacity, profile.as_ref()))
+            .collect();
         let held = capacity as f64 * expert;
         // A cache big enough for the whole store is the "just load it"
         // baseline, and the row is worth printing precisely because it is
@@ -120,6 +137,15 @@ fn main() {
 
     if ram.is_some() {
         println!("\n`!` marks a capacity that would not fit the RAM given.");
+    }
+    match &profile {
+        Some(_) => println!(
+            "\n`pinned` chose its residents from {}, so its column is what a\nprofile taken on other traffic is actually worth here.",
+            flag("--pin-from").unwrap_or_default()
+        ),
+        None => println!(
+            "\n`pinned` ranked experts on this same trace, which flatters it: it is the\nceiling for pinning, not a result. Re-run with --pin-from ANOTHER.trace to\nfind out how much of that survives a profile taken elsewhere."
+        ),
     }
     println!(
         "\ntok/s is a ceiling, not a prediction: it assumes compute is free, every\n\

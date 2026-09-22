@@ -284,10 +284,32 @@ impl Log {
 
     /// Replay against a cache of `capacity` experts under `policy`.
     pub fn replay(&self, policy: Policy, capacity: usize) -> Outcome {
+        self.replay_pinned_from(policy, capacity, None)
+    }
+
+    /// As [`Log::replay`], but [`Policy::Pinned`] may choose its residents
+    /// from a *different* trace.
+    ///
+    /// This is the difference between a claim and a measurement. Ranking
+    /// experts by how often this very trace used them and then scoring
+    /// against the same trace asks the cache to predict a future it has
+    /// already seen; every real deployment picks its residents from
+    /// yesterday's traffic and meets today's. Profiling on one prompt and
+    /// replaying another is the honest version, and the gap between the two
+    /// numbers is exactly how much of the hit rate was hindsight.
+    pub fn replay_pinned_from(
+        &self,
+        policy: Policy,
+        capacity: usize,
+        profile: Option<&Log>,
+    ) -> Outcome {
         let keys = self.accesses();
         let hits = match policy {
             Policy::Lru => lru(&keys, capacity),
-            Policy::Pinned => pinned(&keys, capacity),
+            Policy::Pinned => {
+                let ranked = profile.map_or_else(|| self.accesses(), Log::accesses);
+                pinned(&keys, &ranked, capacity)
+            }
             Policy::Optimal => optimal(&keys, capacity),
         };
         Outcome {
@@ -406,17 +428,17 @@ fn lru(keys: &[u32], capacity: usize) -> u64 {
     hits
 }
 
-/// The globally hottest `capacity` experts, resident for the whole run.
+/// The hottest `capacity` experts of `ranked_by`, resident for the whole
+/// run, scored against `keys`.
 ///
-/// This is cheating in the model's favour — the frequencies come from the
-/// very trace being replayed — but only mildly: expert popularity is a
-/// property of the model and its training data, so a set chosen on one
-/// corpus transfers to another. Treat it as the optimistic end of "pin the
-/// hot ones", and confirm it by pinning from one trace and replaying
-/// another.
-fn pinned(keys: &[u32], capacity: usize) -> u64 {
+/// Pass the same slice twice and the frequencies come from the trace being
+/// replayed, which is the optimistic end: it asks the cache to predict a
+/// future it has already seen. Pass a different trace and the answer is
+/// honest, because that is what a deployment does — yesterday's profile
+/// against today's traffic.
+fn pinned(keys: &[u32], ranked_by: &[u32], capacity: usize) -> u64 {
     let mut count: HashMap<u32, u64> = HashMap::new();
-    for &key in keys {
+    for &key in ranked_by {
         *count.entry(key).or_default() += 1;
     }
     let mut ranked: Vec<(u32, u64)> = count.into_iter().collect();
@@ -424,12 +446,23 @@ fn pinned(keys: &[u32], capacity: usize) -> u64 {
     // the same trace would score differently run to run.
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
+    let resident: std::collections::HashSet<u32> =
+        ranked.iter().take(capacity).map(|(key, _)| *key).collect();
+
     // The first access to a pinned expert is a miss in any honest
     // accounting — the cache starts empty and something has to load it —
-    // but over thousands of tokens that is a rounding error, and counting
-    // it would need the load order, which this policy does not have. Every
-    // later access hits.
-    ranked.iter().take(capacity).map(|(_, n)| n - 1).sum()
+    // but over thousands of tokens that is a rounding error, and a real
+    // implementation would load the whole resident set at startup and pay
+    // it once. Counted as a miss here, which errs against the policy this
+    // is trying to make a case for.
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut hits = 0;
+    for &key in keys {
+        if resident.contains(&key) && !seen.insert(key) {
+            hits += 1;
+        }
+    }
+    hits
 }
 
 /// Bélády: evict whatever is wanted furthest in the future.
@@ -506,7 +539,8 @@ mod tests {
         }
         let distinct = keys.iter().collect::<std::collections::HashSet<_>>().len();
         for capacity in [1, 2, 5, 9, 13] {
-            let (l, p, o) = (lru(&keys, capacity), pinned(&keys, capacity), optimal(&keys, capacity));
+            let (l, p, o) =
+                (lru(&keys, capacity), pinned(&keys, &keys, capacity), optimal(&keys, capacity));
             assert!(o >= l, "optimal {o} < lru {l} at capacity {capacity}");
             assert!(o >= p, "optimal {o} < pinned {p} at capacity {capacity}");
         }
@@ -520,8 +554,19 @@ mod tests {
         // 0 appears four times, 1 twice, 2 once. One slot keeps 0, and
         // scores its three repeat visits.
         let keys = [0, 0, 1, 0, 2, 1, 0];
-        assert_eq!(pinned(&keys, 1), 3);
-        assert_eq!(pinned(&keys, 2), 4);
+        assert_eq!(pinned(&keys, &keys, 1), 3);
+        assert_eq!(pinned(&keys, &keys, 2), 4);
+    }
+
+    /// A hot set chosen on other traffic still has to be scored against
+    /// this traffic, and only the experts both agree on can hit.
+    #[test]
+    fn pinning_from_another_trace_scores_that_trace() {
+        // The profile says 9 is the hottest thing in the world; the replay
+        // never touches it, so one slot buys nothing.
+        assert_eq!(pinned(&[0, 0, 0, 0], &[9, 9, 9, 1], 1), 0);
+        // Two slots reach 0, whose three repeat visits then hit.
+        assert_eq!(pinned(&[0, 0, 0, 0], &[9, 9, 9, 0], 2), 3);
     }
 
     #[test]

@@ -544,6 +544,26 @@ impl ToolCalls {
                     return (content, calls);
                 }
                 (true, Some(at)) => {
+                    // A second block opening before this one closed, with a
+                    // finished call in between: the model wrote the calls and
+                    // forgot the closer between them. A 14B Qwen did exactly
+                    // that, and taking the open as the closer it left out is
+                    // the difference between both calls arriving and neither:
+                    // the block would otherwise run to the *next* closer,
+                    // swallowing the second call into a body that cannot
+                    // parse.
+                    //
+                    // Only when what came before parses, because `<tool_call>`
+                    // inside a block that is not a call is text like any
+                    // other, and a model writing about the format writes
+                    // exactly that.
+                    if let Some(open) = self.held[..at].find(CALL_OPEN) {
+                        if let Some(call) = parse_call(&self.held[..open]) {
+                            calls.push(call);
+                            self.held = self.held[open + CALL_OPEN.len()..].to_string();
+                            continue;
+                        }
+                    }
                     let body = self.held[..at].to_string();
                     self.held = self.held[at + CALL_CLOSE.len()..].to_string();
                     self.inside = false;
@@ -566,12 +586,29 @@ impl ToolCalls {
         if !std::mem::replace(&mut self.inside, false) {
             return (rest, Vec::new());
         }
+        // The same rule as in `feed`, for a reply that ended without ever
+        // closing: every finished call before an open that follows it is a
+        // call the model wrote and did not close.
+        let mut calls = Vec::new();
+        let mut rest = rest.as_str();
+        while let Some(open) = rest.find(CALL_OPEN) {
+            match parse_call(&rest[..open]) {
+                Some(call) => {
+                    calls.push(call);
+                    rest = &rest[open + CALL_OPEN.len()..];
+                }
+                None => break,
+            }
+        }
         // A call the budget cut off. Occasionally the model wrote the whole
         // object and only the closing tag is missing, which is a call; more
         // often it is a fragment, which is text.
-        match parse_call(&rest) {
-            Some(call) => (String::new(), vec![call]),
-            None => (format!("{CALL_OPEN}{rest}"), Vec::new()),
+        match parse_call(rest) {
+            Some(call) => {
+                calls.push(call);
+                (String::new(), calls)
+            }
+            None => (format!("{CALL_OPEN}{rest}"), calls),
         }
     }
 
@@ -744,6 +781,35 @@ mod tests {
         let mut cut = ToolCalls::new();
         cut.feed("<tool_call>{\"name\": \"l");
         assert_eq!(cut.finish(), ("<tool_call>{\"name\": \"l".to_string(), Vec::new()));
+    }
+
+    /// Two calls and one closing tag, which is what a model writes when it
+    /// forgets the one in between. Both calls are there to be had, and reading
+    /// the block through to the *next* closer lost both: what sat between the
+    /// tags was then two objects with a tag in the middle, which parses as
+    /// nothing and came back out as text. An agent saw its own tool call
+    /// printed at it instead of run.
+    #[test]
+    fn a_closing_tag_left_out_between_two_calls() {
+        let reply = "I will fix it and run it.\n\
+                     <tool_call>\n{\"name\": \"edit\", \"arguments\": {\"path\": \"main.rs\"}}\n\
+                     <tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"cargo run\"}}\n\
+                     </tool_call>";
+        let (content, calls) = calls_of(reply);
+        assert_eq!(content, "I will fix it and run it.\n");
+        assert_eq!(calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["edit", "bash"]);
+        assert_eq!(calls_by_char(reply), calls_of(reply), "the stream split differently");
+
+        // The same reply with the last closer gone too, which is what the
+        // budget running out looks like.
+        let cut = reply.strip_suffix("\n</tool_call>").unwrap();
+        assert_eq!(calls_of(cut).1.len(), 2, "{:?}", calls_of(cut));
+
+        // And the rule stays narrow: a block that is not a call is text, so
+        // a model writing *about* the format still gets its words back.
+        let prose = "<tool_call>as in <tool_call>{\"name\": \"f\"}</tool_call>";
+        assert!(calls_of(prose).1.is_empty(), "{:?}", calls_of(prose));
+        assert_eq!(calls_of(prose).0, prose);
     }
 
     /// A streamed reply may be cut anywhere, including inside either tag and

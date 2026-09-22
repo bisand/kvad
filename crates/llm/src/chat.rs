@@ -59,10 +59,9 @@ pub struct Message {
 
 /// One call, in the shape OpenAI gave it and the templates read.
 ///
-/// `arguments` is JSON *text*, not a parsed object, because that is what
-/// OpenAI's wire format carries and what the model wrote. Parsing it here to
-/// serialise it again would mean this engine deciding how to spell a number
-/// the client is about to hand to somebody else's function.
+/// `arguments` is held as JSON *text*, because that is what OpenAI's wire
+/// format carries and what the model wrote — see [`Called`] for why a
+/// template is nevertheless shown the object it spells.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolCall {
     pub id: String,
@@ -78,11 +77,42 @@ pub struct ToolCall {
 /// The id is the wire format's, not the model's — it exists so a client can
 /// match a result to a call — so it is minted where the wire format is, and
 /// this is what the parser produces.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Called {
     pub name: String,
     /// The arguments as JSON text, e.g. `{"path":"src/main.rs"}`.
     pub arguments: String,
+}
+
+/// The arguments reach a template as the *object* they spell, not as the text
+/// they arrived in.
+///
+/// Every Hermes-descended template — Qwen's included — writes a previous call
+/// out with `{{ tool_call.arguments | tojson }}`, and `tojson` of a string is
+/// a quoted, escaped string. Handing it the text put
+/// `"{\"path\": \"main.rs\"}"` in the next turn's prompt, two lines under
+/// the instructions saying a call is `{"name": …, "arguments": <args-json-object>}`.
+/// The model imitates the example nearest to hand: it wrote its next call
+/// double-encoded too, the client sent that back, and the escaping gained a
+/// level per turn until a reply stopped parsing as a call at all. What it
+/// looked like from outside was an agent that answered with the text of a tool
+/// call instead of calling the tool.
+///
+/// Text that is not JSON is serialised as itself. A model that wrote something
+/// unparseable is better represented by what it wrote than by an error here,
+/// and the caller still gets the wire format's string either way: the OpenAI
+/// response is built from these fields, not from this impl.
+impl serde::Serialize for Called {
+    fn serialize<S: serde::Serializer>(&self, out: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut call = out.serialize_struct("Called", 2)?;
+        call.serialize_field("name", &self.name)?;
+        match serde_json::from_str::<serde_json::Value>(&self.arguments) {
+            Ok(object) => call.serialize_field("arguments", &object)?,
+            Err(_) => call.serialize_field("arguments", &self.arguments)?,
+        }
+        call.end()
+    }
 }
 
 impl ToolCall {
@@ -747,7 +777,7 @@ mod tests {
             {%- if tools %}TOOLS:{% for t in tools %} {{ t.function.name }} {{ t | tojson }}{% endfor %}\n{% endif %}\
             {%- for m in messages %}\
             {{- m.role }}: {{ m.content }}\
-            {%- for c in m.tool_calls %} CALL {{ c.function.name }}{{ c.function.arguments }}{% endfor %}\
+            {%- for c in m.tool_calls %} CALL {{ c.function.name }}{{ c.function.arguments | tojson }}{% endfor %}\
             {%- if m.tool_call_id %} (for {{ m.tool_call_id }}){% endif %}\n\
             {%- endfor %}\
             {%- if add_generation_prompt %}assistant:{% endif %}";
@@ -797,7 +827,12 @@ mod tests {
             ),
             "the schema's keys were reordered: {with}"
         );
+        // Through `tojson` as well, and this is the assertion that matters:
+        // the filter has to be handed the object, because `tojson` of the
+        // *text* is a quoted escaped string and the model copies whatever
+        // shape it is shown. See `impl Serialize for Called`.
         assert!(with.contains(r#"CALL read{"path":"main.rs"}"#), "{with}");
+        assert!(!with.contains(r#"\""#), "the arguments were double-encoded: {with}");
         assert!(with.contains("tool: fn main() {} (for call_1)"), "{with}");
         assert!(with.ends_with("assistant:"), "{with}");
 

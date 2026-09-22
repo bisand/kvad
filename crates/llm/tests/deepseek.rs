@@ -740,15 +740,15 @@ fn feeding_tokens_one_at_a_time_gives_the_same_answer() {
 fn the_cache_holds_the_latent_and_not_the_keys() {
     let t = tiny(Flavour::V2);
     let (model, spec) = engine(&t, "cache");
-    assert_eq!(spec.cache.k, t.rope);
-    assert_eq!(spec.cache.v, t.lat);
+    assert_eq!(spec.cache.at(0).k, t.rope);
+    assert_eq!(spec.cache.at(0).v, t.lat);
 
     // What multi-head attention would have stored, for the same model.
     let plain = t.n_head * (t.nope + t.rope + t.v_head);
     assert!(
-        spec.cache.k + spec.cache.v < plain,
+        spec.cache.at(0).k + spec.cache.at(0).v < plain,
         "latent cache {} is not smaller than {plain}",
-        spec.cache.k + spec.cache.v
+        spec.cache.at(0).k + spec.cache.at(0).v
     );
 
     let mut cache = KvCache::new(&spec);

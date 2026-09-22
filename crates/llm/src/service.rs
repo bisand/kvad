@@ -280,7 +280,7 @@ impl Engine {
 /// not per token, so no per-token figure can carry it; see
 /// [`crate::model::CacheShape`].
 fn kvad_kv_bytes_per_token(spec: &crate::model::Spec) -> usize {
-    spec.n_layer * (spec.cache.k + spec.cache.v) * std::mem::size_of::<f32>()
+    spec.cache.bytes_per_token(spec.n_layer)
 }
 
 /// The model currently loaded, plus its sampler.
@@ -523,7 +523,7 @@ mod tests {
     /// less.
     #[test]
     fn the_per_token_cost_agrees_with_the_cache_it_describes() {
-        use crate::model::{CacheShape, KvCache};
+        use crate::model::{CacheLayout, CacheShape, KvCache};
 
         let mut spec = tiny_spec();
 
@@ -533,7 +533,7 @@ mod tests {
             // DeepSeek: 64 rotated + 512 latent, against a `kv_dim()` of 2048.
             ("deepseek", CacheShape::kv(64, 512), 16, 128),
         ] {
-            spec.cache = cache;
+            spec.cache = CacheLayout::uniform(cache);
             spec.n_kv_head = n_kv_head;
             spec.head_dim = head_dim;
             assert_eq!(
@@ -560,7 +560,7 @@ mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: true,
-            cache: crate::model::CacheShape::kv(256, 256),
+            cache: crate::model::CacheLayout::uniform(crate::model::CacheShape::kv(256, 256)),
             config: crate::model::Json::default(),
         }
     }

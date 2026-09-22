@@ -1217,7 +1217,7 @@ fn build(src: &dyn Source, spec: &Spec) -> Res<Box<dyn Transformer>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Arch, CacheShape, Json};
+    use crate::model::{Arch, CacheLayout, CacheShape, Json};
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("nq-test-{}-{name}", std::process::id()));
@@ -1281,7 +1281,7 @@ mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: true,
-            cache: CacheShape::kv(32, 32),
+            cache: CacheLayout::uniform(CacheShape::kv(32, 32)),
             config: Json::default(),
         }
     }

@@ -420,7 +420,7 @@ impl GpuLlama {
 /// arithmetic. It is the point at which a load that failed is allowed to say
 /// so. Microseconds against the seconds a load already takes, paid once, in
 /// exchange for never again serving a model that is quietly half zeros.
-fn settled(device: &Device) -> Res<()> {
+pub(crate) fn settled(device: &Device) -> Res<()> {
     device.synchronize()?;
     Ok(())
 }
@@ -468,7 +468,7 @@ fn settled(device: &Device) -> Res<()> {
 /// not a translation of the fused one — it is the original, and
 /// `the_fused_kernel_agrees_with_the_written_out_one` is what says they are
 /// the same function.
-fn attention(
+pub(crate) fn attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -677,6 +677,15 @@ pub fn session(
         Box::new(GpuLlama::load(paths, spec.clone(), dtype, quant, device, &cache)?)
     } else if arch.is("gpt2") {
         Box::new(crate::gpt2::GpuGpt2::load(paths, spec.clone(), dtype, quant, device, &cache)?)
+    } else if arch.is("qwen3_5") {
+        Box::new(crate::qwen3_5::GpuQwen35::load(
+            paths,
+            spec.clone(),
+            dtype,
+            quant,
+            device,
+            &cache,
+        )?)
     } else {
         Box::new(crate::deepseek::GpuDeepSeek::load(
             paths,
@@ -703,7 +712,7 @@ pub fn session(
 /// `deepseek.rs` implements V3 as well, and V3 is not here: the dispatch
 /// below has no arm for it, so no V3 checkpoint reaches that code. The arm
 /// and this list go together when it gets one.
-const IMPLEMENTED: [&str; 3] = ["llama", "gpt2", "deepseek_v2"];
+const IMPLEMENTED: [&str; 4] = ["llama", "gpt2", "deepseek_v2", "qwen3_5"];
 
 /// Whether this backend can run `arch`, asked before anything is loaded.
 pub fn supports(arch: Arch) -> bool {
@@ -1022,7 +1031,7 @@ pub(crate) mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: true,
-            cache: kvad::model::CacheShape::kv(32, 32),
+            cache: kvad::model::CacheLayout::uniform(kvad::model::CacheShape::kv(32, 32)),
             config: kvad::model::Json::default(),
         }
     }

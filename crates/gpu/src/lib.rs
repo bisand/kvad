@@ -23,4 +23,5 @@ pub mod deepseek;
 mod ffn;
 pub mod gpt2;
 pub mod model;
+pub mod qwen3_5;
 pub mod qcache;

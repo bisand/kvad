@@ -425,7 +425,7 @@ pub(crate) mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: tie,
-            cache: kvad::model::CacheShape::kv(32, 32),
+            cache: kvad::model::CacheLayout::uniform(kvad::model::CacheShape::kv(32, 32)),
             config: kvad::model::Json::default(),
         }
     }

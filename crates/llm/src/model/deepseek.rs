@@ -71,7 +71,7 @@
 //! needed to run the model. Its weights are skipped.
 
 use super::ffn::{Ffn, Layout, Mlp, Moe, Router};
-use super::{Architecture, CacheShape, Json, KvCache, Spec, Transformer};
+use super::{Architecture, CacheLayout, CacheShape, Json, KvCache, Spec, Transformer};
 use crate::qcache::{head, Source};
 use crate::quant::Weight;
 use crate::tensor::{dot, rms_norm, softmax_inplace, Rope};
@@ -189,7 +189,7 @@ fn configure(spec: &mut Spec) -> Res<()> {
     // just never stored. Saying otherwise would make `kv_dim` a lie.
     spec.n_kv_head = spec.n_head;
     // The whole point of the architecture, as a number.
-    spec.cache = CacheShape::kv(mla.qk_rope, mla.kv_lora);
+    spec.cache = CacheLayout::uniform(CacheShape::kv(mla.qk_rope, mla.kv_lora));
     Ok(())
 }
 

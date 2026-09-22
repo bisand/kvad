@@ -1128,6 +1128,70 @@ set to one, where the two rules are the same rule — so a single implementation
 of it is correct today and silently wrong for half the layers of the first
 checkpoint that ships a two.
 
+### The one that stopped keeping a cache
+
+`qwen3_5` — Qwen3.8 — is the first architecture here that does not keep its
+past. Sixteen of its sixty-four layers are ordinary attention. The other
+forty-eight are a **gated delta net**, and they hold one matrix per head
+instead of a row per token:
+
+```text
+    S <- S · e^g       decay what is already there
+    δ  = (v − Sᵀk)·β   how wrong S is about this key
+    S <- S + k ⊗ δ     write the correction
+    y  = Sᵀq           read it back
+```
+
+That is the delta rule. Rather than appending `k ⊗ v` and hoping, it asks what
+`S` already returns for this key and stores only the difference, scaled by a
+learned per-token `β`. `g` is a learned decay, so the layer chooses per token
+how much to forget.
+
+The cost is constant. `S` is the same size at position one and at position
+262144 — 157 MB across those forty-eight layers, whatever the context. Sixty-
+four layers of ordinary attention at full context would be paying per token for
+all of it.
+
+What it costs instead is prefix reuse, which is
+[the decision recorded above](#the-seam-that-cannot-rewind): the state has
+already absorbed the tokens you want to drop, so `truncate` refuses and says
+so. This is the architecture that made that seam necessary, and the first
+backend to ever answer anything but "yes".
+
+### Two implementations agreeing all the way to the wrong answer
+
+`tests/qwen3_5.rs` writes the whole forward pass out a second time, longhand,
+and checks the engine against it. Both passed on the first run. Both were
+wrong.
+
+Qwen3.5's RMSNorm scales by `1 + w`, not by `w`: the stored vector is an
+*offset from one*, initialised to zeros. Every other architecture in this
+repository scales by `w` directly, and so did both of these — the engine and
+the second implementation written to check it, because the same misreading was
+behind both. They agreed with each other to seven decimal places and disagreed
+with the model by a factor of two on every norm in the network.
+
+What caught it was running the real thing. `scripts/check-qwen3-5.py` loads the
+same fixture into `transformers`' own `Qwen3_5ForCausalLM` and compares:
+
+```text
+    positions (7, 64)  worst absolute difference 5.018e+00  (scale 2.614)
+      position 0: 3.228e+00  DISAGREE
+```
+
+and after the fix, on the same fixture:
+
+```text
+    positions (7, 64)  worst absolute difference 1.520e-05  (scale 2.739)
+      position 0: 4.292e-06  ok
+```
+
+The lesson is not "write more tests". It is that a second implementation by the
+same author checks the *algebra* and cannot check the *reading*, and that those
+are different kinds of mistake. The same file, incidentally, uses the ordinary
+`w` convention for its gated norm — two conventions in one checkpoint, and
+nothing announces which is which.
+
 ### Base models versus instruction-tuned
 
 GPT-2 is a **base** model: pure next-token prediction, no instruction tuning.

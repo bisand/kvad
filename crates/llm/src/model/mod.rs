@@ -38,6 +38,8 @@ pub mod ffn;
 pub mod gpt2;
 #[cfg(feature = "arch-llama")]
 pub mod llama;
+#[cfg(feature = "arch-qwen3-5")]
+pub mod qwen3_5;
 
 pub use arch::{Arch, Architecture};
 
@@ -79,7 +81,7 @@ pub struct Spec {
     /// DeepSeek's latent attention stores something else, in two streams of
     /// different widths, which is why this is a field the architecture sets
     /// rather than a number the skeleton computes.
-    pub cache: CacheShape,
+    pub cache: CacheLayout,
     /// The model's `config.json`, as it was read.
     ///
     /// Everything above this line is a field most of the Hub agrees on.
@@ -111,15 +113,86 @@ pub struct CacheShape {
 }
 
 impl CacheShape {
-    /// Keys and values, and no recurrent state: every architecture here so
-    /// far.
+    /// Keys and values, and no recurrent state: the ordinary answer.
     pub const fn kv(k: usize, v: usize) -> Self {
         CacheShape { k, v, state: 0 }
+    }
+
+    /// A recurrent state and nothing per position: a linear-attention layer.
+    pub const fn recurrent(state: usize) -> Self {
+        CacheShape { k: 0, v: 0, state }
     }
 
     /// Bytes one layer keeps at `len` positions.
     pub fn bytes(&self, len: usize) -> usize {
         (len * (self.k + self.v) + self.state) * std::mem::size_of::<f32>()
+    }
+}
+
+/// What *every* layer keeps, which is not always the same thing.
+///
+/// One shape sufficed while every layer of a model did the same thing. Qwen3.8
+/// is the first here that does not: sixteen of its sixty-four layers are
+/// ordinary attention holding keys and values, and the other forty-eight are
+/// linear-attention layers holding a recurrent state and nothing per position.
+/// No single [`CacheShape`] describes that, so the layout carries one per
+/// layer when it has to and one for all of them when it does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheLayout {
+    /// The shape every layer has, when they all have the same one.
+    uniform: CacheShape,
+    /// Per layer, when they differ. Never empty when present.
+    per_layer: Option<Vec<CacheShape>>,
+}
+
+impl CacheLayout {
+    pub fn uniform(shape: CacheShape) -> Self {
+        CacheLayout { uniform: shape, per_layer: None }
+    }
+
+    /// A layout that differs layer by layer. The `uniform` shape it reports
+    /// for an out-of-range layer is the first one, which only a bug asks for.
+    pub fn per_layer(shapes: Vec<CacheShape>) -> Self {
+        let uniform = shapes.first().copied().unwrap_or(CacheShape::kv(0, 0));
+        CacheLayout { uniform, per_layer: Some(shapes) }
+    }
+
+    /// What layer `i` keeps.
+    pub fn at(&self, layer: usize) -> CacheShape {
+        match &self.per_layer {
+            None => self.uniform,
+            Some(shapes) => shapes.get(layer).copied().unwrap_or(self.uniform),
+        }
+    }
+
+    /// Bytes the whole cache holds at `len` positions, across `n_layer`
+    /// layers.
+    pub fn bytes(&self, n_layer: usize, len: usize) -> usize {
+        match &self.per_layer {
+            None => n_layer * self.uniform.bytes(len),
+            Some(shapes) => shapes.iter().take(n_layer).map(|s| s.bytes(len)).sum(),
+        }
+    }
+
+    /// What one more token of context costs, across every layer.
+    ///
+    /// The recurrent state is deliberately absent: it is a cost *per layer*
+    /// and does not move when a token arrives, so no per-token figure can
+    /// carry it. [`CacheLayout::bytes`] is the one that counts everything.
+    pub fn bytes_per_token(&self, n_layer: usize) -> usize {
+        let per = |s: &CacheShape| (s.k + s.v) * std::mem::size_of::<f32>();
+        match &self.per_layer {
+            None => n_layer * per(&self.uniform),
+            Some(shapes) => shapes.iter().take(n_layer).map(per).sum(),
+        }
+    }
+
+    /// Whether any layer holds something that cannot be rewound.
+    pub fn any_recurrent(&self) -> bool {
+        match &self.per_layer {
+            None => self.uniform.state > 0,
+            Some(shapes) => shapes.iter().any(|s| s.state > 0),
+        }
     }
 }
 
@@ -158,6 +231,25 @@ impl Json {
 
     pub fn text(&self, key: &str) -> Option<&str> {
         self.0.get(key)?.as_str()
+    }
+
+    /// The text half of a multimodal config, or the whole of a text one.
+    ///
+    /// Named for what it returns rather than for the key it reads, because
+    /// [`Json::text`] already means "this key, as a string".
+    ///
+    /// Qwen3.8 ships as a `Qwen3_5ForConditionalGeneration`: a vision tower
+    /// and a language model, with `model_type` and little else at the top and
+    /// everything textual under `text_config`. Unwrapping it here means every
+    /// architecture goes on reading the field names it always read, and only
+    /// the discriminator is taken from the outer object — which is the right
+    /// way round, because the outer `model_type` is what names the whole
+    /// thing and the inner one (`qwen3_5_text`) names only a part of it.
+    pub fn text_model(&self) -> Json {
+        match self.0.get("text_config") {
+            Some(v) if v.is_object() => Json::new(v.clone()),
+            _ => self.clone(),
+        }
     }
 
     /// A number the architecture cannot run without.
@@ -214,6 +306,11 @@ impl Spec {
             format!("unsupported architecture `{model_type}`.\nThis build runs: {}.", arch::supported())
         })?;
 
+        // Everything below this line is the *text* model's shape, which for a
+        // multimodal checkpoint is a level down. The architecture was chosen
+        // from the outer object above, because that is what names the whole.
+        let config = config.text_model();
+
         let n_embd = config.num(&["n_embd", "hidden_size"]).ok_or("config: no hidden size")?;
         let n_head = config.num(&["n_head", "num_attention_heads"]).ok_or("config: no head count")?;
         // Llama 3.2 states head_dim explicitly; everyone else implies it.
@@ -238,7 +335,7 @@ impl Spec {
             tie_embeddings: config.flag("tie_word_embeddings").unwrap_or(arch.is("gpt2")),
             // The ordinary answer. An architecture that caches something else
             // overwrites this in `configure`.
-            cache: CacheShape::kv(n_kv_head * head_dim, n_kv_head * head_dim),
+            cache: CacheLayout::uniform(CacheShape::kv(n_kv_head * head_dim, n_kv_head * head_dim)),
             config,
         };
         arch.configure(&mut spec)?;
@@ -320,7 +417,7 @@ pub struct KvCache {
     /// the whole sequence, not one per position. Empty when the architecture
     /// has none, which is all of them so far.
     state: Vec<Vec<f32>>,
-    shape: CacheShape,
+    shape: CacheLayout,
     pub len: usize,
 }
 
@@ -334,8 +431,8 @@ impl KvCache {
         KvCache {
             k: (0..spec.n_layer).map(|_| Vec::new()).collect(),
             v: (0..spec.n_layer).map(|_| Vec::new()).collect(),
-            state: (0..spec.n_layer).map(|_| vec![0.0; spec.cache.state]).collect(),
-            shape: spec.cache,
+            state: (0..spec.n_layer).map(|i| vec![0.0; spec.cache.at(i).state]).collect(),
+            shape: spec.cache.clone(),
             len: 0,
         }
     }
@@ -354,7 +451,7 @@ impl KvCache {
 
     /// Whether anything here refuses to rewind. See [`KvCache::truncate`].
     pub fn is_recurrent(&self) -> bool {
-        self.shape.state > 0
+        self.shape.any_recurrent()
     }
 
     pub fn push(&mut self, layer: usize, k: &[f32], v: &[f32]) {
@@ -409,9 +506,10 @@ impl KvCache {
             self.clear();
             return 0;
         }
-        for (k, v) in self.k.iter_mut().zip(self.v.iter_mut()) {
-            k.truncate(len * self.shape.k);
-            v.truncate(len * self.shape.v);
+        for (i, (k, v)) in self.k.iter_mut().zip(self.v.iter_mut()).enumerate() {
+            let shape = self.shape.at(i);
+            k.truncate(len * shape.k);
+            v.truncate(len * shape.v);
         }
         self.len = len;
         self.len
@@ -432,12 +530,12 @@ impl KvCache {
 
     /// Bytes currently held.
     pub fn bytes(&self) -> usize {
-        self.k.len() * self.shape.bytes(self.len)
+        self.shape.bytes(self.k.len(), self.len)
     }
 
     /// Bytes this cache would hold at full context.
     pub fn max_bytes(spec: &Spec) -> usize {
-        spec.n_layer * spec.cache.bytes(spec.n_ctx)
+        spec.cache.bytes(spec.n_layer, spec.n_ctx)
     }
 }
 
@@ -760,7 +858,7 @@ mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: true,
-            cache: CacheShape::kv(n_kv_head * head_dim, n_kv_head * head_dim),
+            cache: CacheLayout::uniform(CacheShape::kv(n_kv_head * head_dim, n_kv_head * head_dim)),
             config: Json::default(),
         }
     }
@@ -804,7 +902,7 @@ mod tests {
     /// The same spec with a recurrent state, which nothing loads yet.
     fn recurrent_spec() -> Spec {
         let mut spec = test_spec();
-        spec.cache.state = 6;
+        spec.cache = CacheLayout::uniform(CacheShape { k: 4, v: 4, state: 6 });
         spec
     }
 

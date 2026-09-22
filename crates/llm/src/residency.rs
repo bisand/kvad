@@ -83,6 +83,34 @@
 //! LRU at every size, so the gap is real and something cleverer than LRU
 //! could still claim it. Just not by pinning.
 //!
+//! Qwen3-30B-A3B — 48 layers, 128 experts, top-8 — was then run to test
+//! that reading, and confirmed it. Its working set is 6.25% of its store
+//! against DeepSeek's 9.4%, and everything moved the way finer granularity
+//! predicts:
+//!
+//! ```text
+//!                       LRU @10%   LRU @50%   pinned (other domain) @50%
+//! DeepSeek-V2-Lite        27.6%      71.1%            ~60%
+//! Qwen3-30B-A3B           51.6%      97.0%            61-77%  (LRU +21..36)
+//! ```
+//!
+//! The cliff landed on the blob. A cache of 374 blobs hits 1.9%; one of
+//! 384 — which is `top_k * layers` exactly — hits 33.2%. Nothing about
+//! that is tuned, and it gives a sizing rule that needs no measurement:
+//! below `top_k * layers` experts an LRU cache returns nothing, because a
+//! pass evicts every entry before its next use.
+//!
+//! What climbs after the cliff is routing skew, and that is a second,
+//! separate variable. Qwen3 is far more concentrated than DeepSeek — its
+//! busiest expert runs 14x the average against 5x, its top tenth takes
+//! half the reads against a quarter — which is why it reaches 97% where
+//! DeepSeek reaches 71%. And yet pinning does *worse* here, not better:
+//! dead level with LRU even when ranked on the trace it is scored against,
+//! and 21 to 36 points behind when ranked on another domain. Skew does not
+//! help a static set, because the skew is the domain's and not the
+//! model's — the hot tenths of two domains overlap by 22-37%. LRU gets the
+//! same concentration for free and re-learns it when the subject changes.
+//!
 //! A four-expert mixture said the opposite, convincingly, and was wrong:
 //! at top-2 of 4 it reads half of every layer, so its working set is half
 //! the store and LRU cannot win below that capacity whatever the routing

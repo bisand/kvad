@@ -206,7 +206,7 @@ impl GpuDeepSeek {
             let mlp = match layout.is_moe(i, router.n_experts) {
                 false => Mlp::Dense(Ffn::load(&ld, &m, e, inter)?),
                 true => {
-                    Mlp::Moe(Box::new(Moe::load(&ld, &m, e, moe_inter, &router, layout.n_shared)?))
+                    Mlp::Moe(Box::new(Moe::load(&ld, &m, e, moe_inter, &router, layout.shared)?))
                 }
             };
 
@@ -488,6 +488,7 @@ impl Session for GpuDeepSeek {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kvad::model::ffn::Shared;
     use kvad::model::{Json, Transformer};
     use kvad::serde_json;
     use std::collections::HashMap;
@@ -580,8 +581,8 @@ mod tests {
                     for x in 0..router.n_experts {
                         ffn(&mut t, &format!("{p}.mlp.experts.{x}"), moe_inter);
                     }
-                    if layout.n_shared > 0 {
-                        ffn(&mut t, &format!("{p}.mlp.shared_experts"), moe_inter * layout.n_shared);
+                    if layout.shared != Shared::None {
+                        ffn(&mut t, &format!("{p}.mlp.shared_experts"), layout.shared.width(moe_inter));
                     }
                 }
             }

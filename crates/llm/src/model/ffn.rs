@@ -18,6 +18,13 @@
 //! from the checkpoint's own config and defaults every one of them to the
 //! plain answer — softmax over a flat list, top `k`, no rescaling. A family
 //! that wants exactly that, as Qwen3 does, adds nothing here.
+//!
+//! What *is* code is the expert that runs for every token. There are three
+//! answers — none, DeepSeek's, and Qwen3-Next's, which a token can decline
+//! through a sigmoid gate — and [`Shared`] is all three, because the middle
+//! one and the last one are near enough alike that running either under the
+//! other's rule would load, run, and be wrong by an amount that varies per
+//! token.
 
 use super::Json;
 use crate::qcache::Source;
@@ -29,6 +36,52 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 // ---------------------------------------------------------------------------
 // Which layers route
 // ---------------------------------------------------------------------------
+
+/// The expert that runs for every token, whatever the router says.
+///
+/// Two families have one and they do not agree about it. DeepSeek stores `n`
+/// experts side by side in a single matrix and adds the result as it comes;
+/// Qwen3-Next stores one MLP of its own width and multiplies it by
+/// `sigmoid(x · w)` first, so a token can decline it. An ungated shared expert
+/// is this one with the sigmoid nailed to one, and the two are close enough
+/// that running either under the other's rule would load, run, and be wrong
+/// by a factor that varies per token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shared {
+    /// Nobody runs unconditionally. Qwen3's mixture, and Qwen3-Coder's.
+    None,
+    /// DeepSeek's, under `mlp.shared_experts`: `n` experts' worth of width in
+    /// one matrix, added whole.
+    Fused(usize),
+    /// Qwen3-Next's, under `mlp.shared_expert`, of the width given, with
+    /// `mlp.shared_expert_gate` deciding per token how much of it counts.
+    Gated(usize),
+}
+
+impl Shared {
+    /// What this is called in a checkpoint. Singular or plural, and the
+    /// difference is not cosmetic: asking for the wrong one is a load error,
+    /// which is the outcome to want.
+    fn name(self) -> &'static str {
+        match self {
+            Shared::Fused(_) => "shared_experts",
+            _ => "shared_expert",
+        }
+    }
+
+    /// How wide the shared expert is, given one routed expert's width.
+    ///
+    /// Only the framework backend needs this — the hand-written loader reads
+    /// every shape from the checkpoint — but both have to reach the same
+    /// number, so it is worked out once here.
+    pub fn width(self, expert: usize) -> usize {
+        match self {
+            Shared::None => 0,
+            Shared::Fused(n) => expert * n,
+            Shared::Gated(w) => w,
+        }
+    }
+}
 
 /// Which layers are a mixture and which are an ordinary MLP.
 ///
@@ -53,7 +106,8 @@ pub struct Layout {
     /// not. Carrying the offset costs a `usize::from` and means neither
     /// family is being run by the other's rule.
     from_one: bool,
-    pub n_shared: usize,
+    /// The expert that runs unconditionally, if this family has one.
+    pub shared: Shared,
     /// Qwen3's explicit list of layers that are an ordinary MLP whatever the
     /// step says. Empty in the published checkpoints, and the only thing here
     /// that is a list rather than a rule.
@@ -69,7 +123,15 @@ impl Layout {
             first_dense: config.num(&["first_k_dense_replace"]).unwrap_or(0),
             every: step.or_else(|| config.num(&["moe_layer_freq"])).unwrap_or(1).max(1),
             from_one: step.is_some(),
-            n_shared: config.num(&["n_shared_experts"]).unwrap_or(0),
+            // Qwen3-Next's spelling first, and it names a width rather than
+            // a count: it has exactly one shared expert and says how wide.
+            shared: match config.num(&["shared_expert_intermediate_size"]) {
+                Some(width) => Shared::Gated(width),
+                None => match config.num(&["n_shared_experts"]).unwrap_or(0) {
+                    0 => Shared::None,
+                    n => Shared::Fused(n),
+                },
+            },
             dense: config
                 .get("mlp_only_layers")
                 .and_then(|v| v.as_array())
@@ -318,6 +380,60 @@ impl Ffn {
     }
 }
 
+/// The shared expert, and whatever decides how much of it counts.
+///
+/// One struct rather than two fields on [`Moe`], because an `Option<Ffn>` and
+/// an `Option<Weight>` that have to agree about whether they are present is
+/// two chances to disagree.
+pub struct SharedExpert {
+    ffn: Ffn,
+    /// `[1, hidden]`: Qwen3-Next's per-token sigmoid. `None` for DeepSeek,
+    /// which adds its shared experts whole.
+    gate: Option<Weight>,
+}
+
+impl SharedExpert {
+    fn load(src: &dyn Source, prefix: &str, shared: Shared) -> Res<Option<Self>> {
+        if shared == Shared::None {
+            return Ok(None);
+        }
+        Ok(Some(SharedExpert {
+            ffn: Ffn::load(src, &format!("{prefix}.{}", shared.name()))?,
+            gate: match shared {
+                Shared::Gated(_) => Some(src.matrix(&format!("{prefix}.shared_expert_gate.weight"))?),
+                _ => None,
+            },
+        }))
+    }
+
+    /// A batch, which is every batch: the shared expert runs for every token
+    /// and so needs no grouping. Doubles as the accumulator the routed
+    /// experts add into.
+    fn run(&self, hs: &[f32], m: usize) -> Vec<f32> {
+        let mut out = self.ffn.run(hs, m);
+        if let Some(gate) = &self.gate {
+            // One row, so one number per token.
+            let scores = gate.matmul_bt(hs, m, None);
+            let e = out.len() / m;
+            for (i, score) in scores.iter().enumerate().take(m) {
+                let g = 1.0 / (1.0 + (-score).exp());
+                for o in &mut out[i * e..(i + 1) * e] {
+                    *o *= g;
+                }
+            }
+        }
+        out
+    }
+
+    fn param_count(&self) -> usize {
+        self.ffn.param_count() + self.gate.as_ref().map_or(0, Weight::param_count)
+    }
+
+    fn bytes(&self) -> usize {
+        self.ffn.bytes() + self.gate.as_ref().map_or(0, Weight::bytes)
+    }
+}
+
 pub enum Mlp {
     /// The first `first_k_dense_replace` layers are ordinary. The router
     /// needs a residual stream that already means something, and at layer
@@ -341,7 +457,7 @@ pub struct Moe {
     pub bias: Option<Vec<f32>>,
     pub experts: Vec<Ffn>,
     /// Runs for every token, whatever the router says.
-    pub shared: Option<Ffn>,
+    pub shared: Option<SharedExpert>,
 }
 
 impl Moe {
@@ -349,11 +465,12 @@ impl Moe {
     /// this family has one, the experts, and the shared expert if there is
     /// one.
     ///
-    /// Both families that reach here spell the weights identically —
+    /// Every family that reaches here spells the routed weights identically —
     /// `mlp.gate.weight` and `mlp.experts.N.{gate,up,down}_proj.weight` — so
-    /// what tells them apart is what is *absent*: Qwen3 has neither the bias
-    /// nor a shared expert, and asks for neither.
-    pub fn load(src: &dyn Source, prefix: &str, router: &Router, n_shared: usize) -> Res<Self> {
+    /// what tells them apart is what is *around* them: Qwen3 has neither the
+    /// bias nor a shared expert and asks for neither, DeepSeek has both, and
+    /// Qwen3-Next has a shared expert with a mind of its own.
+    pub fn load(src: &dyn Source, prefix: &str, router: &Router, shared: Shared) -> Res<Self> {
         Ok(Moe {
             router: router.clone(),
             gate: src.matrix(&format!("{prefix}.gate.weight"))?,
@@ -361,10 +478,7 @@ impl Moe {
             experts: (0..router.n_experts)
                 .map(|e| Ffn::load(src, &format!("{prefix}.experts.{e}")))
                 .collect::<Res<Vec<_>>>()?,
-            shared: match n_shared {
-                0 => None,
-                _ => Some(Ffn::load(src, &format!("{prefix}.shared_experts"))?),
-            },
+            shared: SharedExpert::load(src, prefix, shared)?,
         })
     }
 
@@ -448,7 +562,7 @@ impl Mlp {
                 moe.gate.param_count()
                     + moe.bias.as_ref().map_or(0, Vec::len)
                     + moe.experts.iter().map(Ffn::param_count).sum::<usize>()
-                    + moe.shared.as_ref().map_or(0, Ffn::param_count)
+                    + moe.shared.as_ref().map_or(0, SharedExpert::param_count)
             }
         }
     }
@@ -459,7 +573,7 @@ impl Mlp {
             Mlp::Moe(moe) => {
                 moe.gate.bytes()
                     + moe.experts.iter().map(Ffn::bytes).sum::<usize>()
-                    + moe.shared.as_ref().map_or(0, Ffn::bytes)
+                    + moe.shared.as_ref().map_or(0, SharedExpert::bytes)
             }
         }
     }
@@ -520,6 +634,30 @@ mod tests {
         let routes = |l: &Layout| (0..4).map(|i| l.is_moe(i, 8)).collect::<Vec<_>>();
         assert_eq!(routes(&named), [false, true, false, true]);
         assert_eq!(routes(&counted), [false, false, true, true]);
+    }
+
+    /// The three answers to "what runs for every token", from the three
+    /// families' own configs.
+    ///
+    /// Worth pinning because the failure is quiet in both directions. Reading
+    /// Qwen3-Next's shared expert as DeepSeek's asks for `mlp.shared_experts`
+    /// and fails loudly, which is fine — but reading it as *absent* would load
+    /// a model that runs with a whole expert missing from every layer.
+    #[test]
+    fn each_family_says_what_runs_for_every_token() {
+        let read = |v: serde_json::Value| Layout::read(&config(v)).shared;
+        assert_eq!(read(json!({ "num_experts": 128 })), Shared::None);
+        assert_eq!(read(json!({ "n_shared_experts": 2 })), Shared::Fused(2));
+        assert_eq!(
+            read(json!({ "shared_expert_intermediate_size": 512 })),
+            Shared::Gated(512)
+        );
+
+        // DeepSeek's is `n` experts side by side in one matrix; Qwen3-Next's
+        // names its own width and has nothing to multiply.
+        assert_eq!(Shared::Fused(2).width(768), 1536);
+        assert_eq!(Shared::Gated(512).width(768), 512);
+        assert_eq!(Shared::None.width(768), 0);
     }
 
     /// Qwen3-30B-A3B's own routing: softmax over a flat 128, the best eight,

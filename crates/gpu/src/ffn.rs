@@ -33,7 +33,7 @@
 use crate::common::{Loader, Proj, Reader, Stored};
 use candle_core::{DType, Tensor};
 use candle_nn::ops;
-use kvad::model::ffn::Router;
+use kvad::model::ffn::{Router, Shared};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -72,6 +72,54 @@ impl Ffn {
     }
 }
 
+/// The shared expert, and whatever decides how much of it counts.
+///
+/// The mirror of [`kvad::model::ffn::SharedExpert`]: DeepSeek adds its shared
+/// experts whole, Qwen3-Next scales its one by `sigmoid(x · w)` first.
+pub(crate) struct SharedExpert {
+    ffn: Ffn,
+    /// `[1, hidden]`, and `None` for the family that has no such thing.
+    gate: Option<Proj>,
+}
+
+impl SharedExpert {
+    fn load(ld: &Loader, vb: &Reader<'_>, e: usize, width: usize, shared: Shared) -> Res<Option<Self>> {
+        let name = match shared {
+            Shared::None => return Ok(None),
+            // Stored fused: `n` experts side by side in one matrix, so the
+            // width is `n` times an expert's.
+            Shared::Fused(_) => "shared_experts",
+            Shared::Gated(_) => "shared_expert",
+        };
+        Ok(Some(SharedExpert {
+            ffn: Ffn::load(ld, &vb.pp(name), e, shared.width(width))?,
+            gate: match shared {
+                Shared::Gated(_) => Some(ld.proj(vb, "shared_expert_gate.weight", 1, e, Stored::OutIn)?),
+                _ => None,
+            },
+        }))
+    }
+
+    /// Every token, so no grouping — and a convenient accumulator for the
+    /// routed experts to add into.
+    fn forward(&self, h: &Tensor) -> Res<Tensor> {
+        let out = self.ffn.forward(h)?;
+        match &self.gate {
+            // `[m, 1]`, broadcast back over the width it scales.
+            Some(gate) => Ok(out.broadcast_mul(&ops::sigmoid(&gate.forward(h)?)?)?),
+            None => Ok(out),
+        }
+    }
+
+    fn params(&self) -> usize {
+        self.ffn.params() + self.gate.as_ref().map_or(0, Proj::params)
+    }
+
+    fn bytes(&self) -> usize {
+        self.ffn.bytes() + self.gate.as_ref().map_or(0, Proj::bytes)
+    }
+}
+
 pub(crate) struct Moe {
     /// How this family picks. A clone per routed layer, which is a few dozen
     /// bytes against the layer's experts.
@@ -82,9 +130,9 @@ pub(crate) struct Moe {
     /// weights. Kept on the host: it is read by the router, which runs there.
     bias: Option<Vec<f32>>,
     experts: Vec<Ffn>,
-    /// Runs for every token, whatever the router says. DeepSeek has one;
-    /// Qwen3 does not.
-    shared: Option<Ffn>,
+    /// Runs for every token, whatever the router says. DeepSeek has one and
+    /// Qwen3-Next has one with a gate; Qwen3's own mixture does not.
+    shared: Option<SharedExpert>,
 }
 
 impl Moe {
@@ -94,7 +142,7 @@ impl Moe {
         e: usize,
         width: usize,
         router: &Router,
-        n_shared: usize,
+        shared: Shared,
     ) -> Res<Self> {
         Ok(Moe {
             router: router.clone(),
@@ -106,12 +154,7 @@ impl Moe {
             experts: (0..router.n_experts)
                 .map(|x| Ffn::load(ld, &vb.pp(format!("experts.{x}")), e, width))
                 .collect::<Res<Vec<_>>>()?,
-            // The shared experts are stored fused: `n` of them side by side in
-            // one matrix, so the width is `n` times an expert's.
-            shared: match n_shared {
-                0 => None,
-                n => Some(Ffn::load(ld, &vb.pp("shared_experts"), e, width * n)?),
-            },
+            shared: SharedExpert::load(ld, vb, e, width, shared)?,
         })
     }
 
@@ -166,13 +209,13 @@ impl Moe {
         self.gate.params()
             + self.bias.as_ref().map_or(0, |v| v.len())
             + self.experts.iter().map(Ffn::params).sum::<usize>()
-            + self.shared.as_ref().map_or(0, Ffn::params)
+            + self.shared.as_ref().map_or(0, SharedExpert::params)
     }
 
     pub(crate) fn bytes(&self) -> usize {
         self.gate.bytes()
             + self.experts.iter().map(Ffn::bytes).sum::<usize>()
-            + self.shared.as_ref().map_or(0, Ffn::bytes)
+            + self.shared.as_ref().map_or(0, SharedExpert::bytes)
     }
 }
 

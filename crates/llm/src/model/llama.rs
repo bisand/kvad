@@ -145,7 +145,7 @@ impl Model {
                 mlp_norm: src.vector(&p("post_attention_layernorm.weight"))?,
                 mlp: match &routed {
                     Some((router, layout)) if layout.is_moe(i, router.n_experts) => {
-                        Mlp::Moe(Box::new(Moe::load(src, &p("mlp"), router, layout.n_shared)?))
+                        Mlp::Moe(Box::new(Moe::load(src, &p("mlp"), router, layout.shared)?))
                     }
                     _ => Mlp::Dense(Ffn::load(src, &p("mlp"))?),
                 },

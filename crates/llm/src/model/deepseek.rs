@@ -377,7 +377,7 @@ impl Model {
 
             let mlp = match layout.is_moe(i, router.n_experts) {
                 false => Mlp::Dense(Ffn::load(src, &p("mlp"))?),
-                true => Mlp::Moe(Box::new(Moe::load(src, &p("mlp"), &router, layout.n_shared)?)),
+                true => Mlp::Moe(Box::new(Moe::load(src, &p("mlp"), &router, layout.shared)?)),
             };
 
             blocks.push(Block {

@@ -193,7 +193,7 @@ impl GpuLlama {
                 mlp_norm: to_dev(l.get(e, "post_attention_layernorm.weight")?)?,
                 mlp: match &routed {
                     Some((router, layout)) if layout.is_moe(i, router.n_experts) => Mlp::Moe(
-                        Box::new(Moe::load(&ld, &mlp, e, expert_width, router, layout.n_shared)?),
+                        Box::new(Moe::load(&ld, &mlp, e, expert_width, router, layout.shared)?),
                     ),
                     _ => Mlp::Dense(Ffn::load(&ld, &mlp, e, spec.intermediate)?),
                 },

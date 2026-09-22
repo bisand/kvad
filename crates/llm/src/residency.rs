@@ -48,6 +48,46 @@
 //! a four-expert mixture — which is the pessimistic end, because a layer
 //! that cheap makes the bookkeeping around it as visible as it ever gets.
 //!
+//! # What it answered
+//!
+//! Measured on DeepSeek-V2-Lite at q8 — 26 routed layers, 64 experts,
+//! top-6 — over three thousand-token generations in different domains
+//! (Rust, prose, plant biochemistry). At half the expert store resident:
+//!
+//! ```text
+//! trace      LRU    pinned (self)   pinned (other domain)   optimal
+//! code      71.2%       77.5%            60.1%               88.4%
+//! prose     70.0%       75.4%            59.0%               87.8%
+//! science   71.1%       71.3%            55.5%               88.2%
+//! ```
+//!
+//! Pinning beats LRU only while it is allowed to rank experts on the very
+//! traffic it is then scored against. Given a profile from another domain,
+//! which is the only kind a deployment has, it falls eleven points *below*
+//! LRU, on every pair. So the policy to build is the ordinary one.
+//!
+//! Routing is why. It is skewed, but weakly — the busiest expert runs 5.2x
+//! as often as the average and the top tenth of experts take 22-27% of the
+//! reads — and what skew there is belongs to the domain rather than to the
+//! model: the hot tenth of a code trace and of a science trace overlap by
+//! 24%, against 10% for picking at random. Over a thousand tokens
+//! essentially every expert is read at least once. There is no stable hot
+//! set to pin.
+//!
+//! Two things worth keeping. LRU is useless below a threshold and fine
+//! above it, and the threshold is not mysterious: a forward pass reads
+//! `top_k * layers` experts before it repeats itself, so a cache smaller
+//! than that evicts every entry before its next use. Here that is 156 of
+//! 1664 blobs, and the measured cliff sits exactly there — 1.9% hit rate
+//! at 5% capacity, 27.6% at 10%. And Belady stays seventeen points above
+//! LRU at every size, so the gap is real and something cleverer than LRU
+//! could still claim it. Just not by pinning.
+//!
+//! A four-expert mixture said the opposite, convincingly, and was wrong:
+//! at top-2 of 4 it reads half of every layer, so its working set is half
+//! the store and LRU cannot win below that capacity whatever the routing
+//! does. Granularity was the variable, and one model could not show it.
+//!
 //! # What a line means
 //!
 //! ```text

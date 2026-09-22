@@ -62,7 +62,8 @@ use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
-use kvad::model::deepseek::{build_rope, Layout, Mla, Router};
+use kvad::model::deepseek::{build_rope, Mla};
+use kvad::model::ffn::{Layout, Router};
 use kvad::model::{Session, Spec};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;

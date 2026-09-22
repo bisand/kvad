@@ -30,6 +30,10 @@
 pub mod arch;
 #[cfg(feature = "arch-deepseek")]
 pub mod deepseek;
+
+/// What a block does after it has attended, shared by every architecture
+/// that has experts.
+pub mod ffn;
 #[cfg(feature = "arch-gpt2")]
 pub mod gpt2;
 #[cfg(feature = "arch-llama")]

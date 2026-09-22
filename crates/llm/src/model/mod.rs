@@ -89,11 +89,38 @@ pub struct Spec {
     pub config: Json,
 }
 
-/// The width of one cached row in each of the KV cache's two streams.
+/// What one layer keeps between tokens.
+///
+/// Two different things, and the difference is the whole of why
+/// [`KvCache::truncate`] cannot always do what it is asked. `k` and `v` are
+/// widths *per position*: the cache holds one row of each per token, and a
+/// prefix's state is exactly the rows belonging to that prefix. `state` is a
+/// width *per layer*: one vector however long the sequence is, carrying
+/// everything the layer has read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheShape {
     pub k: usize,
     pub v: usize,
+    /// A recurrent state that does not grow with position, as the linear
+    /// layers of every architecture released since Qwen3 carry — three
+    /// layers in four, with ordinary attention on the fourth.
+    ///
+    /// Zero for every architecture this engine runs today, which is why
+    /// [`CacheShape::kv`] exists to say so in one word.
+    pub state: usize,
+}
+
+impl CacheShape {
+    /// Keys and values, and no recurrent state: every architecture here so
+    /// far.
+    pub const fn kv(k: usize, v: usize) -> Self {
+        CacheShape { k, v, state: 0 }
+    }
+
+    /// Bytes one layer keeps at `len` positions.
+    pub fn bytes(&self, len: usize) -> usize {
+        (len * (self.k + self.v) + self.state) * std::mem::size_of::<f32>()
+    }
 }
 
 /// A model's `config.json`, with the lookups every architecture needs.
@@ -211,7 +238,7 @@ impl Spec {
             tie_embeddings: config.flag("tie_word_embeddings").unwrap_or(arch.is("gpt2")),
             // The ordinary answer. An architecture that caches something else
             // overwrites this in `configure`.
-            cache: CacheShape { k: n_kv_head * head_dim, v: n_kv_head * head_dim },
+            cache: CacheShape::kv(n_kv_head * head_dim, n_kv_head * head_dim),
             config,
         };
         arch.configure(&mut spec)?;
@@ -289,6 +316,10 @@ pub trait Transformer: Send + Sync {
 pub struct KvCache {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
+    /// Per layer, a recurrent state of `shape.state` floats — one vector for
+    /// the whole sequence, not one per position. Empty when the architecture
+    /// has none, which is all of them so far.
+    state: Vec<Vec<f32>>,
     shape: CacheShape,
     pub len: usize,
 }
@@ -297,12 +328,33 @@ impl KvCache {
     pub fn new(spec: &Spec) -> Self {
         // Deliberately not pre-allocated: a 32k-context model would reserve
         // gigabytes up front for a conversation that may run to fifty tokens.
+        // The recurrent state is the opposite case and *is* allocated: it is
+        // a fixed size that the first token needs in full, and zero is its
+        // correct initial value.
         KvCache {
             k: (0..spec.n_layer).map(|_| Vec::new()).collect(),
             v: (0..spec.n_layer).map(|_| Vec::new()).collect(),
+            state: (0..spec.n_layer).map(|_| vec![0.0; spec.cache.state]).collect(),
             shape: spec.cache,
             len: 0,
         }
+    }
+
+    /// This layer's recurrent state, to read and to write in place.
+    ///
+    /// Empty for an architecture that has none, so a layer that does not use
+    /// one never touches it.
+    pub fn state_mut(&mut self, layer: usize) -> &mut [f32] {
+        &mut self.state[layer]
+    }
+
+    pub fn state(&self, layer: usize) -> &[f32] {
+        &self.state[layer]
+    }
+
+    /// Whether anything here refuses to rewind. See [`KvCache::truncate`].
+    pub fn is_recurrent(&self) -> bool {
+        self.shape.state > 0
     }
 
     pub fn push(&mut self, layer: usize, k: &[f32], v: &[f32]) {
@@ -318,7 +370,7 @@ impl KvCache {
         &self.v[layer]
     }
 
-    /// Drop everything after `len` positions.
+    /// Drop everything after `len` positions, and say how far back it got.
     ///
     /// This is what makes *prefix caching* possible. Two turns of a
     /// conversation share a long common prefix — the entire history — so
@@ -326,15 +378,43 @@ impl KvCache {
     /// that still matches and recompute only the tail. On a long chat this is
     /// the difference between re-reading the whole transcript every time and
     /// processing just the new message.
-    pub fn truncate(&mut self, len: usize) {
+    ///
+    /// # Why this returns a number
+    ///
+    /// Because a recurrent state cannot be rewound, and the caller has to
+    /// find out. Keys and values are *per position*: a prefix's state is
+    /// exactly the rows belonging to that prefix, so dropping the rest is a
+    /// `Vec::truncate` and the answer is always `len`. A recurrent state is
+    /// one vector that has already absorbed every token it has seen, and
+    /// there is no subtraction that takes the unwanted ones back out.
+    ///
+    /// So this engine's answer, for now, is to **refuse**: a cache with a
+    /// recurrent state rewinds to zero or not at all, and says `0`. Every
+    /// turn of such a conversation is a fresh prefill, which is honest and
+    /// slow rather than fast and wrong. The alternative is to snapshot the
+    /// state every N tokens and rewind to the nearest one — memory
+    /// proportional to context / N, and an N nobody can choose without a
+    /// model to measure. This returning a number is what makes that a later
+    /// change here rather than a change to everything that calls it.
+    ///
+    /// The caller must forward from the position this returns, not from the
+    /// one it asked for.
+    #[must_use]
+    pub fn truncate(&mut self, len: usize) -> usize {
         if len >= self.len {
-            return;
+            return self.len;
+        }
+        // The state has read tokens we are dropping, and cannot un-read them.
+        if self.is_recurrent() {
+            self.clear();
+            return 0;
         }
         for (k, v) in self.k.iter_mut().zip(self.v.iter_mut()) {
             k.truncate(len * self.shape.k);
             v.truncate(len * self.shape.v);
         }
         self.len = len;
+        self.len
     }
 
     pub fn clear(&mut self) {
@@ -342,19 +422,22 @@ impl KvCache {
             k.clear();
             v.clear();
         }
+        // Zeroed rather than emptied: a recurrent state is a fixed size that
+        // the next first token needs in full, and zero is what it starts from.
+        for state in self.state.iter_mut() {
+            state.fill(0.0);
+        }
         self.len = 0;
     }
 
     /// Bytes currently held.
     pub fn bytes(&self) -> usize {
-        let per_pos = self.shape.k + self.shape.v;
-        self.len * per_pos * self.k.len() * std::mem::size_of::<f32>()
+        self.k.len() * self.shape.bytes(self.len)
     }
 
     /// Bytes this cache would hold at full context.
     pub fn max_bytes(spec: &Spec) -> usize {
-        let per_pos = spec.cache.k + spec.cache.v;
-        spec.n_layer * spec.n_ctx * per_pos * std::mem::size_of::<f32>()
+        spec.n_layer * spec.cache.bytes(spec.n_ctx)
     }
 }
 
@@ -446,8 +529,16 @@ pub trait Session: Send {
     fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>>;
     /// Tokens currently held in the cache.
     fn cached(&self) -> usize;
-    /// Drop everything after `len` positions, for reuse across chat turns.
-    fn truncate(&mut self, len: usize) -> Res<()>;
+    /// Drop everything after `len` positions, and return how far back it
+    /// actually got — which is `len` for a cache of keys and values, and `0`
+    /// for one holding a recurrent state that cannot be rewound at all.
+    ///
+    /// **The caller must forward from the returned position**, not from the
+    /// one it asked for, and must report that number as the tokens it
+    /// reused. See [`KvCache::truncate`], which explains why the refusal is
+    /// the answer and what the alternative would cost.
+    #[must_use]
+    fn truncate(&mut self, len: usize) -> Res<usize>;
     /// Short description of where this runs, e.g. `cpu q8` or `metal bf16`.
     fn label(&self) -> String;
     fn param_count(&self) -> usize;
@@ -596,9 +687,8 @@ impl Session for CpuSession {
         self.cache.len
     }
 
-    fn truncate(&mut self, len: usize) -> Res<()> {
-        self.cache.truncate(len);
-        Ok(())
+    fn truncate(&mut self, len: usize) -> Res<usize> {
+        Ok(self.cache.truncate(len))
     }
 
     fn label(&self) -> String {
@@ -670,7 +760,7 @@ mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: true,
-            cache: CacheShape { k: n_kv_head * head_dim, v: n_kv_head * head_dim },
+            cache: CacheShape::kv(n_kv_head * head_dim, n_kv_head * head_dim),
             config: Json::default(),
         }
     }
@@ -698,15 +788,78 @@ mod tests {
         assert_eq!(cache.len, 5);
         assert_eq!(cache.keys(0).len(), 5 * spec.kv_dim());
 
-        cache.truncate(3);
+        assert_eq!(cache.truncate(3), 3, "a cache of keys and values rewinds exactly");
         assert_eq!(cache.len, 3);
         assert_eq!(cache.keys(0).len(), 3 * spec.kv_dim());
         assert_eq!(cache.keys(1).len(), 3 * spec.kv_dim());
         // Position 2 must still hold exactly what it held before.
         assert_eq!(cache.keys(0)[2 * spec.kv_dim()], 20.0);
 
-        // Truncating upwards is a no-op, not an extension.
-        cache.truncate(99);
+        // Truncating upwards is a no-op, not an extension — and it reports
+        // what is held rather than what was asked for.
+        assert_eq!(cache.truncate(99), 3);
         assert_eq!(cache.len, 3);
+    }
+
+    /// The same spec with a recurrent state, which nothing loads yet.
+    fn recurrent_spec() -> Spec {
+        let mut spec = test_spec();
+        spec.cache.state = 6;
+        spec
+    }
+
+    /// A recurrent state cannot be rewound, and the cache says so rather than
+    /// pretending.
+    ///
+    /// This is the whole of the decision recorded in [`KvCache::truncate`],
+    /// as a test: a partial rewind is refused and answered `0`, so a caller
+    /// that forwards from the returned position re-reads the prompt instead
+    /// of running the tail over a state that already absorbed it.
+    #[test]
+    fn a_recurrent_cache_refuses_to_rewind_and_says_zero() {
+        let spec = recurrent_spec();
+        let mut cache = KvCache::new(&spec);
+        assert!(cache.is_recurrent());
+        assert_eq!(cache.state(0).len(), 6, "allocated up front, and zeroed");
+
+        for pos in 0..5 {
+            let k: Vec<f32> = (0..spec.kv_dim()).map(|i| (pos * 10 + i) as f32).collect();
+            cache.push(0, &k, &k);
+            cache.push(1, &k, &k);
+            cache.len += 1;
+        }
+        cache.state_mut(0).fill(7.0);
+
+        // What a KV cache would have answered with 3, and what this cannot.
+        assert_eq!(cache.truncate(3), 0);
+        assert_eq!(cache.len, 0);
+        assert_eq!(cache.keys(0).len(), 0, "a refused rewind keeps nothing");
+        assert_eq!(cache.state(0), &[0.0; 6], "and the state goes back to where it starts");
+    }
+
+    /// Asking for everything that is held is not a rewind, so it is not
+    /// refused. Otherwise a second turn that adds tokens to the end of the
+    /// first — the ordinary case in a chat — would throw away a prefix that
+    /// is still exactly right.
+    #[test]
+    fn a_recurrent_cache_keeps_a_prefix_it_was_not_asked_to_drop() {
+        let spec = recurrent_spec();
+        let mut cache = KvCache::new(&spec);
+        cache.len = 5;
+        cache.state_mut(1).fill(2.5);
+
+        assert_eq!(cache.truncate(5), 5);
+        assert_eq!(cache.state(1), &[2.5; 6], "nothing was dropped, so nothing was reset");
+    }
+
+    /// The recurrent state is a cost per layer, not per position, and the
+    /// byte accounting has to show that or it will scale with context.
+    #[test]
+    fn a_recurrent_state_costs_the_same_at_every_length() {
+        let shape = CacheShape { k: 4, v: 4, state: 6 };
+        let f = std::mem::size_of::<f32>();
+        assert_eq!(shape.bytes(0), 6 * f, "the state is there before any token is");
+        assert_eq!(shape.bytes(10) - shape.bytes(9), 8 * f, "one more position, one k and one v");
+        assert_eq!(CacheShape::kv(4, 4).bytes(10), 80 * f);
     }
 }

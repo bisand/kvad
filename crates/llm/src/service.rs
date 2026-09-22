@@ -261,14 +261,26 @@ impl Engine {
     }
 }
 
-/// What one token of context costs in the KV cache: a key and a value, per
-/// layer, at four bytes a float.
+/// What one token of context costs in the KV cache, per layer, at four bytes
+/// a float.
 ///
-/// The same arithmetic as [`crate::model::KvCache::max_bytes`], divided by
-/// the context length — stated here so that a caller can multiply it by the
-/// tokens actually held rather than by the ones that might be.
+/// The same arithmetic as [`crate::model::KvCache::max_bytes`], divided by the
+/// context length — stated here so that a caller can multiply it by the tokens
+/// actually held rather than by the ones that might be.
+///
+/// It reads [`Spec::cache`], which is what the cache actually stores, and not
+/// `kv_dim()`, which is what ordinary attention would have stored. Those agree
+/// for GPT-2 and the Llama family and disagree by a factor of seven for
+/// DeepSeek: MLA declares `n_kv_head == n_head` because every head really does
+/// have its own key, and then keeps none of them — 576 floats a position
+/// against the 2048 `kv_dim()` describes. Saying so made this function claim
+/// seven times the memory the engine was using.
+///
+/// A recurrent state is deliberately not in here. It is a cost *per layer*,
+/// not per token, so no per-token figure can carry it; see
+/// [`crate::model::CacheShape`].
 fn kvad_kv_bytes_per_token(spec: &crate::model::Spec) -> usize {
-    2 * spec.n_layer * spec.kv_dim() * std::mem::size_of::<f32>()
+    spec.n_layer * (spec.cache.k + spec.cache.v) * std::mem::size_of::<f32>()
 }
 
 /// The model currently loaded, plus its sampler.
@@ -498,6 +510,60 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-token figure and the cache's own total have to be the same
+    /// arithmetic, because the doc comment on one of them says they are.
+    ///
+    /// They were not. `kv_bytes_per_token` read `kv_dim()` — what ordinary
+    /// attention *would* store — and DeepSeek stores something else entirely:
+    /// MLA sets `n_kv_head = n_head` because every head really does have its
+    /// own key, then keeps none of them, caching 576 floats a position where
+    /// `kv_dim()` says 2048. The server reported 7.1x the memory it was
+    /// using, on the one architecture whose whole argument is that it uses
+    /// less.
+    #[test]
+    fn the_per_token_cost_agrees_with_the_cache_it_describes() {
+        use crate::model::{CacheShape, KvCache};
+
+        let mut spec = tiny_spec();
+
+        for (what, cache, n_kv_head, head_dim) in [
+            // Llama: what is cached is what `kv_dim()` describes.
+            ("llama", CacheShape::kv(256, 256), 2, 128),
+            // DeepSeek: 64 rotated + 512 latent, against a `kv_dim()` of 2048.
+            ("deepseek", CacheShape::kv(64, 512), 16, 128),
+        ] {
+            spec.cache = cache;
+            spec.n_kv_head = n_kv_head;
+            spec.head_dim = head_dim;
+            assert_eq!(
+                kvad_kv_bytes_per_token(&spec) * spec.n_ctx,
+                KvCache::max_bytes(&spec),
+                "{what}: the per-token figure does not scale to the cache's own total"
+            );
+        }
+    }
+
+    /// A spec with nothing architecture-specific in it, for the arithmetic
+    /// above.
+    fn tiny_spec() -> crate::model::Spec {
+        crate::model::Spec {
+            arch: crate::model::Arch::require("llama"),
+            n_layer: 4,
+            n_head: 4,
+            n_kv_head: 2,
+            n_embd: 256,
+            head_dim: 128,
+            n_ctx: 1024,
+            vocab_size: 32,
+            intermediate: 512,
+            eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_embeddings: true,
+            cache: crate::model::CacheShape::kv(256, 256),
+            config: crate::model::Json::default(),
+        }
+    }
 
     /// An engine that can load nothing, for the tests that are about the
     /// channels either side of the loader rather than about loading.

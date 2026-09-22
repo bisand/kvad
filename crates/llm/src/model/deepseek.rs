@@ -189,10 +189,7 @@ fn configure(spec: &mut Spec) -> Res<()> {
     // just never stored. Saying otherwise would make `kv_dim` a lie.
     spec.n_kv_head = spec.n_head;
     // The whole point of the architecture, as a number.
-    spec.cache = CacheShape {
-        k: mla.qk_rope,
-        v: mla.kv_lora,
-    };
+    spec.cache = CacheShape::kv(mla.qk_rope, mla.kv_lora);
     Ok(())
 }
 

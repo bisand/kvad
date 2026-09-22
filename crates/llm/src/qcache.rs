@@ -1281,7 +1281,7 @@ mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: true,
-            cache: CacheShape { k: 32, v: 32 },
+            cache: CacheShape::kv(32, 32),
             config: Json::default(),
         }
     }

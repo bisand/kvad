@@ -253,7 +253,10 @@ impl Llm {
     /// Forget the conversation so far, so the next prompt starts clean.
     pub fn reset(&mut self) -> Res<()> {
         self.cached_ids.clear();
-        self.session.truncate(0)
+        // Rewinding to zero is the one request every cache can honour, so the
+        // answer is not worth checking here.
+        self.session.truncate(0)?;
+        Ok(())
     }
 
     /// How many leading tokens two sequences share.
@@ -309,10 +312,16 @@ impl Llm {
 
         // Always leave at least one token to process, or there would be no
         // logits to sample the next token from.
-        let reuse = Self::common_prefix(&self.cached_ids, prompt_ids)
+        let wanted = Self::common_prefix(&self.cached_ids, prompt_ids)
             .min(self.session.cached())
             .min(prompt_ids.len() - 1);
-        self.session.truncate(reuse)?;
+        // What the cache *could* keep, which is not always what was asked for:
+        // a recurrent state has already absorbed the tokens being dropped and
+        // rewinds to zero instead. Forwarding from `wanted` after a refusal
+        // would run the tail over a state that had already read it — a model
+        // that is wrong rather than slow, and wrong in a way nothing reports.
+        // See `KvCache::truncate`.
+        let reuse = self.session.truncate(wanted)?;
 
         let mut stats =
             Stats { prompt_tokens: prompt_ids.len(), cached_tokens: reuse, ..Default::default() };

@@ -2129,6 +2129,47 @@ cycles through all six: `cpu f32`, `cpu q8`, `cpu q4`, `gpu bf16`, `gpu q8`,
 That is the usual shape of this kind of work: the interesting part was not the
 new backend, it was the seam the old one had to grow.
 
+### The seam that cannot rewind
+
+`truncate` returns a number now, and the number is the interesting part.
+
+Every architecture released since Qwen3 — Qwen3.8, Qwen3-Coder-Next,
+GLM-5.3-Flash, Kimi-Linear — carries a **recurrent state** on three layers in
+four, with ordinary attention on the fourth. A state is not a cache. Keys and
+values are stored *per position*, so the state of a prefix is exactly the rows
+belonging to that prefix and dropping the rest is a `Vec::truncate`. A
+recurrent state is one fixed-size vector that has already absorbed every token
+it has seen, and **there is no subtraction that takes the unwanted ones back
+out**.
+
+Prefix reuse is built on being able to take them back out. So this engine's
+answer is to refuse: a cache with a recurrent state rewinds to zero or not at
+all. Every turn of such a conversation is a fresh prefill — honest and slow,
+rather than fast and wrong.
+
+Which is why `truncate` reports where it *actually* landed instead of returning
+`()`. The caller used to ask for a rewind to N, assume it happened, and forward
+from N. On a state that refused, that would run the new tail over a state that
+had already read it: a model that is wrong rather than slow, and wrong in a way
+nothing prints. Now the caller forwards from the position it is given and
+reports that as `cached_tokens`, so the refusal shows up as a number on the
+dashboard rather than as a model quietly talking nonsense.
+
+The alternative is to snapshot the state every N tokens and rewind to the
+nearest one, at a memory cost proportional to context / N. That is a real
+design with a real tuning knob, and nobody can choose N without a model to
+measure. Returning a number is what makes it a change to one cache later
+instead of a change to everything that calls it.
+
+Counting what the cache holds turned up a sevenfold error in what the server
+was reporting. `kv_bytes_per_token` read `kv_dim()` — what ordinary
+attention *would* store — where it should have read what the cache actually
+stores. Those agree for GPT-2 and Llama and disagree for DeepSeek, which sets
+`n_kv_head = n_head` because every head really does have its own key, and then
+keeps none of them: 576 floats a position against the 2048 `kv_dim()`
+describes. The server was reporting **7.1x** the memory it was using, on the
+one architecture whose entire argument is that it uses less.
+
 ---
 
 ## Crate 4: `kvad-tui` — the app

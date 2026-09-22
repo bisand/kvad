@@ -381,8 +381,13 @@ impl Session for GpuGpt2 {
         self.pos
     }
 
-    fn truncate(&mut self, len: usize) -> Res<()> {
-        self.rewind(len)
+    fn truncate(&mut self, len: usize) -> Res<usize> {
+        self.rewind(len)?;
+        // Keys and values rewind exactly, and `rewind` clamps a request for
+        // more than is held — so the position afterwards is the answer. No
+        // backend here carries a recurrent state that would refuse; see
+        // `kvad::model::KvCache::truncate`.
+        Ok(self.pos)
     }
 
     fn label(&self) -> String {
@@ -420,7 +425,7 @@ pub(crate) mod tests {
             eps: 1e-5,
             rope_theta: 10000.0,
             tie_embeddings: tie,
-            cache: kvad::model::CacheShape { k: 32, v: 32 },
+            cache: kvad::model::CacheShape::kv(32, 32),
             config: kvad::model::Json::default(),
         }
     }

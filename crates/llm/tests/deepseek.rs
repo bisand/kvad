@@ -773,7 +773,7 @@ fn a_truncated_cache_continues_correctly() {
 
     let mut reused = KvCache::new(&spec);
     model.forward_batch(&[3, 17, 8, 31, 4, 9], &mut reused);
-    reused.truncate(3);
+    assert_eq!(reused.truncate(3), 3, "MLA caches rows, so it rewinds exactly");
     assert_eq!(reused.keys(0).len(), 3 * t.rope);
     assert_eq!(reused.values(0).len(), 3 * t.lat);
     let got = model.forward_batch(&tokens[3..], &mut reused);

@@ -19,7 +19,7 @@
 //! plain answer — softmax over a flat list, top `k`, no rescaling. A family
 //! that wants exactly that, as Qwen3 does, adds nothing here.
 
-use super::{Json, Spec};
+use super::Json;
 use crate::qcache::Source;
 use crate::quant::Weight;
 use crate::tensor::{softmax_inplace, swiglu_inplace};
@@ -33,28 +33,57 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// Which layers are a mixture and which are an ordinary MLP.
 ///
 /// Public because a second backend has to reach the same answer, and reading
-/// three config keys in two places is how two backends come to disagree about
+/// these config keys in two places is how two backends come to disagree about
 /// what a checkpoint contains.
 pub struct Layout {
     /// The first few layers are ordinary. The router needs a residual stream
     /// that already means something, and at layer zero it does not.
-    pub first_dense: usize,
-    pub moe_every: usize,
+    ///
+    /// DeepSeek's way of saying it. Qwen3 says the same thing the other way
+    /// round, by naming the dense layers in `mlp_only_layers`.
+    first_dense: usize,
+    /// One layer in `every` routes.
+    every: usize,
+    /// Whether the layers are counted from one rather than from zero.
+    ///
+    /// DeepSeek asks `layer % moe_layer_freq == 0` and Qwen3 asks
+    /// `(layer + 1) % decoder_sparse_step == 0`. The two agree whenever the
+    /// period is 1 — which it is in every checkpoint either family has
+    /// published — and disagree about which layers route the moment it is
+    /// not. Carrying the offset costs a `usize::from` and means neither
+    /// family is being run by the other's rule.
+    from_one: bool,
     pub n_shared: usize,
+    /// Qwen3's explicit list of layers that are an ordinary MLP whatever the
+    /// step says. Empty in the published checkpoints, and the only thing here
+    /// that is a list rather than a rule.
+    dense: Vec<usize>,
 }
 
 impl Layout {
     pub fn read(config: &Json) -> Self {
+        // Qwen3's spelling first: a config that has it is not DeepSeek's, so
+        // the count that comes with it is the one to obey.
+        let step = config.num(&["decoder_sparse_step"]);
         Layout {
             first_dense: config.num(&["first_k_dense_replace"]).unwrap_or(0),
-            moe_every: config.num(&["moe_layer_freq"]).unwrap_or(1).max(1),
+            every: step.or_else(|| config.num(&["moe_layer_freq"])).unwrap_or(1).max(1),
+            from_one: step.is_some(),
             n_shared: config.num(&["n_shared_experts"]).unwrap_or(0),
+            dense: config
+                .get("mlp_only_layers")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|n| n as usize).collect())
+                .unwrap_or_default(),
         }
     }
 
     /// Whether layer `i` routes.
     pub fn is_moe(&self, i: usize, n_experts: usize) -> bool {
-        n_experts > 0 && i >= self.first_dense && i % self.moe_every == 0
+        n_experts > 0
+            && i >= self.first_dense
+            && !self.dense.contains(&i)
+            && (i + usize::from(self.from_one)) % self.every == 0
     }
 }
 
@@ -103,28 +132,44 @@ pub struct Router {
 }
 
 impl Router {
-    pub fn read(spec: &Spec) -> Res<Self> {
-        let c = &spec.config;
-        let scoring = match c.text("scoring_func").unwrap_or("softmax") {
+    /// How many routed experts this config has, or `None` for a dense model.
+    ///
+    /// The two spellings are the same quantity: `n_routed_experts` is
+    /// DeepSeek's and `num_experts` is Qwen3's. Separate from [`Router::read`]
+    /// because an architecture that is dense *or* routed — `llama`, once
+    /// `qwen3_moe` joined it — has to ask the question before it can know
+    /// whether there is a router to read at all.
+    pub fn count(config: &Json) -> Option<usize> {
+        config.num(&["n_routed_experts", "num_experts"])
+    }
+
+    /// The config's routing policy, whole.
+    ///
+    /// Takes the config and not the `Spec` that holds it, as [`Layout::read`]
+    /// does: nothing here is about widths or head counts, and a test that wants
+    /// to ask what a config routes should not have to build a model first.
+    pub fn read(config: &Json) -> Res<Self> {
+        let scoring = match config.text("scoring_func").unwrap_or("softmax") {
             "softmax" => Scoring::Softmax,
             "sigmoid" => Scoring::Sigmoid,
             other => return Err(format!("unknown scoring_func `{other}`").into()),
         };
-        let select = match c.text("topk_method").unwrap_or("greedy") {
+        let select = match config.text("topk_method").unwrap_or("greedy") {
             "greedy" => Select::Greedy,
             "group_limited_greedy" => Select::GroupLimited,
             "noaux_tc" => Select::NoAuxTc,
             other => return Err(format!("unknown topk_method `{other}`").into()),
         };
         Ok(Router {
-            n_experts: c.need("n_routed_experts")?,
-            top_k: c.need("num_experts_per_tok")?,
-            n_group: c.num(&["n_group"]).unwrap_or(1),
-            topk_group: c.num(&["topk_group"]).unwrap_or(1),
+            n_experts: Router::count(config)
+                .ok_or("config: no `n_routed_experts` and no `num_experts`")?,
+            top_k: config.need("num_experts_per_tok")?,
+            n_group: config.num(&["n_group"]).unwrap_or(1),
+            topk_group: config.num(&["topk_group"]).unwrap_or(1),
             scoring,
             select,
-            norm_topk: c.flag("norm_topk_prob").unwrap_or(false),
-            scale: c.float(&["routed_scaling_factor"]).unwrap_or(1.0),
+            norm_topk: config.flag("norm_topk_prob").unwrap_or(false),
+            scale: config.float(&["routed_scaling_factor"]).unwrap_or(1.0),
             always_scale: select == Select::NoAuxTc,
         })
     }
@@ -300,6 +345,29 @@ pub struct Moe {
 }
 
 impl Moe {
+    /// Read a routed layer: the router's own matrix, the balancing bias if
+    /// this family has one, the experts, and the shared expert if there is
+    /// one.
+    ///
+    /// Both families that reach here spell the weights identically —
+    /// `mlp.gate.weight` and `mlp.experts.N.{gate,up,down}_proj.weight` — so
+    /// what tells them apart is what is *absent*: Qwen3 has neither the bias
+    /// nor a shared expert, and asks for neither.
+    pub fn load(src: &dyn Source, prefix: &str, router: &Router, n_shared: usize) -> Res<Self> {
+        Ok(Moe {
+            router: router.clone(),
+            gate: src.matrix(&format!("{prefix}.gate.weight"))?,
+            bias: src.try_vector(&format!("{prefix}.gate.e_score_correction_bias")),
+            experts: (0..router.n_experts)
+                .map(|e| Ffn::load(src, &format!("{prefix}.experts.{e}")))
+                .collect::<Res<Vec<_>>>()?,
+            shared: match n_shared {
+                0 => None,
+                _ => Some(Ffn::load(src, &format!("{prefix}.shared_experts"))?),
+            },
+        })
+    }
+
     /// The mixture, over a batch.
     ///
     /// Grouped by expert rather than by token. Every token picks its own
@@ -393,6 +461,114 @@ impl Mlp {
                     + moe.experts.iter().map(Ffn::bytes).sum::<usize>()
                     + moe.shared.as_ref().map_or(0, Ffn::bytes)
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a config says
+// ---------------------------------------------------------------------------
+
+/// The config reading, which is the whole of what separates one family's
+/// mixture from another's.
+///
+/// Worth testing here rather than through a model, because these are the
+/// questions a checkpoint answers wrongly in silence: a layer that should have
+/// routed and ran a dense MLP instead loads, runs, and talks nonsense.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn config(v: serde_json::Value) -> Json {
+        Json::new(v)
+    }
+
+    /// The same quantity, two spellings, and a dense model has neither.
+    #[test]
+    fn both_families_say_how_many_experts_they_have() {
+        assert_eq!(Router::count(&config(json!({ "n_routed_experts": 64 }))), Some(64));
+        assert_eq!(Router::count(&config(json!({ "num_experts": 128 }))), Some(128));
+        assert_eq!(Router::count(&config(json!({ "hidden_size": 2048 }))), None);
+    }
+
+    /// DeepSeek asks `layer % freq` and Qwen3 asks `(layer + 1) % step`, so at
+    /// a period of two they route on opposite layers.
+    ///
+    /// Both published families use a period of one, where the two rules agree
+    /// and this distinction is invisible. That is exactly why it is written
+    /// down: the first checkpoint to ship a period of two would otherwise run
+    /// half its layers through the wrong feed-forward.
+    #[test]
+    fn qwen3_counts_layers_from_one_and_deepseek_from_zero() {
+        let qwen = Layout::read(&config(json!({ "decoder_sparse_step": 2 })));
+        let deep = Layout::read(&config(json!({ "moe_layer_freq": 2 })));
+        let routes = |l: &Layout| (0..4).map(|i| l.is_moe(i, 8)).collect::<Vec<_>>();
+        assert_eq!(routes(&qwen), [false, true, false, true]);
+        assert_eq!(routes(&deep), [true, false, true, false]);
+    }
+
+    /// Qwen3 names its dense layers; DeepSeek counts them from the front. A
+    /// layer named in `mlp_only_layers` is dense whatever the step says.
+    #[test]
+    fn the_two_ways_of_saying_a_layer_is_dense_both_work() {
+        let named = Layout::read(&config(json!({
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [0, 2],
+        })));
+        let counted = Layout::read(&config(json!({ "first_k_dense_replace": 2 })));
+        let routes = |l: &Layout| (0..4).map(|i| l.is_moe(i, 8)).collect::<Vec<_>>();
+        assert_eq!(routes(&named), [false, true, false, true]);
+        assert_eq!(routes(&counted), [false, false, true, true]);
+    }
+
+    /// Qwen3-30B-A3B's own routing: softmax over a flat 128, the best eight,
+    /// and those eight renormalised to sum to one.
+    ///
+    /// `norm_topk_prob` is the difference that would be quietly survivable —
+    /// unnormalised softmax weights over the top eight sum to rather less than
+    /// one, so the mixture's whole output comes out scaled down and the model
+    /// degrades instead of failing.
+    #[test]
+    fn qwen3s_chosen_weights_are_renormalised_to_sum_to_one() {
+        let router = Router::read(&config(json!({
+            "num_experts": 8,
+            "num_experts_per_tok": 4,
+            "norm_topk_prob": true,
+        })))
+        .unwrap();
+
+        let logits = [0.0, 3.0, 1.0, -1.0, 2.0, 0.5, -2.0, 4.0];
+        let mut picks = Vec::new();
+        router.route(&logits, None, &mut picks);
+
+        assert_eq!(picks.iter().map(|&(e, _)| e).collect::<Vec<_>>(), [7, 1, 4, 2]);
+        let total: f32 = picks.iter().map(|&(_, w)| w).sum();
+        assert!((total - 1.0).abs() < 1e-6, "the four weights sum to {total}, not 1");
+        // Renormalising is a common divisor, so the softmax's ratios survive
+        // it: expert 7 beats expert 1 by one logit, which is a factor of e.
+        let ratio = picks[0].1 / picks[1].1;
+        assert!((ratio - std::f32::consts::E).abs() < 1e-5, "ratio {ratio}");
+    }
+
+    /// The same config without `norm_topk_prob`, which is DeepSeek V2-Lite's,
+    /// leaves the softmax weights as they are.
+    #[test]
+    fn without_normalisation_the_weights_are_the_softmaxs_own() {
+        let router = Router::read(&config(json!({
+            "n_routed_experts": 8,
+            "num_experts_per_tok": 4,
+        })))
+        .unwrap();
+
+        let logits = [0.0, 3.0, 1.0, -1.0, 2.0, 0.5, -2.0, 4.0];
+        let mut picks = Vec::new();
+        router.route(&logits, None, &mut picks);
+
+        let mut softmax = logits.to_vec();
+        softmax_inplace(&mut softmax);
+        for &(expert, w) in &picks {
+            assert!((w - softmax[expert]).abs() < 1e-6, "expert {expert}: {w}");
         }
     }
 }

@@ -6,7 +6,11 @@
 //! engine. Only the forward pass differs, and [`model::session`] picks which
 //! one from the config.
 //!
-//! [`common`] holds what they share. That is a smaller list than it looks:
+//! Two modules hold what they share. [`ffn`] is what a block does after it has
+//! attended — one MLP, or a router and a hundred of them — which is a choice
+//! every architecture here makes independently of how it attends, and is why
+//! `qwen3_moe` is the Llama backend rather than a fourth one. [`common`] holds
+//! the rest, and that is a smaller list than it looks:
 //! two weight layouts behind one `forward`, an embedding table that is dense or
 //! quantised, the [`Reader`](common::Reader) every checkpoint is read through —
 //! which is what lets a loader be asked, afterwards, what it never looked at —
@@ -16,6 +20,7 @@
 
 mod common;
 pub mod deepseek;
+mod ffn;
 pub mod gpt2;
 pub mod model;
 pub mod qcache;

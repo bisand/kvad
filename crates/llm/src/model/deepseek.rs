@@ -340,9 +340,8 @@ pub struct Model {
 impl Model {
     pub fn load(src: &dyn Source, spec: Spec) -> Res<Self> {
         let mla = Mla::read(&spec.config, spec.n_head)?;
-        let router = Router::read(&spec)?;
-        let c = &spec.config;
-        let Layout { first_dense, moe_every, n_shared } = Layout::read(c);
+        let router = Router::read(&spec.config)?;
+        let layout = Layout::read(&spec.config);
 
         let mut blocks = Vec::with_capacity(spec.n_layer);
         for i in 0..spec.n_layer {
@@ -379,21 +378,9 @@ impl Model {
                 o: src.matrix(&p("self_attn.o_proj.weight"))?,
             };
 
-            let is_moe = Layout { first_dense, moe_every, n_shared }.is_moe(i, router.n_experts);
-            let mlp = match is_moe {
+            let mlp = match layout.is_moe(i, router.n_experts) {
                 false => Mlp::Dense(Ffn::load(src, &p("mlp"))?),
-                true => Mlp::Moe(Box::new(Moe {
-                    router: router.clone(),
-                    gate: src.matrix(&p("mlp.gate.weight"))?,
-                    bias: src.try_vector(&p("mlp.gate.e_score_correction_bias")),
-                    experts: (0..router.n_experts)
-                        .map(|e| Ffn::load(src, &p(&format!("mlp.experts.{e}"))))
-                        .collect::<Res<Vec<_>>>()?,
-                    shared: match n_shared {
-                        0 => None,
-                        _ => Some(Ffn::load(src, &p("mlp.shared_experts"))?),
-                    },
-                })),
+                true => Mlp::Moe(Box::new(Moe::load(src, &p("mlp"), &router, layout.n_shared)?)),
             };
 
             blocks.push(Block {

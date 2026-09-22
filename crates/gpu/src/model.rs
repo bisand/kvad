@@ -28,10 +28,12 @@ use crate::common::{
     causal_mask, check_block, embedding, label, linear, unread, unread_error, Embed, Loader, Proj,
     Reader, Stored,
 };
+use crate::ffn::{Ffn, Mlp, Moe};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, rotary_emb, VarBuilder};
+use kvad::model::ffn::{Layout, Router};
 use kvad::model::{Arch, Session, Spec};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -60,9 +62,9 @@ struct Block {
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
     mlp_norm: Tensor,
-    gate: Proj,
-    up: Proj,
-    down: Proj,
+    /// One MLP, or a routed hundred of them. `qwen3_moe` is this same block
+    /// with the other answer here; see [`crate::ffn`].
+    mlp: Mlp,
 }
 
 pub struct GpuLlama {
@@ -121,15 +123,28 @@ impl GpuLlama {
         let load_dtype = if quant.is_some() { DType::F32 } else { dtype };
         let compute = load_dtype;
 
-        check_block(
-            quant,
-            &[
-                ("hidden size", spec.n_embd),
-                ("MLP width", spec.intermediate),
-                ("attention output", spec.n_head * spec.head_dim),
-                ("KV width", spec.kv_dim()),
-            ],
-        )?;
+        // Dense unless the config says otherwise, and what says otherwise is an
+        // expert count. The CPU loader asks the same question the same way, so
+        // that the two backends cannot disagree about which layers route.
+        let routed = match Router::count(&spec.config) {
+            None => None,
+            Some(_) => Some((Router::read(&spec.config)?, Layout::read(&spec.config))),
+        };
+        // An expert is narrower than a dense layer — 768 against 6144 on
+        // Qwen3-30B-A3B — and it is the expert's width the quantiser's block
+        // size has to divide.
+        let expert_width = spec.config.num(&["moe_intermediate_size"]).unwrap_or(spec.intermediate);
+
+        let mut widths = vec![
+            ("hidden size", spec.n_embd),
+            ("MLP width", spec.intermediate),
+            ("attention output", spec.n_head * spec.head_dim),
+            ("KV width", spec.kv_dim()),
+        ];
+        if routed.is_some() {
+            widths.push(("expert width", expert_width));
+        }
+        check_block(quant, &widths)?;
 
         // The checkpoint is mapped on the host in both modes, and each
         // tensor is moved to the device once it is in its final form —
@@ -176,9 +191,12 @@ impl GpuLlama {
                 q_norm: attn.try_get(hd, "q_norm.weight").map(&to_dev).transpose()?,
                 k_norm: attn.try_get(hd, "k_norm.weight").map(&to_dev).transpose()?,
                 mlp_norm: to_dev(l.get(e, "post_attention_layernorm.weight")?)?,
-                gate: load_t(&mlp, "gate_proj.weight", spec.intermediate, e)?,
-                up: load_t(&mlp, "up_proj.weight", spec.intermediate, e)?,
-                down: load_t(&mlp, "down_proj.weight", e, spec.intermediate)?,
+                mlp: match &routed {
+                    Some((router, layout)) if layout.is_moe(i, router.n_experts) => Mlp::Moe(
+                        Box::new(Moe::load(&ld, &mlp, e, expert_width, router, layout.n_shared)?),
+                    ),
+                    _ => Mlp::Dense(Ffn::load(&ld, &mlp, e, spec.intermediate)?),
+                },
             });
         }
 
@@ -307,9 +325,7 @@ impl GpuLlama {
             x = (x + linear(&out, &blk.o, None)?)?;
 
             let h = ops::rms_norm(&x, &blk.mlp_norm, spec.eps)?;
-            let gate = ops::silu(&linear(&h, &blk.gate, None)?)?;
-            let up = linear(&h, &blk.up, None)?;
-            x = (x + linear(&(gate * up)?, &blk.down, None)?)?;
+            x = (x + blk.mlp.forward(&h, m, spec.n_embd)?)?;
         }
 
         self.pos += m;
@@ -335,9 +351,7 @@ impl GpuLlama {
                     + b.k.params()
                     + b.v.params()
                     + b.o.params()
-                    + b.gate.params()
-                    + b.up.params()
-                    + b.down.params()
+                    + b.mlp.params()
                     + n(&b.attn_norm)
                     + n(&b.mlp_norm)
                     + opt(&b.q_b)
@@ -367,9 +381,8 @@ impl GpuLlama {
             .blocks
             .iter()
             .map(|b| {
-                b.q.bytes() + b.k.bytes() + b.v.bytes() + b.o.bytes() + b.gate.bytes()
-                    + b.up.bytes()
-                    + b.down.bytes()
+                b.q.bytes() + b.k.bytes() + b.v.bytes() + b.o.bytes()
+                    + b.mlp.bytes()
                     + per(&b.attn_norm)
                     + per(&b.mlp_norm)
                     + opt(&b.q_b)
@@ -712,6 +725,7 @@ pub fn pick_device(name: Option<&str>) -> Res<Device> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use kvad::serde_json;
     use std::collections::HashMap;
 
     /// What `supports` promises is what `session` has an arm for. Asked as a
@@ -1402,6 +1416,151 @@ pub(crate) mod tests {
         assert_eq!(quant.embed.bytes(), table * 34 / 32);
         assert!(quant.memory_bytes() * 3 < dense.memory_bytes());
 
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A two-block `qwen3_moe`: the same attention this file already runs, and
+    /// a router with four experts where the second block's MLP would be.
+    ///
+    /// The first block is named in `mlp_only_layers`, so one checkpoint holds
+    /// both answers on the feed-forward axis — a backend that read the layer
+    /// layout backwards would fail the load rather than quietly swap them.
+    ///
+    /// Every width here is a multiple of 32, including the experts' 32, because
+    /// anything narrower the quantiser leaves as f32 and the quantised test
+    /// below would be comparing the dense path with itself.
+    fn moe_checkpoint(tag: &str) -> (Spec, std::path::PathBuf) {
+        let (e, hd, heads, kv, vocab) = (32usize, 16usize, 4usize, 2usize, 64usize);
+        let (inter, moe_inter, experts) = (64usize, 32usize, 4usize);
+        let spec = Spec::from_config(kvad::model::Json::new(serde_json::json!({
+            "model_type": "qwen3_moe",
+            "num_hidden_layers": 2,
+            "num_attention_heads": heads,
+            "num_key_value_heads": kv,
+            "hidden_size": e,
+            "head_dim": hd,
+            "intermediate_size": inter,
+            "moe_intermediate_size": moe_inter,
+            "num_experts": experts,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": true,
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [0],
+            "vocab_size": vocab,
+            "max_position_embeddings": 32,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": true,
+        })))
+        .unwrap();
+
+        let d = Device::Cpu;
+        let rand = |r: usize, c: usize| Tensor::randn(0f32, 0.02f32, (r, c), &d).unwrap();
+        let ones = |n: usize| Tensor::ones(n, DType::F32, &d).unwrap();
+
+        let mut t: HashMap<String, Tensor> = HashMap::new();
+        t.insert("model.embed_tokens.weight".into(), rand(vocab, e));
+        t.insert("model.norm.weight".into(), ones(e));
+        for l in 0..2 {
+            let p = format!("model.layers.{l}");
+            t.insert(format!("{p}.input_layernorm.weight"), ones(e));
+            t.insert(format!("{p}.post_attention_layernorm.weight"), ones(e));
+            t.insert(format!("{p}.self_attn.q_proj.weight"), rand(heads * hd, e));
+            t.insert(format!("{p}.self_attn.k_proj.weight"), rand(kv * hd, e));
+            t.insert(format!("{p}.self_attn.v_proj.weight"), rand(kv * hd, e));
+            t.insert(format!("{p}.self_attn.o_proj.weight"), rand(e, heads * hd));
+            t.insert(format!("{p}.self_attn.q_norm.weight"), ones(hd));
+            t.insert(format!("{p}.self_attn.k_norm.weight"), ones(hd));
+            if l == 0 {
+                t.insert(format!("{p}.mlp.gate_proj.weight"), rand(inter, e));
+                t.insert(format!("{p}.mlp.up_proj.weight"), rand(inter, e));
+                t.insert(format!("{p}.mlp.down_proj.weight"), rand(e, inter));
+                continue;
+            }
+            t.insert(format!("{p}.mlp.gate.weight"), rand(experts, e));
+            for x in 0..experts {
+                let q = format!("{p}.mlp.experts.{x}");
+                t.insert(format!("{q}.gate_proj.weight"), rand(moe_inter, e));
+                t.insert(format!("{q}.up_proj.weight"), rand(moe_inter, e));
+                t.insert(format!("{q}.down_proj.weight"), rand(e, moe_inter));
+            }
+        }
+
+        let path = std::env::temp_dir()
+            .join(format!("gpu-moe-{}-{tag}.safetensors", std::process::id()));
+        candle_core::safetensors::save(&t, &path).unwrap();
+        (spec, path)
+    }
+
+    /// The mixture, against the hand-written engine on the same checkpoint.
+    ///
+    /// Both in f32, so what is left is the order the sums happen in. This is
+    /// the test that says the two backends route the same way: they share
+    /// `Router::route` and the layer layout, and everything either side of it
+    /// — which rows are gathered for which expert, and how the weighted
+    /// results are scattered back — is written twice and could disagree.
+    #[test]
+    fn a_mixture_of_experts_agrees_with_the_cpu_engine() {
+        use kvad::model::Transformer;
+
+        let (spec, path) = moe_checkpoint("agree");
+        // Five, so the routed layer sees a batch that generally spreads over
+        // more experts than any one token reaches.
+        let tokens = [1u32, 2, 3, 4, 5];
+
+        let mut cache = kvad::model::KvCache::new(&spec);
+        let ours = cpu_model(&path, &spec).forward_batch(&tokens, &mut cache);
+
+        let devices = match Device::new_metal(0) {
+            Ok(gpu) => vec![("cpu device", Device::Cpu), ("metal", gpu)],
+            Err(_) => vec![("cpu device", Device::Cpu)],
+        };
+        for (where_, dev) in devices {
+            let mut gpu = GpuLlama::load(
+                std::slice::from_ref(&path),
+                spec.clone(),
+                DType::F32,
+                None,
+                dev,
+                &Vault::off(),
+            )
+            .unwrap();
+            let theirs = gpu.forward(&tokens).unwrap();
+            assert_eq!(theirs.len(), ours.len(), "on {where_}");
+            let worst = theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(worst < 1e-4, "the mixture on {where_} differs from the CPU engine by {worst}");
+        }
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A quantised mixture loads and runs.
+    ///
+    /// Not an agreement test, deliberately. Quantising the router's own matrix
+    /// moves the gate logits, and two experts a hundredth of a logit apart can
+    /// swap places — so the output is allowed to differ by however much two
+    /// different experts differ, and an assertion on the numbers would be an
+    /// assertion about luck. What this does check is the part that would break
+    /// outright: the block-size gate has to be told about the experts' width,
+    /// which is narrower than the dense layers' and is the one a `q4` load of
+    /// Qwen3-30B-A3B actually has to divide.
+    #[test]
+    fn a_quantised_mixture_loads_and_runs() {
+        let (spec, path) = moe_checkpoint("quantised");
+        for quant in [GgmlDType::Q8_0, GgmlDType::Q4_0] {
+            let mut gpu = GpuLlama::load(
+                std::slice::from_ref(&path),
+                spec.clone(),
+                DType::F32,
+                Some(quant),
+                Device::Cpu,
+                &Vault::off(),
+            )
+            .unwrap();
+            let logits = gpu.forward(&[1, 2, 3]).unwrap();
+            assert_eq!(logits.len(), spec.vocab_size, "{quant:?}");
+            assert!(logits.iter().all(|v| v.is_finite()), "{quant:?}");
+        }
         std::fs::remove_file(&path).unwrap();
     }
 }

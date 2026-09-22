@@ -1103,6 +1103,31 @@ costs a 6.5 s prefill against 0.7 s warm, and that is a disk measurement.)
 q4 on this model is now what the name suggests — and it took two sessions and a
 disassembler to stop it being a trade.
 
+### The one that needed no file at all
+
+Qwen3-30B-A3B is also a mixture of experts — 128 of them, eight per token — and
+it added no architecture to this engine. Its attention is the `qwen3` block
+already here, unchanged, and a mixture is not a kind of model: it is one of the
+two answers to what a block does *after* it has attended. So the two questions
+were separated. [`model/ffn.rs`](crates/llm/src/model/ffn.rs) is the second
+axis on its own, and `qwen3_moe` is the Llama block with the other answer on
+it — a config read and a branch in the loader, and the same file runs both.
+
+Even the routing came for free. DeepSeek scores its experts with a sigmoid and
+a learned balancing bias, picks groups before it picks experts, and rescales
+what it chose; Qwen3 does none of that — softmax over a flat list, the best
+eight, renormalised to sum to one. Those are not different code, they are
+different rows of the same config, and the router already defaulted every one
+of them to the plain answer. The family that motivated the split added nothing
+to it.
+
+What it is worth being exact about: the two families disagree about how to
+count layers. `moe_layer_freq` asks `layer % freq == 0` and
+`decoder_sparse_step` asks `(layer + 1) % step == 0`. Both ship with the period
+set to one, where the two rules are the same rule — so a single implementation
+of it is correct today and silently wrong for half the layers of the first
+checkpoint that ships a two.
+
 ### Base models versus instruction-tuned
 
 GPT-2 is a **base** model: pure next-token prediction, no instruction tuning.

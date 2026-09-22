@@ -410,9 +410,15 @@ fn main() -> Res<()> {
         "arch" => {
             // What *this* binary can run, which is a build-time question:
             // every architecture is a Cargo feature.
-            println!("{:<14} {:<30} WHAT IT IS", "ARCHITECTURE", "CONFIG model_type");
-            for a in kvad::model::arch::registry() {
-                println!("{:<14} {:<30} {}", a.id(), a.model_types().join(", "), a.about());
+            // The middle column is as wide as it has to be: `llama` answers to
+            // five `model_type`s now, and a fixed width that one row overflows
+            // pushes that row's description out of line with every other.
+            let types: Vec<String> =
+                kvad::model::arch::registry().iter().map(|a| a.model_types().join(", ")).collect();
+            let w = types.iter().map(String::len).chain([17]).max().unwrap_or(17);
+            println!("{:<14} {:<w$} WHAT IT IS", "ARCHITECTURE", "CONFIG model_type");
+            for (a, t) in kvad::model::arch::registry().iter().zip(&types) {
+                println!("{:<14} {t:<w$} {}", a.id(), a.about());
             }
             println!(
                 "\n{} of them, chosen at build time; see `arch-*` in crates/llm/Cargo.toml.",

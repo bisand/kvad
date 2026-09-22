@@ -58,6 +58,7 @@ use crate::common::{
     causal_mask, check_block, embedding, label, unread, unread_error, Embed, Loader, Proj, Reader,
     Stored,
 };
+use crate::ffn::{Ffn, Mlp, Moe};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -67,28 +68,6 @@ use kvad::model::ffn::{Layout, Router};
 use kvad::model::{Session, Spec};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
-
-/// A SwiGLU MLP: a dense layer, a shared expert, or one routed expert.
-struct Ffn {
-    gate: Proj,
-    up: Proj,
-    down: Proj,
-}
-
-impl Ffn {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = ops::silu(&self.gate.forward(x)?)?;
-        self.down.forward(&(gate * self.up.forward(x)?)?)
-    }
-
-    fn params(&self) -> usize {
-        self.gate.params() + self.up.params() + self.down.params()
-    }
-
-    fn bytes(&self) -> usize {
-        self.gate.bytes() + self.up.bytes() + self.down.bytes()
-    }
-}
 
 /// The query projection, which V3 compresses and V2-Lite does not.
 enum Query {
@@ -112,21 +91,6 @@ struct Attn {
     o: Proj,
 }
 
-struct Moe {
-    /// `[n_experts, hidden]`: one dot product per expert.
-    gate: Proj,
-    /// V3's learned balancing bias, which steers the choice and not the
-    /// weights. Kept on the host: it is read by the router, which runs there.
-    bias: Option<Vec<f32>>,
-    experts: Vec<Ffn>,
-    shared: Option<Ffn>,
-}
-
-enum Mlp {
-    Dense(Ffn),
-    Moe(Moe),
-}
-
 struct Block {
     attn: Attn,
     mlp_norm: Tensor,
@@ -136,7 +100,6 @@ struct Block {
 pub struct GpuDeepSeek {
     spec: Spec,
     mla: Mla,
-    router: Router,
     device: Device,
     dtype: DType,
     quant: Option<GgmlDType>,
@@ -164,7 +127,7 @@ impl GpuDeepSeek {
         cache: &Vault,
     ) -> Res<Self> {
         let mla = Mla::read(&spec.config, spec.n_head)?;
-        let router = Router::read(&spec)?;
+        let router = Router::read(&spec.config)?;
         let layout = Layout::read(&spec.config);
         let load_dtype = if quant.is_some() { DType::F32 } else { dtype };
         let compute = load_dtype;
@@ -205,13 +168,6 @@ impl GpuDeepSeek {
         let load_t = |vb: &Reader<'_>, name: &str, out: usize, inp: usize| -> Res<Proj> {
             ld.proj(vb, name, out, inp, Stored::OutIn)
         };
-        let ffn = |vb: &Reader<'_>, width: usize| -> Res<Ffn> {
-            Ok(Ffn {
-                gate: load_t(vb, "gate_proj.weight", width, e)?,
-                up: load_t(vb, "up_proj.weight", width, e)?,
-                down: load_t(vb, "down_proj.weight", e, width)?,
-            })
-        };
 
         let mut blocks = Vec::with_capacity(spec.n_layer);
         for i in 0..spec.n_layer {
@@ -246,24 +202,11 @@ impl GpuDeepSeek {
                 o: load_t(&sa, "o_proj.weight", e, heads * vh)?,
             };
 
+            let m = l.pp("mlp");
             let mlp = match layout.is_moe(i, router.n_experts) {
-                false => Mlp::Dense(ffn(&l.pp("mlp"), inter)?),
+                false => Mlp::Dense(Ffn::load(&ld, &m, e, inter)?),
                 true => {
-                    let m = l.pp("mlp");
-                    Mlp::Moe(Moe {
-                        gate: load_t(&m, "gate.weight", router.n_experts, e)?,
-                        bias: m
-                            .try_get(router.n_experts, "gate.e_score_correction_bias")
-                            .map(|t| t.to_dtype(DType::F32)?.to_vec1::<f32>())
-                            .transpose()?,
-                        experts: (0..router.n_experts)
-                            .map(|x| ffn(&m.pp(format!("experts.{x}")), moe_inter))
-                            .collect::<Res<Vec<_>>>()?,
-                        shared: match layout.n_shared {
-                            0 => None,
-                            n => Some(ffn(&m.pp("shared_experts"), moe_inter * n)?),
-                        },
-                    })
+                    Mlp::Moe(Box::new(Moe::load(&ld, &m, e, moe_inter, &router, layout.n_shared)?))
                 }
             };
 
@@ -310,7 +253,6 @@ impl GpuDeepSeek {
             cos,
             sin,
             mla,
-            router,
             device,
             dtype: compute,
             quant,
@@ -434,10 +376,7 @@ impl GpuDeepSeek {
 
             // ---- The MLP, or the mixture -----------------------------------
             let h = ops::rms_norm(&x, &blk.mlp_norm, spec.eps)?;
-            let out = match &blk.mlp {
-                Mlp::Dense(f) => f.forward(&h)?,
-                Mlp::Moe(moe) => self.mixture(moe, &h, m, e)?,
-            };
+            let out = blk.mlp.forward(&h, m, e)?;
             x = (x + out)?;
         }
 
@@ -447,55 +386,6 @@ impl GpuDeepSeek {
         let last = ops::rms_norm(&last, &self.final_norm, spec.eps)?;
         let logits = self.head.forward(&last)?.to_dtype(DType::F32)?;
         Ok(logits.flatten_all()?.to_vec1::<f32>()?)
-    }
-
-    /// The mixture, grouped by expert.
-    ///
-    /// The routing itself runs on the host, on `[m, n_experts]` logits, through
-    /// [`Router::route`] — the CPU engine's own function, so that
-    /// group-limited selection and V3's bias-steered choice have one
-    /// implementation rather than two that must be kept level with each other.
-    /// What comes back is a handful of (expert, weight) pairs per token, which
-    /// is inverted here into a row list per expert.
-    ///
-    /// Then, per expert that anybody picked: gather its rows, run it once over
-    /// them, scale each row by that token's weight, and add the result back
-    /// where it came from. `index_add` is the scatter, and it is an add rather
-    /// than a write because a token's output is the *sum* over its experts.
-    fn mixture(&self, moe: &Moe, h: &Tensor, m: usize, e: usize) -> Res<Tensor> {
-        let logits = moe.gate.forward(h)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-
-        let mut by_expert: Vec<(Vec<u32>, Vec<f32>)> =
-            vec![(Vec::new(), Vec::new()); self.router.n_experts];
-        let mut picks = Vec::with_capacity(self.router.top_k);
-        for (i, row) in logits.iter().enumerate() {
-            self.router.route(row, moe.bias.as_deref(), &mut picks);
-            for &(expert, w) in &picks {
-                by_expert[expert].0.push(i as u32);
-                by_expert[expert].1.push(w);
-            }
-        }
-
-        // The shared experts run for every token whatever the router says, so
-        // they need no grouping and make a convenient accumulator.
-        let mut out = match &moe.shared {
-            Some(shared) => shared.forward(h)?,
-            None => Tensor::zeros((m, e), self.dtype, &self.device)?,
-        };
-        for (i, (rows, weights)) in by_expert.iter().enumerate() {
-            // Where the saving is: at decode a token reaches `top_k` experts,
-            // so six of sixty-four run and the rest are never touched.
-            if rows.is_empty() {
-                continue;
-            }
-            let k = rows.len();
-            let idx = Tensor::from_slice(rows, (k,), &self.device)?;
-            let xs = h.index_select(&idx, 0)?;
-            let w = Tensor::from_slice(weights, (k, 1), &self.device)?.to_dtype(self.dtype)?;
-            let y = moe.experts[i].forward(&xs)?.broadcast_mul(&w)?;
-            out = out.index_add(&idx, &y, 0)?;
-        }
-        Ok(out)
     }
 
     fn params(&self) -> usize {
@@ -511,15 +401,6 @@ impl GpuDeepSeek {
                         down.params() + n(norm) + up.params()
                     }
                 };
-                let mlp = match &b.mlp {
-                    Mlp::Dense(f) => f.params(),
-                    Mlp::Moe(moe) => {
-                        moe.gate.params()
-                            + moe.bias.as_ref().map_or(0, |v| v.len())
-                            + moe.experts.iter().map(|f| f.params()).sum::<usize>()
-                            + moe.shared.as_ref().map_or(0, |f| f.params())
-                    }
-                };
                 q + a.kv_a.params()
                     + n(&a.kv_a_norm)
                     + n(&a.uk)
@@ -527,7 +408,7 @@ impl GpuDeepSeek {
                     + a.o.params()
                     + n(&a.norm)
                     + n(&b.mlp_norm)
-                    + mlp
+                    + b.mlp.params()
             })
             .sum();
         let head = match self.spec.tie_embeddings {
@@ -548,15 +429,7 @@ impl GpuDeepSeek {
                     Query::Direct(p) => p.bytes(),
                     Query::Compressed { down, up, .. } => down.bytes() + up.bytes(),
                 };
-                let mlp = match &b.mlp {
-                    Mlp::Dense(f) => f.bytes(),
-                    Mlp::Moe(moe) => {
-                        moe.gate.bytes()
-                            + moe.experts.iter().map(|f| f.bytes()).sum::<usize>()
-                            + moe.shared.as_ref().map_or(0, |f| f.bytes())
-                    }
-                };
-                q + a.kv_a.bytes() + per(&a.uk) + per(&a.uv) + a.o.bytes() + mlp
+                q + a.kv_a.bytes() + per(&a.uk) + per(&a.uv) + a.o.bytes() + b.mlp.bytes()
             })
             .sum();
         let head = if self.tied { 0 } else { self.head.bytes() };
@@ -661,7 +534,7 @@ mod tests {
         let d = Device::Cpu;
         let mla = Mla::read(&spec.config, spec.n_head).unwrap();
         let layout = Layout::read(&spec.config);
-        let router = Router::read(spec).unwrap();
+        let router = Router::read(&spec.config).unwrap();
         let e = spec.n_embd;
         let inter: usize = spec.config.num(&["intermediate_size"]).unwrap();
         let moe_inter: usize = spec.config.num(&["moe_intermediate_size"]).unwrap();

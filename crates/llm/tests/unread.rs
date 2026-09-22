@@ -117,6 +117,66 @@ fn qwen3(tie: bool) -> (serde_json::Value, BTreeMap<String, Mat>) {
     (config, t)
 }
 
+/// A two-block `qwen3_moe`: the same attention, and a router with four experts
+/// where the second block's MLP would be.
+///
+/// The first block is named in `mlp_only_layers`, so one checkpoint holds both
+/// answers on the feed-forward axis and the loader has to get the layer layout
+/// right to read either of them.
+fn qwen3_moe() -> (serde_json::Value, BTreeMap<String, Mat>) {
+    let (e, hd, heads, kv, vocab) = (32usize, 16usize, 4usize, 2usize, 24usize);
+    let (inter, moe_inter, experts) = (64usize, 32usize, 4usize);
+    let config = serde_json::json!({
+        "model_type": "qwen3_moe",
+        "num_hidden_layers": 2,
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv,
+        "hidden_size": e,
+        "head_dim": hd,
+        "intermediate_size": inter,
+        "moe_intermediate_size": moe_inter,
+        "num_experts": experts,
+        "num_experts_per_tok": 2,
+        "norm_topk_prob": true,
+        "decoder_sparse_step": 1,
+        "mlp_only_layers": [0],
+        "vocab_size": vocab,
+        "max_position_embeddings": 32,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": true,
+    });
+
+    let mut t = BTreeMap::new();
+    t.insert("model.embed_tokens.weight".into(), mat(vocab, e));
+    t.insert("model.norm.weight".into(), vec1(e));
+    for l in 0..2 {
+        let p = format!("model.layers.{l}");
+        t.insert(format!("{p}.input_layernorm.weight"), vec1(e));
+        t.insert(format!("{p}.post_attention_layernorm.weight"), vec1(e));
+        t.insert(format!("{p}.self_attn.q_proj.weight"), mat(heads * hd, e));
+        t.insert(format!("{p}.self_attn.k_proj.weight"), mat(kv * hd, e));
+        t.insert(format!("{p}.self_attn.v_proj.weight"), mat(kv * hd, e));
+        t.insert(format!("{p}.self_attn.o_proj.weight"), mat(e, heads * hd));
+        t.insert(format!("{p}.self_attn.q_norm.weight"), vec1(hd));
+        t.insert(format!("{p}.self_attn.k_norm.weight"), vec1(hd));
+        if l == 0 {
+            t.insert(format!("{p}.mlp.gate_proj.weight"), mat(inter, e));
+            t.insert(format!("{p}.mlp.up_proj.weight"), mat(inter, e));
+            t.insert(format!("{p}.mlp.down_proj.weight"), mat(e, inter));
+            continue;
+        }
+        t.insert(format!("{p}.mlp.gate.weight"), mat(experts, e));
+        for x in 0..experts {
+            let q = format!("{p}.mlp.experts.{x}");
+            t.insert(format!("{q}.gate_proj.weight"), mat(moe_inter, e));
+            t.insert(format!("{q}.up_proj.weight"), mat(moe_inter, e));
+            t.insert(format!("{q}.down_proj.weight"), mat(e, moe_inter));
+        }
+    }
+    (config, t)
+}
+
 /// A one-block GPT-2, including the causal mask its exports store as a weight.
 fn gpt2() -> (serde_json::Value, BTreeMap<String, Mat>) {
     let (e, ctx, vocab) = (32usize, 8usize, 24usize);
@@ -212,6 +272,42 @@ fn a_fully_implemented_model_leaves_nothing_over() {
     let (config, t) = qwen3(true);
     let left = load_and_list("complete", config, t).unwrap();
     assert!(left.is_empty(), "nothing should be left, but: {left:?}");
+}
+
+/// The mixture, read whole: every expert, the router's own matrix, and the one
+/// dense block beside them.
+///
+/// A loader that got the layer layout backwards would leave one block's worth
+/// of weights in the file and be told so by name, which is the failure this
+/// check exists for — and the one a forward-pass test cannot see, because a
+/// model that ran three experts out of four would still produce numbers.
+#[test]
+fn a_mixture_of_experts_leaves_nothing_over() {
+    let (config, t) = qwen3_moe();
+    let left = load_and_list("qwen3-moe", config, t).unwrap();
+    assert!(left.is_empty(), "nothing should be left, but: {left:?}");
+}
+
+/// An expert the loader never asked for is named, which is the mixture's own
+/// shape of the bug this file is about: a checkpoint with more experts than the
+/// config admits to loads and runs on the ones it read.
+#[test]
+fn an_expert_outside_the_configured_count_is_named() {
+    let (config, mut t) = qwen3_moe();
+    let q = "model.layers.1.mlp.experts.4";
+    t.insert(format!("{q}.gate_proj.weight"), mat(32, 32));
+    t.insert(format!("{q}.up_proj.weight"), mat(32, 32));
+    t.insert(format!("{q}.down_proj.weight"), mat(32, 32));
+
+    let left = load_and_list("qwen3-moe-extra", config, t).unwrap();
+    assert_eq!(
+        left,
+        vec![
+            format!("{q}.down_proj.weight"),
+            format!("{q}.gate_proj.weight"),
+            format!("{q}.up_proj.weight"),
+        ]
+    );
 }
 
 /// GPT-2 stores its causal mask as a tensor, and recomputing it is not an

@@ -22,7 +22,7 @@
 //! path for free. Mixing the two layouts up produces fluent nonsense rather
 //! than an error, which is why the counting test in the README exists.
 
-use super::ffn::{Ffn, Mlp};
+use super::ffn::{Ffn, Layout, Mlp, Moe, Router};
 use super::{attend, Architecture, KvCache, Spec, Transformer};
 use crate::qcache::{head, Source};
 use crate::quant::Weight;
@@ -41,18 +41,21 @@ fn linear(x: &[f32], w: &Weight, bias: Option<&Vec<f32>>) -> Vec<f32> {
 
 /// This module's entry in the registry.
 ///
-/// Four `model_type`s, one implementation. They differ in configuration —
-/// widths, head counts, rope base — except for Qwen3's per-head RMSNorm on Q
-/// and K, which is applied when the weights for it are present and is the only
-/// branch in this file that is about *which* model is running.
+/// Five `model_type`s, one implementation. They differ in configuration —
+/// widths, head counts, rope base — except for two things that are branches in
+/// this file: Qwen3's per-head RMSNorm on Q and K, applied when the weights for
+/// it are present, and `qwen3_moe`'s feed-forward, which is a router and 128
+/// experts where the others have one MLP. Its attention is the `qwen3` block
+/// unchanged, which is the whole reason it belongs here rather than in a file
+/// of its own.
 ///
-/// The list is exact on purpose. `qwen2_moe` and `qwen3_5_moe` are mixtures of
-/// experts and are not this; `smollm3` skips RoPE on every fourth layer and is
-/// not this either, though a substring test happily said all three were.
+/// The list is exact on purpose. `qwen2_moe` has a shared expert and a
+/// different gate and is not this; `smollm3` skips RoPE on every fourth layer
+/// and is not this either, though a substring test happily said both were.
 pub static ARCH: Architecture = Architecture {
     id: "llama",
-    model_types: &["llama", "mistral", "qwen2", "qwen3"],
-    about: "Llama 2/3, Mistral, Qwen2/2.5/3, SmolLM2, TinyLlama: RoPE, RMSNorm, SwiGLU, GQA",
+    model_types: &["llama", "mistral", "qwen2", "qwen3", "qwen3_moe"],
+    about: "Llama 2/3, Mistral, Qwen2/2.5/3, Qwen3-MoE, SmolLM2: RoPE, RMSNorm, SwiGLU, GQA",
     configure: |_| Ok(()),
     load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
 };
@@ -115,6 +118,16 @@ fn norm_heads(x: &mut [f32], weight: Option<&[f32]>, spec: &Spec) {
 
 impl Model {
     pub fn load(src: &dyn Source, spec: Spec) -> Res<Self> {
+        // Dense unless the config says otherwise, and what says otherwise is an
+        // expert count. `qwen3_moe` is the only `model_type` here that has one;
+        // reading it this way rather than off `model_type` means the branch is
+        // about what the checkpoint holds, which is the only thing the loader
+        // can actually check.
+        let routed = match Router::count(&spec.config) {
+            None => None,
+            Some(_) => Some((Router::read(&spec.config)?, Layout::read(&spec.config))),
+        };
+
         let mut blocks = Vec::with_capacity(spec.n_layer);
         for i in 0..spec.n_layer {
             let p = |s: &str| format!("layers.{i}.{s}");
@@ -130,7 +143,12 @@ impl Model {
                 q_norm: src.try_vector(&p("self_attn.q_norm.weight")),
                 k_norm: src.try_vector(&p("self_attn.k_norm.weight")),
                 mlp_norm: src.vector(&p("post_attention_layernorm.weight"))?,
-                mlp: Mlp::Dense(Ffn::load(src, &p("mlp"))?),
+                mlp: match &routed {
+                    Some((router, layout)) if layout.is_moe(i, router.n_experts) => {
+                        Mlp::Moe(Box::new(Moe::load(src, &p("mlp"), router, layout.n_shared)?))
+                    }
+                    _ => Mlp::Dense(Ffn::load(src, &p("mlp"))?),
+                },
             });
         }
 

@@ -251,6 +251,19 @@ impl Ffn {
         self.down.matmul_bt(&gate, m, None)
     }
 
+    /// One token, through the matrix-*vector* kernel.
+    ///
+    /// Not `run` with a batch of one. `matvec_bt` and `matmul_bt` are separate
+    /// kernels, and this is the path every generated token takes: folding it
+    /// into the batched spelling for tidiness would be a change to the hottest
+    /// loop in the engine, measured in neither direction.
+    pub fn run_one(&self, x: &[f32]) -> Vec<f32> {
+        let mut gate = self.gate.matvec_bt(x, None);
+        let up = self.up.matvec_bt(x, None);
+        swiglu_inplace(&mut gate, &up);
+        self.down.matvec_bt(&gate, None)
+    }
+
     pub fn param_count(&self) -> usize {
         self.gate.param_count() + self.up.param_count() + self.down.param_count()
     }
@@ -265,10 +278,17 @@ pub enum Mlp {
     /// needs a residual stream that already means something, and at layer
     /// zero it does not.
     Dense(Ffn),
-    Moe(Moe),
+    /// Boxed, and not for recursion: an unboxed mixture makes every variant as
+    /// wide as a hundred experts' worth of bookkeeping, so a dense block pays
+    /// for the mixture it does not have. It cost 9% of decode on Qwen2.5-0.5B
+    /// when this enum first replaced three fields on the block.
+    Moe(Box<Moe>),
 }
 
 pub struct Moe {
+    /// How this family picks. Held here rather than on the model, so that a
+    /// mixture without a routing policy cannot be built at all.
+    pub router: Router,
     /// `[n_routed_experts, hidden]` — the router itself, one dot product per
     /// expert.
     pub gate: Weight,
@@ -287,7 +307,8 @@ impl Moe {
     /// experts however you slice it — but walking tokens would read each
     /// chosen expert's weights again for every token that chose it, and
     /// walking experts reads each one once.
-    pub fn run(&self, router: &Router, hs: &[f32], m: usize, e: usize) -> Vec<f32> {
+    pub fn run(&self, hs: &[f32], m: usize, e: usize) -> Vec<f32> {
+        let router = &self.router;
         let n = router.n_experts;
         let logits = self.gate.matmul_bt(hs, m, None);
 
@@ -329,3 +350,49 @@ impl Moe {
     }
 }
 
+
+impl Mlp {
+    /// A batch of tokens. Prefill, and scoring.
+    pub fn run(&self, hs: &[f32], m: usize, e: usize) -> Vec<f32> {
+        match self {
+            Mlp::Dense(ffn) => ffn.run(hs, m),
+            Mlp::Moe(moe) => moe.run(hs, m, e),
+        }
+    }
+
+    /// One token. See [`Ffn::run_one`] for why this is not the batch of one.
+    ///
+    /// A mixture has no such kernel yet: it routes one token through the
+    /// batched expert path, which is a batch of one per chosen expert however
+    /// it is spelled. Worth revisiting when a mixture is the thing being
+    /// decoded rather than the thing being loaded.
+    pub fn run_one(&self, x: &[f32], e: usize) -> Vec<f32> {
+        match self {
+            Mlp::Dense(ffn) => ffn.run_one(x),
+            Mlp::Moe(moe) => moe.run(x, 1, e),
+        }
+    }
+
+    pub fn param_count(&self) -> usize {
+        match self {
+            Mlp::Dense(ffn) => ffn.param_count(),
+            Mlp::Moe(moe) => {
+                moe.gate.param_count()
+                    + moe.bias.as_ref().map_or(0, Vec::len)
+                    + moe.experts.iter().map(Ffn::param_count).sum::<usize>()
+                    + moe.shared.as_ref().map_or(0, Ffn::param_count)
+            }
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        match self {
+            Mlp::Dense(ffn) => ffn.bytes(),
+            Mlp::Moe(moe) => {
+                moe.gate.bytes()
+                    + moe.experts.iter().map(Ffn::bytes).sum::<usize>()
+                    + moe.shared.as_ref().map_or(0, Ffn::bytes)
+            }
+        }
+    }
+}

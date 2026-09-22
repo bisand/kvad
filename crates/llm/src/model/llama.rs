@@ -22,10 +22,11 @@
 //! path for free. Mixing the two layouts up produces fluent nonsense rather
 //! than an error, which is why the counting test in the README exists.
 
+use super::ffn::{Ffn, Mlp};
 use super::{attend, Architecture, KvCache, Spec, Transformer};
 use crate::qcache::{head, Source};
 use crate::quant::Weight;
-use crate::tensor::{rms_norm, swiglu_inplace, Rope};
+use crate::tensor::{rms_norm, Rope};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -75,11 +76,11 @@ pub struct Block {
     q_norm: Option<Vec<f32>>,
     k_norm: Option<Vec<f32>>,
     mlp_norm: Vec<f32>,
-    /// The gate and the value are computed by two separate matrices from the
-    /// same input; `down` projects their product back to `n_embd`.
-    gate_w: Weight,
-    up_w: Weight,
-    down_w: Weight,
+    /// One MLP, or a routed hundred of them. See [`super::ffn`]: what a block
+    /// feeds its attention through is a choice this family makes independently
+    /// of how it attends, and `qwen3_moe` is the same block as `qwen3` with
+    /// the other answer here.
+    mlp: Mlp,
 }
 
 pub struct Model {
@@ -129,9 +130,7 @@ impl Model {
                 q_norm: src.try_vector(&p("self_attn.q_norm.weight")),
                 k_norm: src.try_vector(&p("self_attn.k_norm.weight")),
                 mlp_norm: src.vector(&p("post_attention_layernorm.weight"))?,
-                gate_w: src.matrix(&p("mlp.gate_proj.weight"))?,
-                up_w: src.matrix(&p("mlp.up_proj.weight"))?,
-                down_w: src.matrix(&p("mlp.down_proj.weight"))?,
+                mlp: Mlp::Dense(Ffn::load(src, &p("mlp"))?),
             });
         }
 
@@ -215,10 +214,7 @@ impl Model {
                 hs[i * e..(i + 1) * e]
                     .copy_from_slice(&rms_norm(&xs[i * e..(i + 1) * e], &block.mlp_norm, spec.eps));
             }
-            let mut gate = block.gate_w.matmul_bt(&hs, m, None);
-            let up = block.up_w.matmul_bt(&hs, m, None);
-            swiglu_inplace(&mut gate, &up);
-            let mlp = block.down_w.matmul_bt(&gate, m, None);
+            let mlp = block.mlp.run(&hs, m, e);
             for (x, val) in xs.iter_mut().zip(mlp.iter()) {
                 *x += val;
             }
@@ -246,9 +242,7 @@ impl Transformer for Model {
                 + b.k_w.param_count()
                 + b.v_w.param_count()
                 + b.o_w.param_count()
-                + b.gate_w.param_count()
-                + b.up_w.param_count()
-                + b.down_w.param_count()
+                + b.mlp.param_count()
                 + b.attn_norm.len()
                 + b.mlp_norm.len()
                 + opt(&b.q_b)
@@ -269,9 +263,7 @@ impl Transformer for Model {
                 + b.k_w.bytes()
                 + b.v_w.bytes()
                 + b.o_w.bytes()
-                + b.gate_w.bytes()
-                + b.up_w.bytes()
-                + b.down_w.bytes()
+                + b.mlp.bytes()
         });
         self.embed.bytes()
             + self.lm_head.as_ref().map_or(0, |h| h.bytes())
@@ -345,11 +337,7 @@ impl Transformer for Model {
 
             // ---- MLP sub-block -------------------------------------------
             let h = rms_norm(&x, &block.mlp_norm, spec.eps);
-            let mut gate = linear(&h, &block.gate_w, None);
-            let up = linear(&h, &block.up_w, None);
-            // gate <- silu(gate) * up
-            swiglu_inplace(&mut gate, &up);
-            let mlp = linear(&gate, &block.down_w, None);
+            let mlp = block.mlp.run_one(&h, spec.n_embd);
             for (xi, m) in x.iter_mut().zip(mlp.iter()) {
                 *xi += m; // residual
             }

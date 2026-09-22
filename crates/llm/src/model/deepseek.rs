@@ -330,7 +330,6 @@ struct Block {
 pub struct Model {
     spec: Spec,
     mla: Mla,
-    router: Router,
     embed: Weight,
     lm_head: Option<Weight>,
     blocks: Vec<Block>,
@@ -383,7 +382,8 @@ impl Model {
             let is_moe = Layout { first_dense, moe_every, n_shared }.is_moe(i, router.n_experts);
             let mlp = match is_moe {
                 false => Mlp::Dense(Ffn::load(src, &p("mlp"))?),
-                true => Mlp::Moe(Moe {
+                true => Mlp::Moe(Box::new(Moe {
+                    router: router.clone(),
                     gate: src.matrix(&p("mlp.gate.weight"))?,
                     bias: src.try_vector(&p("mlp.gate.e_score_correction_bias")),
                     experts: (0..router.n_experts)
@@ -393,7 +393,7 @@ impl Model {
                         0 => None,
                         _ => Some(Ffn::load(src, &p("mlp.shared_experts"))?),
                     },
-                }),
+                })),
             };
 
             blocks.push(Block {
@@ -423,7 +423,6 @@ impl Model {
             blocks,
             final_norm: src.vector("norm.weight")?,
             mla,
-            router,
             rope,
             spec,
         })
@@ -468,10 +467,7 @@ impl Model {
                     spec.eps,
                 ));
             }
-            let out = match &block.mlp {
-                Mlp::Dense(ffn) => ffn.run(&hs, m),
-                Mlp::Moe(moe) => moe.run(&self.router, &hs, m, e),
-            };
+            let out = block.mlp.run(&hs, m, e);
             for (x, v) in xs.iter_mut().zip(out.iter()) {
                 *x += v;
             }
@@ -658,30 +654,5 @@ impl Block {
             + a.uv.iter().map(|w| w.bytes()).sum::<usize>()
             + a.o.bytes();
         attn + self.mlp.bytes()
-    }
-}
-
-impl Mlp {
-    fn param_count(&self) -> usize {
-        match self {
-            Mlp::Dense(f) => f.param_count(),
-            Mlp::Moe(m) => {
-                m.gate.param_count()
-                    + m.bias.as_ref().map_or(0, |b| b.len())
-                    + m.experts.iter().map(|f| f.param_count()).sum::<usize>()
-                    + m.shared.as_ref().map_or(0, |f| f.param_count())
-            }
-        }
-    }
-
-    fn bytes(&self) -> usize {
-        match self {
-            Mlp::Dense(f) => f.bytes(),
-            Mlp::Moe(m) => {
-                m.gate.bytes()
-                    + m.experts.iter().map(|f| f.bytes()).sum::<usize>()
-                    + m.shared.as_ref().map_or(0, |f| f.bytes())
-            }
-        }
     }
 }

@@ -277,7 +277,11 @@ fn dtype_bytes(name: &str) -> u64 {
 /// loader will do seventy gigabytes later, and a promise made from a stale
 /// copy of the list would be worse than none.
 fn readable_dtype(name: &str) -> bool {
-    matches!(name, "F32" | "BF16" | "F16")
+    // `F8_E4M3` is readable because the scales that give it meaning ship in
+    // the same file; see `Checkpoint::rescale`. `F8_E5M2` is not, and the
+    // two are one letter apart in the Hub's spelling, which is the reason
+    // this is a list rather than a prefix test.
+    matches!(name, "F32" | "BF16" | "F16" | "F8_E4M3")
 }
 
 /// How a checkpoint's weights are stored, when the reader cannot decode
@@ -799,10 +803,14 @@ mod tests {
     fn the_dtype_holding_the_weights_decides_whether_they_can_be_read() {
         let st = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap();
 
-        // Qwen/Qwen3-Coder-Next-FP8: the norms are bf16 and everything that
-        // matters is not.
+        // Qwen/Qwen3-Coder-Next-FP8. Readable since `decode` learned e4m3,
+        // and this asserted the opposite until it did.
         let fp8 = st(r#"{"parameters":{"BF16":683691264,"F8_E4M3":78995521536}}"#);
-        assert_eq!(unreadable_as(Some(&fp8), None), Some("F8_E4M3".into()));
+        assert_eq!(unreadable_as(Some(&fp8), None), None);
+
+        // One letter apart, and not implemented.
+        let e5m2 = st(r#"{"parameters":{"BF16":683691264,"F8_E5M2":78995521536}}"#);
+        assert_eq!(unreadable_as(Some(&e5m2), None), Some("F8_E5M2".into()));
 
         // Qwen/Qwen3-30B-A3B, which loads.
         let bf16 = st(r#"{"parameters":{"BF16":30532122624}}"#);
@@ -848,14 +856,14 @@ mod tests {
     /// Both halves matter: the button has to go, and the row has to say why
     /// in terms of the dtype rather than of the architecture, which is fine.
     #[test]
-    fn an_fp8_checkpoint_is_blocked_before_it_is_downloaded() {
+    fn a_packing_this_build_cannot_read_is_blocked_before_it_is_downloaded() {
         let mut m = sized(Some(80_000_000_000));
         assert!(m.runnable(), "a bf16 llama is runnable");
 
-        m.unreadable_as = Some("F8_E4M3".into());
+        m.unreadable_as = Some("I32".into());
         assert!(!m.runnable());
         let why = m.blocker().expect("a blocked model states a reason");
-        assert!(why.contains("F8_E4M3"), "{why}");
+        assert!(why.contains("I32"), "{why}");
         assert!(!why.contains("unsupported arch"), "{why}");
     }
 

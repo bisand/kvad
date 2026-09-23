@@ -18,6 +18,10 @@ arch-qwen3-5 = []
 
 [dependencies]
 hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
+# For `F_NOCACHE`: a residency cache that holds its own slabs does not
+# want the kernel holding a second copy of the same bytes. Already a direct
+# dependency of `kvad-serve` and long since in the tree.
+libc = "0.2.189"
 memmap2 = "0.9.11"
 # `json` is not decoration: every chat template that takes tools writes them
 # out with the `tojson` filter, and without the feature the render fails at

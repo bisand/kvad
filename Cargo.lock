@@ -2425,6 +2425,7 @@ name = "kvad"
 version = "0.2.3"
 dependencies = [
  "hf-hub",
+ "libc",
  "memmap2",
  "minijinja",
  "nervus",

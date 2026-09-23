@@ -35,6 +35,7 @@ pub use serde_json;
 
 pub mod chat;
 pub mod crawl;
+pub mod experts;
 pub mod hub;
 pub mod machine;
 pub mod model;

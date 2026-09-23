@@ -28,6 +28,12 @@
 # otherwise. It is also stopped before its binaries are replaced and started
 # again afterwards, so nothing keeps serving from a file that has moved.
 #
+# The service itself — writing the unit, loading it, stopping it and seeing
+# that it stopped — is `kvad service`'s job, and this script asks it to do
+# that whenever the kvad in question has the command. What is left of it
+# here is the fallback for a kvad that predates it: an upgrade from an older
+# release, or an install of one with --version.
+#
 # Nothing here needs root. Nothing here writes outside $HOME unless you point
 # --prefix somewhere else.
 
@@ -512,6 +518,17 @@ service_paths() {
     fi
 }
 
+# Whether a kvad binary can drive the service itself.
+#
+# Asked of the binary rather than worked out from its version: `kvad service
+# help` exits 0 on a kvad that has the command, and 2 on one that predates
+# it, which takes `service` for a command it does not know. Whichever binary
+# the step is about is the one asked — the old one before the files are
+# replaced, the new one after.
+cli_has_service() { # path to a kvad binary
+    [ -x "$1" ] && "$1" service help >/dev/null 2>&1
+}
+
 # Whether the service manager currently has the job, as opposed to there
 # merely being a unit file on disk. The two come apart often enough —
 # somebody stopped it by hand, a bootout that did not take — that guessing
@@ -543,6 +560,10 @@ stop_service() {
     unit=$(service_paths)
     [ -f "$unit" ] || return 0
     step "Stopping the service"
+    if cli_has_service "$PREFIX/kvad"; then
+        "$PREFIX/kvad" service uninstall >&2 && return 0
+        warn "kvad service uninstall did not finish; trying it the old way"
+    fi
     if [ "$PLATFORM" = macos ]; then
         launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null ||
             launchctl unload -w "$unit" 2>/dev/null || true
@@ -565,7 +586,10 @@ suspend_service() {
     service_loaded || return 0
     SERVICE_WAS_LOADED=1
     step "Stopping $SERVICE_LABEL before replacing its binaries"
-    if [ "$PLATFORM" = macos ]; then
+    # The kvad already installed, since the new one is not there yet.
+    if cli_has_service "$PREFIX/kvad"; then
+        "$PREFIX/kvad" service stop >/dev/null 2>&1 || true
+    elif [ "$PLATFORM" = macos ]; then
         launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1 || true
         await_unloaded || true
     else
@@ -588,7 +612,9 @@ suspend_service() {
 # Put back what suspend_service took away, for the run that replaced the
 # binaries and was not asked to rewrite the unit.
 resume_service() {
-    if [ "$PLATFORM" = macos ]; then
+    if cli_has_service "$PREFIX/kvad"; then
+        "$PREFIX/kvad" service start >/dev/null 2>&1 || true
+    elif [ "$PLATFORM" = macos ]; then
         launchctl bootstrap "gui/$(id -u)" "$(service_paths)" >/dev/null 2>&1 ||
             launchctl load -w "$(service_paths)" >/dev/null 2>&1 || true
     else
@@ -1002,7 +1028,18 @@ if [ -f "$SRC/kvad-serve" ]; then
 
     if [ "$do_service" -eq 1 ]; then
         step "Installing the background service"
-        if [ "$PLATFORM" = macos ]; then write_launchd; else write_systemd; fi
+        # --force because the objections it would raise — an address that is
+        # not loopback, an address that is taken — have been put to the
+        # person already, above, and answered.
+        if cli_has_service "$PREFIX/kvad"; then
+            "$PREFIX/kvad" service install --host "$SERVICE_HOST" --port "$SERVICE_PORT" --force >&2 ||
+                warn "kvad service install did not finish; see above. Retry it with:
+    $PREFIX/kvad service install --host $SERVICE_HOST --port $SERVICE_PORT"
+        elif [ "$PLATFORM" = macos ]; then
+            write_launchd
+        else
+            write_systemd
+        fi
     elif [ "$SERVICE_WAS_LOADED" -eq 1 ]; then
         # Stopped a few steps up so its binaries could be replaced. Whatever
         # was just declined, it was not "turn my server off".

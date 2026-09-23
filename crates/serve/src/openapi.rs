@@ -1021,6 +1021,35 @@ mod tests {
         );
     }
 
+    /// Every route has a command, or a written reason it has none.
+    ///
+    /// The same trick as the router test above, one step further out: a
+    /// route added here and not to `kvad::client::COMMANDS` fails, so "the
+    /// CLI can do everything the API can" is checked rather than remembered.
+    /// The CLI's own tests take it the rest of the way, from its table to the
+    /// requests its source actually makes.
+    #[test]
+    fn every_route_has_a_command_or_a_reason_it_has_none() {
+        let described: BTreeSet<(String, String)> =
+            ENDPOINTS.iter().map(|e| (e.method.to_string(), e.path.to_string())).collect();
+        let covered: BTreeSet<(String, String)> = kvad::client::COMMANDS
+            .iter()
+            .chain(kvad::client::NOT_COMMANDS)
+            .map(|(method, path, _)| (method.to_string(), path.to_string()))
+            .collect();
+
+        let missing: Vec<_> = described.difference(&covered).collect();
+        assert!(
+            missing.is_empty(),
+            "these routes have no `kvad` command, and no reason in NOT_COMMANDS: {missing:#?}"
+        );
+        let invented: Vec<_> = covered.difference(&described).collect();
+        assert!(
+            invented.is_empty(),
+            "the CLI's table names routes this server does not have: {invented:#?}"
+        );
+    }
+
     #[test]
     fn path_parameters_are_read_out_of_the_path() {
         assert_eq!(path_params("/api/jobs/{id}/events"), ["id"]);

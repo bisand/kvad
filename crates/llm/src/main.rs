@@ -12,6 +12,7 @@
 //!     kvad run  [--model R] [--prompt TEXT]
 //!     kvad chat [--model R] [--system TEXT]
 //!     kvad serve [...]       the HTTP server and web UI
+//!     kvad service ...       that server as a service that starts at login
 //!
 //! Sampling flags: --max-tokens N --temperature F --top-k N --top-p F --seed N
 //! --greedy
@@ -19,6 +20,16 @@
 //! Wherever a model is named, three things are accepted and tried in this
 //! order: a directory that exists, a model trained here by that name, a Hub
 //! repo id. See `kvad::weights`.
+//!
+//! # Here, or on the server
+//!
+//! Most of these commands can be answered two ways: in this process, which is
+//! how the CLI has always worked, or by a running `kvad-serve`. When one is
+//! running they go to it, so that `kvad chat` talks to the model the service
+//! already holds instead of loading a second copy beside it. Which one, and
+//! why, is `kvad::client`'s question, and the answer is the first line every
+//! such command prints. The commands that only a server can answer — `load`,
+//! `conversations`, `keys` and the rest — live in [`cli`].
 
 use kvad::chat::Message;
 use kvad::crawl;
@@ -33,6 +44,8 @@ use kvad::weights;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+mod cli;
+
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// A small instruction-tuned model: 135M parameters, genuinely converses, and
@@ -44,6 +57,45 @@ struct Args {
     /// Positional argument after the subcommand: a query for `search`, a repo
     /// id for `pull` / `use` / `rm`.
     target: Option<String>,
+    /// The same words one at a time, for the commands that take several:
+    /// `kvad keys rm 4`, `kvad service logs`.
+    words: Vec<String>,
+    /// Where to run: `--remote URL`, `--local`, or neither. See
+    /// `kvad::client`.
+    choice: kvad::client::Choice,
+    /// Print what the server sent, as JSON, instead of a table.
+    json: bool,
+    /// Answer yes to the one question a command would ask.
+    yes: bool,
+    /// Keep going: `kvad service logs -f`.
+    follow: bool,
+    /// Asked for with `--help` after a command: that command's usage.
+    help: bool,
+    /// Whether `--quant` was given, which only matters on a server: there it
+    /// picks a CPU backend, and not giving it leaves the server to choose.
+    quant_given: bool,
+    backend: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    limit: Option<usize>,
+    role: Option<String>,
+    title: Option<String>,
+    dataset: Option<String>,
+    conversation: Option<i64>,
+    /// `kvad chat --save`: keep the conversation on the server.
+    save: bool,
+    /// `kvad run --raw`: continue the prompt, with no chat template.
+    raw: bool,
+    /// `kvad service install --force`: install over the objections.
+    force: bool,
+    /// `kvad auth login --key`: paste a key rather than sign in.
+    key: bool,
+    /// `kvad users edit --password`: set a new one.
+    password: bool,
+    k: Option<usize>,
+    window: Option<usize>,
+    rounds: Option<usize>,
+    tokens: Option<usize>,
     model: Option<String>,
     prompt: Option<String>,
     system: Option<String>,
@@ -81,6 +133,30 @@ impl Default for Args {
         Args {
             command: "run".into(),
             target: None,
+            words: Vec::new(),
+            choice: kvad::client::Choice::Unset,
+            json: false,
+            yes: false,
+            follow: false,
+            help: false,
+            quant_given: false,
+            backend: None,
+            host: None,
+            port: None,
+            limit: None,
+            role: None,
+            title: None,
+            dataset: None,
+            conversation: None,
+            save: false,
+            raw: false,
+            force: false,
+            key: false,
+            password: false,
+            k: None,
+            window: None,
+            rounds: None,
+            tokens: None,
             model: None,
             prompt: None,
             system: None,
@@ -125,12 +201,40 @@ fn usage() -> ! {
            use MODEL           set the default model\n  \
            rm MODEL            delete a downloaded or trained model\n  \
            cache [REPO|clear]  list or delete pre-quantised weight files\n  \
-           info                show a model's config without downloading weights
+           info [MODEL]        show a model's config without downloading weights
   arch                list the architectures this build can run\n  \
            run                 one-shot completion\n  \
            chat                interactive conversation\n  \
-           serve [...]         HTTP server and web UI; options are passed through\n\n\
+           serve [...]         HTTP server and web UI; options are passed through\n  \
+           service ...         run that server at login: status, start, stop,\n  \
+           \u{20}                   restart, logs [-f], install, uninstall\n\n\
+         commands a running server answers (kvad-serve, or `kvad service start`):\n  \
+           ps                  the models in memory, and what is left\n  \
+           load MODEL          put a model in memory  [--backend ID]\n  \
+           unload [ID]         take one out, or all of them\n  \
+           cancel              stop whatever is generating\n  \
+           tokenize TEXT       how the model splits a text\n  \
+           conversations       ls, show ID, edit ID, rm ID\n  \
+           jobs                ls, show ID, watch ID, cancel ID\n  \
+           datasets            ls, add FILE, crawl URL, show ID, check ID, search ID Q, rm ID\n  \
+           evals               runs, show ID, suites, add FILE, edit ID FILE, rm ID,\n  \
+           \u{20}                   run SUITE MODEL..., perplexity DATASET MODEL...\n  \
+           bench               runs, show ID, run MODEL...\n  \
+           metrics             the machine; requests; log\n  \
+           auth                status, login [--key], logout, setup TOKEN, password\n  \
+           users               ls, add NAME, edit ID, rm ID\n  \
+           sessions | keys     ls, rm ID; keys add NAME\n  \
+           api [METHOD PATH [JSON]]\n  \
+           \u{20}                   any route, raw; with no arguments, the list of them\n\n\
          -V, --version         print the version and exit\n\n\
+         where it runs:\n  \
+           --remote URL        send the command to the kvad-serve at URL\n  \
+           --local             run it in this process, even with a server running\n  \
+           \u{20}                   Otherwise: $KVAD_URL, then [client] url in kvad.toml,\n  \
+           \u{20}                   then this machine's service if it answers, then here.\n  \
+           \u{20}                   The first line of output says which, and why.\n  \
+           --json              print what the server sent, as JSON\n  \
+           -y, --yes           answer yes to the question a command would ask\n\n\
          options:\n  \
            --model MODEL       a name trained here, a directory, or a Hub repo id\n  \
            \u{20}                   (default: active, else {DEFAULT_MODEL})\n  \
@@ -141,8 +245,13 @@ fn usage() -> ! {
            --top-k N           keep the N best candidates (default 40)\n  \
            --top-p F           nucleus threshold (default 0.95)\n  \
            --seed N            sampling seed (default 7)\n  \
-           --quant f32|q8|q4   quantise weights on load (default f32)\n  \
-           --greedy            shorthand for --temperature 0\n\n\
+           --quant f32|q8|q4   quantise weights on load (default f32); on a server,\n  \
+           \u{20}                   the CPU backend at that precision\n  \
+           --backend ID        on a server: which backend to load on, e.g. gpu-q8\n  \
+           --greedy            shorthand for --temperature 0\n  \
+           --raw               `run` on a server: continue the prompt, no chat template\n  \
+           --save              `chat` on a server: keep the conversation there\n  \
+           --conversation ID   `chat` on a server: carry on with a kept one\n\n\
          kvad crawl options:\n  \
            --out FILE          where to write it (default: a name from the address)\n  \
            --pages N           most pages to read (default 400)\n  \
@@ -156,7 +265,9 @@ fn usage() -> ! {
          and that is a hundred times the book. robots.txt is obeyed. Ctrl-C stops it\n\
          and loses what it has read; the web UI's Stop keeps it.\n\n\
          kvad train options:\n  \
-           --data FILE         plain text to learn from (required)\n  \
+           --data FILE         plain text to learn from (required here; on a server,\n  \
+           \u{20}                   uploaded as a dataset first)\n  \
+           --dataset ID|NAME   on a server: train on a dataset it already has\n  \
            --name NAME         what to call it; one word, no `/`\n  \
            --from MODEL        train an existing model further, instead of a new one\n  \
            --size NAME         model shape: {sizes} (default {default_size})\n  \
@@ -179,9 +290,39 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// Commands that take words after them, rather than only flags.
+const POSITIONAL: &[&str] = &[
+    "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload",
+    "tokenize", "service", "conversations", "jobs", "datasets", "evals", "bench", "metrics",
+    "auth", "users", "sessions", "keys", "api",
+];
+
+/// Flags that stand alone, and the short spellings some of them have.
+fn switch(a: &mut Args, flag: &str) -> bool {
+    match flag {
+        "--greedy" => a.temperature = 0.0,
+        "--same-host" => a.same_host = true,
+        "--local" => a.choice = kvad::client::Choice::Local,
+        "--json" => a.json = true,
+        "--yes" | "-y" => a.yes = true,
+        "--follow" | "-f" => a.follow = true,
+        "--help" | "-h" => a.help = true,
+        "--save" => a.save = true,
+        "--raw" => a.raw = true,
+        "--force" => a.force = true,
+        "--key" => a.key = true,
+        "--password" => a.password = true,
+        _ => return false,
+    }
+    true
+}
+
 fn parse_args() -> Args {
+    parse_from(std::env::args().skip(1).collect())
+}
+
+fn parse_from(argv: Vec<String>) -> Args {
     let mut a = Args::default();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
 
     if let Some(first) = argv.first() {
@@ -193,31 +334,18 @@ fn parse_args() -> Args {
     if matches!(a.command.as_str(), "-h" | "--help" | "help") {
         usage();
     }
-
-    // Subcommands that take a bare positional argument.
-    if matches!(a.command.as_str(), "search" | "pull" | "use" | "rm" | "cache" | "crawl") {
-        let mut words = Vec::new();
-        while let Some(w) = argv.get(i) {
-            if w.starts_with("--") {
-                break;
-            }
-            words.push(w.clone());
-            i += 1;
-        }
-        if !words.is_empty() {
-            a.target = Some(words.join(" "));
-        }
-    }
+    let positional = POSITIONAL.contains(&a.command.as_str());
 
     while i < argv.len() {
         let flag = argv[i].clone();
-        if flag == "--greedy" {
-            a.temperature = 0.0;
+        // A word, for a command that takes them. Anywhere on the line, so
+        // that `kvad keys rm --json 4` means what it looks like.
+        if positional && !flag.starts_with('-') {
+            a.words.push(flag);
             i += 1;
             continue;
         }
-        if flag == "--same-host" {
-            a.same_host = true;
+        if switch(&mut a, &flag) {
             i += 1;
             continue;
         }
@@ -262,14 +390,36 @@ fn parse_args() -> Args {
                 a.quant = Precision::parse(&value).unwrap_or_else(|| {
                     eprintln!("--quant expects f32, q8 or q4, got `{value}`");
                     std::process::exit(2);
-                })
+                });
+                a.quant_given = true;
             }
+            "--remote" => a.choice = kvad::client::Choice::Remote(value.clone()),
+            "--backend" => a.backend = Some(value.clone()),
+            "--host" => a.host = Some(value.clone()),
+            "--port" => {
+                a.port = Some(value.parse().unwrap_or_else(|_| {
+                    eprintln!("--port expects a port number, 1 to 65535, got `{value}`");
+                    std::process::exit(2);
+                }))
+            }
+            "--limit" | "--lines" | "-n" => a.limit = Some(num() as usize),
+            "--role" => a.role = Some(value.clone()),
+            "--title" => a.title = Some(value.clone()),
+            "--dataset" => a.dataset = Some(value.clone()),
+            "--conversation" => a.conversation = Some(num() as i64),
+            "--k" => a.k = Some(num() as usize),
+            "--window" => a.window = Some(num() as usize),
+            "--rounds" => a.rounds = Some(num() as usize),
+            "--tokens" => a.tokens = Some(num() as usize),
             _ => {
                 eprintln!("unknown flag {flag}");
                 usage();
             }
         }
         i += 2;
+    }
+    if !a.words.is_empty() {
+        a.target = Some(a.words.join(" "));
     }
     a
 }
@@ -353,9 +503,8 @@ fn serve(args: Vec<std::ffi::OsString>) -> ! {
         Err(e) => e,
     };
 
-    // Printed and exited rather than returned: `main` reports a
-    // `Box<dyn Error>` with `Debug`, which would show this as one line with
-    // `\n` in it, and the whole point of it is that somebody reads it.
+    // Printed and exited rather than returned: the whole point of it is
+    // that somebody reads it, and it is written with its own layout.
     eprintln!(
         "could not start `{BIN}`: {failure}\n\n\
          It is a separate binary, because the server depends on this engine and so\n\
@@ -366,7 +515,17 @@ fn serve(args: Vec<std::ffi::OsString>) -> ! {
     std::process::exit(1);
 }
 
-fn main() -> Res<()> {
+fn main() {
+    // Printed with `Display`, not the `Debug` that returning the error from
+    // `main` would use: that shows a message as one quoted line with `\n`
+    // in it, and the messages here are written to be read.
+    if let Err(e) = real_main() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn real_main() -> Res<()> {
     // Handled before anything else is parsed, because everything after
     // `serve` belongs to the server and this program must not have opinions
     // about it.
@@ -384,63 +543,95 @@ fn main() -> Res<()> {
     }
 
     let args = parse_args();
-
-    match args.command.as_str() {
-        "info" => {
-            let files = weights::fetch(&resolve_model(&args))?;
-            let spec = Spec::from_json(&files.config)?;
-            println!("{}", spec.summary());
-            println!("  weight files: {}", files.weights.len());
-            println!(
-                "  KV cache at full context: {:.0} MB",
-                KvCache::max_bytes(&spec) as f64 / 1e6
-            );
-            println!(
-                "  chat template: {}",
-                match &files.tokenizer_config {
-                    Some(p) => match kvad::chat::ChatTemplate::from_tokenizer_config(p)? {
-                        Some(_) => "yes (instruction-tuned)",
-                        None => "no (base model)",
-                    },
-                    None => "no (base model)",
-                }
-            );
-            Ok(())
-        }
-        "arch" => {
-            // What *this* binary can run, which is a build-time question:
-            // every architecture is a Cargo feature.
-            // The middle column is as wide as it has to be: `llama` answers to
-            // five `model_type`s now, and a fixed width that one row overflows
-            // pushes that row's description out of line with every other.
-            let types: Vec<String> =
-                kvad::model::arch::registry().iter().map(|a| a.model_types().join(", ")).collect();
-            let w = types.iter().map(String::len).chain([17]).max().unwrap_or(17);
-            println!("{:<14} {:<w$} WHAT IT IS", "ARCHITECTURE", "CONFIG model_type");
-            for (a, t) in kvad::model::arch::registry().iter().zip(&types) {
-                println!("{:<14} {t:<w$} {}", a.id(), a.about());
-            }
-            println!(
-                "\n{} of them, chosen at build time; see `arch-*` in crates/llm/Cargo.toml.",
-                kvad::model::arch::registry().len()
-            );
-            Ok(())
-        }
-        "search" => search(args),
-        "crawl" => crawl_site(args),
-        "train" => train_model(args),
-        "pull" => pull(args),
-        "ls" => list_local(),
-        "use" => use_model(args),
-        "rm" => remove(args),
-        "cache" => cache(args),
-        "run" => run(args),
-        "chat" => chat(args),
-        other => {
-            eprintln!("unknown command `{other}`");
-            usage();
-        }
+    if args.help {
+        cli::help(&args.command);
     }
+
+    // Local-only commands first. `arch` is a fact about this binary, and
+    // `crawl` writes a file here: the server's version of it makes a dataset
+    // instead, and is `kvad datasets crawl`.
+    match args.command.as_str() {
+        "arch" => return arch(),
+        "crawl" => return crawl_site(args),
+        "service" => return cli::service::run(&args),
+        _ => {}
+    }
+
+    if !cli::known(&args.command) {
+        eprintln!("unknown command `{}`", args.command);
+        usage();
+    }
+
+    // Everything else can be answered by a server, and some of it only by
+    // one. Where it goes is decided once and said first.
+    let target = cli::target(&args)?;
+    let remote = match target {
+        kvad::client::Target::Remote(remote) => remote,
+        kvad::client::Target::Local { .. } => {
+            return match args.command.as_str() {
+                "info" => info(&args),
+                "search" => search(args),
+                "train" => train_model(args),
+                "pull" => pull(args),
+                "ls" => list_local(),
+                "use" => use_model(args),
+                "rm" => remove(args),
+                "cache" => cache(args),
+                "run" => run(args),
+                "chat" => chat(args),
+                other if cli::remote_only(other) => cli::no_server(other),
+                other => {
+                    eprintln!("unknown command `{other}`");
+                    usage();
+                }
+            };
+        }
+    };
+    cli::remote(&remote, &args)
+}
+
+/// `kvad info` — a model's config, read without downloading its weights.
+fn info(args: &Args) -> Res<()> {
+    let model = args.target.clone().or_else(|| args.model.clone()).unwrap_or_else(|| resolve_model(args));
+    let files = weights::fetch(&model)?;
+    let spec = Spec::from_json(&files.config)?;
+    println!("{}", spec.summary());
+    println!("  weight files: {}", files.weights.len());
+    println!(
+        "  KV cache at full context: {:.0} MB",
+        KvCache::max_bytes(&spec) as f64 / 1e6
+    );
+    println!(
+        "  chat template: {}",
+        match &files.tokenizer_config {
+            Some(p) => match kvad::chat::ChatTemplate::from_tokenizer_config(p)? {
+                Some(_) => "yes (instruction-tuned)",
+                None => "no (base model)",
+            },
+            None => "no (base model)",
+        }
+    );
+    Ok(())
+}
+
+/// `kvad arch` — what *this* binary can run, which is a build-time question:
+/// every architecture is a Cargo feature.
+fn arch() -> Res<()> {
+    // The middle column is as wide as it has to be: `llama` answers to
+    // five `model_type`s now, and a fixed width that one row overflows
+    // pushes that row's description out of line with every other.
+    let types: Vec<String> =
+        kvad::model::arch::registry().iter().map(|a| a.model_types().join(", ")).collect();
+    let w = types.iter().map(String::len).chain([17]).max().unwrap_or(17);
+    println!("{:<14} {:<w$} WHAT IT IS", "ARCHITECTURE", "CONFIG model_type");
+    for (a, t) in kvad::model::arch::registry().iter().zip(&types) {
+        println!("{:<14} {t:<w$} {}", a.id(), a.about());
+    }
+    println!(
+        "\n{} of them, chosen at build time; see `arch-*` in crates/llm/Cargo.toml.",
+        kvad::model::arch::registry().len()
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

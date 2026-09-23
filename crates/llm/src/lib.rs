@@ -23,7 +23,9 @@
 //!
 //! [`crawl`] and [`retrieve`] are off to one side: no tensors in either, just
 //! the way a corpus gets made out of a documentation site and the way the
-//! part of it that answers a question gets found again.
+//! part of it that answers a question gets found again. So are [`client`]
+//! and [`daemon`], which are how the command line talks to `kvad-serve` and
+//! to the service manager that keeps it running.
 
 /// The `serde_json` this crate was built against.
 ///
@@ -34,7 +36,9 @@
 pub use serde_json;
 
 pub mod chat;
+pub mod client;
 pub mod crawl;
+pub mod daemon;
 pub mod experts;
 pub mod hub;
 pub mod machine;

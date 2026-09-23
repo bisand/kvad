@@ -116,6 +116,42 @@
 //! the store and LRU cannot win below that capacity whatever the routing
 //! does. Granularity was the variable, and one model could not show it.
 //!
+//! # The third model, and what it cost the argument
+//!
+//! Qwen3-Next-80B-A3B-Instruct at q4 — 48 layers, 512 experts, top-10 — is
+//! the sparsest yet: 480 blobs of 24,576, or 1.95% of the store, against
+//! Qwen3's 6.25% and DeepSeek's 9.4%. Replayed against the real file with
+//! real `pread`s, over the same three domains:
+//!
+//! ```text
+//!   cache     hit (code/prose/sci)     fetch ms/token
+//!   4.8 GB     75.7 / 79.8 / 73.3        14.8 / 12.1 / 12.8
+//!   9.7 GB     88.2 / 91.5 / 86.8         9.3 /  5.9 /  7.1
+//!  24.2 GB     96.9 / 96.6 / 97.0         2.9 /  2.3 /  1.8
+//! ```
+//!
+//! Compared at equal memory rather than equal percentage, the larger model
+//! is the cheaper one to stream: at ~9.7 GB of cache Qwen3-30B spends
+//! 28.6 ms a token on disk and this spends 9.3, with 2.6x the parameters.
+//! Sparser routing is a smaller hot set, and the hot set is the whole cost.
+//!
+//! Then the measurement that cost the argument its premise. The case for
+//! building any of this rested on naive mmap being hopeless above memory —
+//! DeepSeek-V2-Lite at f32, a fifth over, generated 1.5 tok/s against 24
+//! resident. But this model, *two fifths* over memory at 50 GB against 36
+//! usable, generates **10.7 tok/s through the ordinary mmap path** with no
+//! expert cache at all (150 tokens, 14.06s, default threads).
+//!
+//! The same rule explains both. DeepSeek thrashed because its working set
+//! is five times denser, not because paging is a bad mechanism; the kernel
+//! keeps a 0.94 GB hot set resident without being told anything. So the
+//! honest value of an expert-aware fetcher here is 10.7 to roughly 15.5
+//! tok/s — worth having, and not the order of magnitude that was claimed
+//! for it before this was measured.
+//!
+//! The rule now holds on three models, and predicts the mmap case as well
+//! as the replayed one, which is more than it was built to do.
+//!
 //! # What a line means
 //!
 //! ```text

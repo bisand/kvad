@@ -374,6 +374,8 @@ impl App {
                     // nothing here for a model to call.
                     tools: Vec::new(),
                     sampling: Default::default(),
+                    // A conversation: the next turn reuses this one's cache.
+                    fresh: false,
                 });
             }
             K::Backspace => {

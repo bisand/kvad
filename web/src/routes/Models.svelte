@@ -41,6 +41,15 @@
 
   const thousands = (n) => n.toLocaleString();
 
+  /** A click on a control inside a `<summary>` toggles the row as well,
+   *  because toggling is what a summary does with a click. Buttons in a row
+   *  header have their own job, so they take the event and keep it. */
+  const notToggle = (fn) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    fn();
+  };
+
   /** What the Hub said about a search result, once somebody opened it.
    *  `undefined` is "never asked", `null` is "asked, and it could not say".
    *
@@ -57,10 +66,12 @@
         ...hubDetail,
         [id]: await api(`/api/models/detail?repo=${encodeURIComponent(id)}`),
       };
-    } catch {
-      // A repo with no config, a rate limit, no network. The row says so and
-      // the rest of the page carries on; this is not worth a toast.
-      hubDetail = { ...hubDetail, [id]: null };
+    } catch (e) {
+      // The server's reason, not a shrug of our own: it knows things worth
+      // saying, like that DeepSeek publishes V3 in fp8 and this engine reads
+      // bf16. Shown in the row rather than a toast, because it belongs to
+      // the row and the rest of the page carries on without it.
+      hubDetail = { ...hubDetail, [id]: { error: e.message } };
     }
   }
 
@@ -184,16 +195,12 @@
            shared name make it an accordion: opening one closes the last. -->
       <div class="flex flex-col gap-1">
         {#each models.all as m (m.id)}
-          <div
-            class="collapse rounded-box bg-base-200/40 {m.detail ? 'collapse-arrow' : ''}"
-          >
-            <!-- No input for a model that cannot describe itself: without one
-                 the row does not open, and without `collapse-arrow` above it
-                 does not pretend it would. -->
-            {#if m.detail}
-              <input type="radio" name="downloaded" aria-label={`What ${m.id} is`} />
-            {/if}
-            <div class="collapse-title flex flex-wrap items-center gap-x-3 gap-y-1">
+          <!-- `<details>` rather than a radio: a radio cannot be unchecked by
+               clicking it again, so a row opened that way could never be
+               closed. This toggles, and without a `name` several can stay
+               open at once, which is what comparing two models wants. -->
+          <details class="collapse collapse-arrow rounded-box bg-base-200/40">
+            <summary class="collapse-title flex flex-wrap items-center gap-x-3 gap-y-1">
               <div class="flex min-w-40 flex-1 items-center gap-2">
                 <span class="truncate font-medium">{m.id}</span>
                 {#if m.trained}<span class="badge badge-sm">trained here</span>{/if}
@@ -218,14 +225,14 @@
                 <button
                   class="btn btn-sm"
                   disabled={!m.runnable || !!models.busy || models.loaded?.repo === m.id}
-                  onclick={() => models.load(m.id, chosen)}
+                  onclick={notToggle(() => models.load(m.id, chosen))}
                 >
                   Load
                 </button>
                 <button
                   class="btn btn-sm btn-ghost"
                   disabled={models.listing.active === m.id}
-                  onclick={() => models.setActive(m.id)}
+                  onclick={notToggle(() => models.setActive(m.id))}
                   title="The model `kvad run` picks with no --model"
                 >
                   Default
@@ -233,15 +240,15 @@
                 <button
                   class="btn btn-sm btn-ghost"
                   aria-label={`Delete ${m.id}`}
-                  onclick={() => (confirming = m.id)}
+                  onclick={notToggle(() => (confirming = m.id))}
                 >
                   <Icon path={TRASH} size={16} />
                 </button>
               </div>
               <div class="w-full text-xs opacity-60">{m.blocker ?? m.arch}</div>
-            </div>
-            {#if m.detail}
-              <div class="collapse-content text-xs">
+            </summary>
+            <div class="collapse-content text-xs">
+              {#if m.detail}
                 <div class="font-mono opacity-80">{m.detail.summary}</div>
                 <div class="mt-2 flex flex-wrap gap-x-6 gap-y-1 opacity-70">
                   <span>{m.detail.n_layer} layers</span>
@@ -273,9 +280,13 @@
                     {#if m.streams}— none of them fit, so they are read from disk{/if}
                   </div>
                 {/if}
-              </div>
-            {/if}
-          </div>
+              {:else}
+                <span class="opacity-60">
+                  Nothing to show until its config can be read.
+                </span>
+              {/if}
+            </div>
+          </details>
         {/each}
       </div>
     {/if}
@@ -317,18 +328,15 @@
            opening a search result does not close a downloaded one. -->
       <div class="mt-4 flex flex-col gap-1">
         {#each results as r (r.id)}
-          <div class="collapse rounded-box bg-base-200/40 {r.arch ? 'collapse-arrow' : ''}">
-            <!-- Only a model this build can read has a `Spec` to describe, so
-                 only that one opens. -->
-            {#if r.arch}
-              <input
-                type="radio"
-                name="hub"
-                aria-label={`What ${r.id} is`}
-                onchange={(e) => e.currentTarget.checked && askHub(r.id)}
-              />
-            {/if}
-            <div class="collapse-title flex flex-wrap items-center gap-x-3 gap-y-1">
+          <!-- As the downloaded list: a `<details>` toggles, and a radio
+               would open a row that could then never be closed. `ontoggle`
+               rather than `onchange`, and it fires on close too, which is
+               why `askHub` checks whether it already has the answer. -->
+          <details
+            class="collapse collapse-arrow rounded-box bg-base-200/40"
+            ontoggle={(e) => e.currentTarget.open && r.arch && askHub(r.id)}
+          >
+            <summary class="collapse-title flex flex-wrap items-center gap-x-3 gap-y-1">
               <div class="flex min-w-40 flex-1 items-center gap-2">
                 <span class="truncate font-medium">{r.id}</span>
                 {#if r.local}<span class="badge badge-sm badge-soft">here</span>{/if}
@@ -363,7 +371,9 @@
                 <button
                   class="btn btn-sm"
                   disabled={!r.runnable || !!models.busy}
-                  onclick={() => (r.local ? models.load(r.id, chosen) : models.pull(r.id))}
+                  onclick={notToggle(() =>
+                    r.local ? models.load(r.id, chosen) : models.pull(r.id),
+                  )}
                 >
                   {r.local ? "Load" : "Pull"}
                 </button>
@@ -372,12 +382,18 @@
                    config, so the listing says what is runnable before anything
                    is downloaded. -->
               <div class="w-full text-xs opacity-60">{r.blocker ?? r.arch}</div>
-            </div>
-            {#if r.arch}
-              <div class="collapse-content text-xs">
-                {#if hubDetail[r.id] === "asking"}
+            </summary>
+            <div class="collapse-content text-xs">
+              {#if !r.arch}
+                <span class="opacity-60">
+                  This build has no reader for that architecture, so there is nothing
+                  to describe.
+                </span>
+              {:else if hubDetail[r.id] === "asking"}
                   <span class="opacity-60">reading its config…</span>
-                {:else if hubDetail[r.id]}
+                {:else if hubDetail[r.id]?.error}
+                <span class="opacity-70">{hubDetail[r.id].error}</span>
+              {:else if hubDetail[r.id]?.summary}
                   <div class="font-mono opacity-80">{hubDetail[r.id].summary}</div>
                   <div class="mt-2 flex flex-wrap gap-x-6 gap-y-1 opacity-70">
                     <span>{hubDetail[r.id].n_layer} layers</span>
@@ -405,14 +421,11 @@
                       {#if r.streams}— none of them fit, so they are read from disk{/if}
                     </div>
                   {/if}
-                {:else if hubDetail[r.id] === null}
-                  <span class="opacity-60">
-                    Its config could not be read, so there is nothing more to say.
-                  </span>
-                {/if}
-              </div>
-            {/if}
-          </div>
+              {:else}
+                <span class="opacity-60">reading its config…</span>
+              {/if}
+            </div>
+          </details>
         {/each}
       </div>
     {/if}

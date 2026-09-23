@@ -38,6 +38,13 @@
   const STREAMS_TIP =
     "Too large for memory, so the weights are read from disk as the model runs. It works, and it is much slower than a model that fits.";
 
+  /** Which downloaded rows are expanded. Keyed by id so the set survives a
+   *  refresh of the listing, which replaces the objects but not their names. */
+  let open = $state({});
+  const toggle = (id) => (open = { ...open, [id]: !open[id] });
+
+  const thousands = (n) => n.toLocaleString();
+
   let query = $state("");
   let results = $state(null);
   let searching = $state(false);
@@ -171,6 +178,16 @@
               <tr class="hover:bg-base-200/50">
                 <td class="max-w-0 min-w-40">
                   <div class="flex items-center gap-2">
+                    {#if m.detail}
+                      <button
+                        class="btn btn-ghost btn-xs w-5 px-0 font-mono"
+                        aria-expanded={!!open[m.id]}
+                        aria-label={`What ${m.id} is`}
+                        onclick={() => toggle(m.id)}
+                      >
+                        {open[m.id] ? "−" : "+"}
+                      </button>
+                    {/if}
                     <span class="truncate font-medium">{m.id}</span>
                     {#if m.trained}<span class="badge badge-sm">trained here</span>{/if}
                     {#if models.listing.active === m.id}
@@ -221,6 +238,43 @@
                   </div>
                 </td>
               </tr>
+              {#if open[m.id] && m.detail}
+                <tr class="bg-base-200/40">
+                  <td colspan="3" class="text-xs">
+                    <div class="font-mono opacity-80">{m.detail.summary}</div>
+                    <div class="mt-2 flex flex-wrap gap-x-6 gap-y-1 opacity-70">
+                      <span>{m.detail.n_layer} layers</span>
+                      <span>
+                        {m.detail.n_head} heads{m.detail.n_kv_head !== m.detail.n_head
+                          ? ` (${m.detail.n_kv_head} KV)`
+                          : ""}
+                      </span>
+                      <span>{thousands(m.detail.n_embd)} embedding</span>
+                      <span>{thousands(m.detail.n_ctx)} context</span>
+                      <span>{thousands(m.detail.vocab_size)} vocab</span>
+                      {#if m.detail.params}<span>{params(m.detail.params)}</span>{/if}
+                    </div>
+                    {#if m.detail.experts}
+                      <!-- The working set is not decoration: a cache holding
+                           fewer experts than a single pass reads evicts every
+                           one of them before its next use. -->
+                      <div class="mt-2 opacity-70">
+                        mixture of experts — {m.detail.experts.count} per layer,
+                        {m.detail.experts.per_token} chosen per token, so one token reads
+                        {thousands(m.detail.experts.working_set)} of them across the model
+                      </div>
+                    {/if}
+                    {#if m.detail.memory}
+                      <div class="mt-2 opacity-70">
+                        weights here: {humanBytes(m.detail.memory.f32)} at f32 ·
+                        {humanBytes(m.detail.memory.q8)} at q8 ·
+                        {humanBytes(m.detail.memory.q4)} at q4
+                        {#if m.streams}— none of them fit, so they are read from disk{/if}
+                      </div>
+                    {/if}
+                  </td>
+                </tr>
+              {/if}
             {/each}
           </tbody>
         </table>

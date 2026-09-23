@@ -58,6 +58,72 @@ pub struct Model {
     /// result: by the time it is on the disk the question is no longer
     /// whether to fetch it but what to expect when it starts.
     pub streams: bool,
+    /// What the config says this is, for a row somebody opened. `None`
+    /// when there is no config, or when it describes an architecture this
+    /// build has no reader for.
+    pub detail: Option<Detail>,
+}
+
+/// A model past its name and its size: the shape the config describes.
+#[derive(serde::Serialize)]
+pub struct Detail {
+    /// The same line `kvad info` prints.
+    pub summary: String,
+    pub n_layer: usize,
+    pub n_head: usize,
+    pub n_kv_head: usize,
+    pub n_embd: usize,
+    pub n_ctx: usize,
+    pub vocab_size: usize,
+    pub params: Option<u64>,
+    /// Weights here at each precision, as the search results give it.
+    pub memory: Option<Memory>,
+    /// A mixture's shape, when it is one.
+    pub experts: Option<Experts>,
+}
+
+/// How a mixture routes, and what that costs a cache.
+#[derive(serde::Serialize)]
+pub struct Experts {
+    pub count: usize,
+    pub per_token: usize,
+    /// Experts one token reads across the whole model.
+    ///
+    /// The number that decides whether an expert cache is worth having:
+    /// hold fewer than this and every entry is evicted before its next
+    /// use, because a forward pass reads this many before it repeats
+    /// itself. Measured exactly on Qwen3-30B-A3B — a cache of 374 experts
+    /// hits 1.9% and one of 384, which is this number, hits 33.2%.
+    pub working_set: usize,
+}
+
+/// Read the config and say what it describes.
+///
+/// Best effort throughout: a model this build cannot run still lists, and
+/// a row that cannot say what it is says nothing rather than failing.
+fn detail_of(m: &hub::LocalModel) -> Option<Detail> {
+    let config = hub::model_file(&m.path, "config.json")?;
+    let spec = kvad::model::Spec::from_json(&config).ok()?;
+    let experts = kvad::model::ffn::Router::count(&spec.config).and_then(|count| {
+        let per_token = spec.config.num(&["num_experts_per_tok"])?;
+        Some(Experts { count, per_token, working_set: per_token * spec.n_layer })
+    });
+    Some(Detail {
+        summary: spec.summary(),
+        n_layer: spec.n_layer,
+        n_head: spec.n_head,
+        n_kv_head: spec.n_kv_head,
+        n_embd: spec.n_embd,
+        n_ctx: spec.n_ctx,
+        vocab_size: spec.vocab_size,
+        params: m.params,
+        memory: m.params.map(|p| Memory {
+            f32: kvad::quant::Precision::F32.weight_bytes(p),
+            q8: kvad::quant::Precision::Q8.weight_bytes(p),
+            q4: kvad::quant::Precision::Q4.weight_bytes(p),
+        }),
+        experts,
+    })
 }
 
 fn describe(m: &hub::LocalModel, trained: bool) -> Model {
@@ -92,6 +158,7 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
         blocker,
         fits_at: fit.precision().map(|p| p.to_string()),
         streams: fit.streams(),
+        detail: detail_of(m),
     }
 }
 

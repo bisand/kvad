@@ -91,8 +91,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
         method: "get", path: "/api/health", tag: "Meta", access: Access::SignedIn,
         summary: "Is it up, and what is it holding",
         description: "Version, uptime, schema version, whether a UI is embedded, the \
-                      loaded model, the queue depth, the auth mode, and who the server \
-                      thinks you are. The first thing to call when something is wrong.",
+                      models in memory, the queue depth, the auth mode, and who the \
+                      server thinks you are. The first thing to call when something is \
+                      wrong.",
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
@@ -107,7 +108,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
         method: "get", path: "/api/models", tag: "Models", access: Access::SignedIn,
         summary: "What is on this machine",
         description: "Downloaded models, models trained here, the quantised-weight \
-                      cache, the active model, what the engine has loaded, and the \
+                      cache, the active model, the models in memory and what each is \
+                      charged, the memory budget and what is left of it, and the \
                       backends this build can actually load. The filesystem is the \
                       truth: nothing here is read from the database.",
         query: &[], body: None, produces: JSON, events: &[],
@@ -115,7 +117,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         method: "delete", path: "/api/models", tag: "Models", access: Access::Admin,
         summary: "Delete a model",
-        description: "Refused while that model is loaded. Deleting it also forgets its \
+        description: "Refused while that model is in memory on any backend. Deleting it \
+                      also forgets its \
                       quantised weights, which were derived from the files that just \
                       went.",
         query: &[("id", true, "A repo id or the name of a model trained here. In the \
@@ -149,23 +152,30 @@ pub const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         method: "post", path: "/api/models/load", tag: "Models", access: Access::Admin,
         summary: "Load a model, streaming the progress",
-        description: "Loading takes tens of seconds and may download gigabytes first, \
-                      so the answer is a stream rather than a request with nothing in \
-                      it. `POST` and not `EventSource`, because the body names the model.",
+        description: "Loads beside the models already in memory, if it fits in what \
+                      they have left; nothing is unloaded to make room. A model already \
+                      in memory on that backend is answered at once. Loading takes tens \
+                      of seconds and may download gigabytes first, so the answer is a \
+                      stream rather than a request with nothing in it. `POST` and not \
+                      `EventSource`, because the body names the model.",
         query: &[], body: json_body("`{ repo, backend? }`. The backend is an id from \
                                      `/api/models`; omitted means the last one used."),
         produces: SSE,
         events: &[
             ("progress", "A status line, or bytes for a download bar."),
             ("loaded", "The model is in memory; the payload describes it."),
-            ("error", "It did not load, and why."),
+            ("error", "It did not load, and why. `full` is true when it was refused \
+                       for want of memory rather than tried and failed."),
         ],
     },
     Endpoint {
         method: "post", path: "/api/models/unload", tag: "Models", access: Access::Admin,
-        summary: "Drop the loaded model",
-        description: "Gives the memory back without being told what to spend it on next.",
-        query: &[], body: None, produces: JSON, events: &[],
+        summary: "Drop a model from memory, or all of them",
+        description: "Gives the memory back without being told what to spend it on next. \
+                      Answers with the ids of what went.",
+        query: &[], body: json_body("Optional. `{ id }`, as `repo@backend` or a bare repo; \
+                                     with no body every model in memory goes."),
+        produces: JSON, events: &[],
     },
     Endpoint {
         method: "post", path: "/api/models/active", tag: "Models", access: Access::Admin,
@@ -212,7 +222,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       refused rather than quietly answering in prose — `tools` on \
                       `/v1/models` says which those are. `tool_choice` is `auto` or \
                       `none`: forcing a call would need the sampler constrained, \
-                      which this engine does not do.",
+                      which this engine does not do.\n\n\
+                      `model` names a model in memory, as a repo or as \
+                      `repo@backend`. One on disk and not in memory is loaded if it \
+                      fits beside what is, and refused with a 409 naming what holds \
+                      the memory if not; nothing is unloaded to make room. One not on \
+                      disk is a 404. Omitted, it means the one model in memory, and \
+                      is refused when there are several.",
         query: &[], body: json_body("OpenAI's request: `{ messages, stream?, \
                                      temperature?, top_p?, max_tokens?, seed?, \
                                      max_completion_tokens?, tools?, tool_choice? }`."),
@@ -222,16 +238,19 @@ pub const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         method: "get", path: "/v1/models", tag: "Chat", access: Access::SignedIn,
         summary: "Every model this machine has, in OpenAI's shape",
-        description: "One entry per model on disk. Each carries a `kvad` object \
-                      beside OpenAI's fields saying whether that model's chat \
-                      template can be offered tools.",
+        description: "One entry per model on disk, and one more per model in memory \
+                      under `repo@backend`. Each carries a `kvad` object beside \
+                      OpenAI's fields saying whether that model's chat template can be \
+                      offered tools, and whether it is in memory — naming one that is \
+                      not costs a load.",
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
         method: "delete", path: "/api/generation", tag: "Chat", access: Access::SignedIn,
         summary: "Stop generating",
-        description: "Affects whatever the engine is doing now, not a particular \
-                      request — with one generation at a time those are the same thing.",
+        description: "Affects whatever is generating now, not a particular request — \
+                      with one generation at a time across every model in memory, \
+                      those are the same thing.",
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
@@ -299,7 +318,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         method: "post", path: "/api/playground/tokenize", tag: "Playground",
         access: Access::SignedIn,
-        summary: "How the loaded model splits a text",
+        summary: "How the model used last splits a text",
         description: "Each token as the vocabulary entry (`Ġthe`, and all) and as the \
                       piece of your text it covers. The two disagree, and seeing how \
                       is most of the point.",
@@ -515,7 +534,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         method: "get", path: "/api/metrics", tag: "Monitoring", access: Access::SignedIn,
         summary: "What the machine is doing",
-        description: "The loaded model, decode and time-to-first-token summaries, \
+        description: "The models in memory, decode and time-to-first-token summaries, \
                       queue depth, resident memory, the KV cache against what it would \
                       cost at full context, and disk broken into what can be downloaded \
                       again and what cannot.",

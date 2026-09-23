@@ -386,6 +386,9 @@ pub struct State {
     /// Empty and unused in every other mode.
     pub oidc: std::sync::Arc<(crate::config::Oidc, crate::oidc::Flows)>,
     pub started: std::time::Instant,
+    /// Whether a completion naming a model that is not in memory loads it;
+    /// see `config::Server::load_on_request`.
+    pub load_on_request: bool,
 }
 
 /// An error a rejected request turns into: a status and a short reason.

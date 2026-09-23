@@ -15,7 +15,7 @@
 use crate::api::Fail;
 use crate::auth::{Identity, State};
 use crate::models::{sse, stream};
-use crate::scheduler::Piece;
+use crate::scheduler::{Key, Piece};
 use axum::extract::State as St;
 use axum::response::sse::Event;
 use axum::response::IntoResponse;
@@ -40,6 +40,10 @@ const MAX_EXPLAIN: usize = 20;
 #[derive(serde::Deserialize)]
 pub struct CompleteRequest {
     prompt: String,
+    /// Which model in memory, as `repo@backend` or a bare repo. Absent, the
+    /// one used most recently.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
@@ -97,9 +101,7 @@ async fn complete(
     if prompt.trim().is_empty() {
         return Err(Fail::bad("a completion needs a prompt to continue"));
     }
-    if state.engine.loaded().is_none() {
-        return Err(Fail::bad("no model is loaded; load one from the Models page"));
-    }
+    let on = resident(&state.engine, body.model.as_deref())?;
     let d = Sampling::default();
     let sampling = Sampling {
         temperature: body.temperature.unwrap_or(d.temperature).clamp(0.0, 4.0),
@@ -112,7 +114,7 @@ async fn complete(
 
     let mut pieces = state
         .engine
-        .complete(prompt, sampling, explain, body.fresh)
+        .complete(&on, prompt, sampling, explain, body.fresh)
         .map_err(Fail::internal)?;
 
     let (events, rx) = tokio::sync::mpsc::channel::<Event>(64);
@@ -165,6 +167,25 @@ async fn complete(
 #[derive(serde::Deserialize)]
 pub struct TokenizeRequest {
     text: String,
+    /// As [`CompleteRequest::model`].
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// The model in memory a playground request is for: the one it names, or
+/// the one used most recently. Never loads anything — the playground is for
+/// looking at a model somebody already chose.
+fn resident(engine: &crate::scheduler::Scheduler, model: Option<&str>) -> Result<Key, Fail> {
+    match model {
+        Some(name) => engine
+            .find(name)
+            .map(|r| r.key)
+            .ok_or_else(|| Fail::bad(format!("{name} is not loaded; load it from the Models page"))),
+        None => engine
+            .current()
+            .map(|r| r.key)
+            .ok_or_else(|| Fail::bad("no model is loaded; load one from the Models page")),
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -193,11 +214,9 @@ async fn tokenize(
     St(state): St<State>,
     Json(body): Json<TokenizeRequest>,
 ) -> Result<Json<Split>, Fail> {
-    if state.engine.loaded().is_none() {
-        return Err(Fail::bad("no model is loaded; load one from the Models page"));
-    }
+    let on = resident(&state.engine, body.model.as_deref())?;
     let characters = body.text.chars().count();
-    let tokens = state.engine.tokenize(body.text).await.map_err(Fail::bad)?;
+    let tokens = state.engine.tokenize(&on, body.text).await.map_err(Fail::bad)?;
     Ok(Json(Split {
         count: tokens.len(),
         characters,

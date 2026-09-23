@@ -476,7 +476,7 @@ impl Resident {
         let gb: f64 = match std::env::var("KVAD_EXPERT_CACHE") {
             Ok(v) => v.trim().parse().ok()?,
             Err(_) => {
-                let usable = crate::machine::usable_memory_cached()?;
+                let usable = room()?;
                 let budget = default_budget(bytes, usable)?;
                 eprintln!(
                     "expert cache: on, because {} of weights is over the {} this machine \
@@ -639,6 +639,34 @@ impl Resident {
 /// else on the machine no longer has.
 pub fn default_budget(bytes: u64, usable: u64) -> Option<u64> {
     (bytes > usable).then_some(usable / 2)
+}
+
+/// What the next model loaded may count as this machine's memory, when
+/// something else already holds part of it. Zero for "nothing said".
+static ROOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tell the next load how much memory is left for it.
+///
+/// A server holding other models has already spent some of what
+/// [`crate::machine::usable_memory`] reports, and a cache sized against the
+/// whole machine would be sized against memory those models are using. So
+/// the server says what is left before it loads, and `None` after, which
+/// puts the whole machine back.
+///
+/// A process-wide setting rather than an argument, because the cache is
+/// decided many calls below any loader, in [`Resident::wanted`]. That is
+/// sound only while one load runs at a time, which the server's scheduler
+/// guarantees and nothing else in this process sets it.
+pub fn set_room(bytes: Option<u64>) {
+    ROOM.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What [`set_room`] said, or the machine's usable memory.
+fn room() -> Option<u64> {
+    match ROOM.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => crate::machine::usable_memory_cached(),
+        bytes => Some(bytes),
+    }
 }
 
 impl Drop for Resident {

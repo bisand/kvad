@@ -59,7 +59,7 @@
     <div role="alert" class="alert">
       <Icon path="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
       <span>No model is loaded. Load one from the Models page — the playground talks to
-        whatever the engine is holding.</span>
+        the model picked on the Chat page, or the one used last.</span>
     </div>
   {/if}
 
@@ -265,9 +265,10 @@
     <section class="flex flex-col gap-4">
       <div class="bg-base-200 rounded-box flex flex-col gap-3 p-4">
         <p class="text-xs opacity-60">
-          The engine holds one model at a time, so "side by side" happens one after
-          another: each variant is loaded, given the same prompt with the same seed, and
-          unloaded when the next one's turn comes. Expect it to take as long as the
+          A model measured beside another is measured on the memory they share, so "side
+          by side" happens one after another: each variant is loaded alone — anything
+          else in memory is unloaded first — given the same prompt with the same seed,
+          and unloaded when the next one's turn comes. Expect it to take as long as the
           loads do.
         </p>
         <textarea class="textarea textarea-bordered h-20 w-full font-mono text-sm"

@@ -16,16 +16,17 @@
 //! * [`auth`] / [`users`] / [`accounts`] / [`oidc`] — who a request is from,
 //!   and the seam the four modes fit into.
 //! * [`engine`] — which backends this build can load.
-//! * [`scheduler`] — the one owner of the engine thread, and the queue in
-//!   front of it.
-//! * [`models`] — what is on this machine and what the engine holds.
+//! * [`scheduler`] — the owner of the engines, one per model in memory, and
+//!   the queue in front of them.
+//! * [`memory`] — what the models in memory take, and whether one more fits.
+//! * [`models`] — what is on this machine and what the engines hold.
 //! * [`chat`] / [`conversations`] — conversations, stored and served.
 //! * [`openai`] — `/v1`, shaped by somebody else's documentation.
 //! * [`jobs`] — work that outlives the request that asked for it, and the
 //!   two kinds that are not comparisons: downloads and training runs.
 //! * [`training`] / [`datasets`] — starting runs, and the text they read.
 //! * [`compare`] / [`evals`] / [`bench`] — running the same thing against
-//!   several models, which with one model at a time is a sequence.
+//!   several models, one at a time.
 //! * [`playground`] — the model without the conversation around it.
 //! * [`metrics`] / [`watching`] / [`machine`] / [`monitoring`] — what the
 //!   server has been doing, in memory and in the database.
@@ -50,6 +51,7 @@ mod engine;
 mod evals;
 mod jobs;
 mod machine;
+mod memory;
 mod metrics;
 mod models;
 mod monitoring;
@@ -201,14 +203,16 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
     let first_run =
         matches!(cfg.auth.mode, config::Mode::Local | config::Mode::Basic) && accounts == 0;
 
+    let budget = memory::Budget::of_machine(cfg.server.memory_gb, cfg.server.context);
     let state = auth::State {
         auth: auth::provider(cfg.auth.mode, &cfg.auth.oidc)?.into(),
-        engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader())),
+        engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader, budget)),
         jobs: std::sync::Arc::clone(&job_runner),
         metrics: std::sync::Arc::clone(&metrics),
         setup: std::sync::Arc::clone(&setup),
         oidc: std::sync::Arc::new((cfg.auth.oidc.clone(), oidc::Flows::default())),
         started: std::time::Instant::now(),
+        load_on_request: cfg.server.load_on_request,
         db,
     };
 
@@ -282,6 +286,15 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
     println!(
         "  backends   {}",
         engine::available().iter().map(|c| c.id.clone()).collect::<Vec<_>>().join(", ")
+    );
+    println!(
+        "  memory     {:.1} GB for models, {} tokens of context charged to each{}",
+        budget.total as f64 / 1e9,
+        budget.context,
+        match cfg.server.load_on_request {
+            true => ", loaded on request when they fit",
+            false => "",
+        }
     );
     if let Some(repo) = &bring_back {
         println!("  autoload   {repo}, in the background");

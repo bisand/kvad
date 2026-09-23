@@ -311,14 +311,16 @@ async fn the_admin_extractor_takes_administrators_and_nobody_else() {
     let state = |name: &'static str| State {
         db: db.clone(),
         auth: std::sync::Arc::new(As(name)),
-        engine: std::sync::Arc::new(crate::scheduler::Scheduler::spawn(Box::new(|_, _, _, _| {
-            Err("no backend in tests".into())
-        }))),
+        engine: std::sync::Arc::new(crate::scheduler::Scheduler::spawn(
+            || Box::new(|_, _, _, _| Err("no backend in tests".into())),
+            crate::memory::Budget { total: 0, context: 1 },
+        )),
         jobs: std::sync::Arc::new(crate::jobs::Jobs::new(db.clone())),
         metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         setup: std::sync::Arc::new(Setup::default()),
         oidc: std::sync::Arc::new(Default::default()),
         started: std::time::Instant::now(),
+        load_on_request: false,
     };
 
     // Ada is an administrator...
@@ -346,14 +348,16 @@ async fn a_cross_site_post_is_refused_before_the_cookie_is_even_looked_up() {
     let state = State {
         db: db.clone(),
         auth: std::sync::Arc::new(Local),
-        engine: std::sync::Arc::new(crate::scheduler::Scheduler::spawn(Box::new(|_, _, _, _| {
-            Err("no backend in tests".into())
-        }))),
+        engine: std::sync::Arc::new(crate::scheduler::Scheduler::spawn(
+            || Box::new(|_, _, _, _| Err("no backend in tests".into())),
+            crate::memory::Budget { total: 0, context: 1 },
+        )),
         jobs: std::sync::Arc::new(crate::jobs::Jobs::new(db.clone())),
         metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
         setup: std::sync::Arc::new(Setup::default()),
         oidc: std::sync::Arc::new(Default::default()),
         started: std::time::Instant::now(),
+        load_on_request: false,
     };
     let cookie = format!("kvad_session={token}");
 

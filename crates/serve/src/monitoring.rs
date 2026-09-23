@@ -23,12 +23,15 @@ pub fn routes() -> Router<State> {
 pub struct Overview {
     uptime_secs: u64,
     loaded: Option<crate::scheduler::Loaded>,
+    /// Every model in memory, and what each was charged.
+    residents: Vec<crate::scheduler::Resident>,
+    memory: crate::models::Budgeted,
     queue_depth: usize,
     /// Resident memory, or null on a platform we cannot ask. Null is not
     /// zero, and a dashboard should not draw it as though it were.
     resident_bytes: Option<u64>,
-    /// What the loaded model's KV cache would cost at its full context, and
-    /// what the last generation actually left in it.
+    /// What the most recently used model's KV cache would cost at its full
+    /// context, and what its last generation actually left in it.
     kv: Option<Kv>,
     disk: Disk,
     /// Jobs running right now, so the dashboard can say the machine is busy
@@ -55,7 +58,8 @@ pub struct Kv {
 }
 
 pub async fn overview(_: Admin, St(state): St<State>) -> Result<Json<Overview>, Fail> {
-    let loaded = state.engine.loaded();
+    let current = state.engine.current();
+    let loaded = current.as_ref().map(|r| r.model.clone());
     let generations: Vec<Generation> = state.metrics.generations();
     let recent = state.metrics.recent(2000);
 
@@ -65,8 +69,8 @@ pub async fn overview(_: Admin, St(state): St<State>) -> Result<Json<Overview>, 
     })
     .await?;
 
-    let kv = loaded.as_ref().map(|l| {
-        let cached = state.engine.last_cached();
+    let kv = current.as_ref().map(|r| {
+        let (l, cached) = (&r.model, r.cached_tokens);
         Kv {
             bytes_per_token: l.kv_bytes_per_token,
             max_bytes: l.kv_bytes_per_token * l.n_ctx,
@@ -79,6 +83,8 @@ pub async fn overview(_: Admin, St(state): St<State>) -> Result<Json<Overview>, 
     Ok(Json(Overview {
         uptime_secs: state.started.elapsed().as_secs(),
         queue_depth: state.engine.depth(),
+        residents: state.engine.residents(),
+        memory: crate::models::Budgeted::of(&state.engine),
         resident_bytes: machine::resident_bytes(),
         kv,
         disk,

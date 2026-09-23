@@ -66,6 +66,23 @@ pub struct Server {
     /// It is here rather than in the database because it is read once, at
     /// startup, before there is a request to change it.
     pub autoload: bool,
+    /// Load a model that a request names and that is not in memory, if it
+    /// fits beside what is.
+    ///
+    /// Nothing is ever unloaded to make room: a model that does not fit is
+    /// refused, with the models holding the memory named. On by default,
+    /// because a client like OpenCode picks its model per request and would
+    /// otherwise need somebody to load each one first. Off for a machine
+    /// where loading should only ever be something a person did — a
+    /// benchmark run is one.
+    pub load_on_request: bool,
+    /// Gigabytes the models in memory may take between them. Unset, this
+    /// machine's usable memory; see `kvad::machine::usable_memory`.
+    pub memory_gb: Option<f64>,
+    /// Tokens of KV cache each model in memory is charged for, when deciding
+    /// whether another fits. See `memory::DEFAULT_CONTEXT` for the default
+    /// and why.
+    pub context: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -188,7 +205,13 @@ pub enum Mode {
 
 impl Default for Server {
     fn default() -> Self {
-        Server { bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)), autoload: true }
+        Server {
+            bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
+            autoload: true,
+            load_on_request: true,
+            memory_gb: None,
+            context: None,
+        }
     }
 }
 

@@ -60,7 +60,10 @@
     const text = draft;
     draft = "";
     pinned = true;
-    chat.send(text, models.loaded?.repo, groundIn);
+    // By id, `repo@backend`, so that a model in memory on two backends is
+    // answered by the one that was picked rather than by whichever was used
+    // last.
+    chat.send(text, models.loaded?.id ?? models.loaded?.repo, groundIn);
   }
 
   function onKeydown(event) {
@@ -118,7 +121,20 @@
     <!-- Which model will answer, and the controls for how. -->
     <header class="border-base-300 flex items-center gap-2 border-b px-4 py-2">
       <div class="min-w-0 grow">
-        {#if models.loaded}
+        {#if models.residents.length > 1}
+          <select
+            class="select select-sm select-ghost -ml-3 max-w-full font-medium"
+            aria-label="Which model answers"
+            bind:value={() => models.loaded?.id, (id) => (models.picked = id)}
+          >
+            {#each models.residents as r (r.id)}
+              <option value={r.id}>{r.repo} · {r.backend}</option>
+            {/each}
+          </select>
+          {#if !models.loaded?.instruct}
+            <p class="text-xs opacity-60">base model — it continues text rather than answering</p>
+          {/if}
+        {:else if models.loaded}
           <p class="truncate text-sm font-medium">{models.loaded.repo}</p>
           <p class="text-xs opacity-60">
             {models.loaded.backend}

@@ -317,12 +317,33 @@ pub struct Listing {
     /// The model `kvad run` would pick with no `--model`. Shared with the CLI
     /// and the TUI, so setting it here sets it there.
     active: Option<String>,
+    /// The resident used most recently, which is what a page that names no
+    /// model talks to. Kept beside `residents` for the pages that show one.
     loaded: Option<crate::scheduler::Loaded>,
+    /// Every model in memory, in the order they were loaded.
+    residents: Vec<crate::scheduler::Resident>,
+    memory: Budgeted,
     queue_depth: usize,
     /// Every backend this build can actually load; see `engine::available`.
     backends: Vec<crate::engine::Choice>,
     /// Which of them a load uses when the request does not say.
     backend: String,
+}
+
+/// What the models in memory may take, and what they have left of it.
+#[derive(serde::Serialize)]
+pub struct Budgeted {
+    total: u64,
+    left: u64,
+    /// Tokens of KV cache each resident is charged for.
+    context: usize,
+}
+
+impl Budgeted {
+    pub fn of(engine: &crate::scheduler::Scheduler) -> Budgeted {
+        let budget = engine.budget();
+        Budgeted { total: budget.total, left: engine.left(), context: budget.context }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -426,6 +447,8 @@ pub async fn list(_: Identity, St(state): St<State>) -> Result<Json<Listing>, Fa
             .collect(),
         active,
         loaded: state.engine.loaded(),
+        residents: state.engine.residents(),
+        memory: Budgeted::of(&state.engine),
         queue_depth: state.engine.depth(),
         backends: crate::engine::available(),
         backend,
@@ -601,7 +624,12 @@ pub async fn load(
         }
         let outcome = match finished.await {
             Ok(Ok(model)) => sse("loaded", &model),
-            Ok(Err(why)) => sse("error", &json!({ "error": why })),
+            Ok(Err(why)) => sse("error", &json!({
+                "error": why.to_string(),
+                // Refused for want of memory, rather than tried and failed:
+                // the page can say "unload something" instead of "retry".
+                "full": matches!(why, crate::scheduler::LoadError::Full(_)),
+            })),
             Err(e) => sse("error", &json!({ "error": format!("the load was interrupted: {e}") })),
         };
         let _ = events.send(outcome).await;
@@ -610,9 +638,35 @@ pub async fn load(
     Ok(stream(rx))
 }
 
-pub async fn unload(_: Admin, St(state): St<State>) -> Result<Json<serde_json::Value>, Fail> {
-    let was = state.engine.unload().await.map_err(Fail::internal)?;
-    Ok(Json(json!({ "unloaded": was })))
+#[derive(serde::Deserialize, Default)]
+pub struct UnloadRequest {
+    /// The resident to unload, as `repo@backend` or a bare repo. Absent,
+    /// every resident goes.
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// Unload one resident, or all of them.
+///
+/// The body is optional, so that the old call with none still means what it
+/// did when there was only ever one model: give the memory back.
+pub async fn unload(
+    _: Admin,
+    St(state): St<State>,
+    body: Option<Json<UnloadRequest>>,
+) -> Result<Json<serde_json::Value>, Fail> {
+    let which = match body.and_then(|Json(b)| b.id) {
+        Some(id) => Some(
+            state
+                .engine
+                .find(&id)
+                .map(|r| r.key)
+                .ok_or_else(|| Fail::missing(format!("{id} is not loaded")))?,
+        ),
+        None => None,
+    };
+    let gone = state.engine.unload(which).await.map_err(Fail::internal)?;
+    Ok(Json(json!({ "unloaded": gone })))
 }
 
 #[derive(serde::Deserialize)]
@@ -686,8 +740,8 @@ pub async fn remove(
         return Err(Fail::bad("no model was named"));
     }
     // Refusing to delete what is loaded, rather than deleting it and leaving
-    // the engine holding memory-mapped weights whose file is gone.
-    if state.engine.loaded().is_some_and(|l| l.repo == id) {
+    // an engine holding memory-mapped weights whose file is gone.
+    if state.engine.residents().iter().any(|r| r.key.repo == id) {
         return Err(Fail::bad(format!("{id} is loaded; unload it first")));
     }
 

@@ -11,12 +11,22 @@
 //!
 //! # The model field
 //!
-//! OpenAI's `model` selects from many that are all warm. Here there is one
-//! model in memory at a time, so naming a different one means loading it,
-//! which takes tens of seconds and evicts what was there. That is what this
-//! does, because a client that asks for a model and gets somebody else's
-//! answer is worse than a client that waits. Omitting `model` uses whatever
-//! is loaded.
+//! OpenAI's `model` selects from many that are all warm. Here several can be
+//! in memory at once — see [`crate::scheduler`] — and `model` names one of
+//! them, as a repo id or as `repo@backend` for a particular one.
+//!
+//! A model on this disk that is not in memory is loaded, if it fits beside
+//! what is, and the request waits the tens of seconds that takes. Nothing is
+//! ever unloaded to make room. A model that does not fit is refused with a
+//! 409 that names the models holding the memory, because a client that
+//! asks for a model and gets somebody else's answer is worse than a client
+//! that is told no — and a client whose model vanished because another
+//! request named a different one is worse than both. A model that is not on
+//! this disk is a 404, and is not downloaded on the way: pulling several
+//! gigabytes is not something a completion should start.
+//!
+//! Omitting `model` is allowed when exactly one model is in memory. With
+//! several, the server would be guessing.
 //!
 //! # Tools
 //!
@@ -37,7 +47,7 @@
 use crate::api::{blocking, Fail};
 use crate::models::{sse, stream};
 use crate::auth::{Identity, State};
-use crate::scheduler::Piece;
+use crate::scheduler::{LoadError, Piece, Resident};
 use axum::extract::State as St;
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
@@ -47,7 +57,14 @@ use kvad::runtime::{Chosen, Stats};
 use kvad::service::Sampling;
 use serde_json::json;
 
-pub async fn models(_: Identity) -> Result<Json<serde_json::Value>, Fail> {
+/// Every model on this disk that could be asked for, with the ones in memory
+/// marked.
+///
+/// Not only the ones in memory, because naming one that is not loads it when
+/// it fits; see the module docs. A model in memory is listed a second time
+/// under `repo@backend`, which is how a client reaches that one when the same
+/// weights are in memory twice.
+pub async fn models(_: Identity, St(state): St<State>) -> Result<Json<serde_json::Value>, Fail> {
     let found = blocking(move || {
         let listed = |trained: bool| {
             move |m: kvad::hub::LocalModel| (m.id.clone(), trained, takes_tools(&m))
@@ -67,28 +84,36 @@ pub async fn models(_: Identity) -> Result<Json<serde_json::Value>, Fail> {
     })
     .await?;
 
-    Ok(Json(json!({
-        "object": "list",
-        "data": found
-            .into_iter()
-            .map(|(id, trained, tools)| json!({
-                "id": id,
-                "object": "model",
-                // The field is required and means "when was this published".
-                // Nothing here was published, so it is zero rather than a
-                // number invented to look like a date.
-                "created": 0,
-                "owned_by": if trained { "kvad" } else { "huggingface" },
-                // OpenAI's model object says nothing about what a model can
-                // do, because there the answer is in the documentation. Here
-                // it is a property of the checkpoint on this disk, and a
-                // client picking a model for an agent needs it before it
-                // picks — so it goes in the extension field, beside the one
-                // on a completion.
-                "kvad": { "tools": tools },
-            }))
-            .collect::<Vec<_>>(),
-    })))
+    let residents = state.engine.residents();
+    let resident = |id: &str| residents.iter().any(|r| r.key.repo.eq_ignore_ascii_case(id));
+    let mut data: Vec<serde_json::Value> = found
+        .into_iter()
+        .map(|(id, trained, tools)| json!({
+            "id": id,
+            "object": "model",
+            // The field is required and means "when was this published".
+            // Nothing here was published, so it is zero rather than a number
+            // invented to look like a date.
+            "created": 0,
+            "owned_by": if trained { "kvad" } else { "huggingface" },
+            // OpenAI's model object says nothing about what a model can do,
+            // because there the answer is in the documentation. Here it is a
+            // property of the checkpoint on this disk, and a client picking a
+            // model for an agent needs it before it picks — so it goes in the
+            // extension field, beside the one on a completion. Whether it is
+            // in memory goes there too: naming one that is not costs a load.
+            "kvad": { "tools": tools, "resident": resident(&id) },
+        }))
+        .collect();
+    data.extend(residents.iter().map(|r| json!({
+        "id": r.id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "kvad",
+        "kvad": { "tools": r.model.tools, "resident": true, "backend": r.model.backend },
+    })));
+
+    Ok(Json(json!({ "object": "list", "data": data })))
 }
 
 /// Whether a model on disk could be offered tools, read from its template.
@@ -377,35 +402,8 @@ pub async fn completions(
     let tools = body.tools()?;
 
 
-    let loaded = match (&body.model, state.engine.loaded()) {
-        (None, Some(l)) => l,
-        (None, None) => {
-            return Err(Fail::bad("no model is loaded, and the request did not name one"))
-        }
-        (Some(wanted), Some(l)) if &l.repo == wanted => l,
-        (Some(wanted), _) => {
-            // Naming a model that is not loaded loads it. The queue makes
-            // that safe — the load goes in front of this request's own turn —
-            // but it is slow, and a client that did not mean it should be
-            // told why it waited.
-            let db = state.db.clone();
-            // The same answer the Models page would give, from the same
-            // function: a load started from here and a load started from
-            // there must not disagree about what "the default backend"
-            // means.
-            let named = wanted.clone();
-            let backend =
-                blocking(move || Ok(crate::models::default_backend(&db, Some(&named)))).await?;
-            let backend = crate::engine::parse(&backend)
-                .unwrap_or(kvad::service::Backend::Cpu(kvad::quant::Precision::Q8));
-            let (progress, _ignored) = tokio::sync::mpsc::channel(1);
-            state
-                .engine
-                .load(wanted.clone(), backend, progress)
-                .await
-                .map_err(|why| Fail::bad(format!("could not load {wanted}: {why}")))?
-        }
-    };
+    let resident = resident_for(&state, body.model.as_deref()).await?;
+    let loaded = resident.model.clone();
 
     // Asked for a call from a model that cannot make one. The template is
     // where tools live, so a model whose template never mentions them would
@@ -456,7 +454,7 @@ pub async fn completions(
     }
 
     let offered = !tools.is_empty();
-    let pieces = state.engine.chat(turns, tools, sampling).map_err(Fail::internal)?;
+    let pieces = state.engine.chat(&resident.key, turns, tools, sampling).map_err(Fail::internal)?;
     let id = format!("chatcmpl-{}", now_millis());
     let metrics = state.metrics.clone();
     // Timed from here rather than by the middleware: for a streamed reply the
@@ -470,6 +468,66 @@ pub async fn completions(
     };
     response.extensions_mut().insert(crate::watching::RecordedItself);
     Ok(response)
+}
+
+/// The model in memory a request is for, loading it first if it may be.
+async fn resident_for(state: &State, model: Option<&str>) -> Result<Resident, Fail> {
+    let Some(name) = model else {
+        if let Some(only) = state.engine.only() {
+            return Ok(only);
+        }
+        let all = state.engine.residents();
+        return match all.len() {
+            0 => Err(Fail::bad("no model is loaded, and the request did not name one")),
+            _ => Err(Fail::bad(format!(
+                "{} models are loaded and the request did not name one: {}",
+                all.len(),
+                all.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ")
+            ))),
+        };
+    };
+    if let Some(r) = state.engine.find(name) {
+        return Ok(r);
+    }
+
+    let (repo, backend) = crate::scheduler::parse_id(name);
+    let repo = repo.to_string();
+    let db = state.db.clone();
+    let (on_disk, default) = {
+        let repo = repo.clone();
+        blocking(move || {
+            let here = kvad::hub::find_local(&repo)
+                .or_else(|| kvad::hub::find_trained(&repo))
+                .is_some_and(|m| m.complete);
+            // The same answer the Models page would give, from the same
+            // function: a load started from here and a load started from
+            // there must not disagree about what "the default backend"
+            // means.
+            Ok((here, crate::models::default_backend(&db, Some(&repo))))
+        })
+        .await?
+    };
+    if !on_disk {
+        return Err(Fail::missing(format!("{name} is not a model on this machine")));
+    }
+    if !state.load_on_request {
+        return Err(Fail::conflict(format!(
+            "{name} is not loaded, and this server loads models only when somebody asks it to"
+        )));
+    }
+    let backend = backend
+        .or_else(|| crate::engine::parse(&default))
+        .unwrap_or(kvad::service::Backend::Cpu(kvad::quant::Precision::Q8));
+    let (progress, _ignored) = tokio::sync::mpsc::channel(1);
+    match state.engine.load(repo.clone(), backend, progress).await {
+        Ok(_) => {}
+        Err(LoadError::Full(why)) => return Err(Fail::conflict(why)),
+        Err(LoadError::Failed(why)) => return Err(Fail::bad(format!("could not load {name}: {why}"))),
+    }
+    state
+        .engine
+        .find(&crate::scheduler::id_of(&repo, backend))
+        .ok_or_else(|| Fail::internal(format!("{name} loaded and then was not there")))
 }
 
 /// Where a completion's row is filed. The route pattern, matching what the
@@ -493,9 +551,10 @@ fn measured(stats: &Stats) -> crate::metrics::Generation {
 
 /// Stop whatever the engine is generating.
 ///
-/// A `DELETE` with no body, because there is one generation to cancel and the
-/// request that started it is the one holding the stream. When several can
-/// run at once this grows an id.
+/// A `DELETE` with no body, because there is one generation running at a
+/// time across every model in memory, and the request that started it is
+/// the one holding the stream. When several can run at once this grows an
+/// id.
 pub async fn cancel(_: Identity, St(state): St<State>) -> Json<serde_json::Value> {
     state.engine.cancel();
     Json(json!({ "cancelled": true }))

@@ -77,9 +77,9 @@
       <h2 class="text-sm font-medium opacity-60">Run against</h2>
       <VariantPicker bind:value={variants} />
       <p class="text-xs opacity-60">
-        One model at a time means one variant at a time: each is loaded, asked
-        everything, and put away before the next. The same model at two precisions is
-        the comparison this page is for.
+        One variant at a time, alone: anything else in memory is unloaded first, and
+        each variant is loaded, asked everything, and put away before the next. The same
+        model at two precisions is the comparison this page is for.
       </p>
     </section>
   {/if}

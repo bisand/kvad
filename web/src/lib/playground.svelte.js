@@ -7,6 +7,7 @@
 
 import { api, sse } from "./api.js";
 import { toasts } from "./toasts.svelte.js";
+import { models } from "./models.svelte.js";
 
 /** The sampler, as the playground presents it. */
 const DEFAULTS = {
@@ -64,6 +65,7 @@ class Playground {
           // chatting and the wrong one for experimenting.
           seed: s.fixSeed ? s.seed : null,
           explain: s.explain,
+          model: models.loaded?.id ?? null,
         },
         {
           token: (data) => {
@@ -106,7 +108,7 @@ class Playground {
       this.split = await api("/api/playground/tokenize", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, model: models.loaded?.id ?? null }),
       });
       this.error = null;
     } catch (e) {

@@ -201,25 +201,33 @@
 {/snippet}
 
 <div class="flex flex-col gap-6">
-  <!-- What the engine is holding, and the one control that changes it. -->
+  <!-- What is in memory, what it costs, and the controls that change it. -->
   <section class="card bg-base-100 border-base-300 border">
     <div class="card-body gap-4 p-4 sm:p-6">
       <div class="flex flex-wrap items-start justify-between gap-4">
-        <div class="min-w-0">
-          <h2 class="text-sm font-medium opacity-60">Loaded</h2>
-          {#if models.loaded}
-            <p class="mt-1 truncate text-lg font-medium">{models.loaded.repo}</p>
-            <p class="mt-1 text-xs opacity-70">{models.loaded.summary}</p>
+        <div class="min-w-0 grow">
+          <h2 class="text-sm font-medium opacity-60">In memory</h2>
+          {#if models.memory}
+            {@const m = models.memory}
+            <div class="mt-2 max-w-md">
+              <progress
+                class="progress"
+                class:progress-warning={m.left < m.total * 0.15}
+                value={m.total - m.left}
+                max={m.total}
+              ></progress>
+              <p class="text-xs opacity-70">
+                {humanBytes(m.total - m.left)} of {humanBytes(m.total)} taken ·
+                {humanBytes(m.left)} left · each charged for {m.context.toLocaleString()} tokens of
+                context
+              </p>
+            </div>
+          {/if}
+          {#if models.residents.length === 0}
+            <p class="mt-2 text-lg opacity-60">nothing</p>
             <p class="mt-1 text-xs opacity-70">
-              {(models.loaded.params / 1e6).toFixed(1)}M parameters ·
-              weights {humanBytes(models.loaded.weight_bytes)} ·
-              {models.loaded.backend} ·
-              {models.loaded.instruct ? "instruction-tuned" : "base model (completion only)"}
-            </p>
-          {:else}
-            <p class="mt-1 text-lg opacity-60">nothing</p>
-            <p class="mt-1 text-xs opacity-70">
-              The engine holds one model at a time. Load one below to chat with it.
+              Load a model below to chat with it. Several can be in memory at once, as long as
+              they fit; nothing is unloaded to make room for another.
             </p>
           {/if}
         </div>
@@ -235,13 +243,48 @@
               <option value={choice.id}>{choice.label}</option>
             {/each}
           </select>
-          {#if models.loaded}
+          {#if models.residents.length > 1}
             <button class="btn btn-sm" onclick={() => models.unload()} disabled={!!models.busy}>
-              Unload
+              Unload all
             </button>
           {/if}
         </div>
       </div>
+
+      {#if models.residents.length > 0}
+        <ul class="flex flex-col gap-2">
+          {#each models.residents as r (r.id)}
+            <li class="bg-base-200/40 rounded-box flex flex-wrap items-center gap-x-4 gap-y-1 p-3">
+              <div class="min-w-0 grow">
+                <p class="truncate font-medium">
+                  {r.repo}
+                  <span class="badge badge-sm ml-1">{r.backend}</span>
+                  {#if r.streams}
+                    <span class="badge badge-sm badge-warning badge-soft">streams from disk</span>
+                  {/if}
+                </p>
+                <p class="mt-1 text-xs opacity-70">
+                  {r.summary} · {(r.params / 1e6).toFixed(1)}M parameters ·
+                  {r.instruct ? "instruction-tuned" : "base model (completion only)"}
+                </p>
+                <p class="mt-1 text-xs opacity-70">
+                  charged {humanBytes(r.commit)} · weights {humanBytes(r.weight_bytes)} ·
+                  {r.cached_tokens.toLocaleString()} tokens cached · clients name it
+                  <code>{r.id}</code>
+                </p>
+              </div>
+              <button
+                class="btn btn-sm"
+                class:hidden={!may}
+                onclick={() => models.unload(r.id)}
+                disabled={!!models.busy}
+              >
+                Unload
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
 
       {#if models.busy}
         <div>
@@ -296,8 +339,8 @@
                 {#if models.listing.active === m.id}
                   <span class="badge badge-sm badge-soft">default</span>
                 {/if}
-                {#if models.loaded?.repo === m.id}
-                  <span class="badge badge-sm badge-success badge-soft">loaded</span>
+                {#if models.resident(m.id)}
+                  <span class="badge badge-sm badge-success badge-soft">in memory</span>
                 {/if}
                 {#if m.streams}
                   <div class="tooltip" data-tip={diskTip(m)}>
@@ -317,7 +360,9 @@
               <div class="relative z-1 flex gap-1" class:hidden={!may}>
                 <button
                   class="btn btn-sm"
-                  disabled={!m.runnable || !!models.busy || models.loaded?.repo === m.id}
+                  disabled={!m.runnable ||
+                    !!models.busy ||
+                    models.residents.some((r) => r.repo === m.id && r.id.endsWith(`@${chosen}`))}
                   onclick={notToggle(() => models.load(m.id, chosen))}
                 >
                   Load
@@ -371,8 +416,8 @@
   {#if !may}
     <div role="alert" class="alert alert-soft text-sm">
       <span>
-        Loading, pulling and deleting models are an administrator's to do. What is
-        loaded is what you can chat with.
+        Loading, pulling and deleting models are an administrator's to do. What is in
+        memory is what you can chat with.
       </span>
     </div>
   {/if}

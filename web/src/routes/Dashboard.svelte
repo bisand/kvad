@@ -54,6 +54,12 @@
               {m.loaded.backend} · {(m.loaded.params / 1e6).toFixed(1)}M parameters ·
               weights {humanBytes(m.loaded.weight_bytes)}
             </p>
+            {#if m.residents?.length > 1}
+              <p class="text-xs opacity-70">
+                used last, of {m.residents.length} in memory ·
+                {humanBytes(m.memory.total - m.memory.left)} of {humanBytes(m.memory.total)}
+              </p>
+            {/if}
           {:else}
             <p class="text-lg opacity-60">nothing</p>
             <p class="text-xs opacity-70">
@@ -97,7 +103,7 @@
               : `${m.queue_depth} waiting for the engine`}
           </p>
           <p class="mt-1 text-xs opacity-60">
-            One model, one generation at a time. Requests queue in the order they arrive.
+            One generation at a time, whichever model it is for. Requests queue in the order they arrive.
           </p>
         </div>
       </div>

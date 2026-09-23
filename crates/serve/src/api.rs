@@ -87,6 +87,11 @@ impl Fail {
     pub fn missing(what: impl Into<String>) -> Self {
         Fail(StatusCode::NOT_FOUND, what.into())
     }
+    /// Refused because of what the server is holding, not because of what
+    /// was asked: a model that would fit if something else were unloaded.
+    pub fn conflict(why: impl Into<String>) -> Self {
+        Fail(StatusCode::CONFLICT, why.into())
+    }
     pub fn internal(why: impl Into<String>) -> Self {
         Fail(StatusCode::INTERNAL_SERVER_ERROR, why.into())
     }
@@ -133,8 +138,10 @@ pub struct Health {
     /// Whether a built UI is in this binary. A person who sees the stub page
     /// and thinks the server is broken can be pointed here.
     ui_embedded: bool,
-    /// What the engine is holding, and how much is waiting for it.
+    /// The model in memory used most recently, every model in memory, and
+    /// how much is waiting for them.
     loaded: Option<crate::scheduler::Loaded>,
+    residents: Vec<crate::scheduler::Resident>,
     queue_depth: usize,
     /// Which authentication mode is in force. The UI shows or hides the
     /// sign-out button by it.
@@ -154,6 +161,7 @@ async fn health(who: Identity, St(state): St<State>) -> Json<Health> {
         schema: state.db.version().unwrap_or(0),
         ui_embedded: crate::assets::is_embedded(),
         loaded: state.engine.loaded(),
+        residents: state.engine.residents(),
         queue_depth: state.engine.depth(),
         auth: state.auth.mode().to_string(),
         you: who,

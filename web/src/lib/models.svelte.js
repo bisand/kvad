@@ -1,4 +1,4 @@
-// What is on this machine, and what the engine is holding.
+// What is on this machine, and what the engines are holding.
 //
 // One store rather than each page fetching for itself: the Models page, the
 // Chat page's header and the navbar all want the same answer, and three
@@ -27,8 +27,37 @@ class Models {
     }
   }
 
+  /** Every model in memory, in the order they were loaded. */
+  get residents() {
+    return this.listing?.residents ?? [];
+  }
+
+  /** The budget the models in memory share: `{ total, left, context }`. */
+  get memory() {
+    return this.listing?.memory ?? null;
+  }
+
+  /**
+   * The id (`repo@backend`) of the model the Chat page talks to, when
+   * somebody picked one. Null means the server's own choice.
+   */
+  picked = $state(null);
+
+  /**
+   * The model a page that names none talks to: the one picked, while it is
+   * still in memory, or else the one the server used last.
+   */
   get loaded() {
-    return this.listing?.loaded ?? null;
+    const picked = this.residents.find((r) => r.id === this.picked);
+    if (picked) return picked;
+    const last = this.listing?.loaded;
+    if (!last) return null;
+    return this.residents.find((r) => r.repo === last.repo && r.backend === last.backend) ?? last;
+  }
+
+  /** Whether `repo` is in memory on any backend. */
+  resident(repo) {
+    return this.residents.some((r) => r.repo === repo);
   }
 
   /** Every model on this machine, downloaded and trained, in one list. */
@@ -135,10 +164,15 @@ class Models {
     return ok;
   }
 
-  async unload() {
+  /** Unload one model in memory by its id, or every one with none. */
+  async unload(id = null) {
     try {
-      const { unloaded } = await api("/api/models/unload", { method: "POST" });
-      toasts.info(unloaded ? `Unloaded ${unloaded}.` : "Nothing was loaded.");
+      const { unloaded } = await api("/api/models/unload", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+      toasts.info(unloaded.length ? `Unloaded ${unloaded.join(", ")}.` : "Nothing was loaded.");
     } catch (e) {
       toasts.error(e.message);
     }

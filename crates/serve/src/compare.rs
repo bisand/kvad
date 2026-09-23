@@ -1,9 +1,14 @@
 //! Running the same thing against several models, one after another.
 //!
 //! Evals and benchmarks ask different questions and share one awkward fact:
-//! the engine holds a single model, so "side by side" is a lie about the
-//! hardware. What actually happens is a sequence — load, measure, load the
-//! next — and everything in this file exists to make that sequence honest.
+//! "side by side" is a lie about the hardware. The server can hold several
+//! models at once, but a model measured beside another is measured on the
+//! memory they share — `engine::preferred` records a CPU model decoding at
+//! half speed because a GPU model beside it had evicted its weights. So a
+//! comparison runs each variant *alone*: whatever else is in memory is
+//! unloaded first, and what actually happens is a sequence — load, measure,
+//! load the next. Everything in this file exists to make that sequence
+//! honest.
 //!
 //! # Rounds, not runs
 //!
@@ -31,7 +36,7 @@
 //! ever see. See [`kvad::service::Cmd::Complete`].
 
 use crate::jobs::{Case, Jobs, Scored, Timing, Update};
-use crate::scheduler::{Piece, Scheduler};
+use crate::scheduler::{Key, Piece, Scheduler};
 use kvad::runtime::Stats;
 use kvad::service::{Backend, Sampling};
 use rusqlite::params;
@@ -91,22 +96,27 @@ pub fn resolve(variants: &[Variant]) -> Result<Vec<(Variant, Backend)>, String> 
     Ok(out)
 }
 
-/// Make `variant` the loaded model, unless it already is.
+/// Make `variant` the only model in memory, and say which resident it is.
 ///
-/// Reloading a model that is already there would cost a minute and change
-/// nothing, so the check is worth the branch — and it is what makes a suite
-/// of forty cases against one variant load once rather than forty times.
+/// Everything else is unloaded first, including models somebody loaded for
+/// other reasons; see the module docs for why a measurement has to be taken
+/// alone. Reloading a variant that is already there would cost a minute and
+/// change nothing, so the check is worth the branch — and it is what makes a
+/// suite of forty cases against one variant load once rather than forty
+/// times.
 async fn switch(
     engine: &Arc<Scheduler>,
     events: &broadcast::Sender<Update>,
     variant: &Variant,
     backend: Backend,
-) -> Result<(), String> {
-    let wanted = crate::engine::id_of(backend);
-    if let Some(loaded) = engine.loaded() {
-        if loaded.repo == variant.model && loaded.backend.replace(' ', "-") == wanted {
-            return Ok(());
-        }
+) -> Result<Key, String> {
+    let key = Key { repo: variant.model.clone(), backend };
+    for other in engine.residents().into_iter().filter(|r| r.key != key) {
+        let _ = events.send(Update::Status { message: format!("unloading {}", other.id) });
+        engine.unload(Some(other.key)).await?;
+    }
+    if engine.residents().iter().any(|r| r.key == key) {
+        return Ok(key);
     }
     let _ = events.send(Update::Status { message: format!("loading {}", variant.label()) });
     let (progress, mut updates) = tokio::sync::mpsc::channel(32);
@@ -120,17 +130,18 @@ async fn switch(
     };
     let outcome = engine.load(variant.model.clone(), backend, progress).await;
     forward.abort();
-    outcome.map(|_| ())
+    outcome.map(|_| key).map_err(String::from)
 }
 
 /// Generate once, from a cold cache, and return what was written and what it
 /// cost.
 async fn once(
     engine: &Arc<Scheduler>,
+    on: &Key,
     prompt: &str,
     sampling: Sampling,
 ) -> Result<(String, Stats), String> {
-    let mut pieces = engine.complete(prompt.to_string(), sampling, 0, true)?;
+    let mut pieces = engine.complete(on, prompt.to_string(), sampling, 0, true)?;
     let mut text = String::new();
     while let Some(piece) = pieces.recv().await {
         match piece {
@@ -201,10 +212,13 @@ pub fn suite(
         let mut failure: Option<String> = None;
 
         'variants: for (variant, backend) in &variants {
-            if let Err(why) = switch(&engine, &events, variant, *backend).await {
-                failure = Some(format!("{}: {why}", variant.label()));
-                break;
-            }
+            let on = match switch(&engine, &events, variant, *backend).await {
+                Ok(on) => on,
+                Err(why) => {
+                    failure = Some(format!("{}: {why}", variant.label()));
+                    break;
+                }
+            };
             let mut here = 0usize;
             for (idx, case) in cases.iter().enumerate() {
                 if cancel.load(Ordering::Relaxed) {
@@ -219,7 +233,7 @@ pub fn suite(
                     seed: Some(seed),
                     max_tokens,
                 };
-                let (got, stats) = match once(&engine, &case.prompt, sampling).await {
+                let (got, stats) = match once(&engine, &on, &case.prompt, sampling).await {
                     Ok(answer) => answer,
                     // A case that could not run at all is a failed case with
                     // the reason in it, not a failed run: the other thirty
@@ -317,10 +331,13 @@ pub fn score(
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            if let Err(why) = switch(&engine, &events, variant, *backend).await {
-                failure = Some(format!("{}: {why}", variant.label()));
-                break;
-            }
+            let on = match switch(&engine, &events, variant, *backend).await {
+                Ok(on) => on,
+                Err(why) => {
+                    failure = Some(format!("{}: {why}", variant.label()));
+                    break;
+                }
+            };
             let _ = events.send(Update::Status { message: format!("scoring on {}", variant.label()) });
 
             let (progress, mut ticks) = tokio::sync::mpsc::channel(32);
@@ -333,7 +350,7 @@ pub fn score(
                 })
             };
             let started = Instant::now();
-            let scored = engine.score(text.clone(), window, progress).await;
+            let scored = engine.score(&on, text.clone(), window, progress).await;
             relay.abort();
 
             match scored {
@@ -416,10 +433,13 @@ pub fn bench(
                 if cancel.load(Ordering::Relaxed) {
                     break 'rounds;
                 }
-                if let Err(why) = switch(&engine, &events, variant, *backend).await {
-                    failure = Some(format!("{}: {why}", variant.label()));
-                    break 'rounds;
-                }
+                let on = match switch(&engine, &events, variant, *backend).await {
+                    Ok(on) => on,
+                    Err(why) => {
+                        failure = Some(format!("{}: {why}", variant.label()));
+                        break 'rounds;
+                    }
+                };
                 let _ = events.send(Update::Status {
                     message: format!("round {round} · {}", variant.label()),
                 });
@@ -430,7 +450,7 @@ pub fn bench(
                     seed: Some(p.seed),
                     max_tokens: p.tokens,
                 };
-                let (text, stats) = match once(&engine, &p.prompt, sampling).await {
+                let (text, stats) = match once(&engine, &on, &p.prompt, sampling).await {
                     Ok(answer) => answer,
                     Err(why) => {
                         failure = Some(format!("{}: {why}", variant.label()));
@@ -541,7 +561,7 @@ pub fn machine_is_busy(jobs: &Jobs) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::Db;
     use std::path::PathBuf;
@@ -563,7 +583,16 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("kvad-test-config-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
+            // And the quantised weights of a model loaded at q8, which would
+            // otherwise be written beside the developer's real ones under a
+            // name nobody can tell apart from theirs.
+            std::env::set_var("KVAD_QUANT_CACHE", dir.join("quant"));
         });
+    }
+
+    /// A memory budget no test model comes near.
+    pub fn roomy() -> crate::memory::Budget {
+        crate::memory::Budget { total: 1 << 40, context: 1024 }
     }
 
     /// A real model, trained here, in about a second.
@@ -731,7 +760,7 @@ mod against_a_real_model {
     async fn a_suite_runs_against_a_model_trained_in_this_test() {
         let dir = tiny_model("suite");
         let jobs = Arc::new(Jobs::new(Db::in_memory().unwrap()));
-        let engine = Arc::new(Scheduler::spawn(kvad::service::cpu_loader()));
+        let engine = Arc::new(Scheduler::spawn(kvad::service::cpu_loader, roomy()));
         let variants = resolve(&[Variant {
             model: dir.to_string_lossy().into_owned(),
             backend: "cpu-f32".into(),
@@ -780,7 +809,7 @@ mod against_a_real_model {
     async fn a_benchmark_keeps_every_sample_and_summarises_from_them() {
         let dir = tiny_model("bench");
         let jobs = Arc::new(Jobs::new(Db::in_memory().unwrap()));
-        let engine = Arc::new(Scheduler::spawn(kvad::service::cpu_loader()));
+        let engine = Arc::new(Scheduler::spawn(kvad::service::cpu_loader, roomy()));
         let model = dir.to_string_lossy().into_owned();
         let variants =
             resolve(&[Variant { model: model.clone(), backend: "cpu-f32".into() }]).unwrap();
@@ -827,7 +856,7 @@ mod against_a_real_model {
     async fn perplexity_runs_as_a_job_and_tells_the_two_texts_apart() {
         let dir = tiny_model("score");
         let jobs = Arc::new(Jobs::new(Db::in_memory().unwrap()));
-        let engine = Arc::new(Scheduler::spawn(kvad::service::cpu_loader()));
+        let engine = Arc::new(Scheduler::spawn(kvad::service::cpu_loader, roomy()));
         let model = dir.to_string_lossy().into_owned();
         let variants =
             resolve(&[Variant { model, backend: "cpu-f32".into() }]).unwrap();

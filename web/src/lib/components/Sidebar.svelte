@@ -46,7 +46,7 @@
     </ul>
 
     <p class="px-4 py-3 text-xs opacity-50">
-      One model, one generation at a time. Continuous batching is not here yet.
+      Several models in memory, one generation at a time. Continuous batching is not here yet.
     </p>
   </nav>
 </div>

@@ -492,9 +492,25 @@ impl Audit {
     ///
     /// A name this list does not hold records nothing, which is right: there is
     /// no such tensor here to leave unread.
+    ///
+    /// An fp8 weight takes its scales with it. `X.weight_scale_inv` is never
+    /// asked for by name — [`Checkpoint::read`] fetches it while reading
+    /// `X.weight`, because the two are one number each — so without this the
+    /// audit would report every scale in the file as a weight nobody ran,
+    /// which is how the first fp8 model to load here was refused.
+    ///
+    /// Deliberately not on the [`derived`] list. A scale is not a buffer the
+    /// engine could rebuild for itself: it is read, and a scale left over
+    /// with no weight to belong to is exactly the gap this is for.
     pub fn saw(&self, name: &str) {
         if let Some(key) = self.resolve(name) {
-            self.seen.borrow_mut().insert(key.to_string());
+            let scale = format!("{key}_scale_inv");
+            let key = key.to_string();
+            let mut seen = self.seen.borrow_mut();
+            if let Some(scale) = self.have.get(scale.as_str()) {
+                seen.insert(scale.clone());
+            }
+            seen.insert(key);
         }
     }
 
@@ -895,6 +911,47 @@ mod fp8_tests {
         let err = ck.get("w.weight").unwrap_err().to_string();
         assert!(err.contains("weight_scale_inv"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The audit counts a scale as read when its weight is, and not before.
+    ///
+    /// This is the bug that refused the first fp8 model to reach the loader:
+    /// 196 `weight_scale_inv` tensors reported as weights nobody ran, on a
+    /// model that was running all of them.
+    #[test]
+    fn an_fp8_weight_takes_its_scales_with_it() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let audit = Audit::new(names(&[
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.up_proj.weight_scale_inv",
+            "model.layers.0.mlp.down_proj.weight",
+            "model.layers.0.mlp.down_proj.weight_scale_inv",
+        ]));
+
+        audit.saw("model.layers.0.mlp.up_proj.weight");
+        // One weight read, and its scale went with it. The other pair is
+        // untouched, so both of its names are still outstanding.
+        let left = audit.unread();
+        assert_eq!(
+            left,
+            names(&[
+                "model.layers.0.mlp.down_proj.weight",
+                "model.layers.0.mlp.down_proj.weight_scale_inv",
+            ]),
+            "{left:?}"
+        );
+
+        audit.saw("model.layers.0.mlp.down_proj.weight");
+        assert!(audit.unread().is_empty(), "{:?}", audit.unread());
+    }
+
+    /// A scale with no weight to belong to is still a gap, which is why this
+    /// is not on the `derived` list.
+    #[test]
+    fn an_orphaned_scale_is_still_reported() {
+        let audit = Audit::new(vec!["model.layers.0.mlp.up_proj.weight_scale_inv".to_string()]);
+        audit.saw("model.layers.0.mlp.up_proj.weight");
+        assert_eq!(audit.unread().len(), 1);
     }
 
     /// The reader's list and the blocker's list are the same list.

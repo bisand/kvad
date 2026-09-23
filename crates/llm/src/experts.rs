@@ -441,9 +441,10 @@ impl Cache {
 /// one request, the misses of a layer all at once, and evicts the expert
 /// wanted longest ago -- which is the policy [`crate::residency`] measured.
 ///
-/// Opt-in, with `KVAD_EXPERT_CACHE` naming the gigabytes to spend. Whether
-/// it should be the default for a model over memory is a measurement, and
-/// the flag is what makes it a one-flag A/B.
+/// On by default for a model whose weights are larger than the memory this
+/// machine gives them -- see [`default_budget`] -- and off otherwise.
+/// `KVAD_EXPERT_CACHE` overrides both ways: a number of gigabytes to spend,
+/// or `0` for none, which keeps it a one-flag A/B.
 pub struct Resident {
     store: ExpertStore,
     fetcher: Fetcher,
@@ -463,13 +464,29 @@ struct Slots {
 }
 
 impl Resident {
-    /// The cache `KVAD_EXPERT_CACHE` asks for, over the cache file at `path`.
+    /// The cache this model should read its experts through, over the cache
+    /// file at `path`: what `KVAD_EXPERT_CACHE` asks for, or else
+    /// [`default_budget`].
     ///
-    /// `None` when it is not asked for, when the file holds no mixture, or
-    /// when it cannot be set up -- the last said on stderr, since the mapping
-    /// still runs the model and nothing here is worth failing a load over.
+    /// `None` when none is wanted, when the file holds no mixture, or when it
+    /// cannot be set up -- the last said on stderr, since the mapping still
+    /// runs the model and nothing here is worth failing a load over.
     pub fn wanted(container: &crate::qcache::Container, path: &Path) -> Option<std::sync::Arc<Resident>> {
-        let gb: f64 = std::env::var("KVAD_EXPERT_CACHE").ok()?.trim().parse().ok()?;
+        let bytes = container.bytes() as u64;
+        let gb: f64 = match std::env::var("KVAD_EXPERT_CACHE") {
+            Ok(v) => v.trim().parse().ok()?,
+            Err(_) => {
+                let usable = crate::machine::usable_memory_cached()?;
+                let budget = default_budget(bytes, usable)?;
+                eprintln!(
+                    "expert cache: on, because {} of weights is over the {} this machine \
+                     gives them (KVAD_EXPERT_CACHE=0 turns it off)",
+                    crate::hub::human_bytes(bytes),
+                    crate::hub::human_bytes(usable)
+                );
+                budget as f64 / 1e9
+            }
+        };
         if gb <= 0.0 {
             return None;
         }
@@ -491,10 +508,10 @@ impl Resident {
         match Resident::new(store, capacity, threads) {
             Ok(r) => {
                 eprintln!(
-                    "expert cache: {} of {} experts ({:.1} GB), {} reader(s)",
+                    "expert cache: {} of {} experts ({}), {} reader(s)",
                     r.capacity(),
                     r.store.len(),
-                    (r.capacity() * slot) as f64 / 1e9,
+                    crate::hub::human_bytes((r.capacity() * slot) as u64),
                     r.fetcher.threads()
                 );
                 Some(r)
@@ -608,6 +625,22 @@ impl Resident {
     }
 }
 
+/// The bytes to spend on an expert cache by default: half of `usable`, for
+/// a model whose `bytes` of weights are more than `usable`. `None` for one
+/// that fits, where the mapping holds everything and a cache would only be
+/// a second copy.
+///
+/// Over memory, because that is where it was measured to pay: interleaved,
+/// on Qwen3-Next-80B at q4 (50 GB against 36 usable), the batched decode
+/// ran 11.2-12.3 tok/s with a 16 GB cache against 6.7-9.1 without, and on
+/// Qwen3-30B at q8 15.4 and 16.1 against 7.5-7.9. Half, because that is
+/// the size measured -- 16 GB of 36 -- and 26 GB was no better, while
+/// every byte of it is memory the page cache, the KV cache and everything
+/// else on the machine no longer has.
+pub fn default_budget(bytes: u64, usable: u64) -> Option<u64> {
+    (bytes > usable).then_some(usable / 2)
+}
+
 impl Drop for Resident {
     /// What the cache did, because the point of it is a number.
     fn drop(&mut self) {
@@ -627,6 +660,18 @@ impl Drop for Resident {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Over memory it is on, at half of what the machine gives weights;
+    /// otherwise off. The two models it was measured on, at the sizes they
+    /// are, against this machine's 36 GB.
+    #[test]
+    fn the_cache_is_on_by_default_only_for_a_model_over_memory() {
+        let usable = 36_000_000_000;
+        assert_eq!(default_budget(49_814_745_728, usable), Some(18_000_000_000), "Qwen3-Next-80B q4");
+        // Fits on paper, if only just -- and a cache would be a second copy.
+        assert_eq!(default_budget(34_352_646_288, usable), None, "Qwen3-30B q8");
+        assert_eq!(default_budget(usable, usable), None, "exactly full is not over");
+    }
 
     #[test]
     fn an_extent_widens_to_whole_pages() {

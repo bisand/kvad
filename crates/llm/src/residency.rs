@@ -206,11 +206,17 @@
 //! against 12.6 by median) and 1.12x on the 80B (11.2 against 10.0) --
 //! and about 1.1x over the batched path's own default, the `madvise` hint.
 //!
-//! The fetcher stays, off unless `KVAD_EXPERT_CACHE` asks for it. It gives
-//! the same answer to the bit (`tests/deepseek.rs` holds it to that), and
-//! it is the only thing here that bounds what a mixture reads per token
-//! when the page cache does not -- the case DeepSeek-V2-Lite at f32 showed
-//! and this machine has not yet been made to reproduce with it switched on.
+//! So the fetcher is on by default for a mixture whose weights are over
+//! the memory this machine gives them, at half that memory -- the size it
+//! was measured at -- and off for one that fits, where it would only be a
+//! second copy of what the mapping already holds. `KVAD_EXPERT_CACHE`
+//! overrides both ways; see `experts::default_budget`. It gives the same
+//! answer to the bit (`tests/deepseek.rs` holds it to that).
+//!
+//! What that rule leaves out: Qwen3-30B at q8 fits on paper, 32 GB against
+//! 36, so it gets no cache -- and thrashes here all the same, which is
+//! where the cache measured best. A fit with no room to spare is not a fit,
+//! and the rule does not yet know where the room runs out.
 //!
 //! # What a line means
 //!

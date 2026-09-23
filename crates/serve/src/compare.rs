@@ -37,6 +37,7 @@
 
 use crate::jobs::{Case, Jobs, Scored, Timing, Update};
 use crate::scheduler::{Key, Piece, Scheduler};
+use kvad::chat::Message;
 use kvad::runtime::Stats;
 use kvad::service::{Backend, Sampling};
 use rusqlite::params;
@@ -133,15 +134,15 @@ async fn switch(
     outcome.map(|_| key).map_err(String::from)
 }
 
-/// Generate once, from a cold cache, and return what was written and what it
+/// Read one generation to its end, and return what was written and what it
 /// cost.
+///
+/// The caller decides how the prompt reaches the model — a suite as a chat
+/// turn, a benchmark as raw text — and asks for a cold cache either way.
 async fn once(
-    engine: &Arc<Scheduler>,
-    on: &Key,
-    prompt: &str,
-    sampling: Sampling,
+    pieces: Result<tokio::sync::mpsc::Receiver<Piece>, String>,
 ) -> Result<(String, Stats), String> {
-    let mut pieces = engine.complete(on, prompt.to_string(), sampling, 0, true)?;
+    let mut pieces = pieces?;
     let mut text = String::new();
     while let Some(piece) = pieces.recv().await {
         match piece {
@@ -233,7 +234,15 @@ pub fn suite(
                     seed: Some(seed),
                     max_tokens,
                 };
-                let (got, stats) = match once(&engine, &on, &case.prompt, sampling).await {
+                // A case is a question put to the model, so it goes through
+                // the model's own template as a user turn. As raw text, an
+                // instruct model reads "Capital of France?" as a finished
+                // user message and its first token is end-of-turn: an empty
+                // answer to every case. A base model has no template and gets
+                // the text as it is.
+                let asked = vec![Message::user(case.prompt.clone())];
+                let pieces = engine.chat(&on, asked, Vec::new(), sampling, true);
+                let (got, stats) = match once(pieces).await {
                     Ok(answer) => answer,
                     // A case that could not run at all is a failed case with
                     // the reason in it, not a failed run: the other thirty
@@ -450,7 +459,11 @@ pub fn bench(
                     seed: Some(p.seed),
                     max_tokens: p.tokens,
                 };
-                let (text, stats) = match once(&engine, &on, &p.prompt, sampling).await {
+                // Raw text, not a chat turn: a benchmark measures the
+                // arithmetic, and a template would make the same prompt a
+                // different number of tokens on every model.
+                let pieces = engine.complete(&on, p.prompt.clone(), sampling, 0, true);
+                let (text, stats) = match once(pieces).await {
                     Ok(answer) => answer,
                     Err(why) => {
                         failure = Some(format!("{}: {why}", variant.label()));
@@ -602,15 +615,38 @@ pub(crate) mod tests {
     /// gigabytes. Everything below this line is the real engine: the real
     /// loader, the real scheduler, the real tokenizer.
     pub fn tiny_model(name: &str) -> PathBuf {
+        trained_on(name, &"the cat sat on the mat. ".repeat(40)).0
+    }
+
+    /// A tiny *instruct* model: trained on turns, with a template that writes
+    /// them and a character that ends them.
+    ///
+    /// Its whole world is `u:the cat?|a:on the mat.|` — a user turn, an
+    /// answer, and `|` as end-of-turn. So, like a real instruct model, it
+    /// answers when it is asked through its template, and when handed the
+    /// bare question it reads a finished user turn and ends it at once.
+    pub fn tiny_instruct_model(name: &str) -> PathBuf {
+        let (dir, tok) = trained_on(name, &"u:the cat?|a:on the mat.|".repeat(40));
+        let template = "{% for m in messages %}u:{{ m['content'] }}|{% endfor %}\
+                        {% if add_generation_prompt %}a:{% endif %}";
+        let config = serde_json::json!({ "chat_template": template });
+        std::fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
+        let end = tok.encode("|").unwrap()[0];
+        let generation = serde_json::json!({ "eos_token_id": end });
+        std::fs::write(dir.join("generation_config.json"), generation.to_string()).unwrap();
+        dir
+    }
+
+    /// Train a small GPT on `text` and save it where the loader can read it.
+    fn trained_on(name: &str, text: &str) -> (PathBuf, nervus::text::CharTokenizer) {
         somewhere_harmless();
         use nervus::model::{Gpt, GptConfig};
         use nervus::optim::AdamW;
         use nervus::rng::Rng;
         use nervus::text::{train_step, CharTokenizer};
 
-        let text = "the cat sat on the mat. ".repeat(40);
-        let tok = CharTokenizer::from_text(&text);
-        let tokens = tok.encode(&text).unwrap();
+        let tok = CharTokenizer::from_text(text);
+        let tokens = tok.encode(text).unwrap();
         let config =
             GptConfig { vocab: tok.vocab(), context: 32, d_model: 32, n_heads: 4, n_layers: 2 };
 
@@ -626,7 +662,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         nervus::checkpoint::save(&dir, &mut model).unwrap();
         tok.save(&dir).unwrap();
-        dir
+        (dir, tok)
     }
 
     /// Wait for a job to reach a terminal state, or give up.
@@ -799,6 +835,44 @@ mod against_a_real_model {
         // Greedy and seeded: the same case twice gives the same answer, which
         // is the only thing that makes a regression test evidence.
         assert_eq!(verdicts[0].got, verdicts[1].got);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A suite asks an instruct model its questions through the model's own
+    /// template.
+    ///
+    /// It used to send the bare prompt as raw text, and an instruct model
+    /// reads `the cat?` as a finished user turn: its first token was
+    /// end-of-turn, and every case of every suite came back empty. The model
+    /// above has no template, so nothing here noticed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suite_asks_an_instruct_model_through_its_template() {
+        let dir = tiny_instruct_model("instruct");
+        let jobs = Arc::new(Jobs::new(Db::in_memory().unwrap()));
+        let engine = Arc::new(Scheduler::spawn(kvad::service::cpu_loader, roomy()));
+        let variants = resolve(&[Variant {
+            model: dir.to_string_lossy().into_owned(),
+            backend: "cpu-f32".into(),
+        }])
+        .unwrap();
+
+        let cases = vec![Expectation {
+            prompt: "the cat?".into(),
+            expect: "on the mat.".into(),
+            how: Some("equals".into()),
+        }];
+        let job =
+            suite(&jobs, &engine, "turns".into(), cases, variants, 16, 1337, None).unwrap();
+        let job = finished(&jobs, job.id).await;
+        assert_eq!(job.state, "done", "{:?}", job.error);
+
+        let verdicts = jobs.cases(job.id).unwrap();
+        assert_eq!(verdicts.len(), 1);
+        let v = &verdicts[0];
+        assert!(v.passed, "got `{}` from {:?} tokens", v.got, v.generated_tokens);
+        // The answer and nothing after it: end-of-turn stopped it.
+        assert_eq!(v.generated_tokens, Some(11));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

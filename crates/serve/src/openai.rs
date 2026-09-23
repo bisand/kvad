@@ -454,7 +454,8 @@ pub async fn completions(
     }
 
     let offered = !tools.is_empty();
-    let pieces = state.engine.chat(&resident.key, turns, tools, sampling).map_err(Fail::internal)?;
+    let pieces =
+        state.engine.chat(&resident.key, turns, tools, sampling, false).map_err(Fail::internal)?;
     let id = format!("chatcmpl-{}", now_millis());
     let metrics = state.metrics.clone();
     // Timed from here rather than by the middleware: for a streamed reply the

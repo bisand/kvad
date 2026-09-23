@@ -54,7 +54,17 @@ pub enum Cmd {
     /// model's template untouched. A model whose template ignores them —
     /// [`crate::runtime::Llm::takes_tools`] — generates the same reply it
     /// would have without them, so a caller that means it checks first.
-    Chat { messages: Vec<Message>, tools: Vec<serde_json::Value>, sampling: Sampling },
+    ///
+    /// `fresh` drops the KV cache first, as it does for [`Cmd::Complete`]. A
+    /// conversation wants the opposite — its next turn is prefilled out of
+    /// this one's cache — but an eval case is a first turn every time, and
+    /// one served from the previous case's cache is not.
+    Chat {
+        messages: Vec<Message>,
+        tools: Vec<serde_json::Value>,
+        sampling: Sampling,
+        fresh: bool,
+    },
     /// Continue a prompt, with no chat template anywhere near it.
     ///
     /// The base-model view of a model, which for an instruct model is a
@@ -380,12 +390,18 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 }
             }
 
-            Cmd::Chat { messages, tools, sampling } => {
+            Cmd::Chat { messages, tools, sampling, fresh } => {
                 let Some(s) = session.as_mut() else {
                     say("no model loaded");
                     continue;
                 };
                 aim(s, &sampling);
+                if fresh {
+                    if let Err(e) = s.llm.reset() {
+                        fail(e);
+                        continue;
+                    }
+                }
                 let ids = match s.llm.encode_chat(&messages, &tools) {
                     Ok(ids) => ids,
                     Err(e) => {

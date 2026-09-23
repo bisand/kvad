@@ -186,6 +186,7 @@ enum Job {
         messages: Vec<Message>,
         tools: Vec<serde_json::Value>,
         sampling: Sampling,
+        fresh: bool,
         out: tokio_mpsc::Sender<Piece>,
     },
     Complete {
@@ -350,18 +351,22 @@ impl Scheduler {
     /// queued: the first [`Piece`] arrives when the engine reaches it. A
     /// caller that drops the receiver ends the generation, because the
     /// forwarding send then fails.
+    ///
+    /// `fresh` drops the KV cache first, as for [`Scheduler::complete`]; a
+    /// conversation leaves it off so the next turn reuses this one's cache.
     pub fn chat(
         &self,
         on: &Key,
         messages: Vec<Message>,
         tools: Vec<serde_json::Value>,
         sampling: Sampling,
+        fresh: bool,
     ) -> Result<tokio_mpsc::Receiver<Piece>, String> {
         // Bounded, so a client that reads slowly slows the generation down
         // rather than filling memory with tokens it has not asked for. 64 is
         // a second or so of decoding at the rates this engine reaches.
         let (out, rx) = tokio_mpsc::channel(64);
-        self.submit(Job::Chat { on: on.clone(), messages, tools, sampling, out })?;
+        self.submit(Job::Chat { on: on.clone(), messages, tools, sampling, fresh, out })?;
         Ok(rx)
     }
 
@@ -477,11 +482,11 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                 let _ = done.send(failed.map_or(Ok(gone), Err));
             }
 
-            Job::Chat { on, messages, tools, sampling, out } => {
+            Job::Chat { on, messages, tools, sampling, fresh, out } => {
                 match slots.iter().find(|s| s.key == on) {
                     Some(slot) => {
                         *shared.running() = Some(Arc::clone(&slot.engine.cancel));
-                        slot.engine.send(Cmd::Chat { messages, tools, sampling });
+                        slot.engine.send(Cmd::Chat { messages, tools, sampling, fresh });
                         // What the cache holds now: the prompt it prefilled
                         // plus everything it generated.
                         let cached = drain_chat(&slot.engine.rx, &out)
@@ -781,7 +786,7 @@ mod tests {
         let sched = refusing();
         let on = Key { repo: "a/b".into(), backend: Q8 };
         let mut pieces = sched
-            .chat(&on, vec![Message::user("hello")], Vec::new(), Sampling::default())
+            .chat(&on, vec![Message::user("hello")], Vec::new(), Sampling::default(), false)
             .expect("the scheduler refused to queue the job");
         let piece = pieces.recv().await.expect("the stream ended with nothing in it");
         match piece {

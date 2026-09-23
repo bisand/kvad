@@ -181,6 +181,31 @@
 //! this model is a decode kernel that runs a token's experts side by side,
 //! not a faster way to read them.
 //!
+//! That kernel was then written (`quant::matvec_many`: a token's experts
+//! as two parallel sections instead of thirty), and it changed what the
+//! fetcher is worth, because the two were never independent. Qwen3-30B at
+//! q8 is 34 GB against 36 usable -- a fit on paper -- and pages in 20 GB
+//! per 200 tokens here. Three interleaved reps, 200 tokens:
+//!
+//! ```text
+//!                            one expert at a time    a token's experts together
+//!   Qwen3-30B q8, mmap          13.1  12.6  10.0          7.9   7.9   7.5
+//!   Qwen3-30B q8, 16 GB cache   10.5   9.7   9.6         15.4  10.2  16.1
+//!   Qwen3-Next q4, mmap         10.0   8.8  10.3          6.7   8.5   9.1
+//!   Qwen3-Next q4, 16 GB cache   8.1   9.0   9.4         11.2  12.3  11.2
+//! ```
+//!
+//! Batched compute wants its experts already in memory, and the cache is
+//! what guarantees it; through a cold mapping the batch faults its way
+//! through fourteen experts at once and loses. Advising the kernel which
+//! experts were chosen before touching them (`madvise`, now the default)
+//! recovers most of that without a cache -- 13.8 tok/s median on the 30B.
+//! So the fetcher's worth depends on the kernel it feeds: inside the noise
+//! for one expert at a time. With the batched path, against the old
+//! default of mmap and one expert at a time, it is 1.22x on the 30B (15.4
+//! against 12.6 by median) and 1.12x on the 80B (11.2 against 10.0) --
+//! and about 1.1x over the batched path's own default, the `madvise` hint.
+//!
 //! The fetcher stays, off unless `KVAD_EXPERT_CACHE` asks for it. It gives
 //! the same answer to the bit (`tests/deepseek.rs` holds it to that), and
 //! it is the only thing here that bounds what a mixture reads per token

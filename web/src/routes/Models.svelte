@@ -107,8 +107,13 @@
   // The picker chooses where the *next* load runs. Changing it does not touch
   // the model already in memory — the backend is decided when weights are
   // read, which is the same rule the TUI's `p` key follows.
+  //
+  // Null until somebody picks one, and a load then names no backend, so the
+  // server chooses for each model. It knows what this page does not: that a
+  // model is too big for the GPU, or stored in fp8, which the GPU cannot
+  // read. Sending the picker's first option on every load is how
+  // Qwen3-0.6B-FP8 was put on the GPU and failed there.
   let backend = $state(null);
-  const chosen = $derived(backend ?? models.listing?.backend ?? "cpu-q8");
 
   $effect(() => {
     models.refresh();
@@ -237,8 +242,9 @@
           <select
             id="backend"
             class="select select-sm w-36"
-            bind:value={() => chosen, (v) => (backend = v)}
+            bind:value={() => backend ?? "", (v) => (backend = v || null)}
           >
+            <option value="">best for each</option>
             {#each models.listing?.backends ?? [] as choice (choice.id)}
               <option value={choice.id}>{choice.label}</option>
             {/each}
@@ -362,8 +368,10 @@
                   class="btn btn-sm"
                   disabled={!m.runnable ||
                     !!models.busy ||
-                    models.residents.some((r) => r.repo === m.id && r.id.endsWith(`@${chosen}`))}
-                  onclick={notToggle(() => models.load(m.id, chosen))}
+                    models.residents.some(
+                      (r) => r.repo === m.id && (!backend || r.id.endsWith(`@${backend}`)),
+                    )}
+                  onclick={notToggle(() => models.load(m.id, backend))}
                 >
                   Load
                 </button>
@@ -505,7 +513,7 @@
                   class="btn btn-sm"
                   disabled={!r.runnable || !!models.busy}
                   onclick={notToggle(() =>
-                    r.local ? models.load(r.id, chosen) : models.pull(r.id),
+                    r.local ? models.load(r.id, backend) : models.pull(r.id),
                   )}
                 >
                   {r.local ? "Load" : "Pull"}

@@ -1064,3 +1064,73 @@ mod tests {
         assert_eq!(u["total_tokens"], json!(120));
     }
 }
+
+#[cfg(test)]
+mod against_a_real_model {
+    use super::*;
+    use crate::compare::tests::{roomy, tiny_instruct_model};
+    use kvad::quant::Precision;
+    use kvad::service::Backend;
+
+    /// The chat endpoint against an instruct model trained in the test: a
+    /// template, an end token, and one thing it knows how to answer.
+    ///
+    /// Every other test here is about the request or the reply on their own.
+    /// This one is the path between them, and pins three things a model with
+    /// no template could not: the question goes through the template, the
+    /// answer stops at the end token rather than at `max_tokens`, and the
+    /// same question again is prefilled out of the cache the first one left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chat_is_asked_through_the_template_and_keeps_its_cache() {
+        let dir = tiny_instruct_model("openai");
+        let db = crate::db::Db::in_memory().unwrap();
+        let state = State {
+            db: db.clone(),
+            auth: std::sync::Arc::new(crate::auth::Local),
+            engine: std::sync::Arc::new(crate::scheduler::Scheduler::spawn(
+                kvad::service::cpu_loader,
+                roomy(),
+            )),
+            jobs: std::sync::Arc::new(crate::jobs::Jobs::new(db.clone())),
+            metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
+            setup: std::sync::Arc::new(Default::default()),
+            oidc: std::sync::Arc::new(Default::default()),
+            started: std::time::Instant::now(),
+            load_on_request: false,
+        };
+        let (progress, _ignored) = tokio::sync::mpsc::channel(8);
+        let repo = dir.to_string_lossy().into_owned();
+        state.engine.load(repo, Backend::Cpu(Precision::F32), progress).await.unwrap();
+
+        let ask = || async {
+            let who = Identity { id: None, name: "local".into(), role: crate::auth::Role::Admin };
+            let body: Completions = serde_json::from_value(json!({
+                "messages": [{ "role": "user", "content": "the cat?" }],
+                "temperature": 0,
+                "max_tokens": 16,
+            }))
+            .unwrap();
+            let reply = completions(who, St(state.clone()), Json(body)).await.unwrap();
+            let bytes = axum::body::to_bytes(reply.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        let first = ask().await;
+        let choice = &first["choices"][0];
+        assert_eq!(choice["message"]["content"], "on the mat.", "{first}");
+        assert_eq!(choice["finish_reason"], "stop");
+        // `u:the cat?|a:` in, and the answer out without its end token.
+        assert_eq!(first["usage"]["prompt_tokens"], 13);
+        assert_eq!(first["usage"]["completion_tokens"], 11);
+        assert_eq!(first["kvad"]["cached_tokens"], 0);
+
+        // A conversation's next request starts with this one's, so all but
+        // the last prompt token comes out of the cache. An eval clears it;
+        // this endpoint must not.
+        let again = ask().await;
+        assert_eq!(again["choices"][0]["message"]["content"], "on the mat.");
+        assert_eq!(again["kvad"]["cached_tokens"], 12, "{again}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

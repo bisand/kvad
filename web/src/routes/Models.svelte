@@ -1,4 +1,5 @@
 <script>
+  import { api } from "../lib/api.js";
   import { models, humanBytes } from "../lib/models.svelte.js";
   import { auth } from "../lib/auth.svelte.js";
   import { toasts } from "../lib/toasts.svelte.js";
@@ -38,12 +39,30 @@
   const STREAMS_TIP =
     "Too large for memory, so the weights are read from disk as the model runs. It works, and it is much slower than a model that fits.";
 
-  /** Which downloaded rows are expanded. Keyed by id so the set survives a
-   *  refresh of the listing, which replaces the objects but not their names. */
-  let open = $state({});
-  const toggle = (id) => (open = { ...open, [id]: !open[id] });
-
   const thousands = (n) => n.toLocaleString();
+
+  /** What the Hub said about a search result, once somebody opened it.
+   *  `undefined` is "never asked", `null` is "asked, and it could not say".
+   *
+   *  Which rows are *open* is the radio inputs' business, not this file's —
+   *  that is what `collapse` is for. This only remembers the answers, so
+   *  re-opening a row does not ask again. */
+  let hubDetail = $state({});
+
+  async function askHub(id) {
+    if (hubDetail[id] !== undefined) return;
+    hubDetail = { ...hubDetail, [id]: "asking" };
+    try {
+      hubDetail = {
+        ...hubDetail,
+        [id]: await api(`/api/models/detail?repo=${encodeURIComponent(id)}`),
+      };
+    } catch {
+      // A repo with no config, a rate limit, no network. The row says so and
+      // the rest of the page carries on; this is not worth a toast.
+      hubDetail = { ...hubDetail, [id]: null };
+    }
+  }
 
   let query = $state("");
   let results = $state(null);
@@ -160,124 +179,104 @@
         Nothing downloaded yet. Search the Hub below — <code>smollm</code> is a good start.
       </div>
     {:else}
-      <div class="overflow-x-auto">
-        <table class="table">
-          <thead>
-            <tr>
-              <!-- `w-full` on the first column and `whitespace-nowrap` on the
-                   others: the name gets whatever is left over, which on a
-                   narrow screen is not much, and everything else keeps the
-                   width it needs. -->
-              <th class="w-full">Model</th>
-              <th>Size</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each models.all as m (m.id)}
-              <tr class="hover:bg-base-200/50">
-                <td class="max-w-0 min-w-40">
-                  <div class="flex items-center gap-2">
-                    {#if m.detail}
-                      <button
-                        class="btn btn-ghost btn-xs w-5 px-0 font-mono"
-                        aria-expanded={!!open[m.id]}
-                        aria-label={`What ${m.id} is`}
-                        onclick={() => toggle(m.id)}
-                      >
-                        {open[m.id] ? "−" : "+"}
-                      </button>
-                    {/if}
-                    <span class="truncate font-medium">{m.id}</span>
-                    {#if m.trained}<span class="badge badge-sm">trained here</span>{/if}
-                    {#if models.listing.active === m.id}
-                      <span class="badge badge-sm badge-soft">default</span>
-                    {/if}
-                    {#if models.loaded?.repo === m.id}
-                      <span class="badge badge-sm badge-success badge-soft">loaded</span>
-                    {/if}
-                    {#if m.streams}
-                      <div class="tooltip" data-tip={STREAMS_TIP}>
-                        <span
-                          class="badge badge-sm badge-warning badge-soft whitespace-nowrap"
-                        >
-                          disk streaming
-                        </span>
-                      </div>
-                    {/if}
+      <!-- daisyUI `collapse`, one per model, so the whole row is the control
+           rather than a chevron somebody has to aim at. Radio inputs and a
+           shared name make it an accordion: opening one closes the last. -->
+      <div class="flex flex-col gap-1">
+        {#each models.all as m (m.id)}
+          <div
+            class="collapse rounded-box bg-base-200/40 {m.detail ? 'collapse-arrow' : ''}"
+          >
+            <!-- No input for a model that cannot describe itself: without one
+                 the row does not open, and without `collapse-arrow` above it
+                 does not pretend it would. -->
+            {#if m.detail}
+              <input type="radio" name="downloaded" aria-label={`What ${m.id} is`} />
+            {/if}
+            <div class="collapse-title flex flex-wrap items-center gap-x-3 gap-y-1">
+              <div class="flex min-w-40 flex-1 items-center gap-2">
+                <span class="truncate font-medium">{m.id}</span>
+                {#if m.trained}<span class="badge badge-sm">trained here</span>{/if}
+                {#if models.listing.active === m.id}
+                  <span class="badge badge-sm badge-soft">default</span>
+                {/if}
+                {#if models.loaded?.repo === m.id}
+                  <span class="badge badge-sm badge-success badge-soft">loaded</span>
+                {/if}
+                {#if m.streams}
+                  <div class="tooltip" data-tip={STREAMS_TIP}>
+                    <span class="badge badge-sm badge-warning badge-soft whitespace-nowrap">
+                      disk streaming
+                    </span>
                   </div>
-                  <div class="mt-0.5 text-xs opacity-60">
-                    {m.blocker ?? m.arch}
+                {/if}
+              </div>
+              <span class="text-sm whitespace-nowrap opacity-70">{humanBytes(m.bytes)}</span>
+              <!-- The input covers the title to make it clickable, so anything
+                   meant to stay clickable has to sit above it. -->
+              <div class="relative z-1 flex gap-1" class:hidden={!may}>
+                <button
+                  class="btn btn-sm"
+                  disabled={!m.runnable || !!models.busy || models.loaded?.repo === m.id}
+                  onclick={() => models.load(m.id, chosen)}
+                >
+                  Load
+                </button>
+                <button
+                  class="btn btn-sm btn-ghost"
+                  disabled={models.listing.active === m.id}
+                  onclick={() => models.setActive(m.id)}
+                  title="The model `kvad run` picks with no --model"
+                >
+                  Default
+                </button>
+                <button
+                  class="btn btn-sm btn-ghost"
+                  aria-label={`Delete ${m.id}`}
+                  onclick={() => (confirming = m.id)}
+                >
+                  <Icon path={TRASH} size={16} />
+                </button>
+              </div>
+              <div class="w-full text-xs opacity-60">{m.blocker ?? m.arch}</div>
+            </div>
+            {#if m.detail}
+              <div class="collapse-content text-xs">
+                <div class="font-mono opacity-80">{m.detail.summary}</div>
+                <div class="mt-2 flex flex-wrap gap-x-6 gap-y-1 opacity-70">
+                  <span>{m.detail.n_layer} layers</span>
+                  <span>
+                    {m.detail.n_head} heads{m.detail.n_kv_head !== m.detail.n_head
+                      ? ` (${m.detail.n_kv_head} KV)`
+                      : ""}
+                  </span>
+                  <span>{thousands(m.detail.n_embd)} embedding</span>
+                  <span>{thousands(m.detail.n_ctx)} context</span>
+                  <span>{thousands(m.detail.vocab_size)} vocab</span>
+                  {#if m.detail.params}<span>{params(m.detail.params)}</span>{/if}
+                </div>
+                {#if m.detail.experts}
+                  <!-- The working set is not decoration: a cache holding fewer
+                       experts than one pass reads evicts every one of them
+                       before its next use. -->
+                  <div class="mt-2 opacity-70">
+                    mixture of experts — {m.detail.experts.count} per layer,
+                    {m.detail.experts.per_token} chosen per token, so one token reads
+                    {thousands(m.detail.experts.working_set)} of them across the model
                   </div>
-                </td>
-                <td class="text-sm whitespace-nowrap opacity-70">{humanBytes(m.bytes)}</td>
-                <td class="whitespace-nowrap">
-                  <div class="flex justify-end gap-1" class:hidden={!may}>
-                    <button
-                      class="btn btn-sm"
-                      disabled={!m.runnable || !!models.busy || models.loaded?.repo === m.id}
-                      onclick={() => models.load(m.id, chosen)}
-                    >
-                      Load
-                    </button>
-                    <button
-                      class="btn btn-sm btn-ghost"
-                      disabled={models.listing.active === m.id}
-                      onclick={() => models.setActive(m.id)}
-                      title="The model `kvad run` picks with no --model"
-                    >
-                      Default
-                    </button>
-                    <button
-                      class="btn btn-sm btn-ghost"
-                      aria-label={`Delete ${m.id}`}
-                      onclick={() => (confirming = m.id)}
-                    >
-                      <Icon path={TRASH} size={16} />
-                    </button>
+                {/if}
+                {#if m.detail.memory}
+                  <div class="mt-2 opacity-70">
+                    weights here: {humanBytes(m.detail.memory.f32)} at f32 ·
+                    {humanBytes(m.detail.memory.q8)} at q8 ·
+                    {humanBytes(m.detail.memory.q4)} at q4
+                    {#if m.streams}— none of them fit, so they are read from disk{/if}
                   </div>
-                </td>
-              </tr>
-              {#if open[m.id] && m.detail}
-                <tr class="bg-base-200/40">
-                  <td colspan="3" class="text-xs">
-                    <div class="font-mono opacity-80">{m.detail.summary}</div>
-                    <div class="mt-2 flex flex-wrap gap-x-6 gap-y-1 opacity-70">
-                      <span>{m.detail.n_layer} layers</span>
-                      <span>
-                        {m.detail.n_head} heads{m.detail.n_kv_head !== m.detail.n_head
-                          ? ` (${m.detail.n_kv_head} KV)`
-                          : ""}
-                      </span>
-                      <span>{thousands(m.detail.n_embd)} embedding</span>
-                      <span>{thousands(m.detail.n_ctx)} context</span>
-                      <span>{thousands(m.detail.vocab_size)} vocab</span>
-                      {#if m.detail.params}<span>{params(m.detail.params)}</span>{/if}
-                    </div>
-                    {#if m.detail.experts}
-                      <!-- The working set is not decoration: a cache holding
-                           fewer experts than a single pass reads evicts every
-                           one of them before its next use. -->
-                      <div class="mt-2 opacity-70">
-                        mixture of experts — {m.detail.experts.count} per layer,
-                        {m.detail.experts.per_token} chosen per token, so one token reads
-                        {thousands(m.detail.experts.working_set)} of them across the model
-                      </div>
-                    {/if}
-                    {#if m.detail.memory}
-                      <div class="mt-2 opacity-70">
-                        weights here: {humanBytes(m.detail.memory.f32)} at f32 ·
-                        {humanBytes(m.detail.memory.q8)} at q8 ·
-                        {humanBytes(m.detail.memory.q4)} at q4
-                        {#if m.streams}— none of them fit, so they are read from disk{/if}
-                      </div>
-                    {/if}
-                  </td>
-                </tr>
-              {/if}
-            {/each}
-          </tbody>
-        </table>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/each}
       </div>
     {/if}
   </section>
@@ -314,76 +313,107 @@
     </form>
 
     {#if results?.length}
-      <div class="mt-4 overflow-x-auto">
-        <table class="table">
-          <thead>
-            <tr>
-              <th class="w-full">Model</th>
-              <th class="text-right whitespace-nowrap">Download</th>
-              <th class="whitespace-nowrap">Fits here</th>
-              <th class="text-right whitespace-nowrap">Downloads</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each results as r (r.id)}
-              <tr class="hover:bg-base-200/50">
-                <td class="max-w-0 min-w-40">
-                  <div class="flex items-center gap-2">
-                    <span class="truncate font-medium">{r.id}</span>
-                    {#if r.local}<span class="badge badge-sm badge-soft">here</span>{/if}
-                    {#if r.looks_instruct}<span class="badge badge-sm">chat</span>{/if}
+      <!-- Same accordion as the downloaded list, with its own radio group so
+           opening a search result does not close a downloaded one. -->
+      <div class="mt-4 flex flex-col gap-1">
+        {#each results as r (r.id)}
+          <div class="collapse rounded-box bg-base-200/40 {r.arch ? 'collapse-arrow' : ''}">
+            <!-- Only a model this build can read has a `Spec` to describe, so
+                 only that one opens. -->
+            {#if r.arch}
+              <input
+                type="radio"
+                name="hub"
+                aria-label={`What ${r.id} is`}
+                onchange={(e) => e.currentTarget.checked && askHub(r.id)}
+              />
+            {/if}
+            <div class="collapse-title flex flex-wrap items-center gap-x-3 gap-y-1">
+              <div class="flex min-w-40 flex-1 items-center gap-2">
+                <span class="truncate font-medium">{r.id}</span>
+                {#if r.local}<span class="badge badge-sm badge-soft">here</span>{/if}
+                {#if r.looks_instruct}<span class="badge badge-sm">chat</span>{/if}
+              </div>
+              <div class="text-right text-sm whitespace-nowrap opacity-70">
+                {r.bytes ? humanBytes(r.bytes) : "—"}
+                {#if r.params}<span class="text-xs opacity-60">· {params(r.params)}</span>{/if}
+              </div>
+              <!-- What the weights cost here, which is not the download size:
+                   loading quantises, so a 16 GB checkpoint is 4.5 GB at q8. -->
+              {#if !r.size_known}
+                <span class="text-xs opacity-50">unknown</span>
+              {:else if r.streams}
+                <div class="tooltip" data-tip={atEachPrecision(r)}>
+                  <span class="badge badge-sm badge-warning badge-soft whitespace-nowrap">
+                    {r.fits_at} · disk
+                  </span>
+                </div>
+              {:else if r.fits_at}
+                <div class="tooltip" data-tip={atEachPrecision(r)}>
+                  <span class="badge badge-sm badge-success badge-soft">{r.fits_at}</span>
+                </div>
+              {:else}
+                <span class="text-xs opacity-50">unknown</span>
+              {/if}
+              <span class="text-right text-sm whitespace-nowrap opacity-70">
+                {r.downloads.toLocaleString()}
+              </span>
+              <!-- Above the input that makes the rest of the row clickable. -->
+              <div class="relative z-1">
+                <button
+                  class="btn btn-sm"
+                  disabled={!r.runnable || !!models.busy}
+                  onclick={() => (r.local ? models.load(r.id, chosen) : models.pull(r.id))}
+                >
+                  {r.local ? "Load" : "Pull"}
+                </button>
+              </div>
+              <!-- The same verdict `kvad search` prints, from the Hub's own
+                   config, so the listing says what is runnable before anything
+                   is downloaded. -->
+              <div class="w-full text-xs opacity-60">{r.blocker ?? r.arch}</div>
+            </div>
+            {#if r.arch}
+              <div class="collapse-content text-xs">
+                {#if hubDetail[r.id] === "asking"}
+                  <span class="opacity-60">reading its config…</span>
+                {:else if hubDetail[r.id]}
+                  <div class="font-mono opacity-80">{hubDetail[r.id].summary}</div>
+                  <div class="mt-2 flex flex-wrap gap-x-6 gap-y-1 opacity-70">
+                    <span>{hubDetail[r.id].n_layer} layers</span>
+                    <span>
+                      {hubDetail[r.id].n_head} heads{hubDetail[r.id].n_kv_head !==
+                      hubDetail[r.id].n_head
+                        ? ` (${hubDetail[r.id].n_kv_head} KV)`
+                        : ""}
+                    </span>
+                    <span>{thousands(hubDetail[r.id].n_embd)} embedding</span>
+                    <span>{thousands(hubDetail[r.id].n_ctx)} context</span>
+                    <span>{thousands(hubDetail[r.id].vocab_size)} vocab</span>
                   </div>
-                  <!-- `blocker` is the same verdict `kvad search` prints, from
-                       the Hub's own config.json — so the listing can say which
-                       results are runnable before anything is downloaded. -->
-                  <div class="mt-0.5 text-xs opacity-60">{r.blocker ?? r.arch}</div>
-                </td>
-                <td class="text-right text-sm whitespace-nowrap opacity-70">
-                  {r.bytes ? humanBytes(r.bytes) : "—"}
-                  {#if r.params}
-                    <div class="text-xs opacity-60">{params(r.params)}</div>
-                  {/if}
-                </td>
-                <td class="whitespace-nowrap">
-                  <!-- The download size and what it costs here are different
-                       numbers: loading quantises, so a 16 GB checkpoint is
-                       4.5 GB of weights at q8. This column is the second one,
-                       against what this machine has. -->
-                  {#if !r.size_known}
-                    <span class="text-xs opacity-50">unknown</span>
-                  {:else if r.streams}
-                    <div class="tooltip" data-tip={atEachPrecision(r)}>
-                      <span class="badge badge-sm badge-warning badge-soft whitespace-nowrap">
-                        {r.fits_at} · disk
-                      </span>
+                  {#if hubDetail[r.id].experts}
+                    <div class="mt-2 opacity-70">
+                      mixture of experts — {hubDetail[r.id].experts.count} per layer,
+                      {hubDetail[r.id].experts.per_token} chosen per token, so one token reads
+                      {thousands(hubDetail[r.id].experts.working_set)} of them across the model
                     </div>
-                  {:else if r.fits_at}
-                    <div class="tooltip" data-tip={atEachPrecision(r)}>
-                      <span class="badge badge-sm badge-success badge-soft">
-                        {r.fits_at}
-                      </span>
-                    </div>
-                  {:else}
-                    <span class="text-xs opacity-50">unknown</span>
                   {/if}
-                </td>
-                <td class="text-right text-sm whitespace-nowrap opacity-70">
-                  {r.downloads.toLocaleString()}
-                </td>
-                <td class="text-right whitespace-nowrap">
-                  <button
-                    class="btn btn-sm"
-                    disabled={!r.runnable || !!models.busy}
-                    onclick={() => (r.local ? models.load(r.id, chosen) : models.pull(r.id))}
-                  >
-                    {r.local ? "Load" : "Pull"}
-                  </button>
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
+                  {#if r.memory}
+                    <div class="mt-2 opacity-70">
+                      weights here: {humanBytes(r.memory.f32)} at f32 ·
+                      {humanBytes(r.memory.q8)} at q8 · {humanBytes(r.memory.q4)} at q4
+                      {#if r.streams}— none of them fit, so they are read from disk{/if}
+                    </div>
+                  {/if}
+                {:else if hubDetail[r.id] === null}
+                  <span class="opacity-60">
+                    Its config could not be read, so there is nothing more to say.
+                  </span>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/each}
       </div>
     {/if}
   </section>

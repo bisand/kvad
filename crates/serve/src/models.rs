@@ -104,11 +104,20 @@ pub struct Experts {
 fn detail_of(m: &hub::LocalModel) -> Option<Detail> {
     let config = hub::model_file(&m.path, "config.json")?;
     let spec = kvad::model::Spec::from_json(&config).ok()?;
+    Some(detail_from(&spec, m.params))
+}
+
+/// The shape a spec describes, with whatever the caller knows of its size.
+///
+/// A downloaded model knows its parameter count from the safetensors index;
+/// a search result knows it from the Hub and passes `None`, because the row
+/// is already showing it.
+fn detail_from(spec: &kvad::model::Spec, params: Option<u64>) -> Detail {
     let experts = kvad::model::ffn::Router::count(&spec.config).and_then(|count| {
         let per_token = spec.config.num(&["num_experts_per_tok"])?;
         Some(Experts { count, per_token, working_set: per_token * spec.n_layer })
     });
-    Some(Detail {
+    Detail {
         summary: spec.summary(),
         n_layer: spec.n_layer,
         n_head: spec.n_head,
@@ -116,14 +125,40 @@ fn detail_of(m: &hub::LocalModel) -> Option<Detail> {
         n_embd: spec.n_embd,
         n_ctx: spec.n_ctx,
         vocab_size: spec.vocab_size,
-        params: m.params,
-        memory: m.params.map(|p| Memory {
+        params,
+        memory: params.map(|p| Memory {
             f32: kvad::quant::Precision::F32.weight_bytes(p),
             q8: kvad::quant::Precision::Q8.weight_bytes(p),
             q4: kvad::quant::Precision::Q4.weight_bytes(p),
         }),
         experts,
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct DetailQuery {
+    repo: String,
+}
+
+/// What a model on the Hub is, without downloading it.
+///
+/// One request for one `config.json`, asked when somebody opens a row
+/// rather than for every result of every search: forty rows would be forty
+/// round trips, and nearly all of them would be for a model the reader
+/// scrolled straight past.
+pub async fn hub_detail(_: Identity, Query(q): Query<DetailQuery>) -> Result<Json<Detail>, Fail> {
+    let repo = q.repo.trim().to_string();
+    if repo.is_empty() {
+        return Err(Fail::bad("which model?"));
+    }
+    let detail = blocking(move || {
+        let config = hub::remote_config(&repo)
+            .ok_or("that repo has no config.json we could read")?;
+        let spec = kvad::model::Spec::from_config(kvad::model::Json::new(config))?;
+        Ok(detail_from(&spec, None))
     })
+    .await?;
+    Ok(Json(detail))
 }
 
 fn describe(m: &hub::LocalModel, trained: bool) -> Model {

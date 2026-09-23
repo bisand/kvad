@@ -320,6 +320,29 @@ pub fn remote_arch(id: &str) -> Option<Arch> {
     Arch::from_model_type(model_type)
 }
 
+/// A repo's `config.json`, without downloading a byte of its weights.
+///
+/// [`remote_arch`] asks the API's `expand[]=config`, which carries the
+/// `model_type` and nothing else. The file itself carries the shape — layer
+/// count, head count, how many experts and how many of them run — and that
+/// is a separate request, which is why this is its own function and why it
+/// is asked only when somebody wants the answer.
+///
+/// Every way of not knowing is `None`, as in [`remote_arch`], and for the
+/// same reason: the caller has no channel to report them on.
+pub fn remote_config(id: &str) -> Option<serde_json::Value> {
+    let path = repo_path(id)?;
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(3)))
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build(),
+    );
+    let url = format!("https://huggingface.co/{path}/raw/main/config.json");
+    let body = agent.get(&url).call().ok()?.body_mut().read_to_string().ok()?;
+    serde_json::from_str(&body).ok()
+}
+
 /// `id` as a path under `/api/models/`, or `None` if it is not shaped like a
 /// repo id at all.
 ///

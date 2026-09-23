@@ -25,6 +25,7 @@ pub fn routes() -> Router<State> {
         .route("/api/openapi.json", get(crate::openapi::document))
         .route("/api/models", get(crate::models::list).delete(crate::models::remove))
         .route("/api/models/search", get(crate::models::search))
+        .route("/api/models/detail", get(crate::models::hub_detail))
         .route("/api/models/load", post(crate::models::load))
         .route("/api/models/unload", post(crate::models::unload))
         .route("/api/models/active", post(crate::models::set_active))

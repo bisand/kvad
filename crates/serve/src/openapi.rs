@@ -132,6 +132,16 @@ pub const ENDPOINTS: &[Endpoint] = &[
         body: None, produces: JSON, events: &[],
     },
     Endpoint {
+        method: "get", path: "/api/models/detail", tag: "Models", access: Access::SignedIn,
+        summary: "What a model on the Hub is",
+        description: "The shape its `config.json` describes — layers, heads, context, \
+                      and for a mixture how many experts there are and how many run per \
+                      token. One request for one config, so it is asked when somebody \
+                      opens a result rather than for every row of every search.",
+        query: &[("repo", true, "The repo id, `owner/name`.")],
+        body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
         method: "post", path: "/api/models/load", tag: "Models", access: Access::Admin,
         summary: "Load a model, streaming the progress",
         description: "Loading takes tens of seconds and may download gigabytes first, \

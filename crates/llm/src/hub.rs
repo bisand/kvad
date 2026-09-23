@@ -58,6 +58,9 @@ pub struct HubModel {
     /// arrives seventy gigabytes too late. Both signals ride in the search
     /// response already, so this costs nothing beyond reading them.
     pub unreadable_as: Option<String>,
+    /// How much of itself the model reads per token, from the trimmed
+    /// config the search response already carries. See [`Reads`].
+    pub reads: Reads,
 }
 
 impl HubModel {
@@ -113,16 +116,69 @@ impl HubModel {
     }
 
     pub fn fit(&self) -> Fit {
-        fit_of(self.params)
+        fit_of(self.params, self.reads)
     }
 }
+
+/// How much of a model one token reads.
+///
+/// The number that decides what running from the disk costs, and the one a
+/// badge judging by total size cannot see. A dense model reads every weight
+/// for every token. A mixture reads `top_k` of each routed layer's experts,
+/// and Qwen3-Next-80B reads 10 of 512 -- which is why it generated 10.7
+/// tok/s through plain mmap at two fifths over memory, while a dense 70B
+/// the same distance over would page in gigabytes a token.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Reads {
+    /// A dense model: all of it, every token.
+    Everything,
+    /// A mixture reading this fraction of its experts per token.
+    Share(f64),
+    /// A mixture whose expert count was not given, so how sparse it is
+    /// cannot be said. The Hub's trimmed config does this to DeepSeek and
+    /// Mixtral: it keeps `num_experts_per_tok` and drops the count, which
+    /// they spell `n_routed_experts` and `num_local_experts`.
+    SomeOf,
+}
+
+impl Reads {
+    /// Read from a `config.json`, whole or as the Hub trims it.
+    ///
+    /// `num_experts_per_tok` is the mark of a mixture, and the one key
+    /// every family's trimmed config was seen to keep.
+    pub fn of(config: Option<&serde_json::Value>) -> Reads {
+        let num = |k: &str| config?.get(k)?.as_u64().filter(|&n| n > 0);
+        let Some(top_k) = num("num_experts_per_tok") else { return Reads::Everything };
+        match ["n_routed_experts", "num_experts", "num_local_experts"].iter().find_map(|k| num(k)) {
+            Some(count) if count > top_k => Reads::Share(top_k as f64 / count as f64),
+            // One expert of one is a dense model with extra words.
+            Some(_) => Reads::Everything,
+            None => Reads::SomeOf,
+        }
+    }
+
+    pub fn mixture(self) -> bool {
+        !matches!(self, Reads::Everything)
+    }
+}
+
+/// Bytes a token may page in from the disk before the model is better
+/// described as crawling than as streaming.
+///
+/// Set between the only two measurements there are, both through plain mmap
+/// on this machine. Qwen3-Next-80B at q4, whose estimate here is 0.29 GB a
+/// token, generated 10.7 tok/s. DeepSeek-V2-Lite at f32, estimated at 2.5
+/// GB, generated 1.5. The estimates are in the same ratio as the speeds to
+/// within the compute both of them also pay, so the line sits between them
+/// at a gigabyte: a few tokens a second, by the same arithmetic.
+pub const CRAWL: u64 = 1_000_000_000;
 
 /// Whether a model of this size will run here, and out of what.
 ///
 /// Shared by the downloaded list and the search results, because a model
 /// does not change size by being on the disk already and the two pages
 /// disagreeing about it would be a bug waiting to happen.
-fn fit_of(params: Option<u64>) -> Fit {
+pub fn fit_of(params: Option<u64>, reads: Reads) -> Fit {
     let (Some(params), Some(has)) = (params, crate::machine::usable_memory_cached()) else {
         return Fit::Unknown;
     };
@@ -134,10 +190,30 @@ fn fit_of(params: Option<u64>) -> Fit {
         .find(|p| p.weight_bytes(params) <= has)
     {
         Some(p) => Fit::At(p),
-        None => Fit::Slow {
-            needs: crate::quant::Precision::SMALLEST_FIRST[0].weight_bytes(params),
-            has,
-        },
+        None => {
+            let needs = crate::quant::Precision::SMALLEST_FIRST[0].weight_bytes(params);
+            Fit::Slow { needs, has, per_token: from_disk(needs, has, reads) }
+        }
+    }
+}
+
+/// Roughly what one token pages in when `needs` bytes of weights live in
+/// `has` bytes of memory.
+///
+/// The part that does not fit is spread over the experts, and a token reads
+/// its share of them, so it finds that share of the missing part missing.
+/// That assumes the non-expert weights stay resident -- they are read by
+/// every token, so they are the last thing the kernel evicts -- and that
+/// routing is uniform, which it is not: skew makes a real cache do better,
+/// so this errs slow. For a dense model the share is the whole, and the
+/// answer, the part over, is a floor: a pass that scans more than the cache
+/// holds can miss on every page of it.
+fn from_disk(needs: u64, has: u64, reads: Reads) -> Option<u64> {
+    let over = needs.saturating_sub(has);
+    match reads {
+        Reads::Everything => Some(over),
+        Reads::Share(share) => Some((over as f64 * share) as u64),
+        Reads::SomeOf => None,
     }
 }
 
@@ -265,7 +341,12 @@ pub enum Fit {
     /// The two numbers are what separate a model a third over from one
     /// eleven times over. Both are slow; only the first is worth running.
     /// See [`crate::residency`] for where that line falls.
-    Slow { needs: u64, has: u64 },
+    ///
+    /// `per_token` is what separates those two now: roughly the bytes a
+    /// token pages in (see [`from_disk`]), which depends on how much of the
+    /// model a token reads and not on its size. `None` for a mixture whose
+    /// sparsity is not known yet.
+    Slow { needs: u64, has: u64, per_token: Option<u64> },
     /// The Hub did not say how big it is, or we cannot read this machine's
     /// memory. Saying nothing beats guessing.
     Unknown,
@@ -292,19 +373,47 @@ impl Fit {
     pub fn streams(&self) -> bool {
         matches!(self, Fit::Slow { .. })
     }
+
+    /// Whether a token pages in so much that the model is not worth
+    /// running from the disk. See [`CRAWL`].
+    ///
+    /// False when it is not known, which is not a promise that it streams
+    /// well: a caller wanting to say so asks [`Fit::per_token`] as well.
+    pub fn crawls(&self) -> bool {
+        self.per_token().is_some_and(|b| b > CRAWL)
+    }
+
+    /// Roughly the bytes a token pages in from the disk, when it does.
+    pub fn per_token(&self) -> Option<u64> {
+        match self {
+            Fit::Slow { per_token, .. } => *per_token,
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Fit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Fit::At(p) => write!(f, "fits at {p}"),
-            Fit::Slow { needs, has } => write!(
-                f,
-                "slow — {} at {}, have {}",
-                human_bytes(*needs),
-                crate::quant::Precision::SMALLEST_FIRST[0],
-                human_bytes(*has)
-            ),
+            Fit::Slow { needs, has, per_token } => {
+                let word = match per_token {
+                    Some(b) if *b > CRAWL => "crawls",
+                    Some(_) => "streams",
+                    None => "slow",
+                };
+                write!(
+                    f,
+                    "{word} — {} at {}, have {}",
+                    human_bytes(*needs),
+                    crate::quant::Precision::SMALLEST_FIRST[0],
+                    human_bytes(*has)
+                )?;
+                match per_token {
+                    Some(b) => write!(f, ", ~{} a token from disk", human_bytes(*b)),
+                    None => f.write_str(", a mixture of unknown sparsity"),
+                }
+            }
             Fit::Unknown => f.write_str("?"),
         }
     }
@@ -430,6 +539,7 @@ pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
                 });
             HubModel {
                 unreadable_as: unreadable_as(safetensors, m.get("config")),
+                reads: Reads::of(m.get("config")),
                 arch: model_type.as_deref().and_then(Arch::from_model_type),
                 model_type,
                 downloads: m.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -547,12 +657,16 @@ pub struct LocalModel {
     /// blocking these in search stops somebody starting the download, and
     /// this is what stops the ones that are already here being offered.
     pub unreadable_as: Option<String>,
+    /// How much of itself it reads per token, from the whole config on the
+    /// disk -- so, unlike a search result, a downloaded mixture always
+    /// knows its sparsity.
+    pub reads: Reads,
 }
 
 impl LocalModel {
     /// Whether this will run from memory or from the disk. See [`Fit`].
     pub fn fit(&self) -> Fit {
-        fit_of(self.params)
+        fit_of(self.params, self.reads)
     }
 
     /// One-line reason this cannot be run, for the reasons visible from the
@@ -611,6 +725,7 @@ pub fn local_models() -> Vec<LocalModel> {
             Some(LocalModel {
                 params,
                 unreadable_as,
+                reads: Reads::of(config.as_ref()),
                 id,
                 path,
                 bytes,
@@ -659,6 +774,7 @@ pub fn trained_models() -> Vec<LocalModel> {
                 // practice. Asked anyway rather than assumed, because a
                 // directory here is whatever somebody put in it.
                 unreadable_as: config.as_ref().and_then(quant_format),
+                reads: Reads::of(config.as_ref()),
                 // A trained model is laid out flat rather than in the
                 // cache's blob-and-snapshot shape, which `model_file`
                 // already handles by looking directly first.
@@ -846,6 +962,7 @@ mod tests {
             params,
             download_bytes: params.map(|p| p * 2),
             unreadable_as: None,
+            reads: Reads::Everything,
         }
     }
 
@@ -995,9 +1112,48 @@ mod tests {
         // The numbers are the reason this variant carries anything: a model
         // barely over and a model many times over are both slow, and only
         // one of them is slow enough to still be worth running.
-        let Fit::Slow { needs, has } = sized(Some(huge)).fit() else { panic!("expected Slow") };
+        let Fit::Slow { needs, has, .. } = sized(Some(huge)).fit() else { panic!("expected Slow") };
         assert!(needs > has, "{needs} should not fit in {has}");
         assert_eq!(needs, Precision::SMALLEST_FIRST[0].weight_bytes(huge));
+    }
+
+    /// Total size put a dense 70B and a streaming 80B mixture under the same
+    /// badge. These are the real parameter counts, at the precision each was
+    /// run at or would be, against the 36 GB this machine gives weights --
+    /// and the two that were measured have to land on the sides of the line
+    /// their speeds put them on.
+    #[test]
+    fn a_model_over_memory_is_judged_by_what_a_token_reads() {
+        use crate::quant::Precision::{F32, Q4};
+        let has = 36_000_000_000;
+        let cfg = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap();
+
+        // The configs as the Hub's search response trims them.
+        let next = Reads::of(Some(&cfg(r#"{"model_type":"qwen3_next","num_experts":512,"num_experts_per_tok":10}"#)));
+        let llama = Reads::of(Some(&cfg(r#"{"model_type":"llama"}"#)));
+        assert_eq!(next, Reads::Share(10.0 / 512.0));
+        assert_eq!(llama, Reads::Everything);
+        // DeepSeek's count is dropped from the trimmed copy and kept in the
+        // file itself, under its own name.
+        let trimmed = Reads::of(Some(&cfg(r#"{"model_type":"deepseek_v2","num_experts_per_tok":6}"#)));
+        assert_eq!(trimmed, Reads::SomeOf);
+        let deepseek = Reads::of(Some(&cfg(r#"{"n_routed_experts":64,"num_experts_per_tok":6}"#)));
+        assert_eq!(deepseek, Reads::Share(6.0 / 64.0));
+        let mixtral = Reads::of(Some(&cfg(r#"{"num_local_experts":8,"num_experts_per_tok":2}"#)));
+
+        // Measured at 10.7 tok/s through plain mmap.
+        let b = from_disk(Q4.weight_bytes(81_324_862_720), has, next).unwrap();
+        assert!(b < CRAWL, "Qwen3-Next-80B at q4 pages {b} a token");
+        // Measured at 1.5 tok/s.
+        let b = from_disk(F32.weight_bytes(15_706_484_224), has, deepseek).unwrap();
+        assert!(b > CRAWL, "DeepSeek-V2-Lite at f32 pages {b} a token");
+        // Neither measured, and both what the old badge called the 80B's
+        // equal. A mixture is not enough to stream: Mixtral reads a quarter
+        // of itself a token.
+        assert!(from_disk(Q4.weight_bytes(70_553_706_496), has, llama).unwrap() > CRAWL);
+        assert!(from_disk(Q4.weight_bytes(140_630_071_296), has, mixtral).unwrap() > CRAWL);
+        // And a mixture of unknown sparsity is not given a number.
+        assert_eq!(from_disk(Q4.weight_bytes(140_630_071_296), has, trimmed), None);
     }
 
     /// The Hub reports a mixed-dtype checkpoint as counts per dtype, and the

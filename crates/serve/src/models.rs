@@ -58,6 +58,15 @@ pub struct Model {
     /// result: by the time it is on the disk the question is no longer
     /// whether to fetch it but what to expect when it starts.
     pub streams: bool,
+    /// Streams, and pages in so much a token that it is not worth running.
+    /// A dense model over memory, nearly always; a sparse mixture, not.
+    pub crawls: bool,
+    /// Roughly the bytes a token pages in from the disk, when it streams
+    /// and how much of it a token reads is known. See `hub::Fit::per_token`.
+    pub disk_per_token: Option<u64>,
+    /// A mixture of experts, which is what lets a model over memory stream
+    /// at all.
+    pub mixture: bool,
     /// What the config says this is, for a row somebody opened. `None`
     /// when there is no config, or when it describes an architecture this
     /// build has no reader for.
@@ -80,6 +89,37 @@ pub struct Detail {
     pub memory: Option<Memory>,
     /// A mixture's shape, when it is one.
     pub experts: Option<Experts>,
+    /// How the checkpoint stores its weights, when that is not plainly as
+    /// floats: `fp8 (e4m3), 128×128 blocks`. Said because it decides the
+    /// download and the accuracy and not the memory, which is the part
+    /// nobody would guess.
+    pub stored_as: Option<String>,
+    /// The verdict with the whole config in hand: `kvad search`'s line, and
+    /// the numbers behind it. `None` when the size is not known.
+    pub fit: Option<Verdict>,
+}
+
+/// Whether the model runs here, and out of what, as `hub::Fit` says it.
+#[derive(serde::Serialize)]
+pub struct Verdict {
+    /// The line `kvad search` prints: `fits at q8`, `streams — ...`.
+    pub line: String,
+    pub precision: Option<String>,
+    pub streams: bool,
+    pub crawls: bool,
+    pub disk_per_token: Option<u64>,
+}
+
+impl Verdict {
+    fn of(fit: hub::Fit) -> Option<Verdict> {
+        (fit != hub::Fit::Unknown).then(|| Verdict {
+            line: fit.to_string(),
+            precision: fit.precision().map(|p| p.to_string()),
+            streams: fit.streams(),
+            crawls: fit.crawls(),
+            disk_per_token: fit.per_token(),
+        })
+    }
 }
 
 /// How a mixture routes, and what that costs a cache.
@@ -95,6 +135,16 @@ pub struct Experts {
     /// itself. Measured exactly on Qwen3-30B-A3B — a cache of 374 experts
     /// hits 1.9% and one of 384, which is this number, hits 33.2%.
     pub working_set: usize,
+    /// Layers that route. Not every layer does: DeepSeek's first is an
+    /// ordinary MLP, so its working set is 6 × 26 and not 6 × 27.
+    pub layers: usize,
+    /// What `working_set` experts weigh here at each precision: three
+    /// matrices of `hidden × moe_intermediate` apiece. Checked against a
+    /// real cache: one Qwen3-30B expert at q8 is 3 × 2048 × 768 × 1.125
+    /// bytes, 5.31 MB, exactly.
+    pub working_set_bytes: Option<Memory>,
+    /// And the whole expert store, for the proportion.
+    pub store_bytes: Option<Memory>,
 }
 
 /// Read the config and say what it describes.
@@ -107,6 +157,38 @@ fn detail_of(m: &hub::LocalModel) -> Option<Detail> {
     Some(detail_from(&spec, m.params))
 }
 
+/// Weights at each precision this engine offers.
+fn memory(params: u64) -> Memory {
+    Memory {
+        f32: kvad::quant::Precision::F32.weight_bytes(params),
+        q8: kvad::quant::Precision::Q8.weight_bytes(params),
+        q4: kvad::quant::Precision::Q4.weight_bytes(params),
+    }
+}
+
+/// How the weights are packed, for the ones this engine reads packed.
+///
+/// Only fp8 today. A packing it cannot read never gets this far: it is a
+/// blocker, and the row says so in its own words.
+fn stored_as(config: &kvad::model::Json) -> Option<String> {
+    let quant = config.get("quantization_config")?;
+    if !kvad::weights::reads_packing(quant) {
+        return None;
+    }
+    let fmt = quant.get("fmt").and_then(|f| f.as_str()).unwrap_or("e4m3");
+    // The loader derives the block from the tensors' shapes rather than
+    // trusting this; it is only being repeated to a person here.
+    let block = quant
+        .get("weight_block_size")
+        .and_then(|b| b.as_array())
+        .map(|b| b.iter().filter_map(|n| n.as_u64()).map(|n| n.to_string()).collect::<Vec<_>>())
+        .filter(|b| !b.is_empty());
+    Some(match block {
+        Some(b) => format!("fp8 ({fmt}), {} blocks", b.join("×")),
+        None => format!("fp8 ({fmt})"),
+    })
+}
+
 /// The shape a spec describes, with whatever the caller knows of its size.
 ///
 /// A downloaded model knows its parameter count from the safetensors index;
@@ -115,8 +197,22 @@ fn detail_of(m: &hub::LocalModel) -> Option<Detail> {
 fn detail_from(spec: &kvad::model::Spec, params: Option<u64>) -> Detail {
     let experts = kvad::model::ffn::Router::count(&spec.config).and_then(|count| {
         let per_token = spec.config.num(&["num_experts_per_tok"])?;
-        Some(Experts { count, per_token, working_set: per_token * spec.n_layer })
+        let layout = kvad::model::ffn::Layout::read(&spec.config);
+        let layers = (0..spec.n_layer).filter(|&i| layout.is_moe(i, count)).count();
+        let expert = spec
+            .config
+            .num(&["moe_intermediate_size"])
+            .map(|width| 3 * spec.n_embd as u64 * width as u64);
+        Some(Experts {
+            count,
+            per_token,
+            working_set: per_token * layers,
+            layers,
+            working_set_bytes: expert.map(|e| memory(e * (per_token * layers) as u64)),
+            store_bytes: expert.map(|e| memory(e * (count * layers) as u64)),
+        })
     });
+    let reads = hub::Reads::of(Some(spec.config.value()));
     Detail {
         summary: spec.summary(),
         n_layer: spec.n_layer,
@@ -126,18 +222,21 @@ fn detail_from(spec: &kvad::model::Spec, params: Option<u64>) -> Detail {
         n_ctx: spec.n_ctx,
         vocab_size: spec.vocab_size,
         params,
-        memory: params.map(|p| Memory {
-            f32: kvad::quant::Precision::F32.weight_bytes(p),
-            q8: kvad::quant::Precision::Q8.weight_bytes(p),
-            q4: kvad::quant::Precision::Q4.weight_bytes(p),
-        }),
+        memory: params.map(memory),
         experts,
+        stored_as: stored_as(&spec.config),
+        fit: Verdict::of(hub::fit_of(params, reads)),
     }
 }
 
 #[derive(serde::Deserialize)]
 pub struct DetailQuery {
     repo: String,
+    /// The parameter count the search row already has, so the verdict can
+    /// be given without a second request to find it out. It only sizes an
+    /// estimate shown back to whoever sent it, so it is taken as given.
+    #[serde(default)]
+    params: Option<u64>,
 }
 
 /// What a model on the Hub is, without downloading it.
@@ -146,16 +245,21 @@ pub struct DetailQuery {
 /// rather than for every result of every search: forty rows would be forty
 /// round trips, and nearly all of them would be for a model the reader
 /// scrolled straight past.
+///
+/// It is also where the verdict is exact. A search row judges a mixture by
+/// the Hub's trimmed config, which drops DeepSeek's expert count; the file
+/// has it, so the row that could only say "a mixture" can say how sparse.
 pub async fn hub_detail(_: Identity, Query(q): Query<DetailQuery>) -> Result<Json<Detail>, Fail> {
     let repo = q.repo.trim().to_string();
     if repo.is_empty() {
         return Err(Fail::bad("which model?"));
     }
+    let params = q.params;
     let detail = blocking(move || {
         let config = hub::remote_config(&repo)
             .ok_or("that repo has no config.json we could read")?;
         let spec = kvad::model::Spec::from_config(kvad::model::Json::new(config))?;
-        Ok(detail_from(&spec, None))
+        Ok(detail_from(&spec, params))
     })
     .await?;
     Ok(Json(detail))
@@ -197,6 +301,9 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
         blocker,
         fits_at: fit.precision().map(|p| p.to_string()),
         streams: fit.streams(),
+        crawls: fit.crawls(),
+        disk_per_token: fit.per_token(),
+        mixture: m.reads.mixture(),
         detail: detail_of(m),
     }
 }
@@ -363,6 +470,12 @@ pub struct Found {
     /// slower than fitting, which is why it is said out loud rather than
     /// left for someone to infer from two numbers.
     streams: bool,
+    /// As on a downloaded model. From the trimmed config, so a mixture
+    /// whose expert count the Hub dropped has `disk_per_token: null` and
+    /// `crawls: false` until its row is opened.
+    crawls: bool,
+    disk_per_token: Option<u64>,
+    mixture: bool,
     /// What this machine has to spend on weights, so the page can say what
     /// the model is being measured against.
     usable_memory: Option<u64>,
@@ -405,13 +518,12 @@ pub async fn search(
                 local: here.contains(&m.id.as_str()),
                 params: m.params,
                 bytes: m.download_bytes,
-                memory: m.params.map(|p| Memory {
-                    f32: kvad::quant::Precision::F32.weight_bytes(p),
-                    q8: kvad::quant::Precision::Q8.weight_bytes(p),
-                    q4: kvad::quant::Precision::Q4.weight_bytes(p),
-                }),
+                memory: m.params.map(memory),
                 fits_at: m.fit().precision().map(|p| p.to_string()),
                 streams: m.fit().streams(),
+                crawls: m.fit().crawls(),
+                disk_per_token: m.fit().per_token(),
+                mixture: m.reads.mixture(),
                 usable_memory: kvad::machine::usable_memory_cached(),
                 size_known: m.params.is_some(),
                 id: m.id.clone(),
@@ -689,6 +801,7 @@ mod tests {
             // what it weighs, so the size is deliberately unknown.
             params: None,
             unreadable_as: None,
+            reads: hub::Reads::Everything,
         }
     }
 

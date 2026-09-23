@@ -212,6 +212,12 @@ impl Json {
         self.0.get(key)
     }
 
+    /// The whole tree, for a question asked of a config wherever it came
+    /// from -- [`crate::hub::Reads::of`] is asked of the Hub's copy too.
+    pub fn value(&self) -> &serde_json::Value {
+        &self.0
+    }
+
     /// The first of `keys` that is present and a number.
     ///
     /// Several keys because the same quantity has different names in

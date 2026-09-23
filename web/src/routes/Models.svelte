@@ -32,12 +32,32 @@
     )} at q8 · ${humanBytes(r.memory.q4)} at q4`;
     if (!r.streams) return each;
     const has = r.usable_memory ? humanBytes(r.usable_memory) : "what this machine has";
-    return `${each} — none of them fit in ${has}, so the weights are read from disk as the model runs. That works and it is much slower: expect a fraction of the speed a model that fits would give you.`;
+    return `${each}, against ${has}.`;
   }
 
-  /** The one-line version, for a downloaded model with no size breakdown. */
-  const STREAMS_TIP =
-    "Too large for memory, so the weights are read from disk as the model runs. It works, and it is much slower than a model that fits.";
+  /**
+   * What running from the disk costs, for a badge's tooltip.
+   *
+   * Total size is not the answer to that, and badging by it gave a dense 70B
+   * the same badge as an 80B mixture that runs. What a token reads is: the
+   * server estimates the bytes each token pages in, and the two models that
+   * were measured anchor what those numbers mean.
+   */
+  function diskTip(f) {
+    const each = f.disk_per_token == null ? null : humanBytes(f.disk_per_token);
+    if (f.crawls) {
+      return f.mixture
+        ? `Too large for memory, and a token reads enough of it to page in about ${each} from disk. Measured here, a model paging 2.5 GB a token ran at 1.5 tok/s.`
+        : `Too large for memory, and a dense model reads every weight for every token, so each one pages in at least ${each} from disk. It runs, at a crawl.`;
+    }
+    if (each) {
+      return `Too large for memory, but a mixture reads only a few of its experts per token: about ${each} from disk each. Measured here, a model paging 0.3 GB a token ran at 10.7 tok/s.`;
+    }
+    return "Too large for memory. It is a mixture, which can stream well if it is sparse enough — the Hub's summary does not say how many experts it has. Open the row to find out.";
+  }
+
+  /** The badge's words, beside the precision. */
+  const diskWord = (f) => (f.crawls ? "crawls" : f.disk_per_token != null ? "streams" : "disk");
 
   const thousands = (n) => n.toLocaleString();
 
@@ -58,13 +78,17 @@
    *  re-opening a row does not ask again. */
   let hubDetail = $state({});
 
-  async function askHub(id) {
+  async function askHub(r) {
+    const id = r.id;
     if (hubDetail[id] !== undefined) return;
     hubDetail = { ...hubDetail, [id]: "asking" };
+    // The parameter count rides along so the answer can carry a verdict
+    // without the server asking the Hub a second time.
+    const sized = r.params ? `&params=${r.params}` : "";
     try {
       hubDetail = {
         ...hubDetail,
-        [id]: await api(`/api/models/detail?repo=${encodeURIComponent(id)}`),
+        [id]: await api(`/api/models/detail?repo=${encodeURIComponent(id)}${sized}`),
       };
     } catch (e) {
       // The server's reason, not a shrug of our own: it knows things worth
@@ -90,6 +114,13 @@
     models.refresh();
   });
 
+  /** A search row's verdict: the row's own, until opening it has fetched the
+   *  whole config, whose answer is exact where the Hub's summary was not. */
+  function rowFit(r) {
+    const f = hubDetail[r.id]?.fit;
+    return f ? { ...f, mixture: r.mixture, fits_at: f.precision } : r;
+  }
+
   async function search(event) {
     event?.preventDefault();
     if (!query.trim()) return;
@@ -110,6 +141,64 @@
     if (id) await models.remove(id);
   }
 </script>
+
+<!-- The part of an opened row that is the same for a downloaded model and a
+     search result: what a mixture reads, what the weights cost here, and
+     whether that fits. -->
+{#snippet shape(d)}
+  {#if d.experts}
+    <!-- The working set is not decoration: a cache holding fewer experts than
+         one pass reads evicts every one of them before its next use, and it is
+         what a model over memory has to page in. -->
+    <div class="mt-2 opacity-70">
+      mixture of experts — {d.experts.count} per layer, {d.experts.per_token} chosen per
+      token, so one token reads {thousands(d.experts.working_set)} of them across
+      {d.experts.layers} layers
+      {#if d.experts.working_set_bytes}
+        — {humanBytes(d.experts.working_set_bytes.q4)} at q4, of a
+        {humanBytes(d.experts.store_bytes.q4)} store
+      {/if}
+    </div>
+  {/if}
+  {#if d.memory}
+    <div class="mt-2 opacity-70">
+      weights here: {humanBytes(d.memory.f32)} at f32 · {humanBytes(d.memory.q8)} at q8 ·
+      {humanBytes(d.memory.q4)} at q4
+    </div>
+  {/if}
+  {#if d.fit}
+    <div class="mt-2">
+      {#if !d.fit.streams}
+        <span class="opacity-70">Fits in memory here at {d.fit.precision}.</span>
+      {:else if d.fit.crawls}
+        <span class="text-error">
+          {d.experts ? "Crawls" : "Crawls — a dense model reads every weight for every token"}:
+          none of it fits, and each token pages in about {humanBytes(d.fit.disk_per_token)}
+          from disk.
+        </span>
+      {:else if d.fit.disk_per_token != null}
+        <span class="text-warning">
+          Streams: none of it fits, but a token pages in only about
+          {humanBytes(d.fit.disk_per_token)} from disk at {d.fit.precision}. Measured here, a
+          model paging 0.3 GB a token ran at 10.7 tok/s.
+        </span>
+      {:else}
+        <span class="opacity-70">Does not fit in memory, so it is read from disk.</span>
+      {/if}
+    </div>
+  {/if}
+  {#if d.stored_as}
+    <!-- The one fact about an fp8 checkpoint nobody would guess is that it
+         does not save memory here: the loader decodes it and quantises
+         again at whatever precision the backend runs. -->
+    <div class="mt-2 opacity-70">
+      stored as {d.stored_as} — about half the download of bf16. Decoded as it loads, so
+      in memory it costs what any copy of this model does at the precision it runs at.
+      Checked against Qwen3-0.6B's bf16 publication, fp8 weights differ by 1.7% on
+      average.
+    </div>
+  {/if}
+{/snippet}
 
 <div class="flex flex-col gap-6">
   <!-- What the engine is holding, and the one control that changes it. -->
@@ -211,9 +300,13 @@
                   <span class="badge badge-sm badge-success badge-soft">loaded</span>
                 {/if}
                 {#if m.streams}
-                  <div class="tooltip" data-tip={STREAMS_TIP}>
-                    <span class="badge badge-sm badge-warning badge-soft whitespace-nowrap">
-                      disk streaming
+                  <div class="tooltip" data-tip={diskTip(m)}>
+                    <span
+                      class="badge badge-sm badge-soft whitespace-nowrap"
+                      class:badge-warning={!m.crawls}
+                      class:badge-error={m.crawls}
+                    >
+                      {diskWord(m)} from disk
                     </span>
                   </div>
                 {/if}
@@ -262,24 +355,7 @@
                   <span>{thousands(m.detail.vocab_size)} vocab</span>
                   {#if m.detail.params}<span>{params(m.detail.params)}</span>{/if}
                 </div>
-                {#if m.detail.experts}
-                  <!-- The working set is not decoration: a cache holding fewer
-                       experts than one pass reads evicts every one of them
-                       before its next use. -->
-                  <div class="mt-2 opacity-70">
-                    mixture of experts — {m.detail.experts.count} per layer,
-                    {m.detail.experts.per_token} chosen per token, so one token reads
-                    {thousands(m.detail.experts.working_set)} of them across the model
-                  </div>
-                {/if}
-                {#if m.detail.memory}
-                  <div class="mt-2 opacity-70">
-                    weights here: {humanBytes(m.detail.memory.f32)} at f32 ·
-                    {humanBytes(m.detail.memory.q8)} at q8 ·
-                    {humanBytes(m.detail.memory.q4)} at q4
-                    {#if m.streams}— none of them fit, so they are read from disk{/if}
-                  </div>
-                {/if}
+                {@render shape(m.detail)}
               {:else}
                 <span class="opacity-60">
                   Nothing to show until its config can be read.
@@ -334,7 +410,7 @@
                why `askHub` checks whether it already has the answer. -->
           <details
             class="collapse collapse-arrow rounded-box bg-base-200/40"
-            ontoggle={(e) => e.currentTarget.open && r.arch && askHub(r.id)}
+            ontoggle={(e) => e.currentTarget.open && r.arch && askHub(r)}
           >
             <summary class="collapse-title flex flex-wrap items-center gap-x-3 gap-y-1">
               <div class="flex min-w-40 flex-1 items-center gap-2">
@@ -357,10 +433,15 @@
                 </span>
               {:else if !r.size_known}
                 <span class="text-xs opacity-50">unknown</span>
-              {:else if r.streams}
-                <div class="tooltip" data-tip={atEachPrecision(r)}>
-                  <span class="badge badge-sm badge-warning badge-soft whitespace-nowrap">
-                    {r.fits_at} · disk
+              {:else if rowFit(r).streams}
+                {@const f = rowFit(r)}
+                <div class="tooltip" data-tip={`${diskTip(f)} ${atEachPrecision(r)}`}>
+                  <span
+                    class="badge badge-sm badge-soft whitespace-nowrap"
+                    class:badge-warning={!f.crawls}
+                    class:badge-error={f.crawls}
+                  >
+                    {f.fits_at} · {diskWord(f)}
                   </span>
                 </div>
               {:else if r.fits_at}
@@ -414,20 +495,7 @@
                     <span>{thousands(hubDetail[r.id].n_ctx)} context</span>
                     <span>{thousands(hubDetail[r.id].vocab_size)} vocab</span>
                   </div>
-                  {#if hubDetail[r.id].experts}
-                    <div class="mt-2 opacity-70">
-                      mixture of experts — {hubDetail[r.id].experts.count} per layer,
-                      {hubDetail[r.id].experts.per_token} chosen per token, so one token reads
-                      {thousands(hubDetail[r.id].experts.working_set)} of them across the model
-                    </div>
-                  {/if}
-                  {#if r.memory}
-                    <div class="mt-2 opacity-70">
-                      weights here: {humanBytes(r.memory.f32)} at f32 ·
-                      {humanBytes(r.memory.q8)} at q8 · {humanBytes(r.memory.q4)} at q4
-                      {#if r.streams}— none of them fit, so they are read from disk{/if}
-                    </div>
-                  {/if}
+                  {@render shape(hubDetail[r.id])}
               {:else}
                 <span class="opacity-60">reading its config…</span>
               {/if}

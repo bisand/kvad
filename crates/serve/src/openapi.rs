@@ -138,7 +138,12 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       and for a mixture how many experts there are and how many run per \
                       token. One request for one config, so it is asked when somebody \
                       opens a result rather than for every row of every search.",
-        query: &[("repo", true, "The repo id, `owner/name`.")],
+        query: &[
+            ("repo", true, "The repo id, `owner/name`."),
+            ("params", false, "Its parameter count, as the search result gave it. With it the \
+                               answer carries a verdict: whether the model fits here, or \
+                               streams from the disk, and roughly what a token pages in."),
+        ],
         body: None, produces: JSON, events: &[],
     },
     Endpoint {

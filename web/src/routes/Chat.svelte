@@ -4,6 +4,7 @@
   import { api } from "../lib/api.js";
   import { navigate } from "../lib/router.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
+  import { render, copyFromBlock } from "../lib/markdown.js";
 
   const PLUS = "M12 5v14M5 12h14";
   const TRASH = "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6";
@@ -159,7 +160,15 @@
 
       {#each chat.messages as m (m.id)}
         <div class="chat {m.role === 'user' ? 'chat-end' : 'chat-start'}">
-          <div class="chat-bubble whitespace-pre-wrap">{m.content}</div>
+          {#if m.role === "assistant"}
+            <!-- Rendered, because the model wrote Markdown. `render`
+                 sanitises; see lib/markdown.js. -->
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <div class="chat-bubble md" onclick={copyFromBlock}>{@html render(m.content)}</div>
+          {:else}
+            <!-- Typed, not generated: the literal text is the honest one. -->
+            <div class="chat-bubble whitespace-pre-wrap">{m.content}</div>
+          {/if}
           {#if describeStats(m.stats)}
             <div class="chat-footer mt-1 text-xs opacity-50">{describeStats(m.stats)}</div>
           {/if}
@@ -185,11 +194,16 @@
               </div>
             </details>
           {/if}
-          <div class="chat-bubble whitespace-pre-wrap">
-            {chat.streaming}{#if chat.streaming === ""}<span
-                class="loading loading-dots loading-sm align-middle"
-              ></span>{/if}
-          </div>
+          <!-- Rendered as it arrives, so the formatting settles token by
+               token rather than snapping into place at the end. -->
+          {#if chat.streaming === ""}
+            <div class="chat-bubble">
+              <span class="loading loading-dots loading-sm align-middle"></span>
+            </div>
+          {:else}
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <div class="chat-bubble md" onclick={copyFromBlock}>{@html render(chat.streaming)}</div>
+          {/if}
         </div>
       {/if}
 

@@ -5,3 +5,74 @@
 
 @source "../index.html";
 @source "./**/*.{svelte,js}";
+
+/* A model's reply, rendered from Markdown by lib/markdown.js.
+ *
+ * Tailwind's preflight takes every margin and list marker away, which is
+ * right for an app and wrong for prose, so they come back here -- scoped to
+ * `.md`, where the only content is what the renderer produced. Colours are
+ * the theme's own, so light and dim both follow without a second sheet. */
+@layer components {
+  .md { overflow-wrap: anywhere; }
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p, .md ul, .md ol, .md blockquote, .md table, .md .md-code { margin: 0.5em 0; }
+  .md h1, .md h2, .md h3, .md h4 { font-weight: 600; margin: 0.8em 0 0.3em; line-height: 1.3; }
+  .md h1 { font-size: 1.25em; }
+  .md h2 { font-size: 1.15em; }
+  .md h3, .md h4 { font-size: 1em; }
+  .md ul { list-style: disc; padding-left: 1.4em; }
+  .md ol { list-style: decimal; padding-left: 1.6em; }
+  .md li { margin: 0.15em 0; }
+  .md li > ul, .md li > ol { margin: 0.15em 0; }
+  .md a { text-decoration: underline; text-underline-offset: 2px; }
+  .md blockquote {
+    border-left: 3px solid color-mix(in oklab, var(--color-base-content) 25%, transparent);
+    padding-left: 0.75em;
+    opacity: 0.85;
+  }
+  .md hr { border-color: color-mix(in oklab, var(--color-base-content) 20%, transparent); margin: 0.8em 0; }
+  .md :not(pre) > code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+    padding: 0.1em 0.35em;
+    border-radius: 0.3em;
+    background: color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  }
+  /* A table wider than the bubble scrolls rather than pushing it wider. */
+  .md table { display: block; overflow-x: auto; border-collapse: collapse; font-size: 0.9em; }
+  .md th, .md td {
+    border: 1px solid color-mix(in oklab, var(--color-base-content) 20%, transparent);
+    padding: 0.25em 0.6em;
+  }
+  .md th { font-weight: 600; background: color-mix(in oklab, var(--color-base-content) 6%, transparent); }
+
+  .md .md-code {
+    border-radius: 0.5em;
+    overflow: hidden;
+    background: color-mix(in oklab, var(--color-base-content) 8%, transparent);
+  }
+  .md .md-code-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.1em 0.25em 0.1em 0.75em;
+    font-size: 0.75em;
+    opacity: 0.7;
+    background: color-mix(in oklab, var(--color-base-content) 6%, transparent);
+  }
+  .md pre { overflow-x: auto; padding: 0.6em 0.75em; margin: 0; }
+  .md pre code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+
+  /* highlight.js's classes, coloured by the theme rather than by a
+   * stylesheet of its own. */
+  .md .hljs-comment, .md .hljs-quote { opacity: 0.6; font-style: italic; }
+  .md .hljs-keyword, .md .hljs-selector-tag, .md .hljs-meta .hljs-keyword { color: var(--color-primary); }
+  .md .hljs-string, .md .hljs-regexp, .md .hljs-addition { color: var(--color-success); }
+  .md .hljs-number, .md .hljs-literal, .md .hljs-symbol { color: var(--color-warning); }
+  .md .hljs-title, .md .hljs-title.function_, .md .hljs-section { color: var(--color-info); }
+  .md .hljs-type, .md .hljs-built_in, .md .hljs-title.class_ { color: var(--color-secondary); }
+  .md .hljs-attr, .md .hljs-attribute, .md .hljs-variable, .md .hljs-template-variable { color: var(--color-accent); }
+  .md .hljs-meta, .md .hljs-doctag { opacity: 0.75; }
+  .md .hljs-deletion { color: var(--color-error); }
+}

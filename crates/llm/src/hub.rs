@@ -97,9 +97,14 @@ impl HubModel {
     pub fn fit(&self) -> Fit {
         match (self.params, crate::machine::usable_memory()) {
             (None, _) | (_, None) => Fit::Unknown,
-            (Some(_), Some(_)) => match self.best_precision() {
+            (Some(params), Some(has)) => match self.best_precision() {
                 Some(p) => Fit::At(p),
-                None => Fit::TooBig,
+                // The smallest precision there is, which is what "does not
+                // fit" is measured against.
+                None => Fit::TooBig {
+                    needs: crate::quant::Precision::SMALLEST_FIRST[0].weight_bytes(params),
+                    has,
+                },
             },
         }
     }
@@ -110,8 +115,15 @@ impl HubModel {
 pub enum Fit {
     /// Fits, at this precision or anything smaller.
     At(crate::quant::Precision),
-    /// Does not fit even at q4.
-    TooBig,
+    /// Does not fit even at q4, with what the smallest precision would
+    /// need against what this machine has.
+    ///
+    /// The two numbers are the point. "Too big" on its own covers a model
+    /// a gigabyte over and a model eight times over, and those are not the
+    /// same situation: the first is what an expert cache is for, and no
+    /// amount of engineering rescues the second. See
+    /// [`crate::residency`] for which side of that line is worth being on.
+    TooBig { needs: u64, has: u64 },
     /// The Hub did not say how big it is, or we cannot read this machine's
     /// memory. Saying nothing beats guessing.
     Unknown,
@@ -121,7 +133,13 @@ impl std::fmt::Display for Fit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Fit::At(p) => write!(f, "fits at {p}"),
-            Fit::TooBig => f.write_str("too big"),
+            Fit::TooBig { needs, has } => write!(
+                f,
+                "too big — {} at {}, have {}",
+                human_bytes(*needs),
+                crate::quant::Precision::SMALLEST_FIRST[0],
+                human_bytes(*has)
+            ),
             Fit::Unknown => f.write_str("?"),
         }
     }
@@ -569,7 +587,13 @@ mod tests {
 
         // And something no precision saves.
         let huge = (usable as f64 / Precision::Q4.bytes_per_weight()) as u64 * 4;
-        assert_eq!(sized(Some(huge)).fit(), Fit::TooBig);
+        assert!(matches!(sized(Some(huge)).fit(), Fit::TooBig { .. }));
+        // The numbers are the reason this variant carries anything: a model
+        // barely over and a model many times over both used to read "too
+        // big", and only one of them is worth streaming from a disk.
+        let Fit::TooBig { needs, has } = sized(Some(huge)).fit() else { panic!("expected TooBig") };
+        assert!(needs > has, "{needs} should not fit in {has}");
+        assert_eq!(needs, Precision::SMALLEST_FIRST[0].weight_bytes(huge));
     }
 
     /// The Hub reports a mixed-dtype checkpoint as counts per dtype, and the

@@ -284,7 +284,7 @@ pub async fn search(
                 }),
                 fits_at: match m.fit() {
                     hub::Fit::At(p) => Some(p.to_string()),
-                    hub::Fit::TooBig | hub::Fit::Unknown => None,
+                    hub::Fit::TooBig { .. } | hub::Fit::Unknown => None,
                 },
                 size_known: m.params.is_some(),
                 id: m.id.clone(),

@@ -492,7 +492,6 @@ async fn resident_for(state: &State, model: Option<&str>) -> Result<Resident, Fa
 
     let (repo, backend) = crate::scheduler::parse_id(name);
     let repo = repo.to_string();
-    let db = state.db.clone();
     let (on_disk, default) = {
         let repo = repo.clone();
         blocking(move || {
@@ -503,7 +502,7 @@ async fn resident_for(state: &State, model: Option<&str>) -> Result<Resident, Fa
             // function: a load started from here and a load started from
             // there must not disagree about what "the default backend"
             // means.
-            Ok((here, crate::models::default_backend(&db, Some(&repo))))
+            Ok((here, crate::models::default_backend(Some(&repo))))
         })
         .await?
     };

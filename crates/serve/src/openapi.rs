@@ -159,7 +159,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       stream rather than a request with nothing in it. `POST` and not \
                       `EventSource`, because the body names the model.",
         query: &[], body: json_body("`{ repo, backend? }`. The backend is an id from \
-                                     `/api/models`; omitted means the last one used."),
+                                     `/api/models`, for this load only; omitted means \
+                                     what this build prefers for the model, `gpu-q8` \
+                                     wherever the GPU backend can run it."),
         produces: SSE,
         events: &[
             ("progress", "A status line, or bytes for a download bar."),

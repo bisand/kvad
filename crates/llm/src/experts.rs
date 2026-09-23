@@ -192,13 +192,25 @@ impl ExpertStore {
     }
 
     /// Open a descriptor that will not be cached by the kernel.
+    ///
+    /// On macOS, that is: `F_NOCACHE` and no read-ahead. Linux has no
+    /// per-descriptor switch that bypasses the page cache — `O_DIRECT` is the
+    /// nearest, and it wants the buffer aligned as well as the offset — so
+    /// there it is read-ahead off and nothing more. The bytes are the same
+    /// either way. What Linux does not get is the memory: the kernel keeps its
+    /// own copy of what this reads, beside the copy the cache holds.
     pub fn open_uncached(&self) -> Res<File> {
         let file = File::open(&self.path)?;
         // Best effort: a kernel that declines still returns correct bytes,
         // just slower to measure and heavier on memory.
+        #[cfg(target_os = "macos")]
         unsafe {
             libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
             libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
         }
         Ok(file)
     }

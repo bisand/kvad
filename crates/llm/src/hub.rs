@@ -101,7 +101,7 @@ impl HubModel {
                 Some(p) => Fit::At(p),
                 // The smallest precision there is, which is what "does not
                 // fit" is measured against.
-                None => Fit::TooBig {
+                None => Fit::Slow {
                     needs: crate::quant::Precision::SMALLEST_FIRST[0].weight_bytes(params),
                     has,
                 },
@@ -115,15 +115,21 @@ impl HubModel {
 pub enum Fit {
     /// Fits, at this precision or anything smaller.
     At(crate::quant::Precision),
-    /// Does not fit even at q4, with what the smallest precision would
-    /// need against what this machine has.
+    /// Runs, but out of the disk rather than out of memory: what the
+    /// smallest precision needs, against what this machine has.
     ///
-    /// The two numbers are the point. "Too big" on its own covers a model
-    /// a gigabyte over and a model eight times over, and those are not the
-    /// same situation: the first is what an expert cache is for, and no
-    /// amount of engineering rescues the second. See
-    /// [`crate::residency`] for which side of that line is worth being on.
-    TooBig { needs: u64, has: u64 },
+    /// Not "too big", which is what this used to say and what it is not.
+    /// A model larger than memory is mapped, and the pages it wants are
+    /// fetched as it touches them; it produces the same tokens, slower.
+    /// Measured here: DeepSeek-V2-Lite at f32, a fifth larger than memory,
+    /// generated at 1.5 tok/s against 24 with everything resident. Slow is
+    /// the honest word, and refusing would have been the wrong answer to a
+    /// model that works.
+    ///
+    /// The two numbers are what separate a model a third over from one
+    /// eleven times over. Both are slow; only the first is worth running.
+    /// See [`crate::residency`] for where that line falls.
+    Slow { needs: u64, has: u64 },
     /// The Hub did not say how big it is, or we cannot read this machine's
     /// memory. Saying nothing beats guessing.
     Unknown,
@@ -133,9 +139,9 @@ impl std::fmt::Display for Fit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Fit::At(p) => write!(f, "fits at {p}"),
-            Fit::TooBig { needs, has } => write!(
+            Fit::Slow { needs, has } => write!(
                 f,
-                "too big — {} at {}, have {}",
+                "slow — {} at {}, have {}",
                 human_bytes(*needs),
                 crate::quant::Precision::SMALLEST_FIRST[0],
                 human_bytes(*has)
@@ -587,11 +593,11 @@ mod tests {
 
         // And something no precision saves.
         let huge = (usable as f64 / Precision::Q4.bytes_per_weight()) as u64 * 4;
-        assert!(matches!(sized(Some(huge)).fit(), Fit::TooBig { .. }));
+        assert!(matches!(sized(Some(huge)).fit(), Fit::Slow { .. }));
         // The numbers are the reason this variant carries anything: a model
-        // barely over and a model many times over both used to read "too
-        // big", and only one of them is worth streaming from a disk.
-        let Fit::TooBig { needs, has } = sized(Some(huge)).fit() else { panic!("expected TooBig") };
+        // barely over and a model many times over are both slow, and only
+        // one of them is slow enough to still be worth running.
+        let Fit::Slow { needs, has } = sized(Some(huge)).fit() else { panic!("expected Slow") };
         assert!(needs > has, "{needs} should not fit in {has}");
         assert_eq!(needs, Precision::SMALLEST_FIRST[0].weight_bytes(huge));
     }

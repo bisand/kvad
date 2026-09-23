@@ -26,9 +26,31 @@
 //! rather than any single value, because the absolute number says as much
 //! about the text as about the model.
 //!
-//! Score several kinds of text. Quantisation does not degrade every domain
-//! equally, and code -- which is full of exact tokens that are either right
-//! or wrong -- tends to show damage that prose absorbs.
+//! Score several kinds of text, and more of them than feels necessary.
+//! What this measured first, on two texts per model, was that two texts
+//! per model is not enough:
+//!
+//! ```text
+//!                                        prose    code    mean
+//! Qwen3-0.6B         dense 0.6B          +9.35%  +9.63%   9.5%
+//! Qwen3-14B          dense 14.8B         +5.74% +10.27%   8.0%
+//! DeepSeek-V2-Lite   MoE 15.7B/2.4B     +11.52%  +9.28%  10.4%
+//! ```
+//!
+//! That was run to find out whether a mixture is more fragile under
+//! rounding than a dense model of the same order -- the reasoning at the
+//! top of this comment says it should be. The answer is that this cannot
+//! tell: the mixture is worst on prose and best on code, and the 2.4
+//! points between the means are swamped by the 4.5 points that one model
+//! moves between one domain and the next. Anyone wanting that answer needs
+//! many texts per model and a spread to go with each number, not two
+//! samples and a difference.
+//!
+//! What all six agree on is the part worth acting on. q4 costs six to
+//! eleven per cent whatever the architecture, and q8 -- measured against
+//! f32 on the one model here small enough to hold at f32 -- costs -0.25%
+//! and +0.26%, landing on both sides of zero, which is what free looks
+//! like.
 
 use kvad::quant::Precision;
 use kvad::runtime::Llm;

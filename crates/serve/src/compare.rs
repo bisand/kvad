@@ -134,6 +134,12 @@ async fn switch(
     outcome.map(|_| key).map_err(String::from)
 }
 
+/// What a generation that stopped before its first token is called.
+///
+/// The model chose its end token first. It is not an engine failure, and it
+/// is not an answer either.
+const WROTE_NOTHING: &str = "the model wrote nothing: it ended its turn before the first token";
+
 /// Read one generation to its end, and return what was written and what it
 /// cost.
 ///
@@ -250,12 +256,20 @@ pub fn suite(
                     Err(why) => (format!("<{why}>"), Stats::default()),
                 };
                 let how = case.how.clone().unwrap_or_else(|| "contains".into());
+                let right = matches(&got, &case.expect, &how);
+                // An empty answer reads like a page that failed to show one,
+                // so it says what happened instead — after the verdict, which
+                // is about what the model wrote.
+                let got = match stats.generated_tokens {
+                    0 if got.is_empty() => format!("<{WROTE_NOTHING}>"),
+                    _ => got,
+                };
                 let verdict = Case {
                     variant: variant.label(),
                     idx: idx as i64,
                     prompt: case.prompt.clone(),
                     expect: case.expect.clone(),
-                    passed: matches(&got, &case.expect, &how),
+                    passed: right,
                     got,
                     decode_per_sec: (stats.generated_tokens > 0)
                         .then(|| stats.tokens_per_sec() as f64),
@@ -464,6 +478,17 @@ pub fn bench(
                 // different number of tokens on every model.
                 let pieces = engine.complete(&on, p.prompt.clone(), sampling, 0, true);
                 let (text, stats) = match once(pieces).await {
+                    // Not a sample: a rate over no tokens is a zero that would
+                    // sit in the median looking like a very slow model.
+                    Ok((_, stats)) if stats.generated_tokens == 0 => {
+                        failure = Some(format!(
+                            "{}: {WROTE_NOTHING}. An instruct model does that with a \
+                             finished question; a benchmark wants text to continue, \
+                             such as the start of a sentence",
+                            variant.label()
+                        ));
+                        break 'rounds;
+                    }
                     Ok(answer) => answer,
                     Err(why) => {
                         failure = Some(format!("{}: {why}", variant.label()));
@@ -873,6 +898,75 @@ mod against_a_real_model {
         assert!(v.passed, "got `{}` from {:?} tokens", v.got, v.generated_tokens);
         // The answer and nothing after it: end-of-turn stopped it.
         assert_eq!(v.generated_tokens, Some(11));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A case the model answered with nothing says so, rather than showing
+    /// an empty answer that looks like a page that failed to draw one.
+    ///
+    /// The model is the instruct one with its template taken away: a base
+    /// model with an end token, handed a question it has only ever seen
+    /// ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_case_answered_with_nothing_says_so() {
+        let dir = tiny_instruct_model("silent");
+        std::fs::remove_file(dir.join("tokenizer_config.json")).unwrap();
+        let jobs = Arc::new(Jobs::new(Db::in_memory().unwrap()));
+        let engine = Arc::new(Scheduler::spawn(kvad::service::cpu_loader, roomy()));
+        let variants = resolve(&[Variant {
+            model: dir.to_string_lossy().into_owned(),
+            backend: "cpu-f32".into(),
+        }])
+        .unwrap();
+
+        // `nothing` is in the note, and a note is not an answer.
+        let cases = vec![Expectation {
+            prompt: "the cat?".into(),
+            expect: "nothing".into(),
+            how: None,
+        }];
+        let job =
+            suite(&jobs, &engine, "silent".into(), cases, variants, 16, 1337, None).unwrap();
+        let job = finished(&jobs, job.id).await;
+        assert_eq!(job.state, "done", "{:?}", job.error);
+
+        let v = &jobs.cases(job.id).unwrap()[0];
+        assert_eq!(v.generated_tokens, Some(0));
+        assert_eq!(v.got, format!("<{WROTE_NOTHING}>"));
+        assert!(!v.passed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A benchmark whose prompt the model ends at once fails, and says why,
+    /// rather than keeping a sample of no tokens at no tokens a second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_benchmark_of_nothing_is_refused_rather_than_timed() {
+        let dir = tiny_instruct_model("bench-silent");
+        let jobs = Arc::new(Jobs::new(Db::in_memory().unwrap()));
+        let engine = Arc::new(Scheduler::spawn(kvad::service::cpu_loader, roomy()));
+        let variants = resolve(&[Variant {
+            model: dir.to_string_lossy().into_owned(),
+            backend: "cpu-f32".into(),
+        }])
+        .unwrap();
+
+        // Raw text, so the question arrives as a finished user turn.
+        let p = BenchParams {
+            prompt: "the cat?".into(),
+            rounds: 2,
+            tokens: 8,
+            seed: 1337,
+            keep_text: false,
+        };
+        let job = bench(&jobs, &engine, p, variants, None).unwrap();
+        let job = finished(&jobs, job.id).await;
+
+        assert_eq!(job.state, "failed");
+        let why = job.error.unwrap_or_default();
+        assert!(why.contains(WROTE_NOTHING) && why.contains("text to continue"), "{why}");
+        assert!(jobs.timings(job.id).unwrap().is_empty(), "a sample of nothing was kept");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

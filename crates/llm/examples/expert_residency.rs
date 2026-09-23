@@ -22,6 +22,13 @@
 //!                        idea and a bad one)
 //!     --ram GB           mark the capacities that would fit in this much
 //!     --gb A,B,C         capacities to try, instead of the default sweep
+//!     --compute-ms N     how long a token takes when every expert is
+//!                        already resident, measured by generating with
+//!                        this model. Turns the tok/s column from a disk
+//!                        ceiling into a band: perfect overlap of fetch and
+//!                        arithmetic at one end, none at the other. The
+//!                        truth is in between, and which end it is near is
+//!                        the one thing a prefetcher decides.
 //!     --pin-from OTHER   choose the pinned set from another trace's
 //!                        frequencies rather than this one's, which is the
 //!                        difference between a claim and a measurement:
@@ -43,6 +50,7 @@ fn main() {
     };
     let bandwidth = flag("--bandwidth").and_then(|v| v.parse::<f64>().ok()).unwrap_or(11.7) * GB;
     let ram = flag("--ram").and_then(|v| v.parse::<f64>().ok()).map(|g| g * GB);
+    let compute = flag("--compute-ms").and_then(|v| v.parse::<f64>().ok());
 
     let read = |p: &str| match Log::read(std::path::Path::new(p)) {
         Ok(log) => log,
@@ -101,13 +109,21 @@ fn main() {
             .collect(),
     };
 
+    let last = match compute {
+        Some(_) => "tok/s, LRU",
+        None => "tok/s ceiling",
+    };
     println!(
         "  {:>6} {:>5}   {:>15}   {:>15}   {:>15}   {:>13}",
-        "cap GB", "%", "LRU", "pinned", "optimal", "tok/s ceiling"
+        "cap GB", "%", "LRU", "pinned", "optimal", last
     );
+    let (a, b) = match compute {
+        Some(_) => ("overlap", "none"),
+        None => ("LRU", "opt"),
+    };
     println!(
         "  {:>6} {:>5}   {:>6} {:>8}   {:>6} {:>8}   {:>6} {:>8}   {:>6} {:>6}",
-        "", "", "hit", "GB/tok", "hit", "GB/tok", "hit", "GB/tok", "LRU", "opt"
+        "", "", "hit", "GB/tok", "hit", "GB/tok", "hit", "GB/tok", a, b
     );
 
     for capacity in capacities {
@@ -128,11 +144,21 @@ fn main() {
         for o in &by {
             print!("   {:>5.1}% {:>8.3}", 100.0 * o.hit_rate(), o.bytes_per_token() / GB);
         }
-        println!(
-            "   {:>6.1} {:>6.1}",
-            by[0].ceiling(bandwidth).min(9999.9),
-            by[2].ceiling(bandwidth).min(9999.9)
-        );
+        match compute {
+            // With a measured cost per token, the two columns bracket the
+            // answer: fetch entirely hidden behind arithmetic, and fetch
+            // entirely exposed. No engine beats the first or loses to the
+            // second.
+            Some(ms) => {
+                let fetch = 1e3 * by[0].bytes_per_token() / bandwidth;
+                println!("   {:>6.1} {:>6.1}", 1e3 / ms.max(fetch), 1e3 / (ms + fetch));
+            }
+            None => println!(
+                "   {:>6.1} {:>6.1}",
+                by[0].ceiling(bandwidth).min(9999.9),
+                by[2].ceiling(bandwidth).min(9999.9)
+            ),
+        }
     }
 
     if ram.is_some() {
@@ -147,9 +173,12 @@ fn main() {
             "\n`pinned` ranked experts on this same trace, which flatters it: it is the\nceiling for pinning, not a result. Re-run with --pin-from ANOTHER.trace to\nfind out how much of that survives a profile taken elsewhere."
         ),
     }
-    println!(
-        "\ntok/s is a ceiling, not a prediction: it assumes compute is free, every\n\
-         fetch streams at full rate, and nothing is prefetched. A real engine lands\n\
-         below it — so a row that looks bad here cannot be rescued by good code."
-    );
+    match compute {
+        Some(ms) => println!(
+            "\ntok/s brackets LRU between fetch fully hidden behind arithmetic and fetch\n             fully exposed, against {ms:.0} ms/token of compute. A real engine lands\n             inside that band, and where depends on how well it prefetches."
+        ),
+        None => println!(
+            "\ntok/s is a ceiling, not a prediction: it assumes compute is free, every\n             fetch streams at full rate, and nothing is prefetched. Pass --compute-ms\n             with a measured cost per token to get a band instead."
+        ),
+    }
 }

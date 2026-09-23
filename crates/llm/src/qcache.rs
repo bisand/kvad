@@ -216,6 +216,25 @@ impl<T: Plain> Store<T> {
         Ok(Store::Mapped { map: Arc::clone(map), off, len, _t: PhantomData })
     }
 
+    /// Ask the kernel to start reading this array now, if it is mapped.
+    ///
+    /// A hint, and free to ignore: the bytes are right either way, and an
+    /// owned or slab-backed array has nothing to fetch.
+    pub fn will_need(&self) {
+        let Store::Mapped { map, off, len, .. } = self else { return };
+        static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        // SAFETY: `sysconf` reads a constant of the running system.
+        let page = *PAGE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize);
+        let start = map.as_ptr() as usize + off;
+        let base = start & !(page - 1);
+        let end = start + len * std::mem::size_of::<T>();
+        // SAFETY: the range lies inside a live mapping, rounded out to whole
+        // pages that also lie inside it, and `madvise` reads nothing.
+        unsafe {
+            libc::madvise(base as *mut libc::c_void, end - base, libc::MADV_WILLNEED);
+        }
+    }
+
     /// This array, found in `slab` instead of in the file.
     ///
     /// `lo` is where in the file the slab's copy begins -- the page-aligned

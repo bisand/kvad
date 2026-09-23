@@ -553,37 +553,29 @@ impl Moe {
             Some(shared) => shared.run(hs, m),
             None => vec![0.0f32; m * e],
         };
-        let mut rows = Vec::with_capacity(m * e);
-        let mut apply = |expert: usize, ffn: &Ffn| {
-            let tokens = &by_expert[expert];
-            rows.clear();
-            for &(i, _) in tokens {
-                rows.extend_from_slice(&hs[i * e..(i + 1) * e]);
-            }
-            let y = ffn.run(&rows, tokens.len());
-            for (j, &(i, weight)) in tokens.iter().enumerate() {
-                for (o, v) in out[i * e..(i + 1) * e]
-                    .iter_mut()
-                    .zip(&y[j * e..(j + 1) * e])
-                {
-                    *o += weight * v;
-                }
-            }
-        };
         let chosen: Vec<usize> = (0..n).filter(|&x| !by_expert[x].is_empty()).collect();
         let mut done = vec![false; n];
         if let Some(resident) = &self.resident {
             // The same arithmetic on the same bytes, read by us rather than
             // paged in. A weight that cannot be rebased runs as mapped.
-            let read = resident.with(self.layer, &chosen, |expert, slab, lo| {
-                match self.experts[expert].rebased(lo, slab) {
-                    Some(ffn) => apply(expert, &ffn),
-                    None => {
-                        resident.fell_back();
-                        apply(expert, &self.experts[expert]);
-                    }
+            let read = resident.with(self.layer, &chosen, |group| {
+                let views: Vec<Option<Ffn>> =
+                    group.iter().map(|&(x, slab, lo)| self.experts[x].rebased(lo, slab)).collect();
+                let pairs: Vec<(usize, &Ffn)> = group
+                    .iter()
+                    .zip(&views)
+                    .map(|(&(x, ..), view)| match view {
+                        Some(ffn) => (x, ffn),
+                        None => {
+                            resident.fell_back();
+                            (x, &self.experts[x])
+                        }
+                    })
+                    .collect();
+                mix(hs, m, e, &by_expert, &pairs, &mut out);
+                for &(x, ..) in group {
+                    done[x] = true;
                 }
-                done[expert] = true;
             });
             // A failed read costs speed and not the answer: whatever it did
             // not reach runs from the mapping below.
@@ -592,15 +584,110 @@ impl Moe {
                 SAID.call_once(|| eprintln!("expert cache: falling back to the mapping: {err}"));
             }
         }
-        for expert in chosen {
-            if !done[expert] {
-                apply(expert, &self.experts[expert]);
-            }
-        }
+        let rest: Vec<(usize, &Ffn)> =
+            chosen.iter().filter(|&&x| !done[x]).map(|&x| (x, &self.experts[x])).collect();
+        mix(hs, m, e, &by_expert, &rest, &mut out);
         out
     }
 }
 
+
+/// Run `group` -- each expert with the weights to run it from -- and add
+/// each one's output into `out`, weighted, in the order given.
+///
+/// The order is the answer's: floating-point addition does not reassociate,
+/// so the experts are summed in the order the unbatched path always used.
+fn mix(
+    hs: &[f32],
+    m: usize,
+    e: usize,
+    by_expert: &[Vec<(usize, f32)>],
+    group: &[(usize, &Ffn)],
+    out: &mut [f32],
+) {
+    if group.is_empty() {
+        return;
+    }
+    if m == 1 && together() {
+        // Every chosen expert's reads started at once, before any thread
+        // faults on one. Batching without this is a bet that the experts
+        // are already resident: measured cold, it lost to running them one
+        // at a time (8.8 against 11.8 tok/s on Qwen3-30B at q8), and with it
+        // it won (13.8). A no-op for experts read into slabs.
+        if hint() {
+            for &(_, ffn) in group {
+                ffn.gate.will_need();
+                ffn.up.will_need();
+                ffn.down.will_need();
+            }
+        }
+        if let Some(ys) = decode_together(hs, group) {
+            for (&(expert, _), y) in group.iter().zip(ys) {
+                // One token, which chose each of these experts exactly once.
+                let weight = by_expert[expert][0].1;
+                for (o, v) in out.iter_mut().zip(&y) {
+                    *o += weight * v;
+                }
+            }
+            return;
+        }
+    }
+    let mut rows = Vec::with_capacity(m * e);
+    for &(expert, ffn) in group {
+        let tokens = &by_expert[expert];
+        rows.clear();
+        for &(i, _) in tokens {
+            rows.extend_from_slice(&hs[i * e..(i + 1) * e]);
+        }
+        let y = ffn.run(&rows, tokens.len());
+        for (j, &(i, weight)) in tokens.iter().enumerate() {
+            for (o, v) in out[i * e..(i + 1) * e].iter_mut().zip(&y[j * e..(j + 1) * e]) {
+                *o += weight * v;
+            }
+        }
+    }
+}
+
+/// One token through all of its experts at once: every gate and up
+/// projection as one parallel section, then every down projection as
+/// another. See [`crate::quant::matvec_many`].
+///
+/// Through [`Ffn::run`] that was three sections an expert -- thirty a layer
+/// on Qwen3-Next, each a 0.66 MB matrix split fourteen ways -- and the
+/// profile of that was a thread pool mostly yielding. Here it is two.
+/// `None` when the weights are not quantised; the caller runs them singly.
+fn decode_together(x: &[f32], group: &[(usize, &Ffn)]) -> Option<Vec<Vec<f32>>> {
+    let mut jobs = Vec::with_capacity(2 * group.len());
+    for &(_, ffn) in group {
+        jobs.push((&ffn.gate, x));
+        jobs.push((&ffn.up, x));
+    }
+    let mut both = crate::quant::matvec_many(&jobs)?.into_iter();
+    let mut hidden = Vec::with_capacity(group.len());
+    while let (Some(mut gate), Some(up)) = (both.next(), both.next()) {
+        swiglu_inplace(&mut gate, &up);
+        hidden.push(gate);
+    }
+    let jobs: Vec<(&Weight, &[f32])> =
+        group.iter().zip(&hidden).map(|(&(_, ffn), h)| (&ffn.down, h.as_slice())).collect();
+    crate::quant::matvec_many(&jobs)
+}
+
+/// Whether to tell the kernel which experts a token chose before running
+/// them. On unless `KVAD_EXPERT_WILLNEED=0`, which is there for the A/B.
+fn hint() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("KVAD_EXPERT_WILLNEED").as_deref(), Ok("0") | Ok("false")))
+}
+
+/// Whether a token's experts run as one batch. `KVAD_EXPERTS_ONE_BY_ONE=1`
+/// puts back the path this replaced, so the two are one flag apart.
+fn together() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(std::env::var("KVAD_EXPERTS_ONE_BY_ONE").as_deref(), Ok("1") | Ok("true"))
+    })
+}
 
 impl Mlp {
     /// A batch of tokens. Prefill, and scoring.
@@ -665,6 +752,35 @@ mod tests {
 
     fn config(v: serde_json::Value) -> Json {
         Json::new(v)
+    }
+
+    /// A token's experts run as one batch give each expert's output exactly
+    /// as it came from running that expert alone -- the property that lets
+    /// the batched decode path replace the old one without changing a token.
+    #[test]
+    fn a_tokens_experts_together_equal_them_one_by_one() {
+        use crate::quant::Precision;
+        use crate::tensor::Tensor;
+        let mut rng = nervus::rng::Rng::new(11);
+        let mut mat = |rows: usize, cols: usize| {
+            Tensor::new(rows, cols, (0..rows * cols).map(|_| rng.normal() * 0.1).collect())
+        };
+        for precision in [Precision::Q8, Precision::Q4] {
+            let (hidden, width) = (64, 96);
+            let experts: Vec<Ffn> = (0..3)
+                .map(|_| Ffn {
+                    gate: Weight::quantize(mat(width, hidden), precision),
+                    up: Weight::quantize(mat(width, hidden), precision),
+                    down: Weight::quantize(mat(hidden, width), precision),
+                })
+                .collect();
+            let x = mat(1, hidden).data;
+            let group: Vec<(usize, &Ffn)> = experts.iter().enumerate().collect();
+            let together = decode_together(&x, &group).expect("quantised experts batch");
+            for (k, (ffn, got)) in experts.iter().zip(&together).enumerate() {
+                assert_eq!(got, &ffn.run(&x, 1), "{precision}: expert {k} differs");
+            }
+        }
     }
 
     /// The same quantity, two spellings, and a dense model has neither.

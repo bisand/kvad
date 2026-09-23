@@ -312,6 +312,22 @@ impl Weight {
         Some(Weight { rows: self.rows, cols: self.cols, data })
     }
 
+    /// Start reading this weight's bytes, if it is mapped from a file. See
+    /// [`crate::qcache::Store::will_need`].
+    pub fn will_need(&self) {
+        match &self.data {
+            Data::Q8 { scales, qs } => {
+                scales.will_need();
+                qs.will_need();
+            }
+            Data::Q4 { scales, qs } => {
+                scales.will_need();
+                qs.will_need();
+            }
+            Data::F32(_) => {}
+        }
+    }
+
     pub fn from_f32(t: Tensor) -> Weight {
         Weight { rows: t.rows, cols: t.cols, data: Data::F32(t) }
     }
@@ -385,6 +401,56 @@ impl Weight {
         }
     }
 
+    /// One output of [`Weight::matvec_bt`]: row `r` against the quantised
+    /// activation. Shared with [`matvec_many`], which is the same arithmetic
+    /// cut into different parallel sections, and must stay bit-identical.
+    ///
+    /// `inline(always)` because this is the hottest loop in the engine and
+    /// was written inline for the vectoriser's sake: see the pass comments.
+    #[inline(always)]
+    fn qrow(&self, xq: &QActivation, r: usize, dots: &mut [i32]) -> f32 {
+        let n = self.cols;
+        let base = r * (n / BLOCK);
+
+        // ---- pass 1: integers only ---------------------
+        //
+        // This loop must contain no floating-point work at all. Mixing the
+        // per-block scaling in here -- the obvious way to write it -- stops
+        // the whole thing vectorising: the float accumulation is a
+        // non-associative chain the compiler may not reorder, and
+        // interleaving it with the integer reduction defeats that too.
+        // Split into two passes, this becomes `sdot`; combined, it compiles
+        // to scalar loads and multiplies and runs several times slower.
+        //
+        // The scratch buffer is a few hundred bytes and never leaves L1.
+        match &self.data {
+            Data::Q8 { qs, .. } => {
+                let row = &qs[r * n..(r + 1) * n];
+                for (d, (wb, xb)) in
+                    dots.iter_mut().zip(row.chunks_exact(BLOCK).zip(xq.qs.chunks_exact(BLOCK)))
+                {
+                    *d = wb.iter().zip(xb.iter()).map(|(&w, &v)| w as i32 * v as i32).sum();
+                }
+            }
+            Data::Q4 { qs, .. } => {
+                let row = &qs[r * n / 2..(r + 1) * n / 2];
+                q4_row_dots(row, &xq.qs, &xq.sums, dots);
+            }
+            Data::F32(_) => unreachable!(),
+        }
+
+        // ---- pass 2: apply the scales ------------------
+        let scales = match &self.data {
+            Data::Q8 { scales, .. } | Data::Q4 { scales, .. } => scales,
+            Data::F32(_) => unreachable!(),
+        };
+        let mut sums = [0.0f32; 2];
+        for (b, &d) in dots.iter().enumerate() {
+            sums[b & 1] += scales[base + b] * xq.scales[b] * d as f32;
+        }
+        sums[0] + sums[1]
+    }
+
     /// `y = x @ Wᵀ (+ b)`, with `W` stored `[out_features, in_features]`.
     ///
     /// Every matmul in the model goes through here. Blocks run along the
@@ -430,58 +496,7 @@ impl Weight {
                     // handles, rather than 151936 of them.
                     let mut dots = vec![0i32; blocks_per_row];
                     for (j, slot) in dst.iter_mut().enumerate() {
-                        let r = task * per + j;
-                        {
-                            let dots = &mut dots;
-                            let base = r * blocks_per_row;
-
-                            // ---- pass 1: integers only ---------------------
-                            //
-                            // This loop must contain no floating-point work at
-                            // all. Mixing the per-block scaling in here -- the
-                            // obvious way to write it -- stops the whole thing
-                            // vectorising: the float accumulation is a
-                            // non-associative chain the compiler may not
-                            // reorder, and interleaving it with the integer
-                            // reduction defeats that too. Split into two
-                            // passes, this becomes `sdot`; combined, it
-                            // compiles to scalar loads and multiplies and runs
-                            // several times slower.
-                            //
-                            // The scratch buffer is a few hundred bytes and
-                            // never leaves L1.
-                            match &self.data {
-                                Data::Q8 { qs, .. } => {
-                                    let row = &qs[r * n..(r + 1) * n];
-                                    for (d, (wb, xb)) in dots
-                                        .iter_mut()
-                                        .zip(row.chunks_exact(BLOCK).zip(xq.qs.chunks_exact(BLOCK)))
-                                    {
-                                        *d = wb
-                                            .iter()
-                                            .zip(xb.iter())
-                                            .map(|(&w, &v)| w as i32 * v as i32)
-                                            .sum();
-                                    }
-                                }
-                                Data::Q4 { qs, .. } => {
-                                    let row = &qs[r * n / 2..(r + 1) * n / 2];
-                                    q4_row_dots(row, &xq.qs, &xq.sums, dots);
-                                }
-                                Data::F32(_) => unreachable!(),
-                            }
-
-                            // ---- pass 2: apply the scales ------------------
-                            let scales = match &self.data {
-                                Data::Q8 { scales, .. } | Data::Q4 { scales, .. } => scales,
-                                Data::F32(_) => unreachable!(),
-                            };
-                            let mut sums = [0.0f32; 2];
-                            for (b, &d) in dots.iter().enumerate() {
-                                sums[b & 1] += scales[base + b] * xq.scales[b] * d as f32;
-                            }
-                            *slot = sums[0] + sums[1];
-                        }
+                        *slot = self.qrow(&xq, task * per + j, &mut dots);
                     }
                 });
                 out
@@ -592,6 +607,67 @@ impl Weight {
 /// selects it.
 fn dequant_kernel() -> bool {
     matches!(std::env::var("KVAD_DEQUANT").as_deref(), Ok("1") | Ok("true"))
+}
+
+/// Several matrix-vector products as one parallel section.
+///
+/// A mixture's decode step is ten experts of three small matrices each, and
+/// through [`Weight::matvec_bt`] that is thirty parallel sections a layer,
+/// each handing fourteen threads a few microseconds of work: on
+/// Qwen3-Next-80B, `sample` found more of the pool yielding than computing.
+/// Here every row of every job is one index space, cut into one chunk per
+/// thread, so the whole set costs one dispatch.
+///
+/// Each row is [`Weight::qrow`], exactly as `matvec_bt` computes it, so the
+/// results are the same to the bit; only who computes which row changes.
+/// Jobs sharing an input -- an expert's gate and up projections -- quantise
+/// it once, when they are adjacent.
+///
+/// `None` when a weight is not quantised, or the dequantising kernel was
+/// asked for: the caller runs them one at a time, as before.
+pub fn matvec_many(jobs: &[(&Weight, &[f32])]) -> Option<Vec<Vec<f32>>> {
+    if dequant_kernel()
+        || jobs.iter().any(|(w, x)| matches!(w.data, Data::F32(_)) || x.len() != w.cols)
+    {
+        return None;
+    }
+    let mut acts: Vec<QActivation> = Vec::new();
+    let mut which = Vec::with_capacity(jobs.len());
+    let mut last = None;
+    for (_, x) in jobs {
+        let key = (x.as_ptr(), x.len());
+        if last != Some(key) {
+            acts.push(QActivation::new(x));
+            last = Some(key);
+        }
+        which.push(acts.len() - 1);
+    }
+
+    let mut starts = Vec::with_capacity(jobs.len());
+    let mut total = 0;
+    for (w, _) in jobs {
+        starts.push(total);
+        total += w.rows;
+    }
+    let widest = jobs.iter().map(|(w, _)| w.cols / BLOCK).max().unwrap_or(0);
+    let mut flat = vec![0.0f32; total];
+    let per = rows_per_task(total);
+    flat.par_chunks_mut(per).enumerate().for_each(|(task, dst)| {
+        let mut dots = vec![0i32; widest];
+        let first = task * per;
+        // The job holding this chunk's first row; the chunk may run on into
+        // the next few.
+        let mut k = starts.partition_point(|&s| s <= first) - 1;
+        for (j, slot) in dst.iter_mut().enumerate() {
+            let g = first + j;
+            while g >= starts[k] + jobs[k].0.rows {
+                k += 1;
+            }
+            let w = jobs[k].0;
+            *slot = w.qrow(&acts[which[k]], g - starts[k], &mut dots[..w.cols / BLOCK]);
+        }
+    });
+    Some(jobs.iter().zip(&starts).map(|((w, _), &s)| flat[s..s + w.rows].to_vec()).collect())
 }
 
 
@@ -987,6 +1063,37 @@ mod tests {
     fn random_tensor(rows: usize, cols: usize, seed: u64) -> Tensor {
         let mut rng = Rng::new(seed);
         Tensor::new(rows, cols, (0..rows * cols).map(|_| rng.normal() * 0.1).collect())
+    }
+
+    /// Batching matvecs into one parallel section changes who computes each
+    /// row and nothing else, so the answer has to be identical, not close:
+    /// a mixture decoded this way must give the tokens it gave before.
+    ///
+    /// Row counts that do not divide by the thread count put chunk
+    /// boundaries inside jobs and across them; adjacent jobs share an input,
+    /// as an expert's gate and up do; and the widths differ, as up and down do.
+    #[test]
+    fn many_matvecs_at_once_equal_them_one_at_a_time() {
+        for precision in [Precision::Q8, Precision::Q4] {
+            let x = random_tensor(1, 64, 1).data;
+            let h = random_tensor(1, 96, 2).data;
+            let ws = [
+                Weight::quantize(random_tensor(37, 64, 3), precision),
+                Weight::quantize(random_tensor(5, 64, 4), precision),
+                Weight::quantize(random_tensor(1, 96, 5), precision),
+                Weight::quantize(random_tensor(203, 96, 6), precision),
+            ];
+            let jobs: Vec<(&Weight, &[f32])> =
+                vec![(&ws[0], &x), (&ws[1], &x), (&ws[2], &h), (&ws[3], &h)];
+            let many = matvec_many(&jobs).expect("quantised weights take the batched path");
+            for (k, ((w, x), got)) in jobs.iter().zip(&many).enumerate() {
+                assert_eq!(got, &w.matvec_bt(x, None), "{precision}: job {k} differs");
+            }
+        }
+        // An f32 weight is not this function's to run.
+        let f = Weight::quantize(random_tensor(4, 64, 7), Precision::F32);
+        let x = random_tensor(1, 64, 8).data;
+        assert!(matvec_many(&[(&f, &x)]).is_none());
     }
 
     /// Relative error of a round trip through the quantiser.

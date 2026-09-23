@@ -545,8 +545,9 @@ impl Resident {
         (slots.lru.hits, slots.lru.misses)
     }
 
-    /// Make `experts` of `layer` resident, and hand each to `run` with the
-    /// slab holding it and the file offset that slab begins at.
+    /// Make `experts` of `layer` resident, and hand them to `run` a group at
+    /// a time: each with the slab holding it and the file offset that slab
+    /// begins at. A group together, because a token's experts run together.
     ///
     /// In groups no larger than the cache, so that fetching the end of a
     /// group never evicts its beginning before it has run: within a group
@@ -557,7 +558,7 @@ impl Resident {
         &self,
         layer: usize,
         experts: &[usize],
-        mut run: impl FnMut(usize, &std::sync::Arc<crate::qcache::Slab>, u64),
+        mut run: impl FnMut(&[(usize, &std::sync::Arc<crate::qcache::Slab>, u64)]),
     ) -> Res<()> {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         let group = slots.lru.capacity();
@@ -597,9 +598,11 @@ impl Resident {
                 }
                 *bytes += self.fetcher.fetch_into(&mut jobs)?;
             }
-            for (expert, slot, extent) in found {
-                run(expert, &slots.slabs[slot], extent.aligned().0);
-            }
+            let group: Vec<_> = found
+                .iter()
+                .map(|&(expert, slot, extent)| (expert, &slots.slabs[slot], extent.aligned().0))
+                .collect();
+            run(&group);
         }
         Ok(())
     }

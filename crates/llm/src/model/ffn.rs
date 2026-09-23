@@ -523,6 +523,12 @@ impl Moe {
     /// The router's logits for one token and, when this family has a shared
     /// expert, that expert up to its down projection -- as one section.
     ///
+    /// Worth 6% on Qwen3-Next-80B at q4, warm, on a quiet machine: 16.35
+    /// tok/s median against 15.4, four reps each, ranges apart, with
+    /// Qwen3-30B -- no shared expert, so untouched -- moving 0.5% as the
+    /// control. The commit that added this said 11%; that A/B ran while two
+    /// dataset crawls were going, and is superseded.
+    ///
     /// `None` when a weight is not quantised, and the caller does both the
     /// ordinary way.
     fn early(&self, x: &[f32]) -> Option<(Vec<f32>, Option<Pending<'_>>)> {

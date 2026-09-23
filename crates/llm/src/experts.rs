@@ -93,6 +93,11 @@ impl ExpertStore {
     /// Index the experts of a `.nq` cache, or `None` if it holds no mixture.
     pub fn open(path: &Path) -> Res<Option<ExpertStore>> {
         let Some(container) = crate::qcache::Container::open(path)? else { return Ok(None) };
+        ExpertStore::index(&container, path)
+    }
+
+    /// As [`ExpertStore::open`], for a container already open at `path`.
+    pub fn index(container: &crate::qcache::Container, path: &Path) -> Res<Option<ExpertStore>> {
         let header = container.header();
         let Some(tensors) = header.get("tensors").and_then(|t| t.as_object()) else {
             return Err("quant cache has no tensor table".into());
@@ -169,6 +174,12 @@ impl ExpertStore {
     /// same shape. Returns the largest, so a slab sized by it always fits.
     pub fn expert_bytes(&self) -> u32 {
         self.extents.iter().flatten().map(|e| e.len).max().unwrap_or(0)
+    }
+
+    /// Room one expert needs in memory: the widest page-aligned read, so any
+    /// expert fits in any slot.
+    pub fn slot_bytes(&self) -> usize {
+        self.extents.iter().flatten().map(|e| e.aligned().1).max().unwrap_or(0)
     }
 
     /// How many experts this holds, counting only layers that route.
@@ -262,45 +273,66 @@ impl Fetcher {
         if want.len() != slabs.len() {
             return Err("fetch: one slab per extent, please".into());
         }
+        for (extent, slab) in want.iter().zip(slabs.iter_mut()) {
+            let (_, len, _) = extent.aligned();
+            if slab.len() < len {
+                slab.resize(len, 0);
+            }
+        }
+        let mut jobs: Vec<(Extent, &mut [u8])> =
+            want.iter().copied().zip(slabs.iter_mut().map(|s| &mut s[..])).collect();
+        self.fetch_into(&mut jobs)
+    }
+
+    /// Read each extent's aligned span into the buffer beside it, which must
+    /// already be large enough for it.
+    ///
+    /// One request is read on the calling thread: a thread spawned to make
+    /// a single read wins nothing, and a mixture whose cache is working
+    /// misses one expert a layer as often as it misses several.
+    pub fn fetch_into(&self, jobs: &mut [(Extent, &mut [u8])]) -> Res<u64> {
+        // The page-rounded read can run past the end of the file, and needs
+        // only to cover the expert itself, so a short read that does is fine.
+        let read = |file: &File, extent: &Extent, buf: &mut [u8]| -> Res<u64> {
+            let (base, len, skip) = extent.aligned();
+            let buf = buf.get_mut(..len).ok_or("fetch: a buffer is smaller than its read")?;
+            let need = skip + extent.len as usize;
+            let mut got = 0;
+            while got < need {
+                match file.read_at(&mut buf[got..], base + got as u64) {
+                    Ok(0) => return Err(format!("reading at {base}: the file ends early").into()),
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(format!("reading at {base}: {e}").into()),
+                }
+            }
+            Ok(got as u64)
+        };
+        if jobs.len() <= 1 {
+            return jobs.iter_mut().map(|(e, b)| read(&self.files[0], e, b)).sum::<Res<u64>>();
+        }
         let moved = std::sync::atomic::AtomicU64::new(0);
         let failed: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-        // Round robin rather than a contiguous split: the reads are the
-        // same size, so interleaving keeps every descriptor busy for the
-        // same length of time.
+        // As `fetch`: round robin, so every descriptor gets the same share.
+        let mut shares: Vec<Vec<&mut (Extent, &mut [u8])>> =
+            (0..self.files.len()).map(|_| Vec::new()).collect();
+        for (i, job) in jobs.iter_mut().enumerate() {
+            shares[i % self.files.len()].push(job);
+        }
         std::thread::scope(|scope| {
-            let (moved, failed) = (&moved, &failed);
-            for (t, file) in self.files.iter().enumerate() {
-                let mine: Vec<(usize, Extent)> = want
-                    .iter()
-                    .enumerate()
-                    .skip(t)
-                    .step_by(self.files.len())
-                    .map(|(i, e)| (i, *e))
-                    .collect();
-                if mine.is_empty() {
+            for (file, share) in self.files.iter().zip(shares) {
+                if share.is_empty() {
                     continue;
                 }
-                // Each thread owns a disjoint set of slabs, which is what
-                // makes handing out raw pointers to them sound.
-                let slabs = SlabsPtr(slabs.as_mut_ptr());
+                let (moved, failed) = (&moved, &failed);
                 scope.spawn(move || {
-                    let _ = &slabs;
-                    for (i, extent) in mine {
-                        let (base, len, _) = extent.aligned();
-                        // SAFETY: `mine` is disjoint across threads, so no
-                        // two of these ever name the same slab.
-                        let slab = unsafe { &mut *slabs.0.add(i) };
-                        if slab.len() < len {
-                            slab.resize(len, 0);
-                        }
-                        match file.read_at(&mut slab[..len], base) {
+                    for job in share {
+                        match read(file, &job.0, &mut job.1[..]) {
                             Ok(n) => {
-                                moved.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                                moved.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                             }
                             Err(e) => {
-                                *failed.lock().unwrap_or_else(|p| p.into_inner()) =
-                                    Some(format!("reading at {base}: {e}"));
+                                *failed.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
                                 return;
                             }
                         }
@@ -308,24 +340,12 @@ impl Fetcher {
                 });
             }
         });
-
         match failed.into_inner().unwrap_or_else(|p| p.into_inner()) {
             Some(e) => Err(e.into()),
             None => Ok(moved.into_inner()),
         }
     }
 }
-
-/// A pointer to the slab array, carried into the scope threads.
-///
-/// `&mut [Vec<u8>]` cannot be shared, and each thread touches a disjoint
-/// subset, which the borrow checker has no way to be told.
-#[derive(Clone, Copy)]
-struct SlabsPtr(*mut Vec<u8>);
-// SAFETY: the threads that receive this only ever index slabs from their
-// own stride of the round robin, so no two alias.
-unsafe impl Send for SlabsPtr {}
-unsafe impl Sync for SlabsPtr {}
 
 // ---------------------------------------------------------------------------
 // Residency
@@ -400,6 +420,204 @@ impl Cache {
     pub fn slab_mut(&mut self, key: u32) -> Option<&mut Vec<u8>> {
         let slot = *self.at.get(&key)?;
         Some(&mut self.slabs[slot])
+    }
+
+    /// The slot a resident key occupies.
+    pub fn slot(&self, key: u32) -> Option<usize> {
+        self.at.get(&key).copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In the forward pass
+// ---------------------------------------------------------------------------
+
+/// Routed experts held in memory of our own, and read from the disk on a
+/// miss, for a mixture larger than memory.
+///
+/// The alternative is what a mapping does unasked: page an expert in when a
+/// matmul touches it, 16 KB at a time, one fault after another, and evict
+/// by whatever the kernel's idea of recent is. This reads a whole expert in
+/// one request, the misses of a layer all at once, and evicts the expert
+/// wanted longest ago -- which is the policy [`crate::residency`] measured.
+///
+/// Opt-in, with `KVAD_EXPERT_CACHE` naming the gigabytes to spend. Whether
+/// it should be the default for a model over memory is a measurement, and
+/// the flag is what makes it a one-flag A/B.
+pub struct Resident {
+    store: ExpertStore,
+    fetcher: Fetcher,
+    slots: std::sync::Mutex<Slots>,
+    /// Experts that were fetched and then run from the mapping anyway,
+    /// because their weights could not be pointed at the slab. Zero for any
+    /// cache this engine writes; counted so that a test can say so.
+    fallbacks: std::sync::atomic::AtomicU64,
+}
+
+struct Slots {
+    lru: Cache,
+    /// One per slot of `lru`. Refilled through `Arc::get_mut`, which is what
+    /// guarantees no weight still reading an evicted expert sees it change.
+    slabs: Vec<std::sync::Arc<crate::qcache::Slab>>,
+    bytes: u64,
+}
+
+impl Resident {
+    /// The cache `KVAD_EXPERT_CACHE` asks for, over the cache file at `path`.
+    ///
+    /// `None` when it is not asked for, when the file holds no mixture, or
+    /// when it cannot be set up -- the last said on stderr, since the mapping
+    /// still runs the model and nothing here is worth failing a load over.
+    pub fn wanted(container: &crate::qcache::Container, path: &Path) -> Option<std::sync::Arc<Resident>> {
+        let gb: f64 = std::env::var("KVAD_EXPERT_CACHE").ok()?.trim().parse().ok()?;
+        if gb <= 0.0 {
+            return None;
+        }
+        let store = match ExpertStore::index(container, path) {
+            Ok(Some(store)) => store,
+            Ok(None) => return None,
+            Err(e) => {
+                eprintln!("expert cache: not used: {e}");
+                return None;
+            }
+        };
+        let slot = store.slot_bytes();
+        let capacity = (gb * 1e9) as usize / slot.max(1);
+        if capacity == 0 {
+            eprintln!("expert cache: {gb} GB holds no experts of {} MB", slot / 1_000_000);
+            return None;
+        }
+        let threads = std::env::var("KVAD_EXPERT_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or(4);
+        match Resident::new(store, capacity, threads) {
+            Ok(r) => {
+                eprintln!(
+                    "expert cache: {} of {} experts ({:.1} GB), {} reader(s)",
+                    r.capacity(),
+                    r.store.len(),
+                    (r.capacity() * slot) as f64 / 1e9,
+                    r.fetcher.threads()
+                );
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("expert cache: not used: {e}");
+                None
+            }
+        }
+    }
+
+    /// A cache of `slots` experts over `store`, read with `threads`
+    /// descriptors. Never more slots than there are experts.
+    ///
+    /// Fewer than one layer wants is allowed, and slow: [`Resident::with`]
+    /// runs a layer's experts in groups that fit, so it is never wrong.
+    pub fn new(store: ExpertStore, slots: usize, threads: usize) -> Res<std::sync::Arc<Resident>> {
+        let slots = slots.clamp(1, store.len().max(1));
+        let fetcher = Fetcher::new(&store, threads)?;
+        Ok(std::sync::Arc::new(Resident {
+            slots: std::sync::Mutex::new(Slots {
+                lru: Cache::new(slots),
+                slabs: (0..slots).map(|_| std::sync::Arc::new(crate::qcache::Slab::new())).collect(),
+                bytes: 0,
+            }),
+            store,
+            fetcher,
+            fallbacks: std::sync::atomic::AtomicU64::new(0),
+        }))
+    }
+
+    /// Note an expert that ran from the mapping after all.
+    pub fn fell_back(&self) {
+        self.fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn fallbacks(&self) -> u64 {
+        self.fallbacks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.slots.lock().unwrap_or_else(|p| p.into_inner()).lru.capacity()
+    }
+
+    /// Hits and misses so far.
+    pub fn stats(&self) -> (u64, u64) {
+        let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        (slots.lru.hits, slots.lru.misses)
+    }
+
+    /// Make `experts` of `layer` resident, and hand each to `run` with the
+    /// slab holding it and the file offset that slab begins at.
+    ///
+    /// In groups no larger than the cache, so that fetching the end of a
+    /// group never evicts its beginning before it has run: within a group
+    /// every expert is the most recently wanted, and LRU evicts the rest
+    /// first. Decode wants `top_k` at a time and is always one group; a long
+    /// prefill can want every expert of the layer.
+    pub fn with(
+        &self,
+        layer: usize,
+        experts: &[usize],
+        mut run: impl FnMut(usize, &std::sync::Arc<crate::qcache::Slab>, u64),
+    ) -> Res<()> {
+        let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        let group = slots.lru.capacity();
+        for chunk in experts.chunks(group) {
+            let mut misses: Vec<(usize, Extent)> = Vec::new();
+            let mut found: Vec<(usize, usize, Extent)> = Vec::with_capacity(chunk.len());
+            for &expert in chunk {
+                let extent = self
+                    .store
+                    .get(layer, expert)
+                    .ok_or_else(|| format!("layer {layer} has no expert {expert} in the cache file"))?;
+                let key = (layer * self.store.n_experts + expert) as u32;
+                let hit = slots.lru.touch(key);
+                let slot = slots.lru.slot(key).ok_or("expert cache: a key has no slot")?;
+                if !hit {
+                    misses.push((slot, extent));
+                }
+                found.push((expert, slot, extent));
+            }
+            if !misses.is_empty() {
+                let mut want: Vec<Option<Extent>> = vec![None; group];
+                for &(slot, extent) in &misses {
+                    want[slot] = Some(extent);
+                }
+                let Slots { slabs, bytes, .. } = &mut *slots;
+                let mut jobs: Vec<(Extent, &mut [u8])> = Vec::with_capacity(misses.len());
+                for (slab, want) in slabs.iter_mut().zip(want) {
+                    let Some(extent) = want else { continue };
+                    // A view outliving its expert would be a bug in `Moe::run`;
+                    // a fresh slab keeps it from also being a wrong answer.
+                    if std::sync::Arc::get_mut(slab).is_none() {
+                        *slab = std::sync::Arc::new(crate::qcache::Slab::new());
+                    }
+                    let slab = std::sync::Arc::get_mut(slab).ok_or("expert cache: slab is shared")?;
+                    slab.reserve(extent.aligned().1);
+                    jobs.push((extent, slab.bytes_mut()));
+                }
+                *bytes += self.fetcher.fetch_into(&mut jobs)?;
+            }
+            for (expert, slot, extent) in found {
+                run(expert, &slots.slabs[slot], extent.aligned().0);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Resident {
+    /// What the cache did, because the point of it is a number.
+    fn drop(&mut self) {
+        let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        let (h, m) = (slots.lru.hits, slots.lru.misses);
+        if h + m > 0 {
+            eprintln!(
+                "expert cache: {:.1}% hits ({h} of {}), {:.2} GB read",
+                100.0 * h as f64 / (h + m) as f64,
+                h + m,
+                slots.bytes as f64 / 1e9
+            );
+        }
     }
 }
 

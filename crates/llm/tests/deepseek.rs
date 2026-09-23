@@ -933,3 +933,69 @@ fn write_a_fixture_for_the_reference_implementation() {
         println!("wrote {}", out.display());
     }
 }
+
+/// An expert read into memory of our own runs the same arithmetic on the same
+/// bytes as one paged in through the mapping, so the two must agree exactly --
+/// not closely. See `kvad::experts::Resident`.
+///
+/// One slot is fewer than the two experts a token routes to, which makes every
+/// layer fetch and run its experts in groups, evicting as it goes; three leaves
+/// room for hits. Both flavours, because V3 routes through a learned bias and
+/// groups and V2 does not, and the cache sees only what the router chose.
+#[test]
+fn experts_read_off_the_disk_give_the_mapped_answer_exactly() {
+    use kvad::qcache::{Mapped, Source};
+    for (flavour, tag) in [(Flavour::V2, "v2"), (Flavour::V3, "v3")] {
+        let t = tiny(flavour);
+        let base = std::env::temp_dir().join(format!("kvad-ds-{}-resident-{tag}", std::process::id()));
+        let weights = base.with_extension("safetensors");
+        let cache = base.with_extension("q8.nq");
+        write_safetensors(&weights, &t.tensors);
+        let files = [weights.clone()];
+        let ckpt = Checkpoint::open(&files).unwrap();
+        let spec = Spec::from_config(Json::new(t.config.clone())).unwrap();
+
+        let mut live = Live::new(&ckpt, Precision::Q8);
+        live.record_to(&cache).unwrap();
+        deepseek::Model::load(&live, spec.clone()).unwrap();
+        live.finish("test/tiny-moe", &files, &spec).unwrap().expect("no cache was written");
+
+        let tokens = [3u32, 17, 8, 0, 29];
+        let run = |slots: Option<usize>| {
+            let mapped = Mapped::open(&cache, "test/tiny-moe", &files, &spec, Precision::Q8)
+                .unwrap()
+                .expect("the cache just written is not there");
+            if let Some(n) = slots {
+                assert!(mapped.hold_experts(n, 2).unwrap(), "{tag}: no experts in the cache file");
+            }
+            let model = deepseek::Model::load(&mapped, spec.clone()).unwrap();
+            let mut kv = KvCache::new(&spec);
+            let batch = model.forward_batch(&tokens, &mut kv);
+            let step = model.forward(4, &mut kv);
+            let stats = mapped.experts().map(|r| {
+                // Not vacuous the other way either: an expert that could not
+                // be pointed at its slab runs from the mapping, and would
+                // agree for that reason alone.
+                assert_eq!(r.fallbacks(), 0, "{tag}: experts ran from the mapping");
+                r.stats()
+            });
+            (batch, step, stats)
+        };
+
+        let (want_batch, want_step, none) = run(None);
+        assert_eq!(none, None, "{tag}: a cache nobody asked for");
+        for slots in [1, 3] {
+            let (batch, step, stats) = run(Some(slots));
+            assert_eq!(batch, want_batch, "{tag}, {slots} slot(s): prefill differs");
+            assert_eq!(step, want_step, "{tag}, {slots} slot(s): decode differs");
+            // Not vacuous: the experts really were read, not left to the mapping.
+            let (hits, misses) = stats.expect("the cache that was asked for is missing");
+            assert!(misses > 0, "{tag}, {slots} slot(s): nothing was read");
+            if slots == 1 {
+                assert!(hits < misses, "{tag}: one slot cannot hit often");
+            }
+        }
+        let _ = std::fs::remove_file(&weights);
+        let _ = std::fs::remove_file(&cache);
+    }
+}

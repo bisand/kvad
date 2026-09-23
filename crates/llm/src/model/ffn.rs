@@ -387,6 +387,15 @@ impl Ffn {
         self.down.matvec_bt(&gate, None)
     }
 
+    /// This MLP with its weights read from `slab`. See [`Weight::rebased`].
+    fn rebased(&self, lo: u64, slab: &std::sync::Arc<crate::qcache::Slab>) -> Option<Ffn> {
+        Some(Ffn {
+            gate: self.gate.rebased(lo, slab)?,
+            up: self.up.rebased(lo, slab)?,
+            down: self.down.rebased(lo, slab)?,
+        })
+    }
+
     pub fn param_count(&self) -> usize {
         self.gate.param_count() + self.up.param_count() + self.down.param_count()
     }
@@ -482,6 +491,9 @@ pub struct Moe {
     /// them is resident, which would have to be read back — has to be able
     /// to tell them apart. See [`crate::residency`].
     pub layer: usize,
+    /// Where to read the routed experts from instead of the mapping, when a
+    /// cache for them was asked for. Shared by every layer of the model.
+    pub resident: Option<std::sync::Arc<crate::experts::Resident>>,
 }
 
 impl Moe {
@@ -504,6 +516,7 @@ impl Moe {
                 .collect::<Res<Vec<_>>>()?,
             shared: SharedExpert::load(src, prefix, shared)?,
             layer: layer_of(prefix),
+            resident: src.experts(),
         })
     }
 
@@ -541,15 +554,13 @@ impl Moe {
             None => vec![0.0f32; m * e],
         };
         let mut rows = Vec::with_capacity(m * e);
-        for (expert, tokens) in by_expert.iter().enumerate() {
-            if tokens.is_empty() {
-                continue;
-            }
+        let mut apply = |expert: usize, ffn: &Ffn| {
+            let tokens = &by_expert[expert];
             rows.clear();
             for &(i, _) in tokens {
                 rows.extend_from_slice(&hs[i * e..(i + 1) * e]);
             }
-            let y = self.experts[expert].run(&rows, tokens.len());
+            let y = ffn.run(&rows, tokens.len());
             for (j, &(i, weight)) in tokens.iter().enumerate() {
                 for (o, v) in out[i * e..(i + 1) * e]
                     .iter_mut()
@@ -557,6 +568,33 @@ impl Moe {
                 {
                     *o += weight * v;
                 }
+            }
+        };
+        let chosen: Vec<usize> = (0..n).filter(|&x| !by_expert[x].is_empty()).collect();
+        let mut done = vec![false; n];
+        if let Some(resident) = &self.resident {
+            // The same arithmetic on the same bytes, read by us rather than
+            // paged in. A weight that cannot be rebased runs as mapped.
+            let read = resident.with(self.layer, &chosen, |expert, slab, lo| {
+                match self.experts[expert].rebased(lo, slab) {
+                    Some(ffn) => apply(expert, &ffn),
+                    None => {
+                        resident.fell_back();
+                        apply(expert, &self.experts[expert]);
+                    }
+                }
+                done[expert] = true;
+            });
+            // A failed read costs speed and not the answer: whatever it did
+            // not reach runs from the mapping below.
+            if let Err(err) = read {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| eprintln!("expert cache: falling back to the mapping: {err}"));
+            }
+        }
+        for expert in chosen {
+            if !done[expert] {
+                apply(expert, &self.experts[expert]);
             }
         }
         out

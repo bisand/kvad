@@ -145,6 +145,56 @@ pub enum Store<T: Plain> {
         len: usize,
         _t: PhantomData<T>,
     },
+    /// A window onto an expert read off the disk into memory of our own,
+    /// rather than paged in through the mapping. See [`crate::experts`].
+    ///
+    /// Shared, not borrowed: the weight built on it is a temporary that
+    /// lives for one expert's matmuls, and an `Arc` makes "the slab outlives
+    /// the view" a fact the compiler checks rather than a comment.
+    Slab {
+        slab: Arc<Slab>,
+        off: usize,
+        len: usize,
+        _t: PhantomData<T>,
+    },
+}
+
+/// Memory an expert is read into, aligned for any [`Plain`] type.
+///
+/// A `Vec<u8>` promises one byte of alignment and the scales inside it are
+/// `f32`s. Backing it with `u64`s promises eight, and every array the cache
+/// holds sits at a multiple of 64 from the page the read began on.
+pub struct Slab(Vec<u64>);
+
+impl Slab {
+    pub fn new() -> Slab {
+        Slab(Vec::new())
+    }
+
+    /// At least `n` bytes of room, keeping what fits.
+    pub fn reserve(&mut self, n: usize) {
+        let words = n.div_ceil(8);
+        if self.0.len() < words {
+            self.0.resize(words, 0);
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: a `u64` is eight bytes with no padding.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr() as *const u8, self.0.len() * 8) }
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `u64` has no invalid bit patterns and no padding, so any
+        // bytes written through this are a valid `u64` afterwards.
+        unsafe { std::slice::from_raw_parts_mut(self.0.as_mut_ptr() as *mut u8, self.0.len() * 8) }
+    }
+}
+
+impl Default for Slab {
+    fn default() -> Slab {
+        Slab::new()
+    }
 }
 
 impl<T: Plain> Store<T> {
@@ -165,6 +215,25 @@ impl<T: Plain> Store<T> {
         }
         Ok(Store::Mapped { map: Arc::clone(map), off, len, _t: PhantomData })
     }
+
+    /// This array, found in `slab` instead of in the file.
+    ///
+    /// `lo` is where in the file the slab's copy begins -- the page-aligned
+    /// start of the read that filled it. `None` for an array that is not
+    /// mapped, or whose bytes the slab does not hold: a caller asking about
+    /// the wrong expert gets no weight rather than somebody else's.
+    pub fn rebased(&self, lo: u64, slab: &Arc<Slab>) -> Option<Store<T>> {
+        let Store::Mapped { off, len, .. } = self else { return None };
+        let at = (*off as u64).checked_sub(lo)? as usize;
+        let end = at.checked_add(len * std::mem::size_of::<T>())?;
+        if end > slab.bytes().len() {
+            return None;
+        }
+        if (slab.bytes().as_ptr() as usize + at) % std::mem::align_of::<T>() != 0 {
+            return None;
+        }
+        Some(Store::Slab { slab: Arc::clone(slab), off: at, len: *len, _t: PhantomData })
+    }
 }
 
 impl<T: Plain> std::ops::Deref for Store<T> {
@@ -180,6 +249,12 @@ impl<T: Plain> std::ops::Deref for Store<T> {
             // us is undefined behaviour, the same caveat `Checkpoint` carries.
             Store::Mapped { map, off, len, .. } => unsafe {
                 std::slice::from_raw_parts(map.as_ptr().add(*off) as *const T, *len)
+            },
+            // SAFETY: `rebased()` checked bounds and alignment against this
+            // slab, and the `Arc` keeps it alive and unwritten -- a slab is
+            // refilled only through `Arc::get_mut`, which a live view refuses.
+            Store::Slab { slab, off, len, .. } => unsafe {
+                std::slice::from_raw_parts(slab.bytes().as_ptr().add(*off) as *const T, *len)
             },
         }
     }
@@ -247,6 +322,17 @@ pub trait Source {
     /// nothing, for a source with nothing to compare against; both sources here
     /// override it.
     fn skip(&self, _name: &str) {}
+
+    /// Somewhere to read routed experts from other than the mapping, if this
+    /// source has one. See [`crate::experts::Resident`].
+    ///
+    /// One for the whole model, handed to every mixture layer that asks, so
+    /// the layers share one cache as the residency measurements assumed.
+    /// Only a cache file can offer it -- the reads are of that file -- and
+    /// only when asked to, so the default is none.
+    fn experts(&self) -> Option<Arc<crate::experts::Resident>> {
+        None
+    }
 
     /// The same, for a whole subtree of tensors at once.
     ///
@@ -488,6 +574,9 @@ enum Entry {
 /// A cache file, mapped.
 pub struct Mapped {
     file: Container,
+    path: PathBuf,
+    /// Built on first asking, then the same one for every layer.
+    experts: std::sync::OnceLock<Option<Arc<crate::experts::Resident>>>,
     entries: HashMap<String, Entry>,
     /// The checkpoint's tensor list as it was when this file was written,
     /// against what an architecture has since asked for.
@@ -537,12 +626,34 @@ impl Mapped {
             .map(|n| n.as_str().map(str::to_string).ok_or("`checkpoint` is not a list of names"))
             .collect::<Result<Vec<String>, _>>()?;
 
-        Ok(Some(Mapped { file, entries, audit: Audit::new(names) }))
+        Ok(Some(Mapped {
+            file,
+            path: path.to_path_buf(),
+            experts: std::sync::OnceLock::new(),
+            entries,
+            audit: Audit::new(names),
+        }))
     }
 
     /// Bytes on disk.
     pub fn bytes(&self) -> usize {
         self.file.bytes()
+    }
+
+    /// Read routed experts through a cache of `slots` rather than the
+    /// mapping, whatever `KVAD_EXPERT_CACHE` says. `false` if this file
+    /// holds no mixture.
+    ///
+    /// For a caller that wants a particular size -- a test, which cannot set
+    /// an environment variable without setting it for every other test in
+    /// the process. Too late once a model has been built from this source.
+    pub fn hold_experts(&self, slots: usize, threads: usize) -> Res<bool> {
+        let Some(store) = crate::experts::ExpertStore::index(&self.file, &self.path)? else {
+            return Ok(false);
+        };
+        let resident = crate::experts::Resident::new(store, slots, threads)?;
+        self.experts.set(Some(resident)).map_err(|_| "this source has already been built from")?;
+        Ok(true)
     }
 
     fn build(&self, name: &str) -> Res<Weight> {
@@ -596,6 +707,12 @@ impl Mapped {
 // the answer that counts, and an `Option` that comes back `None` records
 // nothing.
 impl Source for Mapped {
+    fn experts(&self) -> Option<Arc<crate::experts::Resident>> {
+        self.experts
+            .get_or_init(|| crate::experts::Resident::wanted(&self.file, &self.path))
+            .clone()
+    }
+
     fn matrix(&self, name: &str) -> Res<Weight> {
         let w = self.build(name)?;
         self.audit.saw(name);

@@ -294,6 +294,24 @@ impl Weight {
         Ok(Weight { rows, cols, data: Data::Q4 { scales, qs } })
     }
 
+    /// The same weight, read from `slab` rather than from the file it was
+    /// mapped from. `lo` is the file offset the slab's first byte came from.
+    ///
+    /// `None` for anything that is not a mapped quantised weight: the caller
+    /// keeps the weight it has, which is correct and merely not faster.
+    pub fn rebased(&self, lo: u64, slab: &std::sync::Arc<crate::qcache::Slab>) -> Option<Weight> {
+        let data = match &self.data {
+            Data::Q8 { scales, qs } => {
+                Data::Q8 { scales: scales.rebased(lo, slab)?, qs: qs.rebased(lo, slab)? }
+            }
+            Data::Q4 { scales, qs } => {
+                Data::Q4 { scales: scales.rebased(lo, slab)?, qs: qs.rebased(lo, slab)? }
+            }
+            Data::F32(_) => return None,
+        };
+        Some(Weight { rows: self.rows, cols: self.cols, data })
+    }
+
     pub fn from_f32(t: Tensor) -> Weight {
         Weight { rows: t.rows, cols: t.cols, data: Data::F32(t) }
     }

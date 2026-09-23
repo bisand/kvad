@@ -145,12 +145,47 @@
 //! The same rule explains both. DeepSeek thrashed because its working set
 //! is five times denser, not because paging is a bad mechanism; the kernel
 //! keeps a 0.94 GB hot set resident without being told anything. So the
-//! honest value of an expert-aware fetcher here is 10.7 to roughly 15.5
-//! tok/s — worth having, and not the order of magnitude that was claimed
-//! for it before this was measured.
+//! honest value of an expert-aware fetcher here looked like 10.7 to
+//! roughly 15.5 tok/s — worth having, and not the order of magnitude that
+//! was claimed for it before this was measured. (Then it was built and
+//! measured too; see below. It is not 15.5 either.)
 //!
 //! The rule now holds on three models, and predicts the mmap case as well
 //! as the replayed one, which is more than it was built to do.
+//!
+//! # The fetcher, wired in, and what it was worth
+//!
+//! That estimate was then tested, and it did not survive. With
+//! [`crate::experts::Resident`] in `Moe::run` -- whole experts read with
+//! `F_NOCACHE`, four at a time, into an LRU of its own -- the same model and
+//! prompt, 400 tokens, three interleaved reps, on AC power:
+//!
+//! ```text
+//!   plain mmap        8.6  10.6  10.6 tok/s    median 10.6
+//!   16 GB cache      10.1  11.6  11.4          median 11.4   89.9% hits
+//!   26 GB cache       8.3   9.7  10.0          median  9.7   93.2% hits
+//! ```
+//!
+//! The larger cache hits more, reads a third less, and came out slower; a
+//! single rerun of each put it ahead instead, 12.0 to 10.7. Neither run
+//! compressed or swapped a page. So the effect is inside the noise, and at
+//! most the 8% the medians suggest -- not 45%.
+//!
+//! The premise was wrong in a way the numbers above already said. At 89.9%
+//! hits the cache reads about 100 MB a token, which is 8 ms of an 88 ms
+//! token at the disk's measured rate; the mapping was already holding the
+//! hot set, as the paragraph above says the kernel does unasked. What the
+//! token is waiting on is the experts' matvecs: `sample` puts two thirds of
+//! the driving thread in them, each a 0.66 MB matrix handed to fourteen
+//! threads, and more of the pool yielding than computing. The next win for
+//! this model is a decode kernel that runs a token's experts side by side,
+//! not a faster way to read them.
+//!
+//! The fetcher stays, off unless `KVAD_EXPERT_CACHE` asks for it. It gives
+//! the same answer to the bit (`tests/deepseek.rs` holds it to that), and
+//! it is the only thing here that bounds what a mixture reads per token
+//! when the page cache does not -- the case DeepSeek-V2-Lite at f32 showed
+//! and this machine has not yet been made to reproduce with it switched on.
 //!
 //! # What a line means
 //!

@@ -343,14 +343,13 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
 /// neither is a reason for a server that is otherwise fine to refuse to run.
 fn autoload(state: &auth::State, repo: String) {
     let scheduler = std::sync::Arc::clone(&state.engine);
-    let db = state.db.clone();
     tokio::spawn(async move {
         // Inside the task rather than before it, because deciding the backend
         // reads the disk and, for a model that is not on it, asks the Hub what
         // that model is. Neither belongs on the thread that is supposed to be
         // getting the server listening.
         let named = repo.clone();
-        let Ok(chosen) = api::blocking(move || Ok(models::default_backend(&db, Some(&named)))).await
+        let Ok(chosen) = api::blocking(move || Ok(models::default_backend(Some(&named)))).await
         else {
             return;
         };

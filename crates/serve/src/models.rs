@@ -26,13 +26,6 @@ use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 
-/// The settings key holding the backend a load uses when nobody says.
-///
-/// In the database rather than the config file because it is a preference,
-/// changed from the UI while the server runs — which is exactly the line the
-/// config module draws.
-const BACKEND_KEY: &str = "models.backend";
-
 #[derive(serde::Serialize)]
 pub struct Model {
     pub id: String,
@@ -353,11 +346,17 @@ pub struct QCache {
     bytes: u64,
 }
 
-/// The backend a load uses when the request does not name one.
+/// The backend a load uses when the request does not name one: what this
+/// build prefers for this model, which is `gpu-q8` wherever the GPU backend
+/// can run the architecture. See [`crate::engine::preferred`], which is where
+/// the measurements are.
 ///
-/// A stored setting is somebody's choice and wins. With none, the answer is
-/// what this build prefers for this model — see [`crate::engine::preferred`],
-/// which is where the measurements are.
+/// Never a stored setting. There used to be one, and every load from the
+/// Models page wrote it, because the page names its picker's backend on
+/// every load. So one experiment at `cpu-f32` became the default for every
+/// load after it — including the one the service does at startup, which then
+/// put 59 GB of f32 weights on a 48 GB machine. A backend a request names is
+/// for that load.
 ///
 /// `repo` is the model about to be loaded, where there is one. It decides
 /// nothing but the architecture, and the architecture decides only whether
@@ -367,29 +366,15 @@ pub struct QCache {
 /// trip finding out what that repo is — see [`known_about`]. Callers already
 /// run it on a blocking thread; the point is that it is on the way to a load,
 /// where seconds are the unit.
-pub fn default_backend(db: &crate::db::Db, repo: Option<&str>) -> String {
-    backend_for(db, repo, hub::remote_arch)
+pub fn default_backend(repo: Option<&str>) -> String {
+    backend_for(repo, hub::remote_arch)
 }
 
 /// [`default_backend`], with the Hub lookup handed in.
 ///
-/// Only so the tests can have both of its answers without a network. Note
-/// that `ask` is never reached when somebody has stored a choice, which is
-/// what keeps a configured server from calling out at all.
-fn backend_for(
-    db: &crate::db::Db,
-    repo: Option<&str>,
-    ask: impl FnOnce(&str) -> Option<kvad::model::Arch>,
-) -> String {
-    let stored = db.setting(BACKEND_KEY).ok().flatten();
-    let stored = stored.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-    match crate::engine::parse(stored) {
-        // A stored backend that this build cannot load — a GPU one in a
-        // `--no-default-features` binary — is treated as unset rather than as
-        // an error every load has to explain.
-        Some(b) => crate::engine::id_of(b),
-        None => crate::engine::id_of(crate::engine::preferred(known_about(repo, ask))),
-    }
+/// Only so the tests can have both of its answers without a network.
+fn backend_for(repo: Option<&str>, ask: impl FnOnce(&str) -> Option<kvad::model::Arch>) -> String {
+    crate::engine::id_of(crate::engine::preferred(known_about(repo, ask)))
 }
 
 /// What can be said about `repo` before anything is loaded.
@@ -423,7 +408,6 @@ fn known_about(repo: Option<&str>, ask: impl FnOnce(&str) -> Option<kvad::model:
 /// loaded. Everything that *changes* a model takes `Admin` instead. Nothing
 /// here is a secret: model names, sizes, and which backends this build has.
 pub async fn list(_: Identity, St(state): St<State>) -> Result<Json<Listing>, Fail> {
-    let db = state.db.clone();
     let scanned = blocking(move || {
         Ok((
             hub::local_models(),
@@ -432,7 +416,7 @@ pub async fn list(_: Identity, St(state): St<State>) -> Result<Json<Listing>, Fa
             hub::State::active(),
             // No model in hand: the picker is asking what this build
             // prefers in general.
-            default_backend(&db, None),
+            default_backend(None),
         ))
     })
     .await?;
@@ -558,9 +542,9 @@ pub async fn search(
 #[derive(serde::Deserialize)]
 pub struct LoadRequest {
     repo: String,
-    /// A backend id from the listing, e.g. `cpu-q8`. Naming one chooses it
-    /// and remembers it; omitting it uses whichever was chosen last, or —
-    /// with nothing ever chosen — what this build prefers for this model.
+    /// A backend id from the listing, e.g. `cpu-q8`, for this load only.
+    /// Omitted, what this build prefers for this model; see
+    /// [`default_backend`].
     #[serde(default)]
     backend: Option<String>,
 }
@@ -578,9 +562,8 @@ pub async fn load(
     let wanted = match &body.backend {
         Some(id) => id.clone(),
         None => {
-            let db = state.db.clone();
             let named = repo.clone();
-            blocking(move || Ok(default_backend(&db, Some(&named)))).await?
+            blocking(move || Ok(default_backend(Some(&named)))).await?
         }
     };
     let backend = crate::engine::parse(&wanted).ok_or_else(|| {
@@ -589,21 +572,6 @@ pub async fn load(
             crate::engine::available().iter().map(|c| c.id.clone()).collect::<Vec<_>>().join(", ")
         ))
     })?;
-
-    // Remembered only when the request named one. A backend that was worked
-    // out from `default_backend` is not a choice anybody made, and storing
-    // it would turn this machine's preference into this machine's setting —
-    // after which the preference stops being consulted, and a model whose
-    // architecture wants a different answer gets the one the last load
-    // happened to use.
-    //
-    // Remembered before the load rather than after, so that a load which
-    // fails halfway still leaves the picker showing what was asked for.
-    if body.backend.is_some() {
-        let db = state.db.clone();
-        let remember = crate::engine::id_of(backend);
-        blocking(move || db.set_setting(BACKEND_KEY, &json!(remember))).await?;
-    }
 
     let (progress, updates) = tokio::sync::mpsc::channel(64);
     let engine = state.engine.clone();
@@ -921,25 +889,13 @@ mod tests {
         assert!(stopped.blocker.unwrap().contains("first checkpoint"));
     }
 
-    /// An unset, unreadable or impossible stored backend all mean the same
-    /// thing: fall back to what this build prefers rather than fail.
+    /// No model named: the build's preference, which is `gpu-q8` in a build
+    /// with a GPU backend. Whatever an earlier load named does not come into
+    /// it, because nothing remembers it.
     #[test]
-    fn the_default_backend_falls_back_rather_than_failing() {
-        let db = crate::db::Db::in_memory().unwrap();
-        // Nothing stored and no model named: the build's preference, which
-        // is the GPU where there is one.
-        let prefers = crate::engine::id_of(crate::engine::preferred(For::Anything));
-        assert_eq!(default_backend(&db, None), prefers);
-
-        db.set_setting(BACKEND_KEY, &json!("cpu-f32")).unwrap();
-        assert_eq!(default_backend(&db, None), "cpu-f32", "a chosen backend is a choice");
-
-        db.set_setting(BACKEND_KEY, &json!("nonsense")).unwrap();
-        assert_eq!(default_backend(&db, None), prefers);
-
-        // Not a string at all — something wrote the wrong shape.
-        db.set_setting(BACKEND_KEY, &json!(17)).unwrap();
-        assert_eq!(default_backend(&db, None), prefers);
+    fn the_default_backend_is_the_builds_preference() {
+        let prefers = if cfg!(feature = "gpu") { "gpu-q8" } else { "cpu-q8" };
+        assert_eq!(default_backend(None), prefers);
     }
 
     /// A model nobody has downloaded is asked about, not guessed at — and
@@ -951,27 +907,19 @@ mod tests {
     /// testing the network.
     #[test]
     fn a_model_this_machine_does_not_have_is_asked_about_not_guessed_at() {
-        let db = crate::db::Db::in_memory().unwrap();
         let llama = kvad::model::Arch::require("llama");
 
         // Nobody can say what it is: offline, or no such repo. Guessing the
         // GPU here would be a default that fails to load.
-        assert_eq!(backend_for(&db, Some("nobody/has-this-model"), |_| None), "cpu-q8");
+        assert_eq!(backend_for(Some("nobody/has-this-model"), |_| None), "cpu-q8");
         assert!(matches!(known_about(Some("nobody/has-this-model"), |_| None), For::Unknown));
 
         // Not downloaded, and the Hub knows what it is, which is enough to
         // choose properly rather than conservatively.
         assert_eq!(
-            backend_for(&db, Some("somebody/a-llama"), |_| Some(llama)),
+            backend_for(Some("somebody/a-llama"), |_| Some(llama)),
             crate::engine::id_of(crate::engine::preferred(For::This(llama))),
         );
-
-        // A stored choice is a choice, and settles it before anyone is asked.
-        db.set_setting(BACKEND_KEY, &json!("cpu-f32")).unwrap();
-        let answer = backend_for(&db, Some("somebody/a-llama"), |_| {
-            panic!("asked the Hub about a model somebody had already chosen a backend for")
-        });
-        assert_eq!(answer, "cpu-f32");
 
         assert!(matches!(
             known_about(None, |_| panic!("asked the Hub about no model in particular")),

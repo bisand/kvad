@@ -348,7 +348,14 @@
               </div>
               <!-- What the weights cost here, which is not the download size:
                    loading quantises, so a 16 GB checkpoint is 4.5 GB at q8. -->
-              {#if !r.size_known}
+              {#if !r.runnable}
+                <!-- A precision badge is a claim about a run. This row cannot
+                     have one, so it does not get to make the claim; the line
+                     underneath says what is wrong. -->
+                <span class="badge badge-sm badge-error badge-soft whitespace-nowrap">
+                  can't run
+                </span>
+              {:else if !r.size_known}
                 <span class="text-xs opacity-50">unknown</span>
               {:else if r.streams}
                 <div class="tooltip" data-tip={atEachPrecision(r)}>

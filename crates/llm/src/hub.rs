@@ -48,23 +48,41 @@ pub struct HubModel {
     /// dtype each is stored in. Not the same as what it costs in memory here,
     /// which depends on the precision it is loaded at.
     pub download_bytes: Option<u64>,
+    /// How this checkpoint's weights are stored, when that is something
+    /// [`crate::weights`] cannot decode: `F8_E4M3` for the fp8
+    /// republications, `I32` for an AWQ repack, `nvfp4-pack-quantized` for a
+    /// compressed-tensors one.
+    ///
+    /// Named here rather than discovered at load time, which is where it used
+    /// to be discovered: the fp8 check in the DeepSeek loader is right and
+    /// arrives seventy gigabytes too late. Both signals ride in the search
+    /// response already, so this costs nothing beyond reading them.
+    pub unreadable_as: Option<String>,
 }
 
 impl HubModel {
     pub fn runnable(&self) -> bool {
-        self.arch.is_some() && !self.gated
+        self.arch.is_some() && !self.gated && self.unreadable_as.is_none()
     }
 
     /// One-line reason a model cannot be run, if it cannot.
     pub fn blocker(&self) -> Option<String> {
         if self.gated {
-            Some("gated — needs licence acceptance on huggingface.co".into())
-        } else {
-            match &self.model_type {
-                None => Some("no config.json".into()),
-                Some(t) if self.arch.is_none() => Some(format!("unsupported arch `{t}`")),
-                _ => None,
-            }
+            return Some("gated — needs licence acceptance on huggingface.co".into());
+        }
+        // Ahead of the architecture, because it is the more specific answer.
+        // An fp8 repack of a model this engine runs is not an unsupported
+        // architecture, and saying that it is would send somebody looking for
+        // the wrong missing thing.
+        if let Some(dtype) = &self.unreadable_as {
+            return Some(format!(
+                "weights are stored as `{dtype}`, which this engine cannot read —                  look for a bf16 or f16 publication of the same model"
+            ));
+        }
+        match &self.model_type {
+            None => Some("no config.json".into()),
+            Some(t) if self.arch.is_none() => Some(format!("unsupported arch `{t}`")),
+            _ => None,
         }
     }
 
@@ -231,6 +249,52 @@ fn dtype_bytes(name: &str) -> u64 {
     }
 }
 
+/// Whether [`crate::weights`] can turn this dtype into the f32 the engine
+/// computes in.
+///
+/// The list is exactly the one `decode` matches on, and the two have to stay
+/// in step: this is a promise made from search-result metadata about what a
+/// loader will do seventy gigabytes later, and a promise made from a stale
+/// copy of the list would be worse than none.
+fn readable_dtype(name: &str) -> bool {
+    matches!(name, "F32" | "BF16" | "F16")
+}
+
+/// How a checkpoint's weights are stored, when the reader cannot decode
+/// them. See [`HubModel::unreadable_as`].
+///
+/// Two signals, and the order between them is the point.
+///
+/// The `safetensors` block is evidence about the bytes themselves, so it
+/// answers whenever it is there. Whatever holds the most parameters is what
+/// the checkpoint *is*: an fp8 repack still ships its norms in bf16, and a
+/// bf16 checkpoint may carry a few thousand i64 values of bookkeeping, so
+/// asking which dtype dominates gets both right where asking whether
+/// anything exotic is present gets the second one wrong.
+///
+/// `quantization_config` is only a claim in a file, and it is checked second
+/// because a config can declare a method meaning "quantise this on load"
+/// while shipping perfectly readable bf16 weights. It earns its place on the
+/// repos the Hub has not indexed, which have no `safetensors` block at all
+/// and would otherwise pass as runnable — an NVFP4 publication among them.
+fn unreadable_as(safetensors: Option<&serde_json::Value>, config: Option<&serde_json::Value>) -> Option<String> {
+    if let Some(by_dtype) = safetensors.and_then(|s| s.get("parameters")).and_then(|p| p.as_object()) {
+        let (dtype, _) = by_dtype
+            .iter()
+            .filter_map(|(d, n)| Some((d, n.as_u64()?)))
+            .max_by_key(|&(_, n)| n)?;
+        return (!readable_dtype(dtype)).then(|| dtype.clone());
+    }
+    let quant = config?.get("quantization_config")?;
+    // `format` is the specific one where compressed-tensors uses both;
+    // `quant_method` is what everything else names itself by.
+    let name = ["format", "quant_method"]
+        .iter()
+        .find_map(|k| quant.get(k)?.as_str())
+        .unwrap_or("a quantised format");
+    Some(name.to_string())
+}
+
 /// Search the Hub, newest-first by download count.
 pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
     // `expand[]` *replaces* the default field set rather than adding to it, so
@@ -273,6 +337,7 @@ pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
                         .sum()
                 });
             HubModel {
+                unreadable_as: unreadable_as(safetensors, m.get("config")),
                 arch: model_type.as_deref().and_then(Arch::from_model_type),
                 model_type,
                 downloads: m.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -663,7 +728,75 @@ mod tests {
             looks_instruct: false,
             params,
             download_bytes: params.map(|p| p * 2),
+            unreadable_as: None,
         }
+    }
+
+    /// The counts are the ones the Hub returns for these repos, so this is a
+    /// test of the shape the API actually sends rather than of one invented
+    /// to suit the code.
+    #[test]
+    fn the_dtype_holding_the_weights_decides_whether_they_can_be_read() {
+        let st = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap();
+
+        // Qwen/Qwen3-Coder-Next-FP8: the norms are bf16 and everything that
+        // matters is not.
+        let fp8 = st(r#"{"parameters":{"BF16":683691264,"F8_E4M3":78995521536}}"#);
+        assert_eq!(unreadable_as(Some(&fp8), None), Some("F8_E4M3".into()));
+
+        // Qwen/Qwen3-30B-A3B, which loads.
+        let bf16 = st(r#"{"parameters":{"BF16":30532122624}}"#);
+        assert_eq!(unreadable_as(Some(&bf16), None), None);
+
+        // Bookkeeping in a dtype we cannot decode does not make the
+        // checkpoint unreadable, which is the whole reason this asks which
+        // dtype dominates rather than whether an odd one is present.
+        let mixed = st(r#"{"parameters":{"BF16":30532122624,"I64":4096}}"#);
+        assert_eq!(unreadable_as(Some(&mixed), None), None);
+
+        // A repo with neither signal says nothing either way.
+        assert_eq!(unreadable_as(None, None), None);
+        assert_eq!(unreadable_as(Some(&st("{}")), None), None);
+    }
+
+    /// ucbye/Qwen3-Coder-Next-NVFP4-GB10 has no `safetensors` block at all,
+    /// and passed as runnable until the config was consulted too.
+    #[test]
+    fn a_repo_the_hub_has_not_indexed_is_judged_by_its_config() {
+        let st = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap();
+
+        let nvfp4 = st(
+            r#"{"quantization_config":{"format":"nvfp4-pack-quantized",
+                "quant_method":"compressed-tensors"}}"#,
+        );
+        assert_eq!(unreadable_as(None, Some(&nvfp4)), Some("nvfp4-pack-quantized".into()));
+
+        // Named by `quant_method` when that is the only spelling on offer.
+        let awq = st(r#"{"quantization_config":{"quant_method":"awq"}}"#);
+        assert_eq!(unreadable_as(None, Some(&awq)), Some("awq".into()));
+
+        // The bytes win when we have them. A config may declare a method
+        // meaning "quantise this as you load it" over readable weights, and
+        // refusing that would block a model that runs.
+        let both = st(r#"{"parameters":{"BF16":30532122624}}"#);
+        assert_eq!(unreadable_as(Some(&both), Some(&awq)), None);
+
+        // A config with no quantisation block is no evidence of anything.
+        assert_eq!(unreadable_as(None, Some(&st(r#"{"model_type":"llama"}"#))), None);
+    }
+
+    /// Both halves matter: the button has to go, and the row has to say why
+    /// in terms of the dtype rather than of the architecture, which is fine.
+    #[test]
+    fn an_fp8_checkpoint_is_blocked_before_it_is_downloaded() {
+        let mut m = sized(Some(80_000_000_000));
+        assert!(m.runnable(), "a bf16 llama is runnable");
+
+        m.unreadable_as = Some("F8_E4M3".into());
+        assert!(!m.runnable());
+        let why = m.blocker().expect("a blocked model states a reason");
+        assert!(why.contains("F8_E4M3"), "{why}");
+        assert!(!why.contains("unsupported arch"), "{why}");
     }
 
     /// The quantised formats are not whole bytes, and the arithmetic that says

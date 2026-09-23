@@ -624,7 +624,52 @@ impl Checkpoint {
         let data = decode(view.data(), view.dtype()).ok_or_else(|| {
             format!("tensor `{name}` is stored as {:?}, which this cannot read", view.dtype())
         })?;
+        let data = match view.dtype() {
+            Dtype::F8_E4M3 => self.rescale(key, rows, cols, data)?,
+            _ => data,
+        };
         Ok(Some(Tensor::new(rows, cols, data)))
+    }
+
+    /// Put an fp8 tensor back on the scale it was quantised from.
+    ///
+    /// An fp8 checkpoint stores `X.weight` beside `X.weight_scale_inv`: one
+    /// f32 for each block of the weight matrix, and the weight is the product
+    /// of the two. The name says *inv*, and the multiplication is still a
+    /// multiplication — that is DeepSeek's spelling, which Qwen and everyone
+    /// publishing fp8 has followed, and it is the kind of thing that returns
+    /// plausible text rather than an error when read the wrong way round.
+    ///
+    /// Nothing here reads the block size from the config, because it is
+    /// already implied: a `[2048, 512]` weight under a `[16, 4]` scale is
+    /// blocked 128 by 128, and deriving it cannot disagree with the file the
+    /// way a separately-parsed constant could.
+    fn rescale(&self, key: &str, rows: usize, cols: usize, mut data: Vec<f32>) -> Res<Vec<f32>> {
+        let name = format!("{key}_scale_inv");
+        let scale = self.read(&name)?.ok_or_else(|| {
+            format!("`{key}` is fp8, and there is no `{name}` beside it to scale it by")
+        })?;
+        if scale.rows == 0 || scale.cols == 0 || scale.rows > rows || scale.cols > cols {
+            return Err(format!(
+                "`{key}` is {rows}x{cols} and its scales are {}x{}, which is not a blocking of it",
+                scale.rows, scale.cols
+            )
+            .into());
+        }
+        let (high, wide) = (rows.div_ceil(scale.rows), cols.div_ceil(scale.cols));
+        for r in 0..rows {
+            let row = &mut data[r * cols..(r + 1) * cols];
+            let base = (r / high) * scale.cols;
+            // By block along the row, so the inner loop is a constant times a
+            // contiguous run and the compiler can use the wide multiply.
+            for (b, run) in row.chunks_mut(wide).enumerate() {
+                let s = scale.data[base + b];
+                for v in run.iter_mut() {
+                    *v *= s;
+                }
+            }
+        }
+        Ok(data)
     }
 
     /// For 1-D tensors, where the shape is noise.
@@ -655,8 +700,65 @@ fn decode(bytes: &[u8], dtype: Dtype) -> Option<Vec<f32>> {
             .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
+        // Raw, and not yet worth anything: an fp8 checkpoint stores a
+        // separate scale for each block of weights, and these values are
+        // meaningless until multiplied by it. `Checkpoint::read` does that
+        // as soon as this returns, and is the only caller.
+        Dtype::F8_E4M3 => bytes.iter().map(|&b| f8_e4m3_to_f32(b)).collect(),
         _ => return None,
     })
+}
+
+/// Every value an `e4m3` byte can take, by the byte.
+///
+/// There are two hundred and fifty-six of them, so the arithmetic is done
+/// once at startup and never again — 80B weights would otherwise pay for the
+/// same sixteen exponents over and over.
+fn f8_e4m3_table() -> &'static [f32; 256] {
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (b, v) in t.iter_mut().enumerate() {
+            let b = b as u8;
+            let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+            let exp = ((b >> 3) & 0x0f) as i32;
+            let man = (b & 0x07) as f32;
+            *v = match exp {
+                // Subnormal: no implicit leading one, and the exponent is
+                // pinned at the smallest normal one.
+                0 => sign * man / 8.0 * (2.0f32).powi(-6),
+                // `e4m3fn`, the variant every checkpoint uses, spends no
+                // encodings on infinity. All ones is the only NaN.
+                0x0f if man == 7.0 => f32::NAN,
+                _ => sign * (1.0 + man / 8.0) * (2.0f32).powi(exp - 7),
+            };
+        }
+        t
+    })
+}
+
+/// Whether the packing a `quantization_config` describes is one this engine
+/// can read.
+///
+/// Kept beside [`decode`], which is what makes the answer true. Callers ask
+/// it from two directions — a search result deciding whether to offer a
+/// download, and a loader deciding whether to start one — and both were
+/// answering "no" to everything before fp8 arrived.
+///
+/// `e4m3` only. `e5m2` trades mantissa for range and is published far less,
+/// and guessing at it would be worse than saying no.
+pub fn reads_packing(quant: &serde_json::Value) -> bool {
+    let method = quant.get("quant_method").and_then(|m| m.as_str()).unwrap_or("");
+    // Absent means e4m3: it is the default every fp8 publication uses, and
+    // the ones that state it state that.
+    let fmt = quant.get("fmt").and_then(|m| m.as_str()).unwrap_or("e4m3");
+    method == "fp8" && fmt == "e4m3"
+}
+
+/// One `e4m3` byte: sign, four exponent bits biased by seven, three of
+/// mantissa. Largest finite value 448, smallest subnormal 2^-9.
+fn f8_e4m3_to_f32(b: u8) -> f32 {
+    f8_e4m3_table()[b as usize]
 }
 
 /// IEEE 754 half -> single precision.
@@ -685,6 +787,131 @@ fn f16_to_f32(h: u16) -> f32 {
 /// Read a JSON file into a `serde_json::Value`.
 pub fn read_json(path: &Path) -> Res<serde_json::Value> {
     Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+#[cfg(test)]
+mod fp8_tests {
+    use super::*;
+
+    /// Worked out from the format rather than from this implementation, so
+    /// the test can disagree with the code: sign, four exponent bits biased
+    /// by seven, three of mantissa, no implicit one when the exponent is
+    /// zero.
+    #[test]
+    fn e4m3_decodes_to_the_values_the_format_defines() {
+        assert_eq!(f8_e4m3_to_f32(0x00), 0.0);
+        assert_eq!(f8_e4m3_to_f32(0x80), 0.0); // negative zero
+        assert_eq!(f8_e4m3_to_f32(0x38), 1.0); // exp 7, mantissa 0
+        assert_eq!(f8_e4m3_to_f32(0x3c), 1.5); // exp 7, mantissa 4 -> 1 + 4/8
+        assert_eq!(f8_e4m3_to_f32(0xb8), -1.0);
+        assert_eq!(f8_e4m3_to_f32(0x40), 2.0);
+
+        // The ends. 448 is the largest finite value `e4m3fn` can hold, which
+        // is the number every description of the format quotes.
+        assert_eq!(f8_e4m3_to_f32(0x7e), 448.0);
+        assert!(f8_e4m3_to_f32(0x7f).is_nan());
+        assert!(f8_e4m3_to_f32(0xff).is_nan());
+
+        // Smallest normal is 2^-6, and below it the mantissa carries the
+        // value alone: 2^-9 is the smallest number the format has at all.
+        assert_eq!(f8_e4m3_to_f32(0x08), 0.015625);
+        assert_eq!(f8_e4m3_to_f32(0x01), 0.001953125);
+    }
+
+    /// Write a one-tensor-per-entry safetensors file by hand: eight bytes of
+    /// header length, that much JSON, then the blob the offsets point into.
+    fn write_safetensors(path: &std::path::Path, entries: &[(&str, &str, Vec<usize>, Vec<u8>)]) {
+        let mut header = String::from("{");
+        let mut blob: Vec<u8> = Vec::new();
+        for (i, (name, dtype, shape, bytes)) in entries.iter().enumerate() {
+            let start = blob.len();
+            blob.extend_from_slice(bytes);
+            let shape = shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+            if i > 0 {
+                header.push(',');
+            }
+            header.push_str(&format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{shape}],\"data_offsets\":[{start},{}]}}",
+                blob.len()
+            ));
+        }
+        header.push('}');
+        let mut out = (header.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&blob);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// The block indexing, which is the part worth doubting.
+    ///
+    /// A 4x8 weight under a 2x4 scale is blocked two rows by two columns, so
+    /// every value in a block is multiplied by the same number and the four
+    /// blocks across a row use four different ones. Getting the row stride
+    /// wrong, or transposing the two, still produces a finite matrix of
+    /// plausible size — which is why this checks a value per block rather
+    /// than a norm over the whole thing.
+    #[test]
+    fn an_fp8_tensor_comes_back_multiplied_by_its_block_scales() {
+        let dir = std::env::temp_dir().join(format!("kvad-fp8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+
+        // Every weight is 1.0, so whatever comes back *is* the scale that was
+        // applied to it, named by position.
+        let weights = vec![0x38u8; 4 * 8];
+        let scales: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let scale_bytes = scales.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>();
+        write_safetensors(
+            &path,
+            &[
+                ("w.weight", "F8_E4M3", vec![4, 8], weights),
+                ("w.weight_scale_inv", "F32", vec![2, 4], scale_bytes),
+            ],
+        );
+
+        let ck = Checkpoint::open(&[path]).unwrap();
+        let t = ck.get("w.weight").unwrap();
+        assert_eq!((t.rows, t.cols), (4, 8));
+        for r in 0..4 {
+            for c in 0..8 {
+                let want = scales[(r / 2) * 4 + c / 2];
+                assert_eq!(t.data[r * 8 + c], want, "at ({r}, {c})");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An fp8 tensor with no scales beside it is not a tensor. Reading it as
+    /// raw e4m3 would hand back numbers that are wrong by whatever the scale
+    /// would have been, and nothing downstream could tell.
+    #[test]
+    fn an_fp8_tensor_without_its_scales_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("kvad-fp8-bare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        write_safetensors(&path, &[("w.weight", "F8_E4M3", vec![4, 8], vec![0x38u8; 32])]);
+
+        let ck = Checkpoint::open(&[path]).unwrap();
+        let err = ck.get("w.weight").unwrap_err().to_string();
+        assert!(err.contains("weight_scale_inv"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reader's list and the blocker's list are the same list.
+    #[test]
+    fn only_the_packings_that_decode_are_accepted() {
+        let q = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap();
+
+        assert!(reads_packing(&q(r#"{"quant_method":"fp8","fmt":"e4m3"}"#)));
+        // Qwen's small publications omit `fmt`; e4m3 is what they mean.
+        assert!(reads_packing(&q(r#"{"quant_method":"fp8"}"#)));
+
+        // Range in place of mantissa, published rarely, and not implemented.
+        assert!(!reads_packing(&q(r#"{"quant_method":"fp8","fmt":"e5m2"}"#)));
+        assert!(!reads_packing(&q(r#"{"quant_method":"awq"}"#)));
+        assert!(!reads_packing(&q(r#"{"quant_method":"compressed-tensors"}"#)));
+        assert!(!reads_packing(&q("{}")));
+    }
 }
 
 #[cfg(test)]

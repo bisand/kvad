@@ -816,17 +816,37 @@ fn v3s_extra_prediction_head_is_skipped_on_purpose() {
     assert_eq!(model.spec().n_layer, spec.n_layer, "the extra block is not a layer");
 }
 
-/// fp8 checkpoints are refused where somebody can still do something about
-/// it, rather than thirty gigabytes later.
+/// fp8 is no longer a refusal, and this used to assert that it was.
+///
+/// The block scheme DeepSeek published V3 and R1 under — `e4m3` weights
+/// beside a `weight_scale_inv` for every 128 by 128 tile — is the one
+/// `Checkpoint::read` now reads, and Qwen's fp8 publications follow it
+/// because DeepSeek's came first. Refusing it was right while nothing could
+/// decode it and is wrong now.
+///
+/// A packing that still cannot be decoded is still refused, and that half of
+/// the old test is the half worth keeping: the check has to distinguish
+/// between the two rather than having been deleted.
 #[test]
-fn an_fp8_checkpoint_is_refused_by_name() {
-    let mut config = tiny(Flavour::V3).config;
-    config["quantization_config"] = serde_json::json!({"quant_method": "fp8", "fmt": "e4m3"});
-    let err = Spec::from_config(Json::new(config))
+fn an_fp8_checkpoint_loads_and_an_awq_one_still_does_not() {
+    let with = |q: serde_json::Value| {
+        let mut config = tiny(Flavour::V3).config;
+        config["quantization_config"] = q;
+        Spec::from_config(Json::new(config))
+    };
+
+    assert!(with(serde_json::json!({"quant_method": "fp8", "fmt": "e4m3"})).is_ok());
+
+    let err = with(serde_json::json!({"quant_method": "awq"})).unwrap_err().to_string();
+    assert!(err.contains("awq"), "{err}");
+    assert!(err.contains("bf16"), "{err}");
+
+    // Range traded for mantissa. Published, not implemented, and the error
+    // has to name what it is rather than saying "fp8" and stopping.
+    let err = with(serde_json::json!({"quant_method": "fp8", "fmt": "e5m2"}))
         .unwrap_err()
         .to_string();
     assert!(err.contains("fp8"), "{err}");
-    assert!(err.contains("bf16"), "{err}");
 }
 
 /// The quantised path is the one anybody will actually run, and MLA gives it

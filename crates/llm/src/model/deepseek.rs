@@ -169,7 +169,7 @@ impl Mla {
 fn configure(spec: &mut Spec) -> Res<()> {
     // fp8 is not a dtype this engine's safetensors reader handles, and the
     // failure it would otherwise produce arrives thirty gigabytes later.
-    if let Some(q) = spec.config.get("quantization_config") {
+    if let Some(q) = spec.config.get("quantization_config").filter(|q| !crate::weights::reads_packing(q)) {
         let method = q
             .get("quant_method")
             .and_then(|m| m.as_str())

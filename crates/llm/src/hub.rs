@@ -159,6 +159,12 @@ fn local_params(dir: &Path, config: Option<&serde_json::Value>, packed: bool) ->
     if packed {
         return None;
     }
+    // An fp8 checkpoint is one byte a weight and says `bfloat16` anyway,
+    // that being what it was converted from. It is readable, so it does not
+    // take the branch above, and the width below would halve it.
+    if config.and_then(|c| c.get("quantization_config")).is_some() {
+        return Some(index_bytes(dir)?);
+    }
     // `torch_dtype` spells these differently from the Hub API's `safetensors`
     // block, which is why this is not `dtype_bytes`. Absent, assume the
     // half precision that nearly every checkpoint now ships in: guessing
@@ -169,15 +175,22 @@ fn local_params(dir: &Path, config: Option<&serde_json::Value>, packed: bool) ->
         Some("float8_e4m3fn" | "float8_e5m2" | "int8" | "uint8") => 1,
         _ => 2,
     };
-    let bytes = match model_file(dir, "model.safetensors.index.json") {
+    Some(index_bytes(dir)? / width)
+}
+
+/// Bytes of weights in a checkpoint, as its own index states them.
+///
+/// A single-file checkpoint has no index, so the file's own size stands in —
+/// it overstates by the header, which is kilobytes against gigabytes.
+fn index_bytes(dir: &Path) -> Option<u64> {
+    match model_file(dir, "model.safetensors.index.json") {
         Some(index) => crate::weights::read_json(&index)
             .ok()?
             .get("metadata")?
             .get("total_size")?
-            .as_u64()?,
-        None => std::fs::metadata(model_file(dir, "model.safetensors")?).ok()?.len(),
-    };
-    Some(bytes / width)
+            .as_u64(),
+        None => Some(std::fs::metadata(model_file(dir, "model.safetensors")?).ok()?.len()),
+    }
 }
 
 /// Whether a model will run on this machine, and how cheaply.
@@ -302,6 +315,12 @@ fn unreadable_as(safetensors: Option<&serde_json::Value>, config: Option<&serde_
 /// disk, which is why it is here rather than inline in either.
 fn quant_format(config: &serde_json::Value) -> Option<String> {
     let quant = config.get("quantization_config")?;
+    // A packing this build reads is not a blocker. It stops being one the
+    // moment `decode` grows a case for it, which is why the question is
+    // asked of the reader rather than answered again here.
+    if crate::weights::reads_packing(quant) {
+        return None;
+    }
     // `format` is the specific one where compressed-tensors uses both;
     // `quant_method` is what everything else names itself by.
     let name = ["format", "quant_method"]

@@ -2692,8 +2692,12 @@ command that only asked the service manager would call it fine.
 
 The API tests train a two-layer GPT on "the cat sat on the mat" *inside the
 test*, save it, and then run a real prompt suite, a real benchmark and a real
-perplexity job against it through the real scheduler. Three tests, under a
-second, no network and no gigabytes.
+perplexity job against it through the real scheduler. A second model is
+trained on chat turns, `u:the cat?|a:on the mat.|`, and saved with a chat
+template and `|` as its end token. The prompt suites and the chat endpoint are
+pointed at instruct models, and a model with no template once let every eval
+answer come back empty on a green suite. Each model trains in under a second,
+with no network and no gigabytes.
 
 Authentication got the mutation treatment: each of fifteen checks was deleted
 in turn and the suite rerun. Two escaped the first pass — the `Admin` extractor

@@ -147,16 +147,23 @@ fn fit_of(params: Option<u64>) -> Fit {
 /// names the dtype they are stored in; the quotient is the count. A
 /// single-file checkpoint has no index, so the file's own size stands in —
 /// it overstates by the header, which is kilobytes against gigabytes.
-fn local_params(dir: &Path, config: Option<&Path>) -> Option<u64> {
+///
+/// `packed` gives up instead. A quantised repack's `torch_dtype` describes
+/// what it was converted *from*: Qwen's fp8 publication of a 30B model says
+/// `bfloat16` over bytes that hold one weight each, and dividing by two
+/// called it a 15B model. An AWQ repack is further out still, at eight
+/// weights to an `i32`. One wrong number here becomes a wrong memory
+/// estimate, a wrong precision and a wrong badge, and none of those are
+/// worth having in place of "unknown".
+fn local_params(dir: &Path, config: Option<&serde_json::Value>, packed: bool) -> Option<u64> {
+    if packed {
+        return None;
+    }
     // `torch_dtype` spells these differently from the Hub API's `safetensors`
     // block, which is why this is not `dtype_bytes`. Absent, assume the
     // half precision that nearly every checkpoint now ships in: guessing
     // wrong by a factor of two is better than saying nothing at all.
-    let width = match config
-        .and_then(|c| crate::weights::read_json(c).ok())
-        .and_then(|j| Some(j.get("torch_dtype")?.as_str()?.to_string()))
-        .as_deref()
-    {
+    let width = match config.and_then(|j| j.get("torch_dtype")?.as_str()) {
         Some("float64" | "int64") => 8,
         Some("float32" | "int32") => 4,
         Some("float8_e4m3fn" | "float8_e5m2" | "int8" | "uint8") => 1,
@@ -285,7 +292,16 @@ fn unreadable_as(safetensors: Option<&serde_json::Value>, config: Option<&serde_
             .max_by_key(|&(_, n)| n)?;
         return (!readable_dtype(dtype)).then(|| dtype.clone());
     }
-    let quant = config?.get("quantization_config")?;
+    quant_format(config?)
+}
+
+/// What a `config.json` calls the format its weights are packed in, if it
+/// says they are packed at all.
+///
+/// The same question asked of a search result and of a directory on the
+/// disk, which is why it is here rather than inline in either.
+fn quant_format(config: &serde_json::Value) -> Option<String> {
+    let quant = config.get("quantization_config")?;
     // `format` is the specific one where compressed-tensors uses both;
     // `quant_method` is what everything else names itself by.
     let name = ["format", "quant_method"]
@@ -450,12 +466,28 @@ pub struct LocalModel {
     /// will fit here — which the page listing them wants to show, and
     /// which nothing on disk states outright.
     pub params: Option<u64>,
+    /// How the weights are packed, when that is something this engine cannot
+    /// read. As [`HubModel::unreadable_as`], for a model already downloaded:
+    /// blocking these in search stops somebody starting the download, and
+    /// this is what stops the ones that are already here being offered.
+    pub unreadable_as: Option<String>,
 }
 
 impl LocalModel {
     /// Whether this will run from memory or from the disk. See [`Fit`].
     pub fn fit(&self) -> Fit {
         fit_of(self.params)
+    }
+
+    /// One-line reason this cannot be run, for the reasons visible from the
+    /// checkpoint's own metadata. The caller adds the ones only it knows —
+    /// a half-finished download, an architecture this build has no reader
+    /// for — and asks this for the rest.
+    pub fn unreadable(&self) -> Option<String> {
+        let packed = self.unreadable_as.as_ref()?;
+        Some(format!(
+            "weights are packed as `{packed}`, which this engine cannot read —              look for a bf16 or f16 publication of the same model"
+        ))
     }
 }
 
@@ -491,14 +523,18 @@ pub fn local_models() -> Vec<LocalModel> {
             let path = entry.path();
             let bytes = dir_size(&path);
             let files = snapshot_files(&path);
-            let config = find_config(&path);
+            // Read once. It used to be parsed for the `model_type` here and
+            // again inside `local_params`, and there are now three questions
+            // to ask it.
+            let config = find_config(&path).and_then(|c| crate::weights::read_json(&c).ok());
             let model_type = config
-                .as_deref()
-                .and_then(|c| crate::weights::read_json(c).ok())
+                .as_ref()
                 .and_then(|j| j.get("model_type")?.as_str().map(str::to_string));
-            let params = local_params(&path, config.as_deref());
+            let unreadable_as = config.as_ref().and_then(quant_format);
+            let params = local_params(&path, config.as_ref(), unreadable_as.is_some());
             Some(LocalModel {
                 params,
+                unreadable_as,
                 id,
                 path,
                 bytes,
@@ -536,22 +572,27 @@ pub fn trained_models() -> Vec<LocalModel> {
         .filter(|e| e.path().is_dir())
         .map(|entry| {
             let path = entry.path();
-            let config = path.join("config.json");
-            let model_type = crate::weights::read_json(&config)
-                .ok()
+            let config = crate::weights::read_json(&path.join("config.json")).ok();
+            let model_type = config
+                .as_ref()
                 .and_then(|j| j.get("model_type")?.as_str().map(str::to_string));
             LocalModel {
                 id: entry.file_name().to_string_lossy().into_owned(),
                 bytes: dir_size(&path),
+                // Nothing this engine trains is packed, so this is `None` in
+                // practice. Asked anyway rather than assumed, because a
+                // directory here is whatever somebody put in it.
+                unreadable_as: config.as_ref().and_then(quant_format),
                 // A trained model is laid out flat rather than in the
                 // cache's blob-and-snapshot shape, which `model_file`
                 // already handles by looking directly first.
-                params: local_params(&path, Some(&config)),
+                params: local_params(&path, config.as_ref(), false),
                 arch: model_type.as_deref().and_then(Arch::from_model_type),
                 model_type,
                 // A directory left behind by a run that was stopped before
                 // its first checkpoint has a tokeniser and no weights.
-                complete: path.join("model.safetensors").is_file() && config.is_file(),
+                complete: path.join("model.safetensors").is_file()
+                    && path.join("config.json").is_file(),
                 path,
             }
         })

@@ -173,6 +173,10 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
             false => "the download did not finish".to_string(),
         }),
         (_, None, _) => Some("no config.json, so there is nothing to say what this is".into()),
+        // Ahead of the architecture, and for the same reason it comes ahead
+        // of it in search: an fp8 repack of a model this engine runs is not
+        // an unsupported architecture.
+        _ if m.unreadable().is_some() => m.unreadable(),
         // Named by the list the loader dispatches on rather than by a copy of
         // it kept here, which is how this came to be offering GPT-2 and the
         // Llama family long after DeepSeek arrived.
@@ -684,7 +688,32 @@ mod tests {
             // These cases are about what a model says for itself, not about
             // what it weighs, so the size is deliberately unknown.
             params: None,
+            unreadable_as: None,
         }
+    }
+
+    /// As `local`, for a checkpoint whose weights are packed in a format this
+    /// engine has no reader for.
+    fn packed(id: &str, model_type: &str, packed_as: &str) -> hub::LocalModel {
+        hub::LocalModel { unreadable_as: Some(packed_as.into()), ..local(id, Some(model_type), true) }
+    }
+
+    /// A repack that is already on the disk gets the same answer as one in
+    /// the search results, and gets it in terms of the packing rather than of
+    /// the architecture — `qwen3_moe` is an architecture this build runs, and
+    /// saying it is not would send somebody looking for the wrong thing.
+    #[test]
+    fn a_downloaded_repack_says_it_is_the_packing_that_stops_it() {
+        let m = describe(&packed("Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8", "qwen3_moe", "fp8"), false);
+        assert!(!m.runnable);
+        let why = m.blocker.expect("a blocked model states a reason");
+        assert!(why.contains("fp8"), "{why}");
+        assert!(!why.contains("not an architecture"), "{why}");
+
+        // An unfinished download is still answered as one. The packing is a
+        // fact about weights, and there are none yet.
+        let half = hub::LocalModel { complete: false, ..packed("a/b", "qwen3_moe", "fp8") };
+        assert!(describe(&half, false).blocker.unwrap().contains("did not finish"));
     }
 
     /// Every unrunnable model says why in a sentence somebody can act on, and

@@ -159,11 +159,15 @@ fn local_params(dir: &Path, config: Option<&serde_json::Value>, packed: bool) ->
     if packed {
         return None;
     }
-    // An fp8 checkpoint is one byte a weight and says `bfloat16` anyway,
-    // that being what it was converted from. It is readable, so it does not
-    // take the branch above, and the width below would halve it.
+    // A quantised checkpoint has no single width to divide by. An fp8 one
+    // holds its big matrices at a byte a weight, its norms and embeddings at
+    // bf16, and an f32 scale for every block on top -- and its `torch_dtype`
+    // says `bfloat16` throughout, that being what it was converted from.
+    // Dividing the total by any one of those was wrong three ways: it called
+    // Qwen3-0.6B-FP8 a 1.06B model against the same weights' 0.75B in bf16.
+    // So this one counts instead of dividing.
     if config.and_then(|c| c.get("quantization_config")).is_some() {
-        return Some(index_bytes(dir)?);
+        return header_params(dir);
     }
     // `torch_dtype` spells these differently from the Hub API's `safetensors`
     // block, which is why this is not `dtype_bytes`. Absent, assume the
@@ -176,6 +180,55 @@ fn local_params(dir: &Path, config: Option<&serde_json::Value>, packed: bool) ->
         _ => 2,
     };
     Some(index_bytes(dir)? / width)
+}
+
+/// Parameters in a checkpoint, counted from the shapes its safetensors
+/// headers declare.
+///
+/// For the mixed-precision checkpoints, where no division gives the right
+/// answer. A header is a JSON object at the front of each shard — eight
+/// bytes of length, then that much text — so this reads kilobytes per shard
+/// and none of the weights.
+///
+/// The scales are excluded. They are how a quantised checkpoint stores what
+/// an unquantised one holds inline, and counting them would report the model
+/// as larger for having been made smaller.
+fn header_params(dir: &Path) -> Option<u64> {
+    let mut total = 0u64;
+    let mut found = false;
+    for name in snapshot_files(dir) {
+        if !name.ends_with(".safetensors") {
+            continue;
+        }
+        let Some(path) = model_file(dir, &name) else { continue };
+        let Ok(mut file) = std::fs::File::open(&path) else { continue };
+        let mut len = [0u8; 8];
+        if std::io::Read::read_exact(&mut file, &mut len).is_err() {
+            continue;
+        }
+        let len = u64::from_le_bytes(len);
+        // A header is kilobytes. Anything claiming to be enormous is a file
+        // this has no business reading into memory.
+        if len == 0 || len > 128 << 20 {
+            continue;
+        }
+        let mut buf = vec![0u8; len as usize];
+        if std::io::Read::read_exact(&mut file, &mut buf).is_err() {
+            continue;
+        }
+        let Ok(header) = serde_json::from_slice::<serde_json::Value>(&buf) else { continue };
+        let Some(entries) = header.as_object() else { continue };
+        for (tensor, meta) in entries {
+            if tensor == "__metadata__" || tensor.ends_with("_scale_inv") || tensor.ends_with("_scale") {
+                continue;
+            }
+            let Some(shape) = meta.get("shape").and_then(|s| s.as_array()) else { continue };
+            let n = shape.iter().filter_map(|d| d.as_u64()).product::<u64>();
+            total += n;
+            found = true;
+        }
+    }
+    found.then_some(total)
 }
 
 /// Bytes of weights in a checkpoint, as its own index states them.
@@ -825,6 +878,40 @@ mod tests {
         // A repo with neither signal says nothing either way.
         assert_eq!(unreadable_as(None, None), None);
         assert_eq!(unreadable_as(Some(&st("{}")), None), None);
+    }
+
+    /// A quantised checkpoint is counted, not divided.
+    ///
+    /// The regression this exists for: dividing `total_size` by a width
+    /// reported Qwen3-0.6B-FP8 as a 1.06B model where the same weights in
+    /// bf16 came to 0.75B, because an fp8 file mixes one-byte matrices with
+    /// bf16 norms and f32 scales and no single divisor is right for it.
+    #[test]
+    fn a_quantised_checkpoint_counts_its_shapes_and_skips_its_scales() {
+        let dir = std::env::temp_dir().join(format!("kvad-hdr-{}", std::process::id()));
+        let snap = dir.join("snapshots").join("abc123");
+        std::fs::create_dir_all(&snap).unwrap();
+
+        // 4x8 of weights, 2x4 of scales. Only the first is the model.
+        let header = r#"{"__metadata__":{"format":"pt"},
+            "w.weight":{"dtype":"F8_E4M3","shape":[4,8],"data_offsets":[0,32]},
+            "w.weight_scale_inv":{"dtype":"F32","shape":[2,4],"data_offsets":[32,64]}}"#;
+        let mut out = (header.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&[0u8; 64]);
+        std::fs::write(snap.join("model.safetensors"), out).unwrap();
+
+        // 32 weights, and not the 8 scales beside them, nor `__metadata__`.
+        assert_eq!(header_params(&dir), Some(32));
+
+        // And the whole way through, as `local_models` would ask it.
+        let config = serde_json::json!({
+            "torch_dtype": "bfloat16",
+            "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"},
+        });
+        assert_eq!(local_params(&dir, Some(&config), false), Some(32));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// ucbye/Qwen3-Coder-Next-NVFP4-GB10 has no `safetensors` block at all,

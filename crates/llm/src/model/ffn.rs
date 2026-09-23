@@ -520,6 +520,37 @@ impl Moe {
         })
     }
 
+    /// The router's logits for one token and, when this family has a shared
+    /// expert, that expert up to its down projection -- as one section.
+    ///
+    /// `None` when a weight is not quantised, and the caller does both the
+    /// ordinary way.
+    fn early(&self, x: &[f32]) -> Option<(Vec<f32>, Option<Pending<'_>>)> {
+        let mut jobs: Vec<(&Weight, &[f32])> = vec![(&self.gate, x)];
+        if let Some(s) = &self.shared {
+            jobs.push((&s.ffn.gate, x));
+            jobs.push((&s.ffn.up, x));
+            if let Some(gate) = &s.gate {
+                jobs.push((gate, x));
+            }
+        }
+        let mut ys = crate::quant::matvec_many(&jobs)?.into_iter();
+        let logits = ys.next()?;
+        let shared = match &self.shared {
+            None => None,
+            Some(s) => {
+                let mut hidden = ys.next()?;
+                swiglu_inplace(&mut hidden, &ys.next()?);
+                let score = match &s.gate {
+                    Some(_) => Some(ys.next()?[0]),
+                    None => None,
+                };
+                Some(Pending { down: &s.ffn.down, hidden, score })
+            }
+        };
+        Some((logits, shared))
+    }
+
     /// The mixture, over a batch.
     ///
     /// Grouped by expert rather than by token. Every token picks its own
@@ -530,7 +561,12 @@ impl Moe {
     pub fn run(&self, hs: &[f32], m: usize, e: usize) -> Vec<f32> {
         let router = &self.router;
         let n = router.n_experts;
-        let logits = self.gate.matmul_bt(hs, m, None);
+        // One token: the router and the shared expert read the same input
+        // and neither needs the other, so they are one parallel section.
+        let (logits, mut shared) = match (m == 1 && together()).then(|| self.early(hs)).flatten() {
+            Some((logits, shared)) => (logits, shared),
+            None => (self.gate.matmul_bt(hs, m, None), None),
+        };
 
         let mut picks = Vec::with_capacity(router.top_k);
         let mut by_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
@@ -549,8 +585,11 @@ impl Moe {
         trace.finish(self.layer, n, self.experts.first().map_or(0, Ffn::bytes));
 
         let mut out = match &self.shared {
+            // Waiting for its down projection, which `mix` runs with the
+            // routed experts' and lands before any of theirs is added.
+            Some(_) if shared.is_some() => vec![0.0f32; m * e],
             // Every token, so it is one batched pass and needs no grouping.
-            Some(shared) => shared.run(hs, m),
+            Some(expert) => expert.run(hs, m),
             None => vec![0.0f32; m * e],
         };
         let chosen: Vec<usize> = (0..n).filter(|&x| !by_expert[x].is_empty()).collect();
@@ -572,7 +611,7 @@ impl Moe {
                         }
                     })
                     .collect();
-                mix(hs, m, e, &by_expert, &pairs, &mut out);
+                mix(hs, m, e, &by_expert, &pairs, &mut shared, &mut out);
                 for &(x, ..) in group {
                     done[x] = true;
                 }
@@ -586,26 +625,59 @@ impl Moe {
         }
         let rest: Vec<(usize, &Ffn)> =
             chosen.iter().filter(|&&x| !done[x]).map(|&x| (x, &self.experts[x])).collect();
-        mix(hs, m, e, &by_expert, &rest, &mut out);
+        mix(hs, m, e, &by_expert, &rest, &mut shared, &mut out);
+        debug_assert!(shared.is_none(), "the shared expert never landed");
         out
     }
 }
 
 
+/// A token's shared expert with only its down projection left to run.
+///
+/// Carried into [`mix`] so the down projection can share a section with the
+/// routed experts' -- and so that, whichever way `mix` runs, the shared
+/// output is what `out` starts as, before any routed expert is added.
+struct Pending<'a> {
+    down: &'a Weight,
+    hidden: Vec<f32>,
+    /// Qwen3-Next's per-token gate, before its sigmoid.
+    score: Option<f32>,
+}
+
+impl Pending<'_> {
+    /// Put the finished shared expert in `out`, as `SharedExpert::run` would.
+    fn land(self, y: Vec<f32>, out: &mut [f32]) {
+        out.copy_from_slice(&y);
+        if let Some(score) = self.score {
+            let g = 1.0 / (1.0 + (-score).exp());
+            for o in out.iter_mut() {
+                *o *= g;
+            }
+        }
+    }
+}
+
 /// Run `group` -- each expert with the weights to run it from -- and add
-/// each one's output into `out`, weighted, in the order given.
+/// each one's output into `out`, weighted, in the order given. `shared`, if
+/// it is still waiting, lands first.
 ///
 /// The order is the answer's: floating-point addition does not reassociate,
-/// so the experts are summed in the order the unbatched path always used.
+/// so the experts are summed in the order the unbatched path always used,
+/// after the shared expert, as they always were.
 fn mix(
     hs: &[f32],
     m: usize,
     e: usize,
     by_expert: &[Vec<(usize, f32)>],
     group: &[(usize, &Ffn)],
+    shared: &mut Option<Pending<'_>>,
     out: &mut [f32],
 ) {
     if group.is_empty() {
+        if let Some(p) = shared.take() {
+            let y = p.down.matvec_bt(&p.hidden, None);
+            p.land(y, out);
+        }
         return;
     }
     if m == 1 && together() {
@@ -621,7 +693,11 @@ fn mix(
                 ffn.down.will_need();
             }
         }
-        if let Some(ys) = decode_together(hs, group) {
+        let tail = shared.as_ref().map(|p| (p.down, p.hidden.as_slice()));
+        if let Some((ys, tail)) = decode_together(hs, group, tail) {
+            if let (Some(p), Some(y)) = (shared.take(), tail) {
+                p.land(y, out);
+            }
             for (&(expert, _), y) in group.iter().zip(ys) {
                 // One token, which chose each of these experts exactly once.
                 let weight = by_expert[expert][0].1;
@@ -631,6 +707,10 @@ fn mix(
             }
             return;
         }
+    }
+    if let Some(p) = shared.take() {
+        let y = p.down.matvec_bt(&p.hidden, None);
+        p.land(y, out);
     }
     let mut rows = Vec::with_capacity(m * e);
     for &(expert, ffn) in group {
@@ -656,7 +736,15 @@ fn mix(
 /// on Qwen3-Next, each a 0.66 MB matrix split fourteen ways -- and the
 /// profile of that was a thread pool mostly yielding. Here it is two.
 /// `None` when the weights are not quantised; the caller runs them singly.
-fn decode_together(x: &[f32], group: &[(usize, &Ffn)]) -> Option<Vec<Vec<f32>>> {
+///
+/// `tail` is one more down projection to run in the second section -- the
+/// shared expert's -- and its result comes back beside the experts'.
+#[allow(clippy::type_complexity)]
+fn decode_together(
+    x: &[f32],
+    group: &[(usize, &Ffn)],
+    tail: Option<(&Weight, &[f32])>,
+) -> Option<(Vec<Vec<f32>>, Option<Vec<f32>>)> {
     let mut jobs = Vec::with_capacity(2 * group.len());
     for &(_, ffn) in group {
         jobs.push((&ffn.gate, x));
@@ -668,9 +756,12 @@ fn decode_together(x: &[f32], group: &[(usize, &Ffn)]) -> Option<Vec<Vec<f32>>> 
         swiglu_inplace(&mut gate, &up);
         hidden.push(gate);
     }
-    let jobs: Vec<(&Weight, &[f32])> =
+    let mut jobs: Vec<(&Weight, &[f32])> =
         group.iter().zip(&hidden).map(|(&(_, ffn), h)| (&ffn.down, h.as_slice())).collect();
-    crate::quant::matvec_many(&jobs)
+    jobs.extend(tail);
+    let mut ys = crate::quant::matvec_many(&jobs)?;
+    let tail = tail.and_then(|_| ys.pop());
+    Some((ys, tail))
 }
 
 /// Whether to tell the kernel which experts a token chose before running
@@ -754,6 +845,74 @@ mod tests {
         Json::new(v)
     }
 
+    /// One token through a whole mixture -- router, shared expert and all --
+    /// against the old path written out longhand: route, run the shared
+    /// expert, then add each chosen expert's output in expert order. Every
+    /// kind of shared expert, because each lands in a different way.
+    #[test]
+    fn a_decoded_token_equals_the_mixture_run_the_old_way() {
+        use crate::quant::Precision;
+        use crate::tensor::Tensor;
+        let mut rng = nervus::rng::Rng::new(29);
+        let mut mat = |rows: usize, cols: usize| {
+            Tensor::new(rows, cols, (0..rows * cols).map(|_| rng.normal() * 0.1).collect())
+        };
+        let (hidden, width, n) = (64, 32, 6);
+        for (kind, shared) in [("none", Shared::None), ("fused", Shared::Fused(2)), ("gated", Shared::Gated(64))] {
+            let precision = Precision::Q8;
+            let mut ffn = |w: usize| Ffn {
+                gate: Weight::quantize(mat(w, hidden), precision),
+                up: Weight::quantize(mat(w, hidden), precision),
+                down: Weight::quantize(mat(hidden, w), precision),
+            };
+            let experts: Vec<Ffn> = (0..n).map(|_| ffn(width)).collect();
+            let shared_ffn = match shared {
+                Shared::None => None,
+                Shared::Fused(k) => Some(ffn(width * k)),
+                Shared::Gated(w) => Some(ffn(w)),
+            };
+            let router = Router::read(&config(json!({
+                "n_routed_experts": n, "num_experts_per_tok": 2, "norm_topk_prob": true
+            })))
+            .unwrap();
+            let moe = Moe {
+                router,
+                gate: Weight::quantize(mat(n, hidden), precision),
+                bias: None,
+                experts,
+                shared: shared_ffn.map(|ffn| SharedExpert {
+                    ffn,
+                    gate: matches!(shared, Shared::Gated(_))
+                        .then(|| Weight::quantize(mat(1, hidden), precision)),
+                }),
+                layer: 0,
+                resident: None,
+            };
+            let x = mat(1, hidden).data;
+
+            let logits = moe.gate.matmul_bt(&x, 1, None);
+            let mut picks = Vec::new();
+            moe.router.route(&logits, None, &mut picks);
+            picks.sort_by_key(|&(expert, _)| expert);
+            let mut want = match &moe.shared {
+                Some(s) => s.run(&x, 1),
+                None => vec![0.0; hidden],
+            };
+            for &(expert, weight) in &picks {
+                for (o, v) in want.iter_mut().zip(&moe.experts[expert].run(&x, 1)) {
+                    *o += weight * v;
+                }
+            }
+            // Not vacuous: the folded path is the one that ran, and it carried
+            // the shared expert out with it where there is one.
+            let (_, pending) = moe
+                .early(&x)
+                .unwrap_or_else(|| panic!("{kind}: the router and shared expert did not batch"));
+            assert_eq!(pending.is_some(), moe.shared.is_some(), "shared expert: {kind}");
+            assert_eq!(moe.run(&x, 1, hidden), want, "shared expert: {kind}");
+        }
+    }
+
     /// A token's experts run as one batch give each expert's output exactly
     /// as it came from running that expert alone -- the property that lets
     /// the batched decode path replace the old one without changing a token.
@@ -776,7 +935,7 @@ mod tests {
                 .collect();
             let x = mat(1, hidden).data;
             let group: Vec<(usize, &Ffn)> = experts.iter().enumerate().collect();
-            let together = decode_together(&x, &group).expect("quantised experts batch");
+            let (together, _) = decode_together(&x, &group, None).expect("quantised experts batch");
             for (k, (ffn, got)) in experts.iter().zip(&together).enumerate() {
                 assert_eq!(got, &ffn.run(&x, 1), "{precision}: expert {k} differs");
             }

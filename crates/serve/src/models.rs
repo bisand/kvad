@@ -361,8 +361,8 @@ pub struct QCache {
 /// for that load.
 ///
 /// `repo` is the model about to be loaded, where there is one. Its
-/// architecture decides whether the GPU is an option, and its size whether
-/// the GPU can hold it; see [`fitted`].
+/// architecture decides whether the GPU is an option, and its size and the
+/// way its weights are stored whether the GPU can take it; see [`fitted`].
 ///
 /// Blocking, and for a repo that is not on this disk it may spend a Hub round
 /// trip finding out what that repo is — see [`known_about`]. Callers already
@@ -378,10 +378,28 @@ pub fn default_backend(repo: Option<&str>) -> String {
 fn backend_for(repo: Option<&str>, ask: impl FnOnce(&str) -> Option<kvad::model::Arch>) -> String {
     let local = repo.and_then(|r| hub::find_local(r).or_else(|| hub::find_trained(r)));
     let preferred = crate::engine::preferred(known_about(repo, local.as_ref(), ask));
-    crate::engine::id_of(fitted(preferred, local.as_ref(), kvad::machine::usable_memory_cached()))
+    let packed = local.as_ref().is_some_and(packed);
+    let usable = kvad::machine::usable_memory_cached();
+    crate::engine::id_of(fitted(preferred, local.as_ref(), packed, usable))
 }
 
-/// The CPU instead of the GPU, for a model the GPU cannot hold.
+/// Whether a checkpoint's weights are packed rather than plain floats: fp8,
+/// with a `weight_scale_inv` beside every matrix.
+///
+/// The CPU engine decodes those as it loads. The GPU loader reads none of
+/// them, and refuses a checkpoint holding tensors it would not read rather
+/// than run a model with pieces missing. Qwen3-0.6B-FP8 is how this was
+/// found: its architecture is one the GPU runs, so it was offered the GPU,
+/// and the load failed on 196 scales.
+fn packed(model: &hub::LocalModel) -> bool {
+    hub::model_file(&model.path, "config.json")
+        .and_then(|path| kvad::weights::read_json(&path).ok())
+        .is_some_and(|config| config.get("quantization_config").is_some())
+}
+
+/// The CPU instead of the GPU, for a model the GPU cannot take: packed
+/// weights (see [`packed`]), which go to `cpu-q8`, the same arithmetic as the
+/// `gpu-q8` they were denied; or a model too big for memory.
 ///
 /// The CPU reads memory-mapped weights, so a model bigger than memory still
 /// runs there, from the disk, and a mixture streams its experts through a
@@ -397,7 +415,15 @@ fn backend_for(repo: Option<&str>, ask: impl FnOnce(&str) -> Option<kvad::model:
 /// Weighed at q8, because that is the GPU default, against usable memory
 /// and not the server's budget: whether the GPU can hold a model at all is a
 /// fact about the machine, not about what else happens to be loaded.
-fn fitted(preferred: Backend, local: Option<&hub::LocalModel>, usable: Option<u64>) -> Backend {
+fn fitted(
+    preferred: Backend,
+    local: Option<&hub::LocalModel>,
+    packed: bool,
+    usable: Option<u64>,
+) -> Backend {
+    if matches!(preferred, Backend::Gpu(_)) && packed {
+        return Backend::Cpu(Precision::Q8);
+    }
     let (Backend::Gpu(_), Some(model), Some(usable)) = (preferred, local, usable) else {
         return preferred;
     };
@@ -862,9 +888,10 @@ mod tests {
     }
 
     /// A model the GPU cannot hold at q8 goes to the CPU, where it can run
-    /// from the disk; anything else keeps what the build prefers.
+    /// from the disk, and so does one whose weights are packed; anything
+    /// else keeps what the build prefers.
     #[test]
-    fn a_model_over_memory_defaults_to_the_cpu() {
+    fn a_model_the_gpu_cannot_take_defaults_to_the_cpu() {
         const GB: u64 = 1_000_000_000;
         let gpu = Backend::Gpu(kvad::service::GpuMode::Q8);
         let sized = |params: u64| hub::LocalModel {
@@ -877,21 +904,27 @@ mod tests {
         // on, so the precision `fit` picks is the smallest, whatever the
         // machine.
         let huge = sized(10_000 * GB);
-        assert_eq!(fitted(gpu, Some(&huge), Some(36 * GB)), Backend::Cpu(Precision::Q4));
+        assert_eq!(fitted(gpu, Some(&huge), false, Some(36 * GB)), Backend::Cpu(Precision::Q4));
 
         // The 80B against this machine's 36 GB: about 85 GB at q8.
-        assert!(matches!(fitted(gpu, Some(&sized(80 * GB)), Some(36 * GB)), Backend::Cpu(_)));
+        assert!(matches!(fitted(gpu, Some(&sized(80 * GB)), false, Some(36 * GB)), Backend::Cpu(_)));
 
         // One that fits keeps the GPU.
-        assert_eq!(fitted(gpu, Some(&sized(14 * GB)), Some(36 * GB)), gpu);
+        assert_eq!(fitted(gpu, Some(&sized(14 * GB)), false, Some(36 * GB)), gpu);
         // A size nobody can read, or a machine nobody can ask, is no reason
         // to move it.
         let unknown = local("a/b", Some("qwen3"), true);
-        assert_eq!(fitted(gpu, Some(&unknown), Some(36 * GB)), gpu);
-        assert_eq!(fitted(gpu, Some(&huge), None), gpu);
+        assert_eq!(fitted(gpu, Some(&unknown), false, Some(36 * GB)), gpu);
+        assert_eq!(fitted(gpu, Some(&huge), false, None), gpu);
         // And a CPU preference is left alone.
         let cpu = Backend::Cpu(Precision::Q8);
-        assert_eq!(fitted(cpu, Some(&huge), Some(36 * GB)), cpu);
+        assert_eq!(fitted(cpu, Some(&huge), false, Some(36 * GB)), cpu);
+
+        // Packed weights are the CPU's to decode, however small the model,
+        // and at q8, which is what the GPU would have run it at.
+        let small = sized(GB);
+        assert_eq!(fitted(gpu, Some(&small), true, Some(36 * GB)), cpu);
+        assert_eq!(fitted(cpu, Some(&small), true, Some(36 * GB)), cpu);
     }
 
     /// As `local`, for a checkpoint whose weights are packed in a format this

@@ -44,6 +44,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 # information is the same and the prompt is not, and the prompt is what the
 # model was tuned on. See minijinja above: it takes the feature on both.
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+# For `kvad.toml`, which the CLI reads to find the server it is a client of:
+# `[client] url`, and `server.bind` for where this machine's service listens.
+# Already in the tree for `kvad-serve`, which reads the same file.
+toml = "1.1.6"
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
 # Resolving `../ch01.html` against the page that linked it, for `crawl`: fiddly

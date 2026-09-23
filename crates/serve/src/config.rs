@@ -32,7 +32,11 @@ use std::net::{IpAddr, SocketAddr};
 /// it to somebody's outgoing connection first. It collides with none of
 /// Ollama (11434), LM Studio (1234), vLLM (8000), SGLang (30000), ComfyUI
 /// (8188), text-generation-webui (7860) or GPT4All (4891).
-pub const DEFAULT_PORT: u16 = 5823;
+///
+/// The number itself lives in `kvad::client`, because the CLI looks for a
+/// running server here before it does anything itself, and two copies of a
+/// port number are one change away from a CLI that never finds its server.
+pub const DEFAULT_PORT: u16 = kvad::client::DEFAULT_PORT;
 use std::path::{Path, PathBuf};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -43,6 +47,18 @@ pub struct Config {
     pub server: Server,
     pub database: Database,
     pub auth: Auth,
+    /// The command line's, not the server's. It is here so that a file with
+    /// it in is not refused as having a key nobody knows.
+    pub client: Client,
+}
+
+/// Where `kvad` sends its commands; see `kvad::client`. Read by the CLI and
+/// ignored here: a server has no business knowing which server its own
+/// machine's CLI talks to.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Client {
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -473,5 +489,19 @@ allow_domains = ["example.com"]
         }
         cfg.auth.mode = Mode::None;
         assert!(cfg.check(false).is_err());
+    }
+
+    /// The file the release bundles has to be a file the server starts with,
+    /// including the section that is the CLI's and not its own — the server
+    /// refuses unknown keys, so a `[client]` it did not know would stop it.
+    #[test]
+    fn the_bundled_example_is_a_config_the_server_takes() {
+        let text = include_str!("../../../docs/kvad.example.toml");
+        let cfg: Config = toml::from_str(text).expect("kvad.example.toml does not parse");
+        assert_eq!(cfg.server.bind.port(), DEFAULT_PORT);
+
+        let with_client = format!("{text}\nurl = \"http://gpu-box.local:5823\"\n");
+        let cfg: Config = toml::from_str(&with_client).expect("a [client] url was refused");
+        assert_eq!(cfg.client.url.as_deref(), Some("http://gpu-box.local:5823"));
     }
 }

@@ -65,3 +65,14 @@ mode = "none"
 # admin_emails = ["ada@example.com"]
 # role_claim = "groups"        # a claim in the ID token holding group names
 # admin_roles = ["kvad-admins"]
+
+[client]
+# Where `kvad` sends its commands. Read by the command line, not the server:
+# with this set, `kvad chat` on this machine talks to that server instead of
+# looking for one here. KVAD_URL and --remote say the same for one shell or
+# one command, and --local runs a command in the process whatever is set.
+#
+# Unset, the CLI looks for this machine's service where it listens — the
+# address its unit file gives it, else [server] bind above, else
+# 127.0.0.1:5823 — and runs the command itself when nothing answers there.
+# url = "http://gpu-box.local:5823"

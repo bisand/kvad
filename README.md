@@ -111,6 +111,17 @@ new binaries. Ask for the rest explicitly:
 curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh -s -- --yes --service
 ```
 
+Once it is installed the service is `kvad service`'s to manage, and the
+installer uses the same command to install and stop it:
+
+```bash
+kvad service status        # is it running, is it answering, what is loaded
+kvad service restart
+kvad service logs -f
+kvad service install --port 5900
+kvad service uninstall
+```
+
 `--prefix DIR`, `--version vX.Y.Z` and `--uninstall` do what they look like;
 `--uninstall` removes the binaries and the service and leaves your models and
 conversations alone. `--host ADDR` and `--port N` answer the address
@@ -2638,6 +2649,45 @@ for decoding — the same arithmetic, a quarter of the memory traffic. It is
 checked against `nervus`'s own logits at every position, which is the same
 second-implementation argument the checkpoint test rests on.
 
+### The command line, as a client of the server
+
+With the service running, `kvad` sends its commands to it. Without that the
+CLI would be a second installation beside the service that happens to share a
+model directory: `kvad chat` would load a second copy of weights the server
+already holds, which on a 17 GB model is the difference between answering and
+swapping. So `ls`, `pull`, `run`, `chat`, `train` and the rest go to the
+server when one answers, and run in the process when none does, and the
+first line of output says which:
+
+```
+$ kvad chat
+kvad: http://127.0.0.1:5823 (the kvad service; --local to run in this process instead)
+model: Qwen/Qwen3-14B@gpu-q8
+```
+
+The order is `--remote URL` or `--local`, then `KVAD_URL`, then `url` under
+`[client]` in `kvad.toml`, then this machine's service at the address its
+unit file gives it. The first three are things somebody said, so a server
+they name that does not answer is an error rather than a reason to quietly do
+the work here instead. The last is a guess, and it costs a connection to
+loopback, which is refused in well under a millisecond when nothing is there.
+
+Everything the API does has a verb, including what has no local meaning:
+`kvad ps`, `load` and `unload` for what is in memory, `conversations`,
+`jobs`, `datasets`, `evals`, `bench`, `metrics`, and `auth`, `users`,
+`sessions` and `keys` for accounts. `kvad auth login` signs in and keeps an
+API key for that server in `credentials.json`, readable by you only; with
+`auth.mode = "none"`, the default, there is nothing to sign in to. `--json`
+prints what the server sent, and a streaming command prints one event a line,
+so they compose with `jq`. `kvad api` with no arguments lists every route, and
+with a path calls one.
+
+`kvad service status` asks two things and says when they disagree: launchd
+or systemd, about whether the job is running, and `/api/health`, about
+whether anything answers. A job the service manager calls running that does
+not answer on its port is the failure people actually hit, and a status
+command that only asked the service manager would call it fine.
+
 ### Testing
 
 The API tests train a two-layer GPT on "the cat sat on the mat" *inside the
@@ -2655,6 +2705,16 @@ And `/api/openapi.json` is generated from a table that a test compares against
 the router, by reading the source of the files that register routes. A route
 added and not documented fails the build. The first version of that test failed
 on itself: it scanned its own source and found the string it searches *with*.
+
+The same trick runs one step further out, to keep "the CLI can do everything
+the API can" true after the day it was written. `kvad::client::COMMANDS` maps
+every route to the command that reaches it, and a route with no command has to
+say why not in `NOT_COMMANDS` — the OIDC callback is not something to type. The
+server's tests fail when a route is in neither table, and the CLI's tests read
+its own source for every path it requests and fail when that set and the table
+differ. A route added to the server therefore fails three tests in turn, until
+it is described, until it has a command, and until the command actually sends
+it.
 
 ---
 

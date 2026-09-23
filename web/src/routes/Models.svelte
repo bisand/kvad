@@ -20,15 +20,23 @@
   /**
    * What the weights cost here at each precision, for the tooltip.
    *
-   * The verdict badge says the best one that fits; this says the whole story,
-   * because "too big" is much more useful when you can see by how much.
+   * The verdict badge says the precision a run would use; this says the whole
+   * story, because a model that does not fit is much more useful when you can
+   * see by how much and against what.
    */
   function atEachPrecision(r) {
     if (!r.memory) return "size unknown";
-    return `weights here: ${humanBytes(r.memory.f32)} at f32 · ${humanBytes(
+    const each = `weights here: ${humanBytes(r.memory.f32)} at f32 · ${humanBytes(
       r.memory.q8,
     )} at q8 · ${humanBytes(r.memory.q4)} at q4`;
+    if (!r.streams) return each;
+    const has = r.usable_memory ? humanBytes(r.usable_memory) : "what this machine has";
+    return `${each} — none of them fit in ${has}, so the weights are read from disk as the model runs. That works and it is much slower: expect a fraction of the speed a model that fits would give you.`;
   }
+
+  /** The one-line version, for a downloaded model with no size breakdown. */
+  const STREAMS_TIP =
+    "Too large for memory, so the weights are read from disk as the model runs. It works, and it is much slower than a model that fits.";
 
   let query = $state("");
   let results = $state(null);
@@ -171,6 +179,15 @@
                     {#if models.loaded?.repo === m.id}
                       <span class="badge badge-sm badge-success badge-soft">loaded</span>
                     {/if}
+                    {#if m.streams}
+                      <div class="tooltip" data-tip={STREAMS_TIP}>
+                        <span
+                          class="badge badge-sm badge-warning badge-soft whitespace-nowrap"
+                        >
+                          disk streaming
+                        </span>
+                      </div>
+                    {/if}
                   </div>
                   <div class="mt-0.5 text-xs opacity-60">
                     {m.blocker ?? m.arch}
@@ -281,6 +298,12 @@
                        against what this machine has. -->
                   {#if !r.size_known}
                     <span class="text-xs opacity-50">unknown</span>
+                  {:else if r.streams}
+                    <div class="tooltip" data-tip={atEachPrecision(r)}>
+                      <span class="badge badge-sm badge-warning badge-soft whitespace-nowrap">
+                        {r.fits_at} · disk
+                      </span>
+                    </div>
                   {:else if r.fits_at}
                     <div class="tooltip" data-tip={atEachPrecision(r)}>
                       <span class="badge badge-sm badge-success badge-soft">
@@ -288,9 +311,7 @@
                       </span>
                     </div>
                   {:else}
-                    <div class="tooltip" data-tip={atEachPrecision(r)}>
-                      <span class="badge badge-sm badge-error badge-soft">too big</span>
-                    </div>
+                    <span class="text-xs opacity-50">unknown</span>
                   {/if}
                 </td>
                 <td class="text-right text-sm whitespace-nowrap opacity-70">

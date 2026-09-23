@@ -84,7 +84,7 @@ impl HubModel {
     /// `None` means either that we do not know the size, or that nothing fits.
     /// [`HubModel::fit`] tells those apart.
     pub fn best_precision(&self) -> Option<crate::quant::Precision> {
-        let usable = crate::machine::usable_memory()?;
+        let usable = crate::machine::usable_memory_cached()?;
         let params = self.params?;
         // Largest first, so the answer is the *best* precision that fits
         // rather than merely the smallest.
@@ -95,19 +95,64 @@ impl HubModel {
     }
 
     pub fn fit(&self) -> Fit {
-        match (self.params, crate::machine::usable_memory()) {
-            (None, _) | (_, None) => Fit::Unknown,
-            (Some(params), Some(has)) => match self.best_precision() {
-                Some(p) => Fit::At(p),
-                // The smallest precision there is, which is what "does not
-                // fit" is measured against.
-                None => Fit::Slow {
-                    needs: crate::quant::Precision::SMALLEST_FIRST[0].weight_bytes(params),
-                    has,
-                },
-            },
-        }
+        fit_of(self.params)
     }
+}
+
+/// Whether a model of this size will run here, and out of what.
+///
+/// Shared by the downloaded list and the search results, because a model
+/// does not change size by being on the disk already and the two pages
+/// disagreeing about it would be a bug waiting to happen.
+fn fit_of(params: Option<u64>) -> Fit {
+    let (Some(params), Some(has)) = (params, crate::machine::usable_memory_cached()) else {
+        return Fit::Unknown;
+    };
+    // Largest first, so the answer is the *best* precision that fits rather
+    // than merely the smallest.
+    match crate::quant::Precision::SMALLEST_FIRST
+        .into_iter()
+        .rev()
+        .find(|p| p.weight_bytes(params) <= has)
+    {
+        Some(p) => Fit::At(p),
+        None => Fit::Slow {
+            needs: crate::quant::Precision::SMALLEST_FIRST[0].weight_bytes(params),
+            has,
+        },
+    }
+}
+
+/// Parameters in a downloaded checkpoint.
+///
+/// The safetensors index names the total bytes of weights and the config
+/// names the dtype they are stored in; the quotient is the count. A
+/// single-file checkpoint has no index, so the file's own size stands in —
+/// it overstates by the header, which is kilobytes against gigabytes.
+fn local_params(dir: &Path, config: Option<&Path>) -> Option<u64> {
+    // `torch_dtype` spells these differently from the Hub API's `safetensors`
+    // block, which is why this is not `dtype_bytes`. Absent, assume the
+    // half precision that nearly every checkpoint now ships in: guessing
+    // wrong by a factor of two is better than saying nothing at all.
+    let width = match config
+        .and_then(|c| crate::weights::read_json(c).ok())
+        .and_then(|j| Some(j.get("torch_dtype")?.as_str()?.to_string()))
+        .as_deref()
+    {
+        Some("float64" | "int64") => 8,
+        Some("float32" | "int32") => 4,
+        Some("float8_e4m3fn" | "float8_e5m2" | "int8" | "uint8") => 1,
+        _ => 2,
+    };
+    let bytes = match model_file(dir, "model.safetensors.index.json") {
+        Some(index) => crate::weights::read_json(&index)
+            .ok()?
+            .get("metadata")?
+            .get("total_size")?
+            .as_u64()?,
+        None => std::fs::metadata(model_file(dir, "model.safetensors")?).ok()?.len(),
+    };
+    Some(bytes / width)
 }
 
 /// Whether a model will run on this machine, and how cheaply.
@@ -133,6 +178,29 @@ pub enum Fit {
     /// The Hub did not say how big it is, or we cannot read this machine's
     /// memory. Saying nothing beats guessing.
     Unknown,
+}
+
+impl Fit {
+    /// The precision a run here would use: the best whose weights fit, or
+    /// the smallest there is when none of them do.
+    ///
+    /// `None` only when the size is unknown. A model larger than memory
+    /// still has an answer, because it still runs — see [`Fit::Slow`] —
+    /// and it runs at the smallest precision, that being the one which
+    /// asks the disk for the least.
+    pub fn precision(&self) -> Option<crate::quant::Precision> {
+        match self {
+            Fit::At(p) => Some(*p),
+            Fit::Slow { .. } => Some(crate::quant::Precision::SMALLEST_FIRST[0]),
+            Fit::Unknown => None,
+        }
+    }
+
+    /// Whether the weights arrive from the disk as the model runs, rather
+    /// than being held in memory.
+    pub fn streams(&self) -> bool {
+        matches!(self, Fit::Slow { .. })
+    }
 }
 
 impl std::fmt::Display for Fit {
@@ -290,6 +358,17 @@ pub struct LocalModel {
     /// "there is no config to read" is not "this build cannot run that".
     pub model_type: Option<String>,
     pub complete: bool,
+    /// Weights in the checkpoint, so a downloaded model can say whether it
+    /// will fit here — which the page listing them wants to show, and
+    /// which nothing on disk states outright.
+    pub params: Option<u64>,
+}
+
+impl LocalModel {
+    /// Whether this will run from memory or from the disk. See [`Fit`].
+    pub fn fit(&self) -> Fit {
+        fit_of(self.params)
+    }
 }
 
 /// Root of the HuggingFace cache, honouring the usual environment variables.
@@ -324,10 +403,14 @@ pub fn local_models() -> Vec<LocalModel> {
             let path = entry.path();
             let bytes = dir_size(&path);
             let files = snapshot_files(&path);
-            let model_type = find_config(&path)
-                .and_then(|c| crate::weights::read_json(&c).ok())
+            let config = find_config(&path);
+            let model_type = config
+                .as_deref()
+                .and_then(|c| crate::weights::read_json(c).ok())
                 .and_then(|j| j.get("model_type")?.as_str().map(str::to_string));
+            let params = local_params(&path, config.as_deref());
             Some(LocalModel {
+                params,
                 id,
                 path,
                 bytes,
@@ -372,6 +455,10 @@ pub fn trained_models() -> Vec<LocalModel> {
             LocalModel {
                 id: entry.file_name().to_string_lossy().into_owned(),
                 bytes: dir_size(&path),
+                // A trained model is laid out flat rather than in the
+                // cache's blob-and-snapshot shape, which `model_file`
+                // already handles by looking directly first.
+                params: local_params(&path, Some(&config)),
                 arch: model_type.as_deref().and_then(Arch::from_model_type),
                 model_type,
                 // A directory left behind by a run that was stopped before
@@ -581,7 +668,7 @@ mod tests {
     #[test]
     fn the_fit_is_the_best_precision_that_will_run() {
         use crate::quant::Precision;
-        let Some(usable) = crate::machine::usable_memory() else { return };
+        let Some(usable) = crate::machine::usable_memory_cached() else { return };
 
         // A model whose f32 weights alone exceed memory, but whose q8 fit.
         let params = (usable as f64 / Precision::Q8.bytes_per_weight()) as u64;

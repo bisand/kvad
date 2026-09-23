@@ -28,6 +28,16 @@ pub fn usable_memory() -> Option<u64> {
     total_memory().map(|b| (b as f64 * USABLE_FRACTION) as u64)
 }
 
+/// As [`usable_memory`], answered once.
+///
+/// How much memory a machine has does not change while the process runs,
+/// and reading it costs a `sysctl` — which is a process spawn, and was
+/// being paid once per row of a forty-row search.
+pub fn usable_memory_cached() -> Option<u64> {
+    static ONCE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(usable_memory)
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     pub fn total_memory() -> Option<u64> {

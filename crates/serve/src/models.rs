@@ -49,6 +49,15 @@ pub struct Model {
     pub runnable: bool,
     /// Why not, when not.
     pub blocker: Option<String>,
+    /// The precision a run here would use: the best whose weights fit, or
+    /// the smallest there is when none of them do. `null` when the size
+    /// could not be read.
+    pub fits_at: Option<String>,
+    /// The weights do not fit, so they arrive from the disk as the model
+    /// runs. Worth saying on a downloaded model and not only on a search
+    /// result: by the time it is on the disk the question is no longer
+    /// whether to fetch it but what to expect when it starts.
+    pub streams: bool,
 }
 
 fn describe(m: &hub::LocalModel, trained: bool) -> Model {
@@ -72,6 +81,7 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
         )),
         _ => None,
     };
+    let fit = m.fit();
     Model {
         id: m.id.clone(),
         arch: m.arch.map(|a| a.to_string()),
@@ -80,6 +90,8 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
         trained,
         runnable: blocker.is_none(),
         blocker,
+        fits_at: fit.precision().map(|p| p.to_string()),
+        streams: fit.streams(),
     }
 }
 
@@ -235,9 +247,19 @@ pub struct Found {
     /// What the weights would occupy here, per precision — which is not the
     /// download size, because loading quantises.
     memory: Option<Memory>,
-    /// The best precision whose weights fit in this machine's memory, or
-    /// `null` for "nothing fits" / "we could not tell".
+    /// The precision a run here would use: the best whose weights fit, or
+    /// the smallest there is when none of them do. `null` only when the
+    /// size is unknown, which `size_known` distinguishes.
     fits_at: Option<String>,
+    /// The weights do not fit, so they arrive from the disk as the model
+    /// runs. That works — a mixture a fifth over memory generated at 1.5
+    /// tok/s here against 24 with everything resident — and it is much
+    /// slower than fitting, which is why it is said out loud rather than
+    /// left for someone to infer from two numbers.
+    streams: bool,
+    /// What this machine has to spend on weights, so the page can say what
+    /// the model is being measured against.
+    usable_memory: Option<u64>,
     /// Which of those two `fits_at: null` means.
     size_known: bool,
 }
@@ -282,10 +304,9 @@ pub async fn search(
                     q8: kvad::quant::Precision::Q8.weight_bytes(p),
                     q4: kvad::quant::Precision::Q4.weight_bytes(p),
                 }),
-                fits_at: match m.fit() {
-                    hub::Fit::At(p) => Some(p.to_string()),
-                    hub::Fit::Slow { .. } | hub::Fit::Unknown => None,
-                },
+                fits_at: m.fit().precision().map(|p| p.to_string()),
+                streams: m.fit().streams(),
+                usable_memory: kvad::machine::usable_memory_cached(),
                 size_known: m.params.is_some(),
                 id: m.id.clone(),
             })
@@ -558,6 +579,9 @@ mod tests {
             arch: model_type.and_then(Arch::from_model_type),
             model_type: model_type.map(str::to_string),
             complete,
+            // These cases are about what a model says for itself, not about
+            // what it weighs, so the size is deliberately unknown.
+            params: None,
         }
     }
 

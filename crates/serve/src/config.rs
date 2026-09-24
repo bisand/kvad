@@ -45,6 +45,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub server: Server,
+    pub data: Data,
     pub database: Database,
     pub auth: Auth,
     /// The command line's, not the server's. It is here so that a file with
@@ -101,10 +102,22 @@ pub struct Server {
     pub context: Option<usize>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+/// Where the database, images, datasets and trained models go.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Data {
+    /// As written: `~/` and a path relative to the file are resolved by
+    /// [`Config::data_dir`].
+    pub dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Database {
-    pub path: PathBuf,
+    /// `kvad.db` in the data directory when not given. Resolved late, by
+    /// [`Config::database_path`], because the data directory is only known
+    /// once the whole file has been read.
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -231,12 +244,6 @@ impl Default for Server {
     }
 }
 
-impl Default for Database {
-    fn default() -> Self {
-        Database { path: kvad::weights::data_dir().join("kvad.db") }
-    }
-}
-
 impl Default for Auth {
     fn default() -> Self {
         Auth { mode: Mode::None, oidc: Oidc::default() }
@@ -276,6 +283,28 @@ impl Config {
             Err(e) => return Err(format!("could not read {}: {e}", path.display()).into()),
         };
         toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()).into())
+    }
+
+    /// The data directory this server uses: `KVAD_DATA_DIR`, else `[data]
+    /// dir` in this file, else the default. `path` is the file this was read
+    /// from, which a relative `dir` is taken from.
+    ///
+    /// This file's word rather than whatever [`kvad::weights::data_dir`]
+    /// would find, because that reads the default `kvad.toml` and a server
+    /// started with `--config` may have been given another.
+    pub fn data_dir(&self, path: &Path) -> PathBuf {
+        if let Some(dir) = std::env::var_os("KVAD_DATA_DIR").filter(|v| !v.is_empty()) {
+            return PathBuf::from(dir);
+        }
+        match self.data.dir.as_deref().filter(|d| !d.trim().is_empty()) {
+            Some(dir) => kvad::weights::configured_dir(dir, path),
+            None => kvad::weights::default_data_dir(),
+        }
+    }
+
+    /// `[database] path`, else `kvad.db` in the data directory.
+    pub fn database_path(&self) -> PathBuf {
+        self.database.path.clone().unwrap_or_else(|| kvad::weights::data_dir().join("kvad.db"))
     }
 
     /// Refuse combinations that would be an accident rather than a choice.
@@ -321,6 +350,32 @@ fn is_loopback(addr: &SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[data] dir` is where the database goes too, unless `[database] path`
+    /// says otherwise, and a relative one is read from the file's directory.
+    #[test]
+    fn the_data_directory_comes_from_the_file_that_was_read() {
+        if std::env::var_os("KVAD_DATA_DIR").is_some() {
+            return; // the environment outranks any file, which is the point of it
+        }
+        let dir = std::env::temp_dir().join(format!("kvad-config-data-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kvad.toml");
+
+        std::fs::write(&path, "[data]\ndir = \"store\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.data_dir(&path), dir.join("store"));
+
+        std::fs::write(&path, "[data]\ndir = \"/srv/kvad\"\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().data_dir(&path), PathBuf::from("/srv/kvad"));
+
+        std::fs::write(&path, "[server]\nautoload = false\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().data_dir(&path), kvad::weights::default_data_dir());
+
+        std::fs::write(&path, "[database]\npath = \"/srv/other.db\"\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().database_path(), PathBuf::from("/srv/other.db"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_absent_file_is_the_defaults_and_a_broken_one_is_an_error() {

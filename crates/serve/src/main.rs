@@ -171,18 +171,22 @@ async fn main() {
 async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     let mut cfg = config::Config::load(&config_path)?;
+    // Before anything asks where its files are.
+    let data_dir = cfg.data_dir(&config_path);
+    kvad::weights::set_data_dir(data_dir.clone());
     if let Some(bind) = args.bind {
         cfg.server.bind = bind;
     }
     if let Some(path) = args.db {
-        cfg.database.path = path;
+        cfg.database.path = Some(path);
     }
     // Before the socket, not after: the check exists to stop the server
     // listening somewhere it should not, and a check after `bind` has already
     // happened is a check that ran too late.
     cfg.check(args.insecure)?;
 
-    let db = db::Db::open(&cfg.database.path)?;
+    let db_path = cfg.database_path();
+    let db = db::Db::open(&db_path)?;
     let schema = db.version()?;
     // Sessions that ran out are refused whether or not they are still rows;
     // this only keeps the table from growing forever.
@@ -275,7 +279,8 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
     tracing::info!("listening on http://{bound}, auth {}, schema {schema}", cfg.auth.mode);
     println!("kvad-serve listening on http://{bound}");
     println!("  config     {}", config_path.display());
-    println!("  database   {} (schema {schema})", cfg.database.path.display());
+    println!("  data       {}", data_dir.display());
+    println!("  database   {} (schema {schema})", db_path.display());
     if cfg.auth.mode == config::Mode::Oidc {
         println!("  provider   {}", cfg.auth.oidc.issuer);
     }

@@ -25,8 +25,21 @@ bind = "127.0.0.1:5823"
 # only when something asks.
 # autoload = true
 
+[data]
+# Where the database, generated images, datasets and trained models go.
+# Defaults to $XDG_DATA_HOME/kvad, or ~/.local/share/kvad. `~/` is your home
+# directory, and a relative path is taken from this file's directory. The
+# CLI reads this too, so `kvad` and `kvad-serve` agree; KVAD_DATA_DIR in the
+# environment overrides it for one process. `install.sh --data-dir DIR`
+# writes it. Changing it moves nothing: move the old directory yourself,
+# with the server stopped.
+#
+# Models pulled from Hugging Face are not in here. They are in the Hub's own
+# cache, ~/.cache/huggingface/hub, which HF_HOME moves.
+# dir = "/Volumes/Models/kvad"
+
 [database]
-# Defaults to $XDG_DATA_HOME/kvad/kvad.db. Data rather than cache: what is in
+# Defaults to kvad.db in the data directory above. Data rather than cache: what is in
 # it — conversations, training runs, API keys — cannot be downloaded again.
 # path = "/var/lib/kvad/kvad.db"
 

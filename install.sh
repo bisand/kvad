@@ -409,6 +409,7 @@ VERSION="${KVAD_VERSION:-}"
 WANT_SERVICE=ask
 WANT_PATH=ask
 UNINSTALL=0
+DATA_DIR=
 
 # KVAD_BIND is the spelling this script started with, and somebody's second
 # machine is still set up that way. It is read first, so KVAD_HOST and
@@ -432,6 +433,8 @@ usage() {
 install.sh — install kvad on macOS or Linux
 
     --prefix DIR     where the binaries go (default: ~/.local/bin)
+    --data-dir DIR   where the database, images, datasets and trained models
+                     go, written to kvad.toml (default: ~/.local/share/kvad)
     --version TAG    a release to install, e.g. v0.1.0 (default: the latest)
     --host ADDR      address the background service listens on
                      (default: 127.0.0.1, or the one it already listens on)
@@ -470,6 +473,8 @@ while [ $# -gt 0 ]; do
         --prefix)      [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX=$2; shift 2 ;;
         --version)     [ $# -ge 2 ] || die "--version needs a tag"; VERSION=$2; shift 2 ;;
         --prefix=*)    PREFIX=${1#*=}; shift ;;
+        --data-dir)    [ $# -ge 2 ] || die "--data-dir needs a directory"; DATA_DIR=$2; shift 2 ;;
+        --data-dir=*)  DATA_DIR=${1#*=}; shift ;;
         --version=*)   VERSION=${1#*=}; shift ;;
         --service)     WANT_SERVICE=yes; shift ;;
         --no-service)  WANT_SERVICE=no; shift ;;
@@ -481,6 +486,28 @@ while [ $# -gt 0 ]; do
         *)             say "unknown option: $1"; usage ;;
     esac
 done
+
+# Absolute, because both end up in files read from somewhere else: the
+# service's unit names the binary, and kvad.toml names the data directory.
+absolute() { # a path as typed, including a ~/ the shell did not expand
+    case $1 in
+        "~")   printf '%s\n' "$HOME" ;;
+        "~/"*) printf '%s\n' "$HOME/${1#"~/"}" ;;
+        /*)    printf '%s\n' "$1" ;;
+        *)     printf '%s\n' "$(pwd)/$1" ;;
+    esac
+}
+PREFIX=$(absolute "$PREFIX")
+[ "$PREFIX" = / ] || PREFIX=${PREFIX%/}
+if [ -n "$DATA_DIR" ]; then
+    DATA_DIR=$(absolute "$DATA_DIR")
+    [ "$DATA_DIR" = / ] || DATA_DIR=${DATA_DIR%/}
+    # It goes into kvad.toml as a TOML string, and these two would need
+    # escaping there. Nobody's data directory is worth that.
+    case $DATA_DIR in
+        *'"'*|*'\'*) die "--data-dir: a path with a quote or a backslash in it is not supported" ;;
+    esac
+fi
 
 # ---------------------------------------------------------------- machine --
 
@@ -520,6 +547,59 @@ case $TARGET in
     *apple-darwin) PLATFORM=macos ;;
     *)             PLATFORM=linux ;;
 esac
+
+# ------------------------------------------------------------------ data --
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/kvad/kvad.toml"
+
+# `dir` under `[data]` in kvad.toml, as written there, or nothing.
+configured_data_dir() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    awk '
+        /^[[:space:]]*\[/ { section = $0; gsub(/[[:space:]]/, "", section); next }
+        section == "[data]" && /^[[:space:]]*dir[[:space:]]*=/ {
+            if (match($0, /"[^"]*"/) || match($0, /\047[^\047]*\047/)) {
+                print substr($0, RSTART + 1, RLENGTH - 2)
+            }
+            exit
+        }' "$CONFIG_FILE"
+}
+
+# The data directory kvad will use, the way it works it out: what kvad.toml
+# says, read the way kvad reads it, or the default. KVAD_DATA_DIR is left
+# out on purpose — it is one process's override, not the machine's answer.
+data_dir_now() {
+    dir=$(configured_data_dir)
+    case $dir in
+        "")         printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/kvad" ;;
+        "~"|"~/"*)  absolute "$dir" ;;
+        /*)         printf '%s\n' "$dir" ;;
+        *)          printf '%s\n' "$(dirname "$CONFIG_FILE")/$dir" ;;
+    esac
+}
+
+# Make kvad.toml say `[data] dir = "$1"`, touching nothing else in it.
+write_data_dir() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        printf '# See kvad.example.toml for everything else that can go here.\n\n[data]\ndir = "%s"\n' \
+            "$1" > "$CONFIG_FILE"
+    elif grep -q '^[[:space:]]*\[[[:space:]]*data[[:space:]]*\][[:space:]]*$' "$CONFIG_FILE"; then
+        # Replace the key where it is, or put it under the section's header.
+        awk -v dir="$1" -v has="$(configured_data_dir)" '
+            function put() { printf "dir = \"%s\"\n", dir; done = 1 }
+            /^[[:space:]]*\[/ {
+                section = $0; gsub(/[[:space:]]/, "", section); print
+                if (section == "[data]" && has == "" && !done) put()
+                next
+            }
+            section == "[data]" && /^[[:space:]]*dir[[:space:]]*=/ { if (!done) put(); next }
+            { print }' "$CONFIG_FILE" > "$CONFIG_FILE.new$$" &&
+            mv -f "$CONFIG_FILE.new$$" "$CONFIG_FILE"
+    else
+        printf '\n[data]\ndir = "%s"\n' "$1" >> "$CONFIG_FILE"
+    fi
+}
 
 # ------------------------------------------------------------- uninstall --
 
@@ -596,6 +676,10 @@ stop_service() {
 SERVICE_WAS_LOADED=0
 suspend_service() {
     [ -f "$(service_paths)" ] || return 0
+    # Somebody else's binaries are not being replaced, so their server has
+    # no reason to stop. A scratch install with --prefix used to take the
+    # real service down and point it at the scratch copy.
+    [ -z "$SERVICE_ELSEWHERE" ] || return 0
     service_loaded || return 0
     SERVICE_WAS_LOADED=1
     step "Stopping $SERVICE_LABEL before replacing its binaries"
@@ -657,8 +741,49 @@ installed_bind() {
     fi
 }
 
+# The kvad-serve an installed service runs, read off its unit the same way
+# installed_bind reads the address.
+installed_program() {
+    unit=$(service_paths)
+    [ -f "$unit" ] || return 1
+    if [ "$PLATFORM" = macos ]; then
+        sed -n '/ProgramArguments/,$p' "$unit" |
+            grep -o '<string>[^<]*</string>' | head -n 1 |
+            sed 's|<string>\(.*\)</string>|\1|; s|&lt;|<|g; s|&gt;|>|g; s|&amp;|\&|g'
+    else
+        line=$(sed -n 's/^ExecStart=//p' "$unit" | head -n 1)
+        case $line in
+            '"'*) line=${line#\"}; printf '%s\n' "${line%%\"*}" ;;
+            *)    printf '%s\n' "${line%% *}" ;;
+        esac
+    fi
+}
+
+# A directory with its symlinks resolved, when it exists. `kvad service
+# install` writes the canonical path, and /tmp is /private/tmp on a Mac.
+canonical_dir() {
+    (cd -P "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+}
+
+# Where the installed service runs its kvad-serve from, when that is not
+# $PREFIX: a second install beside the one it runs, for trying a release or
+# a build. Such an install, or uninstall, leaves the service alone unless
+# asked to move it. Nothing when there is no service, or it is ours.
+service_elsewhere() {
+    [ -f "$(service_paths)" ] || return 0
+    running_program=$(installed_program 2>/dev/null || true)
+    [ -n "$running_program" ] || return 0
+    running_dir=$(dirname "$running_program")
+    [ "$(canonical_dir "$running_dir")" = "$(canonical_dir "$PREFIX")" ] || printf '%s\n' "$running_dir"
+}
+
 if [ "$UNINSTALL" -eq 1 ]; then
-    stop_service
+    elsewhere=$(service_elsewhere)
+    if [ -n "$elsewhere" ]; then
+        say "The background service runs $elsewhere/kvad-serve, not this install's; left alone."
+    else
+        stop_service
+    fi
     step "Removing binaries from $PREFIX"
     removed=0
     for name in kvad kvad-serve kvad-tui kvad-gpu; do
@@ -671,7 +796,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
     [ "$removed" -gt 0 ] || say "  nothing to remove"
     say ""
     say "Models, conversations and configuration were left alone. They are in:"
-    say "  ${XDG_DATA_HOME:-$HOME/.local/share}/kvad"
+    say "  $(data_dir_now)"
     say "  ${XDG_CONFIG_HOME:-$HOME/.config}/kvad"
     say "Delete those directories to remove them too."
     exit 0
@@ -809,6 +934,8 @@ mkdir -p "$PREFIX" || die "could not create $PREFIX"
   Pick somewhere else with --prefix DIR, or fix its permissions. This script
   deliberately does not use sudo."
 
+SERVICE_ELSEWHERE=$(service_elsewhere)
+
 # After the checks that can still refuse, and before the first byte moves:
 # stopping somebody's server for an install that was going to fail on
 # permissions anyway would be rude.
@@ -825,9 +952,25 @@ for name in $BINARIES; do
     say "  $PREFIX/$name"
 done
 
+# Before the service comes back, so that it starts on the directory it was
+# given. Nothing is moved: a database is not something to copy behind
+# somebody's back, and the old directory may be exactly where they want it.
+if [ -n "$DATA_DIR" ]; then
+    before=$(data_dir_now)
+    if [ "$before" != "$DATA_DIR" ]; then
+        step "Setting the data directory"
+        write_data_dir "$DATA_DIR"
+        say "  $CONFIG_FILE: [data] dir = \"$DATA_DIR\""
+        if [ -n "$(ls -A "$before" 2>/dev/null)" ]; then
+            say "  ${DIM}$before still has what was there; nothing was moved. To take it${R}"
+            say "  ${DIM}along, stop the server and: mv \"$before\"/* \"$DATA_DIR\"/${R}"
+        fi
+    fi
+fi
+
 for extra in LICENSE README.md kvad.example.toml; do
     [ -f "$SRC/$extra" ] || continue
-    doc="${XDG_DATA_HOME:-$HOME/.local/share}/kvad/doc"
+    doc="$(data_dir_now)/doc"
     mkdir -p "$doc"
     cp "$SRC/$extra" "$doc/$extra"
 done
@@ -997,7 +1140,10 @@ if [ -f "$SRC/kvad-serve" ]; then
         no)  do_service=0 ;;
         *)
             say ""
-            if [ -f "$(service_paths)" ]; then
+            if [ -n "$SERVICE_ELSEWHERE" ]; then
+                say "${B}kvad-serve${R} already runs as a background service, from $SERVICE_ELSEWHERE."
+                ask "Move it to run $PREFIX/kvad-serve instead?" n n && do_service=1
+            elif [ -f "$(service_paths)" ]; then
                 # An upgrade, and the question is no longer whether to have a
                 # service. Saying no here still puts the running one back;
                 # saying yes rewrites the unit, which is how it picks up a
@@ -1069,6 +1215,9 @@ if [ -f "$SRC/kvad-serve" ]; then
   Start it with:
     $how"
         fi
+    elif [ -n "$SERVICE_ELSEWHERE" ]; then
+        say "  ${DIM}$SERVICE_LABEL still runs $SERVICE_ELSEWHERE/kvad-serve; left alone.${R}"
+        say "  ${DIM}pass --service to move it here${R}"
     elif [ -f "$(service_paths)" ]; then
         say "  ${DIM}$SERVICE_LABEL is installed but was not running; left that way.${R}"
     fi
@@ -1090,5 +1239,6 @@ else
     say "  ${B}kvad serve --bind $(bind_addr)${R}   the API and web UI"
 fi
 say ""
-say "Models go in ${XDG_DATA_HOME:-$HOME/.local/share}/kvad, configuration in"
-say "${XDG_CONFIG_HOME:-$HOME/.config}/kvad. Uninstall with this script and --uninstall."
+say "Data goes in $(data_dir_now), configuration in"
+say "${XDG_CONFIG_HOME:-$HOME/.config}/kvad, and models pulled from Hugging Face in its"
+say "cache, ${HF_HOME:-$HOME/.cache/huggingface}. Uninstall with this script and --uninstall."

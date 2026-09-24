@@ -22,7 +22,7 @@
 //! scaled embeddings, every layer's output but the last, and the last one
 //! through the final norm.
 
-use super::ltx_nn::{rms, RmsNorm, Rope};
+use super::ltx_nn::{gelu, rms, RmsNorm, Rope};
 use crate::common::{Loader, Reader};
 use crate::image::nn::{Ctx, Linear};
 use crate::image::{finish, open};
@@ -166,11 +166,13 @@ impl Gemma {
     /// Load just the tower from the text encoder file at `path`, marking
     /// everything else in it as deliberately unread: for tests and fixtures.
     /// `quant` quantises its matrices, as [`super::ltx_text::TextEncoder`]
-    /// does, and caches them where that would.
+    /// does, and caches them under a name of their own. Sharing that one's
+    /// name, with a spec that is not its spec, made each load find the
+    /// other's cache stale and quantise the 11.6 GB again.
     pub fn load_file(path: &Path, device: &Device, dtype: DType, layers: Option<usize>, quant: Option<GgmlDType>, progress: &mut dyn FnMut(&str)) -> Res<Self> {
         let config = super::metadata(path, "gemma_config")?;
         let paths = [path.to_path_buf()];
-        let mut vault = Vault::open_as(&format!("{}/text_encoder", super::LTX_REPO), &paths, json!({ "component": "gemma", "layers": layers }), quant, progress);
+        let mut vault = Vault::open_as(&format!("{}/text_encoder/gemma", super::LTX_REPO), &paths, json!({ "component": "gemma", "layers": layers }), quant, progress);
         let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
         let r = open(&paths, DType::BF16)?;
         for p in ["vision_model.", "multi_modal_projector.", "audio_projector.", "hf_asset__", "tokenizer_json", "text_embedding_projection."] {
@@ -252,7 +254,7 @@ impl Gemma {
         let x = (x + l.post_attn_ln.forward(&self.lin(&l.o, &o)?)?)?;
 
         let f = l.pre_ff_ln.forward(&x)?;
-        let f = self.lin(&l.down, &(self.lin(&l.gate, &f)?.gelu()? * self.lin(&l.up, &f)?)?)?;
+        let f = self.lin(&l.down, &(gelu(&self.lin(&l.gate, &f)?)? * self.lin(&l.up, &f)?)?)?;
         (x + l.post_ff_ln.forward(&f)?)? * l.scalar
     }
 }

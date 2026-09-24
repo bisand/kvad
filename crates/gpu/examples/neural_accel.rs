@@ -8,12 +8,17 @@
 //! on candle's own device and queue as a `CustomOp2`, and times it against
 //! what `Proj::forward` runs now.
 //!
+//! It asks twice. `dense` runs f16 and bf16 weights, which is `Proj::Dense`.
+//! `q8` runs GGML's Q8_0 blocks, which is `Proj::Quant` and what the image
+//! and video models load. `matmul2d` cannot read those blocks, so that kernel
+//! unpacks each slab of weights to f16 in threadgroup memory first.
+//!
 //! The question is narrow on purpose: is there a gain at the shapes that
 //! matter, before anything is built around it? The shapes are a video DiT's
 //! (LTX-2.5, #51) and one prefill chunk of a 7B model. Decode is left out: at
 //! one row a matmul is bound by memory, and no matrix unit changes that.
 //!
-//!     cargo run --release -p kvad-gpu --example neural_accel
+//!     cargo run --release -p kvad-gpu --example neural_accel [dense|q8]
 //!
 //! # Reading the numbers
 //!
@@ -21,6 +26,10 @@
 //!   times behind **one** device sync, never a sync per repeat, for the reason
 //!   `prefill_cost` gives: a sync hands candle's pooled buffers back and the
 //!   next repeat pays to allocate its output afresh.
+//! - candle and the candidate take turns, round by round, and the speedup is
+//!   the median of the per-round ratios. This machine's speed drifts by a
+//!   third from one run to the next, and timing them apart put that drift in
+//!   the ratio.
 //! - `err` is the largest absolute difference from an f32 product of the same
 //!   inputs, over the largest absolute value of that product. Compare it with
 //!   candle's own kernel at the same dtype, not with zero: both round.
@@ -108,9 +117,11 @@ TILES(bfloat, bf16)
 
     /// The kernel as a candle op, so it runs on candle's command queue and
     /// its output is an ordinary `Tensor`.
+    #[derive(Clone)]
     struct Mpp {
         pipe: ComputePipeline,
         tile: (usize, usize, usize),
+        poison: bool,
     }
 
     impl CustomOp2 for Mpp {
@@ -136,7 +147,7 @@ TILES(bfloat, bf16)
             }
             let dev = a.device();
             let dt = a.dtype();
-            let out = dev.new_buffer(m * n, dt, "mpp_matmul2d")?;
+            let out = output(dev, m * n * dt.size_in_bytes(), self.poison)?;
             let guard = dev.command_encoder()?;
             let enc: &ComputeCommandEncoder = guard.as_ref();
             enc.set_compute_pipeline_state(&self.pipe);
@@ -153,6 +164,187 @@ TILES(bfloat, bf16)
             );
             Ok((MetalStorage::new(out, dev.clone(), m * n, dt), Shape::from((m, n))))
         }
+    }
+
+    /// The same product with the weight in GGML's Q8_0, which is what a q8
+    /// model's `Proj::Quant` holds: `C = A · Wᵀ`, `A` `[M, K]` in f32 or f16,
+    /// `W` `[N, K]` in blocks of 32 weights along `K`, each block one f16
+    /// scale and 32 `int8`s. `C` is f32, as `QMatMul` returns it.
+    ///
+    /// `matmul2d` does not read GGML blocks, so each threadgroup walks `K` in
+    /// steps of `BK` and, at every step:
+    /// 1. all its threads unpack the `BN × BK` slab of `W` it needs into
+    ///    threadgroup memory as f16, `scale × int8`, which is exact enough:
+    ///    the product of an f16 and a small integer, rounded once;
+    /// 2. `matmul2d` multiplies the `BM × BK` slab of `A`, read straight from
+    ///    device memory, by that slab, and adds into a cooperative tensor:
+    ///    the running `BM × BN` sum, held in the SIMD groups' registers across
+    ///    all of `K` and written out once at the end.
+    ///
+    /// The slab is stored as `W` is, a row per output column, so the right
+    /// operand is transposed: extents `(BK, BN)`, `transpose_right`.
+    const SOURCE_Q8: &str = r#"
+#include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+struct block_q8_0 {
+    half d;
+    int8_t qs[32];
+};
+
+template <typename TA, int BM, int BN, int BK, int NSG>
+kernel void mm_q8(device TA *a [[buffer(0)]],
+                  device const block_q8_0 *w [[buffer(1)]],
+                  device float *c [[buffer(2)]],
+                  constant int &M [[buffer(3)]],
+                  constant int &N [[buffer(4)]],
+                  constant int &K [[buffer(5)]],
+                  threadgroup half *slab [[threadgroup(0)]],
+                  uint2 tg [[threadgroup_position_in_grid]],
+                  ushort tid [[thread_index_in_threadgroup]]) {
+    tensor<device TA, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw(slab, dextents<int32_t, 2>(BK, BN));
+
+    constexpr auto desc = matmul2d_descriptor(BM, BN, BK, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+
+    auto ma = ta.slice(0, tg.y * BM);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(ma), decltype(tw), float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+
+    // Each thread unpacks runs of 8 weights, adjacent threads adjacent runs
+    // of the same row, so a SIMD group's reads of a row are contiguous.
+    constexpr int RUN = 8;
+    constexpr int RUNS = BN * BK / RUN;
+    const int blocks = K / 32;
+    device const block_q8_0 *wrow = w + tg.x * BN * blocks;
+    for (int k = 0; k < K; k += BK) {
+        for (int r = tid; r < RUNS; r += 32 * NSG) {
+            const int n = r / (BK / RUN);
+            const int j = (r % (BK / RUN)) * RUN;
+            device const block_q8_0 &b = wrow[n * blocks + (k + j) / 32];
+            const half d = b.d;
+            const int o = j % 32;
+            // Four at a time. The `int8`s sit two bytes into a 34-byte block,
+            // so only a packed (byte-aligned) load may read them; the slab
+            // is the kernel's own and aligned, so a plain `half4` store is.
+            device const packed_char4 *q = (device const packed_char4 *)(b.qs + o);
+            threadgroup half4 *dst = (threadgroup half4 *)(slab + n * BK + j);
+            #pragma unroll
+            for (int i = 0; i < RUN / 4; ++i) {
+                dst[i] = d * half4(char4(q[i]));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // The slice runs to the end of `K`; the descriptor's `BK` is what
+        // says how much of it this step reads. (The header's comments show
+        // a `static_slice` for this. The compiler has no such member.)
+        auto sa = ta.slice(k, tg.y * BM);
+        op.run(sa, tw, acc);
+        // The next step overwrites the slab: nobody may still be reading it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    auto mc = tc.slice(tg.x * BN, tg.y * BM);
+    acc.store(mc);
+}
+
+#define INST(TA, an, BM, BN, BK, NSG) \
+    template [[host_name("mm_q8_" #an "_" #BM "x" #BN "x" #BK "_" #NSG)]] [[kernel]] \
+    decltype(mm_q8<TA, BM, BN, BK, NSG>) mm_q8<TA, BM, BN, BK, NSG>;
+
+#define TILES(TA, an) \
+    INST(TA, an, 64, 64, 32, 4) \
+    INST(TA, an, 64, 64, 64, 4) \
+    INST(TA, an, 128, 64, 64, 4) \
+    INST(TA, an, 128, 128, 32, 8) \
+    INST(TA, an, 128, 128, 64, 8)
+
+TILES(half, f16)
+TILES(float, f32)
+"#;
+
+    /// `SOURCE_Q8`'s tiles: rows of `C`, columns, the `K` step, SIMD groups.
+    const Q8_TILES: [(usize, usize, usize, usize); 5] =
+        [(64, 64, 32, 4), (64, 64, 64, 4), (128, 64, 64, 4), (128, 128, 32, 8), (128, 128, 64, 8)];
+
+    /// Bytes in one Q8_0 block: an f16 scale and 32 `int8`s.
+    const Q8_BLOCK: usize = 34;
+
+    /// The Q8_0 kernel as a candle op. The weight arrives as a flat `u8`
+    /// tensor of blocks, because `QTensor` keeps its Metal buffer private;
+    /// `n` says how many rows the bytes hold.
+    #[derive(Clone)]
+    struct MppQ8 {
+        pipe: ComputePipeline,
+        tile: (usize, usize, usize, usize),
+        n: usize,
+        poison: bool,
+    }
+
+    impl CustomOp2 for MppQ8 {
+        fn name(&self) -> &'static str {
+            "mpp_matmul2d_q8_0"
+        }
+
+        fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout)
+         -> candle_core::Result<(CpuStorage, Shape)> {
+            candle_core::bail!("mpp_matmul2d_q8_0 runs on Metal only")
+        }
+
+        fn metal_fwd(&self, a: &MetalStorage, la: &Layout, w: &MetalStorage, lw: &Layout)
+         -> candle_core::Result<(MetalStorage, Shape)> {
+            let (m, k) = la.shape().dims2()?;
+            let n = self.n;
+            let (bm, bn, bk, nsg) = self.tile;
+            if m % bm != 0 || n % bn != 0 || k % bk != 0 || bk % 32 != 0 || !la.is_contiguous()
+               || lw.shape().elem_count() != n * k / 32 * Q8_BLOCK || lw.start_offset() != 0 {
+                candle_core::bail!("mpp_matmul2d_q8_0: [{m}, {k}] x [{n}, {k}] does not fit tile \
+                                    {bm}x{bn}x{bk}");
+            }
+            let dev = a.device();
+            let out = output(dev, m * n * 4, self.poison)?;
+            let guard = dev.command_encoder()?;
+            let enc: &ComputeCommandEncoder = guard.as_ref();
+            enc.set_compute_pipeline_state(&self.pipe);
+            enc.set_input_buffer(0, Some(a.buffer()), la.start_offset() * a.dtype().size_in_bytes());
+            enc.set_input_buffer(1, Some(w.buffer()), 0);
+            enc.set_output_buffer(2, Some(&out), 0);
+            enc.set_bytes(3, &(m as i32));
+            enc.set_bytes(4, &(n as i32));
+            enc.set_bytes(5, &(k as i32));
+            enc.set_threadgroup_memory_length(0, bn * bk * 2);
+            enc.dispatch_thread_groups(
+                MTLSize { width: n / bn, height: m / bm, depth: 1 },
+                MTLSize { width: 32 * nsg, height: 1, depth: 1 },
+            );
+            Ok((MetalStorage::new(out, dev.clone(), m * n, DType::F32), Shape::from((m, n))))
+        }
+    }
+
+    /// The output buffer. candle hands out buffers from a pool, and a pooled
+    /// buffer can still hold the last product of the same size: a kernel
+    /// that wrote nothing would then "agree" with it exactly. So the
+    /// correctness pass fills its output with `0xff` bytes, NaN in f32 and
+    /// f16 alike, and anything the kernel leaves unwritten shows up as NaN.
+    /// The timed runs skip the fill.
+    fn output(dev: &candle_core::MetalDevice, bytes: usize, poison: bool)
+     -> candle_core::Result<std::sync::Arc<candle_metal_kernels::metal::Buffer>> {
+        let out = dev.allocate_buffer(bytes)?;
+        if poison {
+            let mut blit = dev.blit_command_encoder()?;
+            blit.fill_buffer(&out, (0, bytes), 0xff);
+        }
+        Ok(out)
     }
 
     fn median(mut v: Vec<f64>) -> f64 {
@@ -177,26 +369,60 @@ TILES(bfloat, bf16)
         let opts = MTLCompileOptions::new();
         opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
         let lib = md.metal_device().new_library_with_source(SOURCE, Some(&opts))?;
+        let lib_q8 = md.metal_device().new_library_with_source(SOURCE_Q8, Some(&opts))?;
         let op = |tn: &str, tile: (usize, usize, usize)| -> Result<Mpp, Box<dyn std::error::Error>> {
             let (bm, bn, nsg) = tile;
             let f = lib.get_function(&format!("mm_{tn}_{bm}x{bn}_{nsg}"), None)?;
-            Ok(Mpp { pipe: md.metal_device().new_compute_pipeline_state_with_function(&f)?, tile })
+            Ok(Mpp { pipe: md.metal_device().new_compute_pipeline_state_with_function(&f)?, tile, poison: false })
+        };
+        let op_q8 = |an: &str, tile: (usize, usize, usize, usize), n: usize|
+         -> Result<MppQ8, Box<dyn std::error::Error>> {
+            let (bm, bn, bk, nsg) = tile;
+            let f = lib_q8.get_function(&format!("mm_q8_{an}_{bm}x{bn}x{bk}_{nsg}"), None)?;
+            Ok(MppQ8 { pipe: md.metal_device().new_compute_pipeline_state_with_function(&f)?, tile, n,
+                       poison: false })
         };
 
+        // `dense`, `q8`, or both when no argument is given.
+        let only = std::env::args().nth(1);
+        let dense = only.as_deref() != Some("q8");
+        let q8 = only.as_deref() != Some("dense");
+
+        // One timed run of `f`: `reps` calls behind one sync, in ms per call.
         let (rounds, reps) = (7, 5);
-        let time = |f: &dyn Fn() -> candle_core::Result<Tensor>| -> candle_core::Result<f64> {
-            let _ = f()?;
-            dev.synchronize()?;
-            let mut ms = Vec::with_capacity(rounds);
-            for _ in 0..rounds {
-                let t = std::time::Instant::now();
-                for _ in 0..reps {
-                    let _ = f()?;
-                }
-                dev.synchronize()?;
-                ms.push(t.elapsed().as_secs_f64() * 1000.0 / reps as f64);
+        let once = |f: &dyn Fn() -> candle_core::Result<Tensor>| -> candle_core::Result<f64> {
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                let _ = f()?;
             }
-            Ok(median(ms))
+            dev.synchronize()?;
+            Ok(t.elapsed().as_secs_f64() * 1000.0 / reps as f64)
+        };
+        // candle against a candidate, **in alternating rounds**. This
+        // machine's speed drifts by a third between runs, candle's included,
+        // so timing one and then the other would put the drift in the ratio.
+        // Here each round times both back to back and the ratio is taken per
+        // round: (median candle ms, median candidate ms, median ratio).
+        let race = |base: &dyn Fn() -> candle_core::Result<Tensor>,
+                    cand: &dyn Fn() -> candle_core::Result<Tensor>|
+         -> candle_core::Result<(f64, f64, f64)> {
+            let _ = base()?;
+            let _ = cand()?;
+            dev.synchronize()?;
+            let (mut tb, mut tc, mut r) = (vec![], vec![], vec![]);
+            for _ in 0..rounds {
+                let b = once(base)?;
+                let c = once(cand)?;
+                tb.push(b);
+                tc.push(c);
+                r.push(b / c);
+            }
+            Ok((median(tb), median(tc), median(r)))
+        };
+        let row = |what: String, (tb, tc, x): (f64, f64, f64), tflops: f64, e: f32, apart: f32| {
+            let verdict = if !(e <= 1e-2) { "  WRONG" } else { "" };
+            println!("  {what:28} {tc:7.2} ms {tflops:5.1} TFLOP/s  candle {tb:7.2} ms  {x:4.2}x  \
+                      err {e:.1e}  vs candle {apart:.1e}{verdict}");
         };
 
         let shapes = [
@@ -215,41 +441,71 @@ TILES(bfloat, bf16)
 
             // What a q8 model runs now: `Proj::Quant`, f32 activations,
             // because candle's quantised Metal matmul takes nothing else.
-            let q = {
+            // The same blocks go to both kernels, so any difference between
+            // them is the kernels', not the quantisation's.
+            let blocks = {
                 let wt = b32.t()?.contiguous()?.to_device(&Device::Cpu)?;
-                let cpu = QTensor::quantize(&wt, GgmlDType::Q8_0)?;
-                QMatMul::from_qtensor(QTensor::new(
-                    QStorage::from_data(cpu.data()?, &dev, GgmlDType::Q8_0)?, (n, k))?)?
+                QTensor::quantize(&wt, GgmlDType::Q8_0)?.data()?.into_owned()
             };
-            let t = time(&|| q.forward(&a32))?;
-            println!("  {:28} {t:8.2} ms  {:5.1} TFLOP/s  err {:.1e}",
-                     "candle q8_0, f32 in", tflops(t), err(&q.forward(&a32)?, &want)?);
+            let q = QMatMul::from_qtensor(QTensor::new(
+                QStorage::from_data(std::borrow::Cow::Borrowed(&blocks), &dev, GgmlDType::Q8_0)?, (n, k))?)?;
+            let theirs_q8 = q.forward(&a32)?;
+            println!("  candle q8_0, f32 in: err {:.1e}", err(&theirs_q8, &want)?);
+
+            if q8 {
+                let wq = Tensor::from_slice(&blocks, blocks.len(), &dev)?;
+                // kvad's activations are f32, so the f16 kernels are timed
+                // with the cast in front of them: that is what `Proj::Quant`
+                // would run instead of `q.forward`.
+                //
+                // `matmul2d` also takes f32 on the left, and gives back
+                // candle's product bit for bit at candle's speed: it runs on
+                // the ALUs, not the matrix units. One tile shows that; the
+                // rest would only show it again.
+                for an in ["f32", "f16"] {
+                    let a = if an == "f16" { a32.to_dtype(DType::F16)? } else { a32.clone() };
+                    let tiles = if an == "f16" { &Q8_TILES[..] } else { &Q8_TILES[..1] };
+                    for &tile in tiles {
+                        let (bm, bn, bk, nsg) = tile;
+                        if m % bm != 0 || n % bn != 0 || k % bk != 0 {
+                            continue;
+                        }
+                        let mpp = op_q8(an, tile, n)?;
+                        let ours = a.apply_op2_no_bwd(&wq, &MppQ8 { poison: true, ..mpp.clone() })?;
+                        let e = err(&ours, &want)?;
+                        let apart = err(&ours, &theirs_q8)?;
+                        let r = race(&|| q.forward(&a32), &|| {
+                            let a = if an == "f16" { a32.to_dtype(DType::F16)? } else { a32.clone() };
+                            a.apply_op2_no_bwd(&wq, &mpp)
+                        })?;
+                        row(format!("q8 {an} in {bm}x{bn}x{bk}/{nsg}sg"), r, tflops(r.1), e, apart);
+                    }
+                }
+            }
+            if !dense {
+                continue;
+            }
 
             for (dt, tn) in [(DType::F16, "f16"), (DType::BF16, "bf16")] {
                 let a = a32.to_dtype(dt)?;
                 let b = b32.to_dtype(dt)?;
-                let base = time(&|| a.matmul(&b))?;
                 let theirs = a.matmul(&b)?.to_dtype(DType::F32)?;
-                println!("  {:28} {base:8.2} ms  {:5.1} TFLOP/s  err {:.1e}",
-                         format!("candle {tn}"), tflops(base), err(&theirs, &want)?);
+                println!("  candle {tn}: err {:.1e}", err(&theirs, &want)?);
                 for tile in TILES {
                     let (bm, bn, nsg) = tile;
                     if m % bm != 0 || n % bn != 0 {
                         continue;
                     }
                     let mpp = op(tn, tile)?;
-                    let ours = a.apply_op2_no_bwd(&b, &mpp)?;
+                    let ours = a.apply_op2_no_bwd(&b, &Mpp { poison: true, ..mpp.clone() })?;
                     let e = err(&ours, &want)?;
                     // Against candle's own output too. Two kernels that each
                     // round correctly differ by about one rounding step of the
                     // largest output: the same order as either one's `err`,
                     // and never much more.
                     let apart = err(&ours, &theirs)?;
-                    let t = time(&|| a.apply_op2_no_bwd(&b, &mpp))?;
-                    let verdict = if e > 1e-2 { "  WRONG" } else { "" };
-                    println!("  {:28} {t:8.2} ms  {:5.1} TFLOP/s  err {e:.1e}  vs candle {apart:.1e}  \
-                              {:4.2}x{verdict}",
-                             format!("matmul2d {tn} {bm}x{bn}/{nsg}sg"), tflops(t), base / t);
+                    let r = race(&|| a.matmul(&b), &|| a.apply_op2_no_bwd(&b, &mpp))?;
+                    row(format!("matmul2d {tn} {bm}x{bn}/{nsg}sg"), r, tflops(r.1), e, apart);
                 }
             }
         }

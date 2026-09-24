@@ -210,6 +210,23 @@ impl Vault {
         device: &Device,
     ) -> Option<QTensor> {
         let gd = self.quant?;
+        let blocks = self.blocks(name, shape)?;
+        let storage = QStorage::from_data(Cow::Borrowed(blocks), device, gd);
+        match storage.and_then(|s| QTensor::new(s, shape)) {
+            Ok(q) => Some(q),
+            // A length candle will not take: the file is damaged, and the
+            // load carries on without it.
+            Err(_) => {
+                self.missed.borrow_mut().push(name.to_string());
+                None
+            }
+        }
+    }
+
+    /// `name`'s blocks as the file holds them, for a caller that wants the
+    /// bytes rather than a `QTensor`: `mpp`'s kernel reads Q8_0 itself.
+    pub(crate) fn blocks(&self, name: &str, shape: (usize, usize)) -> Option<&[u8]> {
+        self.quant?;
         let cache = self.read.as_ref()?;
         let miss = |v: &Self| {
             v.missed.borrow_mut().push(name.to_string());
@@ -219,10 +236,10 @@ impl Vault {
         if stored != shape {
             return miss(self);
         }
-        match load(cache, span, shape, gd, device) {
-            Ok(q) => Some(q),
-            // Bad offsets or a length candle will not take: the file is
-            // damaged, and the load carries on without it.
+        match cache.file.slice(span.0, span.1) {
+            Ok(b) => Some(b),
+            // Offsets past the end: the file is damaged, and the load carries
+            // on without it.
             Err(_) => miss(self),
         }
     }
@@ -329,18 +346,6 @@ fn open_valid(path: &Path, want: &serde_json::Value) -> Res<Option<Cache>> {
 /// is one copy the CPU engine's own cache avoids. That is the price of
 /// speaking candle's vocabulary rather than our own, and it is paid against
 /// quantising the matrix from scratch.
-fn load(
-    cache: &Cache,
-    span: Span,
-    shape: (usize, usize),
-    gd: GgmlDType,
-    device: &Device,
-) -> Res<QTensor> {
-    let blocks = cache.file.slice(span.0, span.1)?;
-    let storage = QStorage::from_data(Cow::Borrowed(blocks), device, gd)?;
-    Ok(QTensor::new(storage, shape)?)
-}
-
 fn parse_entry(v: &serde_json::Value) -> Res<(Span, (usize, usize))> {
     let num = |v: Option<&serde_json::Value>| -> Res<usize> {
         v.and_then(serde_json::Value::as_u64).map(|n| n as usize).ok_or_else(|| "bad entry".into())

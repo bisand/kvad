@@ -30,9 +30,16 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// `QMatMul` instead keeps HuggingFace's `[out, in]` and transposes inside its
 /// kernel. Hiding that behind one `forward` keeps the block code identical
 /// either way.
+///
+/// `Blocks` is a third way to hold a quantised matrix, for the M5's matrix
+/// units: the raw Q8_0 bytes, which `mpp`'s kernel reads itself. It is what
+/// [`Loader::accelerated`] gives, and only the image pipelines ask for it;
+/// `mpp` says why a language model cannot.
 pub(crate) enum Proj {
     Dense(Tensor),
     Quant(QMatMul),
+    #[cfg(target_os = "macos")]
+    Blocks(crate::mpp::Q8),
 }
 
 impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
@@ -52,6 +59,10 @@ impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<T
             // the rows out afresh, at zero.
             Proj::Quant(q) if x.layout().start_offset() != 0 => q.forward(&x.force_contiguous()?),
             Proj::Quant(q) => q.forward(x),
+            // Casts to f16 on the way in, which lays the rows out afresh:
+            // the offset bug above cannot reach it.
+            #[cfg(target_os = "macos")]
+            Proj::Blocks(q) => q.forward(x),
         }
     }
 
@@ -62,6 +73,8 @@ impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<T
                 QMatMul::QTensor(t) => t.storage_size_in_bytes(),
                 _ => 0,
             },
+            #[cfg(target_os = "macos")]
+            Proj::Blocks(q) => q.bytes(),
         }
     }
 
@@ -72,6 +85,8 @@ impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<T
                 QMatMul::QTensor(t) => t.shape().elem_count(),
                 _ => 0,
             },
+            #[cfg(target_os = "macos")]
+            Proj::Blocks(q) => q.params(),
         }
     }
 }
@@ -157,11 +172,26 @@ pub(crate) struct Loader<'v> {
     pub(crate) quant: Option<GgmlDType>,
     pub(crate) device: Device,
     vault: &'v Vault,
+    /// Q8_0 projections as [`Proj::Blocks`], for the M5's matrix units.
+    blocks: bool,
 }
 
 impl<'v> Loader<'v> {
     pub(crate) fn new(quant: Option<GgmlDType>, device: Device, vault: &'v Vault) -> Self {
-        Loader { quant, device, vault }
+        Loader { quant, device, vault, blocks: false }
+    }
+
+    /// The same load, with its Q8_0 projections on the M5's matrix units
+    /// where this machine has them, and as before where it does not.
+    ///
+    /// Only for a model with no decode step: a [`Proj::Blocks`] has no
+    /// one-row kernel behind it. `mpp` says why it cannot also keep one.
+    pub(crate) fn accelerated(mut self) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            self.blocks = self.quant == Some(GgmlDType::Q8_0) && crate::mpp::available(&self.device);
+        }
+        self
     }
 
     /// One projection matrix, in whichever layout this load will use it.
@@ -196,6 +226,16 @@ impl<'v> Loader<'v> {
             };
             return Ok(Proj::Dense(w.to_device(&self.device)?));
         };
+        #[cfg(target_os = "macos")]
+        if self.blocks {
+            let full = vb.full(name);
+            if let Some(b) = self.vault.blocks(&full, (out, inp)) {
+                vb.record(name);
+                return Ok(Proj::Blocks(crate::mpp::Q8::new(b, out, inp, &self.device)?));
+            }
+            let blocks = self.quantize(vb, name, out, inp, stored)?.data()?.into_owned();
+            return Ok(Proj::Blocks(crate::mpp::Q8::new(&blocks, out, inp, &self.device)?));
+        }
         Ok(Proj::Quant(QMatMul::from_qtensor(self.quantized(vb, name, out, inp, stored)?)?))
     }
 
@@ -221,6 +261,17 @@ impl<'v> Loader<'v> {
             vb.record(name);
             return Ok(q);
         }
+        let cpu = self.quantize(vb, name, out, inp, stored)?;
+        if self.device.is_cpu() {
+            return Ok(cpu);
+        }
+        Ok(QTensor::new(QStorage::from_data(cpu.data()?, &self.device, gd)?, (out, inp))?)
+    }
+
+    /// A cache miss: read the matrix, quantise it on the host, and file the
+    /// blocks.
+    fn quantize(&self, vb: &Reader<'_>, name: &str, out: usize, inp: usize, stored: Stored) -> Res<QTensor> {
+        let gd = self.quant.ok_or("asked for blocks on a load that is not quantised")?;
         let w = match stored {
             Stored::OutIn => vb.get((out, inp), name)?,
             Stored::InOut => vb.get((inp, out), name)?.t()?.contiguous()?,
@@ -231,13 +282,8 @@ impl<'v> Loader<'v> {
         // also spend — and it hands over the blocks the cache wants without
         // reading them back off the device afterwards.
         let cpu = QTensor::quantize(&w, gd)?;
-        let blocks = cpu.data()?;
-        self.vault.put(&full, (out, inp), &blocks);
-        if self.device.is_cpu() {
-            drop(blocks);
-            return Ok(cpu);
-        }
-        Ok(QTensor::new(QStorage::from_data(blocks, &self.device, gd)?, (out, inp))?)
+        self.vault.put(&vb.full(name), (out, inp), &cpu.data()?);
+        Ok(cpu)
     }
 }
 

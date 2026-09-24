@@ -352,8 +352,17 @@ TILES(float, f32)
         v[v.len() / 2]
     }
 
-    /// `max |got - want| / max |want|`, on the GPU, in f32.
+    /// `max |got - want| / max |want|`, on the GPU, in f32; NaN if any
+    /// element of `got` is not finite.
+    ///
+    /// The NaN has to be put back by hand. candle's `max_all` compares with
+    /// `>`, which a NaN never wins, so the max of an output left entirely
+    /// poisoned is small and the kernel that wrote nothing looks right. A
+    /// sum carries a NaN through.
     fn err(got: &Tensor, want: &Tensor) -> candle_core::Result<f32> {
+        if !got.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?.is_finite() {
+            return Ok(f32::NAN);
+        }
         let d = (got.to_dtype(DType::F32)? - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
         let s = want.abs()?.max_all()?.to_scalar::<f32>()?;
         Ok(d / s)

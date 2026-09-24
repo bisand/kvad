@@ -7,7 +7,7 @@
 //! GPU ones through `kvad_gpu`.
 
 use kvad::runtime::Llm;
-use kvad::service::{cpu_loader, Backend, GpuMode, Loader};
+use kvad::service::{cpu_loader, Backend, GpuMode, Loader, Model};
 use kvad::weights::Watcher;
 
 /// A loader that can build either backend.
@@ -15,7 +15,9 @@ pub fn loader() -> Loader {
     let mut cpu = cpu_loader();
     Box::new(move |repo, backend, progress, watch| match backend {
         Backend::Cpu(_) => cpu(repo, backend, progress, watch),
-        Backend::Gpu(mode) => load_on_gpu(repo, mode, progress, watch),
+        // Text only: this is a chat screen. An image model's loader is the
+        // server's (`kvad-serve`'s `engine.rs`), which has somewhere to show one.
+        Backend::Gpu(mode) => load_on_gpu(repo, mode, progress, watch).map(Model::from),
     })
 }
 

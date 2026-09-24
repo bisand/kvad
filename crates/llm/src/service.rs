@@ -27,9 +27,19 @@
 //! describe and not fulfil, and whoever spawns an engine hands it a
 //! [`Loader`] that can. A build with no GPU crate in it passes
 //! [`cpu_loader`], and asking that one for a GPU says what to do instead.
+//!
+//! # Two kinds of model
+//!
+//! A loader hands back a [`Model`]: a language model, or an image pipeline
+//! ([`crate::image::Painter`]). They are peers, not modes of one another.
+//! [`Llm`] knows nothing about images and a painter knows nothing about
+//! tokens; what they share is this thread, the load and unload around them,
+//! and the channel their progress goes down. Asking one for the other's work
+//! is an [`Evt::Error`] that says which kind of model it is.
 
 use crate::chat::Message;
 use crate::hub::{self, HubModel, LocalModel};
+use crate::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use crate::quant::Precision;
 use crate::runtime::{Chosen, Llm, Perplexity, Stats, Token};
 use crate::sampler::Sampler;
@@ -88,6 +98,21 @@ pub enum Cmd {
     Perplexity { text: String, window: usize },
     RefreshLocal,
     Delete(String),
+    /// Make an image, reporting each denoising step as [`Evt::Painting`] and
+    /// ending with [`Evt::Painted`]. Only an image model can.
+    Paint(ImageRequest),
+}
+
+/// What a [`Loader`] hands back.
+pub enum Model {
+    Text(Llm),
+    Image(Box<dyn Painter>),
+}
+
+impl From<Llm> for Model {
+    fn from(llm: Llm) -> Self {
+        Model::Text(llm)
+    }
 }
 
 /// How to turn logits into tokens, chosen per request.
@@ -197,6 +222,10 @@ pub enum Evt {
         /// occupies is this times the tokens held, and what it *could* occupy
         /// is this times `n_ctx`. A caller reporting memory needs both.
         kv_bytes_per_token: usize,
+        /// For an image model, what it does when a request leaves a knob
+        /// out; `None` for a language model. This is how a caller tells the
+        /// two apart.
+        image: Option<Defaults>,
     },
     /// No model is loaded any more, and what was loaded is named.
     Unloaded(String),
@@ -211,6 +240,9 @@ pub enum Evt {
     /// Progress through a text being scored, in tokens.
     Scoring { done: usize, total: usize },
     Scored(Perplexity),
+    /// One denoising step of an image, done.
+    Painting(Step),
+    Painted(Painted),
     Error(String),
 }
 
@@ -221,7 +253,7 @@ pub enum Evt {
 /// and both are already wired to the event channel by the time a loader sees
 /// them.
 pub type Loader = Box<
-    dyn FnMut(&str, Backend, &mut dyn FnMut(&str), &Watcher) -> Res<Llm> + Send,
+    dyn FnMut(&str, Backend, &mut dyn FnMut(&str), &Watcher) -> Res<Model> + Send,
 >;
 
 /// The loader for a build with no GPU crate in it.
@@ -230,7 +262,7 @@ pub type Loader = Box<
 /// rather than with a type error at the other end of the program.
 pub fn cpu_loader() -> Loader {
     Box::new(|repo, backend, progress, watch| match backend {
-        Backend::Cpu(precision) => Llm::load_watched(repo, precision, progress, watch),
+        Backend::Cpu(precision) => Llm::load_watched(repo, precision, progress, watch).map(Model::from),
         Backend::Gpu(_) => {
             Err("this build has no GPU backend; pick a CPU precision instead".into())
         }
@@ -299,6 +331,32 @@ struct Loaded {
     sampler: Sampler,
 }
 
+/// Whichever kind of model this engine holds.
+enum Held {
+    Text(Loaded),
+    Image { repo: String, painter: Box<dyn Painter> },
+}
+
+impl Held {
+    fn repo(&self) -> &str {
+        match self {
+            Held::Text(s) => &s.llm.repo,
+            Held::Image { repo, .. } => repo,
+        }
+    }
+
+    /// The language model, or an error saying this is not one.
+    fn text(&mut self) -> Result<&mut Loaded, String> {
+        match self {
+            Held::Text(s) => Ok(s),
+            Held::Image { repo, .. } => Err(format!(
+                "{repo} makes images from text; it cannot chat, complete, tokenize or score. \
+                 Ask it for an image instead (POST /v1/images/generations)."
+            )),
+        }
+    }
+}
+
 fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load: Loader) {
     let say = |msg: &str| {
         let _ = tx.send(Evt::Status(msg.to_string()));
@@ -307,7 +365,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
         let _ = tx.send(Evt::Error(e.to_string()));
     };
 
-    let mut session: Option<Loaded> = None;
+    let mut session: Option<Held> = None;
     let _ = tx.send(Evt::Local(hub::local_models()));
 
     while let Ok(cmd) = rx.recv() {
@@ -343,7 +401,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
 
             Cmd::Unload => match session.take() {
                 Some(was) => {
-                    let _ = tx.send(Evt::Unloaded(was.llm.repo.clone()));
+                    let _ = tx.send(Evt::Unloaded(was.repo().to_string()));
                 }
                 None => say("nothing is loaded"),
             },
@@ -367,7 +425,26 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                     })
                 };
                 match load(&repo, backend, &mut progress, &watch) {
-                    Ok(llm) => {
+                    Ok(Model::Image(painter)) => {
+                        let _ = tx.send(Evt::Loaded {
+                            repo: repo.clone(),
+                            summary: painter.summary(),
+                            params: painter.params(),
+                            instruct: false,
+                            tools: false,
+                            backend: painter.backend(),
+                            weight_bytes: painter.weight_bytes(),
+                            n_ctx: 0,
+                            kv_bytes_per_token: 0,
+                            image: Some(painter.defaults()),
+                        });
+                        // Not made the active model: that is what `kvad run`
+                        // talks to when it is not told, and it cannot talk
+                        // to this.
+                        session = Some(Held::Image { repo, painter });
+                        let _ = tx.send(Evt::Local(hub::local_models()));
+                    }
+                    Ok(Model::Text(llm)) => {
                         let _ = tx.send(Evt::Loaded {
                             repo: repo.clone(),
                             summary: llm.spec.summary(),
@@ -378,12 +455,13 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                             weight_bytes: llm.weight_bytes,
                             n_ctx: llm.spec.n_ctx,
                             kv_bytes_per_token: kvad_kv_bytes_per_token(&llm.spec),
+                            image: None,
                         });
                         let _ = hub::State::set_active(&repo);
                         let d = Sampling::default();
                         let sampler =
                             Sampler::new(d.temperature, d.top_k, d.top_p, DEFAULT_SEED);
-                        session = Some(Loaded { llm, sampler });
+                        session = Some(Held::Text(Loaded { llm, sampler }));
                         let _ = tx.send(Evt::Local(hub::local_models()));
                     }
                     Err(e) => fail(e),
@@ -391,9 +469,16 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
             }
 
             Cmd::Chat { messages, tools, sampling, fresh } => {
-                let Some(s) = session.as_mut() else {
+                let Some(held) = session.as_mut() else {
                     say("no model loaded");
                     continue;
+                };
+                let s = match held.text() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        fail(e.into());
+                        continue;
+                    }
                 };
                 aim(s, &sampling);
                 if fresh {
@@ -415,9 +500,16 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
             }
 
             Cmd::Complete { prompt, sampling, explain, fresh } => {
-                let Some(s) = session.as_mut() else {
+                let Some(held) = session.as_mut() else {
                     say("no model loaded");
                     continue;
+                };
+                let s = match held.text() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        fail(e.into());
+                        continue;
+                    }
                 };
                 aim(s, &sampling);
                 if fresh {
@@ -439,9 +531,10 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 run(s, &ids, &sampling, explain, &tx, &cancel);
             }
 
-            Cmd::Tokenize(text) => match session.as_ref() {
+            Cmd::Tokenize(text) => match session.as_mut().map(Held::text) {
                 None => say("no model loaded"),
-                Some(s) => match s.llm.tokenize(&text) {
+                Some(Err(e)) => fail(e.into()),
+                Some(Ok(s)) => match s.llm.tokenize(&text) {
                     Ok(tokens) => {
                         let _ = tx.send(Evt::Tokens(tokens));
                     }
@@ -450,9 +543,16 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
             },
 
             Cmd::Perplexity { text, window } => {
-                let Some(s) = session.as_mut() else {
+                let Some(held) = session.as_mut() else {
                     say("no model loaded");
                     continue;
+                };
+                let s = match held.text() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        fail(e.into());
+                        continue;
+                    }
                 };
                 cancel.store(false, Ordering::Relaxed);
                 let tx2 = tx.clone();
@@ -464,6 +564,32 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 match scored {
                     Ok(p) => {
                         let _ = tx.send(Evt::Scored(p));
+                    }
+                    Err(e) => fail(e),
+                }
+            }
+
+            Cmd::Paint(request) => {
+                let painter = match session.as_mut() {
+                    None => {
+                        say("no model loaded");
+                        continue;
+                    }
+                    Some(Held::Image { painter, .. }) => painter,
+                    Some(Held::Text(s)) => {
+                        fail(format!("{} is a language model; it cannot make images", s.llm.repo).into());
+                        continue;
+                    }
+                };
+                cancel.store(false, Ordering::Relaxed);
+                let tx2 = tx.clone();
+                let cancel2 = Arc::clone(&cancel);
+                let painted = painter.paint(&request, &mut |step| {
+                    tx2.send(Evt::Painting(step)).is_ok() && !cancel2.load(Ordering::Relaxed)
+                });
+                match painted {
+                    Ok(p) => {
+                        let _ = tx.send(Evt::Painted(p));
                     }
                     Err(e) => fail(e),
                 }

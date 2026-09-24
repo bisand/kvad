@@ -49,6 +49,7 @@ pub fn remote_only(command: &str) -> bool {
             | "cancel"
             | "tokenize"
             | "conversations"
+            | "images"
             | "jobs"
             | "datasets"
             | "evals"
@@ -106,6 +107,7 @@ pub fn remote(remote: &Remote, args: &Args) -> Res<()> {
         "chat" => models::chat(remote, args),
         "train" => models::train(remote, args),
         "conversations" => api::conversations(remote, args),
+        "images" => api::images(remote, args),
         "jobs" => api::jobs(remote, args),
         "datasets" => api::datasets(remote, args),
         "evals" => api::evals(remote, args),
@@ -128,6 +130,7 @@ pub fn help(command: &str) -> ! {
     let text = match command {
         "service" => service::USAGE,
         "conversations" => api::CONVERSATIONS,
+        "images" => api::IMAGES,
         "jobs" => api::JOBS,
         "datasets" => api::DATASETS,
         "evals" => api::EVALS,
@@ -287,7 +290,7 @@ mod tests {
     fn every_command_the_table_names_exists() {
         let known: BTreeSet<&str> = [
             "ls", "ps", "search", "info", "pull", "use", "rm", "cache", "load", "unload", "cancel",
-            "tokenize", "run", "chat", "train", "service", "conversations", "jobs", "datasets",
+            "tokenize", "run", "chat", "train", "service", "conversations", "images", "jobs", "datasets",
             "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api",
         ]
         .into();

@@ -18,3 +18,7 @@ path = "src/main.rs"
 candle-core = { version = "0.11.0", features = ["metal"] }
 candle-nn = { version = "0.11.0", features = ["metal"] }
 kvad = { path = "../llm" }
+# The image pipelines tokenise their own prompts: CLIP's vocabulary is not a
+# language model's, and there is no `Llm` around it to do it for them. The
+# same crate and version `kvad` already builds.
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }

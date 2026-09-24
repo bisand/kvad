@@ -47,7 +47,7 @@
 use crate::api::{blocking, Fail};
 use crate::models::{sse, stream};
 use crate::auth::{Identity, State};
-use crate::scheduler::{LoadError, Piece, Resident};
+use crate::scheduler::{Kind, LoadError, Piece, Resident};
 use axum::extract::State as St;
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
@@ -67,11 +67,26 @@ use serde_json::json;
 pub async fn models(_: Identity, St(state): St<State>) -> Result<Json<serde_json::Value>, Fail> {
     let found = blocking(move || {
         let listed = |trained: bool| {
-            move |m: kvad::hub::LocalModel| (m.id.clone(), trained, takes_tools(&m))
+            move |m: kvad::hub::LocalModel| {
+                let kind = match kvad::hub::pipeline(&m) {
+                    Some(_) => "image",
+                    None => "chat",
+                };
+                (m.id.clone(), trained, takes_tools(&m), kind)
+            }
         };
-        let mut all: Vec<(String, bool, bool)> = kvad::hub::local_models()
+        // A language model is one this build has an architecture for; an
+        // image model is one whose pipeline it implements.
+        let runs = |m: &kvad::hub::LocalModel| {
+            m.complete
+                && match kvad::hub::pipeline(m) {
+                    Some(p) => crate::engine::paints(&p),
+                    None => m.arch.is_some(),
+                }
+        };
+        let mut all: Vec<(String, bool, bool, &str)> = kvad::hub::local_models()
             .into_iter()
-            .filter(|m| m.complete && m.arch.is_some())
+            .filter(|m| runs(m))
             .map(listed(false))
             .collect();
         all.extend(
@@ -88,7 +103,7 @@ pub async fn models(_: Identity, St(state): St<State>) -> Result<Json<serde_json
     let resident = |id: &str| residents.iter().any(|r| r.key.repo.eq_ignore_ascii_case(id));
     let mut data: Vec<serde_json::Value> = found
         .into_iter()
-        .map(|(id, trained, tools)| json!({
+        .map(|(id, trained, tools, kind)| json!({
             "id": id,
             "object": "model",
             // The field is required and means "when was this published".
@@ -102,7 +117,10 @@ pub async fn models(_: Identity, St(state): St<State>) -> Result<Json<serde_json
             // model for an agent needs it before it picks — so it goes in the
             // extension field, beside the one on a completion. Whether it is
             // in memory goes there too: naming one that is not costs a load.
-            "kvad": { "tools": tools, "resident": resident(&id) },
+            // `kind` too: an image model answers a different endpoint, and
+            // a client picking a model by name should not have to find that
+            // out from a refusal.
+            "kvad": { "tools": tools, "resident": resident(&id), "kind": kind },
         }))
         .collect();
     data.extend(residents.iter().map(|r| json!({
@@ -110,7 +128,7 @@ pub async fn models(_: Identity, St(state): St<State>) -> Result<Json<serde_json
         "object": "model",
         "created": 0,
         "owned_by": "kvad",
-        "kvad": { "tools": r.model.tools, "resident": true, "backend": r.model.backend },
+        "kvad": { "tools": r.model.tools, "resident": true, "backend": r.model.backend, "kind": r.model.kind },
     })));
 
     Ok(Json(json!({ "object": "list", "data": data })))
@@ -402,7 +420,7 @@ pub async fn completions(
     let tools = body.tools()?;
 
 
-    let resident = resident_for(&state, body.model.as_deref()).await?;
+    let resident = resident_for(&state, body.model.as_deref(), Kind::Chat).await?;
     let loaded = resident.model.clone();
 
     // Asked for a call from a model that cannot make one. The template is
@@ -472,43 +490,58 @@ pub async fn completions(
 }
 
 /// The model in memory a request is for, loading it first if it may be.
-async fn resident_for(state: &State, model: Option<&str>) -> Result<Resident, Fail> {
+///
+/// `want` is the kind of model the endpoint needs. A model of the other kind
+/// is refused *before* it is loaded — naming a 14B language model on the
+/// images endpoint would otherwise spend a minute and thirty gigabytes on a
+/// load whose only outcome is the refusal.
+pub(crate) async fn resident_for(state: &State, model: Option<&str>, want: Kind) -> Result<Resident, Fail> {
     let Some(name) = model else {
-        if let Some(only) = state.engine.only() {
-            return Ok(only);
-        }
-        let all = state.engine.residents();
-        return match all.len() {
-            0 => Err(Fail::bad("no model is loaded, and the request did not name one")),
-            _ => Err(Fail::bad(format!(
-                "{} models are loaded and the request did not name one: {}",
-                all.len(),
-                all.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ")
+        // With no name, only the residents that could answer count: one
+        // language model and one image model in memory is not a choice to
+        // make for a chat.
+        let mut fit: Vec<Resident> = state.engine.residents().into_iter().filter(|r| r.model.kind == want).collect();
+        return match fit.len() {
+            1 => Ok(fit.pop().expect("one")),
+            0 => Err(Fail::bad(format!("no {} model is loaded, and the request did not name one", noun(want)))),
+            n => Err(Fail::bad(format!(
+                "{n} {} models are loaded and the request did not name one: {}",
+                noun(want),
+                fit.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ")
             ))),
         };
     };
     if let Some(r) = state.engine.find(name) {
-        return Ok(r);
+        return match r.model.kind == want {
+            true => Ok(r),
+            false => Err(wrong_kind(name, r.model.kind)),
+        };
     }
 
     let (repo, backend) = crate::scheduler::parse_id(name);
     let repo = repo.to_string();
-    let (on_disk, default) = {
+    let (on_disk, kind, default) = {
         let repo = repo.clone();
         blocking(move || {
-            let here = kvad::hub::find_local(&repo)
-                .or_else(|| kvad::hub::find_trained(&repo))
-                .is_some_and(|m| m.complete);
+            let found = kvad::hub::find_local(&repo).or_else(|| kvad::hub::find_trained(&repo));
+            let here = found.as_ref().is_some_and(|m| m.complete);
+            let kind = match found.as_ref().and_then(kvad::hub::pipeline) {
+                Some(_) => Kind::Image,
+                None => Kind::Chat,
+            };
             // The same answer the Models page would give, from the same
             // function: a load started from here and a load started from
             // there must not disagree about what "the default backend"
             // means.
-            Ok((here, crate::models::default_backend(Some(&repo))))
+            Ok((here, kind, crate::models::default_backend(Some(&repo))))
         })
         .await?
     };
     if !on_disk {
         return Err(Fail::missing(format!("{name} is not a model on this machine")));
+    }
+    if kind != want {
+        return Err(wrong_kind(name, kind));
     }
     if !state.load_on_request {
         return Err(Fail::conflict(format!(
@@ -528,6 +561,21 @@ async fn resident_for(state: &State, model: Option<&str>) -> Result<Resident, Fa
         .engine
         .find(&crate::scheduler::id_of(&repo, backend))
         .ok_or_else(|| Fail::internal(format!("{name} loaded and then was not there")))
+}
+
+fn noun(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Chat => "language",
+        Kind::Image => "image",
+    }
+}
+
+/// A model asked for the other kind of work, said with where to send it.
+fn wrong_kind(name: &str, is: Kind) -> Fail {
+    Fail::bad(match is {
+        Kind::Image => format!("{name} makes images; ask it at /v1/images/generations, not /v1/chat/completions"),
+        Kind::Chat => format!("{name} is a language model; it answers /v1/chat/completions, not image requests"),
+    })
 }
 
 /// Where a completion's row is filed. The route pattern, matching what the
@@ -1044,6 +1092,8 @@ mod tests {
             weight_bytes: 0,
             n_ctx: 2048,
             kv_bytes_per_token: 1024,
+            kind: crate::scheduler::Kind::Chat,
+            image: None,
         };
         let stats = Stats {
             prompt_tokens: 100,

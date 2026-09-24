@@ -595,8 +595,13 @@ fn read_reply(mut response: ureq::http::Response<ureq::Body>, path: &str) -> Res
     Ok((json, cookie))
 }
 
-/// A tiny base64 encoder, for HTTP Basic. Twenty lines is less than a
-/// dependency, and this is the only place that needs one.
+/// Base64 to bytes: how `/v1/images/generations` sends a picture.
+pub fn decode_base64(text: &str) -> Res<Vec<u8>> {
+    base64_lite::decode(text).ok_or_else(|| "the server sent an image that is not base64".into())
+}
+
+/// A tiny base64 encoder, for HTTP Basic, and its inverse, for the pictures
+/// `kvad images make` is sent. Forty lines is less than a dependency.
 mod base64_lite {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -614,6 +619,24 @@ mod base64_lite {
             }
         }
         out
+    }
+
+    /// The inverse of [`encode`]; `None` for anything that is not base64.
+    pub fn decode(text: &str) -> Option<Vec<u8>> {
+        let text = text.trim_end_matches('=');
+        let mut out = Vec::with_capacity(text.len() * 3 / 4);
+        let (mut acc, mut bits) = (0u32, 0);
+        for c in text.bytes() {
+            let v = ALPHABET.iter().position(|&a| a == c)? as u32;
+            acc = acc << 6 | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+                acc &= (1 << bits) - 1;
+            }
+        }
+        Some(out)
     }
 }
 
@@ -783,6 +806,9 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("get", "/api/keys", "kvad keys"),
     ("post", "/api/keys", "kvad keys add, kvad auth login"),
     ("delete", "/api/keys/{id}", "kvad keys rm, kvad auth logout"),
+    ("post", "/v1/images/generations", "kvad images make"),
+    ("get", "/api/images", "kvad images"),
+    ("delete", "/api/images/{id}", "kvad images rm"),
 ];
 
 /// Routes that deliberately have no command, and why not.
@@ -794,6 +820,12 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
          there, make a key on the Account page, and give it to `kvad auth login --key`",
     ),
     ("get", "/api/auth/oidc/callback", "where the identity provider sends the browser back"),
+    (
+        "get",
+        "/api/images/{id}",
+        "the PNG itself, for the web UI's <img>. `kvad images make` writes each picture \
+         to a file from the same bytes as it arrives",
+    ),
 ];
 
 #[cfg(test)]
@@ -856,6 +888,15 @@ mod tests {
         let r = Remote::new("https://kvad.example.com/", Why::Flag).unwrap();
         assert_eq!(r.base, "https://kvad.example.com");
         assert!(Remote::new("ftp://x", Why::Flag).is_err());
+    }
+
+    #[test]
+    fn base64_decodes_what_it_encodes_at_every_padding() {
+        for n in 0..10 {
+            let bytes: Vec<u8> = (0..n).map(|i| (i * 37 + 200) as u8).collect();
+            assert_eq!(base64_lite::decode(&base64_lite::encode(&bytes)).unwrap(), bytes, "{n} bytes");
+        }
+        assert!(base64_lite::decode("not*base64").is_none());
     }
 
     #[test]

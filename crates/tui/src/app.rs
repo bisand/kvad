@@ -218,7 +218,7 @@ impl App {
                 self.streaming.get_or_insert_with(String::new).push_str(&chosen.text);
                 self.scroll = u16::MAX;
             }
-            Evt::Tokens(_) | Evt::Scoring { .. } | Evt::Scored(_) => {}
+            Evt::Tokens(_) | Evt::Scoring { .. } | Evt::Scored(_) | Evt::Painting(_) | Evt::Painted(_) => {}
         }
     }
 

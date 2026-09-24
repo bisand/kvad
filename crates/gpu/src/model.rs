@@ -615,6 +615,10 @@ impl Session for GpuLlama {
 const PREFILL_CHUNK: usize = 512;
 
 
+/// A quantisation candle can do, named here so that a crate using this one
+/// need not depend on candle to hold one.
+pub type Quant = GgmlDType;
+
 /// Weight quantisation for the GPU, in GGML's block formats.
 ///
 /// `q8` and `q4` are the same scheme implemented by hand in

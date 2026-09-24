@@ -15,6 +15,7 @@
   import Datasets from "./routes/Datasets.svelte";
   import Monitoring from "./routes/Monitoring.svelte";
   import Playground from "./routes/Playground.svelte";
+  import Images from "./routes/Images.svelte";
   import Evals from "./routes/Evals.svelte";
   import Benchmarks from "./routes/Benchmarks.svelte";
   import Api from "./routes/Api.svelte";
@@ -92,6 +93,8 @@
         <Chat />
       {:else if page.path === "/playground"}
         <Playground />
+      {:else if page.path === "/images"}
+        <Images />
       {:else if page.path === "/evals"}
         <Evals />
       {:else if page.path === "/benchmarks"}

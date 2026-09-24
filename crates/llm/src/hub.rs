@@ -713,6 +713,7 @@ pub fn local_models() -> Vec<LocalModel> {
             let path = entry.path();
             let bytes = dir_size(&path);
             let files = snapshot_files(&path);
+            let image_weights = denoiser_is_here(&path);
             // Read once. It used to be parsed for the `model_type` here and
             // again inside `local_params`, and there are now three questions
             // to ask it.
@@ -733,7 +734,7 @@ pub fn local_models() -> Vec<LocalModel> {
                 model_type,
                 // A cache entry with a config but no weights is a half-finished
                 // `info` call, not a usable model.
-                complete: files.iter().any(|f| f.ends_with(".safetensors")),
+                complete: files.iter().any(|f| f.ends_with(".safetensors")) || image_weights,
             })
         })
         .collect();
@@ -816,8 +817,62 @@ pub fn model_file(model_dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// The diffusers pipeline a model on disk is, by the `_class_name` in its
+/// `model_index.json` — `StableDiffusionXLPipeline`, `QwenImagePipeline` —
+/// or `None` for anything that has no such file, which is every language
+/// model.
+///
+/// Read here rather than kept on [`LocalModel`], because every listing would
+/// then pay for a file that only a server offering images asks about, and
+/// that asks about it for the few models it is about to show.
+pub fn pipeline(model: &LocalModel) -> Option<String> {
+    let index = model_file(&model.path, "model_index.json")?;
+    let json = crate::weights::read_json(&index).ok()?;
+    json.get("_class_name")?.as_str().map(str::to_string)
+}
+
 fn find_config(model_dir: &Path) -> Option<PathBuf> {
     model_file(model_dir, "config.json")
+}
+
+/// Whether an image pipeline's denoiser is on the disk in full.
+///
+/// A pipeline keeps its weights a directory down — `unet/`, `transformer/` —
+/// so the check above, which looks for weights beside `config.json`, never
+/// finds them. The denoiser is the part that is most of the download and the
+/// part without which nothing else matters, so its presence is what
+/// "downloaded" means here; whether every file a particular pipeline reads is
+/// present is the pipeline's own question, asked when it is offered.
+fn denoiser_is_here(model_dir: &Path) -> bool {
+    if model_file(model_dir, "model_index.json").is_none() {
+        return false;
+    }
+    let Ok(revisions) = std::fs::read_dir(model_dir.join("snapshots")) else { return false };
+    revisions.filter_map(|e| e.ok()).any(|rev| {
+        ["unet", "transformer"].iter().any(|part| {
+            let dir = rev.path().join(part);
+            let Ok(entries) = std::fs::read_dir(&dir) else { return false };
+            let names: Vec<String> =
+                entries.filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned())).collect();
+            match names.iter().find(|n| n.ends_with(".safetensors.index.json")) {
+                // Sharded: every shard the index names.
+                Some(index) => shard_names_in(&dir.join(index)).is_some_and(|shards| {
+                    !shards.is_empty() && shards.iter().all(|s| dir.join(s).is_file())
+                }),
+                None => names.iter().any(|n| n.ends_with(".safetensors")),
+            }
+        })
+    })
+}
+
+/// The files a shard index points at.
+fn shard_names_in(index: &Path) -> Option<Vec<String>> {
+    let json = crate::weights::read_json(index).ok()?;
+    let mut shards: Vec<String> =
+        json.get("weight_map")?.as_object()?.values().filter_map(|v| v.as_str().map(String::from)).collect();
+    shards.sort();
+    shards.dedup();
+    Some(shards)
 }
 
 /// The human-readable file names in a cache entry.

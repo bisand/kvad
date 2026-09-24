@@ -38,6 +38,19 @@ pub(crate) enum Proj {
 impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Proj::Dense(w) => x.matmul(w),
+            // candle 0.11's Metal kernel for a quantised matrix-matrix product
+            // reads its input from the start of the buffer whatever the
+            // tensor's own start offset is: it builds a fresh contiguous
+            // layout for the input and passes *that* layout's offset, which is
+            // always zero. The one-row kernel honours the offset, so a decode
+            // step never shows it. A `narrow` along the rows — the image half
+            // of Qwen-Image's joint attention, which starts where the text
+            // ends — is contiguous, so `contiguous()` does not copy it, and the
+            // product silently used the text's rows for the first patches. It
+            // drew noise at full speed. `copy()` is no cure either: it copies
+            // the whole buffer and keeps the offset. `force_contiguous` lays
+            // the rows out afresh, at zero.
+            Proj::Quant(q) if x.layout().start_offset() != 0 => q.forward(&x.force_contiguous()?),
             Proj::Quant(q) => q.forward(x),
         }
     }
@@ -578,4 +591,34 @@ pub(crate) fn unread_error(arch: &str, left: &[String]) -> String {
         left.len(),
         kvad::weights::collapsed(left).join("\n  ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::quantized::GgmlDType;
+
+    /// A quantised projection of rows taken from the middle of a tensor gives
+    /// those rows' answers, not the first rows' — see `Proj::forward` for the
+    /// kernel that did the second.
+    #[test]
+    fn a_quantised_projection_reads_a_narrowed_input_from_where_it_starts() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; the kernel in question is Metal's");
+            return;
+        };
+        let rand = |n: usize, seed: f32| -> Tensor {
+            let v: Vec<f32> = (0..n).map(|i| ((i as f32 * 12.9898 + seed).sin() * 43758.547).fract() - 0.5).collect();
+            Tensor::from_vec(v, n, &Device::Cpu).unwrap()
+        };
+        let w = rand(64 * 128, 1.0).reshape((64, 128)).unwrap();
+        let q = Proj::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev).unwrap()).unwrap());
+        let x = rand(40 * 128, 2.0).reshape((40, 128)).unwrap().to_device(&dev).unwrap();
+        let whole = q.forward(&x).unwrap().to_vec2::<f32>().unwrap();
+        let part = x.narrow(0, 10, 30).unwrap();
+        assert_ne!(part.layout().start_offset(), 0, "the case this is about");
+        let got = q.forward(&part).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(got[0], whole[10]);
+        assert_eq!(got[29], whole[39]);
+    }
 }

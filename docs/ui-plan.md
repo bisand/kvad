@@ -92,6 +92,7 @@ batching exists. So:
 | **Models** | Local (downloaded and trained) and Hub search with the existing `runnable()`/`blocker()` verdicts, pull with progress, delete, set active, load/unload with a precision/backend picker, quantised-cache management |
 | **Chat** | Persisted conversations, system prompt, sampler controls, per-message stats, stop button, export |
 | **Playground** | Raw completion, the same prompt side by side across F32/Q8/Q4 or two models, a tokeniser inspector, per-token top-k probabilities |
+| **Images** | Text to image with an image model (SDXL, Qwen-Image): prompt, negative prompt, size, steps, guidance, seed; each denoising step with a preview as it happens; a gallery of every picture kept, with its settings. See `docs/image-plan.md` |
 | **Training** | New run (dataset, size preset, `--from`, steps, learning rate), live train/val loss chart with the best-step marker, samples at each checkpoint, cancel, run history, a "chat with this" button |
 | **Datasets** | Upload and list text files; character count, vocabulary, and the unseen-character check against a model before `--from` fails on it; read a documentation site into a corpus, scoped to the starting URL's directory, with a manifest of every page kept beside the text |
 | **Evals** | Perplexity on a held-out file; saved prompt suites with expected outputs as regression tests across models and quantisations |

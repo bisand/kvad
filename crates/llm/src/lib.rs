@@ -25,7 +25,10 @@
 //! the way a corpus gets made out of a documentation site and the way the
 //! part of it that answers a question gets found again. So are [`client`]
 //! and [`daemon`], which are how the command line talks to `kvad-serve` and
-//! to the service manager that keeps it running.
+//! to the service manager that keeps it running. [`image`] is the part of
+//! text-to-image that has no arithmetic in it — the request, the result, a PNG
+//! written by hand — because the models themselves are convolution stacks and
+//! live in `kvad-gpu` (`docs/image-plan.md` says why).
 
 /// The `serde_json` this crate was built against.
 ///
@@ -41,6 +44,7 @@ pub mod crawl;
 pub mod daemon;
 pub mod experts;
 pub mod hub;
+pub mod image;
 pub mod machine;
 pub mod model;
 pub mod qcache;

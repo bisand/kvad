@@ -2306,6 +2306,80 @@ keeps none of them: 576 floats a position against the 2048 `kv_dim()`
 describes. The server was reporting **7.1x** the memory it was using, on the
 one architecture whose entire argument is that it uses less.
 
+### Pictures, which are not tokens
+
+```bash
+cargo run --release -p kvad-gpu --example sdxl -- \
+    --prompt "a lighthouse on a cliff at dusk, oil painting" --out lighthouse.png
+kvad images make "a red fox in fresh snow" --model stabilityai/stable-diffusion-xl-base-1.0
+```
+
+[`image/`](crates/gpu/src/image/mod.rs) is text-to-image, and it is the one
+part of the engine with no CPU version. That is a decision, written down with
+every shape it depends on in [`docs/image-plan.md`](docs/image-plan.md): an
+image model is a convolution stack, `tensor.rs` has no convolution, and a fast
+one is a project of its own. What is still written here is the model. CLIP,
+the UNet, the VAE, both schedulers, Qwen-Image's MMDiT and its video VAE, and
+the PNG encoder are all in this repository; candle supplies `conv2d` and the
+matmuls, and nothing from `candle-transformers` is used.
+
+Nothing about it is a token loop. A text encoder runs once. A denoiser runs
+20–50 times from noise, twice per step while guidance is on, and a scheduler
+with no weights at all turns each prediction into the next latent. A VAE turns
+the last latent into pixels. So a painter is not a `Session`: it implements
+[`kvad::image::Painter`](crates/llm/src/image.rs), a peer of `Llm` that the
+engine thread, the scheduler and the server hold beside it.
+
+The first image out of `examples/sdxl.rs` was the right one: a lighthouse,
+1024², 30 steps. What that took on an M5 Pro, in f16, from single runs (the
+second with a 58 GB download going on in the background):
+
+| | 1024², 30 steps | 768², 20 steps |
+|---|---|---|
+| denoise, per step (guidance on) | 3.93 s | 2.2 s |
+| VAE decode | 9.4 s | 5.3 s |
+| load, from the disk | 19 s | — |
+
+The decode is the most memory the pipeline ever asks for: it is the only
+stage at full resolution, 128 channels of 1024×1024.
+
+Qwen-Image is the same story at twenty billion parameters: Qwen2.5-VL-7B as the
+text encoder, a 60-block MMDiT with a three-axis RoPE as the denoiser, a video
+VAE run on one frame, flow matching instead of noise prediction. 41 GB of bf16
+denoiser does not fit beside anything on a 48 GB machine, so it runs at q8
+through the same loader and quantised-weight cache as the text models: 21.7 GB
+of transformer and 7.5 GB of language tower, quantised once (130 s with the
+quantising, 66 s from the cache after). Again single runs, true CFG at 4:
+
+| | 512², 20 steps | 1024², 20 steps |
+|---|---|---|
+| denoise, per step (two 20B passes) | 6.5 s | 28.3 s |
+| VAE decode | 1.5 s | 5.8 s |
+| peak memory footprint | 32.7 GB, quantising as it loaded | — |
+
+Its first image was structured noise, and the model was not the reason. The
+language tower checked out at once — it is a chat model, so the checkpoint's
+own output head could be pointed at it, and "The capital of France is" came
+back " Paris". The denoiser was probed instead: from pure noise at σ = 1, the
+clean latent it predicts should be smooth, and its neighbouring pixels
+correlated at 0.65. candle's Metal kernel for a quantised matrix-matrix product
+reads its input from the start of the buffer whatever the tensor's offset — and
+the image half of joint attention is a `narrow` that starts where the text
+ends. So every patch was projected from the wrong rows. `Tensor::copy` keeps the
+offset too; `force_contiguous` does not. With that in `Proj::forward` the same
+probe read 0.996, and the next image was a fox.
+
+Two things in it are measurements rather than code:
+
+- **The previews.** Each step can carry a picture of where it is heading,
+  without a decode: the latent's four channels mixed into RGB by a fixed
+  4×3 matrix. The matrix was fitted by least squares from one generated
+  image, latent against pixels, and explains 76–83% of the variance per
+  colour — blurry and slightly wrong, which is what a preview is for.
+- **The schedule.** SDXL's Euler schedule is checked against the timesteps
+  diffusers picks (`958, 925, …, 34, 1` for 30 steps), because a scheduler
+  that visits the wrong noise levels still draws a picture, only a worse one.
+
 ---
 
 ## Crate 4: `kvad-tui` — the app
@@ -2360,9 +2434,11 @@ engine crate, so the engine crate cannot depend on it back, and Cargo would be
 right to refuse the cycle. On Unix it `exec`s, so Ctrl-C reaches the server and
 its exit status is yours.
 
-Ten pages: a dashboard, model management, chat, a playground, training,
-datasets, evals, benchmarks, monitoring and settings — plus the API's own
-documentation at `/api`. Four authentication modes (`none`, `local`, `basic`,
+Eleven pages: a dashboard, model management, chat, a playground, images,
+training, datasets, evals, benchmarks, monitoring and settings — plus the API's
+own documentation at `/api`. `/v1/images/generations` is OpenAI's images
+endpoint, with steps, guidance, seed and a negative prompt beside its fields;
+every picture is kept, with the settings that made it. Four authentication modes (`none`, `local`, `basic`,
 `oidc`), roles, API keys. SQLite for everything the filesystem cannot answer.
 `docs/ui-plan.md` is the plan it was built from, and each phase in it records
 what that phase measured and which of its open questions closed.

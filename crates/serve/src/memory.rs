@@ -186,6 +186,10 @@ pub fn admit(budget: &Budget, held: &[Held], id: &str, need: &Need) -> Admission
 /// Blocking: it reads a directory listing and a config. The scheduler calls
 /// it on its own thread, before the load it is about to decide on.
 pub fn need(repo: &str, backend: Backend, context: usize) -> Need {
+    // An image pipeline holds no KV cache and reads its repo selectively.
+    if let Some(weights) = crate::engine::image_weight_bytes(repo, backend) {
+        return Need { weights: Some(weights), kv: 0, streams: false };
+    }
     let found = kvad::hub::find_local(repo).or_else(|| kvad::hub::find_trained(repo));
     let Some(local) = found.or_else(|| at_path(repo)) else {
         return Need::default();

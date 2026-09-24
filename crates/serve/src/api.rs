@@ -69,6 +69,7 @@ pub fn routes() -> Router<State> {
         .merge(crate::playground::routes())
         .merge(crate::evals::routes())
         .merge(crate::bench::routes())
+        .merge(crate::images::routes())
 }
 
 /// A request that could not be answered, as a status and a sentence.

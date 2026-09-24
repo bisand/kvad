@@ -49,6 +49,7 @@ mod datasets;
 mod db;
 mod engine;
 mod evals;
+mod images;
 mod jobs;
 mod machine;
 mod memory;

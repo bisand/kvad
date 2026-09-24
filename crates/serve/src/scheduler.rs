@@ -69,6 +69,20 @@ pub struct Loaded {
     /// number is this times the tokens actually held — see
     /// [`Resident::cached_tokens`].
     pub kv_bytes_per_token: usize,
+    /// `chat` or `image`: which requests this model can answer.
+    pub kind: Kind,
+    /// For an image model, what a request that leaves a knob out gets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<kvad::image::Defaults>,
+}
+
+/// What a model is for. Language models chat; image pipelines paint; and a
+/// request for the one sent to the other is refused before it is queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Chat,
+    Image,
 }
 
 /// Which model, on which backend.
@@ -159,6 +173,14 @@ pub enum Progress {
     Fetched { file: String },
 }
 
+/// A step of an image, or the image.
+#[derive(Debug, Clone)]
+pub enum Stroke {
+    Step(kvad::image::Step),
+    Done(Box<kvad::image::Painted>),
+    Failed(String),
+}
+
 /// A fragment of a reply, or the end of one.
 #[derive(Debug, Clone)]
 pub enum Piece {
@@ -205,6 +227,7 @@ enum Job {
         progress: tokio_mpsc::Sender<(usize, usize)>,
         done: Answer<Perplexity>,
     },
+    Paint { on: Key, request: kvad::image::ImageRequest, out: tokio_mpsc::Sender<Stroke> },
 }
 
 /// Makes the loader for each new engine. One per engine, because a
@@ -289,15 +312,6 @@ impl Scheduler {
     /// means.
     pub fn current(&self) -> Option<Resident> {
         self.residents().into_iter().max_by_key(|r| r.used)
-    }
-
-    /// The resident there is, if there is exactly one.
-    pub fn only(&self) -> Option<Resident> {
-        let mut all = self.residents();
-        match all.len() {
-            1 => all.pop(),
-            _ => None,
-        }
     }
 
     /// [`Scheduler::current`]'s model, for the places that report one.
@@ -399,6 +413,22 @@ impl Scheduler {
         let (done, wait) = oneshot::channel();
         self.submit(Job::Tokenize { on: on.clone(), text, done })?;
         wait.await.map_err(|_| "the engine stopped before it answered".to_string())?
+    }
+
+    /// Make an image on `on`, a step at a time.
+    ///
+    /// As [`Scheduler::chat`]: the receiver comes back at once, the first
+    /// [`Stroke`] when the engine reaches the job, and dropping the receiver
+    /// stops the generation at the next step.
+    pub fn paint(
+        &self,
+        on: &Key,
+        request: kvad::image::ImageRequest,
+    ) -> Result<tokio_mpsc::Receiver<Stroke>, String> {
+        // A step is seconds, so a handful of them buffered is plenty.
+        let (out, rx) = tokio_mpsc::channel(8);
+        self.submit(Job::Paint { on: on.clone(), request, out })?;
+        Ok(rx)
     }
 
     /// Score a text the model did not write.
@@ -541,6 +571,19 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                 };
                 let _ = done.send(answer);
             }
+
+            Job::Paint { on, request, out } => match slots.iter().find(|s| s.key == on) {
+                Some(slot) => {
+                    *shared.running() = Some(Arc::clone(&slot.engine.cancel));
+                    slot.engine.send(Cmd::Paint(request));
+                    drain_paint(&slot.engine.rx, &out, &slot.engine.cancel);
+                    *shared.running() = None;
+                    touch(&on, clock, None);
+                }
+                None => {
+                    let _ = out.blocking_send(Stroke::Failed(missing(&on)));
+                }
+            },
         }
 
         shared.busy.store(false, Ordering::Relaxed);
@@ -613,6 +656,7 @@ fn drain_load(rx: &Receiver<Evt>, progress: &tokio_mpsc::Sender<Progress>) -> Re
                 weight_bytes,
                 n_ctx,
                 kv_bytes_per_token,
+                image,
             }) => {
                 return Ok(Loaded {
                     repo,
@@ -624,6 +668,8 @@ fn drain_load(rx: &Receiver<Evt>, progress: &tokio_mpsc::Sender<Progress>) -> Re
                     weight_bytes,
                     n_ctx,
                     kv_bytes_per_token,
+                    kind: if image.is_some() { Kind::Image } else { Kind::Chat },
+                    image,
                 })
             }
             Ok(Evt::Error(e)) => return Err(e),
@@ -709,6 +755,32 @@ fn drain_chat(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Piece>) -> Option<Sta
         let _ = out.blocking_send(piece);
         if let Some(stats) = ended {
             return stats;
+        }
+    }
+}
+
+/// Forward an image's steps, then the image.
+///
+/// A client that has gone away is noticed here rather than by the engine: the
+/// engine only learns of it through the cancel flag, which is set on the
+/// first step nobody received. Draining carries on to the engine's answer
+/// either way, or the next job would read this one's leftovers.
+fn drain_paint(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Stroke>, cancel: &AtomicBool) {
+    loop {
+        let stroke = match rx.recv() {
+            Ok(Evt::Painting(step)) => Stroke::Step(step),
+            Ok(Evt::Painted(p)) => Stroke::Done(Box::new(p)),
+            Ok(Evt::Error(e)) => Stroke::Failed(e),
+            Ok(Evt::Status(message)) => Stroke::Failed(message),
+            Ok(_) => continue,
+            Err(_) => Stroke::Failed("the engine thread has stopped".into()),
+        };
+        let last = !matches!(stroke, Stroke::Step(_));
+        if out.blocking_send(stroke).is_err() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if last {
+            return;
         }
     }
 }
@@ -864,7 +936,7 @@ mod tests {
 
         let gone = sched.unload(Some(Key { repo: repo.clone(), backend: F32 })).await.unwrap();
         assert_eq!(gone, [id_of(&repo, F32)]);
-        assert_eq!(sched.only().unwrap().id, id_of(&repo, Q8));
+        assert_eq!(sched.residents().iter().map(|r| r.id.clone()).collect::<Vec<_>>(), [id_of(&repo, Q8)]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -896,7 +968,7 @@ mod tests {
         // Once the first is gone, the second fits.
         sched.unload(None).await.unwrap();
         sched.load(repo.clone(), Q8, nowhere()).await.unwrap();
-        assert_eq!(sched.only().unwrap().key.backend, Q8);
+        assert_eq!(sched.residents().iter().map(|r| r.key.backend).collect::<Vec<_>>(), [Q8]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -125,13 +125,36 @@ impl Vault {
         quant: Option<GgmlDType>,
         progress: &mut dyn FnMut(&str),
     ) -> Self {
+        let shape = serde_json::json!({
+            "arch": spec.arch.to_string(),
+            "n_layer": spec.n_layer,
+            "n_embd": spec.n_embd,
+            "vocab_size": spec.vocab_size,
+            "tie_embeddings": spec.tie_embeddings,
+        });
+        Vault::open_as(repo, paths, shape, quant, progress)
+    }
+
+    /// As [`Vault::open`], for weights that are not a language model and so
+    /// have no [`Spec`] to be known by: one component of an image pipeline,
+    /// described by whatever says what shape it is.
+    ///
+    /// `repo` names the file, so a pipeline with two quantised components
+    /// gives each its own: `Qwen/Qwen-Image/transformer`.
+    pub fn open_as(
+        repo: &str,
+        paths: &[PathBuf],
+        shape: serde_json::Value,
+        quant: Option<GgmlDType>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Self {
         // Nothing to store at bf16: the checkpoint already is the weights.
         let Some(gd) = quant else { return Vault::off() };
         if !kvad::qcache::enabled() {
             return Vault::off();
         }
         let tag = tag(gd);
-        let header = match header(repo, paths, spec, &tag) {
+        let header = match header(repo, paths, shape, &tag) {
             Ok(h) => h,
             Err(e) => {
                 progress(&format!("not caching: {e}"));
@@ -343,19 +366,13 @@ fn brief(s: &str) -> String {
 /// The same questions [`kvad::qcache`] asks, with `precision` naming this
 /// backend rather than a [`kvad::quant::Precision`] — which is what stops a
 /// `gpu-q8` file being read as a `q8` one, on top of the file names differing.
-fn header(repo: &str, paths: &[PathBuf], spec: &Spec, tag: &str) -> Res<serde_json::Value> {
+fn header(repo: &str, paths: &[PathBuf], shape: serde_json::Value, tag: &str) -> Res<serde_json::Value> {
     Ok(serde_json::json!({
         "format": "nanollm-quant-gpu",
         "version": VERSION,
         "precision": tag,
         "repo": repo,
-        "spec": {
-            "arch": spec.arch.to_string(),
-            "n_layer": spec.n_layer,
-            "n_embd": spec.n_embd,
-            "vocab_size": spec.vocab_size,
-            "tie_embeddings": spec.tie_embeddings,
-        },
+        "spec": shape,
         "sources": kvad::qcache::sources(paths)?,
     }))
 }

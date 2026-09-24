@@ -20,6 +20,15 @@ pub const CONVERSATIONS: &str = "usage: kvad conversations [ls]
 The ones started with `kvad chat --save`, and in the web UI. Carry one on with
 `kvad chat --conversation ID`.";
 
+pub const IMAGES: &str = "usage: kvad images [ls]
+       kvad images make PROMPT [--out FILE] [--model MODEL] [--size WxH] [--steps N]
+                               [--guidance F] [--negative TEXT] [--seed N]
+       kvad images rm ID
+
+Pictures made by an image model on the server — SDXL, Qwen-Image. Every one is
+kept there, with the settings that made it; `make` also writes it here, to
+--out or to image-ID.png. Anything left out is the model's own default.";
+
 pub const JOBS: &str = "usage: kvad jobs [ls] [--limit N]
        kvad jobs show ID
        kvad jobs watch ID      follow it until it ends
@@ -967,6 +976,127 @@ pub fn conversations(remote: &Remote, args: &Args) -> Res<()> {
             Ok(())
         }
         other => unknown("conversations", other, CONVERSATIONS),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Images
+// ---------------------------------------------------------------------------
+
+pub fn images(remote: &Remote, args: &Args) -> Res<()> {
+    let (sub, words) = split(args, "ls");
+    match sub {
+        "ls" => {
+            let list = remote.get("/api/images")?;
+            if args.json {
+                out::json(&list);
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = out::items(&list)
+                .iter()
+                .map(|i| {
+                    vec![
+                        out::s(&i["id"]),
+                        out::s(&i["created_at"]),
+                        format!("{}×{}", out::s(&i["width"]), out::s(&i["height"])),
+                        out::s(&i["seed"]),
+                        out::s(&i["model"]),
+                        out::cut(&out::s(&i["prompt"]), 50),
+                    ]
+                })
+                .collect();
+            match rows.is_empty() {
+                true => println!("no images yet. make one:  kvad images make \"a lighthouse at dusk\""),
+                false => out::table(&["ID", "MADE", "SIZE", "SEED", "MODEL", "PROMPT"], &rows),
+            }
+            Ok(())
+        }
+        "make" => {
+            let prompt = match (&args.prompt, words.is_empty()) {
+                (Some(p), _) => p.clone(),
+                (None, false) => words.join(" "),
+                (None, true) => {
+                    eprintln!("make what?\n\n{IMAGES}");
+                    std::process::exit(2);
+                }
+            };
+            let mut body = json!({ "prompt": prompt, "stream": true, "response_format": "b64_json" });
+            if let Some(m) = &args.model {
+                body["model"] = json!(m);
+            }
+            if let Some(size) = &args.size {
+                body["size"] = json!(size);
+            }
+            if let Some(n) = args.steps {
+                body["steps"] = json!(n);
+            }
+            if let Some(g) = args.guidance {
+                body["guidance_scale"] = json!(g);
+            }
+            if let Some(n) = &args.negative {
+                body["negative_prompt"] = json!(n);
+            }
+            if args.seed_given {
+                body["seed"] = json!(args.seed);
+            }
+
+            let mut progress = out::Progress::new();
+            let started = std::time::Instant::now();
+            for event in remote.stream("post", "/v1/images/generations", Some(Body::Json(&body)))? {
+                let event = event?;
+                let data = event.json()?;
+                match event.name.as_str() {
+                    "image_generation.step" => progress.show(format!(
+                        "  step {} of {}  {:.0} s",
+                        out::s(&data["step"]),
+                        out::s(&data["total"]),
+                        started.elapsed().as_secs_f64()
+                    )),
+                    "image_generation.completed" => {
+                        progress.done();
+                        let k = &data["kvad"];
+                        let png = client::decode_base64(data["b64_json"].as_str().unwrap_or(""))?;
+                        let path = args.out.clone().unwrap_or_else(|| format!("image-{}.png", out::s(&k["id"])));
+                        std::fs::write(&path, &png).map_err(|e| format!("could not write {path}: {e}"))?;
+                        match args.json {
+                            true => out::json(k),
+                            false => eprintln!(
+                                "{path}: {}×{}, {} steps, guidance {}, seed {} — image {} on the server\n  \
+                                 denoise {:.1} s, decode {:.1} s",
+                                out::s(&k["width"]),
+                                out::s(&k["height"]),
+                                out::s(&k["steps"]),
+                                out::s(&k["guidance"]),
+                                out::s(&k["seed"]),
+                                out::s(&k["id"]),
+                                k["denoise_secs"].as_f64().unwrap_or(0.0),
+                                k["decode_secs"].as_f64().unwrap_or(0.0),
+                            ),
+                        }
+                    }
+                    "error" => {
+                        progress.done();
+                        return Err(out::s(&data["error"]).into());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        "rm" => {
+            let id = super::id(needs(words, "an image's id", IMAGES))?;
+            if !out::confirm(&format!("delete image {id}?"), args.yes)? {
+                println!("cancelled");
+                return Ok(());
+            }
+            let gone = remote.delete(&format!("/api/images/{id}"))?;
+            match args.json {
+                true => out::json(&gone),
+                false => println!("deleted image {id}"),
+            }
+            Ok(())
+        }
+        other => unknown("images", other, IMAGES),
     }
 }
 

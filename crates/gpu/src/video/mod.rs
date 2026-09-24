@@ -11,7 +11,10 @@
 //! 2D ones, exactly.
 
 pub mod conv3d;
+pub mod gemma;
 pub mod ltx_audio;
+pub(crate) mod ltx_nn;
+pub mod ltx_text;
 pub mod ltx_vae;
 
 use std::path::Path;

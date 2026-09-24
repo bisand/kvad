@@ -69,7 +69,9 @@ impl Linear {
         let x2 = x.reshape((rows, dims[dims.len() - 1]))?;
         let mut y = self.w.forward(&x2)?;
         if let Some(b) = &self.b {
-            y = y.broadcast_add(b)?;
+            // A Q8_0 matrix answers in f32 even when asked in bf16, and the
+            // bias is in the pipeline's dtype; add it in the answer's.
+            y = y.broadcast_add(&b.to_dtype(y.dtype())?)?;
         }
         let mut shape = dims;
         *shape.last_mut().unwrap() = self.out;

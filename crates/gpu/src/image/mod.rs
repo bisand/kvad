@@ -12,16 +12,22 @@
 //! 5. [`vae`] — latents to pixels.
 //! 6. [`sdxl`] — the four put together, as a [`Painter`].
 //! 7. [`qwen`] — the same story at twenty billion parameters: an LLM as the
-//!    text encoder, a transformer as the denoiser, a video VAE as the decoder.
+//!    text encoder, a transformer as the denoiser ([`mmdit`]), a video VAE
+//!    as the decoder.
+//! 8. [`flux`] — the same transformer block again, with [`t5`] and CLIP as
+//!    its encoders and a second, single-stream kind of block after it.
 //!
 //! [`load`] picks the pipeline from the repo's `model_index.json`, the way
 //! [`crate::model::session`] picks an architecture from `config.json`.
 
 pub mod clip;
+pub mod flux;
+pub mod mmdit;
 pub mod nn;
 pub mod qwen;
 pub mod schedule;
 pub mod sdxl;
+pub mod t5;
 pub mod unet;
 pub mod vae;
 
@@ -37,7 +43,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// The pipelines this backend implements, by the `_class_name` their repos'
 /// `model_index.json` gives.
-pub const PIPELINES: [&str; 2] = ["StableDiffusionXLPipeline", "QwenImagePipeline"];
+pub const PIPELINES: [&str; 3] = ["StableDiffusionXLPipeline", "QwenImagePipeline", "FluxPipeline"];
 
 /// What kind of model `repo` is, from its `model_index.json`, if it has one on
 /// this machine. `None` for a language model, a missing repo, or a pipeline
@@ -93,6 +99,7 @@ pub fn weight_bytes(repo: &str, quant: Option<candle_core::quantized::GgmlDType>
             Some(own + vae)
         }
         "QwenImagePipeline" => qwen::weight_bytes(repo, quant, &size),
+        "FluxPipeline" => flux::weight_bytes(repo, quant, &size),
         _ => None,
     }
 }
@@ -140,6 +147,7 @@ pub fn load(
             Ok(Box::new(sdxl::Sdxl::load(repo, device, progress, watch)?))
         }
         "QwenImagePipeline" => Ok(Box::new(qwen::QwenImage::load(repo, quant, device, progress, watch)?)),
+        "FluxPipeline" => Ok(Box::new(flux::Flux::load(repo, quant, device, progress, watch)?)),
         other => Err(format!(
             "`{repo}` is a {other}; the pipelines implemented here are {}",
             PIPELINES.join(" and ")

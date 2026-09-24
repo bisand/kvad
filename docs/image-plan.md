@@ -315,14 +315,62 @@ attention at width 384, resnet), up blocks at 384, 384, 192, 96 with three
 resnets each and a nearest-2× + conv that *halves* the width after each of
 the first three, RMS norm, silu, `conv_out` 96→3, clamp to `[−1, 1]`.
 
-## FLUX
+## FLUX.1-schnell, as read off `black-forest-labs/FLUX.1-schnell`
 
-`black-forest-labs/FLUX.1-schnell` and `-dev` are gated on the Hub: the
-configs cannot be read without accepting a licence on an account, so nothing
-here is taken from them. Architecturally FLUX is the MMDiT above with single-
-stream blocks after the double-stream ones, a T5-XXL text encoder and a
-guidance-distilled timestep input; once Qwen-Image runs, FLUX is a variant
-of it, not a new pipeline. It is left for whoever has the licence to test it.
+Added 2026-09-24. The repo is gated, and was read after its licence had been
+accepted and a token saved on this machine. Before that, this section said
+FLUX could not be read, which was true.
+
+`model_index.json`: `CLIPTextModel`, `T5EncoderModel`, `FluxTransformer2DModel`,
+`AutoencoderKL`, `FlowMatchEulerDiscreteScheduler`. Files as loaded:
+
+| Piece | Files | Bytes (bf16) |
+|---|---|---|
+| CLIP ViT-L text | `text_encoder/model.safetensors` | 0.25 GB |
+| T5 v1.1 XXL encoder | `text_encoder_2/`, 2 shards, 219 tensors | 9.5 GB |
+| MMDiT | `transformer/`, 3 shards, 1156 tensors | 23.8 GB |
+| VAE | `vae/diffusion_pytorch_model.safetensors` | 0.17 GB |
+
+The repo's root also holds a 24 GB single-file copy of the transformer, which
+is not read.
+
+- **Transformer**: `num_layers 19` double blocks and `num_single_layers 38`
+  single blocks, 24 heads of 128 (width 3072), `in_channels 64` (a 16-channel
+  latent in 2×2 patches, packed exactly as Qwen-Image packs), `patch_size 1`
+  at the transformer, `joint_attention_dim 4096` (T5's width),
+  `pooled_projection_dim 768` (CLIP's), `guidance_embeds: false`.
+- **The double blocks are Qwen-Image's blocks.** Same modulation (shift,
+  scale, gate twice), same per-head RMSNorm on q and k, same joint attention
+  with text first, same GELU-tanh MLP; only the weight names differ
+  (`norm1.linear` for `img_mod.1`, `ff` for `img_mlp`). So the block lives
+  once, in `mmdit.rs`, and both models load it.
+- **A single block** runs on text and image as one sequence: one modulation
+  (shift, scale, gate), then attention and a 4× MLP *side by side* from the
+  same normalised input, concatenated to 5 × 3072 and projected back by one
+  `proj_out`, times the gate.
+- **Conditioning**: the time embedding (σ·1000, 256-wide, cos first) plus
+  CLIP's pooled vector, each through its own two-layer MLP, summed. CLIP's
+  pooled vector here is `pooler_output` — the end-of-text row after the final
+  norm, with no projection, unlike SDXL's second encoder.
+- **RoPE**: axes 16 / 56 / 56 over each head, adjacent pairs, θ = 10000. A
+  patch is at `(0, row, col)` counted from the top left; every text token is
+  at `(0, 0, 0)`. Nothing is centred, unlike Qwen-Image.
+- **T5**: 24 layers, width 4096, 64 heads of 64, gated-GELU MLP of 10240,
+  RMSNorm with no bias, no position embeddings but a relative position bias
+  (32 buckets, max distance 128) shared by every layer, and no `1/√d` on the
+  attention scores. The prompt is padded to 256 tokens with id 0 and the
+  padding is **not** masked, because the reference pipeline does not mask it.
+- **Scheduler**: flow matching with `use_dynamic_shifting: false` and
+  `shift 1.0`, so four steps are σ = 1, 0.75, 0.5, 0.25, then 0.
+- **VAE**: `AutoencoderKL` with 16 latent channels, no `post_quant_conv`,
+  `scaling_factor 0.3611` and `shift_factor 0.1159`: pixels are
+  `decode(latent / 0.3611 + 0.1159)`.
+- **Schnell takes no guidance.** It was distilled to make an image in one to
+  four steps without it, so a guidance scale or a negative prompt is refused
+  rather than ignored. FLUX.1-dev, which takes guidance as an input to the time
+  embedding, is refused by name until it has an implementation and a test.
+
+At q8 the transformer is about 12.6 GB and T5 about 5 GB.
 
 ## Where the code goes
 
@@ -346,6 +394,9 @@ that the service layer can name them without depending on candle:
 | `schedule.rs` | Euler (ε) and flow-match Euler (v) |
 | `sdxl.rs` | the SDXL pipeline |
 | `qwen.rs` | Qwen-Image: text tower, MMDiT, Wan decoder, pipeline |
+| `mmdit.rs` | the double-stream block Qwen-Image and FLUX share, and FLUX's single-stream block |
+| `t5.rs` | T5's encoder |
+| `flux.rs` | FLUX.1-schnell |
 
 `examples/sdxl.rs` is the milestone: prompt in, PNG on disk, no server.
 
@@ -415,6 +466,12 @@ before the code. Where the code went differently, it says so here.
   by least squares against one decoded image each. They explain 76–83% of the
   colour variance for SDXL's four channels and 96–98% for Qwen-Image's
   sixteen.
-- **Not done:** FLUX (gated, as above), a CPU path (decided against, as above),
+- **FLUX.1-schnell** (added 2026-09-24) was right the first time: 1024², 4
+  steps, 13.1 s a step, 9.6 s to decode, 18.3 GB at q8 (12.6 GB transformer,
+  5.1 GB T5, both cached). Its preview fit explains 97–99% of the colour
+  variance. It takes no guidance, and a request that asks for guidance or a
+  negative prompt is refused with a 400 before it is queued (`Defaults::
+  takes_guidance`), rather than failing after the model has run.
+- **Not done:** FLUX.1-dev (see the FLUX section), a CPU path (decided against, as above),
   and any speed work. Qwen-Image at 1024² is about ten minutes an image at
   20 steps. Nothing has been profiled yet, and that is where to start.

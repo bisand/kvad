@@ -2319,8 +2319,9 @@ part of the engine with no CPU version. That is a decision, written down with
 every shape it depends on in [`docs/image-plan.md`](docs/image-plan.md): an
 image model is a convolution stack, `tensor.rs` has no convolution, and a fast
 one is a project of its own. What is still written here is the model. CLIP,
-the UNet, the VAE, both schedulers, Qwen-Image's MMDiT and its video VAE, and
-the PNG encoder are all in this repository; candle supplies `conv2d` and the
+the UNet, the VAE, both schedulers, Qwen-Image's MMDiT and its video VAE,
+FLUX's T5 and single-stream blocks, and the PNG encoder are all in this
+repository; candle supplies `conv2d` and the
 matmuls, and nothing from `candle-transformers` is used.
 
 Nothing about it is a token loop. A text encoder runs once. A denoiser runs
@@ -2368,6 +2369,23 @@ the image half of joint attention is a `narrow` that starts where the text
 ends. So every patch was projected from the wrong rows. `Tensor::copy` keeps the
 offset too; `force_contiguous` does not. With that in `Proj::forward` the same
 probe read 0.996, and the next image was a fox.
+
+FLUX.1-schnell came after, and needed less new code than either: its first
+nineteen blocks *are* Qwen-Image's blocks under other names, so the block moved
+into [`mmdit.rs`](crates/gpu/src/image/mmdit.rs) and both models load it. What
+FLUX adds is a T5-XXL encoder ([`t5.rs`](crates/gpu/src/image/t5.rs): relative
+position buckets instead of positions, no `1/√d` on the scores) and 38
+single-stream blocks that run attention and MLP side by side. Its first image
+was right. At q8 it holds 18.3 GB (12.6 GB of transformer, 5.1 GB of T5), and
+schnell's four steps need no guidance, so each is one forward pass:
+
+| | 768², 4 steps | 1024², 4 steps |
+|---|---|---|
+| denoise, per step | 7.3 s | 13.1 s |
+| VAE decode | 5.3 s | 9.6 s |
+
+(Single runs again. FLUX.1-dev takes guidance as an input and is refused by
+name until it has an implementation of its own.)
 
 Two things in it are measurements rather than code:
 

@@ -161,10 +161,12 @@ pub fn pipelines() -> String {
 /// SDXL runs in f16 whatever it is asked, so any GPU backend is the same load
 /// and `gpu-bf16` is the one whose name does not promise a quantisation that
 /// will not happen. Qwen-Image does not fit in bf16 on a machine this server
-/// is likely to be on (41 GB of denoiser alone) and gets q8.
+/// is likely to be on (41 GB of denoiser alone) and gets q8. So does FLUX:
+/// its 24 GB of transformer and 9.5 GB of T5 would fit in bf16 on their own,
+/// and leave room for nothing else.
 pub fn preferred_image(pipeline: &str) -> Backend {
     match pipeline {
-        "QwenImagePipeline" => Backend::Gpu(kvad::service::GpuMode::Q8),
+        "QwenImagePipeline" | "FluxPipeline" => Backend::Gpu(kvad::service::GpuMode::Q8),
         _ => Backend::Gpu(kvad::service::GpuMode::Bf16),
     }
 }

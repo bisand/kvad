@@ -124,22 +124,26 @@ pub(crate) fn euler(config: &Value, steps: usize) -> Res<Schedule> {
 /// the shift spends more of the run at high noise to compensate.
 pub(crate) fn flow(config: &Value, steps: usize, patches: usize) -> Res<Schedule> {
     let f = |k: &str, d: f64| config.get(k).and_then(Value::as_f64).unwrap_or(d);
-    if config.get("use_dynamic_shifting").and_then(Value::as_bool) != Some(true) {
-        return Err("only dynamically shifted flow schedules are implemented".into());
-    }
-    if config.get("time_shift_type").and_then(Value::as_str).unwrap_or("exponential") != "exponential" {
-        return Err("only the exponential time shift is implemented".into());
-    }
-    let (base_len, max_len) = (f("base_image_seq_len", 256.0), f("max_image_seq_len", 4096.0));
-    let (base_shift, max_shift) = (f("base_shift", 0.5), f("max_shift", 1.15));
-    let m = (max_shift - base_shift) / (max_len - base_len);
-    let mu = patches as f64 * m + (base_shift - m * base_len);
-
     let n = steps as f64;
-    let mut sigmas: Vec<f64> = (0..steps)
-        .map(|i| 1.0 - i as f64 * (1.0 - 1.0 / n) / (n - 1.0).max(1.0))
-        .map(|s| mu.exp() / (mu.exp() + (1.0 / s - 1.0)))
-        .collect();
+    let linear = (0..steps).map(|i| 1.0 - i as f64 * (1.0 - 1.0 / n) / (n - 1.0).max(1.0));
+    let mut sigmas: Vec<f64> = match config.get("use_dynamic_shifting").and_then(Value::as_bool) {
+        Some(true) => {
+            if config.get("time_shift_type").and_then(Value::as_str).unwrap_or("exponential") != "exponential" {
+                return Err("only the exponential time shift is implemented".into());
+            }
+            let (base_len, max_len) = (f("base_image_seq_len", 256.0), f("max_image_seq_len", 4096.0));
+            let (base_shift, max_shift) = (f("base_shift", 0.5), f("max_shift", 1.15));
+            let m = (max_shift - base_shift) / (max_len - base_len);
+            let mu = patches as f64 * m + (base_shift - m * base_len);
+            linear.map(|s| mu.exp() / (mu.exp() + (1.0 / s - 1.0))).collect()
+        }
+        // A fixed shift, the same at every size. FLUX.1-schnell's is 1,
+        // which leaves the straight line from 1 down to 1/n as it is.
+        _ => {
+            let shift = f("shift", 1.0);
+            linear.map(|s| shift * s / (1.0 + (shift - 1.0) * s)).collect()
+        }
+    };
     // Stretch so the run ends at `shift_terminal` rather than wherever the
     // shift left it.
     if let Some(end) = config.get("shift_terminal").and_then(Value::as_f64).filter(|&e| e > 0.0) {
@@ -198,6 +202,16 @@ mod tests {
             "max_shift": 0.9, "num_train_timesteps": 1000, "shift": 1.0, "shift_terminal": 0.02,
             "time_shift_type": "exponential", "use_dynamic_shifting": true
         })
+    }
+
+    /// FLUX.1-schnell's: no dynamic shift, a shift of 1, four steps.
+    #[test]
+    fn schnell_s_four_steps_are_a_straight_line() {
+        let c = json!({ "base_image_seq_len": 256, "base_shift": 0.5, "max_image_seq_len": 4096,
+                        "max_shift": 1.15, "num_train_timesteps": 1000, "shift": 1.0,
+                        "use_dynamic_shifting": false });
+        let s = flow(&c, 4, 4096).unwrap();
+        assert_eq!(s.sigmas, [1.0, 0.75, 0.5, 0.25, 0.0]);
     }
 
     #[test]

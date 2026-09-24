@@ -21,7 +21,8 @@
 //! the text models. Activations are f32, which is what candle's quantised
 //! kernels take.
 
-use super::nn::{latent_preview, layer_norm_plain, noise, timestep_embedding, to_rgb8, Conv2d, Ctx, Linear};
+use super::mmdit::{norm_out, Double, Names, Shape};
+use super::nn::{latent_preview, noise, timestep_embedding, to_rgb8, Conv2d, Ctx, Linear};
 use super::schedule;
 use super::{finish, local_file, open, read_json};
 use crate::common::{Loader, Reader, Stored};
@@ -204,25 +205,6 @@ impl TextEncoder {
 // The denoiser: a two-stream MMDiT
 // ---------------------------------------------------------------------------
 
-/// One stream's half of a block: its modulation, attention projections and
-/// MLP. The image and the text each have one, identical in shape.
-struct Stream {
-    modulate: Linear,
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    out: Linear,
-    norm_q: Tensor,
-    norm_k: Tensor,
-    mlp_in: Linear,
-    mlp_out: Linear,
-}
-
-struct DitBlock {
-    img: Stream,
-    txt: Stream,
-}
-
 struct DitConfig {
     layers: usize,
     heads: usize,
@@ -263,6 +245,10 @@ impl DitConfig {
     fn width(&self) -> usize {
         self.heads * self.head_dim
     }
+
+    fn shape(&self) -> Shape {
+        Shape { heads: self.heads, head_dim: self.head_dim }
+    }
 }
 
 struct Dit {
@@ -272,7 +258,7 @@ struct Dit {
     txt_in: Linear,
     time1: Linear,
     time2: Linear,
-    blocks: Vec<DitBlock>,
+    blocks: Vec<Double>,
     norm_out: Linear,
     proj_out: Linear,
 }
@@ -280,29 +266,14 @@ struct Dit {
 impl Dit {
     fn load(cx: &Ctx<'_>, r: &Reader<'_>, cfg: DitConfig) -> Res<Self> {
         let w = cfg.width();
-        let stream = |b: &Reader<'_>, side: &str| -> Res<Stream> {
-            let a = b.pp("attn");
-            let (q, k, v, out, nq, nk) = match side {
-                "img" => ("to_q", "to_k", "to_v", "to_out.0", "norm_q", "norm_k"),
-                _ => ("add_q_proj", "add_k_proj", "add_v_proj", "to_add_out", "norm_added_q", "norm_added_k"),
-            };
-            Ok(Stream {
-                modulate: Linear::load(cx, b, &format!("{side}_mod.1"), w, 6 * w, true)?,
-                q: Linear::load(cx, &a, q, w, w, true)?,
-                k: Linear::load(cx, &a, k, w, w, true)?,
-                v: Linear::load(cx, &a, v, w, w, true)?,
-                out: Linear::load(cx, &a, out, w, w, true)?,
-                norm_q: cx.get(&a, cfg.head_dim, &format!("{nq}.weight"))?,
-                norm_k: cx.get(&a, cfg.head_dim, &format!("{nk}.weight"))?,
-                mlp_in: Linear::load(cx, b, &format!("{side}_mlp.net.0.proj"), w, 4 * w, true)?,
-                mlp_out: Linear::load(cx, b, &format!("{side}_mlp.net.2"), 4 * w, w, true)?,
-            })
-        };
-        let mut blocks = Vec::with_capacity(cfg.layers);
-        for i in 0..cfg.layers {
-            let b = r.pp(format!("transformer_blocks.{i}"));
-            blocks.push(DitBlock { img: stream(&b, "img")?, txt: stream(&b, "txt")? });
-        }
+        // Qwen-Image's names for the two things the shared block does not
+        // fix: where each stream's modulation and MLP live.
+        let img = Names { modulate: "img_mod.1", mlp_in: "img_mlp.net.0.proj", mlp_out: "img_mlp.net.2" };
+        let txt = Names { modulate: "txt_mod.1", mlp_in: "txt_mlp.net.0.proj", mlp_out: "txt_mlp.net.2" };
+        let shape = cfg.shape();
+        let blocks = (0..cfg.layers)
+            .map(|i| Double::load(cx, &r.pp(format!("transformer_blocks.{i}")), shape, &img, &txt))
+            .collect::<Res<Vec<_>>>()?;
         let t = r.pp("time_text_embed.timestep_embedder");
         let patch_out = cfg.patch * cfg.patch * cfg.out_channels;
         Ok(Dit {
@@ -338,77 +309,12 @@ impl Dit {
         let (cos_img, sin_img) = (cos.narrow(0, 0, n_img)?, sin.narrow(0, 0, n_img)?);
         let (cos_txt, sin_txt) = (cos.narrow(0, n_img, n_txt)?, sin.narrow(0, n_img, n_txt)?);
 
+        let shape = self.cfg.shape();
         for block in &self.blocks {
-            (img, txt) = self.block(block, &img, &txt, &temb_act, (&cos_img, &sin_img), (&cos_txt, &sin_txt))?;
+            (img, txt) = block.forward(shape, &img, &txt, &temb_act, (&cos_img, &sin_img), (&cos_txt, &sin_txt))?;
         }
-
-        // Adaptive norm out, and note the order: *scale* then shift, where
-        // the blocks have shift then scale.
-        let m = self.norm_out.forward(&temb_act)?;
-        let w = self.cfg.width();
-        let (scale, shift) = (m.narrow(1, 0, w)?.unsqueeze(1)?, m.narrow(1, w, w)?.unsqueeze(1)?);
-        let img = layer_norm_plain(&img, 1e-6)?.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(&shift)?;
+        let img = norm_out(&self.norm_out, &img, &temb_act, self.cfg.width())?;
         Ok(self.proj_out.forward(&img)?)
-    }
-
-    fn block(
-        &self,
-        b: &DitBlock,
-        img: &Tensor,
-        txt: &Tensor,
-        temb: &Tensor,
-        rope_img: (&Tensor, &Tensor),
-        rope_txt: (&Tensor, &Tensor),
-    ) -> Res<(Tensor, Tensor)> {
-        let w = self.cfg.width();
-        // Six vectors per stream from the time embedding: shift, scale and
-        // gate for the attention half, and the same for the MLP half.
-        let mods = |s: &Stream| -> candle_core::Result<Vec<Tensor>> {
-            let m = s.modulate.forward(temb)?;
-            (0..6).map(|i| m.narrow(1, i * w, w)?.unsqueeze(1)).collect()
-        };
-        let (mi, mt) = (mods(&b.img)?, mods(&b.txt)?);
-        let modulate = |x: &Tensor, shift: &Tensor, scale: &Tensor| -> candle_core::Result<Tensor> {
-            layer_norm_plain(x, 1e-6)?.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)
-        };
-
-        // Attention: each stream projects its own queries, keys and values,
-        // normalises and rotates them, and then one attention runs over the
-        // two concatenated, text first.
-        let (heads, d) = (self.cfg.heads, self.cfg.head_dim);
-        let qkv = |s: &Stream, x: &Tensor, (cos, sin): (&Tensor, &Tensor)| -> candle_core::Result<[Tensor; 3]> {
-            let n = x.dim(1)?;
-            let heads_of = |t: Tensor| t.reshape((1, n, heads, d));
-            let q = ops::rms_norm(&heads_of(s.q.forward(x)?)?.contiguous()?, &s.norm_q, 1e-6)?;
-            let k = ops::rms_norm(&heads_of(s.k.forward(x)?)?.contiguous()?, &s.norm_k, 1e-6)?;
-            let v = heads_of(s.v.forward(x)?)?;
-            let rot = |t: Tensor| -> candle_core::Result<Tensor> {
-                candle_nn::rotary_emb::rope_i(&t.transpose(1, 2)?.contiguous()?, cos, sin)
-            };
-            Ok([rot(q)?, rot(k)?, v.transpose(1, 2)?.contiguous()?])
-        };
-        let [qi, ki, vi] = qkv(&b.img, &modulate(img, &mi[0], &mi[1])?, rope_img)?;
-        let [qt, kt, vt] = qkv(&b.txt, &modulate(txt, &mt[0], &mt[1])?, rope_txt)?;
-        let q = Tensor::cat(&[&qt, &qi], 2)?;
-        let k = Tensor::cat(&[&kt, &ki], 2)?;
-        let v = Tensor::cat(&[&vt, &vi], 2)?;
-        let scale = 1.0 / (d as f64).sqrt();
-        let a = match q.device().is_metal() {
-            true => ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)?,
-            false => super::nn::written_out(&q, &k, &v, scale)?,
-        };
-        let (n_txt, n_img) = (qt.dim(2)?, qi.dim(2)?);
-        let a = a.transpose(1, 2)?.contiguous()?.reshape((1, n_txt + n_img, heads * d))?;
-        let (at, ai) = (a.narrow(1, 0, n_txt)?, a.narrow(1, n_txt, n_img)?);
-
-        let img = (img + b.img.out.forward(&ai)?.broadcast_mul(&mi[2])?)?;
-        let txt = (txt + b.txt.out.forward(&at)?.broadcast_mul(&mt[2])?)?;
-
-        let mlp = |s: &Stream, x: &Tensor, m: &[Tensor]| -> candle_core::Result<Tensor> {
-            let h = s.mlp_in.forward(&modulate(x, &m[3], &m[4])?)?.gelu()?;
-            x + s.mlp_out.forward(&h)?.broadcast_mul(&m[5])?
-        };
-        Ok((mlp(&b.img, &img, &mi)?, mlp(&b.txt, &txt, &mt)?))
     }
 }
 
@@ -859,7 +765,7 @@ impl Painter for QwenImage {
     fn defaults(&self) -> Defaults {
         // The reference's own: 1328² (its 1:1 size), 50 steps, and a true-CFG
         // scale of 4, which applies only when a negative prompt is given.
-        Defaults { width: 1328, height: 1328, steps: 50, guidance: 4.0, multiple: 16 }
+        Defaults { width: 1328, height: 1328, steps: 50, guidance: 4.0, multiple: 16, takes_guidance: true }
     }
 
     fn summary(&self) -> String {

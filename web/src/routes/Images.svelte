@@ -61,7 +61,12 @@
 
       <label class="flex flex-col gap-1">
         <span class="text-sm opacity-70">Negative prompt</span>
-        <input class="input w-full" bind:value={im.negative} placeholder="What to steer away from (optional)" />
+        <input
+          class="input w-full"
+          bind:value={im.negative}
+          disabled={d && !d.takes_guidance}
+          placeholder={d && !d.takes_guidance ? "This model makes images without guidance" : "What to steer away from (optional)"}
+        />
       </label>
 
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -79,7 +84,7 @@
         </label>
         <label class="flex flex-col gap-1">
           <span class="text-sm opacity-70">Guidance</span>
-          <input class="input" type="number" step="0.5" min="0" max="30" bind:value={im.guidance} placeholder={d?.guidance ?? "default"} />
+          <input class="input" type="number" step="0.5" min="0" max="30" bind:value={im.guidance} placeholder={d?.guidance ?? "default"} disabled={d && !d.takes_guidance} />
         </label>
       </div>
 

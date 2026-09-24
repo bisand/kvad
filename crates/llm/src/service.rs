@@ -321,8 +321,12 @@ impl Engine {
 /// A recurrent state is deliberately not in here. It is a cost *per layer*,
 /// not per token, so no per-token figure can carry it; see
 /// [`crate::model::CacheShape`].
-fn kvad_kv_bytes_per_token(spec: &crate::model::Spec) -> usize {
-    spec.cache.bytes_per_token(spec.n_layer)
+///
+/// `number` is how wide one cached number is,
+/// [`crate::model::Session::kv_number_bytes`]:
+/// 4 on the CPU, often 2 on a GPU.
+fn kvad_kv_bytes_per_token(spec: &crate::model::Spec, number: usize) -> usize {
+    spec.cache.bytes_per_token_as(spec.n_layer, number)
 }
 
 /// The model currently loaded, plus its sampler.
@@ -454,7 +458,10 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                             backend: llm.backend(),
                             weight_bytes: llm.weight_bytes,
                             n_ctx: llm.spec.n_ctx,
-                            kv_bytes_per_token: kvad_kv_bytes_per_token(&llm.spec),
+                            kv_bytes_per_token: kvad_kv_bytes_per_token(
+                                &llm.spec,
+                                llm.session.kv_number_bytes(),
+                            ),
                             image: None,
                         });
                         let _ = hub::State::set_active(&repo);
@@ -679,7 +686,7 @@ mod tests {
             spec.n_kv_head = n_kv_head;
             spec.head_dim = head_dim;
             assert_eq!(
-                kvad_kv_bytes_per_token(&spec) * spec.n_ctx,
+                kvad_kv_bytes_per_token(&spec, 4) * spec.n_ctx,
                 KvCache::max_bytes(&spec),
                 "{what}: the per-token figure does not scale to the cache's own total"
             );

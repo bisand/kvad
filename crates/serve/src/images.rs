@@ -109,13 +109,18 @@ fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
         seed: r.get::<_, i64>(9)? as u64,
         bytes: r.get::<_, i64>(10)? as u64,
         secs: r.get(11)?,
+        url: url_of(id, &r.get::<_, String>(12)?),
         created_at: r.get(12)?,
-        url: url_of(id),
     })
 }
 
-fn url_of(id: i64) -> String {
-    format!("/api/images/{id}.png")
+/// The picture's link, which is served as immutable and so has to name one
+/// picture forever. The id alone did not: ids were reused before migration
+/// 009, and start again at 1 in a data directory that was wiped. The time it
+/// was made, as digits, is what tells those apart.
+fn url_of(id: i64, created_at: &str) -> String {
+    let made: String = created_at.chars().filter(char::is_ascii_digit).collect();
+    format!("/api/images/{id}.png?v={made}")
 }
 
 /// Keep an image: its row, then its file, and neither if the file cannot be
@@ -221,8 +226,8 @@ async fn file(who: Identity, St(state): St<State>, Path(name): Path<String>) -> 
     Ok((
         [
             (header::CONTENT_TYPE, "image/png"),
-            // An id is never reused for a different picture, so a browser may
-            // keep it for as long as it likes — but only for this person.
+            // The link names one picture forever (see `url_of`), so a browser
+            // may keep it for as long as it likes — but only for this person.
             (header::CACHE_CONTROL, "private, max-age=31536000, immutable"),
         ],
         bytes,
@@ -541,7 +546,7 @@ mod tests {
         let s = save(&db, &dir, None, "stabilityai/sdxl", "metal f16", &painted(seed)).unwrap();
         assert_eq!(s.seed, seed);
         assert_eq!((s.width, s.height, s.steps), (2, 1, 3));
-        assert_eq!(s.url, format!("/api/images/{}.png", s.id));
+        assert!(s.url.starts_with(&format!("/api/images/{}.png?v=", s.id)), "{}", s.url);
         let file = dir.join(format!("{}.png", s.id));
         assert_eq!(std::fs::read(&file).unwrap(), painted(seed).image.png());
         assert_eq!(list(&db, None).unwrap().len(), 1);
@@ -551,6 +556,29 @@ mod tests {
         assert!(list(&db, None).unwrap().is_empty());
         assert!(!delete(&db, &dir, s.id, None).unwrap(), "a second delete finds nothing");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting the newest image and making another must not give the new
+    /// one the old id: the link is cached as immutable, and a browser that
+    /// saw the old picture there would go on showing it.
+    #[test]
+    fn a_deleted_images_id_is_not_handed_out_again() {
+        let db = Db::in_memory().unwrap();
+        let dir = scratch("reused");
+        let first = save(&db, &dir, None, "m", "b", &painted(1)).unwrap();
+        assert!(delete(&db, &dir, first.id, None).unwrap());
+        let second = save(&db, &dir, None, "m", "b", &painted(2)).unwrap();
+        assert!(second.id > first.id, "id {} was handed out again", first.id);
+        assert_ne!(second.url, first.url);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same id in a wiped data directory is a different picture, and its
+    /// link has to say so.
+    #[test]
+    fn a_link_names_the_moment_as_well_as_the_id() {
+        assert_eq!(url_of(1, "2026-09-24 05:09:48"), "/api/images/1.png?v=20260924050948");
+        assert_ne!(url_of(1, "2026-09-24 05:09:48"), url_of(1, "2026-09-25 10:00:00"));
     }
 
     /// Somebody else's image is not found, the same way somebody else's

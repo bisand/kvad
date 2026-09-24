@@ -123,9 +123,18 @@ impl CacheShape {
         CacheShape { k: 0, v: 0, state }
     }
 
-    /// Bytes one layer keeps at `len` positions.
+    /// Bytes one layer keeps at `len` positions, in f32 as this engine keeps
+    /// them.
     pub fn bytes(&self, len: usize) -> usize {
-        (len * (self.k + self.v) + self.state) * std::mem::size_of::<f32>()
+        self.bytes_as(len, std::mem::size_of::<f32>())
+    }
+
+    /// The same, with each cached key and value number `number` bytes wide.
+    /// A GPU backend's cache is not always f32: see [`Session::kv_number_bytes`].
+    /// The recurrent state is still counted as f32, the widest it is kept in,
+    /// so that a figure here can be too high but never too low.
+    pub fn bytes_as(&self, len: usize, number: usize) -> usize {
+        len * (self.k + self.v) * number + self.state * std::mem::size_of::<f32>()
     }
 }
 
@@ -168,9 +177,14 @@ impl CacheLayout {
     /// Bytes the whole cache holds at `len` positions, across `n_layer`
     /// layers.
     pub fn bytes(&self, n_layer: usize, len: usize) -> usize {
+        self.bytes_as(n_layer, len, std::mem::size_of::<f32>())
+    }
+
+    /// [`CacheLayout::bytes`] with keys and values `number` bytes a number.
+    pub fn bytes_as(&self, n_layer: usize, len: usize, number: usize) -> usize {
         match &self.per_layer {
-            None => n_layer * self.uniform.bytes(len),
-            Some(shapes) => shapes.iter().take(n_layer).map(|s| s.bytes(len)).sum(),
+            None => n_layer * self.uniform.bytes_as(len, number),
+            Some(shapes) => shapes.iter().take(n_layer).map(|s| s.bytes_as(len, number)).sum(),
         }
     }
 
@@ -180,7 +194,13 @@ impl CacheLayout {
     /// and does not move when a token arrives, so no per-token figure can
     /// carry it. [`CacheLayout::bytes`] is the one that counts everything.
     pub fn bytes_per_token(&self, n_layer: usize) -> usize {
-        let per = |s: &CacheShape| (s.k + s.v) * std::mem::size_of::<f32>();
+        self.bytes_per_token_as(n_layer, std::mem::size_of::<f32>())
+    }
+
+    /// [`CacheLayout::bytes_per_token`] with keys and values `number` bytes
+    /// a number.
+    pub fn bytes_per_token_as(&self, n_layer: usize, number: usize) -> usize {
+        let per = |s: &CacheShape| (s.k + s.v) * number;
         match &self.per_layer {
             None => n_layer * per(&self.uniform),
             Some(shapes) => shapes.iter().take(n_layer).map(per).sum(),
@@ -647,6 +667,16 @@ pub trait Session: Send {
     fn label(&self) -> String;
     fn param_count(&self) -> usize;
     fn weight_bytes(&self) -> usize;
+
+    /// Bytes one cached key or value number takes: 4 for this engine's f32
+    /// cache, and whatever a GPU session keeps its cache in, which is 2 for
+    /// a bf16 model or a quantised one whose cache is f16.
+    ///
+    /// The server charges a resident model for its cache from this, so a
+    /// figure that assumed f32 everywhere charged every GPU model double.
+    fn kv_number_bytes(&self) -> usize {
+        std::mem::size_of::<f32>()
+    }
 
     /// Run `tokens` and return logits for **every** one of them, in order.
     ///

@@ -186,11 +186,33 @@ pub fn image_weight_bytes(repo: &str, backend: Backend) -> Option<u64> {
     None
 }
 
+/// Bytes one cached key or value number will take for `spec` at `backend`:
+/// what the loaded session's `kv_number_bytes` will report, asked before
+/// there is one, so that admission charges what the cache will hold.
+///
+/// f32 on the CPU. On the GPU it is the GPU crate's answer, and it depends
+/// on the architecture and the quantisation: 2 for a bf16 model, 2 for a
+/// quantised Llama or Qwen3.5 whose cache is f16, 4 for a quantised GPT-2 or
+/// DeepSeek. The server's GPU is Metal wherever it is built with one.
+pub fn kv_number_bytes(spec: &kvad::model::Spec, backend: Backend) -> usize {
+    #[cfg(feature = "gpu")]
+    if let Backend::Gpu(mode) = backend {
+        let dtype = kvad_gpu::model::parse_dtype(gpu::DTYPE).expect("known dtype");
+        return kvad_gpu::model::kv_number_bytes(spec.arch, dtype, gpu::quant(mode), cfg!(target_os = "macos"));
+    }
+    let _ = (spec, backend);
+    std::mem::size_of::<f32>()
+}
+
 #[cfg(feature = "gpu")]
 mod gpu {
     use kvad::runtime::Llm;
     use kvad::service::{GpuMode, Model};
     use kvad::weights::Watcher;
+
+    /// The dtype every GPU model is loaded at, as `kvad_gpu` spells it. One
+    /// place, because `kv_number_bytes` has to agree with `load` about it.
+    pub(super) const DTYPE: &str = "bf16";
 
     /// The quantisation a mode names, as `kvad_gpu` spells it.
     pub(super) fn quant(mode: GpuMode) -> Option<kvad_gpu::model::Quant> {
@@ -217,7 +239,7 @@ mod gpu {
         progress: &mut dyn FnMut(&str),
         watch: &Watcher,
     ) -> Result<Llm, Box<dyn std::error::Error>> {
-        let dtype = kvad_gpu::model::parse_dtype("bf16").expect("known dtype");
+        let dtype = kvad_gpu::model::parse_dtype(DTYPE).expect("known dtype");
         let quant = quant(mode);
         // Which architecture this is, and whether there is a GPU
         // implementation of it, is the GPU crate's question and is answered

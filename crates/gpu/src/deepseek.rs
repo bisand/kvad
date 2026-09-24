@@ -468,6 +468,10 @@ impl Session for GpuDeepSeek {
         self.params()
     }
 
+    fn kv_number_bytes(&self) -> usize {
+        self.cache.first().map_or(self.dtype.size_in_bytes(), |c| c.number_bytes(self.dtype))
+    }
+
     fn weight_bytes(&self) -> usize {
         self.memory_bytes()
     }
@@ -840,4 +844,16 @@ mod tests {
         assert!(error.contains("q_norm"), "it should name the tensor: {error}");
         std::fs::remove_file(&path).unwrap();
     }
+
+    /// DeepSeek's compressed cache stays in its compute dtype, f32 at q8:
+    /// see `model::tests::check_kv_width`.
+    #[test]
+    fn the_cache_is_as_wide_as_admission_charges() {
+        let (spec, path, _) = tiny(base_config("kv-width"));
+        crate::model::tests::check_kv_width(spec.arch, 4, &|dtype, quant, dev| {
+            Box::new(GpuDeepSeek::load(std::slice::from_ref(&path), spec.clone(), dtype, quant, dev, &Vault::off()).unwrap())
+        });
+        std::fs::remove_file(&path).unwrap();
+    }
+
 }

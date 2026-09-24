@@ -635,6 +635,10 @@ impl Session for GpuQwen35 {
         self.params()
     }
 
+    fn kv_number_bytes(&self) -> usize {
+        self.kv.first().map_or(self.dtype.size_in_bytes(), |c| c.number_bytes(self.dtype))
+    }
+
     fn weight_bytes(&self) -> usize {
         self.memory_bytes()
     }
@@ -887,4 +891,16 @@ mod tests {
         assert_eq!(gpu.cached(), 0);
         std::fs::remove_file(&path).unwrap();
     }
+
+    /// Qwen3.5's full-attention cache is f16 at q8 on Metal, as the Llama
+    /// family's is: see `model::tests::check_kv_width`.
+    #[test]
+    fn the_cache_is_as_wide_as_admission_charges() {
+        let (spec, path) = tiny_of(false, "kv-width");
+        crate::model::tests::check_kv_width(spec.arch, 2, &|dtype, quant, dev| {
+            Box::new(GpuQwen35::load(std::slice::from_ref(&path), spec.clone(), dtype, quant, dev, &Vault::off()).unwrap())
+        });
+        std::fs::remove_file(&path).unwrap();
+    }
+
 }

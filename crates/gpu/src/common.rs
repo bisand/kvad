@@ -411,8 +411,14 @@ fn no_head() -> String {
 /// asked for. `KVAD_GPU_KV_F32=1` keeps the f32 cache, for measuring what
 /// this is worth.
 pub(crate) fn kv_store(device: &Device, quant: Option<GgmlDType>) -> Option<DType> {
+    kv_store_on(device.is_metal(), quant)
+}
+
+/// [`kv_store`] for a device that is Metal or not, for asking before there
+/// is one: `model::kv_number_bytes`.
+pub(crate) fn kv_store_on(metal: bool, quant: Option<GgmlDType>) -> Option<DType> {
     let off = matches!(std::env::var("KVAD_GPU_KV_F32").as_deref(), Ok("1") | Ok("true"));
-    (quant.is_some() && device.is_metal() && !off).then_some(DType::F16)
+    (quant.is_some() && metal && !off).then_some(DType::F16)
 }
 
 /// One layer's keys and values for every position so far, grown in place.
@@ -451,6 +457,12 @@ impl KvCache {
 
     pub(crate) fn new(axis: usize) -> Self {
         KvCache { k: None, v: None, len: 0, axis, store: None }
+    }
+
+    /// Bytes one cached number takes, for a model that computes in
+    /// `compute`: what `Session::kv_number_bytes` reports.
+    pub(crate) fn number_bytes(&self, compute: DType) -> usize {
+        self.store.unwrap_or(compute).size_in_bytes()
     }
 
     /// The same cache, keeping its positions in `store` where that is

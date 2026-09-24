@@ -603,6 +603,10 @@ impl Session for GpuLlama {
         self.params()
     }
 
+    fn kv_number_bytes(&self) -> usize {
+        self.kv.first().map_or(self.dtype.size_in_bytes(), |c| c.number_bytes(self.dtype))
+    }
+
     fn weight_bytes(&self) -> usize {
         self.memory_bytes()
     }
@@ -728,6 +732,27 @@ pub fn supports(arch: Arch) -> bool {
 /// have to be kept in step by hand.
 pub fn supported() -> String {
     IMPLEMENTED.join(", ")
+}
+
+/// Bytes one cached key or value number takes, for a model of `arch` loaded
+/// at `dtype` and `quant` on Metal or not.
+///
+/// This is what its session's `Session::kv_number_bytes` will say, asked
+/// before there is a session. The server charges a model for its cache from
+/// this when deciding whether to load it, and from the session once it has.
+/// The two are held to each other by the tests that load each architecture.
+pub fn kv_number_bytes(arch: Arch, dtype: DType, quant: Option<GgmlDType>, metal: bool) -> usize {
+    // What every loader here computes in: f32 around quantised weights,
+    // because candle's quantised matmul takes nothing else.
+    let compute = if quant.is_some() { DType::F32 } else { dtype };
+    // The architectures whose cache follows `kv_store`: those whose
+    // attention is `attention` in this file. GPT-2 and DeepSeek do their own
+    // arithmetic on the cache, in the compute dtype.
+    let follows = arch.is("llama") || arch.is("qwen3_5") || arch.is("qwen3_next");
+    match crate::common::kv_store_on(metal, quant) {
+        Some(store) if follows => store.size_in_bytes(),
+        _ => compute.size_in_bytes(),
+    }
 }
 
 /// Pick the best device available, unless one was named.
@@ -1587,4 +1612,43 @@ pub(crate) mod tests {
         }
         std::fs::remove_file(&path).unwrap();
     }
+
+    /// That a session keeps its cache as wide as admission charged for it
+    /// before it loaded: [`kv_number_bytes`] against the session's own
+    /// `kv_number_bytes`, dense f32, dense bf16 and q8, on the CPU device
+    /// and on Metal. On Metal at q8, the one place the architectures differ,
+    /// the width is pinned too, to what the architecture is known to keep,
+    /// so the rule and the sessions cannot go wrong together.
+    pub(crate) fn check_kv_width(
+        arch: Arch,
+        metal_q8: usize,
+        load: &dyn Fn(DType, Option<GgmlDType>, Device) -> Box<dyn Session>,
+    ) {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(m) = Device::new_metal(0) {
+            devices.push(m);
+        }
+        for dev in devices {
+            for (dtype, quant) in [(DType::F32, None), (DType::BF16, None), (DType::F32, Some(GgmlDType::Q8_0))] {
+                let session = load(dtype, quant, dev.clone());
+                let charged = kv_number_bytes(arch, dtype, quant, dev.is_metal());
+                let what = format!("{dtype:?} {quant:?} on {}", if dev.is_metal() { "metal" } else { "cpu" });
+                assert_eq!(session.kv_number_bytes(), charged, "{what}: kept, against charged");
+                if dev.is_metal() && quant.is_some() {
+                    assert_eq!(charged, metal_q8, "{what}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cache_is_as_wide_as_admission_charges() {
+        let spec = tiny_spec();
+        let path = write_tensors(&spec, !spec.tie_embeddings, &[], "kv-width");
+        check_kv_width(spec.arch, 2, &|dtype, quant, dev| {
+            Box::new(GpuLlama::load(std::slice::from_ref(&path), spec.clone(), dtype, quant, dev, &Vault::off()).unwrap())
+        });
+        std::fs::remove_file(&path).unwrap();
+    }
+
 }

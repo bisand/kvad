@@ -213,7 +213,7 @@ pub fn need(repo: &str, backend: Backend, context: usize) -> Need {
 
     let kv = kvad::hub::model_file(&local.path, "config.json")
         .and_then(|config| kvad::model::Spec::from_json(&config).ok())
-        .map(|spec| kv_bytes(&spec, context))
+        .map(|spec| kv_bytes(&spec, context, crate::engine::kv_number_bytes(&spec, backend)))
         .unwrap_or(0);
 
     let streams =
@@ -251,9 +251,10 @@ fn at_path(repo: &str) -> Option<kvad::hub::LocalModel> {
     })
 }
 
-/// The KV cache a resident is charged for.
-pub fn kv_bytes(spec: &kvad::model::Spec, context: usize) -> u64 {
-    spec.cache.bytes(spec.n_layer, spec.n_ctx.min(context)) as u64
+/// The KV cache a resident is charged for, with each cached number `number`
+/// bytes wide: [`crate::engine::kv_number_bytes`].
+pub fn kv_bytes(spec: &kvad::model::Spec, context: usize, number: usize) -> u64 {
+    spec.cache.bytes_as(spec.n_layer, spec.n_ctx.min(context), number) as u64
 }
 
 fn gb(bytes: u64) -> String {
@@ -356,9 +357,9 @@ mod tests {
         let spec = kvad::model::Spec::from_config(kvad::model::Json::new(config)).unwrap();
         // 28 layers, a key and a value of 8 heads by 128, four bytes each.
         let per_token = 28 * 2 * 8 * 128 * 4;
-        assert_eq!(kv_bytes(&spec, 40_960), 40_960 * per_token);
-        assert_eq!(kv_bytes(&spec, DEFAULT_CONTEXT), DEFAULT_CONTEXT as u64 * per_token);
+        assert_eq!(kv_bytes(&spec, 40_960, 4), 40_960 * per_token);
+        assert_eq!(kv_bytes(&spec, DEFAULT_CONTEXT, 4), DEFAULT_CONTEXT as u64 * per_token);
         // A model whose context is shorter than the budget's is charged its own.
-        assert_eq!(kv_bytes(&spec, 1 << 20), 40_960 * per_token);
+        assert_eq!(kv_bytes(&spec, 1 << 20, 4), 40_960 * per_token);
     }
 }

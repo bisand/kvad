@@ -44,6 +44,14 @@ pub(crate) enum Proj {
 
 impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
+            // On the M5's matrix units when it is f16 or bf16 and more than
+            // a few rows; `mpp::dense` says which, and declines the rest.
+            #[cfg(target_os = "macos")]
+            Proj::Dense(w) => match crate::mpp::dense(x, w)? {
+                Some(y) => Ok(y),
+                None => x.matmul(w),
+            },
+            #[cfg(not(target_os = "macos"))]
             Proj::Dense(w) => x.matmul(w),
             // candle 0.11's Metal kernel for a quantised matrix-matrix product
             // reads its input from the start of the buffer whatever the

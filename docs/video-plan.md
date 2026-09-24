@@ -824,8 +824,9 @@ The same kind of checks apply here:
    still to be watched by eye.
 3. **The decoders**, with per-component fixtures: the conv video VAE decoder
    (where conv3d, chunking and tiling are proven), then audio VAE → vocoder →
-   BWE.
-4. **Text:** Gemma 4, the aggregate projection and the connectors.
+   BWE. Done in #57; see the measurements below.
+4. **Text:** Gemma 4, the aggregate projection and the connectors. In
+   progress; see below.
 5. **The DiT and one-stage distilled sampling** as `examples/ltx.rs`: prompt
    in, MP4 on disk, no server. **The milestone is one clip, with sound**, at
    512×320 × 25 frames first and 768×512 × 121 second.
@@ -841,3 +842,66 @@ The same kind of checks apply here:
    - the temporal upsampler;
    - the community GGUFs ([#42](https://github.com/bisand/kvad/issues/42));
    - LoRAs ([#41](https://github.com/bisand/kvad/issues/41)).
+
+## What was built, and what it measured
+
+Added 2026-09-24, as the steps land. Everything above is the plan as
+written before the code. Where the code went differently, it says so here.
+Every comparison is against Lightricks' own code on the same weights and
+inputs. `scripts/ltx-fixtures.py` writes the reference outputs, and its
+header lists the commands and the numbers to expect. dB is signal to error:
+every 10 dB is ten times less error power.
+
+**Step 3, the decoders (#57).**
+- **In f32 they are exact.**
+  - Video: 122–124 dB PSNR.
+  - Audio: 124 dB at the spectrogram, 91–97 dB at 16 and 48 kHz.
+- **The video decoder in bf16 on Metal is 59 dB from the reference's f32**,
+  and the reference's own bf16 on MPS is 58.
+- **The audio runs in f32 throughout**, not only the vocoders. In bf16, the
+  decoder's 53 dB spectrogram becomes a 20 dB waveform after the vocoder.
+  The three models are 160 M parameters, about a second of work.
+- **The conv3d built from 2D convolutions was right the first time.** Its
+  speed is not: 768×512 × 121 frames decodes in 71.7 s at an 18.3 GB peak,
+  against the reference's 5.2 s and 11.2 GB on MPS. candle's `conv2d` runs
+  at 1.9 TFLOP/s, where the same matmul alone runs at 7.2
+  ([#56](https://github.com/bisand/kvad/issues/56)). The M5 matmul work
+  (#58–#67) changed nothing here, because convolutions do not go through
+  `Proj`.
+- **Found on the way:** candle 0.11's CPU matmul silently gives wrong
+  numbers when its *left* operand is broadcast along the batch. Metal is
+  unaffected. A test in `ltx_audio.rs` reports whether that is still so.
+
+**Step 4, the text path (in progress).**
+- **Tokens are identical** to LTX's own tokenizer, including a prompt cut at
+  1024 tokens and one that mixes scripts and stray whitespace.
+- **Gemma's first six layers in f32 are exact**: 108–115 dB at every hidden
+  state, global layer 5 included. That covers its single key-value head,
+  its values taken from its keys, and its RoPE turning a quarter of the head.
+- **In bf16 on Metal, those layers are 42–55 dB from the f32 reference.**
+  That is within half a dB of the reference's own bf16 on MPS at every
+  state, so bf16 costs kvad nothing the reference does not also pay.
+- **All 48 layers, against the reference's bf16 on MPS:**
+  - bf16: 36–56 dB (55.7 dB at the final state);
+  - q8 weights with bf16 activations, through the M5 path
+    (`Loader::accelerated`): 27–46 dB.
+
+  These compare two drifting computations, not one against exact. Whether
+  q8's extra drift matters is for the contexts and, in the end, for
+  generations to say.
+- **Time and memory for a 1024-token prompt (the longest there is):**
+
+  | Gemma weights | Time | Peak |
+  |---|---|---|
+  | bf16 | 2.43 s | 25.6 GB |
+  | q8 | 2.75 s | 15.3 GB |
+
+  q8 maps from an 11.6 GB cache in 5–13 s after the first load, which
+  quantises.
+- **The memory table above assumed the connectors at q8.** They are dense
+  bf16 for now, about 4 GB, so the text phase at q8 is about 19 GB rather
+  than 16. Worth quantising if the phase has to shrink.
+- **Still to come:** the aggregate projections and connectors against the
+  reference (they are in the DiT's 42 GB file, which is still
+  downloading), and the whole path from prompt to contexts.
+

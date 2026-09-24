@@ -777,11 +777,21 @@ aggregate projections, goes through `Proj::forward`
 - **Gated attention.** It is small, but new.
 - **An audio path of any kind:** 1D convolutions exist in candle, but
   nothing here has used them.
-- **A video file.** #51's decision stands: an all-`I_PCM` H.264 stream in an
-  MP4 written by hand, plus a WAV, with `ffmpeg` re-encoding if it is
-  installed. The reference writes H.264 at CRF 19 and AAC through PyAV,
-  BT.709 limited range. Ours should tag the same colour space, so that a
-  player shows the same colours.
+- **A video file.** This is now done in
+  [#54](https://github.com/bisand/kvad/pull/54) (`kvad::video`).
+  - The video is an all-`I_PCM` H.264 stream in an MP4 written by hand,
+    tagged BT.709 limited range as the reference's is.
+  - The sound is **FLAC with `VERBATIM` subframes inside the same MP4**,
+    rather than only a WAV beside it. That plays in Chromium and
+    AVFoundation, and a WAV can still be written on its own.
+  - Re-encoding to a small file with `ffmpeg`, if it is installed, is still
+    to do and belongs with the service. The reference writes H.264 at CRF 19
+    and AAC through PyAV.
+- **Serving a video.** The server must answer HTTP Range requests. Without
+  them Chromium cannot seek in a video it has not fully downloaded: with the
+  file written in #54, every seek went back to 0 until the test server
+  answered Range. A paused Chromium video also shows the frame *nearest* the
+  seek time, so a scrubber seeks to a frame's start, not its middle.
 - **Loading a repo without `model_index.json`**, and fetching only named
   files from it.
 
@@ -807,8 +817,11 @@ The same kind of checks apply here:
 ## The order it is built in
 
 1. This document.
-2. **The file writer**, on synthetic frames: an I_PCM MP4 plus a WAV, played
-   in Safari and Chrome. Everything else is invisible without it.
+2. **The file writer**, on synthetic frames. Everything else is invisible
+   without it. Done in #54: an I_PCM MP4 with FLAC sound, plus a WAV. It was
+   decoded frame by frame by ffmpeg, AVFoundation and Chromium at 262×122,
+   768×512 and 1536×1024 (level 6.1). Real-time playback in a browser is
+   still to be watched by eye.
 3. **The decoders**, with per-component fixtures: the conv video VAE decoder
    (where conv3d, chunking and tiling are proven), then audio VAE → vocoder →
    BWE.
@@ -818,7 +831,8 @@ The same kind of checks apply here:
    512×320 × 25 frames first and 768×512 × 121 second.
 6. **Two stages:** the upsampler and stage 2.
 7. **The service:** the `video` kind, `/v1/videos`, storage, the CLI, the UI
-   page. #51 has the shape.
+   page. #51 has the shape. Video files are served with Range support, and
+   `ffmpeg` re-encoding is optional.
 8. **Later, each in its own issue:**
    - the duration head as the default;
    - image-to-video;

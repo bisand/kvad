@@ -6,6 +6,7 @@
   // restart, rather than leaving someone to wonder why a setting they saved
   // is not doing anything.
   import { api, health } from "../api.js";
+  import { backFromRestart, uptimeNow } from "../restart.js";
   import { toasts } from "../toasts.svelte.js";
 
   let info = $state(null);
@@ -96,8 +97,6 @@
     asking = true;
   }
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
   // A link to the new address, from this page's point of view: a server told
   // to listen everywhere is still reached by the name in the address bar.
   function linkTo(bind) {
@@ -111,12 +110,7 @@
     asking = false;
     const moving =
       info.saved && !info.bind_flag && info.saved.bind !== info.running.bind ? info.saved.bind : null;
-    let before = Infinity;
-    try {
-      before = (await health()).uptime_secs;
-    } catch {
-      // Measured against nothing, the first answer after a gap is enough.
-    }
+    const before = await uptimeNow();
     try {
       await api("/api/restart", { method: "POST" });
     } catch (e) {
@@ -129,24 +123,11 @@
     }
 
     restart = "waiting";
-    // Back when it answers after having stopped answering, or answers with
-    // an uptime younger than the one it had: a poll can fall either side of
-    // the moment it was down.
-    const until = Date.now() + 90_000;
-    let away = false;
-    while (Date.now() < until) {
-      await sleep(1000);
-      try {
-        const h = await health();
-        if (away || h.uptime_secs < before) {
-          restart = null;
-          await load();
-          toasts.success("Restarted. The settings in kvad.toml are in force.");
-          return;
-        }
-      } catch {
-        away = true;
-      }
+    if (await backFromRestart(before)) {
+      restart = null;
+      await load();
+      toasts.success("Restarted. The settings in kvad.toml are in force.");
+      return;
     }
     restart =
       "The server has not come back after 90 seconds. `kvad service logs` on its machine says why.";
@@ -283,17 +264,12 @@
       <summary class="collapse-title text-sm">Set elsewhere</summary>
       <div class="collapse-content text-sm">
         <p class="mb-2 text-xs opacity-60">
-          Shown, not changed here: the auth mode decides who may use this page, and a
-          different data directory or database is a different server rather than a setting of
-          this one. Edit <code>kvad.toml</code> for these.
+          Shown, not changed here: the auth mode decides who may use this page. Edit
+          <code>kvad.toml</code> for it. Where the data is, and moving it, is under Data below.
         </p>
         <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
           <dt class="opacity-60">Auth</dt>
           <dd><code>{info.fixed.auth}</code></dd>
-          <dt class="opacity-60">Data</dt>
-          <dd class="break-all font-mono text-xs">{info.fixed.data_dir}</dd>
-          <dt class="opacity-60">Database</dt>
-          <dd class="break-all font-mono text-xs">{info.fixed.database}</dd>
         </dl>
       </div>
     </details>

@@ -71,6 +71,7 @@ pub fn routes() -> Router<State> {
         .merge(crate::bench::routes())
         .merge(crate::images::routes())
         .merge(crate::settings::routes())
+        .merge(crate::storage::routes())
 }
 
 /// A request that could not be answered, as a status and a sentence.
@@ -126,6 +127,18 @@ where
         Ok(Err(why)) => Err(Fail::internal(why)),
         Err(e) => Err(Fail::internal(format!("a background task failed: {e}"))),
     }
+}
+
+/// [`blocking`] for work that answers with its own [`Fail`], so that a
+/// refusal stays a 400 or a 409 rather than becoming a 500.
+pub async fn blocking_or<T, F>(f: F) -> Result<T, Fail>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Fail> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Fail::internal(format!("a background task failed: {e}")))?
 }
 
 #[derive(serde::Serialize)]

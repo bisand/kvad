@@ -7,10 +7,11 @@
 //! the same restart a person would do by hand, done by the server itself so
 //! that the page that changed the file can also apply it.
 //!
-//! Only `[server]` is editable here. The rest is shown and not offered:
-//! the auth mode decides who may use this page, so it is not this page's to
-//! change, and moving the data directory or the database is a different
-//! server rather than a setting of this one.
+//! Only `[server]` is edited as settings here. The auth mode is shown and not
+//! offered: it decides who may use this page, so it is not this page's to
+//! change. `[data] dir` is written too, but only as the last step of moving
+//! the data there, which is [`crate::storage`]'s; changing it alone would
+//! start the server empty somewhere else.
 //!
 //! A save is refused rather than written when the file it would leave behind
 //! is one the server could not start from. That is the whole risk of a
@@ -60,7 +61,12 @@ pub struct Running {
     pub insecure: bool,
     pub data_dir: PathBuf,
     pub database: PathBuf,
+    /// Whether `[database] path` or `--db` named the database, which then
+    /// stays where it is when the data moves.
+    pub database_named: bool,
     pub auth: String,
+    /// A move of the data, if one is under way or has just ended.
+    pub storage: crate::storage::Mover,
     restart: tokio::sync::Notify,
     restarting: AtomicBool,
 }
@@ -80,10 +86,18 @@ impl Running {
             insecure,
             data_dir,
             database: cfg.database_path(),
+            database_named: cfg.database.path.is_some(),
             auth: cfg.auth.mode.to_string(),
+            storage: crate::storage::Mover::default(),
             restart: tokio::sync::Notify::new(),
             restarting: AtomicBool::new(false),
         }
+    }
+
+    /// Whether moving the data takes the database with it: it is
+    /// `kvad.db` in the data directory because nothing said otherwise.
+    pub fn database_moves(&self) -> bool {
+        !self.database_named && self.database == self.data_dir.join("kvad.db")
     }
 
     /// Whether a restart has been asked for. `main` reads this when the
@@ -115,6 +129,20 @@ impl Default for Running {
         let cfg = Config::default();
         let path = std::env::temp_dir().join("kvad-no-such-settings.toml");
         Running::new(path, &cfg, None, false, std::env::temp_dir())
+    }
+}
+
+#[cfg(test)]
+impl Running {
+    /// A server whose data is in `data`, with its database there too.
+    pub fn for_data(data: PathBuf) -> Self {
+        Running {
+            database: data.join("kvad.db"),
+            database_named: false,
+            path: data.join("kvad.toml"),
+            data_dir: data,
+            ..Running::default()
+        }
     }
 }
 
@@ -400,24 +428,66 @@ fn edit_table(text: &str, table: &str, edits: &[(&str, Option<String>)]) -> Stri
     out
 }
 
+/// `kvad.toml` as it would be with `[data] dir` set to `to`, checked the
+/// way a save is: it reads back as exactly that, every other table
+/// unchanged, and the server could start from it.
+fn with_data_dir(running: &Running, to: &Path) -> Result<String, String> {
+    let path = &running.path;
+    let text = read_text(path)?.unwrap_or_default();
+    let before = parse(path, &text)?;
+    let written = to.to_str().ok_or_else(|| format!("{} is not a path kvad.toml can hold", to.display()))?;
+    if written.contains(['"', '\\']) || written.chars().any(char::is_control) {
+        return Err(format!("{} has a quote, backslash or control character in it, which kvad.toml cannot hold here", to.display()));
+    }
+    let edited = edit_table(&text, "data", &[("dir", Some(format!("\"{written}\"")))]);
+    let after = parse(path, &edited)
+        .map_err(|e| format!("{e}; the data was not moved. Edit the file by hand"))?;
+    let untouched = |c: &Config| format!("{:?} {:?} {:?} {:?}", c.server, c.database, c.auth, c.client);
+    if after.data.dir.as_deref() != Some(written) || untouched(&after) != untouched(&before) {
+        return Err(format!(
+            "{} is laid out in a way this page cannot edit safely; the data was not moved. \
+             Set [data] dir by hand",
+            path.display()
+        ));
+    }
+    running.startable(&after).map_err(|why| format!("the server could not start with that: {why}"))?;
+    Ok(edited)
+}
+
+/// Whether kvad.toml can take `[data] dir = to`, asked before a move starts.
+pub fn data_dir_edit(running: &Running, to: &Path) -> Result<(), String> {
+    with_data_dir(running, to).map(|_| ())
+}
+
+/// Write `[data] dir = to` into kvad.toml: the last step of a move.
+pub fn set_data_dir(running: &Running, to: &Path) -> Result<(), String> {
+    let edited = with_data_dir(running, to)?;
+    replace(&running.path, &edited)
+}
+
 async fn restart(_: Admin, St(state): St<State>) -> Result<(StatusCode, Json<serde_json::Value>), Fail> {
     if !cfg!(unix) {
         return Err(Fail::conflict("this build cannot restart itself; restart the service by hand"));
     }
+    if state.settings.storage.busy() {
+        return Err(Fail::conflict("the data is being moved; the server restarts when that is done"));
+    }
+    let settings = Arc::clone(&state.settings);
+    crate::api::blocking_or(move || begin_restart(settings).map_err(Fail::conflict)).await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "restarting": true }))))
+}
+
+/// Check that the server can start from kvad.toml, and restart into it.
+/// Needs to be inside the tokio runtime, which it spawns the restart on.
+pub fn begin_restart(settings: Arc<Running>) -> Result<(), String> {
     // The file it is about to read has to be one it can start from, or this
     // is a restart into a server that exits at once.
-    let running = Arc::clone(&state.settings);
-    blocking(move || {
-        let again = |why: String| format!("the server could not start again: {why}");
-        let cfg = Config::load(&running.path).map_err(|e| again(e.to_string()))?;
-        running.startable(&cfg).map_err(|why| again(why).into())
-    })
-    .await
-    .map_err(|Fail(_, why)| Fail::conflict(why))?;
+    let again = |why: String| format!("the server could not start again: {why}");
+    let cfg = Config::load(&settings.path).map_err(|e| again(e.to_string()))?;
+    settings.startable(&cfg).map_err(again)?;
 
-    let settings = Arc::clone(&state.settings);
     if settings.restarting.swap(true, Ordering::SeqCst) {
-        return Err(Fail::conflict("a restart is already under way"));
+        return Err("a restart is already under way".into());
     }
     tracing::info!("restarting, as asked through the API");
     tokio::spawn(async move {
@@ -428,7 +498,7 @@ async fn restart(_: Admin, St(state): St<State>) -> Result<(StatusCode, Json<ser
         tracing::info!("requests still open after {}s; restarting without them", GRACE.as_secs());
         exec_self();
     });
-    Ok((StatusCode::ACCEPTED, Json(json!({ "restarting": true }))))
+    Ok(())
 }
 
 /// Replace this process with a fresh start of the same program, with the

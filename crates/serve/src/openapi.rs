@@ -139,6 +139,55 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       could not start from.",
         query: &[], body: None, produces: JSON, events: &[],
     },
+    Endpoint {
+        method: "get", path: "/api/data", tag: "Settings", access: Access::Admin,
+        summary: "Where the data is, and how much",
+        description: "The data directory and what is in it, sized; the database and \
+                      whether a move takes it along; the Hugging Face cache and whether \
+                      it follows the data directory (not when HF_HUB_CACHE or HF_HOME \
+                      is set); why a move is not possible, if it is not; a copy an \
+                      earlier move left behind; and the move under way, if there is \
+                      one, with its progress.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/data/plan", tag: "Settings", access: Access::Admin,
+        summary: "What moving the data somewhere would do",
+        description: "Each thing that would move, where to, its size, and whether it is \
+                      renamed (same disk) or copied. Refused with a reason when the \
+                      target is not empty, overlaps the data, lacks the space, or \
+                      kvad.toml cannot take the setting. Changes nothing.",
+        query: &[("to", true, "The directory to move to: a full path, or one starting with ~/.")],
+        body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "post", path: "/api/data/move", tag: "Settings", access: Access::Admin,
+        summary: "Move the data, and restart into it",
+        description: "Answers 202 and moves in the background: what is on another disk is \
+                      copied while the server goes on serving, then, with the database \
+                      held, the database is copied, late changes are caught up, what is \
+                      on the same disk is renamed, `[data] dir` is written to kvad.toml \
+                      and the server restarts. What was copied stays where it was until \
+                      DELETE /api/data/previous. Progress is in GET /api/data.",
+        query: &[],
+        body: json_body("`{ to }`: the directory to move to, empty or new."),
+        produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "delete", path: "/api/data/move", tag: "Settings", access: Access::Admin,
+        summary: "Cancel a move",
+        description: "Stops a move that is still copying and removes what it made. \
+                      Refused with 409 once it is switching over.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "delete", path: "/api/data/previous", tag: "Settings", access: Access::Admin,
+        summary: "Delete the copy a move left behind",
+        description: "Removes exactly the paths the move recorded, and the old data \
+                      directory if that empties it. Refused when any of them overlaps \
+                      what the server uses now.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
 
     // -- Models -------------------------------------------------------------
     Endpoint {
@@ -950,6 +999,7 @@ mod tests {
         ("bench.rs", include_str!("bench.rs")),
         ("images.rs", include_str!("images.rs")),
         ("settings.rs", include_str!("settings.rs")),
+        ("storage.rs", include_str!("storage.rs")),
     ];
 
     const METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];

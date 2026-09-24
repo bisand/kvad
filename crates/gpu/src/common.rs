@@ -390,6 +390,31 @@ fn no_head() -> String {
 // The attention cache
 // ---------------------------------------------------------------------------
 
+/// The dtype a model's attention cache is kept in, if not its compute dtype.
+///
+/// A quantised model computes in f32, because candle's quantised matmul
+/// takes nothing else, and so its cache was f32: four bytes a number where
+/// a dense model's cache has two. Attention reads the whole cache every
+/// token, so at long context that is a large share of what a token reads.
+/// At 8,422 positions of Qwen2.5-1.5B it is about 480 MB a token, against
+/// 1.64 GB of q8 weights. Kept in f16 instead, it is half that, and so is
+/// the memory it holds.
+///
+/// f16 rather than bf16: a cached key or value is a projection's output,
+/// small numbers that want the mantissa (f16 has 11 bits, bf16 8), not the
+/// range bf16 buys. Attention casts the query to match, and the fused kernel
+/// accumulates in f32 whatever it is given. The measured effect on what the
+/// model says is in `examples/kv_precision`.
+///
+/// Only for quantised models on Metal, where the fused kernel is. A dense
+/// model's cache is already its own two-byte dtype, or f32 because f32 was
+/// asked for. `KVAD_GPU_KV_F32=1` keeps the f32 cache, for measuring what
+/// this is worth.
+pub(crate) fn kv_store(device: &Device, quant: Option<GgmlDType>) -> Option<DType> {
+    let off = matches!(std::env::var("KVAD_GPU_KV_F32").as_deref(), Ok("1") | Ok("true"));
+    (quant.is_some() && device.is_metal() && !off).then_some(DType::F16)
+}
+
 /// One layer's keys and values for every position so far, grown in place.
 ///
 /// This was a pair of tensors rebuilt with `Tensor::cat` every step, and
@@ -409,11 +434,15 @@ fn no_head() -> String {
 ///
 /// `axis` is the position axis: 2 for `[1, heads, seq, head_dim]`, 0 for
 /// DeepSeek's compressed `[seq, width]`.
+///
+/// `store` is the dtype the positions are kept in, when it is not the one
+/// they arrive in: see [`kv_store`].
 pub(crate) struct KvCache {
     k: Option<Tensor>,
     v: Option<Tensor>,
     len: usize,
     axis: usize,
+    store: Option<DType>,
 }
 
 impl KvCache {
@@ -421,7 +450,14 @@ impl KvCache {
     const FIRST: usize = 256;
 
     pub(crate) fn new(axis: usize) -> Self {
-        KvCache { k: None, v: None, len: 0, axis }
+        KvCache { k: None, v: None, len: 0, axis, store: None }
+    }
+
+    /// The same cache, keeping its positions in `store` where that is
+    /// `Some`: [`kv_store`]'s answer.
+    pub(crate) fn stored_as(mut self, store: Option<DType>) -> Self {
+        self.store = store;
+        self
     }
 
     /// Positions held.
@@ -433,9 +469,13 @@ impl KvCache {
     /// Add `k` and `v`'s positions after the ones held, and return all of
     /// them: views onto the buffers, not copies.
     pub(crate) fn push(&mut self, k: &Tensor, v: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
-        let (axis, len) = (self.axis, self.len);
+        let (axis, len, store) = (self.axis, self.len, self.store);
         let m = k.dim(axis)?;
         let grow = |held: &Option<Tensor>, new: &Tensor| -> candle_core::Result<Tensor> {
+            let new = match store {
+                Some(dt) => new.to_dtype(dt)?,
+                None => new.clone(),
+            };
             let room = held.as_ref().map_or(Ok(0), |b| b.dim(axis))?;
             let buf = match held {
                 Some(b) if len + m <= room => b.clone(),
@@ -806,6 +846,30 @@ mod tests {
                 );
                 cache.truncate(0);
                 assert_eq!(cache.len(), 0);
+            }
+        }
+    }
+
+
+    /// A cache kept in another dtype holds what `cat` would, cast.
+    #[test]
+    fn a_cache_kept_in_f16_holds_the_cast() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(m) = Device::new_metal(0) {
+            devices.push(m);
+        }
+        for dev in &devices {
+            let mut cache = KvCache::new(2).stored_as(Some(DType::F16));
+            let mut ks = Vec::new();
+            for (i, n) in [300usize, 1, 1, 40].into_iter().enumerate() {
+                let v: Vec<f32> = (0..2 * n * 4).map(|j| (j as f32 * 0.11 + i as f32).cos() * 30.0).collect();
+                let k = Tensor::from_vec(v, (1, 2, n, 4), dev).unwrap();
+                let (gk, gv) = cache.push(&k, &k).unwrap();
+                assert_eq!((gk.dtype(), gv.dtype()), (DType::F16, DType::F16));
+                ks.push(k);
+                let want = Tensor::cat(&ks.iter().collect::<Vec<_>>(), 2).unwrap().to_dtype(DType::F16).unwrap();
+                let flat = |t: &Tensor| t.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert_eq!(flat(&gk.contiguous().unwrap()), flat(&want));
             }
         }
     }

@@ -494,11 +494,24 @@ detect_target() {
         Linux)  os=unknown-linux-gnu ;;
         *) die "unsupported operating system: $os (this installs on macOS and Linux)" ;;
     esac
+    # A shell running under Rosetta on Apple Silicon says x86_64. The machine
+    # underneath is what the binaries run on, and the kernel will tell.
+    if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ] &&
+        [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = 1 ]; then
+        arch=arm64
+    fi
     case $arch in
         arm64|aarch64) arch=aarch64 ;;
         x86_64|amd64)  arch=x86_64 ;;
         *) die "unsupported architecture: $arch" ;;
     esac
+    # Intel Macs stopped getting builds after v0.6.0. A pinned --version is
+    # let through, and the download either finds an old Intel build or says
+    # there is none.
+    if [ "$arch-$os" = x86_64-apple-darwin ] && [ -z "$VERSION" ]; then
+        die "kvad no longer builds for Intel Macs, only Apple Silicon.
+  The last release with an Intel build is v0.6.0: pass --version v0.6.0"
+    fi
     printf '%s-%s\n' "$arch" "$os"
 }
 

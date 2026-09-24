@@ -130,8 +130,8 @@ HOST:PORT` still says both at once. `sh install.sh --help` lists the rest.
 
 macOS gets all four binaries. Linux gets `kvad` and a CPU-only `kvad-serve`:
 `kvad-tui` and `kvad-gpu` both link candle against Metal, which is not a thing
-off a Mac. Apple Silicon is what this is developed and measured on; the
-`x86_64-apple-darwin` build is compiled but not run before release.
+off a Mac. On macOS that means Apple Silicon, which is what this is developed
+and measured on; Intel Macs had an untested build up to v0.6.0 and none since.
 
 The binaries are unsigned and unnotarized, which is deliberate rather than
 lazy: Gatekeeper's quarantine flag is set by LaunchServices, so a tarball

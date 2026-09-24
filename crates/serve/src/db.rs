@@ -48,6 +48,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("006-evals", include_str!("migrations/006-evals.sql")),
     ("007-crawl", include_str!("migrations/007-crawl.sql")),
     ("008-images", include_str!("migrations/008-images.sql")),
+    ("009-image-ids", include_str!("migrations/009-image-ids.sql")),
 ];
 
 #[derive(Clone)]
@@ -256,6 +257,47 @@ mod tests {
             conn.query_row("SELECT count(*) FROM train_metrics WHERE job = 7", [], |r| r.get(0))
                 .unwrap();
         assert_eq!(left, 0, "foreign keys did not come back on after the migration");
+    }
+
+    /// Migration 009 rebuilds `images` for AUTOINCREMENT. The pictures a
+    /// machine already has keep their ids, since their files are named by
+    /// them, and the newest id is not handed out again after the upgrade.
+    #[test]
+    fn remembering_image_ids_keeps_the_images() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let before: Vec<_> = MIGRATIONS.iter().take_while(|(n, _)| *n != "009-image-ids").collect();
+        for (i, (_, sql)) in before.iter().enumerate() {
+            conn.execute_batch(&format!("BEGIN; {sql}; PRAGMA user_version = {}; COMMIT;", i + 1)).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO images (id, model, backend, prompt, width, height, steps, guidance, seed, bytes, secs)
+             VALUES (3, 'm', 'b', 'a lighthouse', 64, 64, 4, 0.0, -1, 10, 1.5),
+                    (5, 'm', 'b', 'a harbour', 64, 64, 4, 0.0, 7, 10, 1.5)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let kept: Vec<(i64, String, i64)> = conn
+            .prepare("SELECT id, prompt, seed FROM images ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(kept, [(3, "a lighthouse".to_string(), -1), (5, "a harbour".to_string(), 7)]);
+
+        conn.execute("DELETE FROM images WHERE id = 5", []).unwrap();
+        conn.execute(
+            "INSERT INTO images (model, backend, prompt, width, height, steps, guidance, seed, bytes, secs)
+             VALUES ('m', 'b', 'a storm', 64, 64, 4, 0.0, 1, 10, 1.5)",
+            [],
+        )
+        .unwrap();
+        let next: i64 = conn.query_row("SELECT max(id) FROM images", [], |r| r.get(0)).unwrap();
+        assert_eq!(next, 6, "the deleted newest id was handed out again");
     }
 
     #[test]

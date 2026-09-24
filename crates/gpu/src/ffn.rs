@@ -31,6 +31,7 @@
 //! kept level with each other.
 
 use crate::common::{Loader, Proj, Reader, Stored};
+use crate::fused;
 use candle_core::{DType, Tensor};
 use candle_nn::ops;
 use kvad::model::ffn::{Router, Shared};
@@ -39,9 +40,11 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// A SwiGLU MLP: a dense layer, a shared expert, or one routed expert.
 pub(crate) struct Ffn {
-    gate: Proj,
-    up: Proj,
+    /// The gate and up projections as one, the gate's outputs first: see
+    /// [`Loader::proj_cat`].
+    gate_up: Proj,
     down: Proj,
+    width: usize,
 }
 
 impl Ffn {
@@ -51,24 +54,24 @@ impl Ffn {
     /// error rather than a silent one — but only because candle is told the
     /// shape it expects, which is the whole reason these widths are passed in.
     pub(crate) fn load(ld: &Loader, vb: &Reader<'_>, e: usize, width: usize) -> Res<Self> {
+        let parts = [("gate_proj.weight", width), ("up_proj.weight", width)];
         Ok(Ffn {
-            gate: ld.proj(vb, "gate_proj.weight", width, e, Stored::OutIn)?,
-            up: ld.proj(vb, "up_proj.weight", width, e, Stored::OutIn)?,
+            gate_up: ld.proj_cat(vb, &parts, e, Stored::OutIn)?,
             down: ld.proj(vb, "down_proj.weight", e, width, Stored::OutIn)?,
+            width,
         })
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = ops::silu(&self.gate.forward(x)?)?;
-        self.down.forward(&(gate * self.up.forward(x)?)?)
+        self.down.forward(&fused::silu_mul(&self.gate_up.forward(x)?, self.width)?)
     }
 
     pub(crate) fn params(&self) -> usize {
-        self.gate.params() + self.up.params() + self.down.params()
+        self.gate_up.params() + self.down.params()
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        self.gate.bytes() + self.up.bytes() + self.down.bytes()
+        self.gate_up.bytes() + self.down.bytes()
     }
 }
 

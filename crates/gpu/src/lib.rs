@@ -18,6 +18,11 @@
 //! those layouts, going by way of [`qcache`] rather than the quantiser when the
 //! quantiser has already been this way.
 //!
+//! `fused` holds a decode step's small ops as single Metal kernels — the
+//! residual add and norm, SiLU and multiply, and everything between the Q/K/V
+//! projection and the cache — each with candle's ops behind it for every
+//! device and step it does not take.
+//!
 //! [`image`] is the other thing this crate does, and the one thing in the
 //! engine with no CPU version: text-to-image pipelines, which are convolution
 //! stacks and so live where the convolutions are. They are not sessions —
@@ -27,6 +32,7 @@
 mod common;
 pub mod deepseek;
 mod ffn;
+mod fused;
 pub mod gpt2;
 pub mod image;
 pub mod model;

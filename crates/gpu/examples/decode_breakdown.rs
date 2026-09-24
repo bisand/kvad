@@ -25,6 +25,12 @@
 //! The `cat`s are timed apart, and at two context lengths, because each one
 //! copies the whole cache so far.
 //!
+//! That list is what `forward` ran when this was written, and still what it
+//! runs off Metal. Since then the cache is a buffer written in place, and on
+//! Metal `fused`'s kernels do most of a layer's small ops at once, so
+//! "inside forward" now times what those replaced; "around the model" times
+//! what runs.
+//!
 //!     cargo run --release -p kvad-gpu --example decode_breakdown -- [--quant q8] [--context 2048]
 //!
 //! Needs Qwen/Qwen2.5-1.5B-Instruct in the Hub cache (`kvad pull`).

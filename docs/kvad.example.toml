@@ -34,8 +34,10 @@ bind = "127.0.0.1:5823"
 # writes it. Changing it moves nothing: move the old directory yourself,
 # with the server stopped.
 #
-# Models pulled from Hugging Face are not in here. They are in the Hub's own
-# cache, ~/.cache/huggingface/hub, which HF_HOME moves.
+# Setting it also moves models pulled from Hugging Face, to huggingface/hub
+# inside it: the layout of ~/.cache/huggingface/hub, where they go when this
+# is not set, so an existing cache moves with one `mv`. HF_HUB_CACHE or
+# HF_HOME, when set, still decide. The Hugging Face token stays where it is.
 # dir = "/Volumes/Models/kvad"
 
 [database]

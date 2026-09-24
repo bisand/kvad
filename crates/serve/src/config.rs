@@ -295,13 +295,18 @@ impl Config {
     /// would find, because that reads the default `kvad.toml` and a server
     /// started with `--config` may have been given another.
     pub fn data_dir(&self, path: &Path) -> PathBuf {
+        self.chosen_data_dir(path).unwrap_or_else(kvad::weights::default_data_dir)
+    }
+
+    /// The same, but nothing when neither names one: what
+    /// [`kvad::weights::set_data_dir`] wants, since only a data directory
+    /// somebody chose takes the Hub's cache with it.
+    pub fn chosen_data_dir(&self, path: &Path) -> Option<PathBuf> {
         if let Some(dir) = std::env::var_os("KVAD_DATA_DIR").filter(|v| !v.is_empty()) {
-            return PathBuf::from(dir);
+            return Some(PathBuf::from(dir));
         }
-        match self.data.dir.as_deref().filter(|d| !d.trim().is_empty()) {
-            Some(dir) => kvad::weights::configured_dir(dir, path),
-            None => kvad::weights::default_data_dir(),
-        }
+        let dir = self.data.dir.as_deref().filter(|d| !d.trim().is_empty())?;
+        Some(kvad::weights::configured_dir(dir, path))
     }
 
     /// `[database] path`, else `kvad.db` in the data directory.

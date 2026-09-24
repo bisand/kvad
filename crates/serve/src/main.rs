@@ -172,8 +172,8 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     let mut cfg = config::Config::load(&config_path)?;
     // Before anything asks where its files are.
+    kvad::weights::set_data_dir(cfg.chosen_data_dir(&config_path));
     let data_dir = cfg.data_dir(&config_path);
-    kvad::weights::set_data_dir(data_dir.clone());
     if let Some(bind) = args.bind {
         cfg.server.bind = bind;
     }
@@ -280,6 +280,7 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
     println!("kvad-serve listening on http://{bound}");
     println!("  config     {}", config_path.display());
     println!("  data       {}", data_dir.display());
+    println!("  hub cache  {}", kvad::hub::cache_dir().display());
     println!("  database   {} (schema {schema})", db_path.display());
     if cfg.auth.mode == config::Mode::Oidc {
         println!("  provider   {}", cfg.auth.oidc.issuer);

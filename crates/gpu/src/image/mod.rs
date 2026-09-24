@@ -121,10 +121,7 @@ pub(crate) fn local_file(repo: &str, file: &str) -> Option<PathBuf> {
     if let Some(dir) = kvad::weights::local_dir(repo) {
         return Some(dir.join(file)).filter(|p| p.is_file());
     }
-    let hub = std::env::var("HF_HOME")
-        .map(|h| PathBuf::from(h).join("hub"))
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache/huggingface/hub")))
-        .ok()?;
+    let hub = kvad::hub::cache_dir();
     let snapshots = hub.join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
     std::fs::read_dir(snapshots).ok()?.flatten().map(|e| e.path().join(file)).find(|p| p.is_file())
 }

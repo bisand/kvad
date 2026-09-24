@@ -1,4 +1,5 @@
-//! Q8_0 matmuls on the M5 GPU's neural accelerators (#52).
+//! Matmuls on the M5 GPU's neural accelerators (#52): Q8_0 in [`Q8`], and
+//! f16 or bf16 in [`dense`].
 //!
 //! Every M5 GPU core carries a matrix unit, and a shader reaches it only
 //! through Metal 4's tensor API, `mpp::tensor_ops::matmul2d`. candle's
@@ -59,6 +60,15 @@
 //! The activations must be f16. `matmul2d` also takes f32 on the left, and
 //! returns candle's product bit for bit at candle's speed: the f32 path is
 //! not accelerated.
+//!
+//! # Dense
+//!
+//! A dense weight is a plain tensor, so nothing stops candle and this kernel
+//! from sharing it, and the language models get it too. [`dense`] takes
+//! `x · w` whenever it is f16 or bf16 and at least [`DENSE_ROWS`] rows: a
+//! prefill chunk, an image model's every projection. A decode step's one row
+//! is still candle's, because a matrix-vector product is not a matrix unit's
+//! job, and there `matmul2d` is slower.
 
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp2, DType, Device, Layout, MetalStorage, Shape, Tensor};
@@ -207,21 +217,61 @@ kernel void mm_q8_0(device half *a [[buffer(0)]],
     auto mc = tc.slice(n0, tg.y * BM);
     acc.store(mc);
 }
+
+// Dense: `C = A · B`, all three row-major and of one dtype. `A` is
+// `[M, K]`, `B` is `[K, N]` (a weight stored `[in, out]`, as `Proj::Dense`
+// keeps it), and `C` is `[M, N]`. `matmul2d` reads both straight from device
+// memory and walks all of `K` itself; the kernel only says which tile is
+// whose. Measured against feeding `K` in steps, or staging `B` in
+// threadgroup memory, this is the fastest there is.
+template <typename T, int TM, int TN, int TSG>
+kernel void mm_dense(device T *a [[buffer(0)]],
+                     device T *b [[buffer(1)]],
+                     device T *c [[buffer(2)]],
+                     constant int &M [[buffer(3)]],
+                     constant int &N [[buffer(4)]],
+                     constant int &K [[buffer(5)]],
+                     uint2 tg [[threadgroup_position_in_grid]]) {
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> tb(b, dextents<int32_t, 2>(N, K));
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent));
+    matmul2d<desc, execution_simdgroups<TSG>> op;
+    auto ma = ta.slice(0, tg.y * TM);
+    auto mb = tb.slice(tg.x * TN, 0);
+    auto mc = tc.slice(tg.x * TN, tg.y * TM);
+    op.run(ma, mb, mc);
+}
+
+#define DENSE(T, tn, TM, TN, TSG) \
+    template [[host_name("mm_dense_" #tn "_" #TM "x" #TN)]] [[kernel]] \
+    decltype(mm_dense<T, TM, TN, TSG>) mm_dense<T, TM, TN, TSG>;
+DENSE(half, f16, 64, 64, 4)
+DENSE(half, f16, 128, 128, 8)
+DENSE(bfloat, bf16, 64, 64, 4)
+DENSE(bfloat, bf16, 128, 128, 8)
 "#;
 
-/// Whether this device runs [`Q8`], answered once per process.
+/// Whether this device runs [`Q8`] and [`dense`], answered once per process.
 ///
 /// Compiling is part of the answer. A GPU of the right family on a macOS
 /// without Metal 4 fails here, and says why on stderr, instead of failing at
 /// the first matmul of a generation.
 pub(crate) fn available(device: &Device) -> bool {
-    pipeline(device).is_some()
+    pipes(device).is_some()
 }
 
-fn pipeline(device: &Device) -> Option<&'static ComputePipeline> {
-    static PIPE: OnceLock<Option<ComputePipeline>> = OnceLock::new();
+/// Every kernel in [`SOURCE`], built.
+struct Pipes {
+    q8: ComputePipeline,
+    /// `[f16, bf16]`, each in [`DENSE_TILES`]' order.
+    dense: [[ComputePipeline; 2]; 2],
+}
+
+fn pipes(device: &Device) -> Option<&'static Pipes> {
+    static PIPES: OnceLock<Option<Pipes>> = OnceLock::new();
     let Device::Metal(md) = device else { return None };
-    PIPE.get_or_init(|| {
+    PIPES.get_or_init(|| {
         if matches!(std::env::var("KVAD_GPU_MPP").as_deref(), Ok("0") | Ok("false")) {
             return None;
         }
@@ -231,15 +281,21 @@ fn pipeline(device: &Device) -> Option<&'static ComputePipeline> {
         }
         let opts = MTLCompileOptions::new();
         opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
-        let built = md
-            .metal_device()
-            .new_library_with_source(SOURCE, Some(&opts))
-            .and_then(|lib| lib.get_function("mm_q8_0", None))
-            .and_then(|f| md.metal_device().new_compute_pipeline_state_with_function(&f));
+        let built = md.metal_device().new_library_with_source(SOURCE, Some(&opts)).and_then(|lib| {
+            let pipe = |name: &str| {
+                lib.get_function(name, None)
+                    .and_then(|f| md.metal_device().new_compute_pipeline_state_with_function(&f))
+            };
+            let dense = |tn: &str| -> Result<[ComputePipeline; 2], candle_metal_kernels::MetalKernelError> {
+                let [(m0, n0, _), (m1, n1, _)] = DENSE_TILES;
+                Ok([pipe(&format!("mm_dense_{tn}_{m0}x{n0}"))?, pipe(&format!("mm_dense_{tn}_{m1}x{n1}"))?])
+            };
+            Ok(Pipes { q8: pipe("mm_q8_0")?, dense: [dense("f16")?, dense("bf16")?] })
+        });
         match built {
             Ok(p) => Some(p),
             Err(e) => {
-                eprintln!("kvad: the M5 matmul kernel did not build, so candle's is used: {e}");
+                eprintln!("kvad: the M5 matmul kernels did not build, so candle's are used: {e}");
                 None
             }
         }
@@ -303,7 +359,7 @@ impl CustomOp2 for Q8 {
             candle_core::bail!("mpp_q8_0: wants contiguous f16 [m, {}], got {:?} {:?}", self.k, a.dtype(), la);
         }
         let dev = a.device();
-        let Some(pipe) = pipeline(&Device::Metal(dev.clone())) else {
+        let Some(pipes) = pipes(&Device::Metal(dev.clone())) else {
             candle_core::bail!("mpp_q8_0: this device cannot run it");
         };
         let out = dev.allocate_buffer(m * n * 4)?;
@@ -318,7 +374,7 @@ impl CustomOp2 for Q8 {
         let guard = dev.command_encoder()?;
         let enc: &ComputeCommandEncoder = guard.as_ref();
         enc.set_label("mpp_q8_0");
-        enc.set_compute_pipeline_state(pipe);
+        enc.set_compute_pipeline_state(&pipes.q8);
         enc.set_input_buffer(0, Some(a.buffer()), la.start_offset() * 2);
         enc.set_input_buffer(1, Some(w.buffer()), 0);
         enc.set_output_buffer(2, Some(&out), 0);
@@ -333,6 +389,120 @@ impl CustomOp2 for Q8 {
             MTLSize { width: 32 * SIMD_GROUPS, height: 1, depth: 1 },
         );
         Ok((MetalStorage::new(out, dev.clone(), m * n, DType::F32), Shape::from((m, n))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dense
+// ---------------------------------------------------------------------------
+
+/// The dense kernel's tiles: rows of `C`, columns, SIMD groups. The probe
+/// measured 128 × 128 over eight SIMD groups fastest at the video DiT's
+/// shapes, and 64 × 64 over four close to the best at a prefill chunk's.
+const DENSE_TILES: [(usize, usize, usize); 2] = [(64, 64, 4), (128, 128, 8)];
+
+/// Rows below which candle's kernel is left to do it.
+///
+/// From `dense_crossover`, bf16, twice, at `[k, n]` of `[3584, 18944]`,
+/// `[4096, 4096]` and `[3072, 3072]`. One row, a decode step, is candle's at
+/// all three: this kernel runs it at 0.87–0.95×. Eight rows are already
+/// this kernel's, at 1.22–1.62×, and from 16 rows it is 2.4–3.6×. Two to
+/// seven were not measured, so eight is where it starts.
+const DENSE_ROWS: usize = 8;
+
+/// Rows from which the 128 × 128 tile is used instead of 64 × 64.
+///
+/// Up to 512 rows the small tile is as good or better at two of the three
+/// shapes, since more, smaller tiles keep more of the GPU busy. From 1024 the
+/// large tile ties there, is 16–19% faster at `[3072, 3072]`, and at 4096
+/// rows is 13–21% faster at all three.
+const BIG_TILE_ROWS: usize = 1024;
+
+/// `x · w` on the matrix units, or `None` where candle should do it.
+///
+/// `x` is `[m, k]`, `w` is `[k, n]`, both f16 or both bf16. `None` means
+/// any of these, and the caller runs `x.matmul(w)` as it always has:
+/// - the device cannot run the kernel;
+/// - the dtype is f32, which `matmul2d` takes but does not accelerate;
+/// - `m` is below [`DENSE_ROWS`], a decode step above all, where a
+///   matrix-vector kernel is the right tool and a matrix unit is not.
+pub(crate) fn dense(x: &Tensor, w: &Tensor) -> candle_core::Result<Option<Tensor>> {
+    if pipes(x.device()).is_none()
+        || x.rank() != 2
+        || w.rank() != 2
+        || x.dtype() != w.dtype()
+        || !matches!(x.dtype(), DType::F16 | DType::BF16)
+        || !w.is_contiguous()
+        || x.dim(0)? < DENSE_ROWS
+    {
+        return Ok(None);
+    }
+    let tile = usize::from(x.dim(0)? >= BIG_TILE_ROWS);
+    Ok(Some(dense_with(x, w, tile)?))
+}
+
+/// [`dense`] in a given tile, whatever the shape: for the tests, and for
+/// measuring where the thresholds belong.
+fn dense_with(x: &Tensor, w: &Tensor, tile: usize) -> candle_core::Result<Tensor> {
+    x.contiguous()?.apply_op2_no_bwd(w, &Dense { tile })
+}
+
+struct Dense {
+    /// Which of [`DENSE_TILES`].
+    tile: usize,
+}
+
+impl CustomOp2 for Dense {
+    fn name(&self) -> &'static str {
+        "mpp_dense"
+    }
+
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout)
+     -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("mpp_dense runs on Metal only")
+    }
+
+    fn metal_fwd(&self, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout)
+     -> candle_core::Result<(MetalStorage, Shape)> {
+        let (m, k) = la.shape().dims2()?;
+        let (kb, n) = lb.shape().dims2()?;
+        let dt = a.dtype();
+        let which = match dt {
+            DType::F16 => 0,
+            DType::BF16 => 1,
+            _ => candle_core::bail!("mpp_dense: {dt:?} is not f16 or bf16"),
+        };
+        if k != kb || b.dtype() != dt || !la.is_contiguous() || !lb.is_contiguous() {
+            candle_core::bail!("mpp_dense: [{m}, {k}] x [{kb}, {n}], {dt:?} x {:?}", b.dtype());
+        }
+        let dev = a.device();
+        let Some(pipes) = pipes(&Device::Metal(dev.clone())) else {
+            candle_core::bail!("mpp_dense: this device cannot run it");
+        };
+        let (tm, tn, sg) = DENSE_TILES[self.tile];
+        let bytes = m * n * dt.size_in_bytes();
+        let out = dev.allocate_buffer(bytes)?;
+        // As for `Q8`: under test every output starts as NaN.
+        #[cfg(test)]
+        {
+            let mut blit = dev.blit_command_encoder()?;
+            blit.fill_buffer(&out, (0, bytes), 0xff);
+        }
+        let guard = dev.command_encoder()?;
+        let enc: &ComputeCommandEncoder = guard.as_ref();
+        enc.set_label("mpp_dense");
+        enc.set_compute_pipeline_state(&pipes.dense[which][self.tile]);
+        enc.set_input_buffer(0, Some(a.buffer()), la.start_offset() * dt.size_in_bytes());
+        enc.set_input_buffer(1, Some(b.buffer()), lb.start_offset() * dt.size_in_bytes());
+        enc.set_output_buffer(2, Some(&out), 0);
+        enc.set_bytes(3, &(m as i32));
+        enc.set_bytes(4, &(n as i32));
+        enc.set_bytes(5, &(k as i32));
+        enc.dispatch_thread_groups(
+            MTLSize { width: n.div_ceil(tn), height: m.div_ceil(tm), depth: 1 },
+            MTLSize { width: 32 * sg, height: 1, depth: 1 },
+        );
+        Ok((MetalStorage::new(out, dev.clone(), m * n, dt), Shape::from((m, n))))
     }
 }
 
@@ -400,4 +570,109 @@ mod tests {
         assert_eq!(q.forward(&x).unwrap().reshape((10, n)).unwrap().to_vec2::<f32>().unwrap(),
                    flat.to_vec2::<f32>().unwrap());
     }
+
+    /// The dense kernel against candle's matmul on the same inputs, both
+    /// dtypes, both tiles, at every kind of ragged edge.
+    #[test]
+    fn dense_agrees_with_candle_at_every_edge() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device");
+            return;
+        };
+        if !available(&dev) {
+            eprintln!("this GPU has no matrix units for matmul2d; nothing to test");
+            return;
+        }
+        for dt in [DType::F16, DType::BF16] {
+            // bf16 keeps 8 bits of mantissa to f16's 11: the two kernels'
+            // roundings differ by that much more.
+            let tol = if dt == DType::F16 { 2e-3 } else { 1.6e-2 };
+            for tile in 0..DENSE_TILES.len() {
+                for (m, k, n) in [(256, 128, 256), (77, 320, 192), (128, 64, 100), (300, 96, 70), (1, 64, 64), (129, 17, 130)] {
+                    let x = (rand(m * k, m as f32).reshape((m, k)).unwrap() * 4.0).unwrap().to_dtype(dt).unwrap()
+                        .to_device(&dev).unwrap();
+                    let w = rand(k * n, n as f32 + 0.5).reshape((k, n)).unwrap().to_dtype(dt).unwrap()
+                        .to_device(&dev).unwrap();
+                    let got = dense_with(&x, &w, tile).unwrap().to_dtype(DType::F32).unwrap();
+                    let want = x.matmul(&w).unwrap().to_dtype(DType::F32).unwrap();
+                    assert_eq!(got.dims(), &[m, n]);
+                    let sum = got.sum_all().unwrap().to_scalar::<f32>().unwrap();
+                    assert!(sum.is_finite(), "{dt:?} tile {tile} [{m}, {k}] x [{k}, {n}]: output not all written");
+                    let scale = want.abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+                    let apart = (got - &want).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+                    assert!(apart <= tol * scale, "{dt:?} tile {tile} [{m}, {k}] x [{k}, {n}]: {apart} apart at scale {scale}");
+                }
+            }
+        }
+    }
+
+    /// What [`dense`] leaves to candle: f32, a decode step, and mixed
+    /// dtypes.
+    #[test]
+    fn dense_declines_what_it_should_not_take() {
+        let Ok(dev) = Device::new_metal(0) else { return };
+        if !available(&dev) {
+            return;
+        }
+        let x = |m: usize, dt: DType| Tensor::zeros((m, 64), dt, &dev).unwrap();
+        let w = |dt: DType| Tensor::zeros((64, 64), dt, &dev).unwrap();
+        assert!(dense(&x(512, DType::F32), &w(DType::F32)).unwrap().is_none());
+        assert!(dense(&x(1, DType::BF16), &w(DType::BF16)).unwrap().is_none());
+        assert!(dense(&x(512, DType::BF16), &w(DType::F16)).unwrap().is_none());
+        assert!(dense(&x(512, DType::BF16), &w(DType::BF16)).unwrap().is_some());
+        let cpu = Tensor::zeros((512, 64), DType::BF16, &Device::Cpu).unwrap();
+        assert!(dense(&cpu, &cpu.t().unwrap().contiguous().unwrap()).unwrap().is_none());
+    }
+
+    /// Where [`DENSE_ROWS`] and [`BIG_TILE_ROWS`] come from. Not a test, a
+    /// measurement; run it with
+    ///
+    ///     cargo test --release -p kvad-gpu dense_crossover -- --ignored --nocapture
+    ///
+    /// Candle and each tile take turns round by round, and each ratio is
+    /// the median of per-round ratios, for the reason `examples/neural_accel`
+    /// gives: this machine's speed drifts between runs.
+    #[test]
+    #[ignore]
+    fn dense_crossover() {
+        let dev = Device::new_metal(0).unwrap();
+        assert!(available(&dev));
+        let once = |f: &dyn Fn() -> Tensor| {
+            let t = std::time::Instant::now();
+            for _ in 0..10 {
+                let _ = f();
+            }
+            dev.synchronize().unwrap();
+            t.elapsed().as_secs_f64() * 100.0
+        };
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        for (k, n) in [(3584, 18944), (4096, 4096), (3072, 3072)] {
+            println!("\nbf16 [m, {k}] x [{k}, {n}]: candle ms, then each tile's speedup over it");
+            let w = rand(k * n, 1.0).reshape((k, n)).unwrap().to_dtype(DType::BF16).unwrap().to_device(&dev).unwrap();
+            for m in [1, 8, 16, 32, 48, 64, 96, 128, 256, 512, 1024, 2048, 4096] {
+                let x = rand(m * k, 2.0).reshape((m, k)).unwrap().to_dtype(DType::BF16).unwrap().to_device(&dev).unwrap();
+                let fs: [&dyn Fn() -> Tensor; 3] = [
+                    &|| x.matmul(&w).unwrap(),
+                    &|| dense_with(&x, &w, 0).unwrap(),
+                    &|| dense_with(&x, &w, 1).unwrap(),
+                ];
+                for f in fs {
+                    let _ = f();
+                }
+                dev.synchronize().unwrap();
+                let (mut base, mut r0, mut r1) = (vec![], vec![], vec![]);
+                for _ in 0..7 {
+                    let b = once(fs[0]);
+                    r0.push(b / once(fs[1]));
+                    r1.push(b / once(fs[2]));
+                    base.push(b);
+                }
+                println!("  m {m:5}: candle {:8.3} ms   64x64 {:5.2}x   128x128 {:5.2}x", median(base), median(r0), median(r1));
+            }
+        }
+    }
+
 }

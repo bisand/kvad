@@ -826,11 +826,15 @@ pub(crate) mod tests {
             eprintln!("no Metal device: the dense GPU path is not exercised here");
             return;
         };
-        let tokens = [1u32, 2, 3, 4];
+        // Four tokens take candle's matmul. Twelve take the M5's matrix
+        // units in bf16, where the machine has them (`mpp::dense` starts at
+        // eight rows), so the prompt a prefill chunk looks like is checked
+        // too.
+        let prompts: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 9, 2, 17, 33, 8, 1, 60, 12, 3, 44, 21]];
         // Qwen2 — the family the server defaults to — is untied and carries
         // attention biases, and `tiny_spec` is neither, so a model that only
         // has what `tiny_spec` has would not have found this.
-        for tie in [true, false] {
+        for (tokens, tie) in prompts.iter().flat_map(|&t| [(t, true), (t, false)]) {
             let mut spec = tiny_spec();
             spec.tie_embeddings = tie;
             let e = spec.n_embd;
@@ -851,7 +855,7 @@ pub(crate) mod tests {
             let path = write_tensors(&spec, !tie, &extra, &format!("dense-on-gpu-{tie}"));
 
             let mut cache = kvad::model::KvCache::new(&spec);
-            let ours = cpu_model(&path, &spec).forward_batch(&tokens, &mut cache);
+            let ours = cpu_model(&path, &spec).forward_batch(tokens, &mut cache);
 
             for (what, dtype, quant) in [
                 ("dense f32", DType::F32, None),
@@ -867,7 +871,7 @@ pub(crate) mod tests {
                     &Vault::off(),
                 )
                 .unwrap();
-                let theirs = gpu.forward(&tokens).unwrap();
+                let theirs = gpu.forward(tokens).unwrap();
                 assert_eq!(theirs.len(), ours.len(), "{what}, tied {tie}");
                 let worst =
                     theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
@@ -879,7 +883,8 @@ pub(crate) mod tests {
                 };
                 assert!(
                     worst < allow,
-                    "{what} on Metal, tied {tie}: differs from the CPU engine by {worst}"
+                    "{what} on Metal, tied {tie}, {} tokens: differs from the CPU engine by {worst}",
+                    tokens.len()
                 );
             }
             std::fs::remove_file(&path).unwrap();

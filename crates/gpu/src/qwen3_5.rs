@@ -21,7 +21,7 @@
 //! engine writes as an index shift.
 
 use crate::common::{
-    check_block, embedding, label, linear, unread, unread_error, Embed, Loader, Proj, Reader,
+    check_block, embedding, label, linear, unread, unread_error, Embed, KvCache, Loader, Proj, Reader,
     Stored,
 };
 use crate::ffn::{Ffn, Mlp, Moe};
@@ -172,7 +172,7 @@ pub struct GpuQwen35 {
     sin: Tensor,
     rope_dim: usize,
     /// Per full-attention layer, `[1, n_kv, seq, head_dim]`.
-    kv: Vec<Option<(Tensor, Tensor)>>,
+    kv: Vec<KvCache>,
     /// Per linear layer.
     state: Vec<Option<State>>,
     pos: usize,
@@ -328,7 +328,7 @@ impl GpuQwen35 {
         crate::model::settled(&device)?;
 
         Ok(GpuQwen35 {
-            kv: (0..spec.n_layer).map(|_| None).collect(),
+            kv: (0..spec.n_layer).map(|_| KvCache::new(2)).collect(),
             state: (0..spec.n_layer).map(|_| None).collect(),
             blocks,
             embed,
@@ -415,7 +415,7 @@ impl GpuQwen35 {
     }
 
     /// One token through a full-attention layer.
-    fn full_step(&self, attn: &Attn, h: &Tensor, layer: usize) -> Res<(Tensor, Tensor, Tensor)> {
+    fn full_step(&self, attn: &Attn, h: &Tensor, cache: &mut KvCache) -> Res<Tensor> {
         let spec = &self.spec;
         let (hd, nh, nkv) = (spec.head_dim, spec.n_head, spec.n_kv_head);
         let pos = self.pos;
@@ -451,10 +451,7 @@ impl GpuQwen35 {
         let k = part(&k)?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let (k, v) = match self.kv[layer].clone() {
-            None => (k, v),
-            Some((pk, pv)) => (Tensor::cat(&[&pk, &k], 2)?, Tensor::cat(&[&pv, &v], 2)?),
-        };
+        let (k, v) = cache.push(&k, &v)?;
 
         // `attention` folds the query heads onto their KV head rather than
         // copying the KV head out per query head, and takes the fused kernel
@@ -466,7 +463,7 @@ impl GpuQwen35 {
 
         // The gate, which is what `attn_output_gate` names.
         let out = out.mul(&ops::sigmoid(&gate)?)?;
-        Ok((linear(&out, &attn.o, None)?, k, v))
+        Ok(linear(&out, &attn.o, None)?)
     }
 }
 
@@ -489,9 +486,12 @@ impl GpuQwen35 {
                 let h = ops::rms_norm(&x, &self.blocks[l].attn_norm, spec.eps)?;
                 let mixed = match &self.blocks[l].mixer {
                     Mixer::Full(attn) => {
-                        let (out, k, v) = self.full_step(attn, &h, l)?;
-                        self.kv[l] = Some((k, v));
-                        out
+                        // Lent out for the step: `full_step` reads the rest
+                        // of `self` while it writes this.
+                        let mut cache = std::mem::replace(&mut self.kv[l], KvCache::new(2));
+                        let out = self.full_step(attn, &h, &mut cache);
+                        self.kv[l] = cache;
+                        out?
                     }
                     Mixer::Linear(net) => {
                         let (out, state) = self.linear_step(net, &h, l)?;
@@ -518,7 +518,7 @@ impl GpuQwen35 {
     fn reset_state(&mut self) -> Res<()> {
         let d = &self.delta;
         for l in 0..self.blocks.len() {
-            self.kv[l] = None;
+            self.kv[l].truncate(0);
             self.state[l] = match self.kinds[l] {
                 Kind::Full => None,
                 Kind::Linear => Some(State {

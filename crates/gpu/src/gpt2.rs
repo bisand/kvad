@@ -34,7 +34,7 @@
 //! full speed and says something else.
 
 use crate::common::{
-    causal_mask, check_block, embedding, label, linear, unread, unread_error, Embed, Loader, Proj,
+    causal_mask, check_block, embedding, label, linear, unread, unread_error, Embed, KvCache, Loader, Proj,
     Reader, Stored,
 };
 use crate::qcache::Vault;
@@ -98,7 +98,7 @@ pub struct GpuGpt2 {
     ln_f: Norm,
     /// Per layer, `[1, n_head, seq, head_dim]` for keys and values. No grouping:
     /// GPT-2 predates it, so `n_kv_head == n_head`.
-    kv: Vec<Option<(Tensor, Tensor)>>,
+    kv: Vec<KvCache>,
     pos: usize,
 }
 
@@ -193,7 +193,7 @@ impl GpuGpt2 {
         debug_assert_eq!(spec.n_head * hd, e, "GPT-2 splits n_embd exactly across its heads");
 
         Ok(GpuGpt2 {
-            kv: (0..spec.n_layer).map(|_| None).collect(),
+            kv: (0..spec.n_layer).map(|_| KvCache::new(2)).collect(),
             blocks,
             wte,
             wpe,
@@ -217,15 +217,7 @@ impl GpuGpt2 {
         if len >= self.pos {
             return Ok(());
         }
-        if len == 0 {
-            self.kv.iter_mut().for_each(|s| *s = None);
-        } else {
-            for slot in self.kv.iter_mut() {
-                if let Some((k, v)) = slot.take() {
-                    *slot = Some((k.narrow(2, 0, len)?, v.narrow(2, 0, len)?));
-                }
-            }
-        }
+        self.kv.iter_mut().for_each(|c| c.truncate(len));
         self.pos = len;
         Ok(())
     }
@@ -273,11 +265,7 @@ impl GpuGpt2 {
             };
             let (q, k, v) = (split(0)?, split(1)?, split(2)?);
 
-            let (k, v) = match self.kv[i].take() {
-                None => (k, v),
-                Some((pk, pv)) => (Tensor::cat(&[&pk, &k], 2)?, Tensor::cat(&[&pv, &v], 2)?),
-            };
-            self.kv[i] = Some((k.clone(), v.clone()));
+            let (k, v) = self.kv[i].push(&k, &v)?;
 
             let mut att = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
             if let Some(msk) = &mask {

@@ -375,6 +375,210 @@ TILES(half, f16)
 TILES(float, f32)
 "#;
 
+    /// Where the Q8_0 kernel's time goes, one change at a time. All three
+    /// take f16 weights stored as `W` is, `[N, K]`, so they differ from each
+    /// other, and from `mm_q8db`, in exactly one thing each:
+    /// - `nt_whole`: `matmul2d` reads `W` from device memory and walks all of
+    ///   `K` itself. What `matmul2d` does unaided.
+    /// - `nt_loop`: the same reads, but the kernel feeds `K` to it `BK` at a
+    ///   time into a cooperative tensor, as the Q8_0 kernel must. The cost of
+    ///   short steps.
+    /// - `nt_staged`: that loop, with each `BN × BK` slab of `W` copied into
+    ///   threadgroup memory first, double-buffered exactly as `mm_q8db` does,
+    ///   but with nothing to unpack. The cost of multiplying from threadgroup
+    ///   memory.
+    ///
+    /// `mm_q8db` is then `nt_staged` plus unpacking, minus half the bytes: a
+    /// Q8_0 row is 34 bytes per 32 weights where f16 is 64.
+    const SOURCE_STAGE: &str = r#"
+#include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+template <int BM, int BN, int NSG>
+kernel void nt_whole(device half *a [[buffer(0)]],
+                     device half *w [[buffer(1)]],
+                     device float *c [[buffer(2)]],
+                     constant int &M [[buffer(3)]],
+                     constant int &N [[buffer(4)]],
+                     constant int &K [[buffer(5)]],
+                     uint2 tg [[threadgroup_position_in_grid]]) {
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tw(w, dextents<int32_t, 2>(K, N));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
+    constexpr auto desc = matmul2d_descriptor(BM, BN, static_cast<int>(dynamic_extent), false, true);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto ma = ta.slice(0, tg.y * BM);
+    auto mw = tw.slice(0, tg.x * BN);
+    auto mc = tc.slice(tg.x * BN, tg.y * BM);
+    op.run(ma, mw, mc);
+}
+
+template <int BM, int BN, int BK, int NSG>
+kernel void nt_loop(device half *a [[buffer(0)]],
+                    device half *w [[buffer(1)]],
+                    device float *c [[buffer(2)]],
+                    constant int &M [[buffer(3)]],
+                    constant int &N [[buffer(4)]],
+                    constant int &K [[buffer(5)]],
+                    uint2 tg [[threadgroup_position_in_grid]]) {
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tw(w, dextents<int32_t, 2>(K, N));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
+    constexpr auto desc = matmul2d_descriptor(BM, BN, BK, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto ma = ta.slice(0, tg.y * BM);
+    auto mw = tw.slice(0, tg.x * BN);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(ma), decltype(mw), float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+    for (int k = 0; k < K; k += BK) {
+        auto sa = ta.slice(k, tg.y * BM);
+        auto sw = tw.slice(k, tg.x * BN);
+        op.run(sa, sw, acc);
+    }
+    auto mc = tc.slice(tg.x * BN, tg.y * BM);
+    acc.store(mc);
+}
+
+template <int BM, int BN, int BK, int NSG>
+kernel void nt_staged(device half *a [[buffer(0)]],
+                      device half *w [[buffer(1)]],
+                      device float *c [[buffer(2)]],
+                      constant int &M [[buffer(3)]],
+                      constant int &N [[buffer(4)]],
+                      constant int &K [[buffer(5)]],
+                      threadgroup half *slab [[threadgroup(0)]],
+                      uint2 tg [[threadgroup_position_in_grid]],
+                      ushort tid [[thread_index_in_threadgroup]]) {
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw0(slab, dextents<int32_t, 2>(BK, BN));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw1(slab + BN * BK, dextents<int32_t, 2>(BK, BN));
+    constexpr auto desc = matmul2d_descriptor(BM, BN, BK, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto ma = ta.slice(0, tg.y * BM);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(ma), decltype(tw0), float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+    // Runs of 8 halves, as the Q8_0 kernel's runs of 8 weights: the same
+    // threads copy the same places, from 16 bytes instead of 10.
+    constexpr int PER = BN * BK / 8 / (32 * NSG);
+    device half *wrow = w + tg.x * BN * K;
+    half4 lo[PER], hi[PER];
+    #define FETCH(k0) \
+        for (int p = 0; p < PER; ++p) { \
+            const int r = tid + p * 32 * NSG; \
+            const int n = r / (BK / 8); \
+            const int j = (r % (BK / 8)) * 8; \
+            device const half4 *src = (device const half4 *)(wrow + n * K + (k0) + j); \
+            lo[p] = src[0]; \
+            hi[p] = src[1]; \
+        }
+    #define STORE(dst) \
+        for (int p = 0; p < PER; ++p) { \
+            const int r = tid + p * 32 * NSG; \
+            const int n = r / (BK / 8); \
+            const int j = (r % (BK / 8)) * 8; \
+            threadgroup half4 *o = (threadgroup half4 *)((dst) + n * BK + j); \
+            o[0] = lo[p]; \
+            o[1] = hi[p]; \
+        }
+    FETCH(0)
+    STORE(slab)
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int s = 0;
+    for (int k = 0; k < K; k += BK, ++s) {
+        const bool more = k + BK < K;
+        if (more) {
+            FETCH(k + BK)
+        }
+        auto sa = ta.slice(k, tg.y * BM);
+        if (s & 1) {
+            op.run(sa, tw1, acc);
+        } else {
+            op.run(sa, tw0, acc);
+        }
+        if (more) {
+            STORE(slab + ((s + 1) & 1) * BN * BK)
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    #undef FETCH
+    #undef STORE
+    auto mc = tc.slice(tg.x * BN, tg.y * BM);
+    acc.store(mc);
+}
+
+template [[host_name("nt_whole")]] [[kernel]] decltype(nt_whole<64, 64, 4>) nt_whole<64, 64, 4>;
+template [[host_name("nt_loop_32")]] [[kernel]] decltype(nt_loop<64, 64, 32, 4>) nt_loop<64, 64, 32, 4>;
+template [[host_name("nt_loop_64")]] [[kernel]] decltype(nt_loop<64, 64, 64, 4>) nt_loop<64, 64, 64, 4>;
+template [[host_name("nt_staged_32")]] [[kernel]] decltype(nt_staged<64, 64, 32, 4>) nt_staged<64, 64, 32, 4>;
+template [[host_name("nt_staged_64")]] [[kernel]] decltype(nt_staged<64, 64, 64, 4>) nt_staged<64, 64, 64, 4>;
+"#;
+
+    /// One of `SOURCE_STAGE`'s kernels as a candle op: `a` f16 `[M, K]`, `w`
+    /// f16 `[N, K]`, out f32 `[M, N]`, 64 × 64 tiles over four SIMD groups.
+    /// `slabs` is the threadgroup memory it wants, in `64 × bk` slabs.
+    #[derive(Clone)]
+    struct MppNt {
+        pipe: ComputePipeline,
+        bk: usize,
+        slabs: usize,
+        poison: bool,
+    }
+
+    impl CustomOp2 for MppNt {
+        fn name(&self) -> &'static str {
+            "mpp_nt"
+        }
+
+        fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout)
+         -> candle_core::Result<(CpuStorage, Shape)> {
+            candle_core::bail!("mpp_nt runs on Metal only")
+        }
+
+        fn metal_fwd(&self, a: &MetalStorage, la: &Layout, w: &MetalStorage, lw: &Layout)
+         -> candle_core::Result<(MetalStorage, Shape)> {
+            let (m, k) = la.shape().dims2()?;
+            let (n, kw) = lw.shape().dims2()?;
+            if k != kw || m % 64 != 0 || n % 64 != 0 || !la.is_contiguous() || !lw.is_contiguous() {
+                candle_core::bail!("mpp_nt: [{m}, {k}] x [{n}, {kw}] does not fit");
+            }
+            let dev = a.device();
+            let out = output(dev, m * n * 4, self.poison)?;
+            let guard = dev.command_encoder()?;
+            let enc: &ComputeCommandEncoder = guard.as_ref();
+            enc.set_compute_pipeline_state(&self.pipe);
+            enc.set_input_buffer(0, Some(a.buffer()), la.start_offset() * 2);
+            enc.set_input_buffer(1, Some(w.buffer()), lw.start_offset() * 2);
+            enc.set_output_buffer(2, Some(&out), 0);
+            enc.set_bytes(3, &(m as i32));
+            enc.set_bytes(4, &(n as i32));
+            enc.set_bytes(5, &(k as i32));
+            if self.slabs > 0 {
+                enc.set_threadgroup_memory_length(0, self.slabs * 64 * self.bk * 2);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize { width: n / 64, height: m / 64, depth: 1 },
+                MTLSize { width: 32 * 4, height: 1, depth: 1 },
+            );
+            Ok((MetalStorage::new(out, dev.clone(), m * n, DType::F32), Shape::from((m, n))))
+        }
+    }
+
     /// `SOURCE_Q8`'s tiles: rows of `C`, columns, the `K` step, SIMD groups.
     const Q8_TILES: [(usize, usize, usize, usize); 5] =
         [(64, 64, 32, 4), (64, 64, 64, 4), (128, 64, 64, 4), (128, 128, 32, 8), (128, 128, 64, 8)];
@@ -483,6 +687,12 @@ TILES(float, f32)
         opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
         let lib = md.metal_device().new_library_with_source(SOURCE, Some(&opts))?;
         let lib_q8 = md.metal_device().new_library_with_source(SOURCE_Q8, Some(&opts))?;
+        let lib_stage = md.metal_device().new_library_with_source(SOURCE_STAGE, Some(&opts))?;
+        let op_nt = |name: &str, bk: usize, slabs: usize| -> Result<MppNt, Box<dyn std::error::Error>> {
+            let f = lib_stage.get_function(name, None)?;
+            Ok(MppNt { pipe: md.metal_device().new_compute_pipeline_state_with_function(&f)?, bk, slabs,
+                       poison: false })
+        };
         let op = |tn: &str, tile: (usize, usize, usize)| -> Result<Mpp, Box<dyn std::error::Error>> {
             let (bm, bn, nsg) = tile;
             let f = lib.get_function(&format!("mm_{tn}_{bm}x{bn}_{nsg}"), None)?;
@@ -497,10 +707,12 @@ TILES(float, f32)
                        poison: false, db })
         };
 
-        // `dense`, `q8`, or both when no argument is given.
+        // `dense`, `q8`, or both when no argument is given; `stage` for
+        // where the Q8_0 kernel's time goes, and nothing else.
         let only = std::env::args().nth(1);
-        let dense = only.as_deref() != Some("q8");
-        let q8 = only.as_deref() != Some("dense");
+        let stage = only.as_deref() == Some("stage");
+        let dense = only.is_none() || only.as_deref() == Some("dense");
+        let q8 = only.is_none() || only.as_deref() == Some("q8");
 
         // One timed run of `f`: `reps` calls behind one sync, in ms per call.
         let (rounds, reps) = (7, 5);
@@ -533,10 +745,13 @@ TILES(float, f32)
             }
             Ok((median(tb), median(tc), median(r)))
         };
-        let row = |what: String, (tb, tc, x): (f64, f64, f64), tflops: f64, e: f32, apart: f32| {
+        // `apart` is `None` where there is no candle output of the same
+        // product to compare with.
+        let row = |what: String, (tb, tc, x): (f64, f64, f64), tflops: f64, e: f32, apart: Option<f32>| {
             let verdict = if !(e <= 1e-2) { "  WRONG" } else { "" };
+            let apart = apart.map(|a| format!("  vs candle {a:.1e}")).unwrap_or_default();
             println!("  {what:28} {tc:7.2} ms {tflops:5.1} TFLOP/s  candle {tb:7.2} ms  {x:4.2}x  \
-                      err {e:.1e}  vs candle {apart:.1e}{verdict}");
+                      err {e:.1e}{apart}{verdict}");
         };
 
         let shapes = [
@@ -566,6 +781,37 @@ TILES(float, f32)
             let theirs_q8 = q.forward(&a32)?;
             println!("  candle q8_0, f32 in: err {:.1e}", err(&theirs_q8, &want)?);
 
+            if stage {
+                // Everything raced against the Q8_0 kernel `mpp.rs` runs, so
+                // the "candle" column below is that kernel, and a ratio over
+                // 1 means faster than it. Raced, not compared across rows:
+                // the "gap to dense" this was meant to explain turned out to
+                // be two numbers from different minutes, and in the same
+                // rounds there is next to none at the DiT's shapes.
+                let wq = Tensor::from_slice(&blocks, blocks.len(), &dev)?;
+                let a16 = a32.to_dtype(DType::F16)?;
+                let w16 = b32.t()?.contiguous()?.to_dtype(DType::F16)?;
+                let prod = op_q8("f16", (64, 64, 32, 4), n, true)?;
+                let base = || a16.apply_op2_no_bwd(&wq, &prod);
+                for (what, name, bk, slabs) in [
+                    ("f16, whole K from device", "nt_whole", 32, 0),
+                    ("f16, K by 32 from device", "nt_loop_32", 32, 0),
+                    ("f16, K by 64 from device", "nt_loop_64", 64, 0),
+                    ("f16, K by 32, staged", "nt_staged_32", 32, 2),
+                    ("f16, K by 64, staged", "nt_staged_64", 64, 2),
+                ] {
+                    if k % bk != 0 {
+                        continue;
+                    }
+                    let nt = op_nt(name, bk, slabs)?;
+                    let ours = a16.apply_op2_no_bwd(&w16, &MppNt { poison: true, ..nt.clone() })?;
+                    let e = err(&ours, &want)?;
+                    let r = race(&base, &|| a16.apply_op2_no_bwd(&w16, &nt))?;
+                    row(what.to_string(), r, tflops(r.1), e, None);
+                }
+                continue;
+            }
+
             if q8 {
                 let wq = Tensor::from_slice(&blocks, blocks.len(), &dev)?;
                 // kvad's activations are f32, so the f16 kernels are timed
@@ -592,7 +838,7 @@ TILES(float, f32)
                             let a = if an == "f16" { a32.to_dtype(DType::F16)? } else { a32.clone() };
                             a.apply_op2_no_bwd(&wq, &mpp)
                         })?;
-                        row(format!("q8 {an} in {bm}x{bn}x{bk}/{nsg}sg"), r, tflops(r.1), e, apart);
+                        row(format!("q8 {an} in {bm}x{bn}x{bk}/{nsg}sg"), r, tflops(r.1), e, Some(apart));
                     }
                 }
 
@@ -610,7 +856,7 @@ TILES(float, f32)
                     let e = err(&ours, &want)?;
                     let apart = err(&ours, &a16.apply_op2_no_bwd(&wq, &one)?)?;
                     let r = race(&|| a16.apply_op2_no_bwd(&wq, &one), &|| a16.apply_op2_no_bwd(&wq, &two))?;
-                    row(format!("q8db {bm}x{bn}x{bk}/{nsg}sg vs 1"), r, tflops(r.1), e, apart);
+                    row(format!("q8db {bm}x{bn}x{bk}/{nsg}sg vs 1"), r, tflops(r.1), e, Some(apart));
                 }
             }
             if !dense {
@@ -636,7 +882,7 @@ TILES(float, f32)
                     // and never much more.
                     let apart = err(&ours, &theirs)?;
                     let r = race(&|| a.matmul(&b), &|| a.apply_op2_no_bwd(&b, &mpp))?;
-                    row(format!("matmul2d {tn} {bm}x{bn}/{nsg}sg"), r, tflops(r.1), e, apart);
+                    row(format!("matmul2d {tn} {bm}x{bn}/{nsg}sg"), r, tflops(r.1), e, Some(apart));
                 }
             }
         }

@@ -608,7 +608,7 @@ impl QwenImage {
         let vault = Vault::open_as(&format!("{repo}/text_encoder"), &paths, json!({ "component": "text_encoder" }), quant, progress);
         let mut vault = vault;
         let text = {
-            let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault), dtype };
+            let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
             let r = open(&paths, DType::F32)?;
             let text = TextEncoder::load(&cx, &r, &config)?;
             params += finish("text encoder", &paths, &r)? - text.unused;
@@ -622,7 +622,7 @@ impl QwenImage {
         let shape = json!({ "component": "transformer", "layers": dcfg.layers, "width": dcfg.width() });
         let mut vault = Vault::open_as(&format!("{repo}/transformer"), &paths, shape, quant, progress);
         let dit = {
-            let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault), dtype };
+            let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
             let r = open(&paths, DType::F32)?;
             let dit = Dit::load(&cx, &r, dcfg)?;
             params += finish("transformer", &paths, &r)?;

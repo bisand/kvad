@@ -22,3 +22,11 @@ kvad = { path = "../llm" }
 # language model's, and there is no `Llm` around it to do it for them. The
 # same crate and version `kvad` already builds.
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+
+# `src/mpp.rs` compiles a Metal 4 kernel of its own and dispatches it on
+# candle's device, and so does `examples/neural_accel.rs`. candle keeps these
+# types to itself; the versions are the ones it already pulls in, so nothing
+# new is built.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-metal-kernels = "0.11.0"
+objc2-metal = "0.3.2"

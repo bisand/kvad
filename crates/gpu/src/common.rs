@@ -387,6 +387,89 @@ fn no_head() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The attention cache
+// ---------------------------------------------------------------------------
+
+/// One layer's keys and values for every position so far, grown in place.
+///
+/// This was a pair of tensors rebuilt with `Tensor::cat` every step, and
+/// `cat` copies both whole to add one position: the cache is copied once a
+/// token, so a reply costs quadratic time in its context.
+/// `examples/decode_breakdown` measured it at 0.14 ms a token at 128
+/// positions of Qwen2.5-1.5B and 0.44 ms at 2,048, still growing.
+///
+/// Now each is a buffer with room to spare. A step writes its positions into
+/// place with `slice_set`, and attention reads a `narrow` view of the part
+/// in use. That view is not contiguous, and it needs not be: the fused
+/// kernel takes the cache's strides, and the written-out path makes its own
+/// contiguous copy of the transpose it wants anyway. When the room runs out
+/// the buffer doubles, so a position is copied a handful of times over a
+/// conversation rather than once per token after it, and the memory held is
+/// never more than twice what is in use.
+///
+/// `axis` is the position axis: 2 for `[1, heads, seq, head_dim]`, 0 for
+/// DeepSeek's compressed `[seq, width]`.
+pub(crate) struct KvCache {
+    k: Option<Tensor>,
+    v: Option<Tensor>,
+    len: usize,
+    axis: usize,
+}
+
+impl KvCache {
+    /// Positions the first buffer holds, so that a short exchange never grows.
+    const FIRST: usize = 256;
+
+    pub(crate) fn new(axis: usize) -> Self {
+        KvCache { k: None, v: None, len: 0, axis }
+    }
+
+    /// Positions held.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Add `k` and `v`'s positions after the ones held, and return all of
+    /// them: views onto the buffers, not copies.
+    pub(crate) fn push(&mut self, k: &Tensor, v: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+        let (axis, len) = (self.axis, self.len);
+        let m = k.dim(axis)?;
+        let grow = |held: &Option<Tensor>, new: &Tensor| -> candle_core::Result<Tensor> {
+            let room = held.as_ref().map_or(Ok(0), |b| b.dim(axis))?;
+            let buf = match held {
+                Some(b) if len + m <= room => b.clone(),
+                _ => {
+                    let mut shape = new.dims().to_vec();
+                    shape[axis] = (len + m).max(2 * room).max(Self::FIRST);
+                    let bigger = Tensor::zeros(shape, new.dtype(), new.device())?;
+                    if let Some(b) = held {
+                        bigger.slice_set(b, axis, 0)?;
+                    }
+                    bigger
+                }
+            };
+            buf.slice_set(&new.contiguous()?, axis, len)?;
+            Ok(buf)
+        };
+        let (kb, vb) = (grow(&self.k, k)?, grow(&self.v, v)?);
+        self.len = len + m;
+        let views = (kb.narrow(axis, 0, self.len)?, vb.narrow(axis, 0, self.len)?);
+        (self.k, self.v) = (Some(kb), Some(vb));
+        Ok(views)
+    }
+
+    /// Forget everything after `len` positions. The room stays for the next
+    /// turn of a conversation, except at zero, which gives the memory back.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+        if self.len == 0 {
+            (self.k, self.v) = (None, None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reading the checkpoint, and noticing what was not read
 // ---------------------------------------------------------------------------
 
@@ -675,4 +758,56 @@ mod tests {
         assert_eq!(got[0], whole[10]);
         assert_eq!(got[29], whole[39]);
     }
+
+    /// The cache holds exactly what `cat` would have: through growth, after
+    /// a rewind, and from pushes of every size, on the axes both layouts use.
+    #[test]
+    fn the_cache_holds_what_cat_would() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(m) = Device::new_metal(0) {
+            devices.push(m);
+        }
+        for dev in &devices {
+            for axis in [2usize, 0] {
+                let shape = |n: usize| if axis == 2 { vec![1, 2, n, 4] } else { vec![n, 6] };
+                let chunk = |n: usize, seed: f32| {
+                    let count: usize = shape(n).iter().product();
+                    let v: Vec<f32> = (0..count).map(|i| (i as f32 * 0.37 + seed).sin()).collect();
+                    Tensor::from_vec(v, shape(n), dev).unwrap()
+                };
+                let mut cache = KvCache::new(axis);
+                let (mut ks, mut vs): (Vec<Tensor>, Vec<Tensor>) = (vec![], vec![]);
+                // One big prompt, single tokens across the first growth, a
+                // chunk across the second, a rewind, and more after it.
+                let mut steps: Vec<usize> = vec![200];
+                steps.extend(std::iter::repeat(1).take(80));
+                steps.push(300);
+                for (i, &n) in steps.iter().enumerate() {
+                    let (k, v) = (chunk(n, i as f32), chunk(n, 100.0 + i as f32));
+                    let (gk, gv) = cache.push(&k, &v).unwrap();
+                    ks.push(k);
+                    vs.push(v);
+                    let want_k = Tensor::cat(&ks.iter().collect::<Vec<_>>(), axis).unwrap();
+                    let want_v = Tensor::cat(&vs.iter().collect::<Vec<_>>(), axis).unwrap();
+                    assert_eq!(cache.len(), want_k.dim(axis).unwrap());
+                    let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert_eq!(flat(&gk.contiguous().unwrap()), flat(&want_k), "axis {axis}, step {i}");
+                    assert_eq!(flat(&gv.contiguous().unwrap()), flat(&want_v), "axis {axis}, step {i}");
+                }
+                // Rewind to 150, then push again: the tail is written over.
+                cache.truncate(150);
+                let (k, v) = (chunk(3, 7.0), chunk(3, 8.0));
+                let (gk, _) = cache.push(&k, &v).unwrap();
+                let whole = Tensor::cat(&ks.iter().collect::<Vec<_>>(), axis).unwrap();
+                let want = Tensor::cat(&[&whole.narrow(axis, 0, 150).unwrap(), &k], axis).unwrap();
+                assert_eq!(
+                    gk.contiguous().unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    want.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                );
+                cache.truncate(0);
+                assert_eq!(cache.len(), 0);
+            }
+        }
+    }
+
 }

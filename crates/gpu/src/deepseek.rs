@@ -55,7 +55,7 @@
 //! sixty-four run and fifty-eight are never touched.
 
 use crate::common::{
-    causal_mask, check_block, embedding, label, unread, unread_error, Embed, Loader, Proj, Reader,
+    causal_mask, check_block, embedding, label, unread, unread_error, Embed, KvCache, Loader, Proj, Reader,
     Stored,
 };
 use crate::ffn::{Ffn, Mlp, Moe};
@@ -113,7 +113,7 @@ pub struct GpuDeepSeek {
     sin: Tensor,
     /// Per layer, the compressed vector and the shared rotated key:
     /// `[1, 1, seq, kv_lora]` and `[1, 1, seq, qk_rope]`.
-    cache: Vec<Option<(Tensor, Tensor)>>,
+    cache: Vec<KvCache>,
     pos: usize,
 }
 
@@ -244,7 +244,7 @@ impl GpuDeepSeek {
         let sin = Tensor::from_slice(sin, (spec.n_ctx, half), &device)?.to_dtype(compute)?;
 
         Ok(GpuDeepSeek {
-            cache: (0..spec.n_layer).map(|_| None).collect(),
+            cache: (0..spec.n_layer).map(|_| KvCache::new(0)).collect(),
             blocks,
             embed,
             head,
@@ -269,15 +269,7 @@ impl GpuDeepSeek {
         if len >= self.pos {
             return Ok(());
         }
-        if len == 0 {
-            self.cache.iter_mut().for_each(|s| *s = None);
-        } else {
-            for slot in self.cache.iter_mut() {
-                if let Some((c, pe)) = slot.take() {
-                    *slot = Some((c.narrow(0, 0, len)?, pe.narrow(0, 0, len)?));
-                }
-            }
-        }
+        self.cache.iter_mut().for_each(|c| c.truncate(len));
         self.pos = len;
         Ok(())
     }
@@ -344,11 +336,7 @@ impl GpuDeepSeek {
                 .rotate(&kv.narrow(1, lat, rope_dim)?.reshape((1, 1, m, rope_dim))?, pos0, m)?
                 .reshape((m, rope_dim))?;
 
-            let (c, k_pe) = match self.cache[l].take() {
-                None => (c, k_pe),
-                Some((pc, ppe)) => (Tensor::cat(&[&pc, &c], 0)?, Tensor::cat(&[&ppe, &k_pe], 0)?),
-            };
-            self.cache[l] = Some((c.clone(), k_pe.clone()));
+            let (c, k_pe) = self.cache[l].push(&c, &k_pe)?;
             let total = pos0 + m;
 
             // ---- Score -----------------------------------------------------

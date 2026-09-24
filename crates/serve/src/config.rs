@@ -74,11 +74,13 @@ pub struct Server {
     /// for naming no model. A service that comes back after a reboot should
     /// come back ready.
     ///
-    /// On by default, and the cost is honest rather than hidden: the model
-    /// that was active when the server stopped is in memory again a minute
-    /// later, whether or not anybody turns up. A machine that would rather
-    /// spend that memory on something else sets this to false, and the first
-    /// request loads as before.
+    /// Off by default. The model that was active when the server stopped
+    /// would be in memory again a minute later whether or not anybody turns
+    /// up, and a restart is not the moment to decide to spend that memory —
+    /// or to start a load that has to be waited out before anything else on
+    /// the queue runs. With it off, the first request loads, as it would
+    /// with `load_on_request`. A machine that should come back ready sets
+    /// this to true.
     ///
     /// It is here rather than in the database because it is read once, at
     /// startup, before there is a request to change it.
@@ -236,7 +238,7 @@ impl Default for Server {
     fn default() -> Self {
         Server {
             bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
-            autoload: true,
+            autoload: false,
             load_on_request: true,
             memory_gb: None,
             context: None,
@@ -385,7 +387,7 @@ mod tests {
         assert_eq!(cfg.server.bind.port(), DEFAULT_PORT);
         assert_eq!(cfg.auth.mode, Mode::None);
         assert!(is_loopback(&cfg.server.bind));
-        assert!(cfg.server.autoload, "a service should come back ready by default");
+        assert!(!cfg.server.autoload, "a restart should not load anything unless asked to");
 
         let broken = std::env::temp_dir().join(format!("kvad-broken-{}.toml", std::process::id()));
         std::fs::write(&broken, "[server]\nbind = \"not an address\"\n").unwrap();
@@ -394,14 +396,14 @@ mod tests {
         std::fs::remove_file(&broken).unwrap();
     }
 
-    /// Turning the autoload off has to be possible without restating the
+    /// Turning the autoload on has to be possible without restating the
     /// bind address, which is the whole point of `default` on the section.
     #[test]
-    fn the_autoload_can_be_turned_off_on_its_own() {
+    fn the_autoload_can_be_turned_on_on_its_own() {
         let path = std::env::temp_dir().join(format!("kvad-autoload-{}.toml", std::process::id()));
-        std::fs::write(&path, "[server]\nautoload = false\n").unwrap();
+        std::fs::write(&path, "[server]\nautoload = true\n").unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert!(!cfg.server.autoload);
+        assert!(cfg.server.autoload);
         assert_eq!(cfg.server.bind.port(), DEFAULT_PORT, "the bind default was lost");
         std::fs::remove_file(&path).unwrap();
     }

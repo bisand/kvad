@@ -910,7 +910,7 @@ fn pull(args: Args) -> Res<()> {
     // Read the config first: no point downloading gigabytes for an
     // architecture we cannot run.
     eprintln!("pulling {repo}");
-    let files = weights::fetch(&repo)?;
+    let files = weights::pull(&repo)?;
     let spec = Spec::from_json(&files.config)?;
     println!("  {}", spec.summary());
 

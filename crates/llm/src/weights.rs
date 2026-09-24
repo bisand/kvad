@@ -351,8 +351,9 @@ impl hf_hub::progress::ProgressHandler for Relay {
     }
 }
 
-/// Download (or reuse from the local cache) everything needed to run `repo_id`,
-/// reporting progress to stderr. A directory is used as it is.
+/// Everything needed to run `repo_id`, from the Hub cache on this machine
+/// where it is there and downloaded where it is not, reporting progress to
+/// stderr. A directory is used as it is.
 pub fn fetch(repo_id: &str) -> Res<ModelFiles> {
     fetch_with(repo_id, &mut |msg| eprintln!("  {msg}"))
 }
@@ -366,11 +367,99 @@ pub fn fetch_with(repo_id: &str, progress: &mut dyn FnMut(&str)) -> Res<ModelFil
 }
 
 /// As [`fetch_with`], and also reporting [`Fetch`] events to `watch`.
+///
+/// Loading is not updating. A file the cache has is used without asking the
+/// Hub whether a newer one exists, because asking is a request per file, and
+/// `hf-hub` retries each one before it falls back to the cache it could have
+/// read in the first place — for three minutes a file when DNS for the Hub
+/// is timing out. With huggingface.co
+/// unreachable, a service restart spent nine minutes on three such probes
+/// for a 14B model the cache held in full, and had loaded nothing.
+/// [`pull_watched`] is the one that asks.
 pub fn fetch_watched(
     repo_id: &str,
     progress: &mut dyn FnMut(&str),
     watch: &Watcher,
 ) -> Res<ModelFiles> {
+    resolve(repo_id, progress, watch, Ask::CacheFirst)
+}
+
+/// As [`fetch`], but asking the Hub for every file, so that a model already
+/// in the cache is brought up to the repo's latest revision. What `kvad pull`
+/// means.
+pub fn pull(repo_id: &str) -> Res<ModelFiles> {
+    pull_watched(repo_id, &mut |msg| eprintln!("  {msg}"), &Watcher::none())
+}
+
+/// As [`pull`], with progress to a callback and [`Fetch`] events to `watch`.
+pub fn pull_watched(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<ModelFiles> {
+    resolve(repo_id, progress, watch, Ask::Hub)
+}
+
+/// The files of `repo_id` if all of them are on this machine already — a
+/// directory, or the Hub cache — and `None` if any would need a download.
+/// Never touches the network.
+pub fn in_cache(repo_id: &str) -> Option<ModelFiles> {
+    resolve(repo_id, &mut |_| {}, &Watcher::none(), Ask::CacheOnly).ok()
+}
+
+/// What the Hub cache on this machine knows about one file of a repo, found
+/// without asking the Hub.
+///
+/// Three answers rather than two, because "not in the cache" means two
+/// different things. `hf-hub` writes a `.no_exist` marker when the Hub says a
+/// file is not in the repo, so a file the cache has already asked about and
+/// been told is missing can be treated as missing — a language model has no
+/// `model_index.json`, a split checkpoint no `model.safetensors` — while one
+/// it has never asked about can only be found out by asking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cached {
+    /// On disk, at this path.
+    Here(PathBuf),
+    /// The Hub said, at the revision the cache holds, that there is no such file.
+    Absent,
+    /// Nothing is known here; only the Hub can say.
+    Unknown,
+}
+
+/// [`Cached`] for `filename` in `repo_id`. A directory standing in for the
+/// repo is complete by definition, so a file it lacks is [`Cached::Absent`].
+pub fn cached(repo_id: &str, filename: &str) -> Cached {
+    if let Some(dir) = local_dir(repo_id) {
+        let path = dir.join(filename);
+        return match path.is_file() {
+            true => Cached::Here(path),
+            false => Cached::Absent,
+        };
+    }
+    let Some((owner, name)) = repo_id.split_once('/') else { return Cached::Unknown };
+    match hf_hub::HFClientSync::new() {
+        Ok(client) => look(&client.model(owner, name), filename),
+        Err(_) => Cached::Unknown,
+    }
+}
+
+fn look(repo: &hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>, filename: &str) -> Cached {
+    match repo.download_file().filename(filename.to_string()).local_files_only(true).send() {
+        Ok(path) => Cached::Here(path),
+        Err(hf_hub::HFError::EntryNotFound { .. }) => Cached::Absent,
+        Err(_) => Cached::Unknown,
+    }
+}
+
+/// How far [`resolve`] may go for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// The cache, and nothing else.
+    CacheOnly,
+    /// The cache, and the Hub for what the cache cannot answer.
+    CacheFirst,
+    /// The Hub for every file, as a pull does. `hf-hub` still skips the
+    /// download of a file whose etag has not changed.
+    Hub,
+}
+
+fn resolve(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher, ask: Ask) -> Res<ModelFiles> {
     if let Some(dir) = local_dir(repo_id) {
         progress(match trained_name(&dir) {
             Some(_) => "a model trained here; nothing to fetch",
@@ -399,6 +488,7 @@ pub fn fetch_watched(
 
     let repo = &repo;
     let progress = std::cell::RefCell::new(progress);
+    let downloaded = std::cell::Cell::new(false);
     // `hf-hub` emits nothing at all when no handler is set, so a fetch nobody
     // is watching pays for none of this.
     let handler = |filename: &str| {
@@ -410,8 +500,15 @@ pub fn fetch_watched(
         watch.emit(Fetch::Fetched { file: filename.to_string() });
         path
     };
-    let get = |filename: &str| -> Res<PathBuf> {
-        (progress.borrow_mut())(&format!("fetching {filename}"));
+    let cache = |filename: &str| match ask {
+        Ask::Hub => Cached::Unknown,
+        _ => look(repo, filename),
+    };
+    let download = |filename: &str| -> Res<PathBuf> {
+        if ask == Ask::CacheOnly {
+            return Err(format!("{repo_id} has no {filename} in the cache here").into());
+        }
+        downloaded.set(true);
         let path = repo
             .download_file()
             .filename(filename.to_string())
@@ -419,44 +516,78 @@ pub fn fetch_watched(
             .send()?;
         Ok(fetched(filename, path))
     };
+    let get = |filename: &str| -> Res<PathBuf> {
+        match cache(filename) {
+            Cached::Here(path) => Ok(fetched(filename, path)),
+            Cached::Absent => Err(format!("{repo_id} has no {filename}").into()),
+            Cached::Unknown => {
+                if ask != Ask::CacheOnly {
+                    (progress.borrow_mut())(&format!("fetching {filename}"));
+                }
+                download(filename)
+            }
+        }
+    };
     let try_get = |filename: &str| -> Option<PathBuf> {
-        let path = repo
-            .download_file()
-            .filename(filename.to_string())
-            .maybe_progress(handler(filename))
-            .send()
-            .ok()?;
-        Some(fetched(filename, path))
+        match cache(filename) {
+            Cached::Here(path) => Some(fetched(filename, path)),
+            Cached::Absent => None,
+            Cached::Unknown => download(filename).ok(),
+        }
+    };
+    let sharded = |index: PathBuf| -> Res<Vec<PathBuf>> {
+        let shards = shard_names(&index)?;
+        (progress.borrow_mut())(&format!("checkpoint is split across {} shards", shards.len()));
+        watch.emit(Fetch::Shards(shards.len()));
+        shards.iter().map(|s| get(s)).collect()
+    };
+    // Every shard an index in the cache names is in the cache too. The fetch
+    // that put them there asked for `model.safetensors` first and would have
+    // stopped at it, so a complete set of shards also says that there is no
+    // single file — whether or not a `.no_exist` marker is there to say so.
+    let whole_set = || -> Option<PathBuf> {
+        let Cached::Here(index) = cache("model.safetensors.index.json") else { return None };
+        let shards = shard_names(&index).ok()?;
+        shards.iter().all(|s| matches!(cache(s), Cached::Here(_))).then_some(index)
     };
 
     // Single file, or a shard index naming several.
-    let weights = match try_get("model.safetensors") {
-        Some(single) => vec![single],
-        None => {
-            let shards = shard_names(&get("model.safetensors.index.json")?)?;
-            (progress.borrow_mut())(&format!("checkpoint is split across {} shards", shards.len()));
-            watch.emit(Fetch::Shards(shards.len()));
-            shards.iter().map(|s| get(s)).collect::<Res<Vec<_>>>()?
-        }
+    let weights = match cache("model.safetensors") {
+        Cached::Here(single) => vec![fetched("model.safetensors", single)],
+        other => match (other, whole_set()) {
+            (_, Some(index)) => sharded(index)?,
+            (Cached::Absent, None) => sharded(get("model.safetensors.index.json")?)?,
+            _ => match try_get("model.safetensors") {
+                Some(single) => vec![single],
+                None => sharded(get("model.safetensors.index.json")?)?,
+            },
+        },
     };
 
-    Ok(ModelFiles {
+    let files = ModelFiles {
         weights,
         tokenizer: get("tokenizer.json")?,
         config: get("config.json")?,
         tokenizer_config: try_get("tokenizer_config.json"),
         generation_config: try_get("generation_config.json"),
-    })
+    };
+    if !downloaded.get() {
+        (progress.borrow_mut())("in the Hub cache on this machine; nothing to fetch");
+    }
+    Ok(files)
 }
 
-/// One file of a repo, by its path inside the repo, downloaded or reused from
-/// the cache — or from a directory standing in for the repo.
+/// One file of a repo, by its path inside the repo, from the cache or
+/// downloaded — or from a directory standing in for the repo.
 ///
 /// [`fetch_watched`] knows what a language model's repo holds and asks for
 /// exactly that. A diffusion pipeline's repo is laid out differently — a
 /// directory per model, `unet/diffusion_pytorch_model.fp16.safetensors`
 /// beside `text_encoder/model.fp16.safetensors` — and the caller is the only
 /// one who knows which of its several variants it wants, so it names them.
+///
+/// The cache is read first, as [`fetch_watched`] reads it, and a file the Hub
+/// has already said is not in the repo is an error without asking again.
 pub fn fetch_file(repo_id: &str, filename: &str, watch: &Watcher) -> Res<PathBuf> {
     if let Some(dir) = local_dir(repo_id) {
         let path = dir.join(filename);
@@ -468,10 +599,17 @@ pub fn fetch_file(repo_id: &str, filename: &str, watch: &Watcher) -> Res<PathBuf
     let (owner, name) =
         repo_id.split_once('/').ok_or_else(|| format!("`{repo_id}` is not a directory here or a Hub repo id"))?;
     let client = hf_hub::HFClientSync::new()?;
-    let progress = watch
-        .is_listening()
-        .then(|| hf_hub::progress::Progress::new(Relay { file: filename.to_string(), watch: watch.clone() }));
-    let path = client.model(owner, name).download_file().filename(filename.to_string()).maybe_progress(progress).send()?;
+    let repo = client.model(owner, name);
+    let path = match look(&repo, filename) {
+        Cached::Here(path) => path,
+        Cached::Absent => return Err(format!("{repo_id} has no {filename}").into()),
+        Cached::Unknown => {
+            let progress = watch
+                .is_listening()
+                .then(|| hf_hub::progress::Progress::new(Relay { file: filename.to_string(), watch: watch.clone() }));
+            repo.download_file().filename(filename.to_string()).maybe_progress(progress).send()?
+        }
+    };
     watch.emit(Fetch::Fetched { file: filename.to_string() });
     Ok(path)
 }

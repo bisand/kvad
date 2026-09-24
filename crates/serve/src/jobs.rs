@@ -413,7 +413,7 @@ pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>) -> Res<Job> {
         let mut progress = |message: &str| {
             let _ = say.send(Update::Status { message: message.to_string() });
         };
-        let outcome = kvad::weights::fetch_watched(&repo, &mut progress, &watch);
+        let outcome = kvad::weights::pull_watched(&repo, &mut progress, &watch);
 
         // `hf-hub` has no way to be interrupted, so a cancelled download is
         // one that is noticed as finished rather than stopped. Saying so is

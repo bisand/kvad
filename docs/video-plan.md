@@ -825,11 +825,12 @@ The same kind of checks apply here:
 3. **The decoders**, with per-component fixtures: the conv video VAE decoder
    (where conv3d, chunking and tiling are proven), then audio VAE → vocoder →
    BWE. Done in #57; see the measurements below.
-4. **Text:** Gemma 4, the aggregate projection and the connectors. In
-   progress; see below.
+4. **Text:** Gemma 4, the aggregate projection and the connectors. Done in
+   #68; see below.
 5. **The DiT and one-stage distilled sampling** as `examples/ltx.rs`: prompt
    in, MP4 on disk, no server. **The milestone is one clip, with sound**, at
-   512×320 × 25 frames first and 768×512 × 121 second.
+   512×320 × 25 frames first and 768×512 × 121 second. Done in #70: both
+   clips, with sound; see below.
 6. **Two stages:** the upsampler and stage 2.
 7. **The service:** the `video` kind, `/v1/videos`, storage, the CLI, the UI
    page. #51 has the shape. Video files are served with Range support, and
@@ -872,7 +873,7 @@ every 10 dB is ten times less error power.
   numbers when its *left* operand is broadcast along the batch. Metal is
   unaffected. A test in `ltx_audio.rs` reports whether that is still so.
 
-**Step 4, the text path (in progress).**
+**Step 4, the text path (#68).**
 - **Tokens are identical** to LTX's own tokenizer, including a prompt cut at
   1024 tokens and one that mixes scripts and stray whitespace.
 - **Gemma's first six layers in f32 are exact**: 108–115 dB at every hidden
@@ -901,7 +902,63 @@ every 10 dB is ten times less error power.
 - **The memory table above assumed the connectors at q8.** They are dense
   bf16 for now, about 4 GB, so the text phase at q8 is about 19 GB rather
   than 16. Worth quantising if the phase has to shrink.
-- **Still to come:** the aggregate projections and connectors against the
-  reference (they are in the DiT's 42 GB file, which is still
-  downloading), and the whole path from prompt to contexts.
+- **The projections and connectors in f32 are exact**: 115.6 dB (video)
+  and 117.6 dB (audio), from the reference's own hidden states.
+- **The whole path on Metal**, against the reference's f32 contexts from its
+  bf16 states: 46.6 / 45.4 dB in bf16 and 46.3 / 44.0 dB at q8, cosine
+  0.99997. (These are after step 5's GELU fix; before it, 44.7 / 46.5 and
+  45.7 / 43.5.) q8's extra drift inside Gemma does not reach the contexts.
+- **q8 is the default for the text path**: 2.75 s rather than 2.43 s for
+  the longest prompt, at 10 GB less.
+
+**Step 5, the DiT and one stage (#70).**
+- **The DiT's first two blocks and its output heads in f32 are exact**, at
+  512×320 × 25 and σ = 0.9875: positions and tokens identical, 115–120 dB
+  on the CPU and 118–123 on Metal. Two blocks of 386 M parameters and the
+  0.43 B around them are 1.2 B, which the reference can run in f32 on the
+  CPU; the other 46 blocks are more of the same block.
+- **In bf16 on Metal they are as close as the reference's own bf16:**
+
+  | | video, blocks 0 / 1 | video velocity | audio |
+  |---|---|---|---|
+  | kvad, bf16 | 46.2 / 45.0 dB | 42.0 dB | 44.6–45.1 dB |
+  | kvad, q8 | 44.7 / 45.7 dB | 42.4 dB | 44.0–44.9 dB |
+  | the reference's bf16 on MPS | 46.8 / 46.6 dB | 43.6 dB | 45.5–46.1 dB |
+
+- **candle's Metal GELU in bf16 cost the video stream 8 dB.** Its kernel
+  evaluates the tanh polynomial in the tensor's own type, where PyTorch
+  computes in f32 and rounds once. In the 16 384-wide video feed-forward
+  that alone put block 0 at 38.7 dB. GELU now runs in f32 everywhere in the
+  video code. It changes nothing measurable in Gemma, whose gated MLP was
+  within ±0.4 dB either way.
+- **candle's Metal pool frees a dropped tensor's buffer only at the next
+  `synchronize()`.** "Drop the text phase" (above) therefore needs a
+  synchronise after the drop. Without one, the text path's 13 GB stayed
+  beside the DiT's 20 GB and 768×512 × 121 ran out of memory in its first
+  step at 37 GB.
+- **Two q8 caches under one name overwrite each other**, each finding the
+  other's spec stale and quantising again. The Gemma-only check now has its
+  own name, and a DiT loaded in part is quantised without a cache.
+- **Generations**, on an M5 Pro at q8, seed 1, with a prompt about a golden
+  retriever on a beach at sunset that "barks twice":
+
+  | | 512×320 × 25 | 768×512 × 121 (5 s) |
+  |---|---|---|
+  | Text path, load and encode | 37 s, 2.4 s | 30 s, 0.6 s |
+  | DiT load | 106 s (quantising) | 40 s (from the 20 GB cache) |
+  | A step | 2.9 s | 29 s |
+  | Video decode | 6.8 s | 69 s |
+  | All told | 224 s | 382 s |
+  | Peak resident | 27.7 GB | 37.2 GB |
+
+  The first step of a run after a build or a new cache is slower (50 s at
+  512×320): shaders compile and the cache pages in.
+- **The pictures are right and the sound is plausible.** The dog runs from
+  the waterline to the camera over the whole five seconds. The short clip's
+  sound has two broadband bursts half a second apart. Both clips peak at
+  full scale, and the reference's own decoder and vocoder give the same
+  peak and loudness from the same latents.
+- **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
+  6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
+  profiling before two stages quadruple the tokens.
 

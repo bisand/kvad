@@ -35,6 +35,13 @@
 //!    is the tile's running sum, held in the SIMD groups' registers until
 //!    the end.
 //!
+//! There are two slabs, and step 1 for the next step overlaps step 2 for
+//! this one. Each thread loads the next step's raw blocks into registers
+//! before the multiply, and unpacks them into the other slab after it. That
+//! needs one barrier a step instead of two, and the probe measured it
+//! 1.02–1.09× faster than one slab on every shape it tried, with the same
+//! output bit for bit.
+//!
 //! Edges need no code of their own. `slice` clips a tensor to its extents,
 //! and `matmul2d` and the final store both honour that, so a tile hanging
 //! off the bottom of `A` or the right of `C` reads and writes only what
@@ -87,6 +94,51 @@ struct block_q8_0 {
     int8_t qs[32];
 };
 
+// Each thread's share of a slab: `PER` runs of 8 weights. Adjacent threads
+// take adjacent runs of the same row, so a SIMD group reads a row
+// contiguously.
+constant constexpr int RUN = 8;
+constant constexpr int PER = BN * BK / RUN / (32 * NSG);
+static_assert(PER * RUN * 32 * NSG == BN * BK, "every thread unpacks the same number of runs");
+
+// A step's raw blocks, from device memory into this thread's registers.
+// Rows past `N` read as zeros. The `int8`s sit two bytes into a 34-byte
+// block, so only a packed (byte-aligned) load may read them.
+inline void fetch(device const block_q8_0 *w, int N, int n0, int blocks, int k, ushort tid,
+                  thread half *d, thread char4 *lo, thread char4 *hi) {
+    #pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int r = tid + p * 32 * NSG;
+        const int n = r / (BK / RUN);
+        const int j = (r % (BK / RUN)) * RUN;
+        if (n0 + n < N) {
+            device const block_q8_0 &b = w[(n0 + n) * blocks + k / 32];
+            device const packed_char4 *q = (device const packed_char4 *)(b.qs + j);
+            d[p] = b.d;
+            lo[p] = char4(q[0]);
+            hi[p] = char4(q[1]);
+        } else {
+            d[p] = 0;
+            lo[p] = char4(0);
+            hi[p] = char4(0);
+        }
+    }
+}
+
+// Those registers, as f16 weights, into a slab: `scale × int8`, rounded once.
+inline void unpack(threadgroup half *slab, ushort tid,
+                   thread half *d, thread char4 *lo, thread char4 *hi) {
+    #pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int r = tid + p * 32 * NSG;
+        const int n = r / (BK / RUN);
+        const int j = (r % (BK / RUN)) * RUN;
+        threadgroup half4 *dst = (threadgroup half4 *)(slab + n * BK + j);
+        dst[0] = d[p] * half4(lo[p]);
+        dst[1] = d[p] * half4(hi[p]);
+    }
+}
+
 kernel void mm_q8_0(device half *a [[buffer(0)]],
                     device const block_q8_0 *w [[buffer(1)]],
                     device float *c [[buffer(2)]],
@@ -98,14 +150,17 @@ kernel void mm_q8_0(device half *a [[buffer(0)]],
                     ushort tid [[thread_index_in_threadgroup]]) {
     tensor<device half, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
     tensor<device float, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
-    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw(slab, dextents<int32_t, 2>(BK, BN));
+    // Two slabs: step `s` multiplies from slab `s % 2` while the next step's
+    // weights are unpacked into the other.
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw0(slab, dextents<int32_t, 2>(BK, BN));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw1(slab + BN * BK, dextents<int32_t, 2>(BK, BN));
 
     constexpr auto desc = matmul2d_descriptor(BM, BN, BK, false, true, false,
                                               matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<NSG>> op;
 
     auto ma = ta.slice(0, tg.y * BM);
-    auto acc = op.template get_destination_cooperative_tensor<decltype(ma), decltype(tw), float>();
+    auto acc = op.template get_destination_cooperative_tensor<decltype(ma), decltype(tw0), float>();
     #pragma unroll
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
         if (acc.is_valid_element(i)) {
@@ -113,36 +168,40 @@ kernel void mm_q8_0(device half *a [[buffer(0)]],
         }
     }
 
-    // Runs of 8 weights, adjacent threads on adjacent runs of the same row,
-    // so a SIMD group reads a row contiguously. The `int8`s sit two bytes
-    // into a 34-byte block, so only a packed (byte-aligned) load may read
-    // them; the slab is aligned, so a plain `half4` store may write it.
-    constexpr int RUN = 8;
-    constexpr int RUNS = BN * BK / RUN;
     const int blocks = K / 32;
     const int n0 = tg.x * BN;
-    for (int k = 0; k < K; k += BK) {
-        for (int r = tid; r < RUNS; r += 32 * NSG) {
-            const int n = r / (BK / RUN);
-            const int j = (r % (BK / RUN)) * RUN;
-            threadgroup half4 *dst = (threadgroup half4 *)(slab + n * BK + j);
-            if (n0 + n < N) {
-                device const block_q8_0 &b = w[(n0 + n) * blocks + k / 32];
-                device const packed_char4 *q = (device const packed_char4 *)(b.qs + j);
-                dst[0] = b.d * half4(char4(q[0]));
-                dst[1] = b.d * half4(char4(q[1]));
-            } else {
-                dst[0] = half4(0);
-                dst[1] = half4(0);
-            }
+    half d[PER];
+    char4 lo[PER], hi[PER];
+
+    fetch(w, N, n0, blocks, 0, tid, d, lo, hi);
+    unpack(slab, tid, d, lo, hi);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int s = 0;
+    for (int k = 0; k < K; k += BK, ++s) {
+        const bool more = k + BK < K;
+        // The next step's device reads go out before this step's multiply,
+        // so they are in flight while it runs.
+        if (more) {
+            fetch(w, N, n0, blocks, k + BK, tid, d, lo, hi);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         // The slice runs to the end of `K`; the descriptor's `BK` bounds what
         // this step reads. (The header's comments show a `static_slice` for
-        // this, which the compiler does not have.)
+        // this, which the compiler does not have.) `s` is the same in every
+        // thread, so the whole threadgroup takes the same branch, as
+        // `matmul2d` requires.
         auto sa = ta.slice(k, tg.y * BM);
-        op.run(sa, tw, acc);
-        // The next step overwrites the slab: nobody may still be reading it.
+        if (s & 1) {
+            op.run(sa, tw1, acc);
+        } else {
+            op.run(sa, tw0, acc);
+        }
+        if (more) {
+            unpack(slab + ((s + 1) & 1) * BN * BK, tid, d, lo, hi);
+        }
+        // One barrier does both jobs. The slab written just now is complete
+        // before anyone multiplies from it. And the slab the step after
+        // next will overwrite has been read by everyone: that was this
+        // step's multiply. One slab needed a barrier on each side.
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     auto mc = tc.slice(n0, tg.y * BM);
@@ -266,7 +325,8 @@ impl CustomOp2 for Q8 {
         enc.set_bytes(3, &(m as i32));
         enc.set_bytes(4, &(n as i32));
         enc.set_bytes(5, &(k as i32));
-        enc.set_threadgroup_memory_length(0, BN * 32 * 2);
+        // Two slabs of `BN × 32` halves.
+        enc.set_threadgroup_memory_length(0, 2 * BN * 32 * 2);
         enc.dispatch_thread_groups(
             MTLSize { width: n.div_ceil(BN), height: m.div_ceil(BM), depth: 1 },
             // Apple GPUs run 32 threads to a SIMD group.

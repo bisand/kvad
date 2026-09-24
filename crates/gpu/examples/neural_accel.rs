@@ -258,9 +258,111 @@ kernel void mm_q8(device TA *a [[buffer(0)]],
     acc.store(mc);
 }
 
+// The same product with two slabs, so that unpacking the next step's
+// weights need not wait for this step's multiply to finish:
+// - each thread loads the next step's raw blocks into registers *before*
+//   `matmul2d` runs, so those device reads are in flight while it does;
+// - after the multiply it unpacks them into the slab this step is not
+//   reading;
+// - one barrier then serves both purposes. Everyone has finished reading the
+//   slab that will be written next, and the slab written this step is
+//   complete. The single-slab kernel needs two barriers a step.
+template <int BN, int BK, int NSG, int PER>
+inline void fetch(device const block_q8_0 *wrow, int blocks, int k, ushort tid,
+                  thread half *d, thread char4 *q0, thread char4 *q1) {
+    constexpr int RUN = 8;
+    #pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int r = tid + p * 32 * NSG;
+        const int n = r / (BK / RUN);
+        const int j = (r % (BK / RUN)) * RUN;
+        device const block_q8_0 &b = wrow[n * blocks + (k + j) / 32];
+        device const packed_char4 *q = (device const packed_char4 *)(b.qs + j % 32);
+        d[p] = b.d;
+        q0[p] = char4(q[0]);
+        q1[p] = char4(q[1]);
+    }
+}
+
+template <int BN, int BK, int NSG, int PER>
+inline void unpack(threadgroup half *slab, ushort tid,
+                   thread half *d, thread char4 *q0, thread char4 *q1) {
+    constexpr int RUN = 8;
+    #pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int r = tid + p * 32 * NSG;
+        const int n = r / (BK / RUN);
+        const int j = (r % (BK / RUN)) * RUN;
+        threadgroup half4 *dst = (threadgroup half4 *)(slab + n * BK + j);
+        dst[0] = d[p] * half4(q0[p]);
+        dst[1] = d[p] * half4(q1[p]);
+    }
+}
+
+template <typename TA, int BM, int BN, int BK, int NSG>
+kernel void mm_q8db(device TA *a [[buffer(0)]],
+                    device const block_q8_0 *w [[buffer(1)]],
+                    device float *c [[buffer(2)]],
+                    constant int &M [[buffer(3)]],
+                    constant int &N [[buffer(4)]],
+                    constant int &K [[buffer(5)]],
+                    threadgroup half *slab [[threadgroup(0)]],
+                    uint2 tg [[threadgroup_position_in_grid]],
+                    ushort tid [[thread_index_in_threadgroup]]) {
+    tensor<device TA, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw0(slab, dextents<int32_t, 2>(BK, BN));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw1(slab + BN * BK, dextents<int32_t, 2>(BK, BN));
+
+    constexpr auto desc = matmul2d_descriptor(BM, BN, BK, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+
+    auto ma = ta.slice(0, tg.y * BM);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(ma), decltype(tw0), float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+
+    constexpr int PER = BN * BK / 8 / (32 * NSG);
+    static_assert(PER * 8 * 32 * NSG == BN * BK, "every thread unpacks the same number of runs");
+    const int blocks = K / 32;
+    device const block_q8_0 *wrow = w + tg.x * BN * blocks;
+    half d[PER];
+    char4 q0[PER], q1[PER];
+
+    fetch<BN, BK, NSG, PER>(wrow, blocks, 0, tid, d, q0, q1);
+    unpack<BN, BK, NSG, PER>(slab, tid, d, q0, q1);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int s = 0;
+    for (int k = 0; k < K; k += BK, ++s) {
+        const bool more = k + BK < K;
+        if (more) {
+            fetch<BN, BK, NSG, PER>(wrow, blocks, k + BK, tid, d, q0, q1);
+        }
+        auto sa = ta.slice(k, tg.y * BM);
+        if (s & 1) {
+            op.run(sa, tw1, acc);
+        } else {
+            op.run(sa, tw0, acc);
+        }
+        if (more) {
+            unpack<BN, BK, NSG, PER>(slab + ((s + 1) & 1) * BN * BK, tid, d, q0, q1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    auto mc = tc.slice(tg.x * BN, tg.y * BM);
+    acc.store(mc);
+}
+
 #define INST(TA, an, BM, BN, BK, NSG) \
     template [[host_name("mm_q8_" #an "_" #BM "x" #BN "x" #BK "_" #NSG)]] [[kernel]] \
-    decltype(mm_q8<TA, BM, BN, BK, NSG>) mm_q8<TA, BM, BN, BK, NSG>;
+    decltype(mm_q8<TA, BM, BN, BK, NSG>) mm_q8<TA, BM, BN, BK, NSG>; \
+    template [[host_name("mm_q8db_" #an "_" #BM "x" #BN "x" #BK "_" #NSG)]] [[kernel]] \
+    decltype(mm_q8db<TA, BM, BN, BK, NSG>) mm_q8db<TA, BM, BN, BK, NSG>;
 
 #define TILES(TA, an) \
     INST(TA, an, 64, 64, 32, 4) \
@@ -289,6 +391,8 @@ TILES(float, f32)
         tile: (usize, usize, usize, usize),
         n: usize,
         poison: bool,
+        /// Two slabs rather than one: `mm_q8db`.
+        db: bool,
     }
 
     impl CustomOp2 for MppQ8 {
@@ -322,7 +426,7 @@ TILES(float, f32)
             enc.set_bytes(3, &(m as i32));
             enc.set_bytes(4, &(n as i32));
             enc.set_bytes(5, &(k as i32));
-            enc.set_threadgroup_memory_length(0, bn * bk * 2);
+            enc.set_threadgroup_memory_length(0, bn * bk * 2 * if self.db { 2 } else { 1 });
             enc.dispatch_thread_groups(
                 MTLSize { width: n / bn, height: m / bm, depth: 1 },
                 MTLSize { width: 32 * nsg, height: 1, depth: 1 },
@@ -384,12 +488,13 @@ TILES(float, f32)
             let f = lib.get_function(&format!("mm_{tn}_{bm}x{bn}_{nsg}"), None)?;
             Ok(Mpp { pipe: md.metal_device().new_compute_pipeline_state_with_function(&f)?, tile, poison: false })
         };
-        let op_q8 = |an: &str, tile: (usize, usize, usize, usize), n: usize|
+        let op_q8 = |an: &str, tile: (usize, usize, usize, usize), n: usize, db: bool|
          -> Result<MppQ8, Box<dyn std::error::Error>> {
             let (bm, bn, bk, nsg) = tile;
-            let f = lib_q8.get_function(&format!("mm_q8_{an}_{bm}x{bn}x{bk}_{nsg}"), None)?;
+            let kind = if db { "q8db" } else { "q8" };
+            let f = lib_q8.get_function(&format!("mm_{kind}_{an}_{bm}x{bn}x{bk}_{nsg}"), None)?;
             Ok(MppQ8 { pipe: md.metal_device().new_compute_pipeline_state_with_function(&f)?, tile, n,
-                       poison: false })
+                       poison: false, db })
         };
 
         // `dense`, `q8`, or both when no argument is given.
@@ -479,7 +584,7 @@ TILES(float, f32)
                         if m % bm != 0 || n % bn != 0 || k % bk != 0 {
                             continue;
                         }
-                        let mpp = op_q8(an, tile, n)?;
+                        let mpp = op_q8(an, tile, n, false)?;
                         let ours = a.apply_op2_no_bwd(&wq, &MppQ8 { poison: true, ..mpp.clone() })?;
                         let e = err(&ours, &want)?;
                         let apart = err(&ours, &theirs_q8)?;
@@ -489,6 +594,23 @@ TILES(float, f32)
                         })?;
                         row(format!("q8 {an} in {bm}x{bn}x{bk}/{nsg}sg"), r, tflops(r.1), e, apart);
                     }
+                }
+
+                // Two slabs against one, the same tile, raced directly: the
+                // "candle" column here is the single-slab kernel.
+                let a16 = a32.to_dtype(DType::F16)?;
+                for &tile in &Q8_TILES {
+                    let (bm, bn, bk, nsg) = tile;
+                    if m % bm != 0 || n % bn != 0 || k % bk != 0 {
+                        continue;
+                    }
+                    let one = op_q8("f16", tile, n, false)?;
+                    let two = op_q8("f16", tile, n, true)?;
+                    let ours = a16.apply_op2_no_bwd(&wq, &MppQ8 { poison: true, ..two.clone() })?;
+                    let e = err(&ours, &want)?;
+                    let apart = err(&ours, &a16.apply_op2_no_bwd(&wq, &one)?)?;
+                    let r = race(&|| a16.apply_op2_no_bwd(&wq, &one), &|| a16.apply_op2_no_bwd(&wq, &two))?;
+                    row(format!("q8db {bm}x{bn}x{bk}/{nsg}sg vs 1"), r, tflops(r.1), e, apart);
                 }
             }
             if !dense {

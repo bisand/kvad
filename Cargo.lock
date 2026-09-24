@@ -2444,8 +2444,10 @@ name = "kvad-gpu"
 version = "0.9.0"
 dependencies = [
  "candle-core",
+ "candle-metal-kernels",
  "candle-nn",
  "kvad",
+ "objc2-metal",
  "tokenizers 0.23.2",
 ]
 

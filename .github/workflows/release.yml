@@ -134,10 +134,6 @@ jobs:
             os: macos-15
             packages: -p kvad -p kvad-tui -p kvad-gpu -p kvad-serve
             extra: ""
-          - target: x86_64-apple-darwin
-            os: macos-15
-            packages: -p kvad -p kvad-tui -p kvad-gpu -p kvad-serve
-            extra: ""
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             packages: -p kvad
@@ -215,11 +211,9 @@ jobs:
           ls -la "dist/$name.tar.gz"
 
       # Runs the binary it just built, on the machine that built it, and
-      # checks it agrees with the release about what it is. Only possible for
-      # the native targets — an x86_64 build on an arm64 runner would need
-      # Rosetta, which the runners do not have.
+      # checks it agrees with the release about what it is. Every target is
+      # native to its runner, so every target gets run.
       - name: Smoke test
-        if: matrix.target != 'x86_64-apple-darwin'
         run: |
           set -eu
           expected="kvad ${{ needs.version.outputs.version }}"

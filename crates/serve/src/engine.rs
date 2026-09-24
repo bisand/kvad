@@ -204,6 +204,23 @@ pub fn kv_number_bytes(spec: &kvad::model::Spec, backend: Backend) -> usize {
     std::mem::size_of::<f32>()
 }
 
+/// Bytes one number of a recurrent state will take for `spec` at `backend`,
+/// as [`kv_number_bytes`] is for the attention cache: what the loaded
+/// session's `state_number_bytes` will report.
+///
+/// f32 on the CPU. On the GPU, the dtype the model computes in: 2 for a
+/// bf16 model, 4 for a quantised one, which computes in f32 — whatever its
+/// attention cache is kept in.
+pub fn state_number_bytes(spec: &kvad::model::Spec, backend: Backend) -> usize {
+    #[cfg(feature = "gpu")]
+    if let Backend::Gpu(mode) = backend {
+        let dtype = kvad_gpu::model::parse_dtype(gpu::DTYPE).expect("known dtype");
+        return kvad_gpu::model::state_number_bytes(dtype, gpu::quant(mode));
+    }
+    let _ = (spec, backend);
+    std::mem::size_of::<f32>()
+}
+
 #[cfg(feature = "gpu")]
 mod gpu {
     use kvad::runtime::Llm;
@@ -211,7 +228,8 @@ mod gpu {
     use kvad::weights::Watcher;
 
     /// The dtype every GPU model is loaded at, as `kvad_gpu` spells it. One
-    /// place, because `kv_number_bytes` has to agree with `load` about it.
+    /// place, because `kv_number_bytes` and `state_number_bytes` have to
+    /// agree with `load` about it.
     pub(super) const DTYPE: &str = "bf16";
 
     /// The quantisation a mode names, as `kvad_gpu` spells it.

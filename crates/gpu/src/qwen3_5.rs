@@ -639,6 +639,13 @@ impl Session for GpuQwen35 {
         self.kv.first().map_or(self.dtype.size_in_bytes(), |c| c.number_bytes(self.dtype))
     }
 
+    /// Read off a state when there is one, and otherwise what `reset_state`
+    /// will make: the compute dtype.
+    fn state_number_bytes(&self) -> usize {
+        let held = self.state.iter().flatten().next();
+        held.map_or(self.dtype.size_in_bytes(), |s| s.s.dtype().size_in_bytes())
+    }
+
     fn weight_bytes(&self) -> usize {
         self.memory_bytes()
     }
@@ -890,6 +897,50 @@ mod tests {
         assert_eq!(gpu.truncate(3).unwrap(), 0);
         assert_eq!(gpu.cached(), 0);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The recurrent state is as wide as admission charges for it before
+    /// the model loads, and as big: the bytes the linear layers hold after a
+    /// step, against the spec's layout at that width with no positions.
+    /// Pinned as well, so the rule and the session cannot go wrong together:
+    /// f32 and q8 keep it in f32, bf16 in bf16, the attention cache aside.
+    #[test]
+    fn the_state_is_as_wide_as_admission_charges() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(m) = Device::new_metal(0) {
+            devices.push(m);
+        }
+        for next in [false, true] {
+            let (spec, path) = tiny_of(next, &format!("state-width-{next}"));
+            for dev in &devices {
+                for (dtype, quant, pinned) in
+                    [(DType::F32, None, 4), (DType::BF16, None, 2), (DType::F32, Some(GgmlDType::Q8_0), 4)]
+                {
+                    // candle has no bf16 matmul on the CPU, so no step to
+                    // take there.
+                    if dtype == DType::BF16 && dev.is_cpu() {
+                        continue;
+                    }
+                    let what = format!("{} {dtype:?} {quant:?} on {dev:?}", spec.arch);
+                    let mut gpu =
+                        GpuQwen35::load(std::slice::from_ref(&path), spec.clone(), dtype, quant, dev.clone(), &Vault::off())
+                            .unwrap();
+                    gpu.forward(&[1, 2, 3]).unwrap();
+                    let charged = crate::model::state_number_bytes(dtype, quant);
+                    assert_eq!(gpu.state_number_bytes(), charged, "{what}: kept, against charged");
+                    assert_eq!(charged, pinned, "{what}");
+                    let held: usize = gpu
+                        .state
+                        .iter()
+                        .flatten()
+                        .map(|st| [&st.conv, &st.s].iter().map(|t| t.elem_count() * t.dtype().size_in_bytes()).sum::<usize>())
+                        .sum();
+                    assert!(held > 0, "{what}: no state");
+                    assert_eq!(held, spec.cache.bytes_as(spec.n_layer, 0, 0, charged), "{what}: held, against charged");
+                }
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     /// Qwen3.5's full-attention cache is f16 at q8 on Metal, as the Llama

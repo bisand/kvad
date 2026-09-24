@@ -36,7 +36,7 @@ use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use kvad::image::Painter;
 use kvad::serde_json::Value;
-use kvad::weights::{fetch_file, Watcher};
+use kvad::weights::{fetch_file, Cached, Watcher};
 use std::path::{Path, PathBuf};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -59,17 +59,28 @@ pub fn pipeline_of(repo: &str) -> Option<&'static str> {
 }
 
 /// Whether `repo` is an image pipeline this backend implements, asking the
-/// Hub when it is not on this machine yet.
+/// Hub only when this machine cannot say.
 ///
-/// A language model's repo has no `model_index.json`, so for one of those the
-/// Hub's answer is a 404 — one small request before a download of gigabytes
-/// that would have happened anyway.
+/// A language model's repo has no `model_index.json`, so for one that is not
+/// here yet the Hub's answer is a 404 — one small request before a download
+/// of gigabytes that would have happened anyway. For one that is here, the
+/// request is not small: with DNS for the Hub timing out, `hf-hub` retried
+/// it for three minutes before giving up. The cache answers instead, when it can:
+/// the file marked as missing, or a language model's files all present,
+/// which is a repo that is not a pipeline.
 pub fn is_pipeline(repo: &str, watch: &Watcher) -> bool {
     if pipeline_of(repo).is_some() {
         return true;
     }
     if kvad::weights::local_dir(repo).is_some() || !repo.contains('/') {
         return false;
+    }
+    match kvad::weights::cached(repo, "model_index.json") {
+        // Here, and `pipeline_of` did not recognise it: a pipeline, but not
+        // one implemented here — which is the same answer as a language model.
+        Cached::Here(_) | Cached::Absent => return false,
+        Cached::Unknown if kvad::weights::in_cache(repo).is_some() => return false,
+        Cached::Unknown => {}
     }
     fetch_file(repo, "model_index.json", watch)
         .ok()

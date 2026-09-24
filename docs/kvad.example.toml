@@ -20,10 +20,10 @@ bind = "127.0.0.1:5823"
 # ready, and the load is a job on the queue like any other, so a request that
 # arrives meanwhile waits for it instead of starting a second one.
 #
-# The cost is honest rather than hidden: the model is in memory a minute
-# after boot whether or not anybody turns up. Set false to spend that memory
-# only when something asks.
-# autoload = true
+# Off by default: the model would be in memory a minute after boot whether
+# or not anybody turns up. Left off, the first request that names a model
+# loads it (see load_on_request).
+# autoload = false
 
 [data]
 # Where the database, generated images, datasets and trained models go.

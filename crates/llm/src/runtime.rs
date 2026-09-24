@@ -345,14 +345,9 @@ impl Llm {
             ids.push(next);
             stats.generated_tokens += 1;
 
-            // Decode the whole tail and emit only what is new. Byte-level BPE
-            // tokens can be fragments of a UTF-8 character, so decoding them
-            // one at a time would emit replacement characters mid-word.
-            let text = self.decode(&ids)?;
-            let previous = self.decode(&ids[..ids.len() - 1])?;
             let chosen = Chosen {
                 id: next,
-                text: new_text(finished(&text), finished(&previous)).to_string(),
+                text: added(&self.tokenizer, &ids)?,
                 // Resolved here rather than by the caller, because the
                 // tokenizer is here and an id means nothing without it.
                 top: top.into_iter().map(|r| self.candidate(r)).collect(),
@@ -506,6 +501,89 @@ fn finished(text: &str) -> &str {
     text.trim_end_matches('\u{FFFD}')
 }
 
+/// Tokens of context [`added`] decodes behind the newest one.
+///
+/// Enough that whatever the newest token completes or changes lies inside
+/// the window. A UTF-8 character is at most four bytes, so at most four
+/// byte-level tokens; the rest is margin.
+const WINDOW: usize = 8;
+
+/// The text `ids`' last token adds to what the ones before it said.
+///
+/// Decoded one token at a time, byte-level BPE tokens can be fragments of a
+/// UTF-8 character, and SentencePiece pieces lose or gain a leading space
+/// depending on what comes before them. So the new text is the difference
+/// between two decodes, with and without the newest token.
+///
+/// Those two decodes used to be of the **whole** sequence, prompt and all,
+/// every token: a chat's history, or an agent's ten-thousand-token context,
+/// decoded twice per token generated. `examples/decode_breakdown` measured
+/// 0.3–0.4 ms a token at 2,048 tokens of context, growing with every token.
+/// Only the last few tokens can differ between the two decodes, so only
+/// they are decoded, **when the window can speak for everything before it**:
+/// - It must begin on a whole character, so that nothing before it can
+///   combine with its bytes. A window that decodes to `\u{FFFD}` first may
+///   have cut one in half.
+/// - It must say something of its own besides `\u{FFFD}`. `finished` holds
+///   a trailing run of those back, in case the next token completes a
+///   character, and releases the run once something whole follows. A run
+///   longer than the window would be cut short. A window of nothing but
+///   special tokens decodes to nothing, and then a SentencePiece decoder
+///   strips the newest piece's leading space, where the whole sequence
+///   would have kept it.
+/// - It must not begin inside a run of byte tokens (`<0xF7>`, `<0x36>`, …),
+///   which SentencePiece falls back to for anything without a piece of its
+///   own. The decoder turns such a run into text as a whole. If the run is
+///   not valid UTF-8, **every** byte in it becomes `\u{FFFD}`, ASCII
+///   included, so a window that starts after the bad byte reads valid text
+///   where the whole sequence reads none. Special tokens are skipped before
+///   the decoder sees anything, so a run carries on across them:
+///   `<0x6B> <unk> <0x0E>` is one run.
+///
+/// Where either fails, the window doubles backwards until both hold, or
+/// until it is the whole sequence, which is what this always did.
+/// `the_window_adds_what_the_whole_sequence_adds` holds the result to the
+/// full decode, token by token.
+fn added(tok: &Tokenizer, ids: &[u32]) -> Res<String> {
+    let Some(last) = ids.len().checked_sub(1) else { return Ok(String::new()) };
+    let decode = |ids: &[u32]| -> Res<String> { tok.decode(ids, true).map_err(|e| e.to_string().into()) };
+    // `<0xF7>` and the like: SentencePiece's byte fallback. Byte-level BPE
+    // has no such tokens, and this is always false for it.
+    let byte = |id: u32| {
+        tok.id_to_token(id).is_some_and(|t| t.len() == 6 && t.starts_with("<0x") && t.ends_with('>'))
+    };
+    // Whether a byte run crosses `from`: the last token before it and the
+    // first in the window that the decoder will see are both bytes. Only
+    // asked when the window starts on a byte, which in real text is rare,
+    // so the special tokens are only looked up then.
+    let splits_a_run = |from: usize| {
+        if from == 0 || !ids[from..last].iter().any(|&id| byte(id)) {
+            return false;
+        }
+        let special: std::collections::HashSet<u32> = tok
+            .get_added_tokens_decoder()
+            .into_iter()
+            .filter(|(_, t)| t.special)
+            .map(|(id, _)| id)
+            .collect();
+        let seen = |id: &&u32| !special.contains(id);
+        let first = ids[from..last].iter().find(seen);
+        let before = ids[..from].iter().rev().find(seen);
+        matches!((first, before), (Some(&a), Some(&b)) if byte(a) && byte(b))
+    };
+    let mut back = WINDOW;
+    loop {
+        let from = last.saturating_sub(back);
+        let previous = decode(&ids[from..last])?;
+        let whole = !previous.starts_with('\u{FFFD}') && !finished(&previous).is_empty() && !splits_a_run(from);
+        if whole || from == 0 {
+            let text = decode(&ids[from..])?;
+            return Ok(new_text(finished(&text), finished(&previous)).to_string());
+        }
+        back *= 2;
+    }
+}
+
 /// What `text` has that `previous` did not.
 ///
 /// Not `text[previous.len()..]`, which is what this was and which panics.
@@ -528,7 +606,9 @@ fn new_text<'a>(text: &'a str, previous: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-    use super::{finished, new_text, Llm};
+    use super::{added, finished, new_text, Llm, WINDOW};
+    use nervus::rng::Rng;
+    use tokenizers::Tokenizer;
 
     #[test]
     fn new_text_is_what_the_last_token_added() {
@@ -584,4 +664,174 @@ mod tests {
         assert_eq!(Llm::common_prefix(&previous, &[9]), 0);
         assert_eq!(Llm::common_prefix(&[], &next), 0);
     }
+
+    /// What the newest token added, the way it was found before [`added`]:
+    /// by decoding everything, twice.
+    fn added_by_whole_decode(tok: &Tokenizer, ids: &[u32]) -> String {
+        let text = tok.decode(ids, true).unwrap();
+        let previous = tok.decode(&ids[..ids.len() - 1], true).unwrap();
+        new_text(finished(&text), finished(&previous)).to_string()
+    }
+
+    /// A plain fixed window, without [`added`]'s checks: what they are for.
+    fn added_by_fixed_window(tok: &Tokenizer, ids: &[u32]) -> String {
+        let last = ids.len() - 1;
+        let from = last.saturating_sub(WINDOW);
+        let text = tok.decode(&ids[from..], true).unwrap();
+        let previous = tok.decode(&ids[from..last], true).unwrap();
+        new_text(finished(&text), finished(&previous)).to_string()
+    }
+
+    /// Every step of generating `ids` after the first `prompt` of them, asked
+    /// of `how` and of the whole decode: the first step they differ, if any.
+    fn first_difference(
+        tok: &Tokenizer,
+        ids: &[u32],
+        prompt: usize,
+        how: &dyn Fn(&Tokenizer, &[u32]) -> String,
+    ) -> Option<(usize, String, String)> {
+        (prompt.max(1)..=ids.len()).find_map(|n| {
+            let (ours, whole) = (how(tok, &ids[..n]), added_by_whole_decode(tok, &ids[..n]));
+            (ours != whole).then_some((n, ours, whole))
+        })
+    }
+
+    fn windowed(tok: &Tokenizer, ids: &[u32]) -> String {
+        added(tok, ids).unwrap()
+    }
+
+    /// Text that makes a tokenizer work: accents, three scripts, emoji built
+    /// from several code points, combining marks, code and whitespace.
+    const HARD_TEXT: &str = "Blåbærsyltetøy på skjærgården, naïve café. 東京の天気は晴れです。\
+        مرحبا بالعالم 👩‍👩‍👧 family 🇳🇴 flag e\u{301} combined 😊😊\n\tfn main() { println!(\"{:?}\", x); }\n\n  \
+        indented, then “quotes”, ellipsis…, and a tail of ❤️‍🔥.";
+
+    /// Qwen2.5's tokenizer, byte-level BPE, as the server's default models
+    /// have. From the Hub cache, so skipped where it has never been pulled.
+    fn qwen() -> Option<Tokenizer> {
+        let snapshots = crate::hub::cache_dir().join("models--Qwen--Qwen2.5-1.5B-Instruct").join("snapshots");
+        let dir = std::fs::read_dir(snapshots).ok()?.flatten().next()?;
+        Tokenizer::from_file(dir.path().join("tokenizer.json")).ok()
+    }
+
+    /// A SentencePiece tokenizer as Llama 2 and Mistral ship theirs:
+    /// `▁` for a space, byte fallback for anything without a piece of its
+    /// own, and the decoder's leading space stripped. The vocabulary is
+    /// small and made up. Only the decoder is under test, and it is the one
+    /// those models use.
+    fn sentencepiece() -> Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (i, t) in ["<unk>", "<s>", "</s>"].iter().enumerate() {
+            vocab.insert(t.to_string(), i.into());
+        }
+        for b in 0..=255u32 {
+            vocab.insert(format!("<0x{b:02X}>"), (3 + b).into());
+        }
+        let pieces = ["▁", "▁Hello", "▁world", ",", ".", "▁the", "▁a", "b", "é", "▁naïve", "▁東京", "の", "\n", "▁▁", "s", "▁café"];
+        for (i, p) in pieces.iter().enumerate() {
+            vocab.insert(p.to_string(), (259 + i).into());
+        }
+        let special = |id: u32, content: &str| serde_json::json!({
+            "id": id, "content": content, "single_word": false, "lstrip": false, "rstrip": false,
+            "normalized": false, "special": true
+        });
+        let json = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [special(0, "<unk>"), special(1, "<s>"), special(2, "</s>")],
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": {"type": "Sequence", "decoders": [
+                {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+                {"type": "ByteFallback"},
+                {"type": "Fuse"},
+                {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+            ]},
+            "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null,
+                      "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true,
+                      "ignore_merges": false, "vocab": vocab, "merges": []}
+        });
+        json.to_string().parse().unwrap()
+    }
+
+    /// Ids drawn from anywhere in a vocabulary, special tokens included:
+    /// fragments of characters in every order, which no real text produces.
+    fn noise(tok: &Tokenizer, n: usize, seed: u64) -> Vec<u32> {
+        let size = tok.get_vocab_size(true) as f32;
+        let mut rng = Rng::new(seed);
+        (0..n).map(|_| ((rng.uniform() * size) as u32).min(size as u32 - 1)).collect()
+    }
+
+    /// The point of [`added`]: token by token, the window says exactly what
+    /// decoding everything said. On real text and on noise, with a prompt in
+    /// front, for both kinds of tokenizer.
+    #[test]
+    fn the_window_adds_what_the_whole_sequence_adds() {
+        let mut cases: Vec<(&str, Tokenizer, Vec<u32>)> = Vec::new();
+        if let Some(q) = qwen() {
+            let text = q.encode(HARD_TEXT, false).unwrap().get_ids().to_vec();
+            cases.push(("qwen, text", q.clone(), text));
+            for seed in 0..20 {
+                cases.push(("qwen, noise", q.clone(), noise(&q, 200, seed)));
+            }
+        } else {
+            eprintln!("Qwen2.5's tokenizer is not in the Hub cache; byte-level BPE is not exercised");
+        }
+        let sp = sentencepiece();
+        for seed in 0..20 {
+            cases.push(("sentencepiece, noise", sp.clone(), noise(&sp, 200, seed)));
+        }
+        for (what, tok, ids) in &cases {
+            for prompt in [1, 5, ids.len() / 2] {
+                if let Some((n, ours, whole)) = first_difference(tok, ids, prompt, &windowed) {
+                    panic!("{what}, prompt {prompt}: at token {n} the window added {ours:?}, the whole decode {whole:?}");
+                }
+            }
+        }
+    }
+
+    /// And the test above can tell. A fixed window, without the checks, cuts a
+    /// long run of held-back `\u{FFFD}` short, starts inside runs of byte
+    /// tokens, and drops a SentencePiece space after a window of special
+    /// tokens.
+    #[test]
+    fn a_fixed_window_is_not_enough() {
+        let sp = sentencepiece();
+        let caught = (0..20).any(|seed| first_difference(&sp, &noise(&sp, 200, seed), 1, &added_by_fixed_window).is_some());
+        assert!(caught, "the noise never needed the checks, so it cannot show they work");
+
+        // `<s>` eight times, then `▁Hello`: the whole decode says " Hello",
+        // and a window of nothing but `<s>` would say "Hello".
+        let hello = sp.token_to_id("▁Hello").unwrap();
+        let world = sp.token_to_id("▁world").unwrap();
+        let ids: Vec<u32> = [world].into_iter().chain([1; WINDOW]).chain([hello]).collect();
+        assert_eq!(added_by_whole_decode(&sp, &ids), " Hello");
+        assert_eq!(added_by_fixed_window(&sp, &ids), "Hello");
+        assert_eq!(added(&sp, &ids).unwrap(), " Hello");
+    }
+
+    /// What finding the new text costs a token, deep into a conversation.
+    /// A measurement, not a test:
+    ///
+    ///     cargo test --release -p kvad runtime::tests::cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn cost() {
+        let q = qwen().expect("Qwen2.5's tokenizer in the Hub cache");
+        let one = q.encode(HARD_TEXT, false).unwrap().get_ids().to_vec();
+        for context in [128, 2048, 8192, 32768] {
+            let ids: Vec<u32> = one.iter().cycle().take(context).copied().collect();
+            let time = |f: &dyn Fn() -> String| {
+                let t = std::time::Instant::now();
+                for _ in 0..20 {
+                    std::hint::black_box(f());
+                }
+                t.elapsed().as_secs_f64() * 1e3 / 20.0
+            };
+            let whole = time(&|| added_by_whole_decode(&q, &ids));
+            let window = time(&|| added(&q, &ids).unwrap());
+            println!("  context {context:6}: whole sequence twice {whole:8.3} ms   window {window:6.3} ms");
+        }
+    }
+
+
+
 }

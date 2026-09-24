@@ -98,10 +98,12 @@ class Images {
       preview: true,
       response_format: "url",
     };
-    if (this.negative.trim()) body.negative_prompt = this.negative;
+    // A model that takes no guidance refuses both, so neither is sent.
+    const guided = this.defaults?.takes_guidance ?? true;
+    if (guided && this.negative.trim()) body.negative_prompt = this.negative;
     if (this.width && this.height) body.size = `${this.width}x${this.height}`;
     if (this.steps) body.steps = this.steps;
-    if (this.guidance != null && this.guidance !== "") body.guidance_scale = Number(this.guidance);
+    if (guided && this.guidance != null && this.guidance !== "") body.guidance_scale = Number(this.guidance);
     if (this.fixSeed && this.seed != null && this.seed !== "") body.seed = Number(this.seed);
 
     this.progress = { ...this.progress, loading: false, started: Date.now() };

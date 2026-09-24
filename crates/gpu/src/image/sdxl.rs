@@ -4,7 +4,7 @@
 //! the place to start reading: tokenize, encode, draw noise, run the loop,
 //! decode. Everything it calls is one of the other files in this directory.
 
-use super::clip::{self, Clip, ClipConfig};
+use super::clip::{self, Clip, ClipConfig, Pooled};
 use super::nn::{latent_preview, noise, to_rgb8, Ctx};
 use super::schedule;
 use super::unet::{Unet, UnetConfig};
@@ -78,12 +78,12 @@ impl Sdxl {
         progress("loading the text encoders");
         let (c, paths) = part(repo, "text_encoder/config.json", "text_encoder/model.fp16.safetensors")?;
         let r = open(&paths, dtype)?;
-        let clip_l = Clip::load(&cx, &r, ClipConfig::from_json(&c)?, false)?;
+        let clip_l = Clip::load(&cx, &r, ClipConfig::from_json(&c)?, Pooled::No)?;
         params += finish("text encoder", &paths, &r)?;
 
         let (c, paths) = part(repo, "text_encoder_2/config.json", "text_encoder_2/model.fp16.safetensors")?;
         let r = open(&paths, dtype)?;
-        let clip_g = Clip::load(&cx, &r, ClipConfig::from_json(&c)?, true)?;
+        let clip_g = Clip::load(&cx, &r, ClipConfig::from_json(&c)?, Pooled::Projected)?;
         params += finish("second text encoder", &paths, &r)?;
 
         progress("loading the UNet");
@@ -212,7 +212,7 @@ impl Painter for Sdxl {
         // 30 steps and guidance 5: the middle of what Stability's own
         // examples use. The model was trained at 1024², and the VAE needs
         // multiples of 8.
-        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8 }
+        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true }
     }
 
     fn summary(&self) -> String {

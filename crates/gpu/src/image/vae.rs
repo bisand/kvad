@@ -33,6 +33,12 @@ pub(crate) struct VaeConfig {
     /// What the latents were multiplied by to give them unit variance for the
     /// denoiser, and so what they are divided by here.
     pub(crate) scaling: f64,
+    /// What was subtracted before that scaling, and so is added back: FLUX's
+    /// VAE centres its latents, SDXL's does not.
+    pub(crate) shift: f64,
+    /// Whether a 1×1 convolution sits between the latent and the decoder.
+    /// SDXL's has one; FLUX's was trained without it.
+    pub(crate) post_quant: bool,
 }
 
 impl VaeConfig {
@@ -50,6 +56,8 @@ impl VaeConfig {
             latent: n("latent_channels")?,
             groups: n("norm_num_groups")?,
             scaling: v.get("scaling_factor").and_then(Value::as_f64).ok_or("VAE config has no `scaling_factor`")?,
+            shift: v.get("shift_factor").and_then(Value::as_f64).unwrap_or(0.0),
+            post_quant: v.get("use_post_quant_conv").and_then(Value::as_bool).unwrap_or(true),
         })
     }
 
@@ -116,7 +124,7 @@ impl Attn {
 
 pub(crate) struct Decoder {
     cfg: VaeConfig,
-    post_quant: Conv2d,
+    post_quant: Option<Conv2d>,
     conv_in: Conv2d,
     mid: (Resnet, Attn, Resnet),
     up: Vec<(Vec<Resnet>, Option<Conv2d>)>,
@@ -162,7 +170,10 @@ impl Decoder {
         }
         let bottom = cfg.channels[0];
         Ok(Decoder {
-            post_quant: Conv2d::load(cx, r, "post_quant_conv", (cfg.latent, cfg.latent, 1), 1)?,
+            post_quant: match cfg.post_quant {
+                true => Some(Conv2d::load(cx, r, "post_quant_conv", (cfg.latent, cfg.latent, 1), 1)?),
+                false => None,
+            },
             conv_in: Conv2d::load(cx, &d, "conv_in", (cfg.latent, top, 3), 1)?,
             norm_out: GroupNorm::load(cx, &d, "conv_norm_out", bottom, g, EPS)?,
             conv_out: Conv2d::load(cx, &d, "conv_out", (bottom, 3, 3), 1)?,
@@ -179,8 +190,12 @@ impl Decoder {
     /// `[1, latent, h, w]`, as the denoiser left it, to `[1, 3, H, W]` in
     /// `[−1, 1]`.
     pub(crate) fn decode(&self, latent: &Tensor) -> candle_core::Result<Tensor> {
-        let z = (latent / self.cfg.scaling)?;
-        let mut h = self.conv_in.forward(&self.post_quant.forward(&z)?)?;
+        let z = ((latent / self.cfg.scaling)? + self.cfg.shift)?;
+        let z = match &self.post_quant {
+            Some(conv) => conv.forward(&z)?,
+            None => z,
+        };
+        let mut h = self.conv_in.forward(&z)?;
         h = self.mid.0.forward(&h)?;
         h = self.mid.1.forward(&h)?;
         h = self.mid.2.forward(&h)?;

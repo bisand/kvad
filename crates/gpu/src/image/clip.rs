@@ -27,6 +27,19 @@ pub(crate) const CONTEXT: usize = 77;
 pub(crate) const START: u32 = 49406;
 pub(crate) const END: u32 = 49407;
 
+/// How much of the pooled vector a pipeline wants.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Pooled {
+    /// None: stop at the penultimate layer and skip the last.
+    No,
+    /// The end-of-text row after the final norm — `CLIPTextModel`'s
+    /// `pooler_output`, which is what FLUX conditions on.
+    Normed,
+    /// That, through `text_projection` — `CLIPTextModelWithProjection`,
+    /// SDXL's second encoder.
+    Projected,
+}
+
 /// The shape of one CLIP text model, from its `config.json`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClipConfig {
@@ -82,15 +95,17 @@ pub(crate) struct Clip {
     tokens: Tensor,
     positions: Tensor,
     layers: Vec<Layer>,
-    /// Only when the pooled vector is wanted: bigG's final norm and its
-    /// projection into the joint space.
-    pooled: Option<(LayerNorm, Linear)>,
+    /// Only when the pooled vector is wanted: the final norm, and for a
+    /// model loaded [`Pooled::Projected`], the projection into the joint
+    /// space.
+    pooled: Option<(LayerNorm, Option<Linear>)>,
 }
 
 impl Clip {
     /// Load enough of the model to give its penultimate hidden state, and,
-    /// if `pooled`, the whole of it and the projection as well.
-    pub(crate) fn load(cx: &Ctx<'_>, r: &Reader<'_>, cfg: ClipConfig, pooled: bool) -> Res<Self> {
+    /// unless `pooled` is [`Pooled::No`], the whole of it.
+    pub(crate) fn load(cx: &Ctx<'_>, r: &Reader<'_>, cfg: ClipConfig, pooled: Pooled) -> Res<Self> {
+        let wants = pooled != Pooled::No;
         let tm = r.pp("text_model");
         let emb = tm.pp("embeddings");
         let w = cfg.width;
@@ -98,7 +113,7 @@ impl Clip {
         let positions = cx.get(&emb, (CONTEXT, w), "position_embedding.weight")?;
 
         // Without the pooled vector the last layer's output is never read.
-        let run = if pooled { cfg.layers } else { cfg.layers - 1 };
+        let run = if wants { cfg.layers } else { cfg.layers - 1 };
         let mut layers = Vec::with_capacity(run);
         for i in 0..run {
             let l = tm.pp(format!("encoder.layers.{i}"));
@@ -115,15 +130,16 @@ impl Clip {
             });
         }
         let pooled = match pooled {
-            true => Some((
-                LayerNorm::load(cx, &tm, "final_layer_norm", w, 1e-5)?,
-                Linear::load(cx, r, "text_projection", w, w, false)?,
-            )),
-            false => {
+            Pooled::No => {
                 tm.skip_under(&format!("encoder.layers.{}.", cfg.layers - 1));
                 tm.skip_under("final_layer_norm");
                 None
             }
+            Pooled::Normed => Some((LayerNorm::load(cx, &tm, "final_layer_norm", w, 1e-5)?, None)),
+            Pooled::Projected => Some((
+                LayerNorm::load(cx, &tm, "final_layer_norm", w, 1e-5)?,
+                Some(Linear::load(cx, r, "text_projection", w, w, false)?),
+            )),
         };
         Ok(Clip { cfg, tokens, positions, layers, pooled })
     }
@@ -155,8 +171,11 @@ impl Clip {
         };
         let pooled = match &self.pooled {
             Some((ln, proj)) => {
-                let last = ln.forward(&x)?;
-                Some(proj.forward(&last.narrow(1, end, 1)?.squeeze(1)?)?)
+                let at_end = ln.forward(&x)?.narrow(1, end, 1)?.squeeze(1)?;
+                Some(match proj {
+                    Some(p) => p.forward(&at_end)?,
+                    None => at_end,
+                })
             }
             None => None,
         };

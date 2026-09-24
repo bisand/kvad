@@ -63,6 +63,10 @@ pub struct Defaults {
     /// Width and height must both be a multiple of this: the VAE's
     /// downsampling, times the denoiser's patch size where it has one.
     pub multiple: usize,
+    /// Whether the model does anything with guidance at all. A distilled
+    /// model — FLUX.1-schnell — was trained to make an image without it, and
+    /// has no use for a guidance scale or a negative prompt either.
+    pub takes_guidance: bool,
 }
 
 /// An [`ImageRequest`] with every blank filled and checked.
@@ -123,6 +127,16 @@ impl ImageRequest {
         }
         if self.prompt.trim().is_empty() {
             return Err("the prompt is empty".into());
+        }
+        // Refused rather than ignored: an image made without the guidance
+        // somebody asked for should not be filed as if it had been.
+        if !d.takes_guidance {
+            if self.guidance.is_some_and(|g| g != 0.0) {
+                return Err("this model makes images without guidance; leave guidance_scale out, or set it to 0".into());
+            }
+            if self.negative_prompt.as_deref().is_some_and(|n| !n.is_empty()) {
+                return Err("this model makes images without guidance, so it has no use for a negative prompt".into());
+            }
         }
         // Kept below 2³² so that it survives a round trip through a browser,
         // where every number is a double and a 64-bit seed would come back
@@ -408,7 +422,7 @@ mod tests {
     }
 
     fn sdxl() -> Defaults {
-        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8 }
+        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true }
     }
 
     #[test]
@@ -430,6 +444,18 @@ mod tests {
         assert!(bad(|r| r.steps = Some(0)).contains("steps"));
         assert!(bad(|r| r.guidance = Some(f32::NAN)).contains("guidance"));
         assert!(bad(|r| r.prompt = "  ".into()).contains("empty"));
+    }
+
+    #[test]
+    fn a_model_without_guidance_refuses_a_guidance_scale_and_a_negative_prompt() {
+        let schnell = Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false };
+        let ask = |g: Option<f32>, n: Option<&str>| {
+            ImageRequest { guidance: g, negative_prompt: n.map(str::to_string), ..ImageRequest::new("a cat") }.resolved(&schnell)
+        };
+        assert!(ask(None, None).is_ok());
+        assert!(ask(Some(0.0), Some("")).is_ok(), "zero and empty are the same as leaving them out");
+        assert!(ask(Some(3.5), None).unwrap_err().to_string().contains("guidance_scale"));
+        assert!(ask(None, Some("blurry")).unwrap_err().to_string().contains("negative prompt"));
     }
 
     #[test]

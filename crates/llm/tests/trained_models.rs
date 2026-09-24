@@ -10,7 +10,7 @@
 //!
 //! These tests share one process, and so share its environment and its
 //! working directory — and they change both. So they run one at a time,
-//! behind [`alone`], which is also what points `XDG_DATA_HOME` at a scratch
+//! behind [`alone`], which is also what points `KVAD_DATA_DIR` at a scratch
 //! directory before any of them can read it. Without that the first test to
 //! run would train into the real models home, which it once did.
 
@@ -38,7 +38,9 @@ fn alone() -> MutexGuard<'static, ()> {
         let root = scratch_root();
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("kvad/models")).unwrap();
-        std::env::set_var("XDG_DATA_HOME", &root);
+        // KVAD_DATA_DIR rather than XDG_DATA_HOME: it outranks a `[data]
+        // dir` in the kvad.toml of whoever runs the tests.
+        std::env::set_var("KVAD_DATA_DIR", root.join("kvad"));
     });
     guard
 }

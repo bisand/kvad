@@ -124,7 +124,13 @@ kvad service uninstall
 
 `--prefix DIR`, `--version vX.Y.Z` and `--uninstall` do what they look like;
 `--uninstall` removes the binaries and the service and leaves your models and
-conversations alone. `--host ADDR` and `--port N` answer the address
+conversations alone. An install into a `--prefix` other than the one the
+background service runs from leaves the service alone, so a second copy can
+sit beside the real one; `--service` moves the service to it. `--data-dir
+DIR` puts the database, images, datasets and trained models somewhere other
+than `~/.local/share/kvad`, by writing `[data] dir` to `kvad.toml`, which the
+CLI and the server both read. `KVAD_DATA_DIR` overrides that for one process.
+Models pulled from Hugging Face stay in its cache, which `HF_HOME` moves. `--host ADDR` and `--port N` answer the address
 questions ahead of time, for a run that should not stop to ask — `--bind
 HOST:PORT` still says both at once. `sh install.sh --help` lists the rest.
 

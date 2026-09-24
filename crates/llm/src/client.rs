@@ -167,7 +167,7 @@ fn reachable(bind: &str) -> String {
 // kvad.toml, as the client reads it
 // ---------------------------------------------------------------------------
 
-/// The two things the client wants from `kvad.toml`.
+/// What the client wants from `kvad.toml`.
 ///
 /// Read as a plain table rather than as the server's own `Config`, which
 /// lives in the server's crate and would take the server's dependencies with
@@ -179,6 +179,8 @@ pub struct Settings {
     pub path: PathBuf,
     pub client_url: Option<String>,
     pub server_bind: Option<String>,
+    /// `[data] dir`, resolved; see [`crate::weights::data_dir`].
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Settings {
@@ -195,6 +197,11 @@ impl Settings {
             }
             Err(e) => return Err(format!("could not read {}: {e}", path.display())),
         };
+        Settings::from_text(&text, path)
+    }
+
+    /// `text` as the file at `path` would be read.
+    fn from_text(text: &str, path: PathBuf) -> Result<Settings, String> {
         let table: toml::Table =
             text.parse().map_err(|e| format!("could not parse {}: {e}", path.display()))?;
         let string = |section: &str, key: &str| {
@@ -203,6 +210,9 @@ impl Settings {
         Ok(Settings {
             client_url: string("client", "url").filter(|u| !u.trim().is_empty()),
             server_bind: string("server", "bind"),
+            data_dir: string("data", "dir")
+                .filter(|d| !d.trim().is_empty())
+                .map(|d| crate::weights::configured_dir(&d, &path)),
             path,
         })
     }
@@ -832,6 +842,18 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// `[data] dir` reaches the CLI resolved the way the server resolves
+    /// it, so that the two agree on where the data is.
+    #[test]
+    fn the_data_directory_is_read_from_kvad_toml() {
+        let path = PathBuf::from("/etc/kvad/kvad.toml");
+        let dir = |text: &str| Settings::from_text(text, path.clone()).unwrap().data_dir;
+        assert_eq!(dir("[data]\ndir = \"/srv/kvad\"\n"), Some(PathBuf::from("/srv/kvad")));
+        assert_eq!(dir("[data]\ndir = \"store\"\n"), Some(PathBuf::from("/etc/kvad/store")));
+        assert_eq!(dir("[data]\ndir = \"\"\n"), None);
+        assert_eq!(dir("[server]\nbind = \"127.0.0.1:5823\"\n"), None);
+    }
 
     fn events(text: &str) -> Vec<Event> {
         Events::new(Cursor::new(text.to_string())).map(|e| e.unwrap()).collect()

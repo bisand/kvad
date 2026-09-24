@@ -65,15 +65,72 @@ pub struct ModelFiles {
 
 /// Where everything this machine cannot download again is kept.
 ///
-/// `$XDG_DATA_HOME/kvad`, or `~/.local/share/kvad`. Data rather than cache,
-/// because a model you trained has exactly one copy, and so does the server's
-/// database. Settings live next door under `XDG_CONFIG_HOME`; see
-/// [`crate::hub::config_dir`].
+/// Data rather than cache, because a model you trained has exactly one copy,
+/// and so does the server's database. Settings live next door under
+/// `XDG_CONFIG_HOME`; see [`crate::hub::config_dir`]. Models pulled from the
+/// Hub are not in here: they are in the Hub's own cache, see
+/// [`crate::hub::cache_dir`].
+///
+/// The first of these that says anything:
+///
+/// 1. what this process was told with [`set_data_dir`] — `kvad-serve`, which
+///    has read the config file it was started with;
+/// 2. `KVAD_DATA_DIR`;
+/// 3. `dir` under `[data]` in `kvad.toml`;
+/// 4. `$XDG_DATA_HOME/kvad`, or `~/.local/share/kvad`.
+///
+/// Worked out every time rather than once, because it is cheap next to what
+/// anybody does with the answer and a test that points it somewhere else
+/// should not have to be the first to ask.
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = FIXED_DATA_DIR.get() {
+        return dir.clone();
+    }
+    if let Some(dir) = std::env::var_os("KVAD_DATA_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    // A kvad.toml that does not parse is reported by whatever reads it for
+    // its own sake — every command that talks to a server, and the server.
+    // This only wants one key, and falls back rather than failing a path.
+    if let Some(dir) = crate::client::Settings::read().ok().and_then(|s| s.data_dir) {
+        return dir;
+    }
+    default_data_dir()
+}
+
+/// `$XDG_DATA_HOME/kvad`, or `~/.local/share/kvad`: the data directory when
+/// nothing names another.
+pub fn default_data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".local/share"));
     base.join("kvad")
+}
+
+static FIXED_DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Settle the data directory for the rest of this process.
+///
+/// For `kvad-serve`, which may have been started with `--config` naming a
+/// file other than the one [`data_dir`] would read. Only the first call
+/// counts.
+pub fn set_data_dir(dir: PathBuf) {
+    let _ = FIXED_DATA_DIR.set(dir);
+}
+
+/// A directory as a config file wrote it: `~/` is the home directory, and
+/// anything else relative is taken from the file's own directory, so that
+/// the file means the same thing whoever reads it and from wherever.
+pub fn configured_dir(written: &str, config_file: &Path) -> PathBuf {
+    let path = match written.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None if written == "~" => home(),
+        None => PathBuf::from(written),
+    };
+    match path.is_absolute() {
+        true => path,
+        false => config_file.parent().unwrap_or(Path::new(".")).join(path),
+    }
 }
 
 /// Where models trained on this machine live: `models` under [`data_dir`].
@@ -1000,8 +1057,17 @@ mod fp8_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::f16_to_f32;
+    use super::{configured_dir, f16_to_f32, home, Path, PathBuf};
     use std::process;
+
+    #[test]
+    fn a_configured_directory_is_read_the_way_the_file_meant_it() {
+        let file = Path::new("/etc/kvad/kvad.toml");
+        assert_eq!(configured_dir("/srv/kvad", file), PathBuf::from("/srv/kvad"));
+        assert_eq!(configured_dir("store", file), PathBuf::from("/etc/kvad/store"));
+        assert_eq!(configured_dir("~/kvad-data", file), home().join("kvad-data"));
+        assert_eq!(configured_dir("~", file), home());
+    }
 
     #[test]
     fn half_precision_conversion() {

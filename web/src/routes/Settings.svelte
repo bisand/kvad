@@ -7,6 +7,7 @@
   import { toasts } from "../lib/toasts.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
   import ServerSettings from "../lib/components/ServerSettings.svelte";
+  import DataSettings from "../lib/components/DataSettings.svelte";
 
   const TRASH =
     "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6";
@@ -101,6 +102,7 @@
 <div class="mx-auto flex max-w-3xl flex-col gap-8">
   {#if auth.isAdmin}
     <ServerSettings />
+    <DataSettings />
   {/if}
 
   {#if !auth.hasAccounts}

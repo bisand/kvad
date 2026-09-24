@@ -102,9 +102,8 @@ impl Db {
     /// A runtime setting, or `None` if it was never written.
     ///
     /// The settings table is here from the first migration and read from the
-    /// UI in a later phase; until then this and its writer are exercised only
-    /// by the tests below.
-    #[allow(dead_code)]
+    /// UI in a later phase; the first reader is `storage`, which keeps the
+    /// copy a move left behind here.
     pub fn setting(&self, key: &str) -> Res<Option<serde_json::Value>> {
         let raw: Option<String> = self.with(|c| {
             c.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))

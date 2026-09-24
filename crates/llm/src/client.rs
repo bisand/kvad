@@ -851,6 +851,16 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
          server's machine, `kvad service restart` restarts the service through launchd \
          or systemd",
     ),
+    ("get", "/api/data", "the Settings page's view of the data directory; on the server's machine, `du` sees it"),
+    ("get", "/api/data/plan", "the Settings page asking before it moves the data"),
+    (
+        "post",
+        "/api/data/move",
+        "moving the data from the Settings page, which then restarts the server; by hand it \
+         is `install.sh --data-dir`, which prints the moves to make",
+    ),
+    ("delete", "/api/data/move", "cancelling a move the Settings page started"),
+    ("delete", "/api/data/previous", "deleting what a move from the Settings page left behind"),
 ];
 
 #[cfg(test)]

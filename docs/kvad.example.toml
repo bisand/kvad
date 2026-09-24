@@ -31,8 +31,9 @@ bind = "127.0.0.1:5823"
 # directory, and a relative path is taken from this file's directory. The
 # CLI reads this too, so `kvad` and `kvad-serve` agree; KVAD_DATA_DIR in the
 # environment overrides it for one process. `install.sh --data-dir DIR`
-# writes it. Changing it moves nothing: move the old directory yourself,
-# with the server stopped.
+# writes it. Changing it here moves nothing: move the old directory
+# yourself, with the server stopped. The Settings page's Data section moves
+# the data for you, writes this, and restarts the server into it.
 #
 # Setting it also moves models pulled from Hugging Face, to huggingface/hub
 # inside it: the layout of ~/.cache/huggingface/hub, where they go when this

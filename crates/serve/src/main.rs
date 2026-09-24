@@ -31,6 +31,7 @@
 //! * [`metrics`] / [`watching`] / [`machine`] / [`monitoring`] — what the
 //!   server has been doing, in memory and in the database.
 //! * [`settings`] — `[server]` from the web UI, and restarting to apply it.
+//! * [`storage`] — where the data is, and moving it from the web UI.
 //! * [`api`] — the routing table, and what every handler shares.
 //! * [`openapi`] — that table, described, with a test that says the
 //!   description and the router are the same server.
@@ -65,6 +66,7 @@ mod retrieval;
 mod scheduler;
 mod secret;
 mod settings;
+mod storage;
 mod watching;
 mod training;
 mod users;

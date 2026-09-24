@@ -132,7 +132,10 @@ than `~/.local/share/kvad`, by writing `[data] dir` to `kvad.toml`, which the
 CLI and the server both read. `KVAD_DATA_DIR` overrides that for one process.
 A chosen data directory takes the models pulled from Hugging Face with it,
 into `huggingface/hub` inside it; without one they stay in
-`~/.cache/huggingface/hub`, and `HF_HUB_CACHE` or `HF_HOME` win either way. `--host ADDR` and `--port N` answer the address
+`~/.cache/huggingface/hub`, and `HF_HUB_CACHE` or `HF_HOME` win either way.
+The web UI's Settings page does the same while the server runs, and moves
+what is already there: renamed on the same disk, copied to another one with
+the old copy kept until you delete it there. `--host ADDR` and `--port N` answer the address
 questions ahead of time, for a run that should not stop to ask — `--bind
 HOST:PORT` still says both at once. `sh install.sh --help` lists the rest.
 

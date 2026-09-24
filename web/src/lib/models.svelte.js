@@ -32,6 +32,16 @@ class Models {
     return this.listing?.residents ?? [];
   }
 
+  /** The language models in memory: what Chat and the Playground can use. */
+  get chatResidents() {
+    return this.residents.filter((r) => r.kind !== "image");
+  }
+
+  /** The image models in memory: what the Images page can use. */
+  get imageResidents() {
+    return this.residents.filter((r) => r.kind === "image");
+  }
+
   /** The budget the models in memory share: `{ total, left, context }`. */
   get memory() {
     return this.listing?.memory ?? null;
@@ -48,11 +58,14 @@ class Models {
    * still in memory, or else the one the server used last.
    */
   get loaded() {
-    const picked = this.residents.find((r) => r.id === this.picked);
+    // Language models only: every page that asks this is one that talks,
+    // and an image model in memory is not somebody to talk to.
+    const residents = this.chatResidents;
+    const picked = residents.find((r) => r.id === this.picked);
     if (picked) return picked;
     const last = this.listing?.loaded;
-    if (!last) return null;
-    return this.residents.find((r) => r.repo === last.repo && r.backend === last.backend) ?? last;
+    if (!last || last.kind === "image") return residents.at(-1) ?? null;
+    return residents.find((r) => r.repo === last.repo && r.backend === last.backend) ?? last;
   }
 
   /** Whether `repo` is in memory on any backend. */

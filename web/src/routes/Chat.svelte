@@ -121,13 +121,13 @@
     <!-- Which model will answer, and the controls for how. -->
     <header class="border-base-300 flex items-center gap-2 border-b px-4 py-2">
       <div class="min-w-0 grow">
-        {#if models.residents.length > 1}
+        {#if models.chatResidents.length > 1}
           <select
             class="select select-sm select-ghost -ml-3 max-w-full font-medium"
             aria-label="Which model answers"
             bind:value={() => models.loaded?.id, (id) => (models.picked = id)}
           >
-            {#each models.residents as r (r.id)}
+            {#each models.chatResidents as r (r.id)}
               <option value={r.id}>{r.repo} · {r.backend}</option>
             {/each}
           </select>

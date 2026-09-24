@@ -242,9 +242,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
         summary: "Every model this machine has, in OpenAI's shape",
         description: "One entry per model on disk, and one more per model in memory \
                       under `repo@backend`. Each carries a `kvad` object beside \
-                      OpenAI's fields saying whether that model's chat template can be \
-                      offered tools, and whether it is in memory — naming one that is \
-                      not costs a load.",
+                      OpenAI's fields saying whether it is a `chat` or an `image` \
+                      model, whether its chat template can be offered tools, and \
+                      whether it is in memory — naming one that is not costs a load.",
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
@@ -293,6 +293,59 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       numbers that generation reported.",
         query: &[], body: json_body("`{ role, content, stats? }`."),
         produces: JSON, events: &[],
+    },
+
+    // -- Images -------------------------------------------------------------
+    Endpoint {
+        method: "post", path: "/v1/images/generations", tag: "Images", access: Access::SignedIn,
+        summary: "Make an image (OpenAI-compatible)",
+        description: "OpenAI's request — `prompt`, `n` (at most 4), `size` as \
+                      `WIDTHxHEIGHT` or `auto`, `response_format` of `b64_json` (the \
+                      default) or `url` — plus diffusers' knobs OpenAI has no field \
+                      for: `negative_prompt`, `steps` (or `num_inference_steps`), \
+                      `guidance_scale` and `seed`. Anything left out is the model's \
+                      own default. `model` names an image model the way it names a \
+                      language model on `/v1/chat/completions`, and is loaded if it \
+                      fits; a language model is refused. Every image is kept, and a \
+                      `url` is this server's link to it, which asks for the same \
+                      credential this request did.\n\n\
+                      `stream: true` sends a step event per denoising step, a preview \
+                      beside each when `partial_images` or `preview` asks, and one \
+                      completed event per image. Each image carries a `kvad` object: \
+                      its id, seed, settings and the time each stage took.",
+        query: &[], body: json_body("`{ prompt, model?, n?, size?, response_format?, \
+                                     stream?, partial_images?, preview?, \
+                                     negative_prompt?, steps?, guidance_scale?, seed? }`"),
+        produces: "application/json or text/event-stream",
+        events: &[
+            ("image_generation.step", "`{ index, step, total }`: a denoising step is done."),
+            ("image_generation.partial_image", "A rough preview of the image so far, \
+                                                as `b64_json`, at the latent's size."),
+            ("image_generation.completed", "The image, as `b64_json` or `url`, with \
+                                            its `kvad` object."),
+            ("error", "`{ error }`, and the stream ends."),
+        ],
+    },
+    Endpoint {
+        method: "get", path: "/api/images", tag: "Images", access: Access::SignedIn,
+        summary: "Your images",
+        description: "Newest first, each with the settings that made it — the seed \
+                      above all — and its `url`. Yours only; another account's are \
+                      not listed.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/images/{id}", tag: "Images", access: Access::SignedIn,
+        summary: "An image, as a PNG",
+        description: "`12` or `12.png`. Another account's image is a 404, as a \
+                      conversation is.",
+        query: &[], body: None, produces: "image/png", events: &[],
+    },
+    Endpoint {
+        method: "delete", path: "/api/images/{id}", tag: "Images", access: Access::SignedIn,
+        summary: "Delete an image",
+        description: "The file and its row together. Another account's image is a 404.",
+        query: &[], body: None, produces: JSON, events: &[],
     },
 
     // -- Playground ---------------------------------------------------------
@@ -762,6 +815,7 @@ const TAGS: &[(&str, &str)] = &[
     ("Meta", "Is it up, and what is it."),
     ("Models", "What is on this machine, and what the engine holds."),
     ("Chat", "Generating, and the conversations kept around it."),
+    ("Images", "Text to image, and the pictures kept afterwards."),
     ("Playground", "The model without the conversation: raw completion, the \
                     tokeniser, and the choice behind each token."),
     ("Training", "Starting runs on this machine's own cores."),
@@ -856,6 +910,7 @@ mod tests {
         ("playground.rs", include_str!("playground.rs")),
         ("evals.rs", include_str!("evals.rs")),
         ("bench.rs", include_str!("bench.rs")),
+        ("images.rs", include_str!("images.rs")),
     ];
 
     const METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];

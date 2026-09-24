@@ -17,11 +17,18 @@
 //! and the [`Loader`](common::Loader) that turns a stored matrix into one of
 //! those layouts, going by way of [`qcache`] rather than the quantiser when the
 //! quantiser has already been this way.
+//!
+//! [`image`] is the other thing this crate does, and the one thing in the
+//! engine with no CPU version: text-to-image pipelines, which are convolution
+//! stacks and so live where the convolutions are. They are not sessions —
+//! nothing about them is tokens in, logits out — and implement
+//! [`kvad::image::Painter`] instead.
 
 mod common;
 pub mod deepseek;
 mod ffn;
 pub mod gpt2;
+pub mod image;
 pub mod model;
 pub mod qwen3_5;
 pub mod qcache;

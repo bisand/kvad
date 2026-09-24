@@ -104,6 +104,12 @@ struct Args {
     top_k: usize,
     top_p: f32,
     seed: u64,
+    /// Whether `--seed` was given: an image with no seed asked for gets a
+    /// fresh one, where a completion gets 7.
+    seed_given: bool,
+    /// `images make` only: how hard to follow the prompt, and what to avoid.
+    guidance: Option<f32>,
+    negative: Option<String>,
     quant: Precision,
     /// `crawl` only.
     out: Option<String>,
@@ -165,6 +171,9 @@ impl Default for Args {
             top_k: 40,
             top_p: 0.95,
             seed: 7,
+            seed_given: false,
+            guidance: None,
+            negative: None,
             quant: Precision::F32,
             out: None,
             pages: None,
@@ -215,6 +224,7 @@ fn usage() -> ! {
            cancel              stop whatever is generating\n  \
            tokenize TEXT       how the model splits a text\n  \
            conversations       ls, show ID, edit ID, rm ID\n  \
+           images              ls, make PROMPT [--out FILE], rm ID\n  \
            jobs                ls, show ID, watch ID, cancel ID\n  \
            datasets            ls, add FILE, crawl URL, show ID, check ID, search ID Q, rm ID\n  \
            evals               runs, show ID, suites, add FILE, edit ID FILE, rm ID,\n  \
@@ -294,7 +304,7 @@ fn usage() -> ! {
 const POSITIONAL: &[&str] = &[
     "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload",
     "tokenize", "service", "conversations", "jobs", "datasets", "evals", "bench", "metrics",
-    "auth", "users", "sessions", "keys", "api",
+    "auth", "users", "sessions", "keys", "api", "images",
 ];
 
 /// Flags that stand alone, and the short spellings some of them have.
@@ -367,7 +377,12 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--temperature" => a.temperature = num() as f32,
             "--top-k" => a.top_k = num() as usize,
             "--top-p" => a.top_p = num() as f32,
-            "--seed" => a.seed = num() as u64,
+            "--seed" => {
+                a.seed = num() as u64;
+                a.seed_given = true;
+            }
+            "--guidance" => a.guidance = Some(num() as f32),
+            "--negative" => a.negative = Some(value.clone()),
             "--out" => a.out = Some(value.clone()),
             "--pages" => a.pages = Some(num() as usize),
             "--mb" => a.megabytes = Some(num()),

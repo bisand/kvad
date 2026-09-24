@@ -41,6 +41,13 @@ export const PAGES = [
     icon: "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z",
   },
   {
+    path: "/images",
+    label: "Images",
+    phase: null,
+    blurb: "Text to image: a prompt, the denoiser's knobs, each step as it happens, and a gallery.",
+    icon: "M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM21 15l-5-5L5 21",
+  },
+  {
     path: "/training",
     label: "Training",
     phase: null,

@@ -8,6 +8,8 @@
 
 use kvad::model::Arch;
 use kvad::quant::Precision;
+#[cfg(feature = "gpu")]
+use kvad::service::Model;
 use kvad::service::{Backend, Loader};
 
 /// A loader for whatever this build can run.
@@ -15,9 +17,19 @@ pub fn loader() -> Loader {
     #[cfg(feature = "gpu")]
     {
         let mut cpu = kvad::service::cpu_loader();
-        Box::new(move |repo, backend, progress, watch| match backend {
-            Backend::Cpu(_) => cpu(repo, backend, progress, watch),
-            Backend::Gpu(mode) => gpu::load(repo, mode, progress, watch),
+        Box::new(move |repo, backend, progress, watch| {
+            // An image pipeline is not a language model at any precision,
+            // and has no CPU implementation at all; see docs/image-plan.md.
+            let image = kvad_gpu::image::is_pipeline(repo, watch);
+            match backend {
+                Backend::Cpu(_) if image => Err(format!(
+                    "{repo} makes images, and images are made on the GPU only; load it at a gpu backend"
+                )
+                .into()),
+                Backend::Cpu(_) => cpu(repo, backend, progress, watch),
+                Backend::Gpu(mode) if image => gpu::paint(repo, mode, progress, watch),
+                Backend::Gpu(mode) => gpu::load(repo, mode, progress, watch).map(Model::from),
+            }
         })
     }
     #[cfg(not(feature = "gpu"))]
@@ -125,11 +137,77 @@ pub fn parse(id: &str) -> Option<Backend> {
         .find(|b| id_of(*b) == id)
 }
 
+/// Whether this build can load an image pipeline of this class.
+pub fn paints(pipeline: &str) -> bool {
+    #[cfg(feature = "gpu")]
+    return kvad_gpu::image::PIPELINES.contains(&pipeline);
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = pipeline;
+        false
+    }
+}
+
+/// The pipelines this build implements, for a message.
+pub fn pipelines() -> String {
+    #[cfg(feature = "gpu")]
+    return kvad_gpu::image::PIPELINES.join(", ");
+    #[cfg(not(feature = "gpu"))]
+    String::from("none")
+}
+
+/// The backend an image pipeline gets when nobody has said which.
+///
+/// SDXL runs in f16 whatever it is asked, so any GPU backend is the same load
+/// and `gpu-bf16` is the one whose name does not promise a quantisation that
+/// will not happen. Qwen-Image does not fit in bf16 on a machine this server
+/// is likely to be on (41 GB of denoiser alone) and gets q8.
+pub fn preferred_image(pipeline: &str) -> Backend {
+    match pipeline {
+        "QwenImagePipeline" => Backend::Gpu(kvad::service::GpuMode::Q8),
+        _ => Backend::Gpu(kvad::service::GpuMode::Bf16),
+    }
+}
+
+/// What an image pipeline on this disk will take at `backend`, or `None` for
+/// anything that is not one (and for everything, in a build with no GPU).
+///
+/// Asked of the pipeline rather than worked out from the repo's size: each
+/// reads only some of its repo, in its own precision. See
+/// [`kvad_gpu::image::weight_bytes`].
+pub fn image_weight_bytes(repo: &str, backend: Backend) -> Option<u64> {
+    #[cfg(feature = "gpu")]
+    if let Backend::Gpu(mode) = backend {
+        return kvad_gpu::image::weight_bytes(repo, gpu::quant(mode));
+    }
+    let _ = (repo, backend);
+    None
+}
+
 #[cfg(feature = "gpu")]
 mod gpu {
     use kvad::runtime::Llm;
-    use kvad::service::GpuMode;
+    use kvad::service::{GpuMode, Model};
     use kvad::weights::Watcher;
+
+    /// The quantisation a mode names, as `kvad_gpu` spells it.
+    pub(super) fn quant(mode: GpuMode) -> Option<kvad_gpu::model::Quant> {
+        let name = match mode {
+            GpuMode::Bf16 => "none",
+            GpuMode::Q8 => "q8",
+            GpuMode::Q4 => "q4",
+        };
+        kvad_gpu::model::parse_quant(name).expect("known quant")
+    }
+
+    pub fn paint(
+        repo: &str,
+        mode: GpuMode,
+        progress: &mut dyn FnMut(&str),
+        watch: &Watcher,
+    ) -> Result<Model, Box<dyn std::error::Error>> {
+        Ok(Model::Image(kvad_gpu::image::load(repo, quant(mode), progress, watch)?))
+    }
 
     pub fn load(
         repo: &str,
@@ -138,11 +216,7 @@ mod gpu {
         watch: &Watcher,
     ) -> Result<Llm, Box<dyn std::error::Error>> {
         let dtype = kvad_gpu::model::parse_dtype("bf16").expect("known dtype");
-        let quant = match mode {
-            GpuMode::Bf16 => None,
-            GpuMode::Q8 => kvad_gpu::model::parse_quant("q8").expect("known quant"),
-            GpuMode::Q4 => kvad_gpu::model::parse_quant("q4").expect("known quant"),
-        };
+        let quant = quant(mode);
         // Which architecture this is, and whether there is a GPU
         // implementation of it, is the GPU crate's question and is answered
         // in one place: `session` dispatches on the config and names what it

@@ -392,6 +392,33 @@ pub fn fetch_watched(
     })
 }
 
+/// One file of a repo, by its path inside the repo, downloaded or reused from
+/// the cache — or from a directory standing in for the repo.
+///
+/// [`fetch_watched`] knows what a language model's repo holds and asks for
+/// exactly that. A diffusion pipeline's repo is laid out differently — a
+/// directory per model, `unet/diffusion_pytorch_model.fp16.safetensors`
+/// beside `text_encoder/model.fp16.safetensors` — and the caller is the only
+/// one who knows which of its several variants it wants, so it names them.
+pub fn fetch_file(repo_id: &str, filename: &str, watch: &Watcher) -> Res<PathBuf> {
+    if let Some(dir) = local_dir(repo_id) {
+        let path = dir.join(filename);
+        return match path.is_file() {
+            true => Ok(path),
+            false => Err(format!("{} has no {filename}", dir.display()).into()),
+        };
+    }
+    let (owner, name) =
+        repo_id.split_once('/').ok_or_else(|| format!("`{repo_id}` is not a directory here or a Hub repo id"))?;
+    let client = hf_hub::HFClientSync::new()?;
+    let progress = watch
+        .is_listening()
+        .then(|| hf_hub::progress::Progress::new(Relay { file: filename.to_string(), watch: watch.clone() }));
+    let path = client.model(owner, name).download_file().filename(filename.to_string()).maybe_progress(progress).send()?;
+    watch.emit(Fetch::Fetched { file: filename.to_string() });
+    Ok(path)
+}
+
 /// Names a checkpoint may hold that are not weights, so leaving them unread is
 /// correct rather than a gap in the implementation.
 ///

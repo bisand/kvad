@@ -62,6 +62,10 @@ pub struct Model {
     /// A mixture of experts, which is what lets a model over memory stream
     /// at all.
     pub mixture: bool,
+    /// `chat` for a language model, `image` for a text-to-image pipeline.
+    pub kind: crate::scheduler::Kind,
+    /// The diffusers pipeline an image model is, by its `model_index.json`.
+    pub pipeline: Option<String>,
     /// What the config says this is, for a row somebody opened. `None`
     /// when there is no config, or when it describes an architecture this
     /// build has no reader for.
@@ -266,7 +270,28 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
     // answered with the architecture message instead — the GPTQ repo that has
     // only its `model.safetensors.index.json` was being told it was the wrong
     // kind of model rather than an unfinished one.
+    // An image pipeline has no `config.json` at its root — each of its
+    // models has its own — so it is recognised by its index before the
+    // architecture checks below would call it a directory of nothing.
+    let pipeline = hub::pipeline(m);
     let blocker = match (m.complete, &m.model_type, m.arch) {
+        (false, _, _) if pipeline.is_some() => Some("the download did not finish".to_string()),
+        _ if pipeline.is_some() => {
+            let p = pipeline.as_deref().unwrap_or_default();
+            match (crate::engine::paints(p), cfg!(feature = "gpu")) {
+                (false, true) => Some(format!(
+                    "`{p}` is not a pipeline this build implements; it implements {}",
+                    crate::engine::pipelines()
+                )),
+                (false, false) => Some("this build has no GPU backend, and images are made on the GPU only".into()),
+                // The pipeline's own answer to whether the files it reads are
+                // here: SDXL borrows its VAE from another repo, and a
+                // Qwen-Image download is 22 files.
+                (true, _) => crate::engine::image_weight_bytes(&m.id, crate::engine::preferred_image(p))
+                    .is_none()
+                    .then(|| "not every file this pipeline reads is downloaded yet".to_string()),
+            }
+        }
         (false, _, _) => Some(match trained {
             true => "no weights yet — the run was stopped before its first checkpoint".into(),
             false => "the download did not finish".to_string(),
@@ -299,6 +324,11 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
         crawls: fit.crawls(),
         disk_per_token: fit.per_token(),
         mixture: m.reads.mixture(),
+        kind: match pipeline {
+            Some(_) => crate::scheduler::Kind::Image,
+            None => crate::scheduler::Kind::Chat,
+        },
+        pipeline,
         detail: detail_of(m),
     }
 }
@@ -369,6 +399,10 @@ pub struct QCache {
 /// run it on a blocking thread; the point is that it is on the way to a load,
 /// where seconds are the unit.
 pub fn default_backend(repo: Option<&str>) -> String {
+    let pipeline = repo.and_then(|r| hub::find_local(r)).and_then(|m| hub::pipeline(&m));
+    if let Some(p) = pipeline {
+        return crate::engine::id_of(crate::engine::preferred_image(&p));
+    }
     backend_for(repo, hub::remote_arch)
 }
 

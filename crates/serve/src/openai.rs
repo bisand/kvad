@@ -1147,6 +1147,7 @@ mod against_a_real_model {
             oidc: std::sync::Arc::new(Default::default()),
             started: std::time::Instant::now(),
             load_on_request: false,
+            settings: Default::default(),
         };
         let (progress, _ignored) = tokio::sync::mpsc::channel(8);
         let repo = dir.to_string_lossy().into_owned();

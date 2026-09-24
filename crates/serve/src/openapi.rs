@@ -103,6 +103,43 @@ pub const ENDPOINTS: &[Endpoint] = &[
         query: &[], body: None, produces: JSON, events: &[],
     },
 
+    // -- Settings -----------------------------------------------------------
+    Endpoint {
+        method: "get", path: "/api/settings", tag: "Settings", access: Access::Admin,
+        summary: "The server's settings, in the file and in force",
+        description: "`[server]` from kvad.toml as the file says it (`saved`) and as this \
+                      process runs with it (`running`); where they differ, a restart is \
+                      what changes it. Also the defaults an unset `memory_gb` and \
+                      `context` come to here, a `--bind` that overrides the file, and \
+                      the auth mode, data directory and database, which are shown and \
+                      not editable.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "put", path: "/api/settings", tag: "Settings", access: Access::Admin,
+        summary: "Change the server's settings in kvad.toml",
+        description: "Writes only the keys that changed, leaving the rest of the file and \
+                      its comments as they were. Refused, with nothing written, when the \
+                      result is a file the server could not start from: an open address \
+                      with no auth, an address something else holds, or a layout the \
+                      edit cannot change safely. Takes effect at the next restart. \
+                      Answers as the GET does.",
+        query: &[],
+        body: json_body("`{ autoload, load_on_request, memory_gb, context, bind }`; \
+                         `null` for `memory_gb` or `context` means the default."),
+        produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "post", path: "/api/restart", tag: "Settings", access: Access::Admin,
+        summary: "Restart the server in place",
+        description: "Answers 202, then stops taking requests, waits up to five seconds \
+                      for those in flight, and starts again as the same process with the \
+                      same arguments. Models in memory are unloaded and running jobs are \
+                      interrupted. Refused with 409 when kvad.toml is one the server \
+                      could not start from.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+
     // -- Models -------------------------------------------------------------
     Endpoint {
         method: "get", path: "/api/models", tag: "Models", access: Access::SignedIn,
@@ -813,6 +850,7 @@ parameter and stream — is checked against the router by a test.";
 
 const TAGS: &[(&str, &str)] = &[
     ("Meta", "Is it up, and what is it."),
+    ("Settings", "The server's own settings, and restarting to apply them."),
     ("Models", "What is on this machine, and what the engine holds."),
     ("Chat", "Generating, and the conversations kept around it."),
     ("Images", "Text to image, and the pictures kept afterwards."),
@@ -911,6 +949,7 @@ mod tests {
         ("evals.rs", include_str!("evals.rs")),
         ("bench.rs", include_str!("bench.rs")),
         ("images.rs", include_str!("images.rs")),
+        ("settings.rs", include_str!("settings.rs")),
     ];
 
     const METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];

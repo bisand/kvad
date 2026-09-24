@@ -468,11 +468,18 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
     let missing = |key: &Key| format!("{} is not loaded", id_of(&key.repo, key.backend));
 
     while let Ok(job) = jobs.recv() {
-        shared.waiting.fetch_sub(1, Ordering::Relaxed);
+        // Busy before the job leaves the waiting count, so that for the
+        // moment between the two the depth reads one too many rather than one
+        // too few: a queue that looks empty while it is not is the worse lie.
         shared.busy.store(true, Ordering::Relaxed);
+        shared.waiting.fetch_sub(1, Ordering::Relaxed);
         clock += 1;
 
-        match job {
+        // What the caller is waiting for: an answer, or the end of its
+        // stream. Handed over only once `busy` is clear, because a caller
+        // that has its answer and then reads the depth must not find its own
+        // job still counted in it.
+        let reply: Box<dyn FnOnce()> = match job {
             Job::Load { repo, backend, progress, done } => {
                 let key = Key { repo, backend };
                 let result = match slots.iter().any(|s| s.key == key) {
@@ -489,7 +496,7 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                         model
                     }),
                 };
-                let _ = done.send(result);
+                Box::new(move || drop(done.send(result)))
             }
 
             Job::Unload { which, done } => {
@@ -509,7 +516,7 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                     shared.residents().retain(|r| r.key != slot.key);
                     gone.push(id_of(&slot.key.repo, slot.key.backend));
                 }
-                let _ = done.send(failed.map_or(Ok(gone), Err));
+                Box::new(move || drop(done.send(failed.map_or(Ok(gone), Err))))
             }
 
             Job::Chat { on, messages, tools, sampling, fresh, out } => {
@@ -528,6 +535,7 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                         let _ = out.blocking_send(Piece::Failed(missing(&on)));
                     }
                 }
+                Box::new(move || drop(out))
             }
 
             Job::Complete { on, prompt, sampling, explain, fresh, out } => {
@@ -544,6 +552,7 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                         let _ = out.blocking_send(Piece::Failed(missing(&on)));
                     }
                 }
+                Box::new(move || drop(out))
             }
 
             Job::Tokenize { on, text, done } => {
@@ -554,7 +563,7 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                     }
                     None => Err(missing(&on)),
                 };
-                let _ = done.send(answer);
+                Box::new(move || drop(done.send(answer)))
             }
 
             Job::Score { on, text, window, progress, done } => {
@@ -569,24 +578,28 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                     }
                     None => Err(missing(&on)),
                 };
-                let _ = done.send(answer);
+                Box::new(move || drop(done.send(answer)))
             }
 
-            Job::Paint { on, request, out } => match slots.iter().find(|s| s.key == on) {
-                Some(slot) => {
-                    *shared.running() = Some(Arc::clone(&slot.engine.cancel));
-                    slot.engine.send(Cmd::Paint(request));
-                    drain_paint(&slot.engine.rx, &out, &slot.engine.cancel);
-                    *shared.running() = None;
-                    touch(&on, clock, None);
+            Job::Paint { on, request, out } => {
+                match slots.iter().find(|s| s.key == on) {
+                    Some(slot) => {
+                        *shared.running() = Some(Arc::clone(&slot.engine.cancel));
+                        slot.engine.send(Cmd::Paint(request));
+                        drain_paint(&slot.engine.rx, &out, &slot.engine.cancel);
+                        *shared.running() = None;
+                        touch(&on, clock, None);
+                    }
+                    None => {
+                        let _ = out.blocking_send(Stroke::Failed(missing(&on)));
+                    }
                 }
-                None => {
-                    let _ = out.blocking_send(Stroke::Failed(missing(&on)));
-                }
-            },
-        }
+                Box::new(move || drop(out))
+            }
+        };
 
         shared.busy.store(false, Ordering::Relaxed);
+        reply();
     }
 }
 

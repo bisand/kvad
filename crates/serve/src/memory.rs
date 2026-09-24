@@ -213,7 +213,11 @@ pub fn need(repo: &str, backend: Backend, context: usize) -> Need {
 
     let kv = kvad::hub::model_file(&local.path, "config.json")
         .and_then(|config| kvad::model::Spec::from_json(&config).ok())
-        .map(|spec| kv_bytes(&spec, context, crate::engine::kv_number_bytes(&spec, backend)))
+        .map(|spec| {
+            let (kv, state) =
+                (crate::engine::kv_number_bytes(&spec, backend), crate::engine::state_number_bytes(&spec, backend));
+            kv_bytes(&spec, context, kv, state)
+        })
         .unwrap_or(0);
 
     let streams =
@@ -252,9 +256,11 @@ fn at_path(repo: &str) -> Option<kvad::hub::LocalModel> {
 }
 
 /// The KV cache a resident is charged for, with each cached number `number`
-/// bytes wide: [`crate::engine::kv_number_bytes`].
-pub fn kv_bytes(spec: &kvad::model::Spec, context: usize, number: usize) -> u64 {
-    spec.cache.bytes_as(spec.n_layer, spec.n_ctx.min(context), number) as u64
+/// bytes wide and each number of a recurrent state `state` bytes:
+/// [`crate::engine::kv_number_bytes`] and
+/// [`crate::engine::state_number_bytes`].
+pub fn kv_bytes(spec: &kvad::model::Spec, context: usize, number: usize, state: usize) -> u64 {
+    spec.cache.bytes_as(spec.n_layer, spec.n_ctx.min(context), number, state) as u64
 }
 
 fn gb(bytes: u64) -> String {
@@ -357,9 +363,49 @@ mod tests {
         let spec = kvad::model::Spec::from_config(kvad::model::Json::new(config)).unwrap();
         // 28 layers, a key and a value of 8 heads by 128, four bytes each.
         let per_token = 28 * 2 * 8 * 128 * 4;
-        assert_eq!(kv_bytes(&spec, 40_960, 4), 40_960 * per_token);
-        assert_eq!(kv_bytes(&spec, DEFAULT_CONTEXT, 4), DEFAULT_CONTEXT as u64 * per_token);
+        assert_eq!(kv_bytes(&spec, 40_960, 4, 4), 40_960 * per_token);
+        assert_eq!(kv_bytes(&spec, DEFAULT_CONTEXT, 4, 4), DEFAULT_CONTEXT as u64 * per_token);
         // A model whose context is shorter than the budget's is charged its own.
-        assert_eq!(kv_bytes(&spec, 1 << 20, 4), 40_960 * per_token);
+        assert_eq!(kv_bytes(&spec, 1 << 20, 4, 4), 40_960 * per_token);
+    }
+
+    /// A recurrent state is charged at the width it is kept in, which on the
+    /// GPU is the model's compute dtype and not its attention cache's: bf16
+    /// for a bf16 model, f32 for a quantised one even where its cache is
+    /// f16. It was charged at f32 whatever the backend.
+    #[test]
+    fn a_recurrent_state_is_charged_at_its_own_width() {
+        let config = serde_json::json!({
+            "model_type": "qwen3_next",
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "hidden_size": 2048,
+            "intermediate_size": 5120,
+            "vocab_size": 151936,
+            "max_position_embeddings": 262144,
+            "full_attention_interval": 4,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+        });
+        let spec = kvad::model::Spec::from_config(kvad::model::Json::new(config)).unwrap();
+        let context = 4096;
+        let charged = |b: Backend| {
+            let (kv, state) = (crate::engine::kv_number_bytes(&spec, b), crate::engine::state_number_bytes(&spec, b));
+            kv_bytes(&spec, context, kv, state)
+        };
+        let at = |kv: usize, state: usize| spec.cache.bytes_as(spec.n_layer, context, kv, state) as u64;
+        assert!(spec.cache.bytes_as(spec.n_layer, 0, 0, 4) > 0, "a layout with no state tests nothing");
+        assert_eq!(charged(Backend::Cpu(Precision::Q8)), at(4, 4));
+        #[cfg(feature = "gpu")]
+        {
+            assert_eq!(charged(Backend::Gpu(GpuMode::Bf16)), at(2, 2));
+            let kv = if cfg!(target_os = "macos") { 2 } else { 4 };
+            assert_eq!(charged(Backend::Gpu(GpuMode::Q8)), at(kv, 4));
+        }
     }
 }

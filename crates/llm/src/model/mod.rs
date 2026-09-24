@@ -126,15 +126,16 @@ impl CacheShape {
     /// Bytes one layer keeps at `len` positions, in f32 as this engine keeps
     /// them.
     pub fn bytes(&self, len: usize) -> usize {
-        self.bytes_as(len, std::mem::size_of::<f32>())
+        let f = std::mem::size_of::<f32>();
+        self.bytes_as(len, f, f)
     }
 
-    /// The same, with each cached key and value number `number` bytes wide.
-    /// A GPU backend's cache is not always f32: see [`Session::kv_number_bytes`].
-    /// The recurrent state is still counted as f32, the widest it is kept in,
-    /// so that a figure here can be too high but never too low.
-    pub fn bytes_as(&self, len: usize, number: usize) -> usize {
-        len * (self.k + self.v) * number + self.state * std::mem::size_of::<f32>()
+    /// The same, with each cached key and value number `number` bytes wide
+    /// and each number of the recurrent state `state` bytes wide. A GPU
+    /// backend keeps neither in f32 as a rule, and not always the two alike:
+    /// see [`Session::kv_number_bytes`] and [`Session::state_number_bytes`].
+    pub fn bytes_as(&self, len: usize, number: usize, state: usize) -> usize {
+        len * (self.k + self.v) * number + self.state * state
     }
 }
 
@@ -177,14 +178,16 @@ impl CacheLayout {
     /// Bytes the whole cache holds at `len` positions, across `n_layer`
     /// layers.
     pub fn bytes(&self, n_layer: usize, len: usize) -> usize {
-        self.bytes_as(n_layer, len, std::mem::size_of::<f32>())
+        let f = std::mem::size_of::<f32>();
+        self.bytes_as(n_layer, len, f, f)
     }
 
-    /// [`CacheLayout::bytes`] with keys and values `number` bytes a number.
-    pub fn bytes_as(&self, n_layer: usize, len: usize, number: usize) -> usize {
+    /// [`CacheLayout::bytes`] with keys and values `number` bytes a number,
+    /// and recurrent states `state`: see [`CacheShape::bytes_as`].
+    pub fn bytes_as(&self, n_layer: usize, len: usize, number: usize, state: usize) -> usize {
         match &self.per_layer {
-            None => n_layer * self.uniform.bytes_as(len, number),
-            Some(shapes) => shapes.iter().take(n_layer).map(|s| s.bytes_as(len, number)).sum(),
+            None => n_layer * self.uniform.bytes_as(len, number, state),
+            Some(shapes) => shapes.iter().take(n_layer).map(|s| s.bytes_as(len, number, state)).sum(),
         }
     }
 
@@ -678,6 +681,17 @@ pub trait Session: Send {
         std::mem::size_of::<f32>()
     }
 
+    /// The same for a recurrent state's numbers, where the model has one: 4
+    /// for this engine, and a GPU session's compute dtype, which is 2 for a
+    /// bf16 model. Not always [`Session::kv_number_bytes`]: a quantised
+    /// model on Metal keeps its attention cache in f16 and its state in f32.
+    ///
+    /// The server charges a model's state from the rule that predicts this
+    /// before it loads. Until there was one, every state was charged as f32.
+    fn state_number_bytes(&self) -> usize {
+        std::mem::size_of::<f32>()
+    }
+
     /// Run `tokens` and return logits for **every** one of them, in order.
     ///
     /// Scoring text needs a distribution per position; generation needs only
@@ -995,5 +1009,17 @@ mod tests {
         assert_eq!(shape.bytes(0), 6 * f, "the state is there before any token is");
         assert_eq!(shape.bytes(10) - shape.bytes(9), 8 * f, "one more position, one k and one v");
         assert_eq!(CacheShape::kv(4, 4).bytes(10), 80 * f);
+    }
+
+    /// The two widths are counted apart: keys and values per position at
+    /// one, the state once at the other.
+    #[test]
+    fn a_recurrent_state_is_counted_at_its_own_width() {
+        let shape = CacheShape { k: 4, v: 4, state: 6 };
+        assert_eq!(shape.bytes_as(10, 2, 4), 10 * 8 * 2 + 6 * 4);
+        assert_eq!(shape.bytes_as(10, 2, 2), 10 * 8 * 2 + 6 * 2);
+        let layout = CacheLayout::per_layer(vec![CacheShape::recurrent(6), CacheShape::kv(4, 4)]);
+        assert_eq!(layout.bytes_as(2, 10, 2, 4), 6 * 4 + 10 * 8 * 2);
+        assert_eq!(layout.bytes(2, 10), layout.bytes_as(2, 10, 4, 4));
     }
 }

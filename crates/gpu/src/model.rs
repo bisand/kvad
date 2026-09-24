@@ -769,6 +769,18 @@ pub fn kv_number_bytes(arch: Arch, dtype: DType, quant: Option<GgmlDType>, metal
     }
 }
 
+/// Bytes one number of a recurrent state takes, for a model loaded at
+/// `dtype` and `quant`: what its session's `Session::state_number_bytes`
+/// will say, asked before there is a session, as [`kv_number_bytes`] is.
+///
+/// The compute dtype, on any device: Qwen3.5's linear layers keep their
+/// convolution window and their state in what they compute in, which is f32
+/// around quantised weights. An architecture with no recurrent state has
+/// nothing for this to size.
+pub fn state_number_bytes(dtype: DType, quant: Option<GgmlDType>) -> usize {
+    if quant.is_some() { DType::F32 } else { dtype }.size_in_bytes()
+}
+
 /// Pick the best device available, unless one was named.
 pub fn pick_device(name: Option<&str>) -> Res<Device> {
     let want = name.unwrap_or("auto").to_ascii_lowercase();

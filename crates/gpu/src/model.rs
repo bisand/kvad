@@ -29,10 +29,11 @@ use crate::common::{
     Reader, Stored,
 };
 use crate::ffn::{Ffn, Mlp, Moe};
+use crate::fused;
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
-use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{ops, rotary_emb, VarBuilder};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::{ops, VarBuilder};
 use kvad::model::ffn::{Layout, Router};
 use kvad::model::{Arch, Session, Spec};
 
@@ -44,12 +45,11 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 struct Block {
     attn_norm: Tensor,
-    q: Proj,
-    q_b: Option<Tensor>,
-    k: Proj,
-    k_b: Option<Tensor>,
-    v: Proj,
-    v_b: Option<Tensor>,
+    /// The query, key and value projections as one, in that order: see
+    /// [`Loader::proj_cat`].
+    qkv: Proj,
+    /// Their biases, likewise, where the model has them.
+    qkv_b: Option<Tensor>,
     o: Proj,
     /// Qwen3's per-head RMSNorm on the queries and the keys, applied after the
     /// projection and *before* RoPE. One vector of `head_dim`, shared by every
@@ -87,24 +87,13 @@ pub struct GpuLlama {
     /// Per layer, `[1, n_kv_head, seq, head_dim]` for keys and values.
     kv: Vec<KvCache>,
     pos: usize,
+    /// Whether a step runs [`crate::fused`]'s kernels, where they fit. Set
+    /// at load from whether this device has them; the tests turn it off to
+    /// hold the kernels to the ops they replace.
+    fuse: bool,
 }
 
 
-
-/// RMSNorm every head of a projection shaped `[.., heads, head_dim]`, if this
-/// model has the weights for it.
-///
-/// The mirror of `norm_heads` in [`kvad::model::llama`], and much shorter for
-/// one reason: `rms_norm` normalises along the last axis, so putting the heads
-/// on the axis before it turns a loop over heads into a single kernel call.
-///
-/// `None` is every other model in this family, and costs one branch per layer.
-fn norm_heads(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> candle_core::Result<Tensor> {
-    match weight {
-        None => Ok(x.clone()),
-        Some(w) => ops::rms_norm(&x.contiguous()?, w, eps),
-    }
-}
 
 impl GpuLlama {
     pub fn load(
@@ -181,12 +170,30 @@ impl GpuLlama {
             let mlp = l.pp("mlp");
             blocks.push(Block {
                 attn_norm: to_dev(l.get(e, "input_layernorm.weight")?)?,
-                q: load_t(&attn, "q_proj.weight", qd, e)?,
-                q_b: attn.try_get(qd, "q_proj.bias").map(&to_dev).transpose()?,
-                k: load_t(&attn, "k_proj.weight", kvd, e)?,
-                k_b: attn.try_get(kvd, "k_proj.bias").map(&to_dev).transpose()?,
-                v: load_t(&attn, "v_proj.weight", kvd, e)?,
-                v_b: attn.try_get(kvd, "v_proj.bias").map(&to_dev).transpose()?,
+                qkv: ld.proj_cat(
+                    &attn,
+                    &[("q_proj.weight", qd), ("k_proj.weight", kvd), ("v_proj.weight", kvd)],
+                    e,
+                    Stored::OutIn,
+                )?,
+                qkv_b: {
+                    let parts = [("q_proj.bias", qd), ("k_proj.bias", kvd), ("v_proj.bias", kvd)];
+                    let got: Vec<_> = parts.iter().map(|&(name, len)| attn.try_get(len, name)).collect();
+                    match got.iter().all(Option::is_none) {
+                        true => None,
+                        // A model with some of the three and not the others
+                        // gets zeros for the others, which is what it adds;
+                        // they are counted as parameters, which they are not.
+                        false => {
+                            let all = got
+                                .into_iter()
+                                .zip(parts)
+                                .map(|(b, (_, len))| b.map_or_else(|| Tensor::zeros(len, load_dtype, &load_dev), Ok))
+                                .collect::<candle_core::Result<Vec<_>>>()?;
+                            Some(to_dev(Tensor::cat(&all, 0)?)?)
+                        }
+                    }
+                },
                 o: load_t(&attn, "o_proj.weight", e, qd)?,
                 q_norm: attn.try_get(hd, "q_norm.weight").map(&to_dev).transpose()?,
                 k_norm: attn.try_get(hd, "k_norm.weight").map(&to_dev).transpose()?,
@@ -228,6 +235,7 @@ impl GpuLlama {
         settled(&device)?;
 
         Ok(GpuLlama {
+            fuse: fused::available(&device),
             kv: (0..spec.n_layer).map(|_| KvCache::new(2).stored_as(kv_store(&device, quant))).collect(),
             blocks,
             embed,
@@ -277,50 +285,62 @@ impl GpuLlama {
             false => None,
         };
 
+        // The MLP's output of the layer before, not yet added to `x`: the
+        // add and the norm after it are one kernel, and the norm belongs to
+        // the next layer.
+        let mut pending: Option<Tensor> = None;
         for (i, blk) in self.blocks.iter().enumerate() {
-            let h = ops::rms_norm(&x, &blk.attn_norm, spec.eps)?;
+            let h = match pending.take() {
+                None => ops::rms_norm(&x, &blk.attn_norm, spec.eps)?,
+                Some(f) => {
+                    let (h, sum) = fused::add_rms_norm(&x, &f, &blk.attn_norm, spec.eps)?;
+                    x = sum;
+                    h
+                }
+            };
 
-            let q = linear(&h, &blk.q, blk.q_b.as_ref())?;
-            let k = linear(&h, &blk.k, blk.k_b.as_ref())?;
-            let v = linear(&h, &blk.v, blk.v_b.as_ref())?;
+            // [m, (n_head + 2 n_kv) hd]: the queries, then the keys, then the
+            // values.
+            let qkv = blk.qkv.forward(&h)?;
+            let heads = fused::Heads {
+                n_head,
+                n_kv,
+                head_dim: hd,
+                bias: blk.qkv_b.as_ref(),
+                q_norm: blk.q_norm.as_ref(),
+                k_norm: blk.k_norm.as_ref(),
+                eps: spec.eps,
+            };
+            // Where MLX's attention kernel takes this step (`fused`, not the
+            // module), the queries go to it in the cache's dtype, which is
+            // what it wants; see `attention`.
+            let cache = self.kv[i].dtype(self.dtype);
+            let q_dtype = if fused(&self.device, hd, m) { cache } else { self.dtype };
+            let (q, k, v) = if self.fuse && fused::rope_cache_fits(&qkv, &heads, &cos, &sin, cache, q_dtype) {
+                let (kb, vb) = self.kv[i].room(&[1, n_kv, m, hd], &[1, n_kv, m, hd], cache, &self.device)?;
+                let q = fused::rope_cache(&qkv, &heads, &cos, &sin, &kb, &vb, self.kv[i].len(), q_dtype)?;
+                let (k, v) = self.kv[i].advance(m)?;
+                (q, k, v)
+            } else {
+                let (q, k, v) = fused::heads(&qkv, &heads, &cos, &sin)?;
+                // Append to the cache along the sequence axis.
+                let (k, v) = self.kv[i].push(&k, &v)?;
+                (q, k, v)
+            };
 
-            // [m, heads * hd] -> [1, m, heads, hd]: the heads are split out
-            // with `hd` still last, which is the layout the per-head norm
-            // below wants.
-            let q = q.reshape((1, m, n_head, hd))?;
-            let k = k.reshape((1, m, n_kv, hd))?;
-
-            // Qwen3 normalises each head of Q and K here, between the
-            // projection and the rotation. Nothing else in this family does,
-            // and for everything else this is a no-op.
-            let q = norm_heads(&q, blk.q_norm.as_ref(), spec.eps)?;
-            let k = norm_heads(&k, blk.k_norm.as_ref(), spec.eps)?;
-
-            // -> [1, heads, m, hd], which is what the rotary kernel and the
-            // batched attention matmuls want.
-            let q = q.transpose(1, 2)?.contiguous()?;
-            let k = k.transpose(1, 2)?.contiguous()?;
-            let v = v.reshape((1, m, n_kv, hd))?.transpose(1, 2)?.contiguous()?;
-
-            let q = rotary_emb::rope(&q, &cos, &sin)?;
-            let k = rotary_emb::rope(&k, &cos, &sin)?;
-
-            // Append to the cache along the sequence axis.
-            let (k, v) = self.kv[i].push(&k, &v)?;
-
-            let out = attention(&q, &k, &v, mask.as_ref(), scale)?;
+            let out = attention(&q, &k, &v, mask.as_ref(), scale)?.to_dtype(self.dtype)?;
             let out = out.transpose(1, 2)?.reshape((m, n_head * hd))?;
-            x = (x + linear(&out, &blk.o, None)?)?;
-
-            let h = ops::rms_norm(&x, &blk.mlp_norm, spec.eps)?;
-            x = (x + blk.mlp.forward(&h, m, spec.n_embd)?)?;
+            let (h, sum) = fused::add_rms_norm(&x, &linear(&out, &blk.o, None)?, &blk.mlp_norm, spec.eps)?;
+            x = sum;
+            pending = Some(blk.mlp.forward(&h, m, spec.n_embd)?);
         }
 
         self.pos += m;
 
         // Only the last position predicts anything we need.
-        let last = x.i(m - 1)?.unsqueeze(0)?;
-        let last = ops::rms_norm(&last, &self.final_norm, spec.eps)?;
+        let last = |t: &Tensor| t.narrow(0, m - 1, 1);
+        let f = pending.ok_or("a model with no layers")?;
+        let (last, _) = fused::add_rms_norm(&last(&x)?, &last(&f)?, &self.final_norm, spec.eps)?;
         let logits = self.head.forward(&last)?.to_dtype(DType::F32)?;
         Ok(logits.flatten_all()?.to_vec1::<f32>()?)
     }
@@ -335,16 +355,12 @@ impl GpuLlama {
             .blocks
             .iter()
             .map(|b| {
-                b.q.params()
-                    + b.k.params()
-                    + b.v.params()
+                b.qkv.params()
                     + b.o.params()
                     + b.mlp.params()
                     + n(&b.attn_norm)
                     + n(&b.mlp_norm)
-                    + opt(&b.q_b)
-                    + opt(&b.k_b)
-                    + opt(&b.v_b)
+                    + opt(&b.qkv_b)
                     + opt(&b.q_norm)
                     + opt(&b.k_norm)
             })
@@ -369,13 +385,11 @@ impl GpuLlama {
             .blocks
             .iter()
             .map(|b| {
-                b.q.bytes() + b.k.bytes() + b.v.bytes() + b.o.bytes()
+                b.qkv.bytes() + b.o.bytes()
                     + b.mlp.bytes()
                     + per(&b.attn_norm)
                     + per(&b.mlp_norm)
-                    + opt(&b.q_b)
-                    + opt(&b.k_b)
-                    + opt(&b.v_b)
+                    + opt(&b.qkv_b)
             })
             .sum();
         // A tied head is the embedding, not a copy of it.
@@ -553,7 +567,7 @@ fn fused(device: &Device, head_dim: usize, m: usize) -> bool {
         && (m == 1 || m % QUERY_TILE == 0)
 }
 
-/// The fused kernel's query tile, which [`fused`] needs `m` to be a multiple
+/// The fused kernel's query tile, which [`fused()`] needs `m` to be a multiple
 /// of and [`Session::forward`] therefore cuts its chunks to.
 const QUERY_TILE: usize = 32;
 
@@ -915,6 +929,123 @@ pub(crate) mod tests {
             }
             std::fs::remove_file(&path).unwrap();
         }
+    }
+
+    /// The fused kernels against candle's ops, through the whole model.
+    ///
+    /// `fused`'s own tests hold each kernel to the ops it replaces; this is
+    /// the plumbing around them: the merged projections split at the right
+    /// columns, the cache written where attention then reads, the residual
+    /// carried from one layer's MLP into the next layer's norm. Two layers,
+    /// so that the norm between them is the fused one, and a prompt past the
+    /// cache's first 256 positions, so that it grows under the kernel.
+    #[test]
+    fn fused_steps_agree_with_candles_ops() {
+        let Ok(dev) = Device::new_metal(0) else { return };
+        if !fused::available(&dev) {
+            return;
+        }
+        let mut spec = tiny_spec();
+        spec.n_layer = 2;
+        spec.n_ctx = 320;
+        let (e, i, hd) = (spec.n_embd, spec.intermediate, spec.head_dim);
+        let (qd, kvd) = (spec.n_head * hd, spec.kv_dim());
+        let d = Device::Cpu;
+        let rand = |shape: &[usize], mean: f32| Tensor::randn(mean, 0.1f32, shape, &d).unwrap();
+        let prompt: Vec<u32> = (0..260).map(|t| (t * 7 % 64) as u32).collect();
+        for (bias, norms) in [(false, false), (true, false), (false, true)] {
+            // `write_tensors` writes layer 0; layer 1 is all extras.
+            let mut extra = Vec::new();
+            let p = "model.layers.1";
+            for (name, shape) in [
+                ("self_attn.q_proj.weight", vec![qd, e]),
+                ("self_attn.k_proj.weight", vec![kvd, e]),
+                ("self_attn.v_proj.weight", vec![kvd, e]),
+                ("self_attn.o_proj.weight", vec![e, qd]),
+                ("mlp.gate_proj.weight", vec![i, e]),
+                ("mlp.up_proj.weight", vec![i, e]),
+                ("mlp.down_proj.weight", vec![e, i]),
+            ] {
+                extra.push((format!("{p}.{name}"), (rand(&shape, 0.0) * 0.2).unwrap()));
+            }
+            for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                extra.push((format!("{p}.{name}"), rand(&[e], 1.0)));
+            }
+            for l in 0..2 {
+                let at = format!("model.layers.{l}.self_attn");
+                if bias {
+                    for (name, n) in [("q_proj.bias", qd), ("k_proj.bias", kvd), ("v_proj.bias", kvd)] {
+                        extra.push((format!("{at}.{name}"), rand(&[n], 0.0)));
+                    }
+                }
+                if norms {
+                    for name in ["q_norm.weight", "k_norm.weight"] {
+                        extra.push((format!("{at}.{name}"), rand(&[hd], 1.0)));
+                    }
+                }
+            }
+            let path = write_tensors(&spec, false, &extra, &format!("fused-{bias}-{norms}"));
+            for (what, dtype, quant, allow) in [
+                ("f32", DType::F32, None, 1e-4),
+                ("bf16", DType::BF16, None, 5e-2),
+                ("q8", DType::F32, Some(GgmlDType::Q8_0), 1e-2),
+            ] {
+                let what = format!("{what}, bias {bias}, norms {norms}");
+                let mut gpu =
+                    GpuLlama::load(std::slice::from_ref(&path), spec.clone(), dtype, quant, dev.clone(), &Vault::off())
+                        .unwrap();
+                fused_against_plain(&mut gpu, &prompt, allow, &what);
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// Run `prompt` and six steps after it with the fused kernels and
+    /// without, and hold the two to `allow` of the largest logit.
+    fn fused_against_plain(gpu: &mut GpuLlama, prompt: &[u32], allow: f32, what: &str) {
+        assert!(gpu.fuse, "{what}: the model does not fuse on a device that can");
+        let mut run = |fuse: bool| -> Vec<Vec<f32>> {
+            gpu.fuse = fuse;
+            gpu.truncate(0).unwrap();
+            let mut all = vec![gpu.forward(prompt).unwrap()];
+            for t in 0..6 {
+                all.push(gpu.forward(&[t * 5 + 1]).unwrap());
+            }
+            all
+        };
+        let before = fused::tests_ran();
+        let fused_logits = run(true);
+        // Every layer's rope_cache and add_rms_norm, and the final norm, at
+        // each of seven steps.
+        assert!(fused::tests_ran() - before >= 7 * 3, "{what}: the kernels did not run");
+        let plain = run(false);
+        for (step, (a, b)) in fused_logits.iter().zip(&plain).enumerate() {
+            let scale = b.iter().fold(0f32, |m, x| m.max(x.abs()));
+            let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            assert!(a.iter().all(|x| x.is_finite()), "{what}, step {step}: not finite");
+            assert!(worst <= allow * scale, "{what}, step {step}: off by {worst} of {scale}");
+        }
+    }
+
+    /// The same for a mixture: its experts' gate and up projections are
+    /// merged too, and its layers' outputs come from a scatter, not a matmul.
+    #[test]
+    fn a_fused_mixture_agrees_with_candles_ops() {
+        let Ok(dev) = Device::new_metal(0) else { return };
+        if !fused::available(&dev) {
+            return;
+        }
+        let (spec, path) = moe_checkpoint("fused");
+        for (what, dtype, quant, allow) in [
+            ("f32", DType::F32, None, 1e-4),
+            ("bf16", DType::BF16, None, 5e-2),
+            ("q8", DType::F32, Some(GgmlDType::Q8_0), 1e-2),
+        ] {
+            let mut gpu =
+                GpuLlama::load(std::slice::from_ref(&path), spec.clone(), dtype, quant, dev.clone(), &Vault::off()).unwrap();
+            fused_against_plain(&mut gpu, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], allow, &format!("mixture, {what}"));
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// A checkpoint in more than one file, which nothing else here builds.

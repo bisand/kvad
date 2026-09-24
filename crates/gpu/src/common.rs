@@ -247,6 +247,60 @@ impl<'v> Loader<'v> {
         Ok(Proj::Quant(QMatMul::from_qtensor(self.quantized(vb, name, out, inp, stored)?)?))
     }
 
+    /// Projections that read the same input, as one: `parts` are each one's
+    /// name and output width, and the merged projection returns their
+    /// outputs side by side, in that order.
+    ///
+    /// A decode step's matrix-vector products are shorter than they are
+    /// wide, and the short ones use the memory worst: Qwen2.5-1.5B's key and
+    /// value projections are 256 rows each. One product for Q, K and V and
+    /// one for gate and up measured 0.28 ms a token faster than five, before
+    /// counting the four dispatches it saves.
+    ///
+    /// The rows are joined on the host, before anything reaches the device:
+    /// a quantised row is its own blocks, so one matrix's bytes after
+    /// another's are the blocks of the two stacked, and the cache's blocks
+    /// can be used as they are.
+    pub(crate) fn proj_cat(&self, vb: &Reader<'_>, parts: &[(&str, usize)], inp: usize, stored: Stored) -> Res<Proj> {
+        if let [(name, out)] = parts {
+            return self.proj(vb, name, *out, inp, stored);
+        }
+        let total = parts.iter().map(|p| p.1).sum();
+        let Some(gd) = self.quant else {
+            let ws = parts
+                .iter()
+                .map(|&(name, out)| {
+                    Ok(match stored {
+                        Stored::OutIn => vb.get((out, inp), name)?.t()?,
+                        Stored::InOut => vb.get((inp, out), name)?,
+                    })
+                })
+                .collect::<Res<Vec<_>>>()?;
+            // `cat` along a later axis of parts that are not contiguous
+            // returns the transpose of a contiguous result, not a contiguous
+            // one, and the M5's dense kernel declines a strided weight:
+            // prefill ran on candle's matmul at half the speed.
+            return Ok(Proj::Dense(Tensor::cat(&ws, 1)?.contiguous()?.to_device(&self.device)?));
+        };
+        let mut bytes = Vec::new();
+        for &(name, out) in parts {
+            let size = out * inp / gd.block_size() * gd.type_size();
+            match self.vault.blocks(&vb.full(name), (out, inp)).filter(|b| b.len() == size) {
+                Some(b) => {
+                    vb.record(name);
+                    bytes.extend_from_slice(b);
+                }
+                None => bytes.extend_from_slice(&self.quantize(vb, name, out, inp, stored)?.data()?),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if self.blocks {
+            return Ok(Proj::Blocks(crate::mpp::Q8::new(&bytes, total, inp, &self.device)?));
+        }
+        let q = QTensor::new(QStorage::from_data(bytes.into(), &self.device, gd)?, (total, inp))?;
+        Ok(Proj::Quant(QMatMul::from_qtensor(q)?))
+    }
+
     /// One matrix in blocks: read back from the cache, or quantised and filed.
     ///
     /// A `QTensor` keeps `[out, in]` whichever way the checkpoint spelled it,
@@ -430,8 +484,9 @@ pub(crate) fn kv_store_on(metal: bool, quant: Option<GgmlDType>) -> Option<DType
 /// positions of Qwen2.5-1.5B and 0.44 ms at 2,048, still growing.
 ///
 /// Now each is a buffer with room to spare. A step writes its positions into
-/// place with `slice_set`, and attention reads a `narrow` view of the part
-/// in use. That view is not contiguous, and it needs not be: the fused
+/// place — with `slice_set`, or on Metal from inside `fused::rope_cache`,
+/// between [`room`](Self::room) and [`advance`](Self::advance) — and
+/// attention reads a `narrow` view of the part in use. That view is not contiguous, and it needs not be: the fused
 /// kernel takes the cache's strides, and the written-out path makes its own
 /// contiguous copy of the transpose it wants anyway. When the room runs out
 /// the buffer doubles, so a position is copied a handful of times over a
@@ -473,42 +528,66 @@ impl KvCache {
     }
 
     /// Positions held.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// The dtype positions are held in, when they are computed in `compute`.
+    pub(crate) fn dtype(&self, compute: DType) -> DType {
+        self.store.unwrap_or(compute)
     }
 
     /// Add `k` and `v`'s positions after the ones held, and return all of
     /// them: views onto the buffers, not copies.
     pub(crate) fn push(&mut self, k: &Tensor, v: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
-        let (axis, len, store) = (self.axis, self.len, self.store);
-        let m = k.dim(axis)?;
-        let grow = |held: &Option<Tensor>, new: &Tensor| -> candle_core::Result<Tensor> {
-            let new = match store {
-                Some(dt) => new.to_dtype(dt)?,
-                None => new.clone(),
-            };
+        let (k, v) = match self.store {
+            Some(dt) => (k.to_dtype(dt)?, v.to_dtype(dt)?),
+            None => (k.clone(), v.clone()),
+        };
+        let (kb, vb) = self.room(k.dims(), v.dims(), k.dtype(), k.device())?;
+        kb.slice_set(&k.contiguous()?, self.axis, self.len)?;
+        vb.slice_set(&v.contiguous()?, self.axis, self.len)?;
+        self.advance(k.dim(self.axis)?)
+    }
+
+    /// The two buffers, grown if they must be to take the positions `k` and
+    /// `v` describe, the shapes of what is to be written: whatever those
+    /// are along `axis` goes after the positions held.
+    ///
+    /// For a caller that writes the positions itself, and then calls
+    /// [`advance`](Self::advance). [`push`](Self::push) is the one that
+    /// does not.
+    pub(crate) fn room(&mut self, k: &[usize], v: &[usize], dtype: DType, device: &Device)
+     -> candle_core::Result<(Tensor, Tensor)> {
+        let (axis, len, m) = (self.axis, self.len, k[self.axis]);
+        let grow = |held: &Option<Tensor>, dims: &[usize]| -> candle_core::Result<Tensor> {
             let room = held.as_ref().map_or(Ok(0), |b| b.dim(axis))?;
-            let buf = match held {
-                Some(b) if len + m <= room => b.clone(),
+            match held {
+                Some(b) if len + m <= room => Ok(b.clone()),
                 _ => {
-                    let mut shape = new.dims().to_vec();
+                    let mut shape = dims.to_vec();
                     shape[axis] = (len + m).max(2 * room).max(Self::FIRST);
-                    let bigger = Tensor::zeros(shape, new.dtype(), new.device())?;
+                    let bigger = Tensor::zeros(shape, dtype, device)?;
                     if let Some(b) = held {
                         bigger.slice_set(b, axis, 0)?;
                     }
-                    bigger
+                    Ok(bigger)
                 }
-            };
-            buf.slice_set(&new.contiguous()?, axis, len)?;
-            Ok(buf)
+            }
         };
         let (kb, vb) = (grow(&self.k, k)?, grow(&self.v, v)?);
-        self.len = len + m;
-        let views = (kb.narrow(axis, 0, self.len)?, vb.narrow(axis, 0, self.len)?);
-        (self.k, self.v) = (Some(kb), Some(vb));
-        Ok(views)
+        (self.k, self.v) = (Some(kb.clone()), Some(vb.clone()));
+        Ok((kb, vb))
+    }
+
+    /// Count `m` positions written after the ones held, and return all of
+    /// them.
+    pub(crate) fn advance(&mut self, m: usize) -> candle_core::Result<(Tensor, Tensor)> {
+        let (Some(k), Some(v)) = (&self.k, &self.v) else {
+            candle_core::bail!("the cache advanced with no room made")
+        };
+        self.len += m;
+        Ok((k.narrow(self.axis, 0, self.len)?, v.narrow(self.axis, 0, self.len)?))
     }
 
     /// Forget everything after `len` positions. The room stays for the next

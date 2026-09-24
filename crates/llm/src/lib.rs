@@ -28,7 +28,8 @@
 //! to the service manager that keeps it running. [`image`] is the part of
 //! text-to-image that has no arithmetic in it — the request, the result, a PNG
 //! written by hand — because the models themselves are convolution stacks and
-//! live in `kvad-gpu` (`docs/image-plan.md` says why).
+//! live in `kvad-gpu` (`docs/image-plan.md` says why). [`video`] is the same
+//! for video: frames and sound, and an MP4 written by hand.
 
 /// The `serde_json` this crate was built against.
 ///
@@ -57,4 +58,5 @@ pub mod simd;
 pub mod sampler;
 pub mod tensor;
 pub mod train;
+pub mod video;
 pub mod weights;

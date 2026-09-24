@@ -68,34 +68,37 @@ pub struct ModelFiles {
 /// Data rather than cache, because a model you trained has exactly one copy,
 /// and so does the server's database. Settings live next door under
 /// `XDG_CONFIG_HOME`; see [`crate::hub::config_dir`]. Models pulled from the
-/// Hub are not in here: they are in the Hub's own cache, see
-/// [`crate::hub::cache_dir`].
+/// Hub come in here too when this directory was chosen rather than defaulted;
+/// see [`crate::hub::cache_dir`].
 ///
-/// The first of these that says anything:
-///
-/// 1. what this process was told with [`set_data_dir`] — `kvad-serve`, which
-///    has read the config file it was started with;
-/// 2. `KVAD_DATA_DIR`;
-/// 3. `dir` under `[data]` in `kvad.toml`;
-/// 4. `$XDG_DATA_HOME/kvad`, or `~/.local/share/kvad`.
+/// [`chosen_data_dir`], or `$XDG_DATA_HOME/kvad`, or `~/.local/share/kvad`.
 ///
 /// Worked out every time rather than once, because it is cheap next to what
 /// anybody does with the answer and a test that points it somewhere else
 /// should not have to be the first to ask.
 pub fn data_dir() -> PathBuf {
-    if let Some(dir) = FIXED_DATA_DIR.get() {
-        return dir.clone();
+    chosen_data_dir().unwrap_or_else(default_data_dir)
+}
+
+/// The data directory somebody named, if anybody did. The first of these
+/// that says anything:
+///
+/// 1. what this process was told with [`set_data_dir`] — `kvad-serve`, which
+///    has read the config file it was started with, and may have been told
+///    that nobody named one;
+/// 2. `KVAD_DATA_DIR`;
+/// 3. `dir` under `[data]` in `kvad.toml`.
+pub fn chosen_data_dir() -> Option<PathBuf> {
+    if let Some(fixed) = FIXED_DATA_DIR.get() {
+        return fixed.clone();
     }
     if let Some(dir) = std::env::var_os("KVAD_DATA_DIR").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
+        return Some(PathBuf::from(dir));
     }
     // A kvad.toml that does not parse is reported by whatever reads it for
     // its own sake — every command that talks to a server, and the server.
     // This only wants one key, and falls back rather than failing a path.
-    if let Some(dir) = crate::client::Settings::read().ok().and_then(|s| s.data_dir) {
-        return dir;
-    }
-    default_data_dir()
+    crate::client::Settings::read().ok().and_then(|s| s.data_dir)
 }
 
 /// `$XDG_DATA_HOME/kvad`, or `~/.local/share/kvad`: the data directory when
@@ -107,15 +110,16 @@ pub fn default_data_dir() -> PathBuf {
     base.join("kvad")
 }
 
-static FIXED_DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static FIXED_DATA_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
-/// Settle the data directory for the rest of this process.
+/// Settle [`chosen_data_dir`] for the rest of this process: `None` for "the
+/// default", which is an answer too.
 ///
 /// For `kvad-serve`, which may have been started with `--config` naming a
 /// file other than the one [`data_dir`] would read. Only the first call
 /// counts.
-pub fn set_data_dir(dir: PathBuf) {
-    let _ = FIXED_DATA_DIR.set(dir);
+pub fn set_data_dir(chosen: Option<PathBuf>) {
+    let _ = FIXED_DATA_DIR.set(chosen);
 }
 
 /// A directory as a config file wrote it: `~/` is the home directory, and
@@ -433,7 +437,7 @@ pub fn cached(repo_id: &str, filename: &str) -> Cached {
         };
     }
     let Some((owner, name)) = repo_id.split_once('/') else { return Cached::Unknown };
-    match hf_hub::HFClientSync::new() {
+    match crate::hub::client() {
         Ok(client) => look(&client.model(owner, name), filename),
         Err(_) => Cached::Unknown,
     }
@@ -483,7 +487,7 @@ fn resolve(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher, ask: 
         )
     })?;
 
-    let client = hf_hub::HFClientSync::new()?;
+    let client = crate::hub::client()?;
     let repo = client.model(owner, name);
 
     let repo = &repo;
@@ -598,7 +602,7 @@ pub fn fetch_file(repo_id: &str, filename: &str, watch: &Watcher) -> Res<PathBuf
     }
     let (owner, name) =
         repo_id.split_once('/').ok_or_else(|| format!("`{repo_id}` is not a directory here or a Hub repo id"))?;
-    let client = hf_hub::HFClientSync::new()?;
+    let client = crate::hub::client()?;
     let repo = client.model(owner, name);
     let path = match look(&repo, filename) {
         Cached::Here(path) => path,

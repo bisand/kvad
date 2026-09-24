@@ -130,7 +130,9 @@ sit beside the real one; `--service` moves the service to it. `--data-dir
 DIR` puts the database, images, datasets and trained models somewhere other
 than `~/.local/share/kvad`, by writing `[data] dir` to `kvad.toml`, which the
 CLI and the server both read. `KVAD_DATA_DIR` overrides that for one process.
-Models pulled from Hugging Face stay in its cache, which `HF_HOME` moves. `--host ADDR` and `--port N` answer the address
+A chosen data directory takes the models pulled from Hugging Face with it,
+into `huggingface/hub` inside it; without one they stay in
+`~/.cache/huggingface/hub`, and `HF_HUB_CACHE` or `HF_HOME` win either way. `--host ADDR` and `--port N` answer the address
 questions ahead of time, for a run that should not stop to ask — `--bind
 HOST:PORT` still says both at once. `sh install.sh --help` lists the rest.
 

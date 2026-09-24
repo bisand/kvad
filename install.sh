@@ -578,6 +578,21 @@ data_dir_now() {
     esac
 }
 
+# Where models pulled from Hugging Face go, worked out the way kvad does: the
+# Hub's own variables, then a data directory somebody chose, then the cache
+# the Hub's other tools share. A defaulted data directory moves nothing.
+hub_dir_now() {
+    if [ -n "${HF_HUB_CACHE:-}" ]; then
+        printf '%s\n' "$HF_HUB_CACHE"
+    elif [ -n "${HF_HOME:-}" ]; then
+        printf '%s\n' "$HF_HOME/hub"
+    elif [ -n "$(configured_data_dir)" ]; then
+        printf '%s\n' "$(data_dir_now)/huggingface/hub"
+    else
+        printf '%s\n' "$HOME/.cache/huggingface/hub"
+    fi
+}
+
 # Make kvad.toml say `[data] dir = "$1"`, touching nothing else in it.
 write_data_dir() {
     mkdir -p "$(dirname "$CONFIG_FILE")"
@@ -957,6 +972,7 @@ done
 # somebody's back, and the old directory may be exactly where they want it.
 if [ -n "$DATA_DIR" ]; then
     before=$(data_dir_now)
+    hub_before=$(hub_dir_now)
     if [ "$before" != "$DATA_DIR" ]; then
         step "Setting the data directory"
         write_data_dir "$DATA_DIR"
@@ -965,6 +981,19 @@ if [ -n "$DATA_DIR" ]; then
             say "  ${DIM}$before still has what was there; nothing was moved. To take it${R}"
             say "  ${DIM}along, stop the server and: mv \"$before\"/* \"$DATA_DIR\"/${R}"
         fi
+        # The models, unless they were inside the old data directory, and so
+        # are in the line above already.
+        hub_after=$(hub_dir_now)
+        case $hub_before in
+            "$before"/*) ;;
+            *)
+                if [ "$hub_after" != "$hub_before" ] && [ -n "$(ls -A "$hub_before" 2>/dev/null)" ]; then
+                    say "  ${DIM}Models pulled from Hugging Face now go in $hub_after. The ones in${R}"
+                    say "  ${DIM}$hub_before stay there until moved:${R}"
+                    say "  ${DIM}  mkdir -p \"$(dirname "$hub_after")\" && mv \"$hub_before\" \"$(dirname "$hub_after")\"/${R}"
+                fi
+                ;;
+        esac
     fi
 fi
 
@@ -1239,6 +1268,6 @@ else
     say "  ${B}kvad serve --bind $(bind_addr)${R}   the API and web UI"
 fi
 say ""
-say "Data goes in $(data_dir_now), configuration in"
-say "${XDG_CONFIG_HOME:-$HOME/.config}/kvad, and models pulled from Hugging Face in its"
-say "cache, ${HF_HOME:-$HOME/.cache/huggingface}. Uninstall with this script and --uninstall."
+say "Data goes in $(data_dir_now), models pulled from Hugging Face in"
+say "$(hub_dir_now), and configuration in ${XDG_CONFIG_HOME:-$HOME/.config}/kvad."
+say "Uninstall with this script and --uninstall."

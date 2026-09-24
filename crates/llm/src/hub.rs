@@ -17,10 +17,9 @@
 //!
 //! # Local models
 //!
-//! `hf-hub` stores downloads in the standard HuggingFace cache
-//! (`~/.cache/huggingface/hub` unless `HF_HOME` says otherwise), laid out as
-//! `models--{owner}--{name}/`. Listing what is on disk is a directory walk;
-//! nothing here maintains a database of its own.
+//! `hf-hub` stores downloads in the HuggingFace cache that [`cache_dir`]
+//! names, laid out as `models--{owner}--{name}/`. Listing what is on disk is
+//! a directory walk; nothing here maintains a database of its own.
 
 use crate::model::Arch;
 use std::path::{Path, PathBuf};
@@ -681,15 +680,43 @@ impl LocalModel {
     }
 }
 
-/// Root of the HuggingFace cache, honouring the usual environment variables.
+/// Root of the HuggingFace cache: where pulled models are, and go.
+///
+/// The first of these that says anything:
+///
+/// 1. `HF_HUB_CACHE`, then `$HF_HOME/hub` — the Hub's own variables, which
+///    somebody set on purpose and which every other Hub tool honours too;
+/// 2. `huggingface/hub` in the data directory, when one was chosen (see
+///    [`crate::weights::chosen_data_dir`]), so that moving kvad's data moves
+///    its models with it. The same layout as the default, so an existing
+///    cache moves there with one `mv`;
+/// 3. `~/.cache/huggingface/hub`, which the Hub's Python tools share.
+///
+/// A data directory that was only defaulted moves nothing, so an existing
+/// cache is not stranded by an upgrade.
 pub fn cache_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("HF_HUB_CACHE") {
-        return PathBuf::from(v);
-    }
-    if let Ok(v) = std::env::var("HF_HOME") {
-        return PathBuf::from(v).join("hub");
-    }
-    dirs_home().join(".cache/huggingface/hub")
+    cache_dir_from(
+        std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()).map(PathBuf::from),
+        std::env::var_os("HF_HOME").filter(|v| !v.is_empty()).map(PathBuf::from),
+        crate::weights::chosen_data_dir(),
+    )
+}
+
+fn cache_dir_from(hub_cache: Option<PathBuf>, hf_home: Option<PathBuf>, data: Option<PathBuf>) -> PathBuf {
+    hub_cache
+        .or_else(|| hf_home.map(|h| h.join("hub")))
+        .or_else(|| data.map(|d| d.join("huggingface/hub")))
+        .unwrap_or_else(|| dirs_home().join(".cache/huggingface/hub"))
+}
+
+/// A Hub client that keeps its files in [`cache_dir`].
+///
+/// Said explicitly rather than left to `hf-hub`, which only knows the
+/// environment and would download into one place while [`local_models`]
+/// looked in another. The token is not moved: it stays where the Hub's own
+/// tools read it, `HF_TOKEN` or `$HF_HOME/token`.
+pub fn client() -> Result<hf_hub::HFClientSync, hf_hub::HFError> {
+    hf_hub::HFClient::builder().cache_dir(cache_dir()).build_sync()
 }
 
 fn dirs_home() -> PathBuf {
@@ -998,6 +1025,17 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Hub's own variables first, then a data directory somebody chose,
+    /// then the default everyone shares.
+    #[test]
+    fn the_hub_cache_follows_a_chosen_data_directory_and_nothing_less() {
+        let p = |s: &str| Some(PathBuf::from(s));
+        assert_eq!(cache_dir_from(p("/c"), p("/h"), p("/d")), PathBuf::from("/c"));
+        assert_eq!(cache_dir_from(None, p("/h"), p("/d")), PathBuf::from("/h/hub"));
+        assert_eq!(cache_dir_from(None, None, p("/d")), PathBuf::from("/d/huggingface/hub"));
+        assert_eq!(cache_dir_from(None, None, None), dirs_home().join(".cache/huggingface/hub"));
+    }
 
     #[test]
     fn urlencoding_handles_spaces_and_slashes() {

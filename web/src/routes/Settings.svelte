@@ -1,11 +1,12 @@
 <script>
-  // The auth half of Settings. Thread counts, sampling defaults and the theme
-  // are other phases' business; what is here is who may use this server and
-  // what they may sign in with.
+  // The server's own settings, for an administrator, and then who may use
+  // this server and what they may sign in with. Thread counts, sampling
+  // defaults and the theme are other phases' business.
   import { api } from "../lib/api.js";
   import { auth } from "../lib/auth.svelte.js";
   import { toasts } from "../lib/toasts.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
+  import ServerSettings from "../lib/components/ServerSettings.svelte";
 
   const TRASH =
     "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6";
@@ -98,6 +99,10 @@
 </script>
 
 <div class="mx-auto flex max-w-3xl flex-col gap-8">
+  {#if auth.isAdmin}
+    <ServerSettings />
+  {/if}
+
   {#if !auth.hasAccounts}
     <div role="alert" class="alert alert-soft">
       <span>

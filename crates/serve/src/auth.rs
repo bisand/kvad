@@ -389,6 +389,8 @@ pub struct State {
     /// Whether a completion naming a model that is not in memory loads it;
     /// see `config::Server::load_on_request`.
     pub load_on_request: bool,
+    /// What the server was started with, and the way to restart it.
+    pub settings: std::sync::Arc<crate::settings::Running>,
 }
 
 /// An error a rejected request turns into: a status and a short reason.

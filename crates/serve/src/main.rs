@@ -30,6 +30,7 @@
 //! * [`playground`] — the model without the conversation around it.
 //! * [`metrics`] / [`watching`] / [`machine`] / [`monitoring`] — what the
 //!   server has been doing, in memory and in the database.
+//! * [`settings`] — `[server]` from the web UI, and restarting to apply it.
 //! * [`api`] — the routing table, and what every handler shares.
 //! * [`openapi`] — that table, described, with a test that says the
 //!   description and the router are the same server.
@@ -63,6 +64,7 @@ mod playground;
 mod retrieval;
 mod scheduler;
 mod secret;
+mod settings;
 mod watching;
 mod training;
 mod users;
@@ -160,15 +162,29 @@ async fn main() {
         )
         .init();
 
-    if let Err(e) = run(parse_args(), metrics).await {
-        // Startup failures are the ones a person reads, so they go to stderr
-        // plainly rather than through the log's formatting.
-        eprintln!("kvad-serve: {e}");
-        std::process::exit(1);
+    match run(parse_args(), metrics).await {
+        Ok(Stopped::ForGood) => {}
+        // After `run` has returned, so that everything it held — the
+        // database above all — has been dropped before the process image is.
+        Ok(Stopped::ToRestart) => settings::exec_self(),
+        Err(e) => {
+            // Startup failures are the ones a person reads, so they go to
+            // stderr plainly rather than through the log's formatting.
+            eprintln!("kvad-serve: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
+/// Why the server stopped serving.
+enum Stopped {
+    /// Ctrl-C.
+    ForGood,
+    /// `POST /api/restart`; see [`settings`].
+    ToRestart,
+}
+
+async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopped> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     let mut cfg = config::Config::load(&config_path)?;
     // Before anything asks where its files are.
@@ -209,6 +225,13 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
         matches!(cfg.auth.mode, config::Mode::Local | config::Mode::Basic) && accounts == 0;
 
     let budget = memory::Budget::of_machine(cfg.server.memory_gb, cfg.server.context);
+    let settings = std::sync::Arc::new(settings::Running::new(
+        config_path.clone(),
+        &cfg,
+        args.bind,
+        args.insecure,
+        data_dir.clone(),
+    ));
     let state = auth::State {
         auth: auth::provider(cfg.auth.mode, &cfg.auth.oidc)?.into(),
         engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader, budget)),
@@ -218,6 +241,7 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
         oidc: std::sync::Arc::new((cfg.auth.oidc.clone(), oidc::Flows::default())),
         started: std::time::Instant::now(),
         load_on_request: cfg.server.load_on_request,
+        settings: std::sync::Arc::clone(&settings),
         db,
     };
 
@@ -332,9 +356,21 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<()> {
         autoload(&state, repo);
     }
 
-    axum::serve(listener, app).with_graceful_shutdown(interrupted()).await?;
+    let stopping = {
+        let settings = std::sync::Arc::clone(&settings);
+        async move {
+            tokio::select! {
+                _ = interrupted() => {}
+                _ = settings.restart_asked() => {}
+            }
+        }
+    };
+    axum::serve(listener, app).with_graceful_shutdown(stopping).await?;
+    if settings.is_restarting() {
+        return Ok(Stopped::ToRestart);
+    }
     println!("stopped");
-    Ok(())
+    Ok(Stopped::ForGood)
 }
 
 /// Put the active model back in memory, without making anyone wait for it.

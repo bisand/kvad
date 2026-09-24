@@ -836,6 +836,21 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
         "the PNG itself, for the web UI's <img>. `kvad images make` writes each picture \
          to a file from the same bytes as it arrives",
     ),
+    (
+        "get",
+        "/api/settings",
+        "the server's kvad.toml, for the web UI's Settings page. On the server's own \
+         machine it is a file to read, at the path kvad-serve prints as it starts \
+         (`kvad service logs`)",
+    ),
+    ("put", "/api/settings", "the same file, written; on the server's machine, an editor does it"),
+    (
+        "post",
+        "/api/restart",
+        "for the web UI, which has no other way to apply a settings change. On the \
+         server's machine, `kvad service restart` restarts the service through launchd \
+         or systemd",
+    ),
 ];
 
 #[cfg(test)]

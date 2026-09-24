@@ -321,6 +321,7 @@ async fn the_admin_extractor_takes_administrators_and_nobody_else() {
         oidc: std::sync::Arc::new(Default::default()),
         started: std::time::Instant::now(),
         load_on_request: false,
+        settings: Default::default(),
     };
 
     // Ada is an administrator...
@@ -358,6 +359,7 @@ async fn a_cross_site_post_is_refused_before_the_cookie_is_even_looked_up() {
         oidc: std::sync::Arc::new(Default::default()),
         started: std::time::Instant::now(),
         load_on_request: false,
+        settings: Default::default(),
     };
     let cookie = format!("kvad_session={token}");
 

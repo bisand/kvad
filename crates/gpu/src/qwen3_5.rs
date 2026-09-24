@@ -21,7 +21,7 @@
 //! engine writes as an index shift.
 
 use crate::common::{
-    check_block, embedding, label, linear, unread, unread_error, Embed, KvCache, Loader, Proj, Reader,
+    check_block, embedding, label, linear, unread, unread_error, Embed, KvCache, kv_store, Loader, Proj, Reader,
     Stored,
 };
 use crate::ffn::{Ffn, Mlp, Moe};
@@ -328,7 +328,7 @@ impl GpuQwen35 {
         crate::model::settled(&device)?;
 
         Ok(GpuQwen35 {
-            kv: (0..spec.n_layer).map(|_| KvCache::new(2)).collect(),
+            kv: (0..spec.n_layer).map(|_| KvCache::new(2).stored_as(kv_store(&device, quant))).collect(),
             state: (0..spec.n_layer).map(|_| None).collect(),
             blocks,
             embed,

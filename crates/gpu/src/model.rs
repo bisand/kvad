@@ -25,7 +25,7 @@
 //! framework's matmul does not care.
 
 use crate::common::{
-    causal_mask, check_block, embedding, label, linear, unread, unread_error, Embed, KvCache, Loader, Proj,
+    causal_mask, check_block, embedding, label, linear, unread, unread_error, Embed, KvCache, kv_store, Loader, Proj,
     Reader, Stored,
 };
 use crate::ffn::{Ffn, Mlp, Moe};
@@ -228,7 +228,7 @@ impl GpuLlama {
         settled(&device)?;
 
         Ok(GpuLlama {
-            kv: (0..spec.n_layer).map(|_| KvCache::new(2)).collect(),
+            kv: (0..spec.n_layer).map(|_| KvCache::new(2).stored_as(kv_store(&device, quant))).collect(),
             blocks,
             embed,
             head,
@@ -464,8 +464,21 @@ pub(crate) fn attention(
     scale: f64,
 ) -> candle_core::Result<Tensor> {
     let (_, _, m, hd) = q.dims4()?;
+    // A cache kept narrower than the arithmetic around it (`kv_store`).
+    // The fused kernel wants one dtype, and accumulates in f32 whatever it
+    // is, so the query goes down to meet the cache. The written-out path
+    // computes its scores in the tensors' own dtype, so there the cache
+    // comes up instead: that path copies what it reads anyway.
+    let narrow = k.dtype() != q.dtype();
     if fused(q.device(), hd, m) {
+        if narrow {
+            let out = ops::sdpa(&q.to_dtype(k.dtype())?, k, v, None, mask.is_some(), scale as f32, 1.0)?;
+            return out.to_dtype(q.dtype());
+        }
         return ops::sdpa(q, k, v, None, mask.is_some(), scale as f32, 1.0);
+    }
+    if narrow {
+        return written_out(q, &k.to_dtype(q.dtype())?, &v.to_dtype(q.dtype())?, mask, scale);
     }
     written_out(q, k, v, mask, scale)
 }

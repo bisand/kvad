@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>Kvad</title>
+  <rect width="32" height="32" rx="7" fill="#1b1f2e"/>
+  <g fill="none" stroke-linecap="round">
+    <path d="M16 17.7 C14.7 13.5 12.2 8.4 8.2 5.8 M16 17.7 C17.3 13.5 19.8 8.4 23.8 5.8" stroke="#efe3c8" stroke-width="2"/>
+    <path d="M16 26.5 C14 20 10 12 3.8 8 M16 26.5 C18 20 22 12 28.2 8" stroke="#f0b35a" stroke-width="3.4"/>
+  </g>
+</svg>

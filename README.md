@@ -1,3 +1,5 @@
+<img src="docs/brand/kvad.svg" width="96" align="right" alt="">
+
 # Kvad
 
 *Kvad* — Old Norse for a composed, recited poem: what a skald performs from

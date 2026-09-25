@@ -265,7 +265,7 @@ impl Flux {
         let mut vault = Vault::open_as(&format!("{repo}/text_encoder_2"), &paths, json!({ "component": "t5" }), quant, progress);
         let t5 = {
             let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
-            let r = open(&paths, DType::F32)?;
+            let r = open(&paths, dtype)?;
             let t5 = T5::load(&cx, &r, &config)?;
             let n = finish("T5", &paths, &r)?;
             (params, bytes) = (params + n, bytes + at(n, quant));
@@ -280,7 +280,7 @@ impl Flux {
         let mut vault = Vault::open_as(&format!("{repo}/transformer"), &paths, shape, quant, progress);
         let dit = {
             let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
-            let r = open(&paths, DType::F32)?;
+            let r = open(&paths, dtype)?;
             let dit = Transformer::load(&cx, &r, cfg)?;
             let n = finish("transformer", &paths, &r)?;
             (params, bytes) = (params + n, bytes + at(n, quant));

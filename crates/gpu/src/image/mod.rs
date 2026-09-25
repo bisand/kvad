@@ -171,6 +171,17 @@ pub(crate) fn read_json(path: &Path) -> Res<Value> {
 /// A [`Reader`] over some safetensors files, mapped on the host and read in
 /// `dtype`. Every tensor is moved to the device once it is in its final
 /// form, as the text backend does and for the same reason (`Loader::proj`).
+///
+/// `dtype` is the one the weights are kept in: the compute dtype. A dense
+/// matrix read in any other has to be cast after `Loader::proj` has uploaded
+/// it, and on Metal that costs more than twice the model. candle 0.11 never
+/// reuses an upload's buffer, and frees a dropped one only at
+/// `synchronize()`, so every f32 upload stays resident until the load is
+/// over; and the cast's output is a pool buffer, rounded up to a power of
+/// two. FLUX's T5, 9.5 GB in bf16, peaked at 32.5 GB read as f32 and at
+/// 10.0 GB read as bf16; the whole bf16 pipeline, 33.7 GB of weights, could
+/// not load on a 48 GB machine and now peaks at 34.6 GB. Quantising needs
+/// no f32 reader either: `QTensor::quantize` widens its input itself.
 pub(crate) fn open(paths: &[PathBuf], dtype: DType) -> Res<Reader<'static>> {
     // SAFETY: candle memory-maps the checkpoints; they are read-only cache
     // entries that nothing else writes while we hold them.

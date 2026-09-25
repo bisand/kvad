@@ -2,9 +2,10 @@
 #
 # The release is the trigger and the source of truth. Draft a release in the
 # GitHub UI (or `gh release create v0.2.0`), publish it, and this workflow
-# builds four tarballs from its tag, stamps that tag into the crate versions,
-# and attaches the tarballs and a SHA256SUMS to that same release. Nothing
-# here creates a release, so the version is decided in one place by a person.
+# builds a tarball per target in `build`'s matrix from its tag, stamps that
+# tag into the crate versions, and attaches the tarballs and a SHA256SUMS to
+# that same release. Nothing here creates a release, so the version is
+# decided in one place by a person.
 #
 # Between publishing and the last upload there is a window where the release
 # exists with no assets, and `install.sh` will say it cannot find a build for
@@ -34,7 +35,8 @@
 # * The web UI is built once, not once per target. `rust-embed` reads
 #   `web/dist` at compile time (see crates/serve/src/assets.rs), so every
 #   target needs those files present — but they are the same files, and
-#   building them four times would be four chances to ship four UIs.
+#   building them once per target would be a chance to ship a different UI
+#   with each.
 # * Linux gets `kvad` and `kvad-serve` only. `kvad-tui` and `kvad-gpu` both
 #   link candle with Metal, which does not exist off macOS, so `kvad-serve`
 #   there is built `--no-default-features`.

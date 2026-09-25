@@ -9,6 +9,13 @@ workflow creates a release.
    release if `web/dist/index.html` is missing — a `kvad-serve` built without
    it compiles happily and serves a stub instead of the UI.
 
+   Nothing but the release builds for Linux: the pull-request check runs on
+   macOS. So a macOS-only call first fails after the release is public, and a
+   failed build attaches nothing — v0.3.0 went out with no binaries over
+   `libc::F_NOCACHE`. Look through the diff since the last tag for `libc::`
+   and other platform APIs in what Linux builds: `kvad`, and `kvad-serve`
+   without its `gpu` feature, which leaves `kvad-gpu` out.
+
 2. Draft a release at <https://github.com/bisand/kvad/releases/new> against a
    new tag `vMAJOR.MINOR.PATCH`, write the notes, and publish it. Or:
 
@@ -20,8 +27,10 @@ workflow creates a release.
    pre-release, which keeps `install.sh` from picking it up as the latest.
 
 3. Publishing starts [`release.yml`](../.github/workflows/release.yml), which
-   builds four tarballs and attaches them to that same release, along with a
-   `SHA256SUMS`. It takes a while; candle is not a small dependency.
+   builds three tarballs — macOS on Apple Silicon, and Linux on x86_64 and
+   arm64 — and attaches them to that same release, along with a `SHA256SUMS`.
+   It takes a while; candle is not a small dependency. There has been no
+   Intel Mac build since v0.6.0.
 
 ## What the version number touches
 

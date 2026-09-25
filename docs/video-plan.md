@@ -831,7 +831,8 @@ The same kind of checks apply here:
    in, MP4 on disk, no server. **The milestone is one clip, with sound**, at
    512×320 × 25 frames first and 768×512 × 121 second. Done in #70: both
    clips, with sound; see below.
-6. **Two stages:** the upsampler and stage 2.
+6. **Two stages:** the upsampler and stage 2. Done in #79, at 1536×1024 ×
+   121; see below.
 7. **The service:** the `video` kind, `/v1/videos`, storage, the CLI, the UI
    page. #51 has the shape. Video files are served with Range support, and
    `ffmpeg` re-encoding is optional.
@@ -949,7 +950,7 @@ every 10 dB is ten times less error power.
   | A step | 2.9 s | 29 s |
   | Video decode | 6.8 s | 69 s |
   | All told | 224 s | 382 s |
-  | Peak resident | 27.7 GB | 37.2 GB |
+  | Peak memory footprint | 39.2 GB (first run) | 24.2 GB |
 
   The first step of a run after a build or a new cache is slower (50 s at
   512×320): shaders compile and the cache pages in.
@@ -961,4 +962,59 @@ every 10 dB is ten times less error power.
 - **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
   6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
   profiling before two stages quadruple the tokens.
+- **How memory is measured here**, from step 6 on: the peak *footprint*
+  (`/usr/bin/time -l`), which counts GPU memory. The resident set size,
+  given for step 5 at first (27.7 and 37.2 GB), counts the mapped q8 cache
+  files and misses private GPU buffers.
+
+**Step 6, two stages (#79).**
+- **The upsampler matches the reference**: 98 dB in f32, on a real latent
+  from a generation. Its conv3d pads time with **zeros**, not edge frames,
+  and its group norm takes each group's statistics over the **whole clip**,
+  as PyTorch's does on a 5D tensor. **In bf16 it is only 27 dB from exact**,
+  and so is the reference's own bf16 on MPS. It is 498 M parameters and a
+  few seconds of work, so kvad runs it in f32.
+- **Stage 2** re-noises both latents to σ = 0.909375 and takes three Euler
+  steps, sound included.
+- **The decoder had to go chunked by blocks, as this plan said it
+  should.** Chunking each convolution was not enough:
+  - a residual step done whole keeps about five full-size tensors alive,
+    3 GB each at 1536×1024;
+  - each convolution padded a copy of its whole input;
+  - PixelNorm made f32 copies of whole stages;
+  - candle's pool keeps freed buffers until a synchronise.
+
+  Decoding 1536×1024 × 121 ran out of memory at 77 GB. Now each residual
+  step, up block and the output tail runs a chunk of frames at a time, with
+  the halo frames its convolutions read, into a preallocated output. It is
+  still exact (122–124 dB in f32, including with one-frame chunks).
+
+  | Decode alone | Before | After |
+  |---|---|---|
+  | 768×512 × 121 | 18.3 GB, 68 s | 8.7 GB, 72 s |
+  | 1536×1024 × 121 | out of memory at 77 GB | 24.2 GB, 285 s |
+
+  That is twice the reference's 12 GB. The blocks' input and output are
+  still whole, and candle rounds every buffer up to a power of two.
+- **Generations**, same prompt and seed:
+
+  | | 768×512, 1 stage | 768×512, 2 stages | 1536×1024, 2 stages |
+  |---|---|---|---|
+  | Stage 1 | 8 × 29 s | 8 × 6.5 s | 8 × 30 s |
+  | Upsampler | – | 3.9 s | 7.7 s |
+  | Stage 2 | – | 3 × 29 s | 3 × 193 s |
+  | Video decode | 69 s | 69 s | 297 s |
+  | All told | 382 s | 309 s | 1224 s |
+  | Peak footprint | 24.2 GB | 26.8 GB | 36.6 GB |
+
+  Two stages at 768×512 are faster than one and more detailed. At 1536×1024
+  the clip holds together for all five seconds, and at full resolution the
+  fur and sand are sharp.
+- **Where the 20 minutes go:** stage 2 (48%) and the decode (24%).
+  - A stage-2 step is about 1.1 PFLOP, done at 5.6 TFLOP/s. The Cost
+    section's estimate was 90 s a step; it takes 193.
+  - The decode's convolutions are #56.
+
+  Both are for profiling before the service (step 7) makes them a user's
+  wait.
 

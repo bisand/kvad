@@ -24,6 +24,7 @@ use super::metadata;
 use crate::common::{Loader, Reader};
 use crate::image::nn::{layer_norm_plain, Ctx, Linear};
 use crate::image::{finish, open};
+use crate::prof::{scope, span};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
@@ -288,9 +289,10 @@ impl Ff {
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let dtype = x.dtype();
-        let h = gelu(&self.up.forward(x)?.to_dtype(dtype)?)?;
-        self.down.forward(&h)?.to_dtype(dtype)
+        let (dtype, dev) = (x.dtype(), x.device());
+        let h = span(|| "up", dev, || self.up.forward(x)?.to_dtype(dtype))?;
+        let h = span(|| "gelu", dev, || gelu(&h))?;
+        span(|| "down", dev, || self.down.forward(&h)?.to_dtype(dtype))
     }
 }
 
@@ -305,6 +307,9 @@ struct Tables {
 }
 
 struct Stream {
+    /// What [`crate::prof`] calls its self-attention, text attention and
+    /// feed-forward.
+    names: [&'static str; 3],
     attn1: GatedAttention,
     attn2: GatedAttention,
     ff: Ff,
@@ -315,6 +320,10 @@ impl Stream {
     fn load(cx: &Ctx<'_>, r: &Reader<'_>, prefix: &str, width: usize, heads: usize, head_dim: usize, ff_bias: bool) -> Res<Self> {
         let n = |s: &str| format!("{prefix}{s}");
         Ok(Stream {
+            names: match prefix.is_empty() {
+                true => ["video self", "video text", "video ff"],
+                false => ["audio self", "audio text", "audio ff"],
+            },
             attn1: GatedAttention::load(cx, &r.pp(n("attn1")), (width, width), heads, head_dim, true)?,
             attn2: GatedAttention::load(cx, &r.pp(n("attn2")), (width, width), heads, head_dim, true)?,
             ff: Ff::load(cx, &r.pp(n("ff")), width, ff_bias)?,
@@ -330,17 +339,17 @@ impl Stream {
     /// block, for one stream. `m` is the nine rows with the table added, `p`
     /// the two for the text.
     fn attend(&self, x: &Tensor, m: &Tensor, p: &Tensor, context: &Tensor, rope: &Rope) -> candle_core::Result<Tensor> {
-        let y = self.attn1.forward(&ada(x, &row(m, 1)?, &row(m, 0)?)?, None, Some(rope), Some(rope))?;
+        let y = scope(self.names[0], || self.attn1.forward(&ada(x, &row(m, 1)?, &row(m, 0)?)?, None, Some(rope), Some(rope)))?;
         let x = (x + y.broadcast_mul(&row(m, 2)?)?)?;
         // The text is modulated but not normalised, and σ moves the
         // modulation, so its keys and values change every step.
         let c = context.broadcast_mul(&(row(p, 1)? + 1.0)?)?.broadcast_add(&row(p, 0)?)?;
-        let y = self.attn2.forward(&ada(&x, &row(m, 7)?, &row(m, 6)?)?, Some(&c), None, None)?;
+        let y = scope(self.names[1], || self.attn2.forward(&ada(&x, &row(m, 7)?, &row(m, 6)?)?, Some(&c), None, None))?;
         &x + y.broadcast_mul(&row(m, 8)?)?
     }
 
     fn feed(&self, x: &Tensor, m: &Tensor) -> candle_core::Result<Tensor> {
-        let y = self.ff.forward(&ada(x, &row(m, 4)?, &row(m, 3)?)?)?;
+        let y = scope(self.names[2], || self.ff.forward(&ada(x, &row(m, 4)?, &row(m, 3)?)?))?;
         x + y.broadcast_mul(&row(m, 5)?)?
     }
 }
@@ -365,18 +374,22 @@ impl Block {
         // update, so the order of the two does not matter.
         let vav = (v.av.narrow(0, 0, 4)? + &m.video_av)?;
         let aav = (a.av.narrow(0, 0, 4)? + &m.audio_av)?;
-        let a2v = self.a2v.forward(
-            &ada(&vx, &row(&vav, 0)?, &row(&vav, 1)?)?,
-            Some(&ada(&ax, &row(&aav, 0)?, &row(&aav, 1)?)?),
-            Some(&g.video_time),
-            Some(&g.audio),
-        )?;
-        let v2a = self.v2a.forward(
-            &ada(&ax, &row(&aav, 2)?, &row(&aav, 3)?)?,
-            Some(&ada(&vx, &row(&vav, 2)?, &row(&vav, 3)?)?),
-            Some(&g.audio),
-            Some(&g.video_time),
-        )?;
+        let a2v = scope("audio to video", || {
+            self.a2v.forward(
+                &ada(&vx, &row(&vav, 0)?, &row(&vav, 1)?)?,
+                Some(&ada(&ax, &row(&aav, 0)?, &row(&aav, 1)?)?),
+                Some(&g.video_time),
+                Some(&g.audio),
+            )
+        })?;
+        let v2a = scope("video to audio", || {
+            self.v2a.forward(
+                &ada(&ax, &row(&aav, 2)?, &row(&aav, 3)?)?,
+                Some(&ada(&vx, &row(&vav, 2)?, &row(&vav, 3)?)?),
+                Some(&g.audio),
+                Some(&g.video_time),
+            )
+        })?;
         let vx = (&vx + a2v.broadcast_mul(&(row(&v.av, 4)? + &m.a2v_gate)?)?)?;
         let ax = (&ax + v2a.broadcast_mul(&(row(&a.av, 4)? + &m.v2a_gate)?)?)?;
 

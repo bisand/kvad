@@ -24,6 +24,7 @@ use super::metadata;
 use crate::common::Loader;
 use crate::image::nn::Ctx;
 use crate::image::{finish, open};
+use crate::prof::span;
 use crate::qcache::Vault;
 use candle_core::{DType, Device, Tensor};
 use kvad::serde_json::Value;
@@ -145,19 +146,25 @@ impl VideoDecoder {
         // Frames first from here on: the frames are every convolution's batch.
         let z = latent.permute((1, 0, 2, 3))?.to_dtype(DType::F32)?;
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?;
-        let mut x = self.conv_in.forward(&z.to_dtype(self.dtype)?)?;
+        let dev = latent.device();
+        // What `crate::prof` calls a step: its kind and the size it works at.
+        let at = |kind: &str, x: &Tensor| -> String {
+            let (t, c, h, w) = x.dims4().unwrap_or_default();
+            format!("{kind} {c} × {t} × {h}×{w}")
+        };
+        let mut x = span(|| at("conv in", &z), dev, || self.conv_in.forward(&z.to_dtype(self.dtype)?))?;
         for block in &self.blocks {
             match block {
                 Block::Res(res) => {
                     for (c1, c2) in res {
-                        x = residual(&x, c1, c2)?;
+                        x = span(|| at("residual", &x), dev, || residual(&x, c1, c2))?;
                         // candle's pool lets go of what a step dropped only
                         // when the device is synchronised.
                         x.device().synchronize()?;
                     }
                 }
                 Block::Up { conv, stride, out } => {
-                    x = up(&x, conv, *stride, *out)?;
+                    x = span(|| at("up", &x), dev, || up(&x, conv, *stride, *out))?;
                     x.device().synchronize()?;
                 }
             }
@@ -165,11 +172,14 @@ impl VideoDecoder {
         let p = self.patch;
         let (t, _, h, w) = x.dims4()?;
         let frames = Tensor::zeros((t, 3, h * p, w * p), DType::F32, x.device())?;
-        for (f, n) in chunks(&x) {
-            let y = self.conv_out.frames(&norm_silu(&halo(&x, f, n, 1)?, EPS)?, (f.saturating_sub(1), t), (f, f + n))?;
-            let y = ((unpatchify(&y, p)?.to_dtype(DType::F32)? + 1.0)? * 0.5)?.clamp(0f32, 1f32)?;
-            frames.slice_set(&y, 0, f)?;
-        }
+        span(|| at("out", &x), dev, || {
+            for (f, n) in chunks(&x) {
+                let y = self.conv_out.frames(&norm_silu(&halo(&x, f, n, 1)?, EPS)?, (f.saturating_sub(1), t), (f, f + n))?;
+                let y = ((unpatchify(&y, p)?.to_dtype(DType::F32)? + 1.0)? * 0.5)?.clamp(0f32, 1f32)?;
+                frames.slice_set(&y, 0, f)?;
+            }
+            Ok(())
+        })?;
         Ok(frames)
     }
 }

@@ -30,3 +30,6 @@ tokenizers = { version = "0.23.2", default-features = false, features = ["onig"]
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-metal-kernels = "0.11.0"
 objc2-metal = "0.3.2"
+# `F_NOCACHE`, for reading an image model's checkpoints past the page cache
+# (`image::open`). The version `kvad` already builds.
+libc = "0.2.189"

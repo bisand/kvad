@@ -193,7 +193,7 @@ impl GatedAttention {
     /// keys when given. No mask: nothing LTX attends over is causal.
     pub(crate) fn forward(&self, x: &Tensor, context: Option<&Tensor>, rope_q: Option<&Rope>, rope_k: Option<&Rope>) -> candle_core::Result<Tensor> {
         let ctx = context.unwrap_or(x);
-        let (t, s) = (x.dim(0)?, ctx.dim(0)?);
+        let t = x.dim(0)?;
         let (h, d) = (self.heads, self.head_dim);
         // A Q8_0 projection on the M5's matrix units answers in f32 whatever
         // it was asked in; everything here stays in the input's dtype.
@@ -204,11 +204,9 @@ impl GatedAttention {
         // the norm reads a q8 projection's f32 and rounds once.
         let (q, k, v) = span(|| "q, k, v", dev, || Ok((self.q.forward(x)?, self.k.forward(ctx)?, lin(&self.v, ctx)?)))?;
         let (q, k) = span(|| "norm, rope", dev, || {
-            let q = self.q_norm.rotated(&q, rope_q, h, dtype)?.reshape((1, t, h * d))?;
-            Ok((q, self.k_norm.rotated(&k, rope_k, h, dtype)?.reshape((1, s, h * d))?))
+            Ok((self.q_norm.rotated(&q, rope_q, h, dtype)?, self.k_norm.rotated(&k, rope_k, h, dtype)?))
         })?;
-        let v = v.reshape((1, s, h * d))?;
-        let o = span(|| "attention", dev, || crate::image::nn::attention(&q, &k, &v, h)?.squeeze(0))?;
+        let o = span(|| "attention", dev, || attend(&q, &k, &v, h))?;
         let o = match &self.gate {
             Some(g) => span(|| "gate", dev, || {
                 let gates = (candle_nn::ops::sigmoid(&lin(g, x)?)? * 2.0)?;
@@ -218,6 +216,19 @@ impl GatedAttention {
         };
         span(|| "out", dev, || lin(&self.out, &o))
     }
+}
+
+/// Attention over `[t, heads · d]` queries and `[s, heads · d]` keys and
+/// values, answering `[t, heads · d]`: on the M5's matrix units where
+/// `mpp_attention` takes it, which reads these rows as they are; otherwise
+/// candle's, which splits the heads into copies first.
+fn attend(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> candle_core::Result<Tensor> {
+    #[cfg(target_os = "macos")]
+    if let Some(o) = crate::mpp_attention::attention(q, k, v, heads)? {
+        return Ok(o);
+    }
+    let one = |x: &Tensor| x.unsqueeze(0);
+    crate::image::nn::attention(&one(q)?, &one(k)?, &one(v)?, heads)?.squeeze(0)
 }
 
 #[cfg(test)]

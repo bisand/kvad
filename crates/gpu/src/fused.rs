@@ -422,14 +422,31 @@ pub(crate) mod metal {
     /// build. `None` where there is no Metal device, the source did not
     /// build, or `KVAD_GPU_FUSED=0` says not to use fused kernels at all.
     pub(crate) fn library(device: &Device, what: &'static str, source: &'static str) -> Option<&'static Kernels> {
+        if matches!(std::env::var("KVAD_GPU_FUSED").as_deref(), Ok("0") | Ok("false")) {
+            return None;
+        }
+        build(device, what, source, None)
+    }
+
+    /// As [`library`], for kernels on the M5's matrix units: built as Metal 4,
+    /// which their tensor API needs, and only where `mpp` runs, so
+    /// `KVAD_GPU_MPP=0` turns them off with the matmuls.
+    pub(crate) fn tensor_library(device: &Device, what: &'static str, source: &'static str) -> Option<&'static Kernels> {
+        if !crate::mpp::available(device) {
+            return None;
+        }
+        let opts = objc2_metal::MTLCompileOptions::new();
+        opts.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version4_0);
+        build(device, what, source, Some(&*opts))
+    }
+
+    fn build(device: &Device, what: &'static str, source: &'static str, opts: Option<&objc2_metal::MTLCompileOptions>)
+     -> Option<&'static Kernels> {
         static LIBS: OnceLock<Mutex<HashMap<&'static str, Option<&'static Kernels>>>> = OnceLock::new();
         let Device::Metal(md) = device else { return None };
         let mut libs = LIBS.get_or_init(Default::default).lock().unwrap();
         *libs.entry(what).or_insert_with(|| {
-            if matches!(std::env::var("KVAD_GPU_FUSED").as_deref(), Ok("0") | Ok("false")) {
-                return None;
-            }
-            match md.metal_device().new_library_with_source(source, None) {
+            match md.metal_device().new_library_with_source(source, opts) {
                 Ok(lib) => Some(&*Box::leak(Box::new(Kernels { lib, device: md.metal_device().clone(), pipes: Mutex::new(HashMap::new()) }))),
                 Err(e) => {
                     eprintln!("kvad: the fused {what} kernels did not build, so candle's ops are used: {e}");

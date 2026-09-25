@@ -41,6 +41,8 @@ pub mod image;
 pub mod model;
 #[cfg(target_os = "macos")]
 mod mpp;
+#[cfg(target_os = "macos")]
+mod mpp_attention;
 pub mod prof;
 pub mod qwen3_5;
 pub mod qcache;

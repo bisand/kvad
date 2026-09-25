@@ -24,7 +24,7 @@
 //! block and at the velocities, in dB. The f32 path agreed with Lightricks'
 //! reference to 115–123 dB, so it stands in for it here. The inputs are the
 //! same from run to run, so `KVAD_GPU_FUSED=0` gives the unfused numbers to
-//! compare.
+//! compare, and `KVAD_GPU_MPP_ATTENTION=0` candle's attention's.
 
 use candle_core::{DType, Device, Tensor};
 use kvad::weights::{fetch_file, Watcher};

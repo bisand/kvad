@@ -1105,9 +1105,45 @@ the chains, as does everything under `KVAD_GPU_FUSED=0`.
   at 768×512 and 33 dB at 1536×1024, mostly in fine detail. The chain run
   twice gives identical clips, so the difference is the rounding's.
 - **1536×1024 peaked at 33.3 GB**, from one run. The chain's peak ranged
-  35.8–39.0 GB over three runs, so the fall is real, if not exactly 5 GB.
-  The likely reason is the chains' f32 intermediates, 400 MB each at
-  24 576 tokens, which the kernels never make.
+  35.8–39.0 GB over three runs. *Corrected with #86:* two later runs with
+  these kernels peaked at 35.1 and 35.3 GB, so 33.3 was a low reading. The
+  kernels lower the peak by a GB or two, not five.
 - **Attention is now 48% of a stage-2 block.** An attention kernel on the
   neural accelerators is the largest lever left in the DiT, and the decode's
   convolutions (#56) the largest outside it.
+
+**Attention on the neural accelerators (#86).** A flash-attention kernel
+in `mpp_attention.rs` does both of attention's products through
+`matmul2d`, and reads q, k and v in the projections' own layout, so the
+copies that split the heads are gone. It is laid out as MLX's M5 attention
+is: 64 queries a threadgroup in four SIMD groups, 32 keys a step, an online
+softmax in powers of two, and one rounding at the end.
+
+| At stage 2's shapes, bf16 | candle | This |
+|---|---|---|
+| Video self-attention, 24 576 × 24 576 | 6.5 TFLOP/s | about 16 (2.5×) |
+| Video to text, 24 576 × 1024 | 3.1 TFLOP/s | about 19 (6×) |
+| Between video and audio | 0.6–0.8 TFLOP/s | 16–19 (20–25×) |
+
+| Same binary, `KVAD_GPU_MPP_ATTENTION=0` for candle's | candle's | This |
+|---|---|---|
+| A stage-2 block (2 rounds each) | 2.76 / 2.78 s | 1.71 / 1.85 s |
+| 768×512, 2 stages, all told (2 runs each) | 186.3 / 190.4 s | 158.7 / 162.3 s |
+| 1536×1024, 2 stages, all told (1 run each) | 936.9 s | 712.7 s |
+| its stage 1 / stage 2 / decode | 167 / 448 / 297 s | 124 / 281 / 284 s |
+| its peak footprint | 35.1 GB | 35.3 GB |
+
+- **Two things made it fast.** Every index into an array of matrix
+  fragments has to be a compile-time constant: one the compiler cannot
+  resolve puts the array in memory, and the first version ran at 3.3
+  TFLOP/s. And a barrier each step keeps the SIMD groups sharing K and V
+  in the core's cache: 9.6 TFLOP/s without it.
+- **Accuracy is unchanged.** The kernel agrees with attention written out
+  in f32 to 55–58 dB in bf16, where candle's gives 44–49. Through the DiT
+  the velocity is 44.7 / 44.9 dB either way. The clips are the same scene,
+  28–30 dB apart, the rounding difference #85 showed too.
+- **MLX's own M5 attention runs the self-attention at 21.5 TFLOP/s.** With
+  every key served from cache this kernel reaches 26, so what is left is
+  how K and V reach the SIMD groups: staging them in threadgroup memory.
+- **1536×1024 now takes 12 minutes, and the decode is as large as stage 2.**
+  #56's convolutions are as big a lever now as anything in the DiT.

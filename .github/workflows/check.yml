@@ -1,0 +1,110 @@
+# Builds and tests a pull request on macOS.
+#
+# Until this, nothing ran on a pull request: `release.yml` is the only other
+# workflow, and it runs when a release is published. A change reached a build
+# machine for the first time as a release.
+#
+# Why the shape is this:
+#
+# * macOS, because it is the one target that builds everything. `kvad-gpu`
+#   and `kvad-tui` link candle with Metal, which does not exist off macOS,
+#   and so does `kvad-serve` with its default features.
+# * The whole workspace's tests, `--locked`, at the `ci` profile in the root
+#   Cargo.toml: release's optimisation without its thin LTO and single
+#   codegen unit. At release, the first run spent 18 of its 20 minutes
+#   compiling and linking (7 building the release binaries, then 11 linking
+#   19 test binaries) and 65 seconds running the tests. The release binaries
+#   are the release workflow's to build; `cargo test` compiles every crate,
+#   binaries included, so a change that does not compile still fails here.
+# * Also on a push to master, which is what makes the cache useful. A pull
+#   request's run can restore a cache saved on its own branch or on the base
+#   branch, and without a run on master every pull request would start by
+#   compiling every dependency.
+# * The web UI first, because `rust-embed` reads `web/dist` at compile time
+#   (crates/serve/src/assets.rs). Without it `kvad-serve` compiles with its
+#   "no UI was built into this binary" stub, which is a different program
+#   from the one that ships; with it, a change that breaks the UI's build
+#   fails here too.
+# * No model is downloaded, and none is needed. The tests write their own
+#   checkpoints, and the ones that fetch from the network are `#[ignore]`d:
+#   the suite passes offline with an empty home directory.
+# * The GPU tests take whatever Metal the runner has. A hosted runner is a
+#   virtual machine, and a test that finds no Metal device, or not the
+#   kernels it needs, returns without running its GPU half. So a green run
+#   here says the CPU half and whatever Metal the runner offers passed; the
+#   M5's matrix units are only ever tested on an M5.
+
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request makes its running check stale. A run on
+# master is left to finish, because a cancelled run saves no cache.
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  macos:
+    name: macOS build and test
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Check there is a UI
+        run: test -s web/dist/index.html
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Its own key, because the cache's is the lock file and the toolchain
+      # and not the profile. Without one, a run restored the cache an earlier
+      # run had saved at another profile, found it "up to date", and saved
+      # nothing: every run compiled all 435 crates again.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: profile-ci
+
+      # What the tests will find, so a run that skipped its GPU half says so.
+      # Asked of Metal itself: `system_profiler SPDisplaysDataType` prints
+      # nothing at all on a hosted runner, which answers nothing.
+      - name: Describe the GPU
+        run: |
+          swift -e '
+          import Metal
+          if let d = MTLCreateSystemDefaultDevice() {
+              print("Metal device: \(d.name)")
+              print("  Apple family 7/8/9: \(d.supportsFamily(.apple7)) \(d.supportsFamily(.apple8)) \(d.supportsFamily(.apple9)), Metal 3: \(d.supportsFamily(.metal3))")
+              print("  recommended working set: \(d.recommendedMaxWorkingSetSize / 1_000_000) MB")
+          } else {
+              print("no Metal device: the GPU tests will skip their GPU half")
+          }' || echo "could not ask Metal; the GPU tests will say nothing either way"
+
+      - name: Test
+        run: cargo test --workspace --locked --profile ci

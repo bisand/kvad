@@ -76,8 +76,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # What the tests will find, so a run that skipped its GPU half says so.
+      # Asked of Metal itself: `system_profiler SPDisplaysDataType` prints
+      # nothing at all on a hosted runner, which answers nothing.
       - name: Describe the GPU
-        run: system_profiler SPDisplaysDataType || true
+        run: |
+          swift -e '
+          import Metal
+          if let d = MTLCreateSystemDefaultDevice() {
+              print("Metal device: \(d.name)")
+              print("  Apple family 7/8/9: \(d.supportsFamily(.apple7)) \(d.supportsFamily(.apple8)) \(d.supportsFamily(.apple9)), Metal 3: \(d.supportsFamily(.metal3))")
+              print("  recommended working set: \(d.recommendedMaxWorkingSetSize / 1_000_000) MB")
+          } else {
+              print("no Metal device: the GPU tests will skip their GPU half")
+          }' || echo "could not ask Metal; the GPU tests will say nothing either way"
 
       - name: Build
         run: cargo build --release --locked -p kvad -p kvad-tui -p kvad-gpu -p kvad-serve

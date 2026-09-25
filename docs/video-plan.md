@@ -1143,7 +1143,36 @@ softmax in powers of two, and one rounding at the end.
   the velocity is 44.7 / 44.9 dB either way. The clips are the same scene,
   28–30 dB apart, the rounding difference #85 showed too.
 - **MLX's own M5 attention runs the self-attention at 21.5 TFLOP/s.** With
-  every key served from cache this kernel reaches 26, so what is left is
-  how K and V reach the SIMD groups: staging them in threadgroup memory.
+  every key served from cache this kernel reaches 26. *Resolved in #87,
+  below: the gap was not in how K and V arrive.*
 - **1536×1024 now takes 12 minutes, and the decode is as large as stage 2.**
   #56's convolutions are as big a lever now as anything in the DiT.
+
+**Level with MLX, and faster matmuls (#87).** Staging K and V in
+threadgroup memory was slower: 11 TFLOP/s copying then computing, and 7
+with a register prefetch. MLX's kernel, compiled from its source in kvad's
+harness and changed a piece at a time, showed what was:
+- **The threadgroup's shape.** Dispatched 128 × 1 instead of 32 × 4, the
+  same threads in the same SIMD groups, MLX's kernel fell from 21.4 to 15.6
+  TFLOP/s, which was #86's rate.
+- **Loading fragments element by element**, not as vectors copied out:
+  16.2 → 18.6 TFLOP/s with the right shape.
+
+The attention now runs stage 2's self-attention at 20.2 TFLOP/s, 3.2×
+candle and level with MLX's 19.4–19.8, raced in turn. `mpp.rs`'s matmuls
+were dispatched the same way, and 32 × n runs them faster too: Q8_0 by
+1.14–1.22× and bf16 by 1.09–1.31× at stage 2's shapes.
+
+| Against #86's build, alternated | #86 | #87 |
+|---|---|---|
+| A stage-2 block | 2.01 / 2.10 s | 1.58 / 1.76 s |
+| 768×512, 2 stages, all told (2 runs each) | 183.0 / 170.0 s | 169.2 / 165.0 s |
+| 1536×1024, 2 stages, all told (1 run each) | 803.4 s | 661.4 s |
+| its stage 1 / stage 2 steps / decode | 132 s / 106–124 s / 299 s | 113 s / 79–80 s / 284 s |
+
+- **The output is byte-for-byte the same as #86's** at both sizes: neither
+  change touches the arithmetic.
+- **The machine ran slower through this session:** #86's own 1536×1024 run
+  took 713 s earlier and 803 s here. The ratios are what compare.
+- **At 1536×1024 the decode is now 43% of the time**, 284 s against stage
+  2's 240. #56 is the largest lever left.

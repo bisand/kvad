@@ -38,6 +38,13 @@ writes what it makes for the examples to compare against.
         scripts/ltx-fixtures.py --dit "$DIT" --contexts /tmp/ltx-fx/text_contexts_f32.safetensors --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx [--quant q8] [--f32]
 
+    UP=$(cargo run -q --release -p kvad-gpu --example ltx_upsample -- --where | head -1)
+    cargo run --release -p kvad-gpu --example ltx -- --prompt "…" --stages 1 \\
+        --width 512 --height 320 --frames 25 --latents /tmp/stage1.safetensors
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --upsampler "$UP" --vae "$VIDEO" --latent /tmp/stage1.safetensors --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_upsample -- --fixtures /tmp/ltx-fx [--cpu | --f32]
+
 (the text fixtures also want `transformers` 5.8 to 5.14 in the venv). The
 `--where` lines download each file first. The repo is gated: accept its
 licence on the Hub and have a token saved.)
@@ -61,6 +68,9 @@ What to expect, as measured on 2026-09-24 on an M5 Pro:
   and 118-123 on Metal. In bf16 on Metal, video 46.2/45.0 dB after the
   blocks and 42.0 at the velocity, audio 44.6-45.1, where the reference's
   own bf16 on MPS is 46.8/46.6, 43.6 and 45.5-46.1. At q8, much the same.
+- The latent upsampler, on a 512x320x25 latent from a generation: 98 dB in
+  f32 on the CPU and on Metal. In bf16 it is 27 dB from exact, and so is
+  the reference's own bf16 on MPS; kvad runs it in f32.
 
 Every reference model here runs in f32 on the CPU, so the files are what the
 architecture computes, not what one GPU's rounding makes of it. It is not part
@@ -394,6 +404,37 @@ def transformer(path, out, contexts, blocks):
     print(f"dit: video {tuple(vlat.shape)}, audio {tuple(alat.shape)}, σ {sigma}")
 
 
+def upsampler(path, vae, latent, out):
+    """The spatial latent upsampler on a real stage-1 latent, through the
+    reference's own `upsample_video`: un-normalise with the VAE's statistics,
+    upsample, normalise again."""
+    from types import SimpleNamespace
+
+    from ltx_core.model.upsampler.model import upsample_video
+    from ltx_core.model.upsampler.model_configurator import LatentUpsamplerConfigurator
+    from ltx_core.model.video_vae.ops import PerChannelStatistics
+
+    meta, tensors = read(path)
+    up = load(LatentUpsamplerConfigurator.from_metadata(meta), tensors, lambda k: k)
+    stats = PerChannelStatistics()
+    with safe_open(vae, framework="pt") as f:
+        for n in ("std-of-means", "mean-of-means"):
+            stats.get_buffer(n).copy_(f.get_tensor(f"per_channel_statistics.{n}").float())
+    z = load_file(latent)["video"][None].float()
+
+    def run(device, dtype):
+        enc = SimpleNamespace(per_channel_statistics=stats.to(device))
+        with torch.no_grad():
+            t = time.time()
+            y = upsample_video(z.to(device, dtype), enc, up.to(device, dtype))[0].float().cpu()
+        print(f"upsampler: {tuple(z.shape[1:])} to {tuple(y.shape)} in {dtype} on {device}, {time.time() - t:.1f} s")
+        return y
+
+    save_file({"latent": z[0].contiguous(), "upsampled": run("cpu", torch.float32).contiguous()}, f"{out}/upsample_f32.safetensors")
+    if torch.backends.mps.is_available():
+        save_file({"upsampled": run("mps", torch.bfloat16).contiguous()}, f"{out}/upsample_bf16.safetensors")
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--video", help="vae/ltx-2.5-video-vae-conv-bf16.safetensors")
@@ -402,6 +443,9 @@ if __name__ == "__main__":
     p.add_argument("--dit", help="diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors (for the connectors)")
     p.add_argument("--blocks", type=int, default=2, help="how many DiT blocks to run with --dit --contexts")
     p.add_argument("--contexts", help="text_contexts_f32.safetensors from --text: the DiT's first blocks against them")
+    p.add_argument("--upsampler", help="latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors, with --vae and --latent")
+    p.add_argument("--vae", help="vae/ltx-2.5-video-vae-conv-bf16.safetensors, for the upsampler's statistics")
+    p.add_argument("--latent", help="a stage-1 latent to upsample: a safetensors file with `video`, [128, F, h, w], as examples/ltx.rs --latents writes")
     p.add_argument("--out", required=True)
     a = p.parse_args()
     import os
@@ -416,4 +460,6 @@ if __name__ == "__main__":
         text(a.text, a.dit, a.out)
     if a.dit and a.contexts:
         transformer(a.dit, a.out, a.contexts, a.blocks)
+    if a.upsampler:
+        upsampler(a.upsampler, a.vae, a.latent, a.out)
     print(f"wrote {a.out} in {time.time() - started:.0f} s")

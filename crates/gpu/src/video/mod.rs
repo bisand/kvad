@@ -1,12 +1,14 @@
 //! Video models: a prompt to frames and sound.
 //!
-//! So far this is LTX-2.5 (`docs/video-plan.md`), one stage of its distilled
-//! model at the requested size:
+//! So far this is LTX-2.5 (`docs/video-plan.md`), its distilled model in two
+//! stages:
 //!
 //! - [`ltx_text`]: the prompt to two contexts, through Gemma 4 ([`gemma`]),
 //!   the aggregate projections and the connectors;
 //! - [`ltx_dit`]: the 48-block DiT that denoises a video and its sound
-//!   together, and [`ltx_sample`], the eight steps that drive it;
+//!   together, and [`ltx_sample`], the steps that drive it: eight at half
+//!   size, then three at full size;
+//! - [`ltx_upsample`]: the latent upsampler between the two stages;
 //! - [`ltx_vae`]: the convolutional video decoder, and [`ltx_audio`]: the
 //!   audio decoder, vocoder and bandwidth extension.
 //!
@@ -25,6 +27,7 @@ pub mod ltx_dit;
 pub mod ltx_sample;
 pub(crate) mod ltx_nn;
 pub mod ltx_text;
+pub mod ltx_upsample;
 pub mod ltx_vae;
 
 use std::path::Path;

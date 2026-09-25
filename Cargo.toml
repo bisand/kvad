@@ -26,3 +26,16 @@ opt-level = 2
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# What `.github/workflows/check.yml` builds and tests with: release's
+# optimisation, so the numerical tests run at release speed, without what
+# only a shipped binary needs. Thin LTO and one codegen unit made the check's
+# 19 test binaries take 11 minutes to link on a hosted runner, for tests that
+# then ran in 65 seconds. Without them, rebuilding the workspace's crates for
+# the tests took 44 s where it had taken 4 min 33 s, on 4 cores of an M5.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = false
+incremental = false

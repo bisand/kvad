@@ -9,10 +9,17 @@
 # * macOS, because it is the one target that builds everything. `kvad-gpu`
 #   and `kvad-tui` link candle with Metal, which does not exist off macOS,
 #   and so does `kvad-serve` with its default features.
-# * The same build as the macOS release job, `--locked` and all, so a pull
-#   request that passes here builds there too. Then the whole workspace's
-#   tests, in release like the build, so the second step reuses the first's
-#   dependencies rather than building everything again at another profile.
+# * The whole workspace's tests, `--locked`, at the `ci` profile in the root
+#   Cargo.toml: release's optimisation without its thin LTO and single
+#   codegen unit. At release, the first run spent 18 of its 20 minutes
+#   compiling and linking (7 building the release binaries, then 11 linking
+#   19 test binaries) and 65 seconds running the tests. The release binaries
+#   are the release workflow's to build; `cargo test` compiles every crate,
+#   binaries included, so a change that does not compile still fails here.
+# * Also on a push to master, which is what makes the cache useful. A pull
+#   request's run can restore a cache saved on its own branch or on the base
+#   branch, and without a run on master every pull request would start by
+#   compiling every dependency.
 # * The web UI first, because `rust-embed` reads `web/dist` at compile time
 #   (crates/serve/src/assets.rs). Without it `kvad-serve` compiles with its
 #   "no UI was built into this binary" stub, which is a different program
@@ -31,15 +38,18 @@ name: check
 
 on:
   pull_request:
+  push:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# A new push to a pull request makes its running check stale.
+# A new push to a pull request makes its running check stale. A run on
+# master is left to finish, because a cancelled run saves no cache.
 concurrency:
   group: check-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -90,8 +100,5 @@ jobs:
               print("no Metal device: the GPU tests will skip their GPU half")
           }' || echo "could not ask Metal; the GPU tests will say nothing either way"
 
-      - name: Build
-        run: cargo build --release --locked -p kvad -p kvad-tui -p kvad-gpu -p kvad-serve
-
       - name: Test
-        run: cargo test --workspace --release --locked
+        run: cargo test --workspace --locked --profile ci

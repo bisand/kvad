@@ -1,0 +1,86 @@
+# Builds and tests a pull request on macOS.
+#
+# Until this, nothing ran on a pull request: `release.yml` is the only other
+# workflow, and it runs when a release is published. A change reached a build
+# machine for the first time as a release.
+#
+# Why the shape is this:
+#
+# * macOS, because it is the one target that builds everything. `kvad-gpu`
+#   and `kvad-tui` link candle with Metal, which does not exist off macOS,
+#   and so does `kvad-serve` with its default features.
+# * The same build as the macOS release job, `--locked` and all, so a pull
+#   request that passes here builds there too. Then the whole workspace's
+#   tests, in release like the build, so the second step reuses the first's
+#   dependencies rather than building everything again at another profile.
+# * The web UI first, because `rust-embed` reads `web/dist` at compile time
+#   (crates/serve/src/assets.rs). Without it `kvad-serve` compiles with its
+#   "no UI was built into this binary" stub, which is a different program
+#   from the one that ships; with it, a change that breaks the UI's build
+#   fails here too.
+# * No model is downloaded, and none is needed. The tests write their own
+#   checkpoints, and the ones that fetch from the network are `#[ignore]`d:
+#   the suite passes offline with an empty home directory.
+# * The GPU tests take whatever Metal the runner has. A hosted runner is a
+#   virtual machine, and a test that finds no Metal device, or not the
+#   kernels it needs, returns without running its GPU half. So a green run
+#   here says the CPU half and whatever Metal the runner offers passed; the
+#   M5's matrix units are only ever tested on an M5.
+
+name: check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request makes its running check stale.
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  macos:
+    name: macOS build and test
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Check there is a UI
+        run: test -s web/dist/index.html
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # What the tests will find, so a run that skipped its GPU half says so.
+      - name: Describe the GPU
+        run: system_profiler SPDisplaysDataType || true
+
+      - name: Build
+        run: cargo build --release --locked -p kvad -p kvad-tui -p kvad-gpu -p kvad-serve
+
+      - name: Test
+        run: cargo test --workspace --release --locked

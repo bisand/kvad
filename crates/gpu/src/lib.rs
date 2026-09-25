@@ -23,6 +23,9 @@
 //! projection and the cache — each with candle's ops behind it for every
 //! device and step it does not take.
 //!
+//! [`uncached`] reads weight files past the page cache, which a model more
+//! than half the machine's memory needs (the module says why).
+//!
 //! [`image`] is the other thing this crate does, and the one thing in the
 //! engine with no CPU version: text-to-image pipelines, which are convolution
 //! stacks and so live where the convolutions are. They are not sessions —
@@ -40,3 +43,4 @@ pub mod model;
 mod mpp;
 pub mod qwen3_5;
 pub mod qcache;
+mod uncached;

@@ -2447,6 +2447,7 @@ dependencies = [
  "candle-metal-kernels",
  "candle-nn",
  "kvad",
+ "libc",
  "objc2-metal",
  "tokenizers 0.23.2",
 ]

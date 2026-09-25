@@ -22,6 +22,11 @@ kvad = { path = "../llm" }
 # language model's, and there is no `Llm` around it to do it for them. The
 # same crate and version `kvad` already builds.
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+# Reading weight files past the page cache (`src/uncached.rs`): `F_NOCACHE`
+# and `msync` on macOS, and on every system an anonymous mapping to read
+# into, which goes back to the system when it is dropped. The version `kvad`
+# already builds.
+libc = "0.2.189"
 
 # `src/mpp.rs` compiles a Metal 4 kernel of its own and dispatches it on
 # candle's device, and so does `examples/neural_accel.rs`. candle keeps these

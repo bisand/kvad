@@ -2,6 +2,7 @@
   import { PAGES } from "../pages.js";
   import { router, navigate } from "../router.svelte.js";
   import Icon from "./Icon.svelte";
+  import Wordmark from "./Wordmark.svelte";
 
   // The id of the drawer's checkbox, so picking a page can close the drawer
   // on a narrow screen. On a wide one the checkbox is not what is holding the
@@ -23,27 +24,17 @@
     <a
       href="/"
       onclick={(e) => pick(e, "/")}
-      class="flex items-baseline gap-2 px-4 h-16 shrink-0"
+      class="group flex items-center px-4 h-16 shrink-0"
+      title="ᚴᚢᛅᛏ: kvad in the younger futhark"
     >
-      <!-- The mark is docs/brand/kvad-mark.svg, inline so it takes the text
-           colour and follows the theme, and sized in em so it sits on the
-           word like a letter. At 20px it leaves the tagline room for one line. -->
-      <span class="text-xl font-semibold tracking-tight"
-        ><svg
-          xmlns="http://www.w3.org/2000/svg"
-          viewBox="5 7 54 48"
-          class="mr-1 inline h-[0.9em] w-auto align-[-0.1em]"
-          fill="none"
-          stroke="currentColor"
-          stroke-linecap="round"
-          aria-hidden="true"
-        >
-          <path d="M32 28 C30 21.5 26 13.5 20 9.5 M32 28 C34 21.5 38 13.5 44 9.5" stroke-width="2.6" opacity=".45" />
-          <path d="M32 39.5 C29 29.9 23.1 18.1 14.2 12.1 M32 39.5 C35 29.9 40.9 18.1 49.8 12.1" stroke-width="2.6" opacity=".7" />
-          <path d="M32 52 C28 39 20 23 8 15 M32 52 C36 39 44 23 56 15" stroke-width="5" />
-        </svg>kvad</span
-      >
-      <span class="text-xs opacity-60">transformers from scratch</span>
+      <!-- Centred in the row, as the navbar's title is, with the tagline
+           under the name rather than beside it: side by side they needed
+           all but 2px of the sidebar's width. -->
+      <span class="flex flex-col items-start gap-2">
+        <Wordmark height={28} />
+        <span class="sr-only">kvad</span>
+        <span class="text-xs leading-none opacity-60">transformers from scratch</span>
+      </span>
     </a>
 
     <ul class="menu w-full grow gap-0.5 px-2">

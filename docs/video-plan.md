@@ -1018,3 +1018,27 @@ every 10 dB is ten times less error power.
   Both are for profiling before the service (step 7) makes them a user's
   wait.
 
+
+**Re-measured after rebasing onto #80**, which reads weights and the q8
+cache past the page cache. Same prompt and seed, two runs each; the latents
+are byte-for-byte those above.
+
+| | 768×512, 1 stage | 768×512, 2 stages | 1536×1024, 2 stages |
+|---|---|---|---|
+| Loads: text path + DiT | 9 s + 3.6 s | 9 s + 3.6 s | 9 s + 3.6 s |
+| All told | 338–341 s | 241–244 s | 1149–1160 s |
+| Peak footprint | 26.8 GB | 29.2 GB | 35.8–39.0 GB |
+
+- **The loads were 70–87 s and are now 13 s.** That is where the time went.
+  Steps and the decode are unchanged against the pre-rebase build measured
+  the same day.
+- **The earlier peaks were too low.** Through the old mapped reads, macOS
+  kept the 33 GB of q8 cache files in its file cache and compressed memory
+  to make room: 48 GB during one 768×512 load, including part of the DiT,
+  which showed 20.3 GB resident instead of 22.8. Nothing is compressed now.
+  A footprint compares across a change to how weights are read only with
+  the compressor's pages beside it.
+- **1536×1024 peaks in stage 2's first step**, just after the upsampler ran
+  in f32 beside the DiT, and the peak varies by 3 GB between runs. Up to
+  39 GB of 48 is the pipeline's tightest point; freeing the upsampler before
+  stage 2 would give some room.

@@ -83,7 +83,13 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
 
+      # Its own key, because the cache's is the lock file and the toolchain
+      # and not the profile. Without one, a run restored the cache an earlier
+      # run had saved at another profile, found it "up to date", and saved
+      # nothing: every run compiled all 435 crates again.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: profile-ci
 
       # What the tests will find, so a run that skipped its GPU half says so.
       # Asked of Metal itself: `system_profiler SPDisplaysDataType` prints

@@ -24,6 +24,7 @@ pub mod conv3d;
 pub mod gemma;
 pub mod ltx_audio;
 pub mod ltx_dit;
+mod ltx_fused;
 pub mod ltx_sample;
 pub(crate) mod ltx_nn;
 pub mod ltx_text;

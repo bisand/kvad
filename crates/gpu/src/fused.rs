@@ -226,7 +226,7 @@ fn norm_heads(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> candle_core::Res
 }
 
 #[cfg(target_os = "macos")]
-mod metal {
+pub(crate) mod metal {
     use super::{type_name, Heads};
     use candle_core::backend::BackendStorage;
     use candle_core::{CpuStorage, CustomOp1, CustomOp3, DType, Device, Layout, MetalStorage, Shape, Storage, Tensor};
@@ -391,16 +391,15 @@ mod metal {
     ROPE_Q(bfloat, bf16)
     "#;
 
-    /// The kernels, built once per process: `None` where there is no Metal
-    /// device, the source did not build, or `KVAD_GPU_FUSED=0` says not to.
-    pub(super) struct Kernels {
+    /// A library of kernels, built once per process from its source.
+    pub(crate) struct Kernels {
         lib: candle_metal_kernels::metal::Library,
         device: candle_metal_kernels::metal::Device,
         pipes: Mutex<HashMap<String, ComputePipeline>>,
     }
 
     impl Kernels {
-        fn pipe(&self, name: &str) -> candle_core::Result<ComputePipeline> {
+        pub(crate) fn pipe(&self, name: &str) -> candle_core::Result<ComputePipeline> {
             let mut pipes = self.pipes.lock().unwrap();
             if let Some(p) = pipes.get(name) {
                 return Ok(p.clone());
@@ -412,27 +411,36 @@ mod metal {
         }
     }
 
+    /// The decode kernels: `None` where there is no Metal device, the source
+    /// did not build, or `KVAD_GPU_FUSED=0` says not to.
     pub(super) fn kernels(device: &Device) -> Option<&'static Kernels> {
-        static KERNELS: OnceLock<Option<Kernels>> = OnceLock::new();
+        library(device, "decode", SOURCE)
+    }
+
+    /// The kernels in `source`, built the first time they are asked for and
+    /// kept for the life of the process; `what` names them if they do not
+    /// build. `None` where there is no Metal device, the source did not
+    /// build, or `KVAD_GPU_FUSED=0` says not to use fused kernels at all.
+    pub(crate) fn library(device: &Device, what: &'static str, source: &'static str) -> Option<&'static Kernels> {
+        static LIBS: OnceLock<Mutex<HashMap<&'static str, Option<&'static Kernels>>>> = OnceLock::new();
         let Device::Metal(md) = device else { return None };
-        KERNELS
-            .get_or_init(|| {
-                if matches!(std::env::var("KVAD_GPU_FUSED").as_deref(), Ok("0") | Ok("false")) {
-                    return None;
+        let mut libs = LIBS.get_or_init(Default::default).lock().unwrap();
+        *libs.entry(what).or_insert_with(|| {
+            if matches!(std::env::var("KVAD_GPU_FUSED").as_deref(), Ok("0") | Ok("false")) {
+                return None;
+            }
+            match md.metal_device().new_library_with_source(source, None) {
+                Ok(lib) => Some(&*Box::leak(Box::new(Kernels { lib, device: md.metal_device().clone(), pipes: Mutex::new(HashMap::new()) }))),
+                Err(e) => {
+                    eprintln!("kvad: the fused {what} kernels did not build, so candle's ops are used: {e}");
+                    None
                 }
-                match md.metal_device().new_library_with_source(SOURCE, None) {
-                    Ok(lib) => Some(Kernels { lib, device: md.metal_device().clone(), pipes: Mutex::new(HashMap::new()) }),
-                    Err(e) => {
-                        eprintln!("kvad: the fused decode kernels did not build, so candle's ops are used: {e}");
-                        None
-                    }
-                }
-            })
-            .as_ref()
+            }
+        })
     }
 
     /// A tensor's Metal buffer and its start, in bytes.
-    fn buffer(storage: &MetalStorage, layout: &Layout) -> (Buffer, usize) {
+    pub(crate) fn buffer(storage: &MetalStorage, layout: &Layout) -> (Buffer, usize) {
         (storage.buffer().clone(), layout.start_offset() * storage.dtype().size_in_bytes())
     }
 
@@ -440,12 +448,12 @@ mod metal {
     thread_local! {
         /// Kernels this thread has launched, so a test can tell a kernel's
         /// answer from the fallback's.
-        pub(super) static RAN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(crate) static RAN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// A new output buffer. Under test it starts as NaN, so a kernel that left
     /// part of it unwritten cannot pass by agreeing with the last tenant.
-    fn output(dev: &candle_core::MetalDevice, bytes: usize) -> candle_core::Result<std::sync::Arc<Buffer>> {
+    pub(crate) fn output(dev: &candle_core::MetalDevice, bytes: usize) -> candle_core::Result<std::sync::Arc<Buffer>> {
         let out = dev.allocate_buffer(bytes)?;
         #[cfg(test)]
         {
@@ -707,7 +715,7 @@ mod metal {
 /// Never reached: [`available`] is false wherever this is compiled, and every
 /// caller asks it first.
 #[cfg(not(target_os = "macos"))]
-mod metal {
+pub(crate) mod metal {
     use super::*;
     pub(super) fn add_rms_norm(_: &Tensor, _: &Tensor, _: &Tensor, _: f32) -> candle_core::Result<(Tensor, Tensor)> {
         unreachable!()

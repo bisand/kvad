@@ -1054,3 +1054,60 @@ are byte-for-byte those above.
   while it ran beside the DiT, and now peaks at 27.1 GB instead of 29.2. The
   video decoder shares the loader: 0.55 GB less to load, 0.3 GB more at its
   peak (9.0 against 8.7 GB at 768×512), at the same speed and output.
+
+**Profiling stage 2 and the decode (#84).** `kvad_gpu::prof` synchronises
+around each labelled piece when it is on, and costs one atomic load when it
+is off. `examples/ltx_cost.rs` runs the first blocks of the DiT at q8 on
+noise at stage 2's shape. `ltx_decode --profile` times the decoder's steps.
+- **A stage-2 block takes 3.96 s** at 24 576 video tokens, against 4.04 s
+  a block in a real step. It does about 23.7 TFLOP, so 5.9 TFLOP/s.
+
+  | Where | s/block | Share |
+  |---|---|---|
+  | Video self-attention, the attention itself (candle's `sdpa`) | 1.77 | 35% |
+  | Projections, all streams | ~1.4 | ~30% |
+  | Element-wise: norms and RoPE, modulation, residuals, GELU, gates | ~1.5 | ~30% |
+  | Text attention, audio, the rest | ~0.3 | ~6% |
+
+  The projections run on the neural accelerators (`Proj::Blocks`), at
+  8–11.5 TFLOP/s. The attention runs on candle's fused kernel, MLX's, at
+  5.6 TFLOP/s on the ordinary ALUs. The element-wise work was chains of
+  small candle ops with casts to f32 and back between them: the q/k norms
+  and RoPE alone took 0.33 s for about 2 GB of traffic.
+- **The 1536×1024 decode takes 282 s**, and 86% of it is three residual
+  stages: 512 channels at 2.6 TFLOP/s, 256 at 1.6 and 128 at 0.9. The rate
+  falls with the channels because candle's `conv2d` builds an im2col copy
+  the size of the frame while the multiply's work per byte shrinks. That is
+  #56's finding at full size, and a convolution that reads neighbourhoods
+  straight from its input is its fix.
+
+**Fusing the DiT's element-wise work (#85).** Five Metal kernels in
+`video/ltx_fused.rs`, each reading its inputs once, computing in f32 and
+rounding once: `modulate` (every modulated norm), `gated_modulate` (a gated
+residual and the norm after it, from one buffer), `gated_add`, `norm_rope`
+(the q/k norm and each head's rotation, read straight from a q8
+projection's f32 answer) and `gelu`. Anything they can't take falls back to
+the chains, as does everything under `KVAD_GPU_FUSED=0`.
+
+| | Chain | Fused |
+|---|---|---|
+| A stage-2 block (2 rounds each) | 3.68 / 3.70 s | 2.88 / 2.99 s |
+| 768×512, 2 stages, all told (2 runs each) | 231.5 / 232.8 s | 187.7 / 188.6 s |
+| 1536×1024, 2 stages, all told (1 run each) | 1085 s | 892 s |
+| its stage-2 steps | 181 s | 138–144 s |
+| its peak footprint | 38.3 GB | 33.3 GB |
+| Velocity, bf16 against f32, video / audio | 44.2 / 44.5 dB | 44.7 / 44.9 dB |
+
+- **Rounding once brings bf16 closer to f32** after every block, by 0.4–1.4
+  dB. kvad's f32 DiT agrees with the reference to 115–123 dB, so it stands
+  in for it (`ltx_cost --accuracy`).
+- **The clips are the same scene with the same motion**, 30 dB PSNR apart
+  at 768×512 and 33 dB at 1536×1024, mostly in fine detail. The chain run
+  twice gives identical clips, so the difference is the rounding's.
+- **1536×1024 peaked at 33.3 GB**, from one run. The chain's peak ranged
+  35.8–39.0 GB over three runs, so the fall is real, if not exactly 5 GB.
+  The likely reason is the chains' f32 intermediates, 400 MB each at
+  24 576 tokens, which the kernels never make.
+- **Attention is now 48% of a stage-2 block.** An attention kernel on the
+  neural accelerators is the largest lever left in the DiT, and the decode's
+  convolutions (#56) the largest outside it.

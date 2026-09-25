@@ -84,10 +84,10 @@ pub fn tag(quant: GgmlDType) -> String {
 /// 0.8. From a file not in the page cache, Qwen-Image loads in 5.1 s rather
 /// than 71, and Qwen3-14B in 3.2 s rather than 21.2; from one that is, 4.8 s
 /// rather than 12.9, and 3.3 rather than 4.2. The price is the blob being
-/// uploaded, which is now counted on the host until it is on the device
-/// where a mapped page was not: the peak rises by about the largest one,
-/// Qwen3-14B's 826 MB token table, and what the model holds once loaded does
-/// not change.
+/// uploaded, which is counted on the host until it is on the device where a
+/// mapped page was not: the peak is the largest blob above what the model
+/// holds once loaded, 0.84 GB for Qwen3-14B, whose token table is 826 MB
+/// ([`uncached::Pages`] says why no more than that).
 struct Cache {
     file: File,
     bytes: u64,

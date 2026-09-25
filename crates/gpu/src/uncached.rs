@@ -51,7 +51,7 @@ pub(crate) fn open(path: &Path) -> io::Result<File> {
 
 /// `len` bytes at `at` in `file`.
 ///
-/// Reads the pages that hold them into a page-aligned buffer, and derefs to
+/// Reads the pages that hold them into a mapping of their own, and derefs to
 /// just the bytes asked for.
 pub(crate) fn read(file: &File, at: u64, len: usize) -> io::Result<Pages> {
     let page = PAGE as u64;
@@ -64,24 +64,63 @@ pub(crate) fn read(file: &File, at: u64, len: usize) -> io::Result<Pages> {
     // The last page may be the file's, which ends where it ends.
     let to = (end.div_ceil(page) * page).min(size);
     let span = (to - from) as usize;
-    let mut buf = vec![0u8; span + PAGE];
-    let off = buf.as_ptr().align_offset(PAGE);
-    file.read_exact_at(&mut buf[off..off + span], from)?;
-    Ok(Pages { buf, at: off + (at - from) as usize, len })
+    let mut pages = Pages::new(span)?;
+    // SAFETY: `span` writable bytes, which this function owns until it
+    // returns them.
+    let buf = unsafe { std::slice::from_raw_parts_mut(pages.map, span) };
+    file.read_exact_at(buf, from)?;
+    (pages.at, pages.len) = ((at - from) as usize, len);
+    Ok(pages)
 }
 
-/// Bytes read by [`read`], in the buffer they were read into.
+/// Bytes read by [`read`], in an anonymous mapping of their own.
+///
+/// Not a `Vec`, because macOS's allocator keeps a large block after it is
+/// freed. It hands it back for the next allocation of the same size, and
+/// counts it against the process until then, so reading blobs of a dozen
+/// sizes left a dozen of them held: Qwen3-14B's load at q8 peaked 2.05 GB
+/// above what it held once loaded. With these it peaks 0.84 GB above, which
+/// is its largest blob, the 826 MB token table, on its way to the device. A
+/// mapping is page-aligned, which the read needs, and `munmap` returns it at
+/// once.
 pub(crate) struct Pages {
-    buf: Vec<u8>,
+    map: *mut u8,
+    size: usize,
     at: usize,
     len: usize,
+}
+
+impl Pages {
+    fn new(size: usize) -> io::Result<Self> {
+        // A mapping cannot be empty, and a span can: an empty tensor at the
+        // end of a file.
+        let size = size.max(1);
+        // SAFETY: a fresh private anonymous mapping, owned by the `Pages`
+        // that unmaps it.
+        let map = unsafe {
+            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+        };
+        if map == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Pages { map: map.cast(), size, at: 0, len: 0 })
+    }
 }
 
 impl std::ops::Deref for Pages {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        &self.buf[self.at..self.at + self.len]
+        // SAFETY: `at + len <= size`, as `read` set them, in a mapping that
+        // lives as long as `self`.
+        unsafe { std::slice::from_raw_parts(self.map.add(self.at), self.len) }
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `new` made, unmapped once.
+        unsafe { libc::munmap(self.map.cast(), self.size) };
     }
 }
 

@@ -282,7 +282,13 @@ impl<'v> Loader<'v> {
             // prefill ran on candle's matmul at half the speed.
             return Ok(Proj::Dense(Tensor::cat(&ws, 1)?.contiguous()?.to_device(&self.device)?));
         };
-        let mut bytes = Vec::new();
+        // At its final size from the start. Grown by doubling, each layer's
+        // buffer was a `realloc`ed block of its own, and macOS's allocator
+        // keeps freed blocks like that rather than handing them back or
+        // reusing them for the next layer's: Qwen3-14B's load at q8 peaked
+        // 7.35 GB above what it held once loaded, on those alone. One size,
+        // allocated once a layer, is one block reused.
+        let mut bytes = Vec::with_capacity(total * inp / gd.block_size() * gd.type_size());
         for &(name, out) in parts {
             let size = out * inp / gd.block_size() * gd.type_size();
             match self.vault.blocks(&vb.full(name), (out, inp)).filter(|b| b.len() == size) {

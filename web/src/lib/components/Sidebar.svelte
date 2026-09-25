@@ -2,6 +2,7 @@
   import { PAGES } from "../pages.js";
   import { router, navigate } from "../router.svelte.js";
   import Icon from "./Icon.svelte";
+  import Wordmark from "./Wordmark.svelte";
 
   // The id of the drawer's checkbox, so picking a page can close the drawer
   // on a narrow screen. On a wide one the checkbox is not what is holding the
@@ -23,10 +24,17 @@
     <a
       href="/"
       onclick={(e) => pick(e, "/")}
-      class="flex items-baseline gap-2 px-4 h-16 shrink-0"
+      class="group flex items-center px-4 h-16 shrink-0"
+      title="ᚴᚢᛅᛏ: kvad in the younger futhark"
     >
-      <span class="text-xl font-semibold tracking-tight">kvad</span>
-      <span class="text-xs opacity-60">transformers from scratch</span>
+      <!-- Centred in the row, as the navbar's title is, with the tagline
+           under the name rather than beside it: side by side they needed
+           all but 2px of the sidebar's width. -->
+      <span class="flex flex-col items-start gap-2">
+        <Wordmark height={28} />
+        <span class="sr-only">kvad</span>
+        <span class="text-xs leading-none opacity-60">transformers from scratch</span>
+      </span>
     </a>
 
     <ul class="menu w-full grow gap-0.5 px-2">

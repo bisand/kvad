@@ -32,6 +32,7 @@ pub mod unet;
 pub mod vae;
 
 use crate::common::{unread, Reader};
+use crate::uncached;
 use candle_core::{DType, Device, Shape, Tensor};
 use candle_nn::var_builder::SimpleBackend;
 use candle_nn::VarBuilder;
@@ -40,7 +41,6 @@ use kvad::serde_json::Value;
 use kvad::weights::{fetch_file, Cached, Watcher};
 use std::collections::HashMap;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -194,23 +194,13 @@ pub(crate) fn open(paths: &[PathBuf], dtype: DType) -> Res<Reader<'static>> {
 
 /// Safetensors files read a tensor at a time, past the page cache.
 ///
-/// candle's reader memory-maps the files, and every page it touches stays in
-/// the page cache after the tensor has been copied out of it. An image model
-/// is read once and kept whole on the device, so a load held two copies: the
-/// weights, and the file pages they came from. For FLUX at bf16 that is
-/// 33.7 GB of each, on a 48 GB machine, and macOS made room by compressing
-/// and swapping the weights already loaded rather than dropping the clean
-/// file pages. Nothing looked wrong until the first image: the encoder and
-/// the first step each touch a model's worth of compressed pages, and took
-/// 29 and 31 s where the second image's took 0.17 and 1.8 s.
-///
-/// So each tensor is `pread` into a buffer of its own, which is dropped once
-/// the tensor is converted; on macOS with `F_NOCACHE`, which keeps the read
-/// out of the cache. The headers are parsed here rather than by
-/// `safetensors`, which wants the whole file in memory to read one. Read
-/// this way FLUX loads in 44 s rather than 94, nothing is compressed, and
-/// the first image's encoder and first step take 0.33 and 1.96 s; the price
-/// is a tensor's buffers on the host, 0.3 GB at the peak.
+/// [`crate::uncached`] says why: read through candle's memory map, FLUX at
+/// bf16 loaded in 94 s, compressed 41 GB of its own weights to make room for
+/// the file pages, and took 29 s to encode its first image and 31 s for the
+/// first step. Read this way it loads in 44 s, nothing is compressed, and
+/// those take 0.33 and 1.96 s; the price is a tensor's buffers on the host,
+/// 0.3 GB at the peak. The headers are parsed here rather than by
+/// `safetensors`, which wants the whole file in memory to read one.
 struct Uncached {
     files: Vec<File>,
     tensors: HashMap<String, Stored>,
@@ -230,17 +220,11 @@ impl Uncached {
         let mut files = Vec::with_capacity(paths.len());
         let mut tensors = HashMap::new();
         for (i, path) in paths.iter().enumerate() {
-            let file = File::open(path)?;
-            #[cfg(target_os = "macos")]
-            uncache(&file).map_err(|e| format!("{}: {e}", path.display()))?;
+            let file = uncached::open(path)?;
             // An eight-byte little-endian header length, the header as JSON,
             // then the data, which the header's offsets count from.
-            let mut n = [0u8; 8];
-            file.read_exact_at(&mut n, 0)?;
-            let n = u64::from_le_bytes(n);
-            let mut header = vec![0u8; usize::try_from(n)?];
-            file.read_exact_at(&mut header, 8)?;
-            let header: Value = kvad::serde_json::from_slice(&header)?;
+            let n = u64::from_le_bytes(uncached::read(&file, 0, 8)?[..].try_into()?);
+            let header: Value = kvad::serde_json::from_slice(&uncached::read(&file, 8, usize::try_from(n)?)?)?;
             let bad = |what: &str| format!("{}: a safetensors header with {what}", path.display());
             for (name, t) in header.as_object().ok_or_else(|| bad("no tensors"))? {
                 if name == "__metadata__" {
@@ -275,57 +259,9 @@ impl Uncached {
 
     fn load(&self, name: &str) -> candle_core::Result<Tensor> {
         let t = self.tensors.get(name).ok_or_else(|| candle_core::Error::CannotFindTensor { path: name.to_string() }.bt())?;
-        // Page-aligned at both ends, in the file and in memory: an uncached
-        // read that is not falls back to the cache.
-        const PAGE: u64 = 16384;
-        let file = &self.files[t.file];
-        let from = t.at / PAGE * PAGE;
-        let to = ((t.at + t.len as u64).div_ceil(PAGE) * PAGE).min(file.metadata()?.len());
-        let span = (to - from) as usize;
-        let mut buf = vec![0u8; span + PAGE as usize];
-        let off = buf.as_ptr().align_offset(PAGE as usize);
-        file.read_exact_at(&mut buf[off..off + span], from)?;
-        let skip = off + (t.at - from) as usize;
-        Tensor::from_raw_buffer(&buf[skip..skip + t.len], t.dtype, &t.shape, &Device::Cpu)
+        let bytes = uncached::read(&self.files[t.file], t.at, t.len)?;
+        Tensor::from_raw_buffer(&bytes, t.dtype, &t.shape, &Device::Cpu)
     }
-}
-
-/// Read `file` past the page cache from now on, and drop what the cache
-/// already holds of it.
-///
-/// The second half matters as much as the first. An uncached read of a page
-/// the cache already has is served from the cache, and marks the page used,
-/// so a checkpoint just downloaded, or read by any earlier load, is kept
-/// through the whole load. With 12.5 GB of FLUX's files cached that way, the
-/// load compressed 35 GB of weights and the first image was as slow as with
-/// no `F_NOCACHE` at all. `msync(MS_INVALIDATE)` over a mapping of the file
-/// drops its clean pages, and a checkpoint has no other kind.
-#[cfg(target_os = "macos")]
-fn uncache(file: &File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let fd = file.as_raw_fd();
-    let len = file.metadata()?.len() as usize;
-    // SAFETY: calls on a descriptor this function borrows, and a read-only
-    // mapping that nothing reads and that is unmapped before returning.
-    unsafe {
-        if libc::fcntl(fd, libc::F_NOCACHE, 1) == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if len == 0 {
-            return Ok(());
-        }
-        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0);
-        if p == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-        let r = libc::msync(p, len, libc::MS_INVALIDATE);
-        let e = std::io::Error::last_os_error();
-        libc::munmap(p, len);
-        if r == -1 {
-            return Err(e);
-        }
-    }
-    Ok(())
 }
 
 impl SimpleBackend for Uncached {

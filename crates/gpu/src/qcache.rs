@@ -33,6 +33,7 @@
 //! nobody wanted still counts as missed.
 
 use crate::common::ggml_name;
+use crate::uncached::{self, Pages};
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::Device;
 use kvad::model::Spec;
@@ -41,6 +42,7 @@ use kvad::serde_json;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -68,9 +70,27 @@ pub fn tag(quant: GgmlDType) -> String {
     format!("gpu-{}", ggml_name(quant))
 }
 
-/// A cache file that is valid for this checkpoint, mapped.
+/// A cache file that is valid for this checkpoint, open.
+///
+/// Read with [`uncached`], not through [`Container`]'s mapping, which is
+/// dropped once the header has been checked. The blocks go to the device and
+/// the file's pages would stay behind in the page cache: a second copy of the
+/// model, which Qwen-Image at q8 (29.5 GB) cannot have on a 48 GB machine.
+/// Mapped, its load compressed 36 GB of the weights it had already loaded,
+/// and the first image took 7.8 s to encode and 11.4 s for its first step.
+///
+/// Read this way nothing is compressed, and it is faster besides: `pread`
+/// in whole blobs runs at about 6 GB/s where page faults on a mapping ran at
+/// 0.8. From a file not in the page cache, Qwen-Image loads in 5.1 s rather
+/// than 71, and Qwen3-14B in 3.2 s rather than 21.2; from one that is, 4.8 s
+/// rather than 12.9, and 3.3 rather than 4.2. The price is the blob being
+/// uploaded, which is now counted on the host until it is on the device
+/// where a mapped page was not: the peak rises by about the largest one,
+/// Qwen3-14B's 826 MB token table, and what the model holds once loaded does
+/// not change.
 struct Cache {
-    file: Container,
+    file: File,
+    bytes: u64,
     /// Name to where its blocks are and what shape they make.
     entries: HashMap<String, (Span, (usize, usize))>,
 }
@@ -93,7 +113,7 @@ pub struct Vault {
     write: RefCell<Option<Writer>>,
     /// Why recording stopped, if it did.
     failure: RefCell<Option<String>>,
-    /// Names this build wanted that the mapped file did not hold.
+    /// Names this build wanted that the file did not hold.
     missed: RefCell<Vec<String>>,
 }
 
@@ -112,8 +132,8 @@ impl Vault {
         }
     }
 
-    /// Map the cache for this model at this quantisation, or arrange to write
-    /// one.
+    /// Open the cache for this model at this quantisation, or arrange to
+    /// write one.
     ///
     /// Never fails. Every way this can go wrong — no directory, a file from an
     /// older format, a re-downloaded checkpoint — ends with the load going to
@@ -167,9 +187,9 @@ impl Vault {
         let stale = match open_valid(&path, &vault.header) {
             Ok(Some(cache)) => {
                 progress(&format!(
-                    "mapping {} weights ({} MB)",
+                    "reading cached {} weights ({} MB)",
                     vault.tag,
-                    cache.file.bytes() / 1_000_000
+                    cache.bytes / 1_000_000
                 ));
                 vault.read = Some(cache);
                 vault.path = Some(path);
@@ -211,7 +231,7 @@ impl Vault {
     ) -> Option<QTensor> {
         let gd = self.quant?;
         let blocks = self.blocks(name, shape)?;
-        let storage = QStorage::from_data(Cow::Borrowed(blocks), device, gd);
+        let storage = QStorage::from_data(Cow::Borrowed(&blocks), device, gd);
         match storage.and_then(|s| QTensor::new(s, shape)) {
             Ok(q) => Some(q),
             // A length candle will not take: the file is damaged, and the
@@ -225,7 +245,7 @@ impl Vault {
 
     /// `name`'s blocks as the file holds them, for a caller that wants the
     /// bytes rather than a `QTensor`: `mpp`'s kernel reads Q8_0 itself.
-    pub(crate) fn blocks(&self, name: &str, shape: (usize, usize)) -> Option<&[u8]> {
+    pub(crate) fn blocks(&self, name: &str, shape: (usize, usize)) -> Option<Pages> {
         self.quant?;
         let cache = self.read.as_ref()?;
         let miss = |v: &Self| {
@@ -236,10 +256,10 @@ impl Vault {
         if stored != shape {
             return miss(self);
         }
-        match cache.file.slice(span.0, span.1) {
+        match uncached::read(&cache.file, span.0 as u64, span.1) {
             Ok(b) => Some(b),
-            // Offsets past the end: the file is damaged, and the load carries
-            // on without it.
+            // Offsets past the end, or a read that failed: the file is
+            // damaged, and the load carries on without it.
             Err(_) => miss(self),
         }
     }
@@ -276,7 +296,7 @@ impl Vault {
     ///
     /// Call it once the architecture has finished loading, which is the first
     /// moment either question can be answered: what was written is only whole
-    /// now, and what was missing from a mapped file is only known now.
+    /// now, and what was missing from a cached file is only known now.
     pub fn finish(&mut self, progress: &mut dyn FnMut(&str)) {
         let missed = std::mem::take(&mut *self.missed.borrow_mut());
         if !missed.is_empty() {
@@ -308,7 +328,7 @@ impl Vault {
     }
 }
 
-/// Map `path` if it is there and is still about this checkpoint.
+/// Open `path` if it is there and is still about this checkpoint.
 ///
 /// `Ok(None)` means there is no cache yet. `Err` means there is one and it
 /// cannot be trusted, which is worth saying out loud before rebuilding.
@@ -336,16 +356,18 @@ fn open_valid(path: &Path, want: &serde_json::Value) -> Res<Option<Cache>> {
             entries.insert(name.clone(), parse_entry(entry)?);
         }
     }
-    Ok(Some(Cache { file, entries }))
+    let bytes = file.bytes() as u64;
+    drop(file);
+    Ok(Some(Cache { file: uncached::open(path)?, bytes, entries }))
 }
 
-/// One mapped blob, handed to candle as the blocks it already is.
+/// One blob, handed to candle as the blocks it already is.
 ///
 /// `from_data` copies: on Metal into a device buffer, which is the trip a
 /// weight has to make however it arrived, and on the CPU into a `Vec`, which
-/// is one copy the CPU engine's own cache avoids. That is the price of
-/// speaking candle's vocabulary rather than our own, and it is paid against
-/// quantising the matrix from scratch.
+/// the CPU engine's own cache, reading its mapping in place, does without.
+/// That is the price of speaking candle's vocabulary rather than our own, and
+/// it is paid against quantising the matrix from scratch.
 fn parse_entry(v: &serde_json::Value) -> Res<(Span, (usize, usize))> {
     let num = |v: Option<&serde_json::Value>| -> Res<usize> {
         v.and_then(serde_json::Value::as_u64).map(|n| n as usize).ok_or_else(|| "bad entry".into())
@@ -487,10 +509,10 @@ mod tests {
     /// And the file has to be doing the work. A miss is answered from the
     /// checkpoint, correctly and silently, so a cache that matched nothing at
     /// all would pass the equality check and fail at its job: hence the
-    /// assertions that the second load said `mapping`, said nothing about
+    /// assertions that the second load said `reading cached`, said nothing about
     /// staleness, and left the file where it was.
     #[test]
-    fn a_mapped_model_answers_exactly_what_the_quantised_one_did() {
+    fn a_cached_model_answers_exactly_what_the_quantised_one_did() {
         let _dir = Dir::new("roundtrip");
         let tokens = [1u32, 2, 3, 4];
         for (arch, spec, path) in fixtures("roundtrip") {
@@ -503,10 +525,10 @@ mod tests {
             assert!(file.exists(), "{arch}: nothing was written");
 
             let (second, log) = load(&repo, &path, &spec, Some(GgmlDType::Q8_0), &tokens);
-            assert!(log.contains("mapping gpu-q8 weights"), "{arch}: {log}");
+            assert!(log.contains("reading cached gpu-q8 weights"), "{arch}: {log}");
             assert!(!log.contains("stale"), "{arch}: a cache this build wrote is not stale: {log}");
             assert!(file.exists(), "{arch}: the file went away: {log}");
-            assert_eq!(second, first, "{arch}: the mapped model is a different model");
+            assert_eq!(second, first, "{arch}: the cached model is a different model");
 
             std::fs::remove_file(&path).unwrap();
         }
@@ -544,7 +566,7 @@ mod tests {
         assert!(log.contains("first load"), "{log}");
         let (last, log) = load(repo, &path, &spec, Some(GgmlDType::Q8_0), &tokens);
         assert_eq!(last, whole);
-        assert!(log.contains("mapping") && !log.contains("stale"), "{log}");
+        assert!(log.contains("reading cached") && !log.contains("stale"), "{log}");
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -576,7 +598,7 @@ mod tests {
 
         // And the rebuilt file is about the new one.
         let (again, log) = load(repo, &path, &spec, Some(GgmlDType::Q8_0), &tokens);
-        assert!(log.contains("mapping") && !log.contains("stale"), "{log}");
+        assert!(log.contains("reading cached") && !log.contains("stale"), "{log}");
         assert_eq!(again, after);
 
         std::fs::remove_file(&path).unwrap();

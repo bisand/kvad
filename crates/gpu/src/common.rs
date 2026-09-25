@@ -239,7 +239,7 @@ impl<'v> Loader<'v> {
             let full = vb.full(name);
             if let Some(b) = self.vault.blocks(&full, (out, inp)) {
                 vb.record(name);
-                return Ok(Proj::Blocks(crate::mpp::Q8::new(b, out, inp, &self.device)?));
+                return Ok(Proj::Blocks(crate::mpp::Q8::new(&b, out, inp, &self.device)?));
             }
             let blocks = self.quantize(vb, name, out, inp, stored)?.data()?.into_owned();
             return Ok(Proj::Blocks(crate::mpp::Q8::new(&blocks, out, inp, &self.device)?));
@@ -288,7 +288,7 @@ impl<'v> Loader<'v> {
             match self.vault.blocks(&vb.full(name), (out, inp)).filter(|b| b.len() == size) {
                 Some(b) => {
                     vb.record(name);
-                    bytes.extend_from_slice(b);
+                    bytes.extend_from_slice(&b);
                 }
                 None => bytes.extend_from_slice(&self.quantize(vb, name, out, inp, stored)?.data()?),
             }

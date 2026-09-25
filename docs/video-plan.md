@@ -1038,7 +1038,19 @@ are byte-for-byte those above.
   which showed 20.3 GB resident instead of 22.8. Nothing is compressed now.
   A footprint compares across a change to how weights are read only with
   the compressor's pages beside it.
-- **1536×1024 peaks in stage 2's first step**, just after the upsampler ran
-  in f32 beside the DiT, and the peak varies by 3 GB between runs. Up to
-  39 GB of 48 is the pipeline's tightest point; freeing the upsampler before
-  stage 2 would give some room.
+- **1536×1024 peaks in stage 2's own working set**: the DiT's 22.8 GB and
+  about 13 GB of activations at 24 576 tokens, 35–37 GB, once with a spike
+  to 39 GB as stage 2 started. The upsampler is already dropped and
+  synchronised before stage 2. Its memory comes back 0.1–0.3 s after the
+  synchronise, not at it, which may be what the spike overlapped. Shrinking
+  the upsampler does not lower this peak. Shrinking the DiT's activations
+  would. Up to 39 GB of 48 is the pipeline's tightest point.
+- **The upsampler was larger than it needed to be** (3345a2b, in #79).
+  `Conv3d::load` folded each weight on the device, so the upload stayed
+  allocated beside the folded copy until a synchronise, and the copy was
+  rounded up to a power of two: 4.5 GB for 2 GB of f32 weights. Folded on
+  the host it is 2.5 GB, and with a synchronise after each block the
+  upsampler peaks at about 6 GB instead of 8. 768×512 in two stages peaked
+  while it ran beside the DiT, and now peaks at 27.1 GB instead of 29.2. The
+  video decoder shares the loader: 0.55 GB less to load, 0.3 GB more at its
+  peak (9.0 against 8.7 GB at 768×512), at the same speed and output.

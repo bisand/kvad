@@ -67,9 +67,13 @@ pub struct Conv3d {
 impl Conv3d {
     pub(crate) fn load(cx: &Ctx<'_>, r: &Reader<'_>, name: &str, cin: usize, cout: usize) -> Res<Self> {
         let r = r.pp(name);
-        let w = cx.get(&r, (cout, cin, 3, 3, 3), "weight")?;
+        // Folded on the host and uploaded once. Folded on the device, the
+        // upload stays allocated beside the folded copy until the next
+        // synchronise, and the copy is rounded up to a power of two: the
+        // upsampler held 4.5 GB for its 2 GB of f32 weights.
+        let w = r.get((cout, cin, 3, 3, 3), "weight")?.to_dtype(cx.dtype)?;
         Ok(Conv3d {
-            w: fold(&w)?,
+            w: fold(&w)?.to_device(cx.device())?,
             b: cx.get(&r, cout, "bias")?.reshape((1, cout, 1, 1))?,
             cin,
             time: Time::Replicate,

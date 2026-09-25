@@ -157,13 +157,21 @@ impl Upsampler {
         // Frames first from here on, as the convolutions want them.
         let z = latent.to_dtype(DType::F32)?.permute((1, 0, 2, 3))?;
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?.to_dtype(self.dtype)?;
-        let mut x = self.norm.forward(&self.initial.forward(&z)?)?.silu()?;
+        // Synchronised after every block: candle's Metal pool frees a dropped
+        // buffer only then, and without it all 18 steps' temporaries stayed
+        // allocated to the end.
+        let step = |x: candle_core::Result<Tensor>| -> candle_core::Result<Tensor> {
+            let x = x?;
+            x.device().synchronize()?;
+            Ok(x)
+        };
+        let mut x = step(self.norm.forward(&self.initial.forward(&z)?)?.silu())?;
         for b in &self.res {
-            x = b.forward(&x)?;
+            x = step(b.forward(&x))?;
         }
-        x = shuffle(&self.up.forward(&x)?)?;
+        x = step(shuffle(&self.up.forward(&x)?))?;
         for b in &self.post {
-            x = b.forward(&x)?;
+            x = step(b.forward(&x))?;
         }
         let z = self.last.forward(&x)?.to_dtype(DType::F32)?;
         z.broadcast_sub(&self.mean)?.broadcast_div(&self.std)?.permute((1, 0, 2, 3))?.contiguous()

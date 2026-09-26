@@ -835,8 +835,7 @@ The same kind of checks apply here:
    121; see below.
 7. **The service:** the `video` kind, `/v1/videos`, storage, the CLI, the UI
    page. #51 has the shape. Video files are served with Range support, and
-   `ffmpeg` re-encoding is optional. Done, without the re-encoding; see
-   below.
+   `ffmpeg` re-encoding is optional. Done; see below.
 8. **Later, each in its own issue:**
    - the duration head as the default;
    - image-to-video;
@@ -1355,6 +1354,28 @@ client asks for a video, the way it asks an image model for a picture.
   278.5 s, decode 38.6 s), for a 288 MB file. The server's peak footprint
   over its whole life, the load and the generation, was 33.5 GB, under the
   35.3 GB admission charged. One run.
-- **Not done:** re-encoding with `ffmpeg` (the files are 14 MB a second at
-  768×512 and 57 at 1536×1024); a latent preview while it runs;
-  image-to-video; progress as a stream rather than polled.
+- **Not done:** a latent preview while it runs; image-to-video; progress as
+  a stream rather than polled.
+
+**Compressed with `ffmpeg`, when there is one.** The MP4 `kvad::video` writes
+compresses nothing: 14 MB a second at 768×512, 57 at 1536×1024. Each video
+is now re-encoded as the reference writes its own, H.264 at CRF 19 and AAC,
+with the BT.709 tags and the index in front.
+
+| Re-encoded on an M5 Pro | Time | Size | PSNR from the original |
+|---|---|---|---|
+| 768×512 × 97 | 0.3 s | 58.3 → 1.9 MB | 43.6 dB |
+| 1536×1024 × 121 | 0.9 s | 287.9 → 9.1 MB | 44.2 dB |
+
+- **So the uncompressed file is not kept.** A thirtieth of the size for
+  under a second, at 44 dB, is not a trade anybody would decline per video.
+  If `ffmpeg` fails, the uncompressed file is kept, and the failure logged.
+- **`[videos] ffmpeg`** in `kvad.toml`: `auto` (the default), `off`, or a
+  path. `auto` looks on `PATH` and then in `/opt/homebrew/bin`,
+  `/usr/local/bin` and `/usr/bin`. The installed launchd service runs with
+  `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, where a `PATH` lookup alone never
+  finds Homebrew's `ffmpeg`. Started with that `PATH`, the server found it,
+  and said so as it started.
+- **Through the server:** a 5 s clip at 768×512 was served at 1.7 MB, with
+  121 H.264 High frames and AAC sound, and Chromium seeked in it to 4 s and
+  played on.

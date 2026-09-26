@@ -48,6 +48,7 @@ pub struct Config {
     pub data: Data,
     pub database: Database,
     pub auth: Auth,
+    pub videos: Videos,
     /// The command line's, not the server's. It is here so that a file with
     /// it in is not refused as having a key nobody knows.
     pub client: Client,
@@ -102,6 +103,22 @@ pub struct Server {
     /// whether another fits. See `memory::DEFAULT_CONTEXT` for the default
     /// and why.
     pub context: Option<usize>,
+}
+
+/// What happens to a video once it is made.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Videos {
+    /// The `ffmpeg` that compresses each video: `auto` to look for one,
+    /// `off` to keep the uncompressed file, or a path. See
+    /// `videos::find_ffmpeg`.
+    pub ffmpeg: String,
+}
+
+impl Default for Videos {
+    fn default() -> Self {
+        Videos { ffmpeg: "auto".into() }
+    }
 }
 
 /// Where the database, images, datasets and trained models go.

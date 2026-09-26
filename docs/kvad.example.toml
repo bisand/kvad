@@ -41,6 +41,16 @@ bind = "127.0.0.1:5823"
 # HF_HOME, when set, still decide. The Hugging Face token stays where it is.
 # dir = "/Volumes/Models/kvad"
 
+[videos]
+# The ffmpeg that compresses each video once it is made: H.264 at CRF 19 and
+# AAC, as LTX's reference writes them. kvad writes an MP4 itself that
+# compresses nothing, about 14 MB a second at 768×512; compressed it is about
+# a thirtieth of that, at 44 dB PSNR from the original, in under a second.
+# "auto" looks on PATH and then in /opt/homebrew/bin, /usr/local/bin and
+# /usr/bin, since a launchd service's PATH has only the system directories.
+# "off" keeps the uncompressed file. Anything else is a path to ffmpeg.
+# ffmpeg = "auto"
+
 [database]
 # Defaults to kvad.db in the data directory above. Data rather than cache: what is in
 # it — conversations, training runs, API keys — cannot be downloaded again.

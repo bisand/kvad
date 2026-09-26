@@ -24,9 +24,19 @@
 //! `videos/<id>.mp4` in the data directory, beside `images/`, for the reason
 //! images are there: it is somebody's work and the only copy. A poster frame
 //! goes beside it as `<id>.png`, for a gallery to show before anything
-//! plays. The MP4 compresses nothing (`kvad::video` says why), so 5 s at
-//! 768×512 is 71 MB and at 1536×1024 285 MB. The gallery's delete matters
-//! more here than it does for pictures.
+//! plays.
+//!
+//! # Compressed, when there is an `ffmpeg`
+//!
+//! The MP4 `kvad::video` writes compresses nothing (it says why): 5 s at
+//! 768×512 is 71 MB, and at 1536×1024 288 MB. Where an `ffmpeg` can be
+//! found, each is re-encoded as LTX's reference writes its own, H.264 at
+//! CRF 19 and AAC. Measured on an M5 Pro, that takes under a second, is a
+//! thirtieth of the size (58 MB to 1.9, 288 MB to 9.1), and is 43.6–44.2 dB
+//! PSNR from the uncompressed file. The uncompressed file is not kept: at
+//! that price, nobody would keep it. If `ffmpeg` fails, it is kept instead,
+//! and the failure is logged. `[videos] ffmpeg` in `kvad.toml` names one, or
+//! turns this off; see [`find_ffmpeg`].
 //!
 //! # Seeking
 //!
@@ -253,9 +263,10 @@ pub fn advance(db: &Db, id: i64, step: &kvad::video::Step) -> Res<bool> {
 /// Keep a finished video: the files, then the row that says they are there.
 ///
 /// The files are written aside and renamed into place, so that nobody is
-/// served half a video. If the row went while the files were being written,
+/// served half a video; `ffmpeg`, when there is one, compresses the MP4 on
+/// its way into place. If the row went while the files were being written,
 /// the video was deleted, and the files go too.
-pub fn finish(db: &Db, dir: &FsPath, id: i64, f: &Filmed) -> Res<bool> {
+pub fn finish(db: &Db, dir: &FsPath, id: i64, f: &Filmed, ffmpeg: Option<&FsPath>) -> Res<bool> {
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     let mp4 = f.video.mp4(f.audio.as_ref());
     // The middle frame, which says more about a clip than its first.
@@ -263,23 +274,95 @@ pub fn finish(db: &Db, dir: &FsPath, id: i64, f: &Filmed) -> Res<bool> {
     for (ext, bytes) in [("mp4", &mp4), ("png", &poster)] {
         let path = dir.join(format!("{id}.{ext}"));
         let aside = dir.join(format!("{id}.{ext}.part"));
-        if let Err(e) = std::fs::write(&aside, bytes).and_then(|()| std::fs::rename(&aside, &path)) {
+        let written = std::fs::write(&aside, bytes).and_then(|()| match (ext, ffmpeg) {
+            ("mp4", Some(ffmpeg)) => compress(ffmpeg, &aside, &path, id),
+            _ => std::fs::rename(&aside, &path),
+        });
+        if let Err(e) = written {
             let _ = std::fs::remove_file(&aside);
             remove_files(dir, id);
             return Err(format!("could not write {}: {e}", path.display()).into());
         }
     }
+    let bytes = std::fs::metadata(dir.join(format!("{id}.mp4")))?.len();
     let n = db.with(|c| {
         c.execute(
             "UPDATE videos SET status = 'completed', progress = 1, phase = NULL, bytes = ?2, encode_secs = ?3, \
              denoise_secs = ?4, decode_secs = ?5, completed_at = datetime('now') WHERE id = ?1",
-            params![id, mp4.len() as i64, f.encode_secs, f.denoise_secs, f.decode_secs],
+            params![id, bytes as i64, f.encode_secs, f.denoise_secs, f.decode_secs],
         )
     })?;
     if n == 0 {
         remove_files(dir, id);
     }
     Ok(n > 0)
+}
+
+/// Re-encode the uncompressed MP4 at `raw` into `to`, as LTX's reference
+/// writes its own; or, if `ffmpeg` fails, move `raw` there as it is.
+///
+/// Written to a third name and renamed, as every file here is. The colours
+/// are said again for the encoder, which would otherwise write none, and
+/// `faststart` puts the index in front, as `kvad::video` does, so that a
+/// browser can start before the whole file is there.
+fn compress(ffmpeg: &FsPath, raw: &FsPath, to: &FsPath, id: i64) -> std::io::Result<()> {
+    let out = raw.with_extension("x264");
+    let ran = std::process::Command::new(ffmpeg)
+        .args(["-nostdin", "-y", "-v", "error", "-i"])
+        .arg(raw)
+        .args(["-c:v", "libx264", "-crf", "19", "-preset", "medium", "-pix_fmt", "yuv420p"])
+        .args(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"])
+        .args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "mp4"])
+        .arg(&out)
+        .stdin(std::process::Stdio::null())
+        .output();
+    let why = match ran {
+        Ok(o) if o.status.success() => {
+            std::fs::remove_file(raw)?;
+            return std::fs::rename(&out, to);
+        }
+        Ok(o) => format!("{}: {}", o.status, String::from_utf8_lossy(&o.stderr).trim()),
+        Err(e) => e.to_string(),
+    };
+    let _ = std::fs::remove_file(&out);
+    tracing::warn!("video {id} is kept uncompressed: {} failed: {why}", ffmpeg.display());
+    std::fs::rename(raw, to)
+}
+
+/// The `ffmpeg` every video is compressed with, chosen once at startup.
+static FFMPEG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Choose the `ffmpeg` from `[videos] ffmpeg`, and say what was chosen, for
+/// the line the server prints as it starts.
+pub fn use_ffmpeg(setting: &str) -> String {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let found = find_ffmpeg(setting, &std::env::split_paths(&path).collect::<Vec<_>>());
+    let said = match (&found, setting.trim()) {
+        (Some(p), _) => format!("compressed with {}", p.display()),
+        (None, "off") => "kept uncompressed ([videos] ffmpeg = \"off\")".into(),
+        (None, "auto" | "") => "kept uncompressed: no ffmpeg found".into(),
+        (None, named) => format!("kept uncompressed: {named} is not a file"),
+    };
+    let _ = FFMPEG.set(found);
+    said
+}
+
+/// `ffmpeg` as `[videos] ffmpeg` says to find it: `off` for none, a path
+/// for that file if it is there, and `auto` for the first on `path` or in
+/// the places a package manager puts one. The last matters: a launchd
+/// service runs with `/usr/bin:/bin:/usr/sbin:/sbin` for its `PATH`, and
+/// Homebrew's `ffmpeg` is in none of them.
+pub fn find_ffmpeg(setting: &str, path: &[PathBuf]) -> Option<PathBuf> {
+    match setting.trim() {
+        "off" => None,
+        "auto" | "" => path
+            .iter()
+            .cloned()
+            .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from))
+            .map(|d| d.join("ffmpeg"))
+            .find(|f| f.is_file()),
+        named => Some(PathBuf::from(named)).filter(|f| f.is_file()),
+    }
 }
 
 /// Whether a video's row is still there.
@@ -623,7 +706,9 @@ async fn run(state: State, id: i64, key: Key, request: VideoRequest) {
             }
             Reel::Done(filmed) => {
                 let db = db.clone();
-                if let Err(Fail(_, why)) = blocking(move || finish(&db, &dir(), id, &filmed)).await {
+                let ffmpeg = FFMPEG.get().cloned().flatten();
+                let finished = blocking(move || finish(&db, &dir(), id, &filmed, ffmpeg.as_deref())).await;
+                if let Err(Fail(_, why)) = finished {
                     failed(why).await;
                 }
                 return;
@@ -858,7 +943,7 @@ mod tests {
         assert!(s.started.is_some());
         assert_eq!(s.resource()["progress"], 50);
 
-        assert!(finish(&db, &dir, q.id, &filmed(seed)).unwrap());
+        assert!(finish(&db, &dir, q.id, &filmed(seed), None).unwrap());
         let s = get_one(&db, q.id, None).unwrap().unwrap();
         let mp4 = std::fs::read(dir.join(format!("{}.mp4", q.id))).unwrap();
         assert_eq!(mp4, filmed(seed).video.mp4(filmed(seed).audio.as_ref()));
@@ -882,7 +967,7 @@ mod tests {
         let dir = scratch("deleted");
         let q = queue(&db, None, "m", "b", &resolved(1)).unwrap();
         assert!(delete(&db, &dir, q.id, None).unwrap());
-        assert!(!finish(&db, &dir, q.id, &filmed(1)).unwrap());
+        assert!(!finish(&db, &dir, q.id, &filmed(1), None).unwrap());
         assert!(!dir.join(format!("{}.mp4", q.id)).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -898,7 +983,7 @@ mod tests {
         );
         let step = kvad::video::Step { phase: "text", done: 0, total: 1, progress: 0.0, elapsed: 0.0 };
         advance(&db, b.id, &step).unwrap();
-        finish(&db, &dir, c.id, &filmed(3)).unwrap();
+        finish(&db, &dir, c.id, &filmed(3), None).unwrap();
         assert_eq!(abandon(&db).unwrap(), 2);
         let status = |id| get_one(&db, id, None).unwrap().unwrap().status;
         assert_eq!((status(a.id), status(b.id), status(c.id)), ("failed".into(), "failed".into(), "completed".into()));
@@ -918,6 +1003,49 @@ mod tests {
         assert!(list(&db, Some(2)).unwrap().is_empty());
         assert!(!delete(&db, &dir, mine.id, Some(2)).unwrap());
         assert!(get_one(&db, mine.id, Some(1)).unwrap().is_some());
+    }
+
+    #[test]
+    fn ffmpeg_is_found_where_it_is_asked_for_and_nowhere_else() {
+        let dir = scratch("ffmpeg");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("ffmpeg");
+        std::fs::write(&fake, b"").unwrap();
+        assert_eq!(find_ffmpeg("off", &[dir.clone()]), None);
+        assert_eq!(find_ffmpeg("auto", &[dir.clone()]), Some(fake.clone()), "PATH comes first");
+        assert_eq!(find_ffmpeg(fake.to_str().unwrap(), &[]), Some(fake.clone()));
+        assert_eq!(find_ffmpeg(dir.join("nothing").to_str().unwrap(), &[]), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A video from a real `ffmpeg`, where there is one: whole, smaller, and
+    /// what `bytes` says; and from one that fails, the uncompressed file.
+    #[test]
+    fn a_video_is_compressed_when_ffmpeg_works_and_kept_when_it_does_not() {
+        let Some(ffmpeg) = find_ffmpeg("auto", &[]) else { return };
+        let db = Db::in_memory().unwrap();
+        let dir = scratch("compressed");
+        let (w, h, n) = (64, 64, 9);
+        let rgb = (0..w * h * 3 * n).map(|i| ((i / 3) % w * 4 + i / (w * h * 3) * 8) as u8).collect();
+        let f = Filmed { video: Video { width: w, height: h, fps: 24, rgb }, ..filmed(1) };
+        let raw = f.video.mp4(f.audio.as_ref());
+
+        let q = queue(&db, None, "m", "b", &resolved(1)).unwrap();
+        assert!(finish(&db, &dir, q.id, &f, Some(&ffmpeg)).unwrap());
+        let mp4 = std::fs::read(dir.join(format!("{}.mp4", q.id))).unwrap();
+        assert!(mp4.len() < raw.len(), "{} bytes compressed against {}", mp4.len(), raw.len());
+        assert_eq!(get_one(&db, q.id, None).unwrap().unwrap().bytes, Some(mp4.len() as u64));
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| {
+            let name = e.unwrap().file_name().into_string().unwrap();
+            !name.contains("part") && !name.contains("x264")
+        }), "nothing left aside");
+
+        let q = queue(&db, None, "m", "b", &resolved(2)).unwrap();
+        let broken = dir.join("not-ffmpeg");
+        std::fs::write(&broken, b"").unwrap();
+        assert!(finish(&db, &dir, q.id, &f, Some(&broken)).unwrap());
+        assert_eq!(std::fs::read(dir.join(format!("{}.mp4", q.id))).unwrap(), raw);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

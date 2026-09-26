@@ -15,6 +15,8 @@
 //!
 //! `--path FILE` loads the decoder from a file rather than the Hub, and
 //! `--where` only prints where the Hub's copy is (downloading it first).
+//! `--profile` prints how long each step of the decoder took
+//! ([`kvad_gpu::prof`]), with the steps at one size summed.
 
 use candle_core::{DType, Device};
 use kvad::weights::{fetch_file, Watcher};
@@ -52,10 +54,17 @@ fn main() -> Res<()> {
     }
     let latent = latent.to_device(&device)?;
 
+    if flag("--profile") {
+        kvad_gpu::prof::start();
+    }
     let t = Instant::now();
     let frames = decoder.decode(&latent)?.to_device(&Device::Cpu)?;
     let (n, _, h, w) = frames.dims4()?;
-    eprintln!("decoded {:?} to {n} frames of {w}×{h} in {:.2} s", latent.dims(), t.elapsed().as_secs_f64());
+    let took = t.elapsed().as_secs_f64();
+    eprintln!("decoded {:?} to {n} frames of {w}×{h} in {took:.2} s", latent.dims());
+    for r in kvad_gpu::prof::stop() {
+        eprintln!("   {:<34} {:>2}× {:>7.2} s {:>5.1}%", r.label, r.calls, r.seconds, 100.0 * r.seconds / took);
+    }
 
     if let Some(expect) = value("--expect") {
         let mut want = candle_core::safetensors::load(&expect, &Device::Cpu)?.remove("frames").ok_or("no `frames` tensor")?;

@@ -13,6 +13,7 @@
 
 use crate::common::Reader;
 use crate::image::nn::{Ctx, Linear};
+use crate::prof::span;
 use candle_core::{DType, Device, Tensor, D};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -189,18 +190,19 @@ impl GatedAttention {
         // it was asked in; everything here stays in the input's dtype.
         let dtype = x.dtype();
         let lin = |l: &Linear, y: &Tensor| l.forward(y)?.to_dtype(dtype);
-        let q = heads(self.q_norm.forward(&lin(&self.q, x)?)?, t, rope_q)?;
-        let k = heads(self.k_norm.forward(&lin(&self.k, ctx)?)?, s, rope_k)?;
-        let v = lin(&self.v, ctx)?.reshape((1, s, h * d))?;
-        let o = crate::image::nn::attention(&q, &k, &v, h)?.squeeze(0)?;
+        let dev = x.device();
+        let (q, k, v) = span(|| "q, k, v", dev, || Ok((lin(&self.q, x)?, lin(&self.k, ctx)?, lin(&self.v, ctx)?)))?;
+        let (q, k) = span(|| "norm, rope", dev, || Ok((heads(self.q_norm.forward(&q)?, t, rope_q)?, heads(self.k_norm.forward(&k)?, s, rope_k)?)))?;
+        let v = v.reshape((1, s, h * d))?;
+        let o = span(|| "attention", dev, || crate::image::nn::attention(&q, &k, &v, h)?.squeeze(0))?;
         let o = match &self.gate {
-            Some(g) => {
+            Some(g) => span(|| "gate", dev, || {
                 let gates = (candle_nn::ops::sigmoid(&lin(g, x)?)? * 2.0)?;
-                o.reshape((t, h, d))?.broadcast_mul(&gates.unsqueeze(2)?)?.reshape((t, h * d))?
-            }
+                o.reshape((t, h, d))?.broadcast_mul(&gates.unsqueeze(2)?)?.reshape((t, h * d))
+            })?,
             None => o,
         };
-        lin(&self.out, &o)
+        span(|| "out", dev, || lin(&self.out, &o))
     }
 }
 

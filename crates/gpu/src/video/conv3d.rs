@@ -1,4 +1,12 @@
-//! A 3D convolution, built exactly out of 2D ones.
+//! A 3D convolution, built exactly out of 2D ones, or run on the M5's
+//! matrix units.
+//!
+//! In f16 or bf16 on an M5 GPU, [`Conv3d`] runs `mpp_conv3d`, an
+//! implicit-GEMM kernel that gathers each neighbourhood as it multiplies:
+//! 7–17× the folded convolution below. With [`norm_silu`] as one kernel
+//! too, the whole 1536×1024 decode takes 31 s instead of 278 (#56).
+//! Everywhere else, and in f32 (the latent upsampler), it runs the folded
+//! convolution this module describes.
 //!
 //! A video decoder's convolutions are 3×3×3: each output sample mixes its
 //! neighbours in time as well as in space. candle has `conv1d` and `conv2d`
@@ -56,12 +64,22 @@ pub enum Time {
 /// A 3×3×3 convolution with stride 1, padded in time as [`Time`] says and
 /// with zeros in space, on frames-first tensors.
 pub struct Conv3d {
-    /// `[out, 3·in, 3, 3]`: the kernel with its time taps folded into its
-    /// input channels, earliest frame first.
-    w: Tensor,
+    w: Kernel,
     b: Tensor,
     cin: usize,
     time: Time,
+}
+
+/// The kernel, laid out for whichever convolution runs it; chosen at load,
+/// so it is held once.
+enum Kernel {
+    /// `[out, 3·in, 3, 3]`: the time taps folded into the input channels,
+    /// earliest frame first, for candle's `conv2d`.
+    Folded(Tensor),
+    /// `[out, 27·in]`, tap major, for `mpp_conv3d`: in f16 or bf16 on an M5,
+    /// where it runs 7–17× faster (#56).
+    #[cfg(target_os = "macos")]
+    Taps(Tensor),
 }
 
 impl Conv3d {
@@ -72,12 +90,27 @@ impl Conv3d {
         // synchronise, and the copy is rounded up to a power of two: the
         // upsampler held 4.5 GB for its 2 GB of f32 weights.
         let w = r.get((cout, cin, 3, 3, 3), "weight")?.to_dtype(cx.dtype)?;
+        #[cfg(target_os = "macos")]
+        let w = match crate::mpp_conv3d::runs(cx.device(), cx.dtype, cin) {
+            true => Kernel::Taps(crate::mpp_conv3d::taps(&w)?.to_device(cx.device())?),
+            false => Kernel::Folded(fold(&w)?.to_device(cx.device())?),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let w = Kernel::Folded(fold(&w)?.to_device(cx.device())?);
         Ok(Conv3d {
-            w: fold(&w)?.to_device(cx.device())?,
+            w,
             b: cx.get(&r, cout, "bias")?.reshape((1, cout, 1, 1))?,
             cin,
             time: Time::Replicate,
         })
+    }
+
+    /// The folded convolution for a kernel `[out, in, 3, 3, 3]` and a bias
+    /// `[out]`, on their own device: for comparing other convolutions with.
+    #[cfg(test)]
+    pub(crate) fn folded(w: &Tensor, b: Tensor, time: Time) -> candle_core::Result<Self> {
+        let (cout, cin, ..) = w.dims5()?;
+        Ok(Conv3d { w: Kernel::Folded(fold(w)?), b: b.reshape((1, cout, 1, 1))?, cin, time })
     }
 
     /// The same convolution padded in time as `time` says.
@@ -106,6 +139,13 @@ impl Conv3d {
     fn frames_in(&self, x: &Tensor, clip: (usize, usize), (lo, hi): (usize, usize), scratch: usize) -> candle_core::Result<Tensor> {
         let (_, c, h, w) = x.dims4()?;
         debug_assert_eq!(c, self.cin);
+        let k = match &self.w {
+            Kernel::Folded(k) => k,
+            // It gathers the neighbourhoods as it multiplies, so it needs no
+            // scratch, and no chunks or bands.
+            #[cfg(target_os = "macos")]
+            Kernel::Taps(k) => return crate::mpp_conv3d::conv3d(x, k, &self.b.flatten_all()?, clip, (lo, hi), self.time == Time::Zeros),
+        };
 
         // Rows per band, then frames per chunk, so that neither the stacked
         // input nor candle's copy of every neighbourhood grows past SCRATCH.
@@ -125,7 +165,7 @@ impl Conv3d {
                 let xp = self.window(x, clip, (f, n), (r, m))?;
                 let taps = (0..3).map(|k| xp.narrow(0, k, n)).collect::<candle_core::Result<Vec<_>>>()?;
                 let stacked = Tensor::cat(&taps, 1)?;
-                bands.push(stacked.conv2d(&self.w, 0, 1, 1, 1)?.broadcast_add(&self.b)?);
+                bands.push(stacked.conv2d(k, 0, 1, 1, 1)?.broadcast_add(&self.b)?);
                 r += m;
             }
             chunks.push(if bands.len() == 1 { bands.pop().unwrap() } else { Tensor::cat(&bands, 2)? });
@@ -213,9 +253,14 @@ pub fn by_frames(x: &Tensor, f: impl Fn(&Tensor) -> candle_core::Result<Tensor>)
     Tensor::cat(&pieces, 0)
 }
 
-/// `silu(pixel_norm(x))`, a few frames at a time: what precedes every
-/// convolution in the decoder.
+/// `silu(pixel_norm(x))`: what precedes every convolution in the decoder.
+///
+/// One kernel on Metal (`ltx_fused`), which makes nothing but its answer.
+/// Otherwise the chain, a few frames at a time.
 pub fn norm_silu(x: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
+    if let Some(y) = super::ltx_fused::norm_silu(x, eps as f32)? {
+        return Ok(y);
+    }
     by_frames(x, |x| pixel_norm(x, eps)?.silu())
 }
 
@@ -274,7 +319,7 @@ mod tests {
         let b = values(cout, 3);
         for time in [Time::Replicate, Time::Zeros] {
             let conv = Conv3d {
-                w: fold(&Tensor::from_vec(k.clone(), (cout, c, 3, 3, 3), &dev).unwrap()).unwrap(),
+                w: Kernel::Folded(fold(&Tensor::from_vec(k.clone(), (cout, c, 3, 3, 3), &dev).unwrap()).unwrap()),
                 b: Tensor::from_vec(b.clone(), (1, cout, 1, 1), &dev).unwrap(),
                 cin: c,
                 time,
@@ -298,7 +343,7 @@ mod tests {
         let k = values(cout * c * 27, 5);
         for time in [Time::Replicate, Time::Zeros] {
             let conv = Conv3d {
-                w: fold(&Tensor::from_vec(k.clone(), (cout, c, 3, 3, 3), &dev).unwrap()).unwrap(),
+                w: Kernel::Folded(fold(&Tensor::from_vec(k.clone(), (cout, c, 3, 3, 3), &dev).unwrap()).unwrap()),
                 b: Tensor::zeros((1, cout, 1, 1), DType::F32, &dev).unwrap(),
                 cin: c,
                 time,
@@ -321,7 +366,7 @@ mod tests {
         let x = Tensor::from_vec(values(t * c * h * w, 8), (t, c, h, w), &dev).unwrap();
         let k = Tensor::from_vec(values(cout * c * 27, 9), (cout, c, 3, 3, 3), &dev).unwrap();
         for time in [Time::Replicate, Time::Zeros] {
-            let conv = Conv3d { w: fold(&k).unwrap(), b: Tensor::zeros((1, cout, 1, 1), DType::F32, &dev).unwrap(), cin: c, time };
+            let conv = Conv3d { w: Kernel::Folded(fold(&k).unwrap()), b: Tensor::zeros((1, cout, 1, 1), DType::F32, &dev).unwrap(), cin: c, time };
             let whole = conv.forward(&x).unwrap();
             for (lo, hi) in [(0usize, 2usize), (2, 3), (3, 5), (0, 5)] {
                 let (s, e) = (lo.saturating_sub(1), (hi + 1).min(t));

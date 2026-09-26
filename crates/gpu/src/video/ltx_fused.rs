@@ -7,7 +7,7 @@
 //! norms and RoPE alone took 0.33 s for about 2 GB of traffic.
 //!
 //! Five kernels take their places, each reading its inputs once and writing
-//! once:
+//! once, and a sixth serves the video decoder:
 //! - [`modulate`]: `rms(x)·(1 + scale) + shift`, how every norm in a block
 //!   is modulated;
 //! - [`gated_modulate`]: the gated residual `x + y·g`, and the modulated norm
@@ -17,7 +17,9 @@
 //!   width, then each head's rotation, read straight from a q8 projection's
 //!   f32 answer;
 //! - [`gelu`]: tanh-GELU, from the up projection's answer to the dtype the
-//!   down projection takes.
+//!   down projection takes;
+//! - [`norm_silu`]: the decoder's pixel norm and SiLU, which come before
+//!   every convolution in its residual blocks and its output tail.
 //!
 //! Each does its arithmetic in f32 and rounds once, where candle's chains
 //! round after each op, so the two differ in the last bit of bf16; the tests
@@ -113,6 +115,18 @@ pub(crate) fn norm_rope(x: &Tensor, w: &Tensor, rope: Option<(&Tensor, &Tensor)>
         return Ok(None);
     }
     metal::norm_rope(x, w, rope, width / heads / 2, eps, dt).map(Some)
+}
+
+/// `silu(x / rms(x))`, the RMS taken over the channels of a frames-first
+/// `[T, C, H, W]` at each pixel: the video decoder's pixel norm and the
+/// SiLU after it, in `x`'s dtype, computed in f32 and rounded once.
+///
+/// `None` where the kernel cannot take it: the caller has the chain.
+pub(crate) fn norm_silu(x: &Tensor, eps: f32) -> candle_core::Result<Option<Tensor>> {
+    if !(readable(x) && x.rank() == 4) {
+        return Ok(None);
+    }
+    metal::norm_silu(x, eps).map(Some)
 }
 
 /// Tanh-GELU of `x`, in `dt`, computed in f32 from whatever `x` is.
@@ -267,12 +281,44 @@ mod metal {
         out[i] = T(0.5f * v * (1.0f + precise::tanh(0.7978845608028654f * v * (1.0f + 0.044715f * v * v))));
     }
 
+    struct PixParams {
+        uint c;
+        uint hw;
+        float eps;
+    };
+
+    // One thread a pixel of one frame, walking its channels twice: once for
+    // the sum of squares, once to write. Neighbouring threads take
+    // neighbouring pixels, so every read is of a run.
+    template<typename T>
+    kernel void norm_silu(
+        device const T *x [[buffer(0)]],
+        device T *out [[buffer(1)]],
+        constant PixParams &p [[buffer(2)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= p.hw) return;
+        const ulong base = ulong(gid.y) * p.c * p.hw + gid.x;
+        float acc = 0;
+        for (uint j = 0; j < p.c; j++) {
+            const float v = float(x[base + ulong(j) * p.hw]);
+            acc += v * v;
+        }
+        const float inv = 1.0f / sqrt(acc / float(p.c) + p.eps);
+        for (uint j = 0; j < p.c; j++) {
+            const float v = float(x[base + ulong(j) * p.hw]) * inv;
+            out[base + ulong(j) * p.hw] = T(v / (1.0f + exp(-v)));
+        }
+    }
+
     #define ONE(T, N) \
     template [[host_name("modulate_" #N)]] kernel void modulate<T>( \
         device const T *, device const T *, device const T *, device const T *, device const T *, \
         device T *, device T *, constant ModParams &, uint, uint, uint, uint, uint); \
     template [[host_name("gated_add_" #N)]] kernel void gated_add<T>( \
-        device const T *, device const T *, device const T *, device T *, constant uint &, constant uint &, uint);
+        device const T *, device const T *, device const T *, device T *, constant uint &, constant uint &, uint); \
+    template [[host_name("norm_silu_" #N)]] kernel void norm_silu<T>( \
+        device const T *, device T *, constant PixParams &, uint2);
     ONE(float, f32)
     ONE(half, f16)
     ONE(bfloat, bf16)
@@ -330,6 +376,52 @@ mod metal {
 
     pub(super) fn gelu(x: &Tensor, dt: DType) -> candle_core::Result<Tensor> {
         x.apply_op1_no_bwd(&Gelu { dt })
+    }
+
+    pub(super) fn norm_silu(x: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
+        x.apply_op1_no_bwd(&NormSilu { eps })
+    }
+
+    struct NormSilu {
+        eps: f32,
+    }
+
+    #[repr(C)]
+    struct PixParams {
+        c: u32,
+        hw: u32,
+        eps: f32,
+    }
+
+    impl CustomOp1 for NormSilu {
+        fn name(&self) -> &'static str {
+            "ltx_norm_silu"
+        }
+
+        fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+            candle_core::bail!("ltx_norm_silu runs on Metal only")
+        }
+
+        fn metal_fwd(&self, x: &MetalStorage, lx: &Layout) -> candle_core::Result<(MetalStorage, Shape)> {
+            let (dt, dev) = (x.dtype(), x.device());
+            let (t, c, h, w) = lx.shape().dims4()?;
+            let n = t * c * h * w;
+            let pipe = pipe(dev, &format!("norm_silu_{}", type_name(dt).unwrap()))?;
+            let out = output(dev, n * dt.size_in_bytes())?;
+            let guard = dev.command_encoder()?;
+            let enc: &ComputeCommandEncoder = guard.as_ref();
+            enc.set_label("ltx_norm_silu");
+            enc.set_compute_pipeline_state(&pipe);
+            let (xb, xo) = buffer(x, lx);
+            enc.set_input_buffer(0, Some(&xb), xo);
+            enc.set_output_buffer(1, Some(&out), 0);
+            enc.set_bytes(2, &PixParams { c: c as u32, hw: (h * w) as u32, eps: self.eps });
+            enc.dispatch_thread_groups(
+                MTLSize { width: (h * w).div_ceil(256), height: t, depth: 1 },
+                MTLSize { width: 256, height: 1, depth: 1 },
+            );
+            Ok((MetalStorage::new(out, dev.clone(), n, dt), lx.shape().clone()))
+        }
     }
 
     struct Modulate {
@@ -547,6 +639,9 @@ mod metal {
     pub(super) fn gelu(_: &Tensor, _: DType) -> candle_core::Result<Tensor> {
         unreachable!()
     }
+    pub(super) fn norm_silu(_: &Tensor, _: f32) -> candle_core::Result<Tensor> {
+        unreachable!()
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -589,6 +684,26 @@ mod tests {
     fn rows(e: usize, dt: DType, dev: &Device) -> (Tensor, Tensor, Tensor) {
         let t = (rand(&[4, e], dt, dev) * 0.3).unwrap();
         (t.narrow(0, 1, 1).unwrap(), t.narrow(0, 2, 1).unwrap(), t.narrow(0, 3, 1).unwrap())
+    }
+
+    /// The decoder's pixel norm and SiLU against candle's chain: its widths,
+    /// a frame too small for a threadgroup, and a strided input declined.
+    #[test]
+    fn norm_silu_agrees_with_the_ops_it_replaces() {
+        let Some(dev) = gpu() else { return };
+        for dt in [DType::F32, DType::F16, DType::BF16] {
+            for dims in [[3, 128, 5, 7], [2, 512, 16, 24], [2, 1024, 3, 4], [1, 32, 1, 1]] {
+                let x = (rand(&dims, dt, &dev) * 3.0).unwrap();
+                let before = ran();
+                let got = norm_silu(&x, 1e-8).unwrap().expect("the kernel declined");
+                assert_eq!(ran(), before + 1, "the kernel did not run");
+                let want = crate::video::conv3d::pixel_norm(&x, 1e-8).unwrap().silu().unwrap();
+                let got = off(&got, &want);
+                assert!(got < 3.0 * ulp(dt), "{dt:?} {dims:?}: off by {got}");
+            }
+        }
+        let x = rand(&[2, 8, 4, 4], DType::BF16, &dev).transpose(2, 3).unwrap();
+        assert!(norm_silu(&x, 1e-8).unwrap().is_none());
     }
 
     #[test]

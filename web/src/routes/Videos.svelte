@@ -37,6 +37,11 @@
     return parts.join(" · ");
   }
 
+  // A preview is a 404 until the first denoising step is done, and each
+  // step's is a new link; so it is hidden until one loads.
+  const hide = (e) => (e.currentTarget.style.visibility = "hidden");
+  const show = (e) => (e.currentTarget.style.visibility = "visible");
+
   function took(g) {
     const k = g.kvad;
     return (k.encode_secs + k.denoise_secs + k.decode_secs).toFixed(0);
@@ -164,6 +169,15 @@
       {#if current && live(current)}
         {#if current.status === "queued"}
           <span class="loading loading-spinner"></span>
+        {:else if current.kvad.preview_url}
+          <img
+            src={current.kvad.preview_url}
+            alt="A rough preview of the middle of the clip so far"
+            class="w-full max-w-lg rounded"
+            style:aspect-ratio="{current.kvad.width} / {current.kvad.height}"
+            onload={show}
+            onerror={hide}
+          />
         {/if}
         <progress class="progress w-full max-w-lg" value={current.kvad.progress} max="1"></progress>
         <p class="text-sm opacity-70">{where(current)}</p>
@@ -171,7 +185,9 @@
         <p class="text-xs opacity-50">
           The text path encodes the prompt, the DiT makes the clip at half size and again at full
           size, and the decoders make the frames and the sound. Progress is weighted by what each
-          part takes.
+          part takes. The preview is the middle of the clip, mixed straight into colour from the
+          DiT's latest guess, at a 64th of the size in the first stage and a 32nd in the second:
+          colours and composition, not detail.
         </p>
         <button class="btn btn-sm" onclick={() => v.remove(current)}>Stop and delete</button>
       {:else if current}
@@ -209,9 +225,12 @@
               <!-- svelte-ignore a11y_media_has_caption -->
               <video src={g.kvad.url} poster={g.kvad.thumbnail_url} controls preload="none" class="aspect-video w-full bg-black object-contain"></video>
             {:else if live(g)}
-              <div class="flex aspect-video w-full flex-col items-center justify-center gap-2 p-4">
-                <progress class="progress w-3/4" value={g.kvad.progress} max="1"></progress>
-                <p class="text-xs opacity-70">{where(g)}</p>
+              <div class="relative flex aspect-video w-full flex-col items-center justify-center gap-2 p-4">
+                {#if g.kvad.preview_url}
+                  <img src={g.kvad.preview_url} alt="" class="absolute inset-0 h-full w-full object-contain opacity-60" onload={show} onerror={hide} />
+                {/if}
+                <progress class="progress relative w-3/4" value={g.kvad.progress} max="1"></progress>
+                <p class="relative text-xs opacity-70">{where(g)}</p>
               </div>
             {:else}
               <div class="flex aspect-video w-full items-center justify-center p-4">

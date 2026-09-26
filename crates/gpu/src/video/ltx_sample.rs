@@ -72,9 +72,15 @@ pub struct Latents {
     pub audio: Tensor,
 }
 
+/// What a step's callback hears after the step: its number, the σ it went
+/// to, and the DiT's prediction of the clean video, as tokens `[n, 128]` in
+/// bf16 — what a preview shows, since the latent itself is still mostly
+/// noise.
+pub type OnStep<'a> = &'a mut dyn FnMut(usize, f32, &Tensor) -> Res<()>;
+
 /// Stage 1 at the grid's own size, from pure noise to the latents the
-/// decoders read. `step` hears each step's number and σ after it runs.
-pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, step: &mut dyn FnMut(usize, f32) -> Res<()>) -> Res<Latents> {
+/// decoders read. `step` hears each step as it ends; see [`OnStep`].
+pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, step: OnStep<'_>) -> Res<Latents> {
     let shape = grid.shape();
     let (dev, keep) = (dit.device(), DType::BF16);
     let (nv, na) = (shape.video_tokens(), shape.audio_latents());
@@ -89,6 +95,7 @@ pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, step: &mut d
         // The prediction, rounded to the latent's dtype as the reference's is.
         let x0v = (f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?;
         let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
+        step(i, next, &x0v)?;
         if next == 0.0 {
             (xv, xa) = (x0v, x0a);
         } else {
@@ -101,7 +108,6 @@ pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, step: &mut d
             xv = update(&xv, &x0v, 2 + 2 * i as u64)?;
             xa = update(&xa, &x0a, 3 + 2 * i as u64)?;
         }
-        step(i, next)?;
     }
     Ok(Latents { video: video_latent(&xv.to_dtype(DType::F32)?, shape)?, audio: audio_latent(&xa.to_dtype(DType::F32)?, 8)? })
 }
@@ -118,8 +124,8 @@ fn euler(x: &Tensor, x0: &Tensor, sigma: f32, next: f32) -> candle_core::Result<
 
 /// Stage 2: `latents`, the upsampled video and stage 1's sound, re-noised
 /// to [`STAGE_2`]'s first level and refined by three Euler steps at the
-/// grid's size. `step` hears each step's number and σ after it runs.
-pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u64, step: &mut dyn FnMut(usize, f32) -> Res<()>) -> Res<Latents> {
+/// grid's size. `step` hears each step as it ends; see [`OnStep`].
+pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u64, step: OnStep<'_>) -> Res<Latents> {
     let shape = grid.shape();
     let (dev, keep) = (dit.device(), DType::BF16);
     let f = |t: &Tensor| t.to_dtype(DType::F32);
@@ -143,7 +149,7 @@ pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u
         let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
         xv = euler(&xv, &x0v, s, next)?;
         xa = euler(&xa, &x0a, s, next)?;
-        step(i, next)?;
+        step(i, next, &x0v)?;
     }
     Ok(Latents { video: video_latent(&xv.to_dtype(DType::F32)?, shape)?, audio: audio_latent(&xa.to_dtype(DType::F32)?, 8)? })
 }

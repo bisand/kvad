@@ -1354,8 +1354,8 @@ client asks for a video, the way it asks an image model for a picture.
   278.5 s, decode 38.6 s), for a 288 MB file. The server's peak footprint
   over its whole life, the load and the generation, was 33.5 GB, under the
   35.3 GB admission charged. One run.
-- **Not done:** a latent preview while it runs; image-to-video; progress as
-  a stream rather than polled.
+- **Not done:** image-to-video; progress as a stream rather than polled.
+  Compression and a preview came after; see below.
 
 **Compressed with `ffmpeg`, when there is one.** The MP4 `kvad::video` writes
 compresses nothing: 14 MB a second at 768×512, 57 at 1536×1024. Each video
@@ -1379,3 +1379,27 @@ with the BT.709 tags and the index in front.
 - **Through the server:** a 5 s clip at 768×512 was served at 1.7 MB, with
   121 H.264 High frames and AAC sound, and Chromium seeked in it to 4 s and
   played on.
+
+**A rough preview while a video is made.** After each denoising step, the
+DiT's prediction of the clean video has its middle latent frame mixed
+straight into colour by a fixed 128 × 3 matrix, as the image models'
+previews are. That is 12×8 pixels in stage 1 at 768×512 and 24×16 in
+stage 2. The server keeps the latest as `videos/<id>.preview.png`, serves it
+as `/content?variant=preview` while the video is in progress, and drops it
+when the video is done; the Videos page shows it, scaled up smoothly.
+
+- **The matrix is fitted here**, by least squares from the final latents of
+  three 768×512 × 121 clips (a fox in snow, a city street at night in the
+  rain, a dog on a beach at sunset) to their decoded frames, each averaged
+  over the 32×32 pixels and 8 frames a latent cell covers. Fitted on two and
+  scored on the third, it explains 84–96% of the variance in each of red,
+  green and blue, 22–26 dB from the pooled frames; on all three, 98%. Ridge
+  regression did no better on the clip left out.
+- **On a fourth scene, not in the fit** (a red balloon over hills and a
+  lake), the previews score 26.9–27.0 dB against the finished clip's middle
+  frame, pooled to their size: at the end of stage 1, after stage 2's first
+  step, and after its last. The first preview, after stage 1's first step
+  and about 15 s in, already shows the balloon, the sky, the hills and the
+  lake where the finished clip has them.
+- **It costs nothing that was not already paid:** reading the frame back is
+  the synchronise each step's progress report already made.

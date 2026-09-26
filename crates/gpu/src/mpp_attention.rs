@@ -75,18 +75,22 @@
 //! It runs wherever `mpp` does, and `KVAD_GPU_MPP_ATTENTION=0` leaves
 //! attention alone to candle, for measuring what this is worth.
 
+use crate::mpp::fragments;
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp3, DType, Layout, MetalStorage, Shape, Tensor};
 use candle_metal_kernels::metal::ComputeCommandEncoder;
 use objc2_metal::MTLSize;
 
-const SOURCE: &str = r#"
+const SOURCE: &str = concat!(
+    r#"
 #include <metal_stdlib>
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 using namespace mpp::tensor_ops;
-
+"#,
+    fragments!(),
+    r#"
 struct Params {
     int lq, lk;
     // Row strides, in elements.
@@ -95,72 +99,9 @@ struct Params {
     int hq, hk, hv;
     // 1/√d × log₂e: the softmax in powers of two.
     float scale;
+    // The gates' row stride, which is the heads, or 0 for no gates.
+    int ldg;
 };
-
-// `f(0)` to `f(N - 1)`, each index a compile-time constant. Every array of
-// fragments below is indexed only through this: see the module's notes.
-template <int I, int N>
-struct each {
-    template <typename F>
-    static __attribute__((always_inline)) void run(thread const F &f) {
-        f(integral_constant<int, I>());
-        each<I + 1, N>::run(f);
-    }
-};
-template <int N>
-struct each<N, N> {
-    template <typename F>
-    static __attribute__((always_inline)) void run(thread const F &) {}
-};
-// `EACH(N, i, body)`: `body` for `i` from 0 to N - 1, `i` a constant.
-#define EACH(N, I, ...) each<0, N>::run([&](auto I##_) { constexpr int I = decltype(I##_)::value; __VA_ARGS__ })
-
-// A 16 × 16 fragment: eight numbers a lane, rows r and r + 8, columns c to
-// c + 3.
-template <typename T> using frag = vec<T, 8>;
-
-// This lane's (c, r).
-inline short2 place(ushort lane) {
-    const short g = lane >> 2;
-    return short2(((g & 2) | (lane & 1)) * 4, (g & 4) | ((lane >> 1) & 3));
-}
-
-// A fragment from row-major memory, element by element: reading each row's
-// four as one vector and copying them out was 13–15% slower. With EDGE,
-// only `rows` rows exist and the rest read as zeros; without, all 16 do and
-// nothing is checked.
-template <bool EDGE = true, typename T>
-inline frag<T> load(device const T *p, int ld, short2 at, int rows) {
-    frag<T> f;
-    p += at.y * ld + at.x;
-    EACH(2, i,
-        if (!EDGE || at.y + i * 8 < rows) {
-            EACH(4, c, f[i * 4 + c] = p[i * 8 * ld + c];);
-        } else {
-            EACH(4, c, f[i * 4 + c] = T(0););
-        }
-    );
-    return f;
-}
-
-// `c0 | c1 += a · (b0 | b1)`: one SIMD group's 16 × 32 × 16 product on the
-// matrix unit. `b0` and `b1` are the right operand's two 16-column halves;
-// with `TR`, they are the two 16-row halves of what is stored, and the
-// product takes its transpose.
-template <bool TR, typename TA, typename TB>
-inline void mma(thread frag<float> &c0, thread frag<float> &c1, thread const frag<TA> &a,
-                thread const frag<TB> &b0, thread const frag<TB> &b1) {
-    constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, TR, true,
-                                              matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<desc, execution_simdgroup> op;
-    auto ca = op.template get_left_input_cooperative_tensor<TA, TB, float>();
-    auto cb = op.template get_right_input_cooperative_tensor<TA, TB, float>();
-    auto cc = op.template get_destination_cooperative_tensor<remove_addrspace_t<decltype(ca)>,
-                                                             remove_addrspace_t<decltype(cb)>, float>();
-    EACH(8, i, ca[i] = a[i]; cb[i] = b0[i]; cb[8 + i] = b1[i]; cc[i] = c0[i]; cc[8 + i] = c1[i];);
-    op.run(ca, cb, cc);
-    EACH(8, i, c0[i] = cc[i]; c1[i] = cc[8 + i];);
-}
 
 // Keys a step.
 constant constexpr int BK = 32;
@@ -173,6 +114,7 @@ template <typename T, int D>
         device const T *v [[buffer(2)]],
         device T *o [[buffer(3)]],
         constant Params &p [[buffer(4)]],
+        device const float *gate [[buffer(5)]],
         uint2 tg [[threadgroup_position_in_grid]],
         ushort sg [[simdgroup_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]]) {
@@ -269,10 +211,15 @@ template <typename T, int D>
         step(true_type());
     }
 
+    // Each row divided by its sum and, with gates, scaled by its head's
+    // `2·sigmoid(gate)`, then rounded once.
     EACH(2, i,
         const short r = at.y + i * 8;
         if (r < rows) {
-            const float inv = 1.0f / l[i];
+            float inv = 1.0f / l[i];
+            if (p.ldg) {
+                inv *= 2.0f / (1.0f + precise::exp(-gate[(q0 + r) * p.ldg + h]));
+            }
             EACH(TD, d,
                 vec<T, 4> y;
                 EACH(4, c, y[c] = T(acc[d][i * 4 + c] * inv););
@@ -288,7 +235,8 @@ ATTN(half, f16, 64)
 ATTN(half, f16, 128)
 ATTN(bfloat, bf16, 64)
 ATTN(bfloat, bf16, 128)
-"#;
+"#
+);
 
 /// Queries a threadgroup: four SIMD groups of 16.
 const BQ: usize = 64;
@@ -305,6 +253,7 @@ struct Params {
     hk: i32,
     hv: i32,
     scale: f32,
+    ldg: i32,
 }
 
 /// Where a head's rows are: `(rows, row stride, head stride)`, from
@@ -326,15 +275,18 @@ fn rows_of(l: &Layout, heads: usize, d: usize) -> Option<(usize, usize, usize)> 
 ///
 /// `q` is `[lq, heads · d]`, `k` and `v` `[lk, heads · d]`, or any of the
 /// three `[heads, l, d]`; the answer is `[lq, heads · d]` in `q`'s dtype.
-/// `None` means one of these:
+/// With `gate`, `[lq, heads]` logits, each query's head is scaled by
+/// `2·sigmoid(gate)` before it is rounded, as LTX's gated attention does
+/// after it. `None` means one of these:
 /// - the device has no matrix units, or `KVAD_GPU_MPP=0` or
 ///   `KVAD_GPU_MPP_ATTENTION=0`;
 /// - the dtype is not f16 or bf16, or the three differ;
 /// - `d` is not 64 or 128;
 /// - a row is not contiguous, or a stride or start is not a multiple of four
 ///   elements;
-/// - there are no keys.
-pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> candle_core::Result<Option<Tensor>> {
+/// - there are no keys;
+/// - `gate` is not `[lq, heads]`.
+pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize, gate: Option<&Tensor>) -> candle_core::Result<Option<Tensor>> {
     let d = match q.rank() {
         3 => q.dim(2)?,
         _ => q.dim(q.rank() - 1)? / heads.max(1),
@@ -349,10 +301,14 @@ pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> can
         || kr.is_none()
         || kr.map(|r| r.0) != vr.map(|r| r.0)
         || kr.is_some_and(|r| r.0 == 0)
+        || gate.is_some_and(|g| g.dims() != [qr.unwrap().0, heads])
     {
         return Ok(None);
     }
-    Ok(Some(q.apply_op3_no_bwd(k, v, &Attention { heads, d })?))
+    // The logits come in f32 from a q8 projection, and in the model's
+    // dtype from a dense one; the kernel reads f32.
+    let gate = gate.map(|g| g.to_dtype(DType::F32)?.contiguous()).transpose()?;
+    Ok(Some(q.apply_op3_no_bwd(k, v, &Attention { heads, d, gate })?))
 }
 
 fn kernels(device: &candle_core::Device) -> Option<&'static crate::fused::metal::Kernels> {
@@ -365,6 +321,8 @@ fn kernels(device: &candle_core::Device) -> Option<&'static crate::fused::metal:
 struct Attention {
     heads: usize,
     d: usize,
+    /// `[lq, heads]` f32 logits, contiguous.
+    gate: Option<Tensor>,
 }
 
 impl CustomOp3 for Attention {
@@ -403,6 +361,20 @@ impl CustomOp3 for Attention {
             hk: hk as i32,
             hv: hv as i32,
             scale: std::f32::consts::LOG2_E / (d as f32).sqrt(),
+            ldg: if self.gate.is_some() { h as i32 } else { 0 },
+        };
+        // The gates' buffer, a storage apart from q's, k's and v's, so taking
+        // its lock cannot wait on candle's; without gates, q's stands in,
+        // bound but never read.
+        let gate = match &self.gate {
+            Some(g) => {
+                let (s, l) = g.storage_and_layout();
+                match &*s {
+                    candle_core::Storage::Metal(s) => buffer(s, l),
+                    _ => candle_core::bail!("mpp_attention: the gates are not on Metal"),
+                }
+            }
+            None => buffer(q, lq),
         };
         let guard = dev.command_encoder()?;
         let enc: &ComputeCommandEncoder = guard.as_ref();
@@ -414,6 +386,7 @@ impl CustomOp3 for Attention {
         }
         enc.set_output_buffer(3, Some(&out), 0);
         enc.set_bytes(4, &params);
+        enc.set_input_buffer(5, Some(&gate.0), gate.1);
         enc.dispatch_thread_groups(
             MTLSize { width: rows.div_ceil(BQ), height: h, depth: 1 },
             // 32 × 4, a SIMD group to a row, not 128 × 1: the same threads
@@ -490,7 +463,7 @@ mod tests {
                     crate::image::nn::attention(&r(&q, lq), &r(&k, lk), &r(&v, lk), heads).unwrap().squeeze(0).unwrap()
                 };
                 let before = crate::fused::tests_ran();
-                let got = attention(&q, &k, &v, heads).unwrap().expect("the kernel declined");
+                let got = attention(&q, &k, &v, heads, None).unwrap().expect("the kernel declined");
                 assert_eq!(crate::fused::tests_ran(), before + 1, "the kernel did not run");
                 assert_eq!(got.dims(), &[lq, w]);
                 assert_eq!(got.dtype(), dt);
@@ -499,6 +472,40 @@ mod tests {
                 assert!(ours > floor - 3.0, "{dt:?} [{lq}, {lk}] × {heads} × {d}: {ours:.1} dB, candle {floor:.1}");
             }
         }
+    }
+
+    /// Gates scale each query's head by `2·sigmoid(gate)` before the
+    /// rounding: as close to attention written out and gated in f32 as the
+    /// ungated kernel is to it ungated. Logits in bf16 are read too.
+    #[test]
+    fn gates_each_query_and_head() {
+        let Some(dev) = gpu() else { return };
+        for (lq, lk, heads, d) in [(128, 128, 2, 128), (77, 50, 3, 64), (1, 33, 1, 64)] {
+            let w = heads * d;
+            let rand = |l: usize| (Tensor::randn(0f32, 1.0, (l, w), &dev).unwrap() * 2.0).unwrap().to_dtype(DType::BF16).unwrap();
+            let (q, k, v) = (rand(lq), rand(lk), rand(lk));
+            let logits = (Tensor::randn(0f32, 1.0, (lq, heads), &dev).unwrap() * 3.0).unwrap();
+            let gates = (candle_nn::ops::sigmoid(&logits).unwrap() * 2.0).unwrap();
+            let want = reference(&q, &k, &v, heads);
+            let gated = want.reshape((lq, heads, d)).unwrap().broadcast_mul(&gates.unsqueeze(2).unwrap()).unwrap().reshape((lq, w)).unwrap();
+            let plain = db(&attention(&q, &k, &v, heads, None).unwrap().unwrap(), &want);
+            for g in [logits.clone(), logits.to_dtype(DType::BF16).unwrap()] {
+                // bf16 logits are the f32 ones rounded, so they are held to
+                // their own gates.
+                let gates = (candle_nn::ops::sigmoid(&g.to_dtype(DType::F32).unwrap()).unwrap() * 2.0).unwrap();
+                let gated = match g.dtype() {
+                    DType::F32 => gated.clone(),
+                    _ => want.reshape((lq, heads, d)).unwrap().broadcast_mul(&gates.unsqueeze(2).unwrap()).unwrap().reshape((lq, w)).unwrap(),
+                };
+                let got = attention(&q, &k, &v, heads, Some(&g)).unwrap().expect("the kernel declined");
+                let ours = db(&got, &gated);
+                assert!(ours > plain - 1.0, "[{lq}, {lk}] × {heads} × {d}, {:?} gates: {ours:.1} dB, ungated {plain:.1}", g.dtype());
+            }
+        }
+        // Gates of the wrong shape are declined.
+        let bf = Tensor::zeros((8, 256), DType::BF16, &dev).unwrap();
+        let g = Tensor::zeros((8, 4), DType::F32, &dev).unwrap();
+        assert!(attention(&bf, &bf, &bf, 2, Some(&g)).unwrap().is_none());
     }
 
     /// Rows need not be packed, and heads may come first: a narrowed slice
@@ -510,11 +517,11 @@ mod tests {
         let wide = Tensor::randn(0f32, 1.0, (l, 3 * heads * d), &dev).unwrap().to_dtype(DType::BF16).unwrap();
         let (q, k, v) = (wide.narrow(1, heads * d, heads * d).unwrap(), wide.narrow(1, 0, heads * d).unwrap(), wide.narrow(1, 2 * heads * d, heads * d).unwrap());
         let host = |t: Tensor| t.to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap();
-        let got = host(attention(&q, &k, &v, heads).unwrap().unwrap());
+        let got = host(attention(&q, &k, &v, heads, None).unwrap().unwrap());
         let packed = |t: &Tensor| t.contiguous().unwrap();
-        assert_eq!(got, host(attention(&packed(&q), &packed(&k), &packed(&v), heads).unwrap().unwrap()));
+        assert_eq!(got, host(attention(&packed(&q), &packed(&k), &packed(&v), heads, None).unwrap().unwrap()));
         let first = |t: &Tensor| t.reshape((l, heads, d)).unwrap().transpose(0, 1).unwrap().contiguous().unwrap();
-        assert_eq!(got, host(attention(&first(&q), &first(&k), &first(&v), heads).unwrap().unwrap()));
+        assert_eq!(got, host(attention(&first(&q), &first(&k), &first(&v), heads, None).unwrap().unwrap()));
     }
 
     /// What it leaves to candle.
@@ -523,16 +530,16 @@ mod tests {
         let Some(dev) = gpu() else { return };
         let t = |l: usize, w: usize, dt: DType| Tensor::zeros((l, w), dt, &dev).unwrap();
         let bf = |l: usize| t(l, 256, DType::BF16);
-        assert!(attention(&bf(8), &bf(8), &bf(8), 2).unwrap().is_some());
+        assert!(attention(&bf(8), &bf(8), &bf(8), 2, None).unwrap().is_some());
         // f32, mixed dtypes, a head width of 32, a transposed input, no keys.
-        assert!(attention(&t(8, 256, DType::F32), &t(8, 256, DType::F32), &t(8, 256, DType::F32), 2).unwrap().is_none());
-        assert!(attention(&bf(8), &t(8, 256, DType::F16), &bf(8), 2).unwrap().is_none());
-        assert!(attention(&bf(8), &bf(8), &bf(8), 8).unwrap().is_none());
+        assert!(attention(&t(8, 256, DType::F32), &t(8, 256, DType::F32), &t(8, 256, DType::F32), 2, None).unwrap().is_none());
+        assert!(attention(&bf(8), &t(8, 256, DType::F16), &bf(8), 2, None).unwrap().is_none());
+        assert!(attention(&bf(8), &bf(8), &bf(8), 8, None).unwrap().is_none());
         let tr = t(256, 8, DType::BF16).t().unwrap();
-        assert!(attention(&tr, &bf(8), &bf(8), 2).unwrap().is_none());
-        assert!(attention(&bf(8), &bf(0), &bf(0), 2).unwrap().is_none());
+        assert!(attention(&tr, &bf(8), &bf(8), 2, None).unwrap().is_none());
+        assert!(attention(&bf(8), &bf(0), &bf(0), 2, None).unwrap().is_none());
         let cpu = Tensor::zeros((8, 256), DType::BF16, &Device::Cpu).unwrap();
-        assert!(attention(&cpu, &cpu, &cpu, 2).unwrap().is_none());
+        assert!(attention(&cpu, &cpu, &cpu, 2, None).unwrap().is_none());
     }
 
     /// Not a test, a measurement: the kernel against candle's attention at
@@ -578,7 +585,7 @@ mod tests {
                 t.elapsed().as_secs_f64() / reps as f64
             };
             let candle = || drop(crate::image::nn::attention(&q3, &k3, &v3, heads).unwrap());
-            let ours = || drop(attention(&q, &k, &v, heads).unwrap().unwrap());
+            let ours = || drop(attention(&q, &k, &v, heads, None).unwrap().unwrap());
             time(&candle);
             time(&ours);
             let (mut theirs, mut mine) = (vec![], vec![]);

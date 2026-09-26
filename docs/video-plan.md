@@ -1215,3 +1215,69 @@ one kernel too (`ltx_fused::norm_silu`).
 - **Where 1536×1024's 7 minutes go now:** stage 2 about 240 s, stage 1
   110 s, the decode 31–36 s. The DiT is the lever again, and the service
   (step 7) is the step left.
+
+**Stage 2's projections at MLX's rate, and the gates inside attention.**
+Profiled again on `master`, a stage-2 block took 1.56 s. Its q8 projections
+ran at 10–12 TFLOP/s, against 18 for the feed-forward's. Alone, the Q8_0
+kernel ran every shape at about 21. The rest went to what came after it:
+the kernel answered in f32, then candle added the bias and cast to bf16 in
+passes of their own. At `[24576, 4096] × [4096, 4096]` that was 65 ms
+against the kernel's 39. The per-head gates, `2·sigmoid(g)` over the whole
+attention output, took another 0.13 s, 9% of the block.
+- **The store finishes each sum.** It adds the bias, takes the feed-forward's
+  GELU where asked, and rounds once to the dtype asked for. Nothing reads
+  an f32 answer back, and the 16 384-wide GELU pass is gone. The sums are
+  the same as before, bit for bit.
+- **The kernel is laid out as the attention kernel is.** Each SIMD group
+  keeps a `32 × 32` corner of the tile as `16 × 16` fragments in registers,
+  loads its rows of the activations element by element, and multiplies on
+  the matrix unit `16 × 32 × 16` at a time. The weights are unpacked into a
+  padded slab in threadgroup memory as before. It reads bf16 as it comes
+  and rounds it to f16 in registers, so the f16 copy of every input is
+  gone too. The attention kernel and this one now share the fragment code.
+- **Attention applies the gates** to each row before it rounds. The gates'
+  logits stay in f32 from the q8 projection.
+
+| Q8_0, bias, bf16 in and out, `[24576, k] × [k, n]` | Before | Now | MLX 8-bit |
+|---|---|---|---|
+| 4096 → 4096 | 12.6 TFLOP/s | 23–25.5 | 26.1–26.4 |
+| 4096 → 16 384 | 13.1 | 23.5–25.6 | 24.5–25.1 |
+| 16 384 → 4096 | 17.1 | 20.7–24.4 | 21.8–21.9 |
+| 4096 → 2048 | 11.5 | 21.7–24.8 | 22.8 |
+| 2048 → 4096 | 8.5 | 20.7–23.2 | 22.4–22.8 |
+| 4096 → 32, the gates' logits | 1.7 | 5.4–6.0 | – |
+
+MLX's numbers are its `quantized_matmul`, 8 bits in groups of 32 or 64, on
+bf16 input, in the same session. Stepping 64 along `K` at a time, as MLX
+does, ran at 21 here against 25. A `128 × 64` tile over eight SIMD groups
+was no faster.
+
+| Against `master`'s build, alternated | `master` | This |
+|---|---|---|
+| A stage-2 block (`ltx_cost`) | 1.56 s | 1.09 s |
+| 768×512, 2 stages, all told | 101.7 / 106.6 s | 78.7 / 79.0 s |
+| its stage 1 / stage 2 | 28.6–31.2 / 44.7–45.8 s | 18.0–20.7 / 30.3–31.7 s |
+| 1536×1024, 2 stages, all told (1 run each) | 458.4 s | 368.5 s |
+| its stage 1 / stage 2 | 125.4 / 269.1 s | 87.0 / 214.3 s |
+| its peak footprint | 35.3 GB | 33.0 GB |
+
+- **A 1536×1024 step gains less than a 768×512 one** (1.26× against 1.47×).
+  Attention grows with the square of the tokens and was already fast, and at
+  24 576 tokens it is now 40% of a block.
+- **Accuracy:** bf16 against f32 through two blocks is 44.7 / 44.9 dB at the
+  velocity, as before, and 0.1 dB closer after each block from rounding the
+  gated output once. Each build gives byte-identical latents run to run.
+  Between builds the clips are 31 dB PSNR apart at 768×512 and 35 dB at
+  1536×1024, the same scene and motion. That is the rounding difference
+  #85 and #86 showed.
+- **The peak** is one run each, and has moved by two GB between runs of one
+  build before. The f32 answers no longer exist, so a lower peak is
+  plausible, but this does not show it.
+- **The element-wise kernels are not worth rewriting yet.** In isolation
+  they move 78–134 GB/s against 127–154 for candle's plainest ops, and all
+  of them together are 3–4% of a block.
+- **The tests passed without the kernels.** A source that failed to compile
+  left `mpp::available` false, and every test skipped. A test now asserts
+  that the kernels build wherever the GPU has matrix units.
+- **Where 1536×1024's 6 minutes go now:** stage 2 about 215 s, of which
+  attention is about 40%; stage 1 about 87 s; the decode about 40 s.

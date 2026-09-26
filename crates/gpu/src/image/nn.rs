@@ -62,6 +62,39 @@ impl Linear {
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        // The bias is added to the kernel's f32 sums as they are stored.
+        #[cfg(target_os = "macos")]
+        if let Proj::Blocks(q) = &self.w {
+            return q.linear(x, self.b.as_ref(), DType::F32, false);
+        }
+        self.written_out(x)
+    }
+
+    /// [`Linear::forward`], answered in `dt`. A Q8_0 matrix on the M5's
+    /// matrix units rounds each f32 sum, bias and all, straight to `dt` as
+    /// it stores it: the same numbers as `forward(x)?.to_dtype(dt)`, without
+    /// writing the f32 answer and reading it back twice.
+    pub(crate) fn forward_in(&self, x: &Tensor, dt: DType) -> candle_core::Result<Tensor> {
+        #[cfg(target_os = "macos")]
+        if let Proj::Blocks(q) = &self.w {
+            return q.linear(x, self.b.as_ref(), dt, false);
+        }
+        self.written_out(x)?.to_dtype(dt)
+    }
+
+    /// The tanh-GELU of [`Linear::forward`], in `dt`, where the matrix's
+    /// kernel can take it in its store: from the f32 sum, rounded once.
+    /// `None` where it cannot, for the caller to apply its own.
+    pub(crate) fn gelu_in(&self, x: &Tensor, dt: DType) -> candle_core::Result<Option<Tensor>> {
+        #[cfg(target_os = "macos")]
+        if let Proj::Blocks(q) = &self.w {
+            return q.linear(x, self.b.as_ref(), dt, true).map(Some);
+        }
+        let _ = (x, dt);
+        Ok(None)
+    }
+
+    fn written_out(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         // Flattened to two axes for the multiply: a dense `matmul` wants its
         // operands' batch axes to agree, and a weight has none.
         let dims = x.dims().to_vec();

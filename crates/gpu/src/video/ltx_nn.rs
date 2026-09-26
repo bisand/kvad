@@ -164,7 +164,6 @@ pub(crate) struct GatedAttention {
     k_norm: RmsNorm,
     gate: Option<Linear>,
     heads: usize,
-    head_dim: usize,
 }
 
 impl GatedAttention {
@@ -184,7 +183,6 @@ impl GatedAttention {
                 false => None,
             },
             heads,
-            head_dim,
         })
     }
 
@@ -193,12 +191,11 @@ impl GatedAttention {
     /// keys when given. No mask: nothing LTX attends over is causal.
     pub(crate) fn forward(&self, x: &Tensor, context: Option<&Tensor>, rope_q: Option<&Rope>, rope_k: Option<&Rope>) -> candle_core::Result<Tensor> {
         let ctx = context.unwrap_or(x);
-        let t = x.dim(0)?;
-        let (h, d) = (self.heads, self.head_dim);
-        // A Q8_0 projection on the M5's matrix units answers in f32 whatever
-        // it was asked in; everything here stays in the input's dtype.
+        let h = self.heads;
+        // A Q8_0 projection on the M5's matrix units sums in f32 whatever it
+        // was asked in; everything here stays in the input's dtype.
         let dtype = x.dtype();
-        let lin = |l: &Linear, y: &Tensor| l.forward(y)?.to_dtype(dtype);
+        let lin = |l: &Linear, y: &Tensor| l.forward_in(y, dtype);
         let dev = x.device();
         // The queries and keys go to their norms as the projections answer:
         // the norm reads a q8 projection's f32 and rounds once.
@@ -206,29 +203,35 @@ impl GatedAttention {
         let (q, k) = span(|| "norm, rope", dev, || {
             Ok((self.q_norm.rotated(&q, rope_q, h, dtype)?, self.k_norm.rotated(&k, rope_k, h, dtype)?))
         })?;
-        let o = span(|| "attention", dev, || attend(&q, &k, &v, h))?;
-        let o = match &self.gate {
-            Some(g) => span(|| "gate", dev, || {
-                let gates = (candle_nn::ops::sigmoid(&lin(g, x)?)? * 2.0)?;
-                o.reshape((t, h, d))?.broadcast_mul(&gates.unsqueeze(2)?)?.reshape((t, h * d))
-            })?,
-            None => o,
-        };
+        // The gates' logits as the projection answers them: attention on
+        // the matrix units applies them itself, before it rounds.
+        let gate = self.gate.as_ref().map(|g| span(|| "gate", dev, || g.forward(x))).transpose()?;
+        let o = span(|| "attention", dev, || attend(&q, &k, &v, h, gate.as_ref()))?;
         span(|| "out", dev, || lin(&self.out, &o))
     }
 }
 
 /// Attention over `[t, heads · d]` queries and `[s, heads · d]` keys and
-/// values, answering `[t, heads · d]`: on the M5's matrix units where
-/// `mpp_attention` takes it, which reads these rows as they are; otherwise
-/// candle's, which splits the heads into copies first.
-fn attend(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> candle_core::Result<Tensor> {
+/// values, answering `[t, heads · d]`, each head scaled by `2·sigmoid` of
+/// its `[t, heads]` gate logits when there are some: on the M5's matrix
+/// units where `mpp_attention` takes it, which reads these rows as they are
+/// and gates in f32 before rounding; otherwise candle's, which splits the
+/// heads into copies first, then the gates in the model's dtype.
+fn attend(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize, gate: Option<&Tensor>) -> candle_core::Result<Tensor> {
     #[cfg(target_os = "macos")]
-    if let Some(o) = crate::mpp_attention::attention(q, k, v, heads)? {
+    if let Some(o) = crate::mpp_attention::attention(q, k, v, heads, gate)? {
         return Ok(o);
     }
     let one = |x: &Tensor| x.unsqueeze(0);
-    crate::image::nn::attention(&one(q)?, &one(k)?, &one(v)?, heads)?.squeeze(0)
+    let o = crate::image::nn::attention(&one(q)?, &one(k)?, &one(v)?, heads)?.squeeze(0)?;
+    match gate {
+        Some(g) => {
+            let (t, width) = o.dims2()?;
+            let gates = (candle_nn::ops::sigmoid(&g.to_dtype(o.dtype())?)? * 2.0)?;
+            o.reshape((t, heads, width / heads))?.broadcast_mul(&gates.unsqueeze(2)?)?.reshape((t, width))
+        }
+        None => Ok(o),
+    }
 }
 
 #[cfg(test)]

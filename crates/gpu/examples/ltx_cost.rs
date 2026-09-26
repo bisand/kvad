@@ -96,7 +96,7 @@ fn main() -> Res<()> {
     let forward = || -> Res<f64> {
         device.synchronize()?;
         let s = Instant::now();
-        dit.forward(&video, &audio, (0.725, 0.725), &ctx, &grid)?;
+        dit.forward(&video, &audio, (0.725, 0.725), 0, &ctx, &grid)?;
         device.synchronize()?;
         Ok(s.elapsed().as_secs_f64())
     };
@@ -167,7 +167,7 @@ fn accuracy(path: &std::path::Path, shape: Shape, blocks: usize, device: &Device
         let ctx = Contexts { video: on(&cv)?, audio: on(&ca)? };
         let host = |x: &Tensor| -> candle_core::Result<Tensor> { x.to_device(&Device::Cpu)?.to_dtype(DType::F32) };
         let mut out = Vec::new();
-        let (v, au) = dit.forward_watched(&on(&video)?, &on(&audio)?, (0.725, 0.725), &ctx, &grid, &mut |_, vx, ax| {
+        let (v, au) = dit.forward_watched(&on(&video)?, &on(&audio)?, (0.725, 0.725), 0, &ctx, &grid, &mut |_, vx, ax| {
             out.push((host(vx)?, host(ax)?));
             Ok(())
         })?;

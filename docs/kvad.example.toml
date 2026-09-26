@@ -49,6 +49,10 @@ bind = "127.0.0.1:5823"
 # "auto" looks on PATH and then in /opt/homebrew/bin, /usr/local/bin and
 # /usr/bin, since a launchd service's PATH has only the system directories.
 # "off" keeps the uncompressed file. Anything else is a path to ffmpeg.
+#
+# The same ffmpeg reads the picture a video starts from (input_reference), and
+# puts it through one frame of H.264 at CRF 18 first, as LTX's reference does.
+# Without one, a video cannot start from a picture.
 # ffmpeg = "auto"
 
 [database]

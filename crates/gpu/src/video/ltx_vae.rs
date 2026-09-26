@@ -292,6 +292,238 @@ fn unpatchify(x: &Tensor, p: usize) -> candle_core::Result<Tensor> {
         .reshape((t, c, h * p, w * p))
 }
 
+/// A step of the encoder.
+enum Down {
+    /// Residual blocks, as the decoder's.
+    Res(Vec<(Conv3d, Conv3d)>),
+    /// Space to depth, with a residual: a convolution to `out / (p₁·p₂·p₃)`
+    /// channels folded into `out`, plus the input folded the same way and
+    /// averaged down to `out` channels in groups of `group`.
+    Fold { conv: Conv3d, stride: [usize; 3], group: usize },
+}
+
+/// The encoder half of the same file: one picture to the latent frame the
+/// DiT holds it as, for image-to-video.
+///
+/// The mirror of [`VideoDecoder`]: patchify 4×4 pixels into 48 channels,
+/// then residual blocks and space-to-depth steps down to `[128, 1, h, w]`,
+/// normalised by the same statistics.
+///
+/// **One picture only.** The reference's encoder is causal: each
+/// convolution sees two copies of the first frame before it, and a step
+/// that halves time puts one more in front. A picture is one frame, so every
+/// frame any convolution reads is that frame, and [`Conv3d`]'s own padding,
+/// one copy of the edge frame each side, reads the same three. So the
+/// decoder's convolutions serve unchanged; a clip of several frames would
+/// need the causal padding, and is refused.
+pub struct ImageEncoder {
+    conv_in: Conv3d,
+    blocks: Vec<Down>,
+    conv_out: Conv3d,
+    patch: usize,
+    latent: usize,
+    mean: Tensor,
+    std: Tensor,
+    dtype: DType,
+    params: usize,
+}
+
+impl ImageEncoder {
+    /// Load the encoder half of the file at `path`, computing in `dtype` on
+    /// `device`.
+    pub fn load(path: &Path, device: &Device, dtype: DType) -> Res<Self> {
+        let config = metadata(path, "config")?;
+        let vae = &config["vae"];
+        if vae["_class_name"] != "CausalVideoAutoencoder" {
+            return Err(format!("{}: not LTX's conv video VAE ({})", path.display(), vae["_class_name"]).into());
+        }
+        for (key, want) in [
+            ("norm_layer", Value::from("pixel_norm")),
+            ("spatial_padding_mode", Value::from("zeros")),
+            ("dims", Value::from(3)),
+            // 128 means and one log-variance shared by all of them, which
+            // an encoder that keeps the means has no use for.
+            ("latent_log_var", Value::from("uniform")),
+        ] {
+            if vae[key] != want {
+                return Err(format!("{}: `{key}` is {}, and this encoder is written for {want}", path.display(), vae[key]).into());
+            }
+        }
+        let latent = vae["latent_channels"].as_u64().ok_or("no latent_channels")? as usize;
+        let mut c = vae["encoder_base_channels"].as_u64().ok_or("no encoder_base_channels")? as usize;
+        let patch = vae["patch_size"].as_u64().ok_or("no patch_size")? as usize;
+        let spec = vae["encoder_blocks"].as_array().ok_or("no encoder_blocks")?;
+
+        let vault = Vault::off();
+        let cx = Ctx { ld: Loader::new(None, device.clone(), &vault), dtype };
+        let paths = [path.to_path_buf()];
+        let r = open(&paths, DType::BF16)?;
+        r.skip_under("decoder");
+        let e = r.pp("encoder");
+
+        let conv_in = Conv3d::load(&cx, &e, "conv_in.conv", 3 * patch * patch, c)?;
+        let mut blocks = Vec::new();
+        for (i, b) in spec.iter().enumerate() {
+            let (name, p) = (b[0].as_str().unwrap_or(""), &b[1]);
+            let d = e.pp(format!("down_blocks.{i}"));
+            let block = match name {
+                "res_x" => {
+                    let n = p["num_layers"].as_u64().ok_or("res_x without num_layers")? as usize;
+                    let res = (0..n)
+                        .map(|j| {
+                            let rb = d.pp(format!("res_blocks.{j}"));
+                            Ok((Conv3d::load(&cx, &rb, "conv1.conv", c, c)?, Conv3d::load(&cx, &rb, "conv2.conv", c, c)?))
+                        })
+                        .collect::<Res<Vec<_>>>()?;
+                    Down::Res(res)
+                }
+                "compress_all_res" | "compress_time_res" | "compress_space_res" => {
+                    let stride = match name {
+                        "compress_all_res" => [2, 2, 2],
+                        "compress_time_res" => [2, 1, 1],
+                        _ => [1, 2, 2],
+                    };
+                    let out = c * p["multiplier"].as_u64().unwrap_or(2) as usize;
+                    let n: usize = stride.iter().product();
+                    let conv = Conv3d::load(&cx, &d, "conv.conv", c, out / n)?;
+                    let group = c * n / out;
+                    c = out;
+                    Down::Fold { conv, stride, group }
+                }
+                other => return Err(format!("{}: encoder block `{other}` is not implemented", path.display()).into()),
+            };
+            blocks.push(block);
+        }
+        // 128 means and the shared log-variance.
+        let conv_out = Conv3d::load(&cx, &e, "conv_out.conv", c, latent + 1)?;
+
+        let stats = r.pp("per_channel_statistics");
+        let stat = |name: &str| -> Res<Tensor> { Ok(cx.get(&stats, latent, name)?.to_dtype(DType::F32)?.reshape((1, latent, 1, 1))?) };
+        let (mean, std) = (stat("mean-of-means")?, stat("std-of-means")?);
+        let params = finish("LTX video encoder", &paths, &r)?;
+        Ok(ImageEncoder { conv_in, blocks, conv_out, patch, latent, mean, std, dtype, params })
+    }
+
+    pub fn params(&self) -> usize {
+        self.params
+    }
+
+    /// A picture `[3, H, W]` in `[−1, 1]`, both sides a multiple of 32, to
+    /// its normalised latent `[128, 1, H/32, W/32]`, as f32.
+    pub fn encode(&self, picture: &Tensor) -> candle_core::Result<Tensor> {
+        let (_, h, w) = picture.dims3()?;
+        if h % 32 != 0 || w % 32 != 0 {
+            candle_core::bail!("{w}×{h}: the encoder wants both sides a multiple of 32");
+        }
+        // Frames first, as in the decoder: one frame.
+        let x = patchify(&picture.unsqueeze(0)?.to_dtype(self.dtype)?, self.patch)?;
+        let mut x = self.conv_in.forward(&x)?;
+        for block in &self.blocks {
+            x = match block {
+                Down::Res(res) => {
+                    for (c1, c2) in res {
+                        x = residual(&x, c1, c2)?;
+                    }
+                    x
+                }
+                Down::Fold { conv, stride, group } => {
+                    // Halving time puts a copy of the first frame in front,
+                    // so that one frame folds into one.
+                    let x = match stride[0] {
+                        2 => Tensor::cat(&[&x.narrow(0, 0, 1)?, &x], 0)?,
+                        _ => x,
+                    };
+                    // The groups averaged as `[t·c/g, g, h, w]`: candle's
+                    // Metal reductions are wrong over a five-axis tensor
+                    // (mean, sum and max alike; 1e38 out), and right at four.
+                    let skip = fold(&x, *stride)?;
+                    let (t, c, h, w) = skip.dims4()?;
+                    let skip = skip.reshape((t * c / group, *group, h, w))?.to_dtype(DType::F32)?.mean(1)?.reshape((t, c / group, h, w))?;
+                    (fold(&conv.forward(&x)?, *stride)?.to_dtype(DType::F32)? + skip)?.to_dtype(self.dtype)?
+                }
+            };
+            x.device().synchronize()?;
+        }
+        let x = self.conv_out.forward(&norm_silu(&x, EPS)?)?;
+        let means = x.narrow(1, 0, self.latent)?.to_dtype(DType::F32)?;
+        let z = means.broadcast_sub(&self.mean)?.broadcast_div(&self.std)?;
+        // [1, 128, h, w] → [128, 1, h, w].
+        z.permute((1, 0, 2, 3))?.contiguous()
+    }
+}
+
+/// `[T, 3, H, W]` to `[T, 3·p·p, H/p, W/p]`: the inverse of [`unpatchify`].
+///
+/// The channel index is `c·p² + r·p + q`, `q` the offset in the row and `r`
+/// in the column: `b c (f p) (h q) (w r) -> b (c p r q) f h w` in the
+/// reference, with one frame a patch.
+fn patchify(x: &Tensor, p: usize) -> candle_core::Result<Tensor> {
+    let (t, c, h, w) = x.dims4()?;
+    x.reshape(&[t, c, h / p, p, w / p, p][..])?
+        // [t, c, h, q, w, r] → [t, c, r, q, h, w]
+        .permute(&[0, 1, 5, 3, 2, 4][..])?
+        .contiguous()?
+        .reshape((t, c * p * p, h / p, w / p))
+}
+
+/// `[T, c, H, W]` to `[T/p₁, c·p₁·p₂·p₃, H/p₂, W/p₃]`: each block of frames,
+/// rows and columns folded into channels, the inverse of [`unfold`].
+///
+/// The channel index is `((c·p₁ + i)·p₂ + j)·p₃ + k`, as the reference's
+/// `b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w` has it.
+fn fold(x: &Tensor, [p1, p2, p3]: [usize; 3]) -> candle_core::Result<Tensor> {
+    let (t, c, h, w) = x.dims4()?;
+    x.reshape(&[t / p1, p1, c, h / p2, p2, w / p3, p3][..])?
+        // [d, p1, c, h, p2, w, p3] → [d, c, p1, p2, p3, h, w]
+        .permute(&[0, 2, 1, 4, 6, 3, 5][..])?
+        .contiguous()?
+        .reshape((t / p1, c * p1 * p2 * p3, h / p2, w / p3))
+}
+
+/// A picture `rgb` of `width × height` scaled to cover `w × h` and cut to it
+/// from the middle, as `[3, h, w]` in `[−1, 1]`, f32, on the host: how the
+/// reference prepares a picture for the encoder.
+///
+/// Its `resize_and_center_crop`: scale by whichever of `h/height` and
+/// `w/width` is larger, round the new size up, resample bilinearly, and cut
+/// the middle out. The resampling is torch's `interpolate(mode="bilinear",
+/// align_corners=False)` written out, with no antialiasing, as the
+/// reference calls it: output pixel `i` reads the input at
+/// `(i + ½)·(in/out) − ½`, clamped at 0, and blends its two neighbours.
+pub fn picture(rgb: &[u8], width: usize, height: usize, w: usize, h: usize) -> candle_core::Result<Tensor> {
+    if rgb.len() != width * height * 3 || width == 0 || height == 0 {
+        candle_core::bail!("a {width}×{height} picture of {} bytes", rgb.len());
+    }
+    let scale = (h as f64 / height as f64).max(w as f64 / width as f64);
+    let (nh, nw) = ((height as f64 * scale).ceil() as usize, (width as f64 * scale).ceil() as usize);
+    let (top, left) = ((nh - h) / 2, (nw - w) / 2);
+    // Each output row's (or column's) two input neighbours and the weight of
+    // the second, in f32 as torch computes them.
+    let taps = |out: usize, inp: usize, from: usize, n: usize| -> Vec<(usize, usize, f32)> {
+        let ratio = inp as f32 / out as f32;
+        (from..from + n)
+            .map(|i| {
+                let src = ((i as f32 + 0.5) * ratio - 0.5).max(0.0);
+                let i0 = (src as usize).min(inp - 1);
+                (i0, (i0 + 1).min(inp - 1), src - i0 as f32)
+            })
+            .collect()
+    };
+    let (rows, cols) = (taps(nh, height, top, h), taps(nw, width, left, w));
+    let mut out = vec![0f32; 3 * h * w];
+    for (y, &(y0, y1, fy)) in rows.iter().enumerate() {
+        for (x, &(x0, x1, fx)) in cols.iter().enumerate() {
+            for c in 0..3 {
+                let at = |yy: usize, xx: usize| rgb[(yy * width + xx) * 3 + c] as f32;
+                let top = at(y0, x0) * (1.0 - fx) + at(y0, x1) * fx;
+                let bottom = at(y1, x0) * (1.0 - fx) + at(y1, x1) * fx;
+                out[(c * h + y) * w + x] = (top * (1.0 - fy) + bottom * fy) / 127.5 - 1.0;
+            }
+        }
+    }
+    Tensor::from_vec(out, (3, h, w), &Device::Cpu)
+}
+
 /// The per-channel statistics video latents are normalised by, from the VAE
 /// file at `path`: `(mean, std)`, `[128]` each, in f32 on the CPU.
 ///
@@ -327,6 +559,35 @@ mod tests {
         // Channel ((i·2 + j)·2 + k) lands at frame i, row j, column k; frame
         // 1 is what is left.
         assert_eq!(y.flatten_all().unwrap().to_vec1::<f32>().unwrap(), [4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn fold_and_patchify_undo_unfold_and_unpatchify() {
+        let x = Tensor::arange(0f32, (2 * 16 * 2 * 4) as f32, &Device::Cpu).unwrap().reshape((2, 16, 2, 4)).unwrap();
+        let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let back = unfold(&fold(&unfold(&x, [2, 2, 2], 2).unwrap(), [2, 2, 2]).unwrap(), [2, 2, 2], 2).unwrap();
+        assert_eq!(v(&back), v(&unfold(&x, [2, 2, 2], 2).unwrap()));
+        assert_eq!(v(&fold(&unfold(&x, [1, 2, 2], 4).unwrap(), [1, 2, 2]).unwrap()), v(&x));
+        let x = x.narrow(1, 0, 12).unwrap().contiguous().unwrap().reshape((2, 12, 2, 4)).unwrap();
+        assert_eq!(v(&patchify(&unpatchify(&x, 2).unwrap(), 2).unwrap()), v(&x));
+    }
+
+    #[test]
+    fn a_picture_is_scaled_to_cover_and_cut_from_the_middle() {
+        // 4×2, each pixel's red its column·10 and green its row·10: scaled
+        // ×2 to 8×4 and cut to 4×4, the columns kept are 2 to 5.
+        let rgb: Vec<u8> = (0..2).flat_map(|y| (0..4).flat_map(move |x| [x * 10, y * 10, 0])).collect();
+        let p = picture(&rgb, 4, 2, 4, 4).unwrap();
+        assert_eq!(p.dims(), [3, 4, 4]);
+        let red: Vec<f32> = p.get(0).unwrap().get(0).unwrap().to_vec1::<f32>().unwrap();
+        // Output column 2 reads input (2.5)·½ − ½ = 0.75: 7.5; then 12.5,
+        // 17.5, 22.5. Scaled to [−1, 1].
+        let want = [7.5f32, 12.5, 17.5, 22.5].map(|v| v / 127.5 - 1.0);
+        for (a, b) in red.iter().zip(want) {
+            assert!((a - b).abs() < 1e-6, "{red:?}");
+        }
+        // Row 0 of the output reads input row max(0.25 − ½, 0) = 0: green 0.
+        assert!((p.get(1).unwrap().get(0).unwrap().get(0).unwrap().to_scalar::<f32>().unwrap() + 1.0).abs() < 1e-6);
     }
 
     #[test]

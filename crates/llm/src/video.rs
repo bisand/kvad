@@ -84,6 +84,12 @@ pub struct VideoRequest {
     /// denoiser, so leaving the sound out saves only its decode, a few
     /// seconds; it is here for a caller who wants a silent file.
     pub audio: Option<bool>,
+    /// A picture to start from: the video's first frame, scaled to cover
+    /// the video's size and cut from the middle. Any size; a caller that
+    /// read it from a file should have done whatever the model's training
+    /// did to pictures, which for LTX-2.5 is one H.264 round trip at CRF 18
+    /// (the server's `videos.rs` does it).
+    pub image: Option<crate::image::Image>,
 }
 
 /// A model's own answers for what a [`VideoRequest`] leaves out, and its
@@ -110,6 +116,8 @@ pub struct Defaults {
     /// it loaded on can hold, so that a request that would run the GPU out
     /// of memory is refused before it is queued.
     pub max_volume: usize,
+    /// Whether it can start from a picture ([`VideoRequest::image`]).
+    pub image: bool,
 }
 
 /// A [`VideoRequest`] with every blank filled and checked.
@@ -185,6 +193,14 @@ impl VideoRequest {
         }
         if self.prompt.trim().is_empty() {
             return Err("the prompt is empty".into());
+        }
+        if let Some(p) = &self.image {
+            if !d.image {
+                return Err("this model does not start a video from a picture".into());
+            }
+            if p.width < 2 || p.height < 2 || p.rgb.len() != p.width * p.height * 3 {
+                return Err(format!("a {}×{} picture of {} bytes, which is not RGB at that size", p.width, p.height, p.rgb.len()).into());
+            }
         }
         // As for an image: chosen here, from the clock, so that the result
         // can say which seed made it; and below 2³² so that it survives a
@@ -375,6 +391,115 @@ impl Audio {
 /// A sample in [-1, 1] as a signed 16-bit integer.
 fn pcm16(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * 32767.0).round() as i16
+}
+
+// ---------------------------------------------------------------------------
+// A picture to start from
+// ---------------------------------------------------------------------------
+
+/// The CRF LTX-2.5's reference re-compresses a picture at before it is
+/// encoded: its `detect_params` gives 18 to a checkpoint of 2.4 or later,
+/// and 33 before that.
+pub const PICTURE_CRF: u32 = 18;
+
+/// The picture in the file at `path`, as a video model was trained to see
+/// one: decoded, and put through one H.264 frame at `crf` and back.
+///
+/// By `ffmpeg`, for two reasons. kvad has no decoder for JPEG, PNG or WebP
+/// of its own ([`Image::png`](crate::image::Image::png) only writes), and
+/// the round trip needs an H.264 encoder anyway: LTX was trained on frames
+/// of compressed video, and its reference compresses a picture before
+/// encoding it, so that the first frame looks like the frames after it.
+/// It does it as LTX's `encode_single_frame` does: the picture cut to even
+/// sides from the top left, libx264 `veryfast` at `crf`, 4:2:0, in a stream
+/// of one frame a second. A `crf` of 0 skips the round trip, as it does
+/// there.
+///
+/// Measured on a 1000×700 picture: the round trip moves it 37.8 dB PSNR from
+/// what it was, and this lands 48.2 dB from the reference's own round trip.
+/// That is as close as the reference is to itself: PyAV lets x264 cut the
+/// frame into a slice for each core, and its answer on one core is 50.1 dB
+/// from its answer on eighteen. The frame rate matters, oddly, for one
+/// frame: at `ffmpeg`'s default 25 it was 43.9 dB.
+///
+/// `ffmpeg` turns a JPEG by its EXIF orientation, as the reference does. It
+/// does not convert an ICC profile to sRGB, which the reference does.
+pub fn picture_from_file(ffmpeg: &std::path::Path, path: &std::path::Path, crf: u32) -> Res<crate::image::Image> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let run = |args: &[&str], input: Option<Vec<u8>>| -> Res<Vec<u8>> {
+        let mut child = Command::new(ffmpeg)
+            .args(["-nostdin", "-v", "error"])
+            .args(args)
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run {}: {e}", ffmpeg.display()))?;
+        // Fed from a thread, so that a picture larger than a pipe's buffer
+        // cannot leave both sides waiting on each other.
+        let feed = input.map(|bytes| {
+            let mut stdin = child.stdin.take();
+            std::thread::spawn(move || stdin.as_mut().map(|s| s.write_all(&bytes)))
+        });
+        let mut out = Vec::new();
+        child.stdout.take().ok_or("no stdout")?.read_to_end(&mut out)?;
+        let mut err = String::new();
+        child.stderr.take().ok_or("no stderr")?.read_to_string(&mut err)?;
+        if let Some(f) = feed {
+            let _ = f.join();
+        }
+        match child.wait()? {
+            s if s.success() => Ok(out),
+            s => Err(format!("{} {s}: {}", ffmpeg.display(), err.trim()).into()),
+        }
+    };
+    let path = path.to_str().ok_or("a picture's path that is not UTF-8")?;
+    // PPM out: a header that gives the size, then the RGB as it is.
+    let ppm = ["-frames:v", "1", "-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "pipe:1"];
+    let bytes = match crf {
+        0 => run(&[&["-i", path][..], &ppm[..]].concat(), None)?,
+        _ => {
+            let crf = crf.to_string();
+            let h264 = run(
+                &[
+                    "-i", path, "-frames:v", "1", "-vf", "crop=trunc(iw/2)*2:trunc(ih/2)*2:0:0", "-r", "1", "-c:v",
+                    "libx264", "-preset", "veryfast", "-crf", &crf, "-pix_fmt", "yuv420p", "-f", "h264", "pipe:1",
+                ],
+                None,
+            )?;
+            run(&[&["-f", "h264", "-i", "pipe:0"][..], &ppm[..]].concat(), Some(h264))?
+        }
+    };
+    ppm_rgb(&bytes)
+}
+
+/// A binary PPM (`P6`, 8 bits) as an image.
+fn ppm_rgb(bytes: &[u8]) -> Res<crate::image::Image> {
+    // `P6`, width, height and the largest value, each after white space,
+    // then one byte of white space and the samples.
+    let mut fields = Vec::new();
+    let mut at = 0;
+    while fields.len() < 4 {
+        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        let start = at;
+        while bytes.get(at).is_some_and(|b| !b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        if start == at {
+            return Err("ffmpeg's PPM ended in its header".into());
+        }
+        fields.push(std::str::from_utf8(&bytes[start..at])?.to_string());
+    }
+    let n = |i: usize| fields[i].parse::<usize>().map_err(|_| format!("a PPM header field {:?}", fields[i]));
+    let (width, height, max) = (n(1)?, n(2)?, n(3)?);
+    if fields[0] != "P6" || max != 255 {
+        return Err(format!("a PPM that is {} with samples to {max}, not P6 to 255", fields[0]).into());
+    }
+    let rgb = bytes.get(at + 1..at + 1 + width * height * 3).ok_or("ffmpeg's PPM is shorter than its header says")?.to_vec();
+    Ok(crate::image::Image { width, height, rgb })
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1226,40 @@ fn stbl(b: &mut Vec<u8>, t: &Track, offsets: &[u64], large: bool) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_ppm_is_read_by_its_header() {
+        let mut ppm = b"P6\n3 1\n255\n".to_vec();
+        ppm.extend([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let p = ppm_rgb(&ppm).unwrap();
+        assert_eq!((p.width, p.height, p.rgb), (3, 1, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        assert!(ppm_rgb(b"P6\n3 1\n255\n\x01\x02").is_err());
+        assert!(ppm_rgb(b"P5\n1 1\n255\n\x01").is_err());
+    }
+
+    /// Through `ffmpeg`, where there is one: exactly, without the round
+    /// trip; close, with it; and cut to even sides as the reference cuts.
+    #[test]
+    fn a_picture_comes_back_from_ffmpeg() {
+        let Some(ffmpeg) = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"].into_iter().map(std::path::PathBuf::from).find(|p| p.is_file()) else {
+            return;
+        };
+        let (w, h) = (33, 20);
+        let rgb: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| [(x * 7) as u8, (y * 11) as u8, 128])).collect();
+        let dir = std::env::temp_dir().join(format!("kvad-picture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("p.png");
+        std::fs::write(&png, crate::image::Image { width: w, height: h, rgb: rgb.clone() }.png()).unwrap();
+        let exact = picture_from_file(&ffmpeg, &png, 0).unwrap();
+        assert_eq!((exact.width, exact.height), (w, h));
+        assert_eq!(exact.rgb, rgb);
+        let round = picture_from_file(&ffmpeg, &png, PICTURE_CRF).unwrap();
+        assert_eq!((round.width, round.height), (32, 20));
+        let kept: Vec<u8> = (0..h).flat_map(|y| rgb[y * w * 3..(y * w + 32) * 3].to_vec()).collect();
+        let worst = round.rgb.iter().zip(&kept).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        assert!(worst < 40, "{worst} levels apart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn bits(f: impl FnOnce(&mut Bits)) -> String {
         let mut b = Bits::new();
         f(&mut b);
@@ -1318,7 +1477,7 @@ mod tests {
     }
 
     fn ltx() -> Defaults {
-        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121 }
+        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true }
     }
 
     #[test]

@@ -838,7 +838,7 @@ The same kind of checks apply here:
    `ffmpeg` re-encoding is optional. Done; see below.
 8. **Later, each in its own issue:**
    - the duration head as the default;
-   - image-to-video;
+   - image-to-video (done; see below);
    - the dev model with its guidance;
    - the DiffVAE decoder;
    - the temporal upsampler;
@@ -1354,8 +1354,8 @@ client asks for a video, the way it asks an image model for a picture.
   278.5 s, decode 38.6 s), for a 288 MB file. The server's peak footprint
   over its whole life, the load and the generation, was 33.5 GB, under the
   35.3 GB admission charged. One run.
-- **Not done:** image-to-video. Compression, a preview and progress as a
-  stream came after; see below.
+- **Not done:** image-to-video. Compression, a preview, progress as a
+  stream and image-to-video came after; see below.
 
 **Compressed with `ffmpeg`, when there is one.** The MP4 `kvad::video` writes
 compresses nothing: 14 MB a second at 768×512, 57 at 1536×1024. Each video
@@ -1426,3 +1426,96 @@ thirty times for each answer that changed.
   time left ticks on a clock of its own, since the events come once a step.
 - **`kvad videos make`** follows the stream, and `kvad videos watch ID`
   follows one again after the wait was stopped.
+
+**Image-to-video.** A video can start from a picture: OpenAI's
+`input_reference`, which becomes the first frame. The reference's distilled
+pipeline does it with a `VideoConditionByLatentIndex` at frame 0 and
+strength 1, and so does kvad, piece for piece:
+
+1. **The picture is put through one frame of H.264** at CRF 18, the value
+   the reference's `detect_params` gives a checkpoint of 2.4 or later (33
+   before). LTX was trained on frames of compressed video, and a picture
+   that is too clean does not look like the frames after it.
+2. **It is scaled to cover each stage's size and cut from the middle**:
+   bilinear, `align_corners=False`, no antialiasing, as the reference's
+   `resize_and_center_crop` calls torch; from the picture itself for each
+   stage, not from stage 1's copy.
+3. **The video VAE's encoder** makes it one latent frame, `[128, 1, h, w]`,
+   in bf16 as the reference runs it.
+4. **Its tokens are held**: they start as the picture instead of noise, and
+   after every update they are put back, as the reference's
+   `post_process_latent` does with a denoise mask of 0 there. In stage 2
+   the picture encoded at the full size replaces the upsampled first frame.
+5. **The DiT modulates them at σ = 0.** The reference evaluates σ per token,
+   `mask · σ`, and this is the one place that matters. What reads a token's
+   σ — the nine adaLN rows, the audio–video scale and shift, the output
+   head — gets a second set of rows at σ = 0, which the first `h·w` tokens
+   read. What reads the stream's σ as a whole — the text keys and values,
+   both audio–video gates — stays at the step's σ, as in the reference. The
+   fused kernels take a split point, so the residual stream is not cut and
+   joined around each norm.
+
+What was measured against the reference (`scripts/ltx-fixtures.py
+--picture`, `--contexts random`; `examples/ltx_encode.rs`,
+`examples/ltx_dit.rs --held`):
+
+| Piece | kvad | The reference's own bf16 |
+|---|---|---|
+| Scaling and cutting, 1000×700 to 384×256 and 768×512 | 150 dB, 0.00 of a level apart | — |
+| Encoder, f32 on the CPU | 105.9–108.0 dB | — |
+| Encoder, f32 on Metal | 105.6–107.6 dB | — |
+| Encoder, bf16 on Metal (0.15 s at 768×512) | 37.4–41.0 dB | 37.0–40.1 dB |
+| DiT, first frame held, f32 on the CPU | 107.4–118.3 dB | — |
+| DiT, first frame held, bf16 on Metal | video 47.1/46.0, velocity 42.9 dB | 46.9/46.3, 43.7 dB |
+
+- **The held check tests what it says.** The reference's two fixtures,
+  held and not, differ by 2.1 dB after the first block and 13.3 dB at the
+  video velocity; kvad matches the held one to 107–118 dB in f32.
+- **candle's Metal reductions are wrong over five axes.** The encoder's
+  space-to-depth residual averages channel groups, and as a mean over the
+  middle of a `[t, c, g, h, w]` tensor it was 1e38 out on Metal (mean, sum
+  and max alike) and right on the CPU: −27 dB, then NaN. At four axes,
+  `[t·c/g, g, h, w]`, it is exact.
+- **One picture only.** The reference's encoder is causal. For a single
+  frame every tap of every convolution reads that frame, so the decoder's
+  convolutions, which pad one copy each side, read the same three copies,
+  and serve unchanged. A clip as the input would need causal padding.
+- **The H.264 round trip is `ffmpeg`'s** (`kvad::video::picture_from_file`),
+  which also reads the picture: kvad writes PNGs and has no decoder, and
+  the round trip needs an encoder anyway. On a 1000×700 picture it lands
+  48.2 dB PSNR from the reference's own round trip (by PyAV), where the
+  round trip itself moves the picture 37.8 dB from what it was. That is as
+  close as the reference comes to itself: PyAV lets x264 cut a frame into a
+  slice per core, and its answer on one core is 50.1 dB from its answer on
+  eighteen; the two x264 builds, each on one core, are 49.1 dB apart. At
+  `ffmpeg`'s default 25 fps rather than the reference's 1, it was 43.9 dB:
+  the frame rate moves the rate control even for one frame.
+- **`ffmpeg` turns a JPEG by its EXIF orientation**, as the reference does,
+  in the same direction (checked with orientation 6, ffmpeg 9.0.2). It does
+  not convert an ICC profile to sRGB, which the reference does.
+
+End to end, on an M5 Pro, from a 1024×768 picture (a red car in a street,
+made by FLUX.1-schnell here):
+
+- **768×512 × 121** took 77.8 s, with a peak footprint of 26.8 GB, where
+  text-to-video's was 27.0. The picture, both encodes and the `ffmpeg`
+  round trip, took 1.0 s. The clip's first frame is 29.0 dB PSNR from the
+  picture as scaled and cut (the VAE's reconstruction, after H.264), and
+  its ninth 17.4 dB: the picture is held, and the clip moves on from it.
+- **1536×1024 × 121** peaked at 31.3 GB, under the 35.3 GB admission
+  charges. The picture took 1.5 s. One run, 366 s, with a build running
+  beside part of it.
+- **Through the server:** `input_reference` as a file in a form (the page,
+  as OpenAI's SDK sends one) and as a `data:` URL in JSON (`kvad videos
+  make --image`). A URL elsewhere, a `file_id`, any other file, and a file
+  that is not a picture are each a 400 with its own sentence; `ffmpeg`'s
+  words, which name a path in the data directory, go to the log. The
+  picture is kept as sent, as `videos/<id>.input`, served as
+  `/content?variant=input` and linked as `kvad.picture_url`, and deleted
+  with the video. A 4 s clip at 768×512 through the CLI: picture and text
+  11.4 s, denoise 44.0 s, decode 10.8 s.
+- **The page** takes a picture beside the prompt and says what the cut will
+  take (a 4:3 picture for a 3:2 video loses 11% of it, top and bottom). It
+  shows the picture in place of the preview until the first step has one,
+  marks a video made from a picture in the gallery, and "Reuse" fetches the
+  picture back into the form.

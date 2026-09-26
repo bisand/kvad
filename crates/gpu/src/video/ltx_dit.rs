@@ -17,8 +17,16 @@
 //! turn σ into rows of shifts, scales and gates once a step, and each block
 //! adds its own learned table to them. `docs/video-plan.md` has the table of
 //! rows, the positions, and where the reference was read for each.
+//!
+//! **Image-to-video.** The first latent frame can be a picture, held clean
+//! while the rest is denoised. The reference modulates each token by its own
+//! σ, so the picture's tokens, which come first, are modulated at σ = 0 and
+//! the rest at the step's σ: two sets of the video's rows, of which each
+//! token reads one ([`ltx_fused::Held`]). What reads the stream's σ as a
+//! whole, the text keys and values and both audio–video gates, stays at the
+//! step's σ, as it does in the reference.
 
-use super::ltx_fused::{self, gated_add, gated_modulate};
+use super::ltx_fused::{self, gated_add, gated_modulate, Held};
 use super::ltx_nn::{GatedAttention, Rope};
 use super::ltx_text::Contexts;
 use super::metadata;
@@ -251,6 +259,10 @@ impl AdaLn {
 }
 
 /// One step's modulation rows, before each block adds its own tables.
+///
+/// What is modulated per token is `[k, rows, width]`: `k` is 1, or 2 when
+/// the first `held` video tokens are a picture at σ = 0, whose rows come
+/// first. The rest is `[rows, width]`, one set for every token.
 struct Mods {
     video: Tensor,
     audio: Tensor,
@@ -260,22 +272,30 @@ struct Mods {
     audio_av: Tensor,
     /// The audio → video gate, driven by the *audio* σ.
     a2v_gate: Tensor,
-    /// The video → audio gate, driven by the *video* σ.
+    /// The video → audio gate, driven by the *video* σ: the step's, since
+    /// the reference drives it by the stream's σ, not each token's.
     v2a_gate: Tensor,
+    /// `[k, width]`.
     video_embedded: Tensor,
     audio_embedded: Tensor,
+    held: Held,
 }
 
+/// Row `i` of a table: `[1, width]` from `[rows, width]`, or `[k, width]`
+/// from `[k, rows, width]`, one for each set of tokens.
 fn row(t: &Tensor, i: usize) -> candle_core::Result<Tensor> {
-    t.narrow(0, i, 1)
+    match t.rank() {
+        3 => t.narrow(1, i, 1)?.reshape((t.dim(0)?, t.dim(2)?)),
+        _ => t.narrow(0, i, 1),
+    }
 }
 
 /// Every norm's epsilon in a block.
 const EPS: f32 = 1e-6;
 
 /// `rms(x)·(1 + scale) + shift`: how every norm in a block is modulated.
-fn ada(x: &Tensor, scale: &Tensor, shift: &Tensor) -> candle_core::Result<Tensor> {
-    ltx_fused::modulate(x, scale, shift, EPS)
+fn ada(x: &Tensor, scale: &Tensor, shift: &Tensor, held: Held) -> candle_core::Result<Tensor> {
+    ltx_fused::modulate(x, scale, shift, held, EPS)
 }
 
 /// A feed-forward: up, tanh-GELU, down.
@@ -348,25 +368,25 @@ impl Stream {
     }
 
     /// Self-attention, then attention to the text: the first half of a
-    /// block, for one stream. `m` is the nine rows with the table added, `p`
-    /// the two for the text.
-    fn attend(&self, x: &Tensor, m: &Tensor, p: &Tensor, context: &Tensor, rope: &Rope) -> candle_core::Result<Tensor> {
-        let y = scope(self.names[0], || self.attn1.forward(&ada(x, &row(m, 1)?, &row(m, 0)?)?, None, Some(rope), Some(rope)))?;
-        let (h, x) = gated_modulate(x, &y, &row(m, 2)?, &row(m, 7)?, &row(m, 6)?, EPS)?;
+    /// block, for one stream. `m` is the nine rows with the table added, for
+    /// each set of tokens `held` says; `p` the two for the text.
+    fn attend(&self, x: &Tensor, m: &Tensor, p: &Tensor, context: &Tensor, rope: &Rope, held: Held) -> candle_core::Result<Tensor> {
+        let y = scope(self.names[0], || self.attn1.forward(&ada(x, &row(m, 1)?, &row(m, 0)?, held)?, None, Some(rope), Some(rope)))?;
+        let (h, x) = gated_modulate(x, &y, &row(m, 2)?, &row(m, 7)?, &row(m, 6)?, held, EPS)?;
         // The text is modulated but not normalised, and σ moves the
         // modulation, so its keys and values change every step.
         let c = context.broadcast_mul(&(row(p, 1)? + 1.0)?)?.broadcast_add(&row(p, 0)?)?;
         let y = scope(self.names[1], || self.attn2.forward(&h, Some(&c), None, None))?;
-        gated_add(&x, &y, &row(m, 8)?)
+        gated_add(&x, &y, &row(m, 8)?, held)
     }
 
     /// The second half of a block: the audio–video attention's gated
     /// residual `x + y·g`, which the feed-forward's norm reads straight
     /// after, then the feed-forward and its own residual.
-    fn feed(&self, x: &Tensor, y: &Tensor, g: &Tensor, m: &Tensor) -> candle_core::Result<Tensor> {
-        let (h, x) = gated_modulate(x, y, g, &row(m, 4)?, &row(m, 3)?, EPS)?;
+    fn feed(&self, x: &Tensor, y: &Tensor, g: &Tensor, m: &Tensor, held: Held) -> candle_core::Result<Tensor> {
+        let (h, x) = gated_modulate(x, y, g, &row(m, 4)?, &row(m, 3)?, held, EPS)?;
         let y = scope(self.names[2], || self.ff.forward(&h))?;
-        gated_add(&x, &y, &row(m, 5)?)
+        gated_add(&x, &y, &row(m, 5)?, held)
     }
 }
 
@@ -381,33 +401,34 @@ struct Block {
 impl Block {
     fn forward(&self, vx: &Tensor, ax: &Tensor, m: &Mods, ctx: &Contexts, g: &Grid) -> candle_core::Result<(Tensor, Tensor)> {
         let (v, a) = (&self.video.tables, &self.audio.tables);
-        let vm = (&v.main + &m.video)?;
+        let (held, all) = (m.held, Held(0));
+        let vm = v.main.broadcast_add(&m.video)?;
         let am = (&a.main + &m.audio)?;
-        let vx = self.video.attend(vx, &vm, &(&v.prompt + &m.video_prompt)?, &ctx.video, &g.video)?;
-        let ax = self.audio.attend(ax, &am, &(&a.prompt + &m.audio_prompt)?, &ctx.audio, &g.audio)?;
+        let vx = self.video.attend(vx, &vm, &(&v.prompt + &m.video_prompt)?, &ctx.video, &g.video, held)?;
+        let ax = self.audio.attend(ax, &am, &(&a.prompt + &m.audio_prompt)?, &ctx.audio, &g.audio, all)?;
 
         // Each direction reads both streams as they were before either
         // update, so the order of the two does not matter.
-        let vav = (v.av.narrow(0, 0, 4)? + &m.video_av)?;
+        let vav = v.av.narrow(0, 0, 4)?.broadcast_add(&m.video_av)?;
         let aav = (a.av.narrow(0, 0, 4)? + &m.audio_av)?;
         let a2v = scope("audio to video", || {
             self.a2v.forward(
-                &ada(&vx, &row(&vav, 0)?, &row(&vav, 1)?)?,
-                Some(&ada(&ax, &row(&aav, 0)?, &row(&aav, 1)?)?),
+                &ada(&vx, &row(&vav, 0)?, &row(&vav, 1)?, held)?,
+                Some(&ada(&ax, &row(&aav, 0)?, &row(&aav, 1)?, all)?),
                 Some(&g.video_time),
                 Some(&g.audio),
             )
         })?;
         let v2a = scope("video to audio", || {
             self.v2a.forward(
-                &ada(&ax, &row(&aav, 2)?, &row(&aav, 3)?)?,
-                Some(&ada(&vx, &row(&vav, 2)?, &row(&vav, 3)?)?),
+                &ada(&ax, &row(&aav, 2)?, &row(&aav, 3)?, all)?,
+                Some(&ada(&vx, &row(&vav, 2)?, &row(&vav, 3)?, held)?),
                 Some(&g.audio),
                 Some(&g.video_time),
             )
         })?;
         let (vg, ag) = ((row(&v.av, 4)? + &m.a2v_gate)?, (row(&a.av, 4)? + &m.v2a_gate)?);
-        Ok((self.video.feed(&vx, &a2v, &vg, &vm)?, self.audio.feed(&ax, &v2a, &ag, &am)?))
+        Ok((self.video.feed(&vx, &a2v, &vg, &vm, held)?, self.audio.feed(&ax, &v2a, &ag, &am, all)?))
     }
 }
 
@@ -419,10 +440,21 @@ struct Head {
 }
 
 impl Head {
-    fn forward(&self, x: &Tensor, embedded: &Tensor) -> candle_core::Result<Tensor> {
-        let t = self.table.broadcast_add(embedded)?;
-        let x = layer_norm_plain(x, 1e-6)?.broadcast_mul(&(row(&t, 1)? + 1.0)?)?.broadcast_add(&row(&t, 0)?)?;
-        self.proj.forward_in(&x, x.dtype())
+    /// `embedded` is `[k, width]`: with two, the first `held` tokens take
+    /// the first.
+    fn forward(&self, x: &Tensor, embedded: &Tensor, held: Held) -> candle_core::Result<Tensor> {
+        let one = |x: &Tensor, e: &Tensor| -> candle_core::Result<Tensor> {
+            let t = self.table.broadcast_add(e)?;
+            let x = layer_norm_plain(x, 1e-6)?.broadcast_mul(&(row(&t, 1)? + 1.0)?)?.broadcast_add(&row(&t, 0)?)?;
+            self.proj.forward_in(&x, x.dtype())
+        };
+        let (k, n) = (embedded.dim(0)?, x.dim(0)?);
+        let h = held.0.min(n);
+        match (k, h) {
+            (2, h) if h > 0 && h < n => Tensor::cat(&[one(&x.narrow(0, 0, h)?, &embedded.narrow(0, 0, 1)?)?, one(&x.narrow(0, h, n - h)?, &embedded.narrow(0, 1, 1)?)?], 0),
+            (2, h) if h == n => one(x, &embedded.narrow(0, 0, 1)?),
+            _ => one(x, &embedded.narrow(0, k - 1, 1)?),
+        }
     }
 }
 
@@ -561,29 +593,44 @@ impl Dit {
         })
     }
 
-    fn mods(&self, video_sigma: f32, audio_sigma: f32) -> Res<Mods> {
+    /// The step's rows, and a second set of the video's per-token ones at
+    /// σ = 0 when `held` tokens are held there.
+    fn mods(&self, video_sigma: f32, audio_sigma: f32, held: usize) -> Res<Mods> {
         let (dev, dt) = (&self.device, self.dtype);
         let (tv, ta) = (video_sigma * 1000.0, audio_sigma * 1000.0);
         let (video, video_embedded) = self.adaln.forward(tv, dev, dt)?;
         let (audio, audio_embedded) = self.audio_adaln.forward(ta, dev, dt)?;
+        let video_av = self.video_av.forward(tv, dev, dt)?.0;
+        // Held rows first, then the step's: `[k, rows, width]`.
+        let (video, video_av, video_embedded) = match held {
+            0 => (video.unsqueeze(0)?, video_av.unsqueeze(0)?, video_embedded),
+            _ => {
+                let (still, still_embedded) = self.adaln.forward(0.0, dev, dt)?;
+                let still_av = self.video_av.forward(0.0, dev, dt)?.0;
+                (Tensor::stack(&[still, video], 0)?, Tensor::stack(&[still_av, video_av], 0)?, Tensor::cat(&[still_embedded, video_embedded], 0)?)
+            }
+        };
         Ok(Mods {
             video,
             audio,
             video_prompt: self.prompt_adaln.forward(tv, dev, dt)?.0,
             audio_prompt: self.audio_prompt_adaln.forward(ta, dev, dt)?.0,
-            video_av: self.video_av.forward(tv, dev, dt)?.0,
+            video_av,
             audio_av: self.audio_av.forward(ta, dev, dt)?.0,
             a2v_gate: self.a2v_gate.forward(ta * self.cfg.gate_factor, dev, dt)?.0,
             v2a_gate: self.v2a_gate.forward(tv * self.cfg.gate_factor, dev, dt)?.0,
             video_embedded,
             audio_embedded,
+            held: Held(held),
         })
     }
 
     /// The velocities `ε − x₀` for video tokens `[F·h·w, 128]` and audio
-    /// tokens `[T, 128]` at noise levels σ, in the DiT's dtype.
-    pub fn forward(&self, video: &Tensor, audio: &Tensor, sigma: (f32, f32), ctx: &Contexts, grid: &Grid) -> Res<(Tensor, Tensor)> {
-        self.forward_watched(video, audio, sigma, ctx, grid, &mut |_, _, _| Ok(()))
+    /// tokens `[T, 128]` at noise levels σ, in the DiT's dtype. The first
+    /// `held` video tokens are held clean, at σ = 0: a picture the video
+    /// starts from, or none.
+    pub fn forward(&self, video: &Tensor, audio: &Tensor, sigma: (f32, f32), held: usize, ctx: &Contexts, grid: &Grid) -> Res<(Tensor, Tensor)> {
+        self.forward_watched(video, audio, sigma, held, ctx, grid, &mut |_, _, _| Ok(()))
     }
 
     /// [`Dit::forward`], showing `watch` both streams after every block.
@@ -592,12 +639,13 @@ impl Dit {
         video: &Tensor,
         audio: &Tensor,
         sigma: (f32, f32),
+        held: usize,
         ctx: &Contexts,
         grid: &Grid,
         watch: &mut dyn FnMut(usize, &Tensor, &Tensor) -> Res<()>,
     ) -> Res<(Tensor, Tensor)> {
         let dt = self.dtype;
-        let m = self.mods(sigma.0, sigma.1)?;
+        let m = self.mods(sigma.0, sigma.1, held)?;
         let mut vx = self.patchify.forward(&video.to_dtype(dt)?)?.to_dtype(dt)?;
         if let Some(k) = &self.keyframe {
             let n = grid.shape.frame_tokens();
@@ -610,7 +658,7 @@ impl Dit {
             (vx, ax) = b.forward(&vx, &ax, &m, &ctx, grid)?;
             watch(i, &vx, &ax)?;
         }
-        Ok((self.head.forward(&vx, &m.video_embedded)?, self.audio_head.forward(&ax, &m.audio_embedded)?))
+        Ok((self.head.forward(&vx, &m.video_embedded, m.held)?, self.audio_head.forward(&ax, &m.audio_embedded, Held(0))?))
     }
 }
 

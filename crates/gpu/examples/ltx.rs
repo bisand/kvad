@@ -3,7 +3,8 @@
 //!
 //!     cargo run --release -p kvad-gpu --example ltx -- --prompt "…" \
 //!         [--width 768] [--height 512] [--frames 121] [--fps 24] [--seed 0] \
-//!         [--stages 2] [--quant q8|bf16] [--out ltx.mp4] [--latents FILE]
+//!         [--stages 2] [--quant q8|bf16] [--out ltx.mp4] [--latents FILE] \
+//!         [--image PICTURE]
 //!
 //! In phases, so that no two large models are resident at once:
 //!
@@ -18,6 +19,11 @@
 //! `--stages 1` runs stage 1 alone at the full size instead: eight steps at
 //! full size rather than three, and no upsampler. Two stages want the width
 //! and height to be multiples of 64.
+//!
+//! `--image` starts the video from a picture, any format `ffmpeg` reads:
+//! it is put through LTX's H.264 round trip (`ffmpeg` is needed for that),
+//! scaled to cover each stage's size, encoded by the video VAE's encoder, and
+//! held as the first latent frame while the rest is denoised.
 //!
 //! `--quant` is the text path's and the DiT's weights: q8 by default, about
 //! 19 GB for the text phase and 20 GB for the DiT. `--latents` also saves the
@@ -72,6 +78,30 @@ fn main() -> Res<()> {
         if stages == 1 { "" } else { "s" }
     );
 
+    // 0. The picture, encoded at each stage's size.
+    let stills = match value("--image") {
+        None => None,
+        Some(path) => {
+            let t = Instant::now();
+            let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"].into_iter().find(|p| std::path::Path::new(p).is_file()).ok_or("--image needs ffmpeg")?;
+            let p = kvad::video::picture_from_file(ffmpeg.as_ref(), path.as_ref(), kvad::video::PICTURE_CRF)?;
+            let enc = ltx_vae::ImageEncoder::load(&fetch(ltx_vae::FILE)?, &device, dtype)?;
+            let at = |s: Shape| -> Res<Tensor> {
+                let z = enc.encode(&ltx_vae::picture(&p.rgb, p.width, p.height, s.width, s.height)?.to_device(&device)?)?;
+                Ok(kvad_gpu::video::ltx_dit::video_tokens(&z)?.to_dtype(dtype)?)
+            };
+            let stills = (at(first)?, at(shape)?);
+            drop(enc);
+            device.synchronize()?;
+            eprintln!("0. a {}×{} picture, encoded at {}×{} and {}×{} in {:.1} s", p.width, p.height, first.width, first.height, shape.width, shape.height, t.elapsed().as_secs_f64());
+            Some(stills)
+        }
+    };
+    let (still_1, still_2) = match &stills {
+        Some((a, b)) => (Some(a), Some(b)),
+        None => (None, None),
+    };
+
     // 1. The prompt.
     let ctx = {
         let t = Instant::now();
@@ -109,7 +139,7 @@ fn main() -> Res<()> {
         let t = Instant::now();
         let grid = dit.grid(first)?;
         eprintln!("   stage 1 at {}×{}: {} video tokens", first.width, first.height, first.video_tokens());
-        let l = one_stage(&dit, &ctx, &grid, seed, &mut report(1, STAGE_1.len() - 1))?;
+        let l = one_stage(&dit, &ctx, &grid, seed, still_1, &mut report(1, STAGE_1.len() - 1))?;
         eprintln!("   stage 1 in {:.1} s", t.elapsed().as_secs_f64());
         match stages {
             1 => l,
@@ -122,7 +152,7 @@ fn main() -> Res<()> {
                 eprintln!("   upsampled {:?} to {:?} in {:.1} s", l.video.dims(), video.dims(), t.elapsed().as_secs_f64());
                 let t = Instant::now();
                 let grid = dit.grid(shape)?;
-                let l = refine(&dit, &ctx, &grid, &Latents { video, audio: l.audio }, seed, &mut report(2, STAGE_2.len() - 1))?;
+                let l = refine(&dit, &ctx, &grid, &Latents { video, audio: l.audio }, seed, still_2, &mut report(2, STAGE_2.len() - 1))?;
                 eprintln!("   stage 2 at {}×{} in {:.1} s", shape.width, shape.height, t.elapsed().as_secs_f64());
                 l
             }

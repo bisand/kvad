@@ -13,6 +13,10 @@
 //!    against the same f32 reference; and the reference's own bf16 against
 //!    its f32, for the drift bf16 costs it.
 //!
+//! `--held` does steps 2 and 3 as image-to-video does them: the first latent
+//! frame held at σ = 0 while the rest is at the fixture's σ, against the
+//! reference's `dit_held_*`.
+//!
 //! `--only N` runs just step N; `--blocks N` loads that many blocks (the
 //! fixture's count by default); `--f32` runs step 3 in f32.
 
@@ -59,13 +63,24 @@ fn main() -> Res<()> {
     // against the reference's.
     let video = video_tokens(&get(&inputs, "video_latent")?)?;
     let audio = audio_tokens(&get(&inputs, "audio_latent")?)?;
-    let contexts = file("text_contexts_f32.safetensors")?;
-    let want = file("dit_f32.safetensors")?;
+    // The contexts the reference ran with: its own text path's, or seeded
+    // ones, which the fixture keeps beside its inputs.
+    let contexts = match inputs.contains_key("video_context") {
+        true => HashMap::from([("video".to_string(), get(&inputs, "video_context")?), ("audio".to_string(), get(&inputs, "audio_context")?)]),
+        false => file("text_contexts_f32.safetensors")?,
+    };
+    let held = argv.iter().any(|a| a == "--held");
+    let fixture = if held { "dit_held" } else { "dit" };
+    let want = file(&format!("{fixture}_f32.safetensors"))?;
+    let held = if held { shape.frame_tokens() } else { 0 };
     let blocks: usize = match value("--blocks") {
         Some(b) => b.parse()?,
         None => (0..).take_while(|i| want.contains_key(&format!("video_{i}"))).count(),
     };
     eprintln!("{}×{}×{} at {} fps: {} video tokens, {} audio; σ {sigma}; {blocks} blocks", shape.width, shape.height, shape.frames, shape.fps, shape.video_tokens(), shape.audio_latents());
+    if held > 0 {
+        eprintln!("the first {held} video tokens held at σ = 0");
+    }
 
     if step(1) {
         // The reference's positions are [start, end) pairs; RoPE reads the
@@ -96,7 +111,7 @@ fn main() -> Res<()> {
         let (v, a) = (video.to_device(device)?, audio.to_device(device)?);
         let mut out = vec![];
         let t = Instant::now();
-        let (vv, va) = dit.forward_watched(&v, &a, (sigma, sigma), &ctx, &grid, &mut |i, vx, ax| {
+        let (vv, va) = dit.forward_watched(&v, &a, (sigma, sigma), held, &ctx, &grid, &mut |i, vx, ax| {
             out.push((i, vx.clone(), ax.clone()));
             Ok(())
         })?;
@@ -121,7 +136,7 @@ fn main() -> Res<()> {
             _ => "bf16 on Metal",
         };
         run(&Device::new_metal(0)?, dtype, quant, label, 3)?;
-        if let Ok(r) = file("dit_bf16.safetensors") {
+        if let Ok(r) = file(&format!("{fixture}_bf16.safetensors")) {
             let mut line = String::new();
             for i in 0..blocks {
                 line += &format!(" block {i} {:.1}/{:.1},", db(&get(&r, &format!("video_{i}"))?, &get(&want, &format!("video_{i}"))?)?, db(&get(&r, &format!("audio_{i}"))?, &get(&want, &format!("audio_{i}"))?)?);

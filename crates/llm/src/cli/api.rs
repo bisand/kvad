@@ -32,6 +32,7 @@ kept there, with the settings that made it; `make` also writes it here, to
 pub const VIDEOS: &str = "usage: kvad videos [ls]
        kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]
                                [--seconds S | --frames N] [--fps N] [--seed N] [--silent]
+                               [--image PICTURE]
        kvad videos show ID
        kvad videos watch ID    follow it until it ends
        kvad videos get ID [--out FILE]
@@ -42,7 +43,11 @@ video takes minutes, and is the server's job from the moment it is asked for:
 `make` follows it and writes it here, to --out or to video-ID.mp4, but
 stopping the wait does not stop the video. `show` says how far along one is,
 `watch` follows it again, `get` fetches it when it is done, and `rm` deletes
-it, stopping it if it is still being made. Anything left out is the model's own default.";
+it, stopping it if it is still being made. Anything left out is the model's own default.
+
+--image starts the video from a picture, which becomes its first frame, scaled
+to cover the video's size and cut from the middle. Any format the server's
+ffmpeg reads, 20 MiB at most; the server needs ffmpeg for it.";
 
 pub const JOBS: &str = "usage: kvad jobs [ls] [--limit N]
        kvad jobs show ID
@@ -1182,6 +1187,12 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
             if args.silent {
                 body["audio"] = json!(false);
             }
+            if let Some(path) = &args.image {
+                let bytes = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;
+                // The server reads the picture by its bytes, not its name,
+                // so the media type in the URL is only a label.
+                body["input_reference"] = json!({ "image_url": format!("data:application/octet-stream;base64,{}", client::encode_base64(&bytes)) });
+            }
             let video = remote.post("/v1/videos", &body)?;
             let id = out::s(&video["id"]);
             eprintln!(
@@ -1198,12 +1209,13 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                 true => out::json(&video),
                 false => eprintln!(
                     "{path}: {}, {} frames at {} fps, seed {}{}\n  \
-                     text {:.1} s, denoise {:.1} s, decode {:.1} s",
+                     {} {:.1} s, denoise {:.1} s, decode {:.1} s",
                     out::s(&video["size"]),
                     out::s(&k["frames"]),
                     out::s(&k["fps"]),
                     out::s(&k["seed"]),
                     if k["audio"] == json!(false) { ", no sound" } else { "" },
+                    if k["picture_url"].is_string() { "picture and text" } else { "text" },
                     k["encode_secs"].as_f64().unwrap_or(0.0),
                     k["denoise_secs"].as_f64().unwrap_or(0.0),
                     k["decode_secs"].as_f64().unwrap_or(0.0),

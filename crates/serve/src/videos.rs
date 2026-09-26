@@ -19,12 +19,30 @@
 //! marked deprecated as this is written; its shape is still the only one a
 //! client of theirs knows.
 //!
+//! # From a picture
+//!
+//! OpenAI's `input_reference` is the picture a video starts from: a file in
+//! the form, or in JSON an object whose `image_url` is a `data:` URL. A URL
+//! elsewhere is refused (this server fetches nothing on a client's behalf),
+//! and so is a `file_id` (there is no Files API here). Sora wants the
+//! picture at the video's size; here it is scaled to cover it and cut from
+//! the middle, as LTX's reference does.
+//!
+//! It is read by `ffmpeg`, which is then needed rather than optional: kvad
+//! has no JPEG, PNG or WebP decoder of its own, and LTX's reference puts a
+//! picture through one frame of H.264 before encoding it, so that it looks
+//! like the frames it will be followed by
+//! ([`kvad::video::picture_from_file`]). It is read as the request arrives,
+//! so that a file that is not a picture is a 400 and not a failed video. It
+//! is kept as it was sent, as `<id>.input`, for a page to show beside the
+//! video.
+//!
 //! # Where videos live
 //!
 //! `videos/<id>.mp4` in the data directory, beside `images/`, for the reason
 //! images are there: it is somebody's work and the only copy. A poster frame
 //! goes beside it as `<id>.png`, for a gallery to show before anything
-//! plays.
+//! plays, and the picture it started from, if it did, as `<id>.input`.
 //!
 //! # Compressed, when there is an `ffmpeg`
 //!
@@ -70,7 +88,7 @@ use crate::auth::{Identity, State};
 use crate::db::Db;
 use crate::scheduler::{Key, Kind, Reel};
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, State as St};
+use axum::extract::{DefaultBodyLimit, Path, Query, State as St};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -89,7 +107,14 @@ pub fn routes() -> Router<State> {
         .route("/v1/videos/{id}", get(retrieve).delete(remove))
         .route("/v1/videos/{id}/content", get(content))
         .route("/v1/videos/{id}/events", get(events))
+        // A picture to start from, sent as base64 at its largest; axum's
+        // default of 2 MB would refuse a photograph.
+        .layer(DefaultBodyLimit::max(MAX_PICTURE / 3 * 4 + (1 << 16)))
 }
+
+/// The largest picture a video may start from: OpenAI's limit on an
+/// `image_url`, 20 MiB.
+const MAX_PICTURE: usize = 20 << 20;
 
 /// Where the MP4s are: `videos` in the data directory.
 pub fn dir() -> PathBuf {
@@ -127,12 +152,15 @@ pub struct Stored {
     pub created: i64,
     pub started: Option<i64>,
     pub completed: Option<i64>,
+    /// Whether it started from a picture, kept as `<id>.input`.
+    pub picture: bool,
 }
 
 const COLUMNS: &str = "id, model, backend, prompt, width, height, frames, fps, seed, audio, status, progress, \
                        phase, error, bytes, encode_secs, denoise_secs, decode_secs, created_at, \
                        CAST(strftime('%s', created_at) AS INTEGER), \
-                       CAST(strftime('%s', started_at) AS INTEGER), CAST(strftime('%s', completed_at) AS INTEGER)";
+                       CAST(strftime('%s', started_at) AS INTEGER), CAST(strftime('%s', completed_at) AS INTEGER), \
+                       picture";
 
 fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
     Ok(Stored {
@@ -158,6 +186,7 @@ fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
         created: r.get(19)?,
         started: r.get(20)?,
         completed: r.get(21)?,
+        picture: r.get::<_, i64>(22)? != 0,
     })
 }
 
@@ -218,6 +247,8 @@ impl Stored {
                 "decode_secs": self.decode_secs,
                 "url": done.then(|| self.link("video")),
                 "thumbnail_url": done.then(|| self.link("thumbnail")),
+                // The picture it started from, as it was sent.
+                "picture_url": self.picture.then(|| self.link("input")),
                 // Named by how far along it is, so that each step's is a new
                 // link and a page showing it asks again. A 404 until the
                 // first denoising step is done.
@@ -242,12 +273,13 @@ fn seconds(frames: u32, fps: u32) -> String {
 /// from one that failed.
 const CANCELLED: &str = "cancelled";
 
-/// Write the row for a video about to be made.
-pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::video::Resolved) -> Res<Stored> {
+/// Write the row for a video about to be made; `picture` when it starts
+/// from one, which the caller keeps as `<id>.input`.
+pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::video::Resolved, picture: bool) -> Res<Stored> {
     let id = db.with(|c| {
         c.execute(
-            "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio, picture) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 owner,
                 model,
@@ -258,7 +290,8 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
                 r.frames as i64,
                 r.fps as i64,
                 r.seed as i64,
-                r.audio as i64
+                r.audio as i64,
+                picture as i64
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -500,7 +533,7 @@ pub fn delete(db: &Db, dir: &FsPath, id: i64, owner: Option<i64>) -> Res<bool> {
 }
 
 fn remove_files(dir: &FsPath, id: i64) {
-    for ext in ["mp4", "png", "preview.png"] {
+    for ext in ["mp4", "png", "preview.png", "input"] {
         let _ = std::fs::remove_file(dir.join(format!("{id}.{ext}")));
     }
 }
@@ -568,10 +601,10 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 }
 
 /// A request's fields, whichever way it was sent: JSON's own values, or a
-/// form's as strings. Files are named in `files`, to be refused.
+/// form's as strings. A form's files are in `files`, by field name.
 struct Fields {
     map: Map<String, Value>,
-    files: Vec<String>,
+    files: Vec<(String, Vec<u8>)>,
 }
 
 impl Fields {
@@ -582,7 +615,7 @@ impl Fields {
             let mut files = Vec::new();
             for part in form(body, kind)? {
                 match part.filename {
-                    Some(_) => files.push(part.name),
+                    Some(_) => files.push((part.name, part.data)),
                     None => {
                         let text = String::from_utf8(part.data)
                             .map_err(|_| Fail::bad(format!("the form field {} is not text", part.name)))?;
@@ -646,17 +679,68 @@ struct Asked {
     /// OpenAI's way of giving a length, turned into frames once the frame
     /// rate is known.
     seconds: Option<f64>,
+    /// The picture to start from, as it was sent: a file's bytes, still to
+    /// be read.
+    picture: Option<Vec<u8>>,
+}
+
+/// `input_reference`, whichever way it came: a file in a form, a `data:`
+/// URL as OpenAI's `{"image_url": …}` or on its own. What cannot be had
+/// without fetching or a Files API is refused by name.
+fn picture(f: &Fields) -> Result<Option<Vec<u8>>, Fail> {
+    if let Some((name, _)) = f.files.iter().find(|(n, _)| n != "input_reference") {
+        return Err(Fail::bad(format!("{name}: the only file a video takes is input_reference, the picture it starts from")));
+    }
+    let bytes = match (f.files.iter().find(|(n, _)| n == "input_reference"), f.get(&["input_reference"])) {
+        (Some((_, bytes)), _) => bytes.clone(),
+        (None, None) => return Ok(None),
+        (None, Some((_, v))) => {
+            // A form sends an object as its JSON text.
+            let v = match v {
+                Value::String(t) if t.trim_start().starts_with('{') => serde_json::from_str(t).unwrap_or(v.clone()),
+                v => v.clone(),
+            };
+            let url = match &v {
+                Value::String(u) => u.clone(),
+                Value::Object(o) if o.contains_key("file_id") => {
+                    return Err(Fail::bad("input_reference.file_id: there is no Files API here; send the picture itself, as a file or a data: URL"))
+                }
+                Value::Object(o) => o.get("image_url").and_then(Value::as_str).map(str::to_string).ok_or_else(|| Fail::bad("input_reference wants an image_url"))?,
+                _ => return Err(Fail::bad("input_reference is a file, or {\"image_url\": \"data:…\"}")),
+            };
+            data_url(url.trim())?
+        }
+    };
+    if bytes.is_empty() {
+        return Err(Fail::bad("input_reference is empty"));
+    }
+    if bytes.len() > MAX_PICTURE {
+        return Err(Fail::bad(format!("input_reference is {} MB, and the most a picture may be is {} MB", bytes.len() >> 20, MAX_PICTURE >> 20)));
+    }
+    Ok(Some(bytes))
+}
+
+/// The bytes a `data:` URL holds, base64 or not.
+fn data_url(url: &str) -> Result<Vec<u8>, Fail> {
+    use base64::Engine;
+    let Some(rest) = url.strip_prefix("data:") else {
+        return Err(Fail::bad(match url.starts_with("http:") || url.starts_with("https:") {
+            true => "input_reference.image_url: this server fetches nothing on a client's behalf; send the picture itself, as a file or a data: URL",
+            false => "input_reference.image_url is not a data: URL",
+        }));
+    };
+    let (head, body) = rest.split_once(',').ok_or_else(|| Fail::bad("a data: URL with no comma"))?;
+    match head.ends_with(";base64") {
+        true => base64::engine::general_purpose::STANDARD
+            .decode(body.trim())
+            .map_err(|e| Fail::bad(format!("input_reference.image_url is not base64: {e}"))),
+        false => Ok(body.as_bytes().to_vec()),
+    }
 }
 
 impl Asked {
     fn read(f: &Fields) -> Result<Asked, Fail> {
-        // A file in a form, or OpenAI's JSON reference to one.
-        let reference = f.files.first().cloned().or_else(|| f.get(&["input_reference"]).map(|_| "input_reference".into()));
-        if let Some(name) = reference {
-            return Err(Fail::bad(format!(
-                "{name}: making a video from a picture is not implemented here yet; leave it out"
-            )));
-        }
+        let picture = picture(f)?;
         // Refused rather than ignored, as images refuse a guidance scale a
         // model has no use for: a video made without what was asked for
         // should not be filed as if it had been.
@@ -696,20 +780,24 @@ impl Asked {
                 fps: f.number(&["fps", "frame_rate"])?,
                 seed: f.number(&["seed"])?,
                 audio: f.flag("audio")?,
+                // Read in `create`, where `ffmpeg` is known.
+                image: None,
             },
             seconds,
+            picture,
         })
     }
 
     /// The request, with `seconds` turned into the nearest number of frames
     /// the model can make.
-    fn request(mut self, d: &kvad::video::Defaults) -> VideoRequest {
+    fn request(&self, d: &kvad::video::Defaults) -> VideoRequest {
+        let mut request = self.request.clone();
         if let Some(s) = self.seconds {
-            let fps = self.request.fps.unwrap_or(d.fps) as f64;
+            let fps = request.fps.unwrap_or(d.fps) as f64;
             let steps = (s * fps / d.frame_step as f64).round().max(1.0) as usize;
-            self.request.frames = Some(steps * d.frame_step + 1);
+            request.frames = Some(steps * d.frame_step + 1);
         }
-        self.request
+        request
     }
 }
 
@@ -725,15 +813,79 @@ pub async fn create(who: Identity, headers: HeaderMap, St(state): St<State>, bod
         .video
         .ok_or_else(|| Fail::internal(format!("{} loaded as a video model with no defaults", resident.model.repo)))?;
     let mut request = asked.request(&defaults);
+    // The picture is read now, so that one that is not a picture is a 400.
+    // It is written aside first, since `ffmpeg` reads a file, and moved to
+    // `<id>.input` once there is an id.
+    let upload = match &asked.picture {
+        None => None,
+        Some(bytes) => {
+            if !defaults.image {
+                return Err(Fail::bad(format!("input_reference: {} does not start a video from a picture", resident.model.repo)));
+            }
+            let ffmpeg = FFMPEG.get().cloned().flatten().ok_or_else(|| {
+                Fail::bad("input_reference: starting from a picture needs ffmpeg on the server, to read it; `[videos] ffmpeg` in kvad.toml")
+            })?;
+            let bytes = bytes.clone();
+            let (image, aside) = blocking(move || {
+                let dir = dir();
+                std::fs::create_dir_all(&dir)?;
+                let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+                let aside = dir.join(format!(".upload-{}-{nanos}", std::process::id()));
+                std::fs::write(&aside, &bytes)?;
+                match kvad::video::picture_from_file(&ffmpeg, &aside, kvad::video::PICTURE_CRF) {
+                    Ok(image) => Ok((Ok(image), aside)),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&aside);
+                        Ok((Err(e.to_string()), aside))
+                    }
+                }
+            })
+            .await?;
+            // ffmpeg's own words name the file it was given, which is a path
+            // in the data directory: they go to the log, not the client.
+            let image = image.map_err(|e| {
+                tracing::info!("input_reference refused: {e}");
+                Fail::bad("input_reference is not a picture this server can read: try a PNG, JPEG or WebP")
+            })?;
+            request.image = Some(image);
+            Some(aside)
+        }
+    };
+    let forget = |aside: &Option<PathBuf>| {
+        if let Some(a) = aside {
+            let _ = std::fs::remove_file(a);
+        }
+    };
     // Checked now, so that a size the model cannot make is a 400 and not a
     // failed video after a wait. The seed is fixed now too, so that the row
     // can say which one it is before the video exists.
-    let resolved = request.resolved(&defaults).map_err(|e| Fail::bad(e.to_string()))?;
+    let resolved = match request.resolved(&defaults) {
+        Ok(r) => r,
+        Err(e) => {
+            forget(&upload);
+            return Err(Fail::bad(e.to_string()));
+        }
+    };
     request.seed = Some(resolved.seed);
 
     let (db, owner, model, backend) =
         (state.db.clone(), who.id, resident.model.repo.clone(), resident.model.backend.clone());
-    let stored = blocking(move || queue(&db, owner, &model, &backend, &resolved)).await?;
+    let aside = upload.clone();
+    let stored = blocking(move || {
+        let stored = queue(&db, owner, &model, &backend, &resolved, aside.is_some())?;
+        if let Some(a) = &aside {
+            std::fs::rename(a, dir().join(format!("{}.input", stored.id)))?;
+        }
+        Ok(stored)
+    })
+    .await;
+    let stored = match stored {
+        Ok(s) => s,
+        Err(e) => {
+            forget(&upload);
+            return Err(e);
+        }
+    };
     let herald = Herald::new(stored.id);
     tokio::spawn(run(state, stored.id, resident.key, request, herald));
     Ok(Json(stored.resource()))
@@ -807,6 +959,21 @@ async fn run(state: State, id: i64, key: Key, request: VideoRequest, _herald: He
         }
     }
     failed("the engine stopped before it answered".into()).await
+}
+
+/// A picture's media type, by its first bytes: what a browser needs told
+/// to show one kept without its name.
+fn sniff(b: &[u8]) -> &'static str {
+    match b {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        [_, _, _, _, b'f', b't', b'y', b'p', b'a', b'v', b'i', b'f', ..] => "image/avif",
+        [_, _, _, _, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', ..] => "image/heic",
+        [b'B', b'M', ..] => "image/bmp",
+        _ => "application/octet-stream",
+    }
 }
 
 /// `video_12`, or `12`: the id in a path.
@@ -933,9 +1100,24 @@ async fn content(
         None | Some("video") => ("mp4", "video/mp4"),
         Some("thumbnail") => ("png", "image/png"),
         Some("preview") => ("preview.png", "image/png"),
-        Some(v) => return Err(Fail::bad(format!("variant is video, thumbnail or preview here, not {v}"))),
+        Some("input") => ("input", "application/octet-stream"),
+        Some(v) => return Err(Fail::bad(format!("variant is video, thumbnail, preview or input here, not {v}"))),
     };
     let v = one(&who, &state, &name).await?;
+    // kvad's own variant: the picture it started from, as it was sent, at
+    // any status.
+    if ext == "input" {
+        let bytes = match (v.picture, std::fs::read(dir().join(format!("{}.input", v.id)))) {
+            (true, Ok(bytes)) => bytes,
+            _ => return Err(Fail::missing(format!("{} did not start from a picture", v.name()))),
+        };
+        let made: String = v.created_at.chars().filter(char::is_ascii_digit).collect();
+        let cache = match q.get("v") == Some(&made) {
+            true => "private, max-age=31536000, immutable",
+            false => "private, no-cache",
+        };
+        return Ok(([(header::CONTENT_TYPE, sniff(&bytes)), (header::CACHE_CONTROL, cache)], bytes).into_response());
+    }
     // kvad's own variant: the latest step's rough look, while it is made.
     if ext == "preview.png" {
         let path = dir().join(format!("{}.preview.png", v.id));
@@ -1079,7 +1261,7 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let dir = scratch("life");
         let seed = u64::MAX - 7;
-        let q = queue(&db, None, "Lightricks/LTX-2.5", "metal q8", &resolved(seed)).unwrap();
+        let q = queue(&db, None, "Lightricks/LTX-2.5", "metal q8", &resolved(seed), false).unwrap();
         assert_eq!((q.status.as_str(), q.seed, q.started), ("queued", seed, None));
         assert_eq!(q.resource()["kvad"]["url"], Value::Null, "no link before there is a file");
 
@@ -1113,12 +1295,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A video that started from a picture links to it, and its picture
+    /// goes with it.
+    #[test]
+    fn a_video_s_picture_is_linked_and_forgotten_with_it() {
+        let db = Db::in_memory().unwrap();
+        let dir = scratch("picture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = queue(&db, None, "m", "b", &resolved(1), true).unwrap();
+        std::fs::write(dir.join(format!("{}.input", q.id)), b"\xFF\xD8\xFF").unwrap();
+        let link = q.resource()["kvad"]["picture_url"].as_str().unwrap().to_string();
+        assert!(link.starts_with(&format!("/v1/videos/video_{}/content?variant=input&v=", q.id)), "{link}");
+        let plain = queue(&db, None, "m", "b", &resolved(2), false).unwrap();
+        assert_eq!(plain.resource()["kvad"]["picture_url"], Value::Null);
+        assert!(delete(&db, &dir, q.id, None).unwrap());
+        assert!(!dir.join(format!("{}.input", q.id)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A video deleted while its files were being written leaves no files.
     #[test]
     fn a_video_deleted_before_it_finished_leaves_nothing() {
         let db = Db::in_memory().unwrap();
         let dir = scratch("deleted");
-        let q = queue(&db, None, "m", "b", &resolved(1)).unwrap();
+        let q = queue(&db, None, "m", "b", &resolved(1), false).unwrap();
         assert!(delete(&db, &dir, q.id, None).unwrap());
         assert!(!finish(&db, &dir, q.id, &filmed(1), None).unwrap());
         assert!(!dir.join(format!("{}.mp4", q.id)).exists());
@@ -1130,9 +1330,9 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let dir = scratch("restart");
         let (a, b, c) = (
-            queue(&db, None, "m", "b", &resolved(1)).unwrap(),
-            queue(&db, None, "m", "b", &resolved(2)).unwrap(),
-            queue(&db, None, "m", "b", &resolved(3)).unwrap(),
+            queue(&db, None, "m", "b", &resolved(1), false).unwrap(),
+            queue(&db, None, "m", "b", &resolved(2), false).unwrap(),
+            queue(&db, None, "m", "b", &resolved(3), false).unwrap(),
         );
         let step = kvad::video::Step { phase: "text", done: 0, total: 1, progress: 0.0, elapsed: 0.0, preview: None };
         advance(&db, b.id, &step).unwrap();
@@ -1151,7 +1351,7 @@ mod tests {
         db.with(|c| c.execute("INSERT INTO users (id, name, role) VALUES (1, 'a', 'user'), (2, 'b', 'user')", []))
             .unwrap();
         let dir = scratch("owned");
-        let mine = queue(&db, Some(1), "m", "b", &resolved(1)).unwrap();
+        let mine = queue(&db, Some(1), "m", "b", &resolved(1), false).unwrap();
         assert!(get_one(&db, mine.id, Some(2)).unwrap().is_none());
         assert!(list(&db, Some(2)).unwrap().is_empty());
         assert!(!delete(&db, &dir, mine.id, Some(2)).unwrap());
@@ -1183,7 +1383,7 @@ mod tests {
         let f = Filmed { video: Video { width: w, height: h, fps: 24, rgb }, ..filmed(1) };
         let raw = f.video.mp4(f.audio.as_ref());
 
-        let q = queue(&db, None, "m", "b", &resolved(1)).unwrap();
+        let q = queue(&db, None, "m", "b", &resolved(1), false).unwrap();
         assert!(finish(&db, &dir, q.id, &f, Some(&ffmpeg)).unwrap());
         let mp4 = std::fs::read(dir.join(format!("{}.mp4", q.id))).unwrap();
         assert!(mp4.len() < raw.len(), "{} bytes compressed against {}", mp4.len(), raw.len());
@@ -1193,7 +1393,7 @@ mod tests {
             !name.contains("part") && !name.contains("x264")
         }), "nothing left aside");
 
-        let q = queue(&db, None, "m", "b", &resolved(2)).unwrap();
+        let q = queue(&db, None, "m", "b", &resolved(2), false).unwrap();
         let broken = dir.join("not-ffmpeg");
         std::fs::write(&broken, b"").unwrap();
         assert!(finish(&db, &dir, q.id, &f, Some(&broken)).unwrap());
@@ -1238,6 +1438,7 @@ mod tests {
         frame_step: 8,
         max_frames: 121,
         max_volume: 1536 * 1024 * 121,
+        image: true,
     };
 
     #[test]
@@ -1266,7 +1467,10 @@ mod tests {
             Ok(_) => panic!("accepted"),
             Err(Fail(_, why)) => why,
         };
-        assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "image_url": "x" } })).contains("from a picture"));
+        assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "image_url": "https://example.com/a.png" } })).contains("fetches nothing"));
+        assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "image_url": "x" } })).contains("not a data: URL"));
+        assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "file_id": "file-123" } })).contains("no Files API"));
+        assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "image_url": "data:image/png;base64,!!" } })).contains("not base64"));
         assert!(refuse(json!({ "prompt": "a dog", "negative_prompt": "blur" })).contains("without guidance"));
         assert!(refuse(json!({ "prompt": "a dog", "seconds": 4, "frames": 97 })).contains("not both"));
         assert!(refuse(json!({ "prompt": "a dog", "size": "big" })).contains("WIDTHxHEIGHT"));
@@ -1292,10 +1496,31 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(header::CONTENT_TYPE, "multipart/form-data; boundary=\"abc123\"".parse().unwrap());
         let f = Fields::read(&h, body.as_bytes()).unwrap();
-        assert_eq!(f.files, ["input_reference"]);
+        assert_eq!(f.files, [("input_reference".to_string(), vec![1, 2])]);
         assert_eq!(f.number::<f64>(&["seconds"]).unwrap(), Some(4.0));
+        assert_eq!(Asked::read(&f).unwrap().picture, Some(vec![1, 2]));
+        // Any other file is refused by name.
+        let other = body.replace("name=\"input_reference\"", "name=\"mask\"");
+        let f = Fields::read(&h, other.as_bytes()).unwrap();
+        assert!(matches!(Asked::read(&f), Err(Fail(_, why)) if why.contains("mask")));
         assert!(form(b"--abc123\r\nno headers end", "multipart/form-data; boundary=abc123").is_err());
         assert!(form(body.as_bytes(), "multipart/form-data").is_err());
+    }
+
+    /// OpenAI's JSON reference to a picture, a `data:` URL, as an object, as
+    /// a form sends that object, and on its own.
+    #[test]
+    fn a_picture_is_read_from_a_data_url() {
+        let png = [0x89, b'P', b'N', b'G', 1, 2, 3];
+        let url = format!("data:image/png;base64,{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png));
+        for reference in [json!({ "image_url": url }), json!(json!({ "image_url": url }).to_string()), json!(url)] {
+            let a = Asked::read(&json_fields(json!({ "prompt": "a dog", "input_reference": reference }))).unwrap();
+            assert_eq!(a.picture.as_deref(), Some(&png[..]));
+        }
+        assert_eq!(sniff(&png), "image/png");
+        assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), "image/jpeg");
+        assert_eq!(sniff(b"RIFF\0\0\0\0WEBPVP8 "), "image/webp");
+        assert_eq!(sniff(b"text"), "application/octet-stream");
     }
 
     #[test]

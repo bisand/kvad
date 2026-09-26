@@ -303,6 +303,17 @@ fn pipes(device: &Device) -> Option<&'static Pipes> {
     .as_ref()
 }
 
+/// A threadgroup of `sg` SIMD groups, laid out 32 × `sg`: a SIMD group to a
+/// row. `32·sg × 1` is the same threads in the same SIMD groups, and nothing
+/// in the kernels reads the shape, yet at the DiT's shapes it was slower:
+/// raced in one process, 32 × `sg` ran Q8_0 at 1.14–1.22× and bf16 at
+/// 1.09–1.31× where `m` is 24 576, and within a few percent either way at
+/// 1024 rows. `mpp_attention` found it first: MLX dispatches its M5
+/// attention this way, and dispatched `128 × 1` it lost a quarter.
+fn shape(sg: usize) -> MTLSize {
+    MTLSize { width: 32, height: sg, depth: 1 }
+}
+
 /// One `[n, k]` weight matrix, in Q8_0 blocks on the GPU, for [`SOURCE`].
 pub(crate) struct Q8 {
     blocks: Tensor,
@@ -386,7 +397,7 @@ impl CustomOp2 for Q8 {
         enc.dispatch_thread_groups(
             MTLSize { width: n.div_ceil(BN), height: m.div_ceil(BM), depth: 1 },
             // Apple GPUs run 32 threads to a SIMD group.
-            MTLSize { width: 32 * SIMD_GROUPS, height: 1, depth: 1 },
+            shape(SIMD_GROUPS),
         );
         Ok((MetalStorage::new(out, dev.clone(), m * n, DType::F32), Shape::from((m, n))))
     }
@@ -500,7 +511,7 @@ impl CustomOp2 for Dense {
         enc.set_bytes(5, &(k as i32));
         enc.dispatch_thread_groups(
             MTLSize { width: n.div_ceil(tn), height: m.div_ceil(tm), depth: 1 },
-            MTLSize { width: 32 * sg, height: 1, depth: 1 },
+            shape(sg),
         );
         Ok((MetalStorage::new(out, dev.clone(), m * n, dt), Shape::from((m, n))))
     }

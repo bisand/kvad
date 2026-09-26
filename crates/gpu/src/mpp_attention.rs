@@ -5,7 +5,7 @@
 //! runs video self-attention at about 6.5 TFLOP/s, 48% of a DiT block. This
 //! one does both of attention's products through `matmul2d`, as `mpp` does
 //! the projections', and never writes the scores down. At stage 2's shapes
-//! it measured 2.5× candle on video self-attention, 6× on the attention to
+//! it measured 3× candle on video self-attention, 7× on the attention to
 //! the text, and 20× or more on the small attentions between video and
 //! sound, where candle's kernel has too few queries or keys to fill the GPU.
 //!
@@ -37,7 +37,8 @@
 //! four sit in four lanes that differ in their bits 0 and 3, so a row's
 //! maximum and sum are two `simd_shuffle_xor`s.
 //!
-//! Two things decide its speed, both measured:
+//! Four things decide its speed, all measured at stage 2's video
+//! self-attention:
 //! - **Every index into an array of fragments must be a constant.** One
 //!   index the compiler cannot resolve, even in a loop that only zeroes the
 //!   array, puts the whole array in memory. A probe of the bare product ran
@@ -48,14 +49,20 @@
 //!   3.3 TFLOP/s.
 //! - **The four SIMD groups stay in step.** They all read the same keys and
 //!   values, and a threadgroup barrier once a step keeps them close enough
-//!   to share those reads in the core's cache. Without it, stage 2's video
-//!   self-attention ran at 9.6 TFLOP/s instead of 16.
+//!   to share those reads in the core's cache: 9.6 → 16 TFLOP/s.
+//! - **The threadgroup is dispatched as 32 × 4 threads, not 128 × 1.** It is
+//!   the same 128 threads in the same four SIMD groups, and nothing in the
+//!   kernel reads the shape, yet 128 × 1 held this kernel at about 16 TFLOP/s
+//!   and took MLX's own, compiled here from its source, from 21.4 to 15.6.
+//! - **Fragments are loaded element by element**, as MLX loads them, rather
+//!   than as a vector of four copied out: with the dispatch above, 16.2 →
+//!   18.6 TFLOP/s.
 //!
-//! With every key read from the core's cache (a probe with one key row
-//! repeated), the kernel runs at 26 TFLOP/s; MLX's own runs the real shape
-//! at 21.5. What is left is in how the keys and values reach the SIMD
-//! groups: each still loads them itself, and staging them once per
-//! threadgroup in threadgroup memory is the next thing to try.
+//! Together these bring it level with MLX's own M5 attention, raced in one
+//! process on the same inputs. Staging each step's keys and values once in
+//! threadgroup memory, instead of each SIMD group loading its own, was
+//! slower: 11 TFLOP/s copying then computing, and 7 with the next step
+//! prefetched into registers, which crowded out the accumulators.
 //!
 //! # What it reads
 //!
@@ -118,14 +125,21 @@ inline short2 place(ushort lane) {
     return short2(((g & 2) | (lane & 1)) * 4, (g & 4) | ((lane >> 1) & 3));
 }
 
-// A fragment from row-major memory. With EDGE, only `rows` rows exist and
-// the rest read as zeros; without, all 16 do and nothing is checked.
+// A fragment from row-major memory, element by element: reading each row's
+// four as one vector and copying them out was 13–15% slower. With EDGE,
+// only `rows` rows exist and the rest read as zeros; without, all 16 do and
+// nothing is checked.
 template <bool EDGE = true, typename T>
 inline frag<T> load(device const T *p, int ld, short2 at, int rows) {
-    const vec<T, 4> x0 = !EDGE || at.y < rows ? *(device const vec<T, 4> *)(p + at.y * ld + at.x) : vec<T, 4>(0);
-    const vec<T, 4> x1 = !EDGE || at.y + 8 < rows ? *(device const vec<T, 4> *)(p + (at.y + 8) * ld + at.x) : vec<T, 4>(0);
     frag<T> f;
-    EACH(4, c, f[c] = x0[c]; f[4 + c] = x1[c];);
+    p += at.y * ld + at.x;
+    EACH(2, i,
+        if (!EDGE || at.y + i * 8 < rows) {
+            EACH(4, c, f[i * 4 + c] = p[i * 8 * ld + c];);
+        } else {
+            EACH(4, c, f[i * 4 + c] = T(0););
+        }
+    );
     return f;
 }
 
@@ -402,7 +416,9 @@ impl CustomOp3 for Attention {
         enc.set_bytes(4, &params);
         enc.dispatch_thread_groups(
             MTLSize { width: rows.div_ceil(BQ), height: h, depth: 1 },
-            MTLSize { width: 32 * BQ / 16, height: 1, depth: 1 },
+            // 32 × 4, a SIMD group to a row, not 128 × 1: the same threads
+            // in the same SIMD groups, and yet see the module's notes.
+            MTLSize { width: 32, height: BQ / 16, depth: 1 },
         );
         Ok((MetalStorage::new(out, dev.clone(), rows * width, dt), Shape::from((rows, width))))
     }

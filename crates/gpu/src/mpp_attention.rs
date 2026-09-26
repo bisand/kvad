@@ -441,7 +441,10 @@ mod tests {
     /// and every kind of ragged edge, including one query and one key.
     ///
     /// Measured when written: 55–58 dB in bf16 and 70–74 dB in f16, where
-    /// candle's attention gives 44–49 and 61–67 on the same inputs.
+    /// candle's attention gives 44–49 and 61–67 on the same inputs. On the
+    /// seeds it draws now: 55.0–55.6 and 72.2–74.8 dB against candle's
+    /// 43.8–48.4 and 64.0–67.4, at least 4.9 dB ahead of it everywhere but
+    /// the single key, where both are exact.
     #[test]
     fn agrees_with_attention_written_out() {
         let Some(dev) = gpu() else {
@@ -450,12 +453,18 @@ mod tests {
         };
         // (queries, keys, heads, d)
         let shapes = [(128, 128, 2, 128), (77, 50, 3, 64), (300, 1024, 2, 128), (126, 126, 4, 64), (1, 33, 1, 64), (65, 1, 2, 128)];
+        // Seeded on the host, as in `gates_each_query_and_head`, whose notes
+        // say why: candle's `randn` on Metal does not repeat itself.
+        let mut seed = 100u64;
         for dt in [DType::BF16, DType::F16] {
             for (lq, lk, heads, d) in shapes {
                 let w = heads * d;
                 // Spread wide enough that the softmax is peaked in places, as
                 // a normed query's is, and not flat.
-                let rand = |l: usize| (Tensor::randn(0f32, 1.0, (l, w), &dev).unwrap() * 2.0).unwrap().to_dtype(dt).unwrap();
+                let mut rand = |l: usize| {
+                    seed += 1;
+                    (crate::image::nn::noise(seed, &[l, w], &dev, DType::F32).unwrap() * 2.0).unwrap().to_dtype(dt).unwrap()
+                };
                 let (q, k, v) = (rand(lq), rand(lk), rand(lk));
                 let want = reference(&q, &k, &v, heads);
                 let theirs = {
@@ -475,31 +484,53 @@ mod tests {
     }
 
     /// Gates scale each query's head by `2·sigmoid(gate)` before the
-    /// rounding: as close to attention written out and gated in f32 as the
-    /// ungated kernel is to it ungated. Logits in bf16 are read too.
+    /// rounding, and cost nothing: the gated answer is as close to attention
+    /// written out and gated in f32 as a bf16 answer can be. Logits in bf16
+    /// are read too.
+    ///
+    /// "As close as it can be" is that answer's own rounding,
+    /// `db(bf16(gated), gated)`, and not the ungated kernel's error, which it
+    /// once was. Scaling a head moves its numbers to other places between
+    /// bf16's steps, so the gated and ungated answers round differently by
+    /// chance, and with one query's 64 numbers by a lot. Over 300 seeds each,
+    /// measured when written: at `[1, 33] × 1 × 64` the gated kernel was
+    /// 4.2 dB worse than the ungated one on one draw and 4.0 dB better on
+    /// another, while never more than 0.7 dB short of its own answer's
+    /// rounding, nor the ungated one more than 0.8 of its. At the two larger
+    /// shapes, where many rows average the chance out, the swing was 0.3 dB
+    /// and neither was more than 0.04 dB short. Held to the ungated kernel
+    /// within 1 dB, the test failed 2 runs in 36 beside the rest of this
+    /// module, and 86 in 150 run alone.
+    ///
+    /// The inputs are drawn on the host from fixed seeds, by `noise`. candle's
+    /// `randn` on Metal is not repeatable, even from its fixed default seed:
+    /// run alone, this test's k and v came out one of several ways, and the
+    /// kernel, given the same inputs twice, gave the same bits.
     #[test]
     fn gates_each_query_and_head() {
         let Some(dev) = gpu() else { return };
-        for (lq, lk, heads, d) in [(128, 128, 2, 128), (77, 50, 3, 64), (1, 33, 1, 64)] {
+        let shapes = [(128, 128, 2, 128), (77, 50, 3, 64), (1, 33, 1, 64)];
+        for (seed, (lq, lk, heads, d)) in (0u64..).step_by(4).zip(shapes) {
             let w = heads * d;
-            let rand = |l: usize| (Tensor::randn(0f32, 1.0, (l, w), &dev).unwrap() * 2.0).unwrap().to_dtype(DType::BF16).unwrap();
-            let (q, k, v) = (rand(lq), rand(lk), rand(lk));
-            let logits = (Tensor::randn(0f32, 1.0, (lq, heads), &dev).unwrap() * 3.0).unwrap();
-            let gates = (candle_nn::ops::sigmoid(&logits).unwrap() * 2.0).unwrap();
+            let noise = |s: u64, shape: &[usize]| crate::image::nn::noise(seed + s, shape, &dev, DType::F32).unwrap();
+            let rand = |s: u64, l: usize| (noise(s, &[l, w]) * 2.0).unwrap().to_dtype(DType::BF16).unwrap();
+            let (q, k, v) = (rand(0, lq), rand(1, lk), rand(2, lk));
+            let logits = (noise(3, &[lq, heads]) * 3.0).unwrap();
             let want = reference(&q, &k, &v, heads);
-            let gated = want.reshape((lq, heads, d)).unwrap().broadcast_mul(&gates.unsqueeze(2).unwrap()).unwrap().reshape((lq, w)).unwrap();
             let plain = db(&attention(&q, &k, &v, heads, None).unwrap().unwrap(), &want);
             for g in [logits.clone(), logits.to_dtype(DType::BF16).unwrap()] {
                 // bf16 logits are the f32 ones rounded, so they are held to
                 // their own gates.
                 let gates = (candle_nn::ops::sigmoid(&g.to_dtype(DType::F32).unwrap()).unwrap() * 2.0).unwrap();
-                let gated = match g.dtype() {
-                    DType::F32 => gated.clone(),
-                    _ => want.reshape((lq, heads, d)).unwrap().broadcast_mul(&gates.unsqueeze(2).unwrap()).unwrap().reshape((lq, w)).unwrap(),
-                };
+                let gated = want.reshape((lq, heads, d)).unwrap().broadcast_mul(&gates.unsqueeze(2).unwrap()).unwrap().reshape((lq, w)).unwrap();
+                let floor = db(&gated.to_dtype(DType::BF16).unwrap(), &gated);
                 let got = attention(&q, &k, &v, heads, Some(&g)).unwrap().expect("the kernel declined");
                 let ours = db(&got, &gated);
-                assert!(ours > plain - 1.0, "[{lq}, {lk}] × {heads} × {d}, {:?} gates: {ours:.1} dB, ungated {plain:.1}", g.dtype());
+                // Measured on these seeds: 0.006–0.022 dB short of the floor,
+                // the same every run. A gate 0.5% too large in the kernel was
+                // 10 dB short, and one on the wrong row or head, or sigmoid
+                // without its 2, would be further.
+                assert!(ours > floor - 1.0, "[{lq}, {lk}] × {heads} × {d}, {:?} gates: {ours:.2} dB, bf16's own {floor:.2}, ungated {plain:.2}", g.dtype());
             }
         }
         // Gates of the wrong shape are declined.

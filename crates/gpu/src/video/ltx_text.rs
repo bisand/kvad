@@ -29,7 +29,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// The text encoder's file in [`super::LTX_REPO`].
 pub const TEXT_FILE: &str = "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors";
 /// The distilled DiT's file, which holds the connectors.
-pub const DIT_FILE: &str = "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors";
+pub const DIT_FILE: &str = kvad::video::LTX_DENOISER;
 
 /// Every prompt is this many tokens by the time the DiT sees it, padded if
 /// shorter and cut if longer.

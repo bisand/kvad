@@ -69,20 +69,36 @@ pub struct Loaded {
     /// number is this times the tokens actually held — see
     /// [`Resident::cached_tokens`].
     pub kv_bytes_per_token: usize,
-    /// `chat` or `image`: which requests this model can answer.
+    /// `chat`, `image` or `video`: which requests this model can answer.
     pub kind: Kind,
     /// For an image model, what a request that leaves a knob out gets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<kvad::image::Defaults>,
+    /// For a video model, the same, and its limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<kvad::video::Defaults>,
 }
 
-/// What a model is for. Language models chat; image pipelines paint; and a
-/// request for the one sent to the other is refused before it is queued.
+/// What a model is for. Language models chat, image pipelines paint, video
+/// pipelines film; and a request for one sent to another is refused before
+/// it is queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Chat,
     Image,
+    Video,
+}
+
+impl Kind {
+    /// The kind of a model on disk, from the pipeline it is, if it is one.
+    pub fn of_pipeline(pipeline: Option<&str>) -> Kind {
+        match pipeline {
+            Some(p) if kvad::video::is_video_pipeline(p) => Kind::Video,
+            Some(_) => Kind::Image,
+            None => Kind::Chat,
+        }
+    }
 }
 
 /// Which model, on which backend.
@@ -181,6 +197,14 @@ pub enum Stroke {
     Failed(String),
 }
 
+/// Where a video has got to, or the video.
+#[derive(Debug, Clone)]
+pub enum Reel {
+    Step(kvad::video::Step),
+    Done(Box<kvad::video::Filmed>),
+    Failed(String),
+}
+
 /// A fragment of a reply, or the end of one.
 #[derive(Debug, Clone)]
 pub enum Piece {
@@ -228,6 +252,7 @@ enum Job {
         done: Answer<Perplexity>,
     },
     Paint { on: Key, request: kvad::image::ImageRequest, out: tokio_mpsc::Sender<Stroke> },
+    Film { on: Key, request: kvad::video::VideoRequest, out: tokio_mpsc::Sender<Reel> },
 }
 
 /// Makes the loader for each new engine. One per engine, because a
@@ -431,6 +456,16 @@ impl Scheduler {
         Ok(rx)
     }
 
+    /// Make a video on `on`, as [`Scheduler::paint`] makes an image.
+    ///
+    /// The engine is this job's for minutes, and every other request on the
+    /// same engine waits behind it.
+    pub fn film(&self, on: &Key, request: kvad::video::VideoRequest) -> Result<tokio_mpsc::Receiver<Reel>, String> {
+        let (out, rx) = tokio_mpsc::channel(8);
+        self.submit(Job::Film { on: on.clone(), request, out })?;
+        Ok(rx)
+    }
+
     /// Score a text the model did not write.
     pub async fn score(
         &self,
@@ -596,6 +631,24 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                 }
                 Box::new(move || drop(out))
             }
+
+            Job::Film { on, request, out } => {
+                match slots.iter().find(|s| s.key == on) {
+                    // Deleted while it waited: a minute of the GPU saved.
+                    _ if out.is_closed() => {}
+                    Some(slot) => {
+                        *shared.running() = Some(Arc::clone(&slot.engine.cancel));
+                        slot.engine.send(Cmd::Film(request));
+                        drain_film(&slot.engine.rx, &out, &slot.engine.cancel);
+                        *shared.running() = None;
+                        touch(&on, clock, None);
+                    }
+                    None => {
+                        let _ = out.blocking_send(Reel::Failed(missing(&on)));
+                    }
+                }
+                Box::new(move || drop(out))
+            }
         };
 
         shared.busy.store(false, Ordering::Relaxed);
@@ -670,6 +723,7 @@ fn drain_load(rx: &Receiver<Evt>, progress: &tokio_mpsc::Sender<Progress>) -> Re
                 n_ctx,
                 kv_bytes_per_token,
                 image,
+                video,
             }) => {
                 return Ok(Loaded {
                     repo,
@@ -681,8 +735,13 @@ fn drain_load(rx: &Receiver<Evt>, progress: &tokio_mpsc::Sender<Progress>) -> Re
                     weight_bytes,
                     n_ctx,
                     kv_bytes_per_token,
-                    kind: if image.is_some() { Kind::Image } else { Kind::Chat },
+                    kind: match (&image, &video) {
+                        (Some(_), _) => Kind::Image,
+                        (_, Some(_)) => Kind::Video,
+                        _ => Kind::Chat,
+                    },
                     image,
+                    video,
                 })
             }
             Ok(Evt::Error(e)) => return Err(e),
@@ -772,6 +831,40 @@ fn drain_chat(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Piece>) -> Option<Sta
     }
 }
 
+/// Forward a video's progress, then the video, as [`drain_paint`] does an
+/// image's.
+///
+/// Unlike an image's steps, a video's can be most of a minute apart, and
+/// the engine checks the cancel flag only when it reports one. So the flag
+/// is set as soon as the receiver is gone, not at the first event nobody
+/// received: that would let the engine run one more step, which at
+/// 1536×1024 is fifty seconds of a video nobody wants.
+fn drain_film(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Reel>, cancel: &AtomicBool) {
+    loop {
+        let reel = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if out.is_closed() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                continue;
+            }
+            Ok(Evt::Filming(step)) => Reel::Step(step),
+            Ok(Evt::Filmed(f)) => Reel::Done(f),
+            Ok(Evt::Error(e)) => Reel::Failed(e),
+            Ok(Evt::Status(message)) => Reel::Failed(message),
+            Ok(_) => continue,
+            Err(_) => Reel::Failed("the engine thread has stopped".into()),
+        };
+        let last = !matches!(reel, Reel::Step(_));
+        if out.blocking_send(reel).is_err() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if last {
+            return;
+        }
+    }
+}
+
 /// Forward an image's steps, then the image.
 ///
 /// A client that has gone away is noticed here rather than by the engine: the
@@ -822,6 +915,13 @@ mod tests {
 
     const Q8: Backend = Backend::Cpu(Precision::Q8);
     const F32: Backend = Backend::Cpu(Precision::F32);
+
+    #[test]
+    fn a_pipeline_is_an_image_or_a_video_model_by_its_name() {
+        assert_eq!(Kind::of_pipeline(None), Kind::Chat);
+        assert_eq!(Kind::of_pipeline(Some("FluxPipeline")), Kind::Image);
+        assert_eq!(Kind::of_pipeline(Some(kvad::video::LTX_PIPELINE)), Kind::Video);
+    }
 
     fn roomy() -> Budget {
         Budget { total: 1 << 40, context: 1024 }

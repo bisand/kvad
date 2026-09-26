@@ -434,6 +434,68 @@ pub const ENDPOINTS: &[Endpoint] = &[
         query: &[], body: None, produces: JSON, events: &[],
     },
 
+    // -- Videos -------------------------------------------------------------
+    Endpoint {
+        method: "post", path: "/v1/videos", tag: "Videos", access: Access::SignedIn,
+        summary: "Make a video (OpenAI-compatible)",
+        description: "OpenAI's request — `prompt`, `model`, `size` as `WIDTHxHEIGHT`, \
+                      `seconds` — as JSON or as `multipart/form-data`, which is how \
+                      OpenAI's SDKs send it. Beside them: `frames` (or `num_frames`) \
+                      instead of `seconds`, `fps`, `seed`, and `audio: false` for a \
+                      silent file. A length in seconds becomes the nearest number of \
+                      frames the model can make. `input_reference`, a negative prompt, \
+                      guidance and steps are refused: the one video model here makes \
+                      videos from text on a fixed schedule.\n\n\
+                      Answers at once with the video in OpenAI's shape, `queued`; the \
+                      generation is the server's from then on, and takes minutes. The \
+                      engine that makes it answers nothing else meanwhile.",
+        query: &[], body: json_body("`{ prompt, model?, size?, seconds?, frames?, fps?, seed?, \
+                                     audio? }`, or the same fields as `multipart/form-data`."),
+        produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/v1/videos", tag: "Videos", access: Access::SignedIn,
+        summary: "Your videos",
+        description: "OpenAI's list: `{ object, data, first_id, last_id, has_more }`, \
+                      newest first. Each video carries a `kvad` object with its \
+                      settings, its finer progress and phase, what each part took, and \
+                      links to the file and its poster frame once it is done.",
+        query: &[
+            ("limit", false, "At most this many, 0 to 100; 20 when left out."),
+            ("order", false, "`desc` (the default) or `asc`, by when each was asked for."),
+            ("after", false, "Continue after this video's id."),
+        ],
+        body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/v1/videos/{id}", tag: "Videos", access: Access::SignedIn,
+        summary: "A video, and how far along it is",
+        description: "`video_12` or `12`. `status` is `queued`, `in_progress`, \
+                      `completed` or `failed`, and `progress` a whole percentage, \
+                      weighted by what each part of a generation takes. Another \
+                      account's video is a 404.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "delete", path: "/v1/videos/{id}", tag: "Videos", access: Access::SignedIn,
+        summary: "Delete a video",
+        description: "The file, its poster and its row. A video still being made stops \
+                      at its next step.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/v1/videos/{id}/content", tag: "Videos", access: Access::SignedIn,
+        summary: "A video's file",
+        description: "The MP4, with HTTP Range requests answered so that a player can \
+                      seek before it has the whole file. A 404 until the video is \
+                      `completed`.",
+        query: &[
+            ("variant", false, "`video` (the default), or `thumbnail` for the middle frame as a \
+                         PNG. OpenAI's thumbnail is a WebP, and there is no `spritesheet`."),
+        ],
+        body: None, produces: "video/mp4 or image/png", events: &[],
+    },
+
     // -- Playground ---------------------------------------------------------
     Endpoint {
         method: "post", path: "/api/playground/complete", tag: "Playground",
@@ -903,6 +965,7 @@ const TAGS: &[(&str, &str)] = &[
     ("Models", "What is on this machine, and what the engine holds."),
     ("Chat", "Generating, and the conversations kept around it."),
     ("Images", "Text to image, and the pictures kept afterwards."),
+    ("Videos", "Text to video, as jobs that run on the server, and the videos kept afterwards."),
     ("Playground", "The model without the conversation: raw completion, the \
                     tokeniser, and the choice behind each token."),
     ("Training", "Starting runs on this machine's own cores."),
@@ -998,6 +1061,7 @@ mod tests {
         ("evals.rs", include_str!("evals.rs")),
         ("bench.rs", include_str!("bench.rs")),
         ("images.rs", include_str!("images.rs")),
+        ("videos.rs", include_str!("videos.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("storage.rs", include_str!("storage.rs")),
     ];

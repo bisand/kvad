@@ -30,8 +30,9 @@
 //!
 //! # Two kinds of model
 //!
-//! A loader hands back a [`Model`]: a language model, or an image pipeline
-//! ([`crate::image::Painter`]). They are peers, not modes of one another.
+//! A loader hands back a [`Model`]: a language model, an image pipeline
+//! ([`crate::image::Painter`]) or a video pipeline
+//! ([`crate::video::Director`]). They are peers, not modes of one another.
 //! [`Llm`] knows nothing about images and a painter knows nothing about
 //! tokens; what they share is this thread, the load and unload around them,
 //! and the channel their progress goes down. Asking one for the other's work
@@ -43,6 +44,7 @@ use crate::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use crate::quant::Precision;
 use crate::runtime::{Chosen, Llm, Perplexity, Stats, Token};
 use crate::sampler::Sampler;
+use crate::video::{Director, Filmed, VideoRequest};
 use crate::weights::{Fetch, Watcher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -101,12 +103,16 @@ pub enum Cmd {
     /// Make an image, reporting each denoising step as [`Evt::Painting`] and
     /// ending with [`Evt::Painted`]. Only an image model can.
     Paint(ImageRequest),
+    /// Make a video, reporting its progress as [`Evt::Filming`] and ending
+    /// with [`Evt::Filmed`]. Only a video model can.
+    Film(VideoRequest),
 }
 
 /// What a [`Loader`] hands back.
 pub enum Model {
     Text(Llm),
     Image(Box<dyn Painter>),
+    Video(Box<dyn Director>),
 }
 
 impl From<Llm> for Model {
@@ -226,6 +232,8 @@ pub enum Evt {
         /// out; `None` for a language model. This is how a caller tells the
         /// two apart.
         image: Option<Defaults>,
+        /// For a video model, the same; `None` for any other.
+        video: Option<crate::video::Defaults>,
     },
     /// No model is loaded any more, and what was loaded is named.
     Unloaded(String),
@@ -243,6 +251,11 @@ pub enum Evt {
     /// One denoising step of an image, done.
     Painting(Step),
     Painted(Painted),
+    /// Where a video has got to.
+    Filming(crate::video::Step),
+    /// Boxed, because a video is the frames themselves, and every other
+    /// event would otherwise be sent at its size.
+    Filmed(Box<Filmed>),
     Error(String),
 }
 
@@ -339,13 +352,14 @@ struct Loaded {
 enum Held {
     Text(Loaded),
     Image { repo: String, painter: Box<dyn Painter> },
+    Video { repo: String, director: Box<dyn Director> },
 }
 
 impl Held {
     fn repo(&self) -> &str {
         match self {
             Held::Text(s) => &s.llm.repo,
-            Held::Image { repo, .. } => repo,
+            Held::Image { repo, .. } | Held::Video { repo, .. } => repo,
         }
     }
 
@@ -356,6 +370,10 @@ impl Held {
             Held::Image { repo, .. } => Err(format!(
                 "{repo} makes images from text; it cannot chat, complete, tokenize or score. \
                  Ask it for an image instead (POST /v1/images/generations)."
+            )),
+            Held::Video { repo, .. } => Err(format!(
+                "{repo} makes videos from text; it cannot chat, complete, tokenize or score. \
+                 Ask it for a video instead (POST /v1/videos)."
             )),
         }
     }
@@ -441,11 +459,30 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                             n_ctx: 0,
                             kv_bytes_per_token: 0,
                             image: Some(painter.defaults()),
+                            video: None,
                         });
                         // Not made the active model: that is what `kvad run`
                         // talks to when it is not told, and it cannot talk
                         // to this.
                         session = Some(Held::Image { repo, painter });
+                        let _ = tx.send(Evt::Local(hub::local_models()));
+                    }
+                    Ok(Model::Video(director)) => {
+                        let _ = tx.send(Evt::Loaded {
+                            repo: repo.clone(),
+                            summary: director.summary(),
+                            params: director.params(),
+                            instruct: false,
+                            tools: false,
+                            backend: director.backend(),
+                            weight_bytes: director.weight_bytes(),
+                            n_ctx: 0,
+                            kv_bytes_per_token: 0,
+                            image: None,
+                            video: Some(director.defaults()),
+                        });
+                        // Not the active model either, for the same reason.
+                        session = Some(Held::Video { repo, director });
                         let _ = tx.send(Evt::Local(hub::local_models()));
                     }
                     Ok(Model::Text(llm)) => {
@@ -463,6 +500,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                                 llm.session.kv_number_bytes(),
                             ),
                             image: None,
+                            video: None,
                         });
                         let _ = hub::State::set_active(&repo);
                         let d = Sampling::default();
@@ -587,6 +625,10 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                         fail(format!("{} is a language model; it cannot make images", s.llm.repo).into());
                         continue;
                     }
+                    Some(Held::Video { repo, .. }) => {
+                        fail(format!("{repo} makes videos; ask it at /v1/videos").into());
+                        continue;
+                    }
                 };
                 cancel.store(false, Ordering::Relaxed);
                 let tx2 = tx.clone();
@@ -597,6 +639,36 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 match painted {
                     Ok(p) => {
                         let _ = tx.send(Evt::Painted(p));
+                    }
+                    Err(e) => fail(e),
+                }
+            }
+
+            Cmd::Film(request) => {
+                let director = match session.as_mut() {
+                    None => {
+                        say("no model loaded");
+                        continue;
+                    }
+                    Some(Held::Video { director, .. }) => director,
+                    Some(Held::Text(s)) => {
+                        fail(format!("{} is a language model; it cannot make videos", s.llm.repo).into());
+                        continue;
+                    }
+                    Some(Held::Image { repo, .. }) => {
+                        fail(format!("{repo} makes images; ask it at /v1/images/generations").into());
+                        continue;
+                    }
+                };
+                cancel.store(false, Ordering::Relaxed);
+                let tx2 = tx.clone();
+                let cancel2 = Arc::clone(&cancel);
+                let filmed = director.film(&request, &mut |step| {
+                    tx2.send(Evt::Filming(step)).is_ok() && !cancel2.load(Ordering::Relaxed)
+                });
+                match filmed {
+                    Ok(f) => {
+                        let _ = tx.send(Evt::Filmed(Box::new(f)));
                     }
                     Err(e) => fail(e),
                 }

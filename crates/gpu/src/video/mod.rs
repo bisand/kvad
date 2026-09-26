@@ -12,6 +12,9 @@
 //! - [`ltx_vae`]: the convolutional video decoder, and [`ltx_audio`]: the
 //!   audio decoder, vocoder and bandwidth extension.
 //!
+//! [`ltx`] puts them together as a [`kvad::video::Director`], for the
+//! server.
+//!
 //! They are written on candle for the same reason the image models are
 //! (`docs/image-plan.md`): the decoders are convolution stacks, and `kvad`'s
 //! own `tensor.rs` has no convolutions.
@@ -22,6 +25,7 @@
 
 pub mod conv3d;
 pub mod gemma;
+pub mod ltx;
 pub mod ltx_audio;
 pub mod ltx_dit;
 mod ltx_fused;

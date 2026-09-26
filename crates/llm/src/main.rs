@@ -110,6 +110,12 @@ struct Args {
     /// `images make` only: how hard to follow the prompt, and what to avoid.
     guidance: Option<f32>,
     negative: Option<String>,
+    /// `videos make` only: how long, at how many frames a second, and
+    /// whether without sound.
+    seconds: Option<f64>,
+    frames: Option<usize>,
+    fps: Option<u32>,
+    silent: bool,
     quant: Precision,
     /// `crawl` only.
     out: Option<String>,
@@ -174,6 +180,10 @@ impl Default for Args {
             seed_given: false,
             guidance: None,
             negative: None,
+            seconds: None,
+            frames: None,
+            fps: None,
+            silent: false,
             quant: Precision::F32,
             out: None,
             pages: None,
@@ -225,6 +235,7 @@ fn usage() -> ! {
            tokenize TEXT       how the model splits a text\n  \
            conversations       ls, show ID, edit ID, rm ID\n  \
            images              ls, make PROMPT [--out FILE], rm ID\n  \
+           videos              ls, make PROMPT [--out FILE], show ID, get ID, rm ID\n  \
            jobs                ls, show ID, watch ID, cancel ID\n  \
            datasets            ls, add FILE, crawl URL, show ID, check ID, search ID Q, rm ID\n  \
            evals               runs, show ID, suites, add FILE, edit ID FILE, rm ID,\n  \
@@ -304,7 +315,7 @@ fn usage() -> ! {
 const POSITIONAL: &[&str] = &[
     "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload",
     "tokenize", "service", "conversations", "jobs", "datasets", "evals", "bench", "metrics",
-    "auth", "users", "sessions", "keys", "api", "images",
+    "auth", "users", "sessions", "keys", "api", "images", "videos",
 ];
 
 /// Flags that stand alone, and the short spellings some of them have.
@@ -322,6 +333,7 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--force" => a.force = true,
         "--key" => a.key = true,
         "--password" => a.password = true,
+        "--silent" => a.silent = true,
         _ => return false,
     }
     true
@@ -383,6 +395,9 @@ fn parse_from(argv: Vec<String>) -> Args {
             }
             "--guidance" => a.guidance = Some(num() as f32),
             "--negative" => a.negative = Some(value.clone()),
+            "--seconds" => a.seconds = Some(num()),
+            "--frames" => a.frames = Some(num() as usize),
+            "--fps" => a.fps = Some(num() as u32),
             "--out" => a.out = Some(value.clone()),
             "--pages" => a.pages = Some(num() as usize),
             "--mb" => a.megabytes = Some(num()),

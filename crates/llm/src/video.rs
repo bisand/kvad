@@ -31,6 +31,248 @@
 //! The colours are BT.709, limited range, 4:2:0, and the stream says so. That
 //! is what the LTX reference writes, and what a player assumes when a stream
 //! says nothing; saying it anyway means no player has to guess.
+//!
+//! # Asking for a video
+//!
+//! The rest is what [`crate::image`] is for pictures: the request, the
+//! progress report, the result, and the [`Director`] trait a pipeline
+//! implements so that the service can hold one. It is a peer of
+//! [`crate::image::Painter`] and not a painter with a time axis. A video has
+//! a length and a frame rate and sound; the one video model here has no
+//! guidance scale and no choice of steps; and its progress is not a count of
+//! steps, because its steps are of two sizes and a third of its time is not
+//! steps at all.
+
+type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// The name a video pipeline goes by, as an image pipeline goes by the
+/// `_class_name` in its `model_index.json`.
+///
+/// LTX-2.5's repo has no `model_index.json`: it is one safetensors file per
+/// component, laid out for ComfyUI. So it is recognised by its denoiser's
+/// file, [`LTX_DENOISER`], and given the name diffusers gives LTX-2's
+/// pipeline.
+pub const LTX_PIPELINE: &str = "LTX2Pipeline";
+
+/// The file that makes a repo LTX-2.5: its distilled DiT.
+pub const LTX_DENOISER: &str = "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors";
+
+/// Whether a pipeline, by name, makes videos rather than images.
+pub fn is_video_pipeline(name: &str) -> bool {
+    name == LTX_PIPELINE
+}
+
+/// What a caller asks a [`Director`] for.
+///
+/// Everything but the prompt is optional, and [`Director::defaults`] fills
+/// it in, as for [`crate::image::ImageRequest`]. There is no guidance and no
+/// step count, because LTX-2.5's distilled model, the only one here, has a
+/// fixed schedule and was trained without guidance; the dev model, when it
+/// comes, is what will add them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VideoRequest {
+    pub prompt: String,
+    pub width: Option<usize>,
+    pub height: Option<usize>,
+    /// Frames, the first one included.
+    pub frames: Option<usize>,
+    pub fps: Option<u32>,
+    /// The noise the video starts from. The same seed and settings give the
+    /// same video.
+    pub seed: Option<u64>,
+    /// Whether to keep the sound. LTX makes both together in one pass of its
+    /// denoiser, so leaving the sound out saves only its decode, a few
+    /// seconds; it is here for a caller who wants a silent file.
+    pub audio: Option<bool>,
+}
+
+/// A model's own answers for what a [`VideoRequest`] leaves out, and its
+/// limits.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Defaults {
+    pub width: usize,
+    pub height: usize,
+    pub frames: usize,
+    pub fps: u32,
+    /// Width and height must both be a multiple of this.
+    pub multiple: usize,
+    /// Frames must be one more than a multiple of this: a video VAE that
+    /// compresses time by 8 keeps the first frame on its own, so LTX's
+    /// clips are 8k + 1 frames long.
+    pub frame_step: usize,
+    pub max_frames: usize,
+    /// The most pixels times frames a request may ask for.
+    ///
+    /// Memory and time both grow with this, and at the same rate whichever
+    /// way it is spent: 2048×768 and 1536×1024 are the same number of
+    /// tokens to the DiT and the same number of pixels to the decoder. A
+    /// pipeline sets it from what it has measured and from what the machine
+    /// it loaded on can hold, so that a request that would run the GPU out
+    /// of memory is refused before it is queued.
+    pub max_volume: usize,
+}
+
+/// A [`VideoRequest`] with every blank filled and checked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolved {
+    pub prompt: String,
+    pub width: usize,
+    pub height: usize,
+    pub frames: usize,
+    pub fps: u32,
+    pub seed: u64,
+    pub audio: bool,
+}
+
+impl Resolved {
+    /// The clip's length.
+    pub fn seconds(&self) -> f64 {
+        self.frames as f64 / self.fps as f64
+    }
+}
+
+impl VideoRequest {
+    pub fn new(prompt: impl Into<String>) -> Self {
+        VideoRequest { prompt: prompt.into(), ..Default::default() }
+    }
+
+    /// Fill the blanks from `d` and refuse what cannot be made, naming the
+    /// nearest request that can.
+    pub fn resolved(&self, d: &Defaults) -> Res<Resolved> {
+        let width = self.width.unwrap_or(d.width);
+        let height = self.height.unwrap_or(d.height);
+        let frames = self.frames.unwrap_or(d.frames);
+        let fps = self.fps.unwrap_or(d.fps);
+        for (what, n) in [("width", width), ("height", height)] {
+            if n == 0 || n % d.multiple != 0 {
+                return Err(format!(
+                    "{what} must be a multiple of {} for this model, and {n} is not; try {}",
+                    d.multiple,
+                    ((n + d.multiple / 2) / d.multiple).max(1) * d.multiple
+                )
+                .into());
+            }
+        }
+        if frames == 0 || frames % d.frame_step != 1 % d.frame_step {
+            let below = frames.saturating_sub(1) / d.frame_step * d.frame_step + 1;
+            return Err(format!(
+                "frames must be one more than a multiple of {} for this model, and {frames} is not; try {below} or {}",
+                d.frame_step,
+                below + d.frame_step
+            )
+            .into());
+        }
+        if frames > d.max_frames {
+            return Err(format!("this model makes at most {} frames, not {frames}", d.max_frames).into());
+        }
+        if !(1..=120).contains(&fps) {
+            return Err(format!("fps must be between 1 and 120, not {fps}").into());
+        }
+        if width * height * frames > d.max_volume {
+            // The longest clip at this size that fits, as the likeliest fix.
+            let most = (d.max_volume / (width * height)).min(d.max_frames);
+            let most = most.saturating_sub(1) / d.frame_step * d.frame_step + 1;
+            return Err(format!(
+                "{width}×{height} × {frames} frames is more than this model makes here, {} pixels × frames; \
+                 at {width}×{height} that is {}",
+                d.max_volume,
+                match most >= d.frame_step + 1 {
+                    true => format!("{most} frames or fewer"),
+                    false => "not even one clip; ask for a smaller size".to_string(),
+                }
+            )
+            .into());
+        }
+        if self.prompt.trim().is_empty() {
+            return Err("the prompt is empty".into());
+        }
+        // As for an image: chosen here, from the clock, so that the result
+        // can say which seed made it; and below 2³² so that it survives a
+        // browser.
+        let seed = self.seed.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64 % (1 << 32))
+                .unwrap_or(0)
+        });
+        Ok(Resolved {
+            prompt: self.prompt.clone(),
+            width,
+            height,
+            frames,
+            fps,
+            seed,
+            audio: self.audio.unwrap_or(true),
+        })
+    }
+}
+
+/// Where a generation has got to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    /// What is running: for LTX, `text`, `stage 1`, `upsample`, `stage 2`,
+    /// `decode`.
+    pub phase: &'static str,
+    /// Of this phase, the steps done and how many there are; 0 of 1 for a
+    /// phase that is one piece of work and has just begun.
+    pub done: usize,
+    pub total: usize,
+    /// The whole generation's share done, from 0 to 1.
+    ///
+    /// Weighted by what each part is expected to take rather than counted:
+    /// a step of LTX's second stage takes four times one of its first at
+    /// 768×512, and the loads and the decode are a quarter of the time.
+    pub progress: f32,
+    /// Seconds since the generation began.
+    pub elapsed: f64,
+}
+
+/// What a finished generation hands back.
+#[derive(Debug, Clone)]
+pub struct Filmed {
+    pub video: Video,
+    /// The sound, unless the request left it out.
+    pub audio: Option<Audio>,
+    /// The request as it was run, blanks filled.
+    pub request: Resolved,
+    /// Seconds spent loading and running the text path, the denoiser
+    /// (both stages and the upsampler between them, loads included), and
+    /// the decoders.
+    pub encode_secs: f64,
+    pub denoise_secs: f64,
+    pub decode_secs: f64,
+}
+
+/// A loaded text-to-video pipeline.
+///
+/// `Send` for the reason [`crate::image::Painter`] is. What it holds between
+/// generations is its own business: LTX holds nothing but paths, and loads
+/// each phase as it gets to it, because its phases do not fit in memory
+/// together and loading them takes seconds against a generation's minutes.
+pub trait Director: Send {
+    /// Make one video.
+    ///
+    /// `on_step` is called at the start of every phase and after every
+    /// step. Returning `false` stops the generation, which then fails with
+    /// "cancelled".
+    fn film(&mut self, req: &VideoRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Filmed>;
+
+    fn defaults(&self) -> Defaults;
+
+    /// One line for a person: architecture, size, where it runs.
+    fn summary(&self) -> String;
+
+    fn params(&self) -> usize;
+
+    /// Bytes a generation takes at its largest, for memory accounting.
+    ///
+    /// Not the weights held between generations, which may be none: what
+    /// admission has to keep free is what the next generation will need.
+    fn weight_bytes(&self) -> usize;
+
+    /// `metal q8`: where and how this pipeline runs.
+    fn backend(&self) -> String;
+}
 
 /// Frames to be shown one after another, as 8-bit RGB.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +298,13 @@ pub struct Audio {
 impl Video {
     pub fn frames(&self) -> usize {
         self.rgb.len() / (self.width * self.height * 3)
+    }
+
+    /// Frame `i` as a picture: a thumbnail, or a poster for a player that
+    /// has not started.
+    pub fn frame(&self, i: usize) -> crate::image::Image {
+        let n = self.width * self.height * 3;
+        crate::image::Image { width: self.width, height: self.height, rgb: self.rgb[i * n..(i + 1) * n].to_vec() }
     }
 
     /// The video, and the sound if there is some, as an MP4 file.
@@ -1060,5 +1309,49 @@ mod tests {
         let stbl = find(traks[1], &["mdia", "minf", "stbl"]);
         let stts = find(stbl, &["stts"]);
         assert_eq!(&stts[4..16], &[0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0x07, 0xd0]);
+    }
+
+    fn ltx() -> Defaults {
+        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121 }
+    }
+
+    #[test]
+    fn a_request_takes_the_models_defaults_for_what_it_leaves_out() {
+        let r = VideoRequest { seed: Some(3), ..VideoRequest::new("a dog") }.resolved(&ltx()).unwrap();
+        assert_eq!((r.width, r.height, r.frames, r.fps, r.seed, r.audio), (768, 512, 121, 24, 3, true));
+        assert!((r.seconds() - 121.0 / 24.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_request_the_model_cannot_make_is_refused_with_the_nearest_it_can() {
+        let bad = |f: fn(&mut VideoRequest)| {
+            let mut r = VideoRequest::new("a dog");
+            f(&mut r);
+            r.resolved(&ltx()).unwrap_err().to_string()
+        };
+        assert!(bad(|r| r.height = Some(720)).contains("try 704"), "{}", bad(|r| r.height = Some(720)));
+        assert!(bad(|r| r.frames = Some(120)).contains("try 113 or 121"), "{}", bad(|r| r.frames = Some(120)));
+        assert!(bad(|r| r.frames = Some(129)).contains("at most 121"));
+        assert!(bad(|r| r.fps = Some(0)).contains("fps"));
+        assert!(bad(|r| r.prompt = " ".into()).contains("empty"));
+        // Twice the measured size is refused, and told how long a clip at
+        // that size would fit.
+        let big = bad(|r| (r.width, r.height) = (Some(2048), Some(1536)));
+        assert!(big.contains("57 frames or fewer"), "{big}");
+    }
+
+    #[test]
+    fn the_same_volume_is_allowed_whichever_way_it_is_spent() {
+        let d = ltx();
+        let ask = |w, h, f| VideoRequest { width: Some(w), height: Some(h), frames: Some(f), ..VideoRequest::new("a dog") }.resolved(&d);
+        assert!(ask(1536, 1024, 121).is_ok());
+        assert!(ask(2048, 768, 121).is_ok());
+        assert!(ask(2048, 832, 121).is_err());
+    }
+
+    #[test]
+    fn a_frame_is_a_picture_of_its_own() {
+        let v = Video { width: 2, height: 1, fps: 24, rgb: (0..12).collect() };
+        assert_eq!(v.frame(1).rgb, [6, 7, 8, 9, 10, 11]);
     }
 }

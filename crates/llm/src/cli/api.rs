@@ -29,6 +29,20 @@ Pictures made by an image model on the server — SDXL, Qwen-Image. Every one is
 kept there, with the settings that made it; `make` also writes it here, to
 --out or to image-ID.png. Anything left out is the model's own default.";
 
+pub const VIDEOS: &str = "usage: kvad videos [ls]
+       kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]
+                               [--seconds S | --frames N] [--fps N] [--seed N] [--silent]
+       kvad videos show ID
+       kvad videos get ID [--out FILE]
+       kvad videos rm ID
+
+Clips made by a video model on the server — LTX-2.5 — with their sound. A
+video takes minutes, and is the server's job from the moment it is asked for:
+`make` waits and writes it here, to --out or to video-ID.mp4, but stopping
+the wait does not stop the video. `show` says how far along one is, `get`
+fetches it when it is done, and `rm` deletes it, stopping it if it is still
+being made. Anything left out is the model's own default.";
+
 pub const JOBS: &str = "usage: kvad jobs [ls] [--limit N]
        kvad jobs show ID
        kvad jobs watch ID      follow it until it ends
@@ -1098,6 +1112,187 @@ pub fn images(remote: &Remote, args: &Args) -> Res<()> {
         }
         other => unknown("images", other, IMAGES),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Videos
+// ---------------------------------------------------------------------------
+
+pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
+    let (sub, words) = split(args, "ls");
+    match sub {
+        "ls" => {
+            let list = remote.get("/v1/videos?limit=100")?;
+            if args.json {
+                out::json(&list);
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = list["data"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .map(|v| {
+                    vec![
+                        out::s(&v["kvad"]["id"]),
+                        state(v),
+                        out::s(&v["size"]),
+                        format!("{} s", out::s(&v["seconds"])),
+                        out::s(&v["kvad"]["seed"]),
+                        out::s(&v["model"]),
+                        out::cut(&out::s(&v["prompt"]), 40),
+                    ]
+                })
+                .collect();
+            match rows.is_empty() {
+                true => println!("no videos yet. make one:  kvad videos make \"a lighthouse at dusk, waves breaking\""),
+                false => out::table(&["ID", "STATUS", "SIZE", "LENGTH", "SEED", "MODEL", "PROMPT"], &rows),
+            }
+            Ok(())
+        }
+        "make" => {
+            let prompt = match (&args.prompt, words.is_empty()) {
+                (Some(p), _) => p.clone(),
+                (None, false) => words.join(" "),
+                (None, true) => {
+                    eprintln!("make what?\n\n{VIDEOS}");
+                    std::process::exit(2);
+                }
+            };
+            let mut body = json!({ "prompt": prompt });
+            if let Some(m) = &args.model {
+                body["model"] = json!(m);
+            }
+            if let Some(size) = &args.size {
+                body["size"] = json!(size);
+            }
+            if let Some(s) = args.seconds {
+                body["seconds"] = json!(s);
+            }
+            if let Some(n) = args.frames {
+                body["frames"] = json!(n);
+            }
+            if let Some(n) = args.fps {
+                body["fps"] = json!(n);
+            }
+            if args.seed_given {
+                body["seed"] = json!(args.seed);
+            }
+            if args.silent {
+                body["audio"] = json!(false);
+            }
+            let video = remote.post("/v1/videos", &body)?;
+            let id = out::s(&video["id"]);
+            eprintln!(
+                "{id}: {}, {} s — the server keeps making it if this stops waiting; `kvad videos get {}` fetches it",
+                out::s(&video["size"]),
+                out::s(&video["seconds"]),
+                out::s(&video["kvad"]["id"]),
+            );
+            let mut progress = out::Progress::new();
+            let video = loop {
+                let v = remote.get(&format!("/v1/videos/{id}"))?;
+                match v["status"].as_str() {
+                    Some("completed") => break v,
+                    Some("failed") => {
+                        progress.done();
+                        return Err(out::s(&v["error"]["message"]).into());
+                    }
+                    _ => progress.show(format!("  {}", state(&v))),
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            };
+            progress.done();
+            let path = args.out.clone().unwrap_or_else(|| format!("video-{}.mp4", out::s(&video["kvad"]["id"])));
+            fetch(remote, &video, &path)?;
+            let k = &video["kvad"];
+            match args.json {
+                true => out::json(&video),
+                false => eprintln!(
+                    "{path}: {}, {} frames at {} fps, seed {}{}\n  \
+                     text {:.1} s, denoise {:.1} s, decode {:.1} s",
+                    out::s(&video["size"]),
+                    out::s(&k["frames"]),
+                    out::s(&k["fps"]),
+                    out::s(&k["seed"]),
+                    if k["audio"] == json!(false) { ", no sound" } else { "" },
+                    k["encode_secs"].as_f64().unwrap_or(0.0),
+                    k["denoise_secs"].as_f64().unwrap_or(0.0),
+                    k["decode_secs"].as_f64().unwrap_or(0.0),
+                ),
+            }
+            Ok(())
+        }
+        "show" => {
+            let id = super::id(needs(words, "a video's id", VIDEOS))?;
+            let v = remote.get(&format!("/v1/videos/{id}"))?;
+            match args.json {
+                true => out::json(&v),
+                false => {
+                    println!("{}  {}", out::s(&v["id"]), state(&v));
+                    let (size, secs, seed) = (out::s(&v["size"]), out::s(&v["seconds"]), out::s(&v["kvad"]["seed"]));
+                    println!("  {size}, {secs} s, seed {seed}, {}", out::s(&v["model"]));
+                    println!("  {}", out::s(&v["prompt"]));
+                }
+            }
+            Ok(())
+        }
+        "get" => {
+            let id = super::id(needs(words, "a video's id", VIDEOS))?;
+            let v = remote.get(&format!("/v1/videos/{id}"))?;
+            if v["status"] != "completed" {
+                return Err(format!("video {id} is {}", state(&v)).into());
+            }
+            let path = args.out.clone().unwrap_or_else(|| format!("video-{id}.mp4"));
+            fetch(remote, &v, &path)
+        }
+        "rm" => {
+            let id = super::id(needs(words, "a video's id", VIDEOS))?;
+            if !out::confirm(&format!("delete video {id}?"), args.yes)? {
+                println!("cancelled");
+                return Ok(());
+            }
+            let gone = remote.delete(&format!("/v1/videos/{id}"))?;
+            match args.json {
+                true => out::json(&gone),
+                false => println!("deleted video {id}"),
+            }
+            Ok(())
+        }
+        other => unknown("videos", other, VIDEOS),
+    }
+}
+
+/// Where a video is, in a few words: `completed`, `stage 2, 61%, about 40 s
+/// left`, `queued`.
+fn state(v: &Value) -> String {
+    let k = &v["kvad"];
+    match v["status"].as_str().unwrap_or("?") {
+        "in_progress" => {
+            let p = k["progress"].as_f64().unwrap_or(0.0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            // From the share done so far: rough early on, and not shown
+            // until there is something to go on.
+            let left = match (k["started_at"].as_f64(), p > 0.05) {
+                (Some(t), true) => format!(", about {:.0} s left", (now - t) * (1.0 - p) / p),
+                _ => String::new(),
+            };
+            format!("{}, {:.0}%{left}", out::s(&k["phase"]), p * 100.0)
+        }
+        "failed" => format!("failed: {}", out::s(&v["error"]["message"])),
+        other => other.to_string(),
+    }
+}
+
+/// Write a finished video's file to `path`.
+fn fetch(remote: &Remote, video: &Value, path: &str) -> Res<()> {
+    let id = out::s(&video["id"]);
+    let bytes = remote.download(&format!("/v1/videos/{id}/content"), std::path::Path::new(path))?;
+    eprintln!("wrote {path} ({:.1} MB)", bytes as f64 / 1e6);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

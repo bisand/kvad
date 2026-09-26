@@ -533,6 +533,29 @@ impl Remote {
         self.call("delete", path, None)
     }
 
+    /// A file, written to `to` as it arrives: `kvad videos get`, whose files
+    /// run to hundreds of megabytes. Written aside and renamed, so that a
+    /// download cut short leaves no file that looks whole. The bytes
+    /// written come back.
+    pub fn download(&self, path: &str, to: &std::path::Path) -> Res<u64> {
+        let response = self.send("get", path, None, "*/*")?;
+        if response.status().as_u16() >= 400 {
+            read_reply(response, path)?;
+            return Err(format!("{path} failed").into());
+        }
+        let aside = to.with_extension("part");
+        let written = (|| {
+            let mut file = std::fs::File::create(&aside)?;
+            let n = std::io::copy(&mut response.into_body().into_reader(), &mut file)?;
+            std::fs::rename(&aside, to)?;
+            Ok::<u64, std::io::Error>(n)
+        })();
+        written.map_err(|e| {
+            let _ = std::fs::remove_file(&aside);
+            format!("could not write {}: {e}", to.display()).into()
+        })
+    }
+
     /// A request whose answer is a stream of server-sent events.
     pub fn stream(&self, method: &str, path: &str, body: Option<Body>) -> Res<Events<Stream>> {
         match self.exchange_with(method, path, body, "text/event-stream")? {
@@ -819,6 +842,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("post", "/v1/images/generations", "kvad images make"),
     ("get", "/api/images", "kvad images"),
     ("delete", "/api/images/{id}", "kvad images rm"),
+    ("post", "/v1/videos", "kvad videos make"),
+    ("get", "/v1/videos", "kvad videos"),
+    ("get", "/v1/videos/{id}", "kvad videos show, kvad videos make"),
+    ("delete", "/v1/videos/{id}", "kvad videos rm"),
+    ("get", "/v1/videos/{id}/content", "kvad videos get, kvad videos make"),
 ];
 
 /// Routes that deliberately have no command, and why not.

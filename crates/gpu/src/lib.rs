@@ -44,3 +44,4 @@ mod mpp;
 pub mod qwen3_5;
 pub mod qcache;
 mod uncached;
+pub mod video;

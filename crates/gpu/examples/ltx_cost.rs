@@ -167,7 +167,7 @@ fn accuracy(path: &std::path::Path, shape: Shape, blocks: usize, device: &Device
         let ctx = Contexts { video: on(&cv)?, audio: on(&ca)? };
         let host = |x: &Tensor| -> candle_core::Result<Tensor> { x.to_device(&Device::Cpu)?.to_dtype(DType::F32) };
         let mut out = Vec::new();
-        let (v, au) = dit.forward_watched(&on(&video)?, &on(&audio)?, (0.725, 0.725), 0, &ctx, &grid, &mut |_, vx, ax| {
+        let (v, au) = dit.forward_watched(&on(&video)?, &on(&audio)?, (0.725, 0.725), 0, &ctx, &grid, &Default::default(), &mut |_, vx, ax| {
             out.push((host(vx)?, host(ax)?));
             Ok(())
         })?;

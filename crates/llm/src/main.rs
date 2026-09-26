@@ -116,6 +116,8 @@ struct Args {
     frames: Option<usize>,
     fps: Option<u32>,
     silent: bool,
+    /// `pull` only: LTX-2.5's dev model too, for guided videos.
+    dev: bool,
     /// The picture a video starts from.
     image: Option<String>,
     quant: Precision,
@@ -186,6 +188,7 @@ impl Default for Args {
             frames: None,
             fps: None,
             silent: false,
+            dev: false,
             image: None,
             quant: Precision::F32,
             out: None,
@@ -337,6 +340,7 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--key" => a.key = true,
         "--password" => a.password = true,
         "--silent" => a.silent = true,
+        "--dev" => a.dev = true,
         _ => return false,
     }
     true

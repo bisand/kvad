@@ -209,6 +209,26 @@ impl GatedAttention {
         let o = span(|| "attention", dev, || attend(&q, &k, &v, h, gate.as_ref()))?;
         span(|| "out", dev, || lin(&self.out, &o))
     }
+
+    /// Self-attention with the attention itself skipped: the value
+    /// projection of `x`, gated and projected out as the attention's output
+    /// would have been. The reference's `all_perturbed` path, which is what
+    /// spatio-temporal guidance (STG) asks of a block: what the model makes
+    /// when that block cannot look at the other tokens.
+    pub(crate) fn value_only(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let dtype = x.dtype();
+        let v = self.v.forward_in(x, dtype)?;
+        let o = match &self.gate {
+            Some(g) => {
+                let (t, width) = v.dims2()?;
+                let gates = (candle_nn::ops::sigmoid(&g.forward(x)?.to_dtype(DType::F32)?)? * 2.0)?;
+                let o = v.to_dtype(DType::F32)?.reshape((t, self.heads, width / self.heads))?.broadcast_mul(&gates.unsqueeze(2)?)?;
+                o.reshape((t, width))?.to_dtype(dtype)?
+            }
+            None => v,
+        };
+        self.out.forward_in(&o, dtype)
+    }
 }
 
 /// Attention over `[t, heads · d]` queries and `[s, heads · d]` keys and

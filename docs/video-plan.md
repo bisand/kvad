@@ -466,7 +466,8 @@ request with guidance or a negative prompt is refused before it is queued.
 
 The dev model's guidance is CFG 3 (video) and 7 (audio), STG on block 28,
 modality guidance 3, rescale 0.7, over 30 steps: up to four DiT calls a step.
-That belongs in its own issue.
+That belongs in its own issue. (It came later; see "The dev model with its
+guidance" below.)
 
 ### Duration head
 
@@ -841,7 +842,7 @@ The same kind of checks apply here:
 8. **Later, each in its own issue:**
    - the duration head as the default (done; see below);
    - image-to-video (done; see below);
-   - the dev model with its guidance;
+   - the dev model with its guidance (done; see below);
    - the DiffVAE decoder;
    - the temporal upsampler;
    - the community GGUFs ([#42](https://github.com/bisand/kvad/issues/42));
@@ -1571,3 +1572,88 @@ floored to 8k + 1.
   `kvad videos` shows "4.71 s, from the prompt"; the page's Seconds field
   reads "auto" and says what the model may choose at the size in the form,
   and "Reuse" leaves a chosen length for the model to choose again.
+
+**The dev model with its guidance.** A request that gives `steps`,
+`guidance_scale` or `negative_prompt` now runs LTX-2.5's dev model, as the
+reference's `ti2vid_two_stages` does; one that gives none runs the distilled
+model, as before.
+
+1. **The text path** encodes the prompt and the negative prompt (the
+   reference's `DEFAULT_NEGATIVE_PROMPT`, word for word, when none is given).
+   The connectors are read from the distilled DiT's file for both models:
+   the dev file's are the same, all 258 tensors byte for byte, and so are
+   the two configs, so the text path keeps one cache.
+2. **Stage 1** runs the dev DiT at half size, from noise, in 30 Euler steps
+   on `LTX2Scheduler`'s levels (shifted as for 4096 tokens, which is what the
+   reference's pipelines always ask for, and stretched to end at 0.1). Each
+   step predicts the clean latents four times:
+   - with the prompt;
+   - with the negative prompt;
+   - with block 28's self-attention skipped, video and audio, its output
+     the value projection alone (spatio-temporal guidance, STG);
+   - with every audio–video attention skipped (modality guidance).
+
+   Then `cond + (cfg − 1)(cond − uncond) + stg(cond − blind) + (modality −
+   1)(cond − deaf)`, with CFG 3 for the video and 7 for the sound, STG 1 and
+   modality 3, rescaled so that its spread is 0.7 of the way back to
+   `cond`'s. The four calls run one after another, not batched, so memory at
+   its largest is one call's.
+3. **Stage 2** is the dev DiT with the distilled LoRA (rank 450, strength 1)
+   fused in: `W + B·A` in f32, rounded to the checkpoint's bf16, then
+   quantised to a q8 cache of its own. Its three unguided steps are the
+   distilled pipeline's, and, as in the reference, its sound is discarded
+   and stage 1's kept.
+
+What was checked against the reference, on the first two blocks and the
+heads (`scripts/ltx-fixtures.py --contexts random` and `--lora`/`--guided`;
+`examples/ltx_dit.rs`):
+
+| Piece | kvad, f32 on the CPU | kvad, bf16 on Metal | The reference's own bf16 |
+|---|---|---|---|
+| STG on the last block loaded | 111.7–120.1 dB | video 41.0, audio 45.5 at the velocity | 41.6, 45.8 |
+| Audio–video attention skipped | 114.6–120.0 dB | 42.4, 45.3 | 43.7, 45.6 |
+| The distilled LoRA fused | 114.8–120.7 dB | 44.4, 45.3 | 44.6, 45.3 |
+| One guided prediction, all four passes combined | video 102.6, audio 99.2 dB | 35.6, 27.4 | 35.7, 27.1 |
+| The 30-step schedule | within 3e-7 of every level | | |
+
+- **Each check tests what it says.** Skipping block 1's self-attention
+  leaves block 0 untouched and moves block 1 to −2.3 dB from the plain
+  pass; skipping the audio–video attention moves the outputs by 39–52 dB.
+- **A fused LoRA has to be rounded to bf16**, as the reference rounds it.
+  Kept in f32 when the rest of a check read in f32, it came out 55–62 dB
+  from the reference, where everything else is 110 dB and more.
+- **The guided prediction is further from exact in f32** (99–103 dB) than
+  one pass, because guidance multiplies the passes' tiny differences by as
+  much as 7; in bf16 it is where the reference's own bf16 is.
+
+On an M5 Pro, the lighthouse prompt at seed 1, with every cache built:
+
+| 768×512 × 121 | Distilled | Dev, guided |
+|---|---|---|
+| Text | 8.7 s load | 8.7 s load, and a second prompt |
+| Stage 1 | 17.8 s (8 steps) | 283.8 s (30 steps, 9.5 s each) |
+| Stage 2 | 28.8 s | 34.3 s, the LoRA'd DiT's 3.7 s load included |
+| All told | about 75 s | 347.2 s |
+| Peak footprint | 27.0 GB | 24.6 GB |
+
+- **1536×1024 × 121, guided**: 1486.8 s all told (stage 1 1238.9 s, 41 s
+  a step; stage 2 187.4 s; decode 38 s), with a peak footprint of 31.6 GB,
+  under the 35.3 GB admission charges for that size. One run, with a build
+  beside part of it. The distilled model's measured peak there was 33.0–35.3
+  GB; stage 1's four calls a step run one after another, so they add time,
+  not memory.
+- **The same seed makes the same file**: a second run was byte for byte
+  the first, whose caches it built.
+- **Building the caches**, once: the dev DiT loaded and quantised in 23.9 s,
+  and the dev DiT with the LoRA fused in 54.5 s; 20 GB each.
+- **Through the service**, the three knobs select the pipeline, and its
+  files come only from `kvad pull Lightricks/LTX-2.5 --dev` (51 GB): a
+  guided request before that is a 400 naming the command, and so is one to
+  a model without a guided pipeline. `kvad.guided` says how a video was
+  guided; the page has the three fields folded under "Guidance". Through
+  the test server, `kvad videos make … --seconds 2 --steps 12 --guidance 4`
+  made a 49-frame clip (text 9.9 s, denoise 74.5 s, decode 5.8 s), stored
+  with `guided: { steps: 12, guidance: 4 }`, and "Reuse" put both back.
+  `kvad pull … --dev` fetches the two files alone: the plain pull of LTX's
+  repo looks for a model index it does not have, and a load fetches the
+  distilled model's files.

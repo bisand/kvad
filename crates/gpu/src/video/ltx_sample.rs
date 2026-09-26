@@ -25,7 +25,7 @@
 //! for every token all the same, so a seed makes the same noise with a
 //! picture as without.
 
-use super::ltx_dit::{audio_latent, audio_tokens, video_latent, video_tokens, Dit, Grid};
+use super::ltx_dit::{audio_latent, audio_tokens, video_latent, video_tokens, Dit, Grid, Perturb};
 use super::ltx_text::Contexts;
 use crate::image::nn::noise;
 use candle_core::{DType, Tensor};
@@ -184,9 +184,228 @@ pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u
     Ok(Latents { video: video_latent(&xv.to_dtype(DType::F32)?, shape)?, audio: audio_latent(&xa.to_dtype(DType::F32)?, 8)? })
 }
 
+// ---------------------------------------------------------------------------
+// The dev model: guided, in more steps
+// ---------------------------------------------------------------------------
+
+/// Stage 1's steps for the dev model, as LTX-2.5's reference pipelines run it.
+pub const DEV_STEPS: usize = 30;
+
+/// The dev model's noise levels for `steps` steps: LTX's `LTX2Scheduler`.
+///
+/// Evenly spaced levels from 1 to 0, shifted towards 1 by `e^s / (e^s +
+/// 1/σ − 1)` with `s` 2.05, and then stretched so that the last level before
+/// 0 is 0.1. The shift depends on the token count in the reference's
+/// formula, but its pipelines never pass a latent, so it is always the one
+/// for 4096 tokens. In f32, in the reference's order, where it first
+/// comes to 0.99999994 rather than 1.
+pub fn dev_sigmas(steps: usize) -> Vec<f32> {
+    let (base, most, base_at, most_at) = (0.95f64, 2.05f64, 1024.0f64, 4096.0f64);
+    let shift = 4096.0 * ((most - base) / (most_at - base_at)) + (base - (most - base) / (most_at - base_at) * base_at);
+    let e = shift.exp() as f32;
+    let shifted: Vec<f32> = (0..=steps)
+        .map(|i| 1.0 - i as f32 / steps as f32)
+        .map(|s| match s == 0.0 {
+            true => 0.0,
+            false => e / (e + (1.0 / s - 1.0)),
+        })
+        .collect();
+    // The last level before 0 is stretched to 0.1, and the rest with it.
+    let last = 1.0 - shifted[steps - 1];
+    let scale = last / (1.0 - 0.1f32);
+    shifted.iter().map(|&s| if s == 0.0 { 0.0 } else { 1.0 - (1.0 - s) / scale }).collect()
+}
+
+/// How hard to steer one stream, and away from what.
+///
+/// Each prediction of the clean latent is `cond + (cfg − 1)·(cond − uncond)
+/// + stg·(cond − blind) + (modality − 1)·(cond − deaf)`: away from the
+/// negative prompt, away from the model with its STG block's self-attention
+/// skipped, and away from each stream made without the other. Then it is
+/// scaled so that its spread is `rescale` of the way back to `cond`'s, which
+/// keeps a strong guidance from washing out the colours.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Guide {
+    pub cfg: f32,
+    pub stg: f32,
+    pub modality: f32,
+    pub rescale: f32,
+}
+
+/// LTX-2.5's guidance, from its reference's `PipelineParams` for 2.3 and
+/// after: CFG 3 for the video and 7 for the sound, STG 1 on block 28,
+/// modality 3, rescale 0.7.
+pub const VIDEO_GUIDE: Guide = Guide { cfg: 3.0, stg: 1.0, modality: 3.0, rescale: 0.7 };
+pub const AUDIO_GUIDE: Guide = Guide { cfg: 7.0, stg: 1.0, modality: 3.0, rescale: 0.7 };
+pub const STG_BLOCK: usize = 28;
+
+/// What the guided pipelines steer away from when a request names nothing
+/// else: the reference's `DEFAULT_NEGATIVE_PROMPT`, word for word.
+pub const NEGATIVE_PROMPT: &str = "has_subtitles, has_blurbox, transition from black, transition to black, speech_ending_short, \
+    blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, \
+    grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, \
+    deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, \
+    wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of \
+    field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent \
+    lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny \
+    valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, \
+    mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, \
+    off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward \
+    pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, \
+    inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts.";
+
+impl Guide {
+    /// The guided prediction, from the four in the model's dtype, computed
+    /// in f32 and rounded back once, as the reference's `MultiModalGuider`
+    /// does. The spread is the unbiased standard deviation over the whole
+    /// stream, tokens and channels alike.
+    fn combine(&self, cond: &Tensor, uncond: &Tensor, blind: &Tensor, deaf: &Tensor) -> candle_core::Result<Tensor> {
+        let f = |t: &Tensor| t.to_dtype(DType::F32);
+        let c = f(cond)?;
+        let pred = ((&c + ((&c - f(uncond)?)? * (self.cfg - 1.0) as f64)?)? + ((&c - f(blind)?)? * self.stg as f64)?)?;
+        let pred = (pred + ((&c - f(deaf)?)? * (self.modality - 1.0) as f64)?)?;
+        let pred = match self.rescale {
+            0.0 => pred,
+            r => {
+                let factor = r * (std(&c)? / std(&pred)?) + (1.0 - r);
+                (pred * factor as f64)?
+            }
+        };
+        pred.to_dtype(cond.dtype())
+    }
+}
+
+/// The unbiased standard deviation of every element, as torch's `std()`.
+fn std(t: &Tensor) -> candle_core::Result<f32> {
+    let x = t.flatten_all()?;
+    let n = x.dim(0)? as f64;
+    let mean = x.mean_all()?.to_scalar::<f32>()? as f64;
+    let ss = x.broadcast_sub(&Tensor::new(mean as f32, x.device())?)?.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+    Ok((ss / (n - 1.0)).sqrt() as f32)
+}
+
+/// One guided prediction of the clean latents at σ `s`, from video tokens
+/// `xv` and audio tokens `xa`, in their dtype: the reference's
+/// `_guided_denoise`, with its four passes one after another.
+///
+/// Each pass's prediction is `x − σ·v`, rounded to the latents' dtype as
+/// the reference's `X0Model` rounds it; the held frame's is the frame
+/// itself, its own σ being 0, and after the guidance it is put back, since
+/// the rescale scales it with the rest.
+#[allow(clippy::too_many_arguments)]
+pub fn guided_x0(
+    dit: &Dit,
+    xv: &Tensor,
+    xa: &Tensor,
+    s: f32,
+    pos: &Contexts,
+    neg: &Contexts,
+    grid: &Grid,
+    (gv, ga): (Guide, Guide),
+    still: Option<&Tensor>,
+) -> Res<(Tensor, Tensor)> {
+    let n0 = held(still, grid.shape())?;
+    let keep = xv.dtype();
+    let f = |t: &Tensor| t.to_dtype(DType::F32);
+    let x0 = |ctx: &Contexts, p: &Perturb| -> Res<(Tensor, Tensor)> {
+        let (vv, va) = dit.forward_perturbed(xv, xa, (s, s), n0, ctx, grid, p)?;
+        let v0 = hold(&(f(xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?, still)?;
+        Ok((v0, (f(xa)? - (f(&va)? * s as f64)?)?.to_dtype(xa.dtype())?))
+    };
+    let blind = Perturb { blind: vec![STG_BLOCK.min(dit.layers().saturating_sub(1))], deaf: false };
+    let deaf = Perturb { blind: vec![], deaf: true };
+    let (cv, ca) = x0(pos, &Perturb::default())?;
+    let (uv, ua) = x0(neg, &Perturb::default())?;
+    let (bv, ba) = x0(pos, &blind)?;
+    let (dv, da) = x0(pos, &deaf)?;
+    Ok((hold(&gv.combine(&cv, &uv, &bv, &dv)?, still)?, ga.combine(&ca, &ua, &ba, &da)?))
+}
+
+/// Stage 1 for the dev model: from pure noise, in [`dev_sigmas`]' steps of
+/// Euler, each prediction of the clean latent guided as `guides` say
+/// (video, sound). `pos` is the prompt's contexts and `neg` the negative
+/// prompt's. Four DiT calls a step, one after another rather than batched,
+/// so that the memory at its largest is one call's: the prompt, the
+/// negative prompt, the model blinded at [`STG_BLOCK`], and each stream
+/// deaf to the other. `still`, `step`: as [`one_stage`].
+#[allow(clippy::too_many_arguments)]
+pub fn guided(
+    dit: &Dit,
+    pos: &Contexts,
+    neg: &Contexts,
+    grid: &Grid,
+    seed: u64,
+    sigmas: &[f32],
+    guides: (Guide, Guide),
+    still: Option<&Tensor>,
+    step: OnStep<'_>,
+) -> Res<Latents> {
+    let shape = grid.shape();
+    let (dev, keep) = (dit.device(), DType::BF16);
+    let (nv, na) = (shape.video_tokens(), shape.audio_latents());
+    // Checked here, before thirty steps of work, rather than at the first.
+    held(still, shape)?;
+    let mut xv = hold(&noise(stream(seed, 0), &[nv, 128], dev, keep)?, still)?;
+    let mut xa = noise(stream(seed, 1), &[na, 128], dev, keep)?;
+    for i in 0..sigmas.len() - 1 {
+        let (s, next) = (sigmas[i], sigmas[i + 1]);
+        let (x0v, x0a) = guided_x0(dit, &xv, &xa, s, pos, neg, grid, guides, still)?;
+        xv = hold(&euler(&xv, &x0v, s, next)?, still)?;
+        xa = euler(&xa, &x0a, s, next)?;
+        step(i, next, &x0v)?;
+    }
+    Ok(Latents { video: video_latent(&xv.to_dtype(DType::F32)?, shape)?, audio: audio_latent(&xa.to_dtype(DType::F32)?, 8)? })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_negative_prompt_is_one_line_with_single_spaces() {
+        // Rust's `\` line continuation eats the next line's indent, so the
+        // string is the reference's: its joined literals, one space apart.
+        assert!(!NEGATIVE_PROMPT.contains("  ") && !NEGATIVE_PROMPT.contains('\n'));
+        assert!(NEGATIVE_PROMPT.starts_with("has_subtitles, has_blurbox,") && NEGATIVE_PROMPT.ends_with("or AI artifacts."));
+        assert_eq!(NEGATIVE_PROMPT.len(), 1171);
+    }
+
+    #[test]
+    fn the_dev_schedule_is_the_reference_s() {
+        // `LTX2Scheduler().execute(steps=30)`, printed to nine figures.
+        let want = [
+            0.99999994, 0.99495703, 0.989603043, 0.983908415, 0.977839589, 0.97135824, 0.964421213, 0.956978142, 0.948972046,
+            0.940336406, 0.930993795, 0.920853794, 0.909809828, 0.897735238, 0.884478688, 0.869858027, 0.853650749, 0.835584104,
+            0.815318584, 0.792426705, 0.766362846, 0.736418009, 0.701656222, 0.660813332, 0.612140656, 0.553147852, 0.480163693,
+            0.387540817, 0.266120434, 0.100000024, 0.0,
+        ];
+        let got = dev_sigmas(DEV_STEPS);
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!((g - w as f32).abs() < 3e-7, "step {i}: {g} against {w}");
+        }
+    }
+
+    #[test]
+    fn guidance_steers_away_and_rescales_as_the_reference_does() {
+        let dev = candle_core::Device::Cpu;
+        let t = |v: &[f32]| Tensor::new(v, &dev).unwrap();
+        let (c, u, b, d) = (t(&[1.0, 2.0, 3.0, 4.0]), t(&[1.0, 1.0, 1.0, 1.0]), t(&[0.0, 2.0, 3.0, 4.0]), t(&[1.0, 2.0, 3.0, 5.0]));
+        let g = Guide { cfg: 3.0, stg: 1.0, modality: 3.0, rescale: 0.0 };
+        // cond + 2(cond − uncond) + (cond − blind) + 2(cond − deaf).
+        let want = [1.0 + 0.0 + 1.0 + 0.0, 2.0 + 2.0, 3.0 + 4.0, 4.0 + 6.0 - 2.0];
+        assert_eq!(g.combine(&c, &u, &b, &d).unwrap().to_vec1::<f32>().unwrap(), want);
+        // Rescaled: std(cond)/std(pred) of the way, times 0.7, plus 0.3.
+        let r = Guide { rescale: 0.7, ..g }.combine(&c, &u, &b, &d).unwrap().to_vec1::<f32>().unwrap();
+        let sd = |v: &[f32]| {
+            let m = v.iter().sum::<f32>() / v.len() as f32;
+            (v.iter().map(|x| (x - m).powi(2)).sum::<f32>() / (v.len() - 1) as f32).sqrt()
+        };
+        let factor = 0.7 * sd(&[1.0, 2.0, 3.0, 4.0]) / sd(&want) + 0.3;
+        for (x, w) in r.iter().zip(want) {
+            assert!((x - w * factor).abs() < 1e-5, "{r:?}");
+        }
+    }
 
     #[test]
     fn ancestral_coefficients_match_the_plans_table() {

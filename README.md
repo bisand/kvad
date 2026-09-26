@@ -2472,7 +2472,8 @@ images endpoint, with steps, guidance, seed and a negative prompt beside its
 fields; every picture is kept, with the settings that made it. `/v1/videos` is
 OpenAI's video endpoint, a job that answers at once and is watched until it is
 done, for LTX-2.5's clips with sound, from a prompt or from a picture and a
-prompt (`docs/video-plan.md`). Four authentication modes (`none`, `local`, `basic`,
+prompt, fast from its distilled model or guided from its dev model
+(`docs/video-plan.md`). Four authentication modes (`none`, `local`, `basic`,
 `oidc`), roles, API keys. SQLite for everything the filesystem cannot answer.
 `docs/ui-plan.md` is the plan it was built from, and each phase in it records
 what that phase measured and which of its open questions closed.

@@ -218,6 +218,11 @@ impl Vault {
         vault
     }
 
+    /// Whether this load is served from a cache already written.
+    pub(crate) fn is_reading(&self) -> bool {
+        self.read.is_some()
+    }
+
     /// `name`, already quantised, if the file has it in the shape asked for.
     ///
     /// A shape that disagrees is treated as a miss rather than an error: the

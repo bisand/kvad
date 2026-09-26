@@ -161,13 +161,18 @@ pub struct Stored {
     pub picture: bool,
     /// Whether the model chose its length. `frames` is 0 until it has.
     pub chosen: bool,
+    /// The guided pipeline's steps and scale, when it made the video, and
+    /// the negative prompt, when the request gave one.
+    pub steps: Option<u32>,
+    pub guidance: Option<f64>,
+    pub negative_prompt: Option<String>,
 }
 
 const COLUMNS: &str = "id, model, backend, prompt, width, height, frames, fps, seed, audio, status, progress, \
                        phase, error, bytes, encode_secs, denoise_secs, decode_secs, created_at, \
                        CAST(strftime('%s', created_at) AS INTEGER), \
                        CAST(strftime('%s', started_at) AS INTEGER), CAST(strftime('%s', completed_at) AS INTEGER), \
-                       picture, chosen";
+                       picture, chosen, steps, guidance, negative_prompt";
 
 fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
     Ok(Stored {
@@ -195,6 +200,9 @@ fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
         completed: r.get(21)?,
         picture: r.get::<_, i64>(22)? != 0,
         chosen: r.get::<_, i64>(23)? != 0,
+        steps: r.get(24)?,
+        guidance: r.get(25)?,
+        negative_prompt: r.get(26)?,
     })
 }
 
@@ -246,6 +254,12 @@ impl Stored {
                 "frames": (self.frames > 0).then_some(self.frames),
                 // Whether the model chose the length, from the prompt.
                 "length_chosen": self.chosen,
+                // How it was guided, when it was: the dev model's pipeline.
+                "guided": self.steps.map(|steps| json!({
+                    "steps": steps,
+                    "guidance": self.guidance,
+                    "negative_prompt": self.negative_prompt,
+                })),
                 "fps": self.fps,
                 "seed": self.seed,
                 "audio": self.audio,
@@ -290,8 +304,8 @@ const CANCELLED: &str = "cancelled";
 pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::video::Resolved, picture: bool) -> Res<Stored> {
     let id = db.with(|c| {
         c.execute(
-            "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio, picture, chosen) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio, picture, chosen, \
+             steps, guidance, negative_prompt) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 owner,
                 model,
@@ -304,7 +318,10 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
                 r.seed as i64,
                 r.audio as i64,
                 picture as i64,
-                r.chosen as i64
+                r.chosen as i64,
+                r.guided.as_ref().map(|g| g.steps as i64),
+                r.guided.as_ref().map(|g| g.guidance as f64),
+                r.guided.as_ref().and_then(|g| g.negative_prompt.clone())
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -755,16 +772,6 @@ fn data_url(url: &str) -> Result<Vec<u8>, Fail> {
 impl Asked {
     fn read(f: &Fields) -> Result<Asked, Fail> {
         let picture = picture(f)?;
-        // Refused rather than ignored, as images refuse a guidance scale a
-        // model has no use for: a video made without what was asked for
-        // should not be filed as if it had been.
-        for knob in ["negative_prompt", "guidance_scale", "steps", "num_inference_steps"] {
-            if f.get(&[knob]).is_some() {
-                return Err(Fail::bad(format!(
-                    "{knob}: this model makes videos on a fixed schedule, without guidance; leave it out"
-                )));
-            }
-        }
         let prompt = f.text(&["prompt"]).ok_or_else(|| Fail::bad("prompt is required"))?;
         let (width, height) = match f.text(&["size"]).as_deref().map(str::trim) {
             None | Some("auto") => (None, None),
@@ -796,6 +803,12 @@ impl Asked {
                 audio: f.flag("audio")?,
                 // Read in `create`, where `ffmpeg` is known.
                 image: None,
+                // Any of these asks for the guided pipeline; a model without
+                // one refuses them by name, as images refuse a guidance scale
+                // a model has no use for.
+                steps: f.number(&["steps", "num_inference_steps"])?,
+                guidance: f.number(&["guidance_scale", "guidance"])?,
+                negative_prompt: f.text(&["negative_prompt"]),
             },
             seconds,
             picture,
@@ -881,6 +894,13 @@ pub async fn create(who: Identity, headers: HeaderMap, St(state): St<State>, bod
         }
     };
     request.seed = Some(resolved.seed);
+    // The guided pipeline's files, which a load does not fetch.
+    if resolved.guided.is_some() {
+        if let Err(why) = crate::engine::guided_ready(&resident.model.repo) {
+            forget(&upload);
+            return Err(Fail::bad(why));
+        }
+    }
 
     let (db, owner, model, backend) =
         (state.db.clone(), who.id, resident.model.repo.clone(), resident.model.backend.clone());
@@ -1248,7 +1268,7 @@ mod tests {
     use kvad::video::{Audio, Resolved, Video};
 
     fn resolved(seed: u64) -> Resolved {
-        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, fps: 24, seed, audio: true }
+        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, guided: None, fps: 24, seed, audio: true }
     }
 
     fn filmed(seed: u64) -> Filmed {
@@ -1325,6 +1345,19 @@ mod tests {
         assert!(advance(&db, q.id, &step).unwrap());
         let v = get_one(&db, q.id, None).unwrap().unwrap().resource();
         assert_eq!((v["seconds"].as_str(), v["kvad"]["frames"].as_u64()), (Some("4.04"), Some(97)));
+    }
+
+    /// A guided video says how it was guided; an unguided one says nothing.
+    #[test]
+    fn a_guided_video_keeps_its_guidance() {
+        let db = Db::in_memory().unwrap();
+        let g = kvad::video::GuidedRun { steps: 20, guidance: 4.5, negative_prompt: Some("blur".into()) };
+        let q = queue(&db, None, "m", "b", &Resolved { guided: Some(g), ..resolved(1) }, false).unwrap();
+        assert_eq!(q.resource()["kvad"]["guided"], json!({ "steps": 20, "guidance": 4.5, "negative_prompt": "blur" }));
+        let g = kvad::video::GuidedRun { steps: 30, guidance: 3.0, negative_prompt: None };
+        let q = queue(&db, None, "m", "b", &Resolved { guided: Some(g), ..resolved(2) }, false).unwrap();
+        assert_eq!(q.resource()["kvad"]["guided"]["negative_prompt"], Value::Null);
+        assert_eq!(queue(&db, None, "m", "b", &resolved(3), false).unwrap().resource()["kvad"]["guided"], Value::Null);
     }
 
     /// A video that started from a picture links to it, and its picture
@@ -1472,6 +1505,7 @@ mod tests {
         max_volume: 1536 * 1024 * 121,
         image: true,
         duration: false,
+        guided: Some(kvad::video::Guided { steps: 30, max_steps: 60, guidance: 3.0 }),
     };
 
     #[test]
@@ -1504,12 +1538,14 @@ mod tests {
         assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "image_url": "x" } })).contains("not a data: URL"));
         assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "file_id": "file-123" } })).contains("no Files API"));
         assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "image_url": "data:image/png;base64,!!" } })).contains("not base64"));
-        assert!(refuse(json!({ "prompt": "a dog", "negative_prompt": "blur" })).contains("without guidance"));
         assert!(refuse(json!({ "prompt": "a dog", "seconds": 4, "frames": 97 })).contains("not both"));
         assert!(refuse(json!({ "prompt": "a dog", "size": "big" })).contains("WIDTHxHEIGHT"));
         assert!(refuse(json!({ "size": "768x512" })).contains("prompt"));
         // Empty is the same as left out.
-        assert!(Asked::read(&json_fields(json!({ "prompt": "a dog", "negative_prompt": "" }))).is_ok());
+        assert_eq!(Asked::read(&json_fields(json!({ "prompt": "a dog", "negative_prompt": "" }))).unwrap().request.negative_prompt, None);
+        // The guidance knobs, in OpenAI-ish and diffusers' names.
+        let a = Asked::read(&json_fields(json!({ "prompt": "a dog", "num_inference_steps": "20", "guidance_scale": 4.5, "negative_prompt": "blur" }))).unwrap();
+        assert_eq!((a.request.steps, a.request.guidance, a.request.negative_prompt.as_deref()), (Some(20), Some(4.5), Some("blur")));
     }
 
     /// The body OpenAI's Python SDK sends for `videos.create`, with a file

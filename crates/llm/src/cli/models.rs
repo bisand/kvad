@@ -247,13 +247,17 @@ pub fn info(remote: &Remote, args: &Args) -> Res<()> {
 /// `kvad pull` — a job on the server, followed until it ends.
 pub fn pull(remote: &Remote, args: &Args) -> Res<()> {
     let Some(repo) = args.target.clone().or_else(|| args.model.clone()) else {
-        eprintln!("usage: kvad pull REPO");
+        eprintln!("usage: kvad pull REPO [--dev]");
         std::process::exit(2);
     };
-    let job = remote.post("/api/models/pull", &json!({ "repo": repo }))?;
+    // `--dev`: LTX-2.5's dev model and distilled LoRA too, 51 GB, which a
+    // video asks for by giving steps, guidance or a negative prompt.
+    let job = remote.post("/api/models/pull", &json!({ "repo": repo, "dev": args.dev }))?;
     super::api::follow(remote, &job, args)?;
-    if !args.json {
-        println!("\nrun it with:  kvad run --model {repo}");
+    match (args.json, args.dev) {
+        (true, _) => {}
+        (false, true) => println!("\nguided videos, 30 steps unless --steps says:  kvad videos make \"…\" --guidance 3"),
+        (false, false) => println!("\nrun it with:  kvad run --model {repo}"),
     }
     Ok(())
 }

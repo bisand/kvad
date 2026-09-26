@@ -633,6 +633,79 @@ pub(crate) struct Reader<'a> {
     /// went wrong in the first place. DeepSeek V3's multi-token-prediction head
     /// is the case this exists for.
     skipped: Rc<RefCell<Vec<String>>>,
+    /// A LoRA fused into what is read; see [`Lora`].
+    lora: Option<Rc<Lora>>,
+}
+
+/// A LoRA, fused into each weight it adapts as the weight is read:
+/// `W + strength · B·A`.
+///
+/// LTX-2.5's distilled LoRA is how its dev model makes its second stage,
+/// and it is fused before quantising, as the reference fuses it into the
+/// bf16 weights before anything runs: in f32, then rounded to the
+/// checkpoint's dtype, `stored`, once, whatever dtype the rest of the load
+/// reads in. Kept in f32 instead, a DiT's first two blocks came out 55–62 dB
+/// from the reference's in f32, where they are 110 dB and more otherwise. So a quantised cache of the fused model is written once, and
+/// a load that reads that cache never comes here.
+///
+/// A LoRA's names are the model's, with `strip` taken off the front, and
+/// `.lora_A.weight` and `.lora_B.weight` for `.weight`; its `alpha / rank`
+/// scale is 1 (checked at [`Lora::open`]).
+pub(crate) struct Lora {
+    st: candle_core::safetensors::MmapedSafetensors,
+    strength: f64,
+    strip: String,
+    stored: DType,
+    /// Where the product `B·A` is taken: a rank-450 product over the whole
+    /// DiT is about 20 TFLOP, seconds on the GPU and minutes on the host.
+    device: Device,
+    /// The A–B pairs fused so far, to say at the end if any was not.
+    fused: RefCell<usize>,
+    pairs: usize,
+}
+
+impl Lora {
+    pub(crate) fn open(path: &std::path::Path, strength: f64, strip: &str, stored: DType, device: &Device) -> Res<Self> {
+        // SAFETY: a read-only file in the Hub's cache, as every other here.
+        let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(path)? };
+        let names: Vec<String> = st.tensors().into_iter().map(|(n, _)| n).collect();
+        let pairs = names.iter().filter(|n| n.ends_with(".lora_A.weight")).count();
+        if pairs == 0 || names.len() != 2 * pairs {
+            return Err(format!("{}: {} tensors, of which {pairs} are LoRA A factors: not a plain LoRA", path.display(), names.len()).into());
+        }
+        // alpha / rank, where the file says; kvad fuses at a scale of one.
+        let meta = crate::video::metadata_raw(path)?;
+        if let (Some(a), Some(r)) = (meta.get("lora_alpha"), meta.get("lora_rank")) {
+            if a != r {
+                return Err(format!("{}: alpha {a} over rank {r}, and only a scale of one is implemented", path.display()).into());
+            }
+        }
+        Ok(Lora { st, strength, strip: strip.to_string(), stored, device: device.clone(), fused: RefCell::new(0), pairs })
+    }
+
+    /// `w`, read as `name`, with this LoRA's product added if it adapts it.
+    fn fuse(&self, name: &str, w: Tensor) -> candle_core::Result<Tensor> {
+        let Some(base) = name.strip_suffix(".weight").and_then(|n| n.strip_prefix(self.strip.as_str())) else {
+            return Ok(w);
+        };
+        let (Ok(a), Ok(b)) = (self.st.load(&format!("{base}.lora_A.weight"), &self.device), self.st.load(&format!("{base}.lora_B.weight"), &self.device)) else {
+            return Ok(w);
+        };
+        let f = |t: Tensor| t.to_dtype(DType::F32);
+        // (B · strength) · A in f32, plus the weight, rounded once.
+        let delta = (f(b)? * self.strength)?.matmul(&f(a)?)?.to_device(w.device())?;
+        if delta.dims() != w.dims() {
+            candle_core::bail!("{name}: the LoRA's product is {:?} and the weight {:?}", delta.dims(), w.dims());
+        }
+        *self.fused.borrow_mut() += 1;
+        (delta + f(w.clone())?)?.to_dtype(self.stored)?.to_dtype(w.dtype())
+    }
+
+    /// The pairs this LoRA holds that no read asked for: a LoRA meant for
+    /// another model, or a part of this one not loaded.
+    pub(crate) fn unused(&self) -> usize {
+        self.pairs - *self.fused.borrow()
+    }
 }
 
 impl<'a> Reader<'a> {
@@ -641,7 +714,13 @@ impl<'a> Reader<'a> {
             vb,
             seen: Rc::new(RefCell::new(HashSet::new())),
             skipped: Rc::new(RefCell::new(Vec::new())),
+            lora: None,
         }
+    }
+
+    /// The same reader, with `lora` fused into every weight it adapts.
+    pub(crate) fn with_lora(self, lora: Rc<Lora>) -> Self {
+        Reader { lora: Some(lora), ..self }
     }
 
     /// Descend into a prefix, keeping the shared record.
@@ -650,6 +729,7 @@ impl<'a> Reader<'a> {
             vb: self.vb.pp(s.to_string()),
             seen: Rc::clone(&self.seen),
             skipped: Rc::clone(&self.skipped),
+            lora: self.lora.clone(),
         }
     }
 
@@ -682,7 +762,11 @@ impl<'a> Reader<'a> {
         name: &str,
     ) -> candle_core::Result<Tensor> {
         self.record(name);
-        self.vb.get(shape, name)
+        let w = self.vb.get(shape, name)?;
+        match &self.lora {
+            Some(l) => l.fuse(&self.full(name), w),
+            None => Ok(w),
+        }
     }
 
     /// A depthwise convolution's filters, as `[channels, kernel]`.

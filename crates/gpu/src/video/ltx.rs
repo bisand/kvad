@@ -21,8 +21,8 @@
 //! peak of the largest clip [`Defaults::max_volume`] allows.
 
 use super::ltx_dit::{video_tokens, Dit, Shape};
-use super::ltx_sample::{one_stage, refine, Latents, STAGE_1, STAGE_2};
-use super::ltx_text::{Contexts, TextEncoder, DIT_FILE, TEXT_FILE};
+use super::ltx_sample::{dev_sigmas, guided, one_stage, refine, Guide, Latents, AUDIO_GUIDE, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
+use super::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
 use super::{ltx_audio, ltx_duration, ltx_upsample, ltx_vae};
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
@@ -82,6 +82,20 @@ pub fn is_pipeline(repo: &str) -> bool {
     // By the file `kvad::hub::pipeline` knows it by, asked directly: the
     // listing would size every model in the cache to answer.
     crate::image::local_file(repo, kvad::video::LTX_DENOISER).is_some()
+}
+
+/// Whether `repo`'s guided pipeline can run: its dev DiT and distilled LoRA
+/// on this machine, asked of the disk. `Err` says how to fetch them.
+pub fn guided_ready(repo: &str) -> Result<(), String> {
+    let missing: Vec<&str> = kvad::video::LTX_DEV_FILES.iter().copied().filter(|f| crate::image::local_file(repo, f).is_none()).collect();
+    match missing.is_empty() {
+        true => Ok(()),
+        false => Err(format!(
+            "guidance runs {repo}'s dev model, whose files are not on this machine ({}); \
+             `kvad pull {repo} --dev` fetches them, 51 GB",
+            missing.join(", ")
+        )),
+    }
 }
 
 /// What loading `repo` will need admitted, when every file it reads is on
@@ -180,6 +194,8 @@ impl Ltx {
             max_volume: volume_for_this_machine(),
             image: true,
             duration: head.is_some(),
+            // The dev model, whose files `kvad pull … --dev` fetches.
+            guided: Some(kvad::video::Guided { steps: super::ltx_sample::DEV_STEPS, max_steps: 60, guidance: VIDEO_GUIDE.cfg }),
         };
         Ok(Ltx { repo: repo.to_string(), paths, head, quant, device, defaults, params })
     }
@@ -213,8 +229,13 @@ fn header_params(path: &Path, skip: &[&str]) -> Res<usize> {
 struct Plan {
     /// Encoding the picture a video starts from, when there is one.
     picture: f64,
+    /// Stage 1's steps, and the DiT calls each makes: 8 and 1 for the
+    /// distilled model, the request's steps and 4 for the dev model.
+    steps_1: usize,
     text: f64,
     load: f64,
+    /// Loading stage 2's DiT: only the dev model has a second one.
+    load_2: f64,
     stage_1: f64,
     upsample: f64,
     stage_2: f64,
@@ -222,15 +243,23 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(first: Shape, full: Shape, picture: bool) -> Self {
+    fn new(first: Shape, full: Shape, picture: bool, guided: Option<usize>) -> Self {
         let step = |tokens: usize| tokens as f64 * (1.386e-3 + 2.86e-8 * tokens as f64);
         let at_768 = (768 * 512 * 121) as f64;
         let volume = (full.width * full.height * full.frames) as f64;
+        let (steps_1, calls) = match guided {
+            Some(n) => (n, 4.0),
+            None => (STAGE_1.len() - 1, 1.0),
+        };
         Plan {
             picture: if picture { 1.0 } else { 0.0 },
-            text: 9.4,
+            steps_1,
+            // The dev model encodes a negative prompt too, and loads a
+            // second DiT for stage 2.
+            text: if guided.is_some() { 10.0 } else { 9.4 },
             load: 3.5,
-            stage_1: step(first.video_tokens()),
+            load_2: if guided.is_some() { 3.5 } else { 0.0 },
+            stage_1: step(first.video_tokens()) * calls,
             upsample: 2.1 * full.video_tokens() as f64 / 6144.0,
             stage_2: step(full.video_tokens()),
             decode: 13.0 * volume / at_768,
@@ -238,7 +267,7 @@ impl Plan {
     }
 
     fn total(&self) -> f64 {
-        self.picture + self.text + self.load + self.stage_1 * (STAGE_1.len() - 1) as f64 + self.upsample + self.stage_2 * (STAGE_2.len() - 1) as f64 + self.decode
+        self.picture + self.text + self.load + self.load_2 + self.stage_1 * self.steps_1 as f64 + self.upsample + self.stage_2 * (STAGE_2.len() - 1) as f64 + self.decode
     }
 }
 
@@ -255,7 +284,8 @@ impl Ltx {
         };
         let (mut first, mut full) = shapes(r.frames)?;
         let (device, dtype, quant) = (&self.device, DType::BF16, Some(self.quant));
-        let mut plan = Plan::new(first, full, req.image.is_some());
+        let guided_steps = r.guided.as_ref().map(|g| g.steps);
+        let mut plan = Plan::new(first, full, req.image.is_some(), guided_steps);
         let total = std::cell::Cell::new(plan.total());
         let chosen = std::cell::Cell::new(None);
         let started = Instant::now();
@@ -269,7 +299,17 @@ impl Ltx {
             }
         };
         let mut quiet = |_: &str| {};
-        let (s1, s2) = (STAGE_1.len() - 1, STAGE_2.len() - 1);
+        let s2 = STAGE_2.len() - 1;
+        // The dev model's files, when the request wants guidance: asked again
+        // here, since they could have gone since the request was checked.
+        let dev = match &r.guided {
+            Some(_) => {
+                guided_ready(&self.repo)?;
+                let find = |f: &str| crate::image::local_file(&self.repo, f).ok_or_else(|| format!("{f} is not on this machine"));
+                Some((find(DEV_FILE)?, find(DISTILLED_LORA)?))
+            }
+            None => None,
+        };
 
         // 0. The picture, when the video starts from one: encoded at each
         // stage's size, from the picture itself each time, as the reference
@@ -297,9 +337,16 @@ impl Ltx {
 
         // 1. The prompt.
         report("text", 0, 1, plan.picture, None)?;
-        let ctx = {
+        // The connectors are read from the distilled DiT's file whichever
+        // model runs: the dev file's are the same, byte for byte (258 of 258
+        // tensors, checked), so the text path has one cache.
+        let (ctx, neg) = {
             let enc = TextEncoder::load(&self.paths[0], &self.paths[1], device, dtype, quant, &mut quiet)?;
-            enc.encode(&r.prompt)?
+            let neg = match &r.guided {
+                Some(g) => Some(enc.encode(g.negative_prompt.as_deref().unwrap_or(NEGATIVE_PROMPT))?),
+                None => None,
+            };
+            (enc.encode(&r.prompt)?, neg)
         };
         // The length, when the model chooses it: the head reads the two
         // contexts just made, and chooses within the reference's 1–20 s and
@@ -309,7 +356,7 @@ impl Ltx {
             let most = ((ltx_duration::MAX_SECONDS * fps).round() as usize).min(r.frames);
             r.frames = ltx_duration::frames_for(seconds, fps, (ltx_duration::MIN_SECONDS * fps).round() as usize, most);
             (first, full) = shapes(r.frames)?;
-            plan = Plan::new(first, full, req.image.is_some());
+            plan = Plan::new(first, full, req.image.is_some(), guided_steps);
             total.set(plan.total());
             chosen.set(Some(r.frames));
         }
@@ -322,9 +369,13 @@ impl Ltx {
         // 2. The latents.
         let t = Instant::now();
         let mut done = plan.picture + plan.text;
+        let s1 = plan.steps_1;
         report("stage 1", 0, s1, done, None)?;
         let latents = {
-            let dit = Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?;
+            let dit = match &dev {
+                Some((d, _)) => Dit::load_as(d, None, "transformer-dev", device, dtype, None, quant, &mut quiet)?,
+                None => Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?,
+            };
             done += plan.load;
             let ctx = Contexts { video: ctx.video.clone(), audio: ctx.audio.clone() };
             let l = {
@@ -332,7 +383,15 @@ impl Ltx {
                     let look = preview(clean, first)?;
                     report("stage 1", i + 1, s1, done + plan.stage_1 * (i + 1) as f64, Some(look))
                 };
-                one_stage(&dit, &ctx, &dit.grid(first)?, r.seed, still_1, &mut step)?
+                match (&r.guided, &neg) {
+                    // The dev model: the request's steps, guided as its
+                    // reference's pipelines guide it, the video's CFG as asked.
+                    (Some(g), Some(neg)) => {
+                        let video = Guide { cfg: g.guidance, ..VIDEO_GUIDE };
+                        guided(&dit, &ctx, neg, &dit.grid(first)?, r.seed, &dev_sigmas(g.steps), (video, AUDIO_GUIDE), still_1, &mut step)?
+                    }
+                    _ => one_stage(&dit, &ctx, &dit.grid(first)?, r.seed, still_1, &mut step)?,
+                }
             };
             done += plan.stage_1 * s1 as f64;
             report("upsample", 0, 1, done, None)?;
@@ -343,12 +402,34 @@ impl Ltx {
             device.synchronize()?;
             done += plan.upsample;
             report("stage 2", 0, s2, done, None)?;
+            // The dev model's second stage is its DiT with the distilled
+            // LoRA fused in, cached on its own; the first goes before it
+            // loads, so that the two are never resident together.
+            let fused;
+            let second = match &dev {
+                Some((d, lora)) => {
+                    drop(dit);
+                    device.synchronize()?;
+                    fused = Dit::load_as(d, Some((lora, 1.0)), "transformer-dev-distilled", device, dtype, None, quant, &mut quiet)?;
+                    &fused
+                }
+                None => &dit,
+            };
+            done += plan.load_2;
             let mut step = |i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
                 let look = preview(clean, full)?;
                 report("stage 2", i + 1, s2, done + plan.stage_2 * (i + 1) as f64, Some(look))
             };
-            refine(&dit, &ctx, &dit.grid(full)?, &Latents { video, audio: l.audio }, r.seed, still_2, &mut step)?
+            let stage_1_audio = l.audio.clone();
+            let l = refine(second, &ctx, &second.grid(full)?, &Latents { video, audio: l.audio }, r.seed, still_2, &mut step)?;
+            match dev {
+                // The reference keeps stage 1's sound: its stage 2 refines
+                // the video only.
+                Some(_) => Latents { video: l.video, audio: stage_1_audio },
+                None => l,
+            }
         };
+        drop(neg);
         drop(ctx);
         // And the DiT's 20 GB, before the decoders need room for frames.
         device.synchronize()?;
@@ -609,16 +690,34 @@ mod tests {
     }
 
     #[test]
+    fn guidance_without_the_dev_files_says_how_to_get_them() {
+        let why = guided_ready("nobody/nothing-here").unwrap_err();
+        assert!(why.contains("kvad pull nobody/nothing-here --dev"), "{why}");
+        assert!(why.contains(kvad::video::LTX_DEV_FILES[0]) && why.contains(kvad::video::LTX_DEV_FILES[1]), "{why}");
+    }
+
+    #[test]
+    fn a_guided_plan_charges_four_calls_a_step_and_a_second_load() {
+        let full = Shape::new(768, 512, 121, 24.0).unwrap();
+        let first = Shape::new(384, 256, 121, 24.0).unwrap();
+        let (p, g) = (Plan::new(first, full, false, None), Plan::new(first, full, false, Some(30)));
+        assert!((g.stage_1 - 4.0 * p.stage_1).abs() < 1e-9 && g.steps_1 == 30 && p.steps_1 == 8);
+        assert_eq!((p.load_2, g.load_2), (0.0, 3.5));
+        // Measured: 283.8 s for stage 1's thirty steps at 768×512.
+        assert!((g.stage_1 * 30.0 - 283.8).abs() / 283.8 < 0.1, "{}", g.stage_1 * 30.0);
+    }
+
+    #[test]
     fn the_plans_proportions_are_the_measured_ones() {
         let full = Shape::new(768, 512, 121, 24.0).unwrap();
         let first = Shape::new(384, 256, 121, 24.0).unwrap();
-        let p = Plan::new(first, full, false);
+        let p = Plan::new(first, full, false, None);
         // Stage 1's eight steps took 17.8 s and stage 2's three 28.8 s.
         assert!((p.stage_1 * 8.0 - 17.8).abs() < 0.5, "{}", p.stage_1 * 8.0);
         assert!((p.stage_2 * 3.0 - 28.8).abs() < 0.5, "{}", p.stage_2 * 3.0);
         assert!((p.total() - 75.0).abs() < 2.0, "{}", p.total());
         // A picture adds its encoding, and nothing else.
-        let q = Plan::new(first, full, true);
+        let q = Plan::new(first, full, true, None);
         assert!((q.total() - p.total() - q.picture).abs() < 1e-9 && q.picture > 0.0);
     }
 }

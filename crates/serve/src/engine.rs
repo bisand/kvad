@@ -199,6 +199,30 @@ pub fn pipeline_weight_bytes(repo: &str, backend: Backend) -> Option<u64> {
     None
 }
 
+/// Whether `repo` is LTX-2.5, by name or by the files it holds, asking the
+/// disk and never the Hub.
+pub fn is_ltx(repo: &str) -> bool {
+    #[cfg(feature = "gpu")]
+    return kvad_gpu::video::ltx::is_pipeline(repo);
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = repo;
+        false
+    }
+}
+
+/// Whether `repo`'s guided pipeline can run here: `Err` says what to fetch
+/// when its files are not on this machine. Asked when a request wants
+/// guidance rather than at load, since the files can be pulled after.
+pub fn guided_ready(repo: &str) -> Result<(), String> {
+    #[cfg(feature = "gpu")]
+    if kvad_gpu::video::ltx::is_pipeline(repo) {
+        return kvad_gpu::video::ltx::guided_ready(repo);
+    }
+    let _ = repo;
+    Ok(())
+}
+
 /// Bytes one cached key or value number will take for `spec` at `backend`:
 /// what the loaded session's `kv_number_bytes` will report, asked before
 /// there is one, so that admission charges what the cache will hold.

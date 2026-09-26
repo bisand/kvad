@@ -1176,3 +1176,42 @@ were dispatched the same way, and 32 × n runs them faster too: Q8_0 by
   took 713 s earlier and 803 s here. The ratios are what compare.
 - **At 1536×1024 the decode is now 43% of the time**, 284 s against stage
   2's 240. #56 is the largest lever left.
+
+**The decoder's convolutions on the matrix units (#88, for #56).** The
+Decoding section planned 3×3×3 convolutions as 2D ones over neighbouring
+frames, and #57 built them that way on candle's `conv2d`. They were exact,
+but three quarters of their time went to `conv2d`'s `im2col` copy, and the
+residual stages ran at 0.9–2.6 TFLOP/s. `mpp_conv3d` is an implicit-GEMM
+convolution instead: the kernel, stored `[out, 27·in]`, times the input's
+shifted neighbourhoods, which each threadgroup gathers into threadgroup
+memory 32 channels at a time as it multiplies. Nothing the size of
+`im2col` is built. The pixel norm and SiLU before each convolution became
+one kernel too (`ltx_fused::norm_silu`).
+
+| Decode, bf16 | Before | Convolution kernel | Both kernels |
+|---|---|---|---|
+| 768×512 (2 runs each) | 69.85 / 69.84 s | 12.16 / 12.16 s | 7.79 / 7.80 s |
+| 1536×1024 (1 run each) | 278.4 s | 45.5 s | 31.3 s |
+| its peak footprint | 24.0 GB | 19.1 GB | 18.3 GB |
+
+| Against `master`'s build, alternated | `master` | #88 |
+|---|---|---|
+| 768×512, 2 stages, all told | 160.2 s | 91.3 s |
+| 1536×1024, 2 stages, all told | 662.5 s | 432.0 s |
+| its decode | 281.3 s | 35.6 s |
+
+- **Per convolution it runs at 15–18 TFLOP/s**, 7–17× the folded
+  `conv2d`, and agrees with it to the output's rounding: 55.6 dB in bf16,
+  73.7 dB in f16. The folded convolution still runs everywhere else,
+  including the f32 latent upsampler.
+- **The clips are 54.4–54.7 dB PSNR from before**, and the latents are
+  byte-for-byte the same: only the decode changed. #88's 1536×1024 run
+  drifted about 20 s in stage 2, which it does not touch.
+- **Against the reference:** `ltx-core` decoded 768×512 in 5.2–5.5 s on
+  MPS (#56). kvad now takes 7.8 s, where it took 68.8.
+- **Memory:** the decode's peak no longer comes near the DiT's. At
+  768×512 it is 8.8 GB, below the reference's 11.2, and a generation's
+  peak is stage 2's.
+- **Where 1536×1024's 7 minutes go now:** stage 2 about 240 s, stage 1
+  110 s, the decode 31–36 s. The DiT is the lever again, and the service
+  (step 7) is the step left.

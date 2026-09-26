@@ -34,6 +34,10 @@ writes what it makes for the examples to compare against.
         scripts/ltx-fixtures.py --text "$TEXT" --dit "$DIT" --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_text -- --fixtures /tmp/ltx-fx [--quant q8]
 
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --dit "$DIT" --contexts /tmp/ltx-fx/text_contexts_f32.safetensors --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx [--quant q8] [--f32]
+
 (the text fixtures also want `transformers` 5.8 to 5.14 in the venv). The
 `--where` lines download each file first. The repo is gated: accept its
 licence on the Hub and have a token saved.)
@@ -52,6 +56,11 @@ What to expect, as measured on 2026-09-24 on an M5 Pro:
   the reference's own bf16 on MPS, to within half a dB at every state.
 - All 48 layers in bf16 on Metal are 36-56 dB from the reference's bf16 on
   MPS (two bf16 computations drifting apart); at q8, 27-46 dB.
+- The DiT's first two blocks and its output heads, at 512x320x25 and
+  sigma 0.9875: identical positions and tokens; 115-120 dB in f32 on the CPU
+  and 118-123 on Metal. In bf16 on Metal, video 46.2/45.0 dB after the
+  blocks and 42.0 at the velocity, audio 44.6-45.1, where the reference's
+  own bf16 on MPS is 46.8/46.6, 43.6 and 45.5-46.1. At q8, much the same.
 
 Every reference model here runs in f32 on the CPU, so the files are what the
 architecture computes, not what one GPU's rounding makes of it. It is not part
@@ -303,12 +312,96 @@ def text(path, dit, out):
     print("text: contexts", tuple(o.video_encoding.shape), tuple(o.audio_encoding.shape))
 
 
+def transformer(path, out, contexts, blocks):
+    """The DiT's first `blocks` blocks, with everything around them: the
+    patchify projections, the eight adaLN modules, the keyframe embedding,
+    the RoPE tables built from the reference's own positions, and the output
+    heads. The whole DiT is 22B parameters, 88 GB in f32; two blocks of it
+    and the rest are 1.2B. What is left out is only more of the same block."""
+    from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
+    from ltx_core.model.transformer.modality import Modality
+    from ltx_core.model.transformer.model_configurator import LTXModelConfigurator
+    from ltx_core.tools import AudioLatentTools, VideoLatentTools
+    from ltx_core.types import AudioLatentShape, VideoLatentShape, VideoPixelShape
+
+    prefix = "model.diffusion_model."
+    with safe_open(path, framework="pt") as f:
+        meta = {k: json.loads(v) if v.strip().startswith("{") else v for k, v in f.metadata().items()}
+        keep = lambda k: k.startswith(prefix) and "_embeddings_connector." not in k and not (
+            k.startswith(prefix + "transformer_blocks.") and int(k.split(".")[3]) >= blocks
+        )
+        tensors = {k: f.get_tensor(k) for k in f.keys() if keep(k)}
+    meta["config"]["transformer"]["num_layers"] = blocks
+
+    # 512×320, 25 frames at 24 fps: 4 latent frames of 10×16, 640 video
+    # tokens, and 26 audio latents. Small enough for f32 on the CPU.
+    width, height, frames, fps = 512, 320, 25, 24.0
+    pixels = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
+    vtools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), VideoLatentShape.from_pixel_shape(pixels), fps)
+    atools = AudioLatentTools(AudioPatchifier(patch_size=1), AudioLatentShape.from_video_pixel_shape(pixels))
+    vstate = vtools.create_initial_state("cpu", torch.float32)
+    astate = atools.create_initial_state("cpu", torch.float32)
+    g = torch.Generator().manual_seed(7)
+    vlat = torch.randn(vstate.latent.shape, generator=g)
+    alat = torch.randn(astate.latent.shape, generator=g)
+    sigma = 0.9875
+    ctx = load_file(contexts)
+
+    def run(device, dtype):
+        m = LTXModelConfigurator.from_metadata(meta)
+        m = load(m, tensors, lambda k: k[len(prefix):])
+        m = m.to(device=device, dtype=dtype)
+        caught = {}
+        for i, b in enumerate(m.transformer_blocks):
+            b.register_forward_hook(lambda _m, _i, o, i=i: caught.update({f"video_{i}": o[0].x[0].float().cpu(), f"audio_{i}": o[1].x[0].float().cpu()}))
+
+        def modality(state, lat, context):
+            s = torch.tensor([sigma], device=device)
+            mask = None if state.keyframes_mask is None else state.keyframes_mask.to(device)
+            return Modality(
+                latent=lat.to(device=device, dtype=dtype),
+                sigma=s,
+                timesteps=(state.denoise_mask.to(device) * s).float(),
+                positions=state.positions.to(device),
+                context=context.to(device=device, dtype=dtype)[None],
+                keyframes_mask=mask,
+            )
+
+        with torch.no_grad():
+            t = time.time()
+            v, a = m(modality(vstate, vlat, ctx["video"]), modality(astate, alat, ctx["audio"]), None)
+            print(f"dit: {blocks} blocks in {dtype} on {device}, {time.time() - t:.1f} s")
+        caught.update({"video_out": v[0].float().cpu(), "audio_out": a[0].float().cpu()})
+        return {k: v.contiguous() for k, v in caught.items()}
+
+    save_file(
+        {
+            "video": vlat[0].contiguous(),
+            "audio": alat[0].contiguous(),
+            # The same, unpatchified by the reference: [128, F, h, w], [8, T, 16].
+            "video_latent": vtools.patchifier.unpatchify(vlat, vtools.target_shape)[0].contiguous(),
+            "audio_latent": atools.patchifier.unpatchify(alat, atools.target_shape)[0].contiguous(),
+            "video_positions": vstate.positions[0].contiguous(),
+            "audio_positions": astate.positions[0].contiguous(),
+            "sigma": torch.tensor([sigma]),
+            "shape": torch.tensor([width, height, frames, fps]),
+        },
+        f"{out}/dit_inputs.safetensors",
+    )
+    save_file(run("cpu", torch.float32), f"{out}/dit_f32.safetensors")
+    if torch.backends.mps.is_available():
+        save_file(run("mps", torch.bfloat16), f"{out}/dit_bf16.safetensors")
+    print(f"dit: video {tuple(vlat.shape)}, audio {tuple(alat.shape)}, σ {sigma}")
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--video", help="vae/ltx-2.5-video-vae-conv-bf16.safetensors")
     p.add_argument("--audio", help="vae/ltx-2.5-audio-vae-bf16.safetensors")
     p.add_argument("--text", help="text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors")
     p.add_argument("--dit", help="diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors (for the connectors)")
+    p.add_argument("--blocks", type=int, default=2, help="how many DiT blocks to run with --dit --contexts")
+    p.add_argument("--contexts", help="text_contexts_f32.safetensors from --text: the DiT's first blocks against them")
     p.add_argument("--out", required=True)
     a = p.parse_args()
     import os
@@ -321,4 +414,6 @@ if __name__ == "__main__":
         audio(a.audio, a.out)
     if a.text:
         text(a.text, a.dit, a.out)
+    if a.dit and a.contexts:
+        transformer(a.dit, a.out, a.contexts, a.blocks)
     print(f"wrote {a.out} in {time.time() - started:.0f} s")

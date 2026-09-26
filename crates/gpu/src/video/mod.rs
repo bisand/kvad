@@ -1,10 +1,18 @@
-//! Video models: what turns a latent into frames and sound.
+//! Video models: a prompt to frames and sound.
 //!
-//! So far this is LTX-2.5's decoders (`docs/video-plan.md`, step 3): the
-//! convolutional video VAE decoder in [`ltx_vae`], and in time the audio
-//! decoder, vocoder and bandwidth extension. They are written on candle for
-//! the same reason the image models are (`docs/image-plan.md`): they are
-//! convolution stacks, and `kvad`'s own `tensor.rs` has no convolutions.
+//! So far this is LTX-2.5 (`docs/video-plan.md`), one stage of its distilled
+//! model at the requested size:
+//!
+//! - [`ltx_text`]: the prompt to two contexts, through Gemma 4 ([`gemma`]),
+//!   the aggregate projections and the connectors;
+//! - [`ltx_dit`]: the 48-block DiT that denoises a video and its sound
+//!   together, and [`ltx_sample`], the eight steps that drive it;
+//! - [`ltx_vae`]: the convolutional video decoder, and [`ltx_audio`]: the
+//!   audio decoder, vocoder and bandwidth extension.
+//!
+//! They are written on candle for the same reason the image models are
+//! (`docs/image-plan.md`): the decoders are convolution stacks, and `kvad`'s
+//! own `tensor.rs` has no convolutions.
 //!
 //! The one thing here that the image models never needed is the third
 //! dimension. candle has no 3D convolution, and [`conv3d`] builds one out of
@@ -13,6 +21,8 @@
 pub mod conv3d;
 pub mod gemma;
 pub mod ltx_audio;
+pub mod ltx_dit;
+pub mod ltx_sample;
 pub(crate) mod ltx_nn;
 pub mod ltx_text;
 pub mod ltx_vae;

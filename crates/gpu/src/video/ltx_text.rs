@@ -13,7 +13,7 @@
 //! where the reference was read for it.
 
 use super::gemma::Gemma;
-use super::ltx_nn::{rms, GatedAttention, Rope};
+use super::ltx_nn::{gelu, rms, GatedAttention, Rope};
 use super::metadata;
 use crate::common::{Loader, Reader};
 use crate::image::nn::{Ctx, Linear};
@@ -129,7 +129,7 @@ impl Connector {
         let mut x = Tensor::cat(&[x, &filled.to_dtype(x.dtype())?], 0)?;
         for (attn, ff_in, ff_out) in &self.blocks {
             x = (&x + attn.forward(&rms(&x, 1e-6)?, None, Some(&self.rope), Some(&self.rope))?)?;
-            x = (&x + ff_out.forward(&ff_in.forward(&rms(&x, 1e-6)?)?.gelu()?)?)?;
+            x = (&x + ff_out.forward(&gelu(&ff_in.forward(&rms(&x, 1e-6)?)?)?)?)?;
         }
         rms(&x, 1e-6)
     }

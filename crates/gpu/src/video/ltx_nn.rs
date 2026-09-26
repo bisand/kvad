@@ -1,8 +1,9 @@
-//! The pieces LTX-2.5's transformers share: the text connectors now, the DiT
-//! next (`docs/video-plan.md`).
+//! The pieces LTX-2.5's transformers share: the text connectors and the DiT
+//! (`docs/video-plan.md`).
 //!
 //! - [`rms`], RMS norm with no weight of its own, which every LTX block uses
 //!   because modulation or the next projection supplies the scale;
+//! - [`gelu`], in f32 whatever its input, because candle's bf16 one is not;
 //! - [`RmsNorm`], the weighted one, over a whole attention width at once;
 //! - [`Rope`], LTX's "split" rotary embedding: one frequency vector across
 //!   the *whole* attention width, cut into a slice per head, applied to each
@@ -22,6 +23,17 @@ pub(crate) fn rms(x: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
     let x = x.to_dtype(DType::F32)?;
     let r = (x.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?;
     x.broadcast_div(&r)?.to_dtype(dtype)
+}
+
+/// Tanh-approximated GELU, computed in f32 whatever `x` is.
+///
+/// candle's Metal kernel evaluates the polynomial and the tanh in the
+/// tensor's own type, so in bf16 every intermediate is rounded to eight bits
+/// of mantissa; PyTorch computes in f32 and rounds once. In the DiT's video
+/// feed-forward, 16 384 wide, that difference alone cost 8 dB against the
+/// reference after one block: 38.7 dB where the reference's own bf16 is 46.8.
+pub(crate) fn gelu(x: &Tensor) -> candle_core::Result<Tensor> {
+    x.to_dtype(DType::F32)?.gelu()?.to_dtype(x.dtype())
 }
 
 /// RMS norm over the last axis, times a learned weight (not `1 + weight`).
@@ -173,18 +185,22 @@ impl GatedAttention {
             };
             y.reshape((1, n, h * d))
         };
-        let q = heads(self.q_norm.forward(&self.q.forward(x)?)?, t, rope_q)?;
-        let k = heads(self.k_norm.forward(&self.k.forward(ctx)?)?, s, rope_k)?;
-        let v = self.v.forward(ctx)?.reshape((1, s, h * d))?;
+        // A Q8_0 projection on the M5's matrix units answers in f32 whatever
+        // it was asked in; everything here stays in the input's dtype.
+        let dtype = x.dtype();
+        let lin = |l: &Linear, y: &Tensor| l.forward(y)?.to_dtype(dtype);
+        let q = heads(self.q_norm.forward(&lin(&self.q, x)?)?, t, rope_q)?;
+        let k = heads(self.k_norm.forward(&lin(&self.k, ctx)?)?, s, rope_k)?;
+        let v = lin(&self.v, ctx)?.reshape((1, s, h * d))?;
         let o = crate::image::nn::attention(&q, &k, &v, h)?.squeeze(0)?;
         let o = match &self.gate {
             Some(g) => {
-                let gates = (candle_nn::ops::sigmoid(&g.forward(x)?)? * 2.0)?;
+                let gates = (candle_nn::ops::sigmoid(&lin(g, x)?)? * 2.0)?;
                 o.reshape((t, h, d))?.broadcast_mul(&gates.unsqueeze(2)?)?.reshape((t, h * d))?
             }
             None => o,
         };
-        self.out.forward(&o)
+        lin(&self.out, &o)
     }
 }
 

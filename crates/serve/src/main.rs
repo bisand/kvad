@@ -221,6 +221,7 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
     // And any video that was being made: its generation died with the
     // process that ran it.
     let unfinished = videos::abandon(&db).unwrap_or(0);
+    let ffmpeg = videos::use_ffmpeg(&cfg.videos.ffmpeg);
 
     let setup = std::sync::Arc::new(auth::Setup::default());
     let accounts = users::count(&db)?;
@@ -333,6 +334,7 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
             false => "",
         }
     );
+    println!("  videos     {ffmpeg}");
     if let Some(repo) = &bring_back {
         println!("  autoload   {repo}, in the background");
     }

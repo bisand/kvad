@@ -52,6 +52,23 @@ impl RmsNorm {
         let dtype = x.dtype();
         rms(&x.to_dtype(DType::F32)?, self.eps)?.broadcast_mul(&self.w)?.to_dtype(dtype)
     }
+
+    /// `x` `[n, width]` normed over its whole width, then, with `rope`, each
+    /// of its `heads` rotated: in `dt`, whatever `x` came in. One kernel
+    /// where [`super::ltx_fused::norm_rope`] takes it.
+    pub(crate) fn rotated(&self, x: &Tensor, rope: Option<&Rope>, heads: usize, dt: DType) -> candle_core::Result<Tensor> {
+        if let Some(y) = super::ltx_fused::norm_rope(x, &self.w, rope.map(|r| (&r.cos, &r.sin)), heads, self.eps as f32, dt)? {
+            return Ok(y);
+        }
+        let y = self.forward(&x.to_dtype(dt)?)?;
+        match rope {
+            Some(r) => {
+                let (n, width) = y.dims2()?;
+                r.rotate(&y.reshape((n, heads, width / heads))?)?.reshape((n, width))
+            }
+            None => Ok(y),
+        }
+    }
 }
 
 /// Rotary embedding tables, `cos` and `sin`, each `[T, heads, half]`.
@@ -178,21 +195,18 @@ impl GatedAttention {
         let ctx = context.unwrap_or(x);
         let (t, s) = (x.dim(0)?, ctx.dim(0)?);
         let (h, d) = (self.heads, self.head_dim);
-        let heads = |y: Tensor, n: usize, rope: Option<&Rope>| -> candle_core::Result<Tensor> {
-            let y = y.reshape((n, h, d))?;
-            let y = match rope {
-                Some(r) => r.rotate(&y)?,
-                None => y,
-            };
-            y.reshape((1, n, h * d))
-        };
         // A Q8_0 projection on the M5's matrix units answers in f32 whatever
         // it was asked in; everything here stays in the input's dtype.
         let dtype = x.dtype();
         let lin = |l: &Linear, y: &Tensor| l.forward(y)?.to_dtype(dtype);
         let dev = x.device();
-        let (q, k, v) = span(|| "q, k, v", dev, || Ok((lin(&self.q, x)?, lin(&self.k, ctx)?, lin(&self.v, ctx)?)))?;
-        let (q, k) = span(|| "norm, rope", dev, || Ok((heads(self.q_norm.forward(&q)?, t, rope_q)?, heads(self.k_norm.forward(&k)?, s, rope_k)?)))?;
+        // The queries and keys go to their norms as the projections answer:
+        // the norm reads a q8 projection's f32 and rounds once.
+        let (q, k, v) = span(|| "q, k, v", dev, || Ok((self.q.forward(x)?, self.k.forward(ctx)?, lin(&self.v, ctx)?)))?;
+        let (q, k) = span(|| "norm, rope", dev, || {
+            let q = self.q_norm.rotated(&q, rope_q, h, dtype)?.reshape((1, t, h * d))?;
+            Ok((q, self.k_norm.rotated(&k, rope_k, h, dtype)?.reshape((1, s, h * d))?))
+        })?;
         let v = v.reshape((1, s, h * d))?;
         let o = span(|| "attention", dev, || crate::image::nn::attention(&q, &k, &v, h)?.squeeze(0))?;
         let o = match &self.gate {
@@ -247,6 +261,47 @@ mod tests {
         let want = [1.0 * ca - 3.0 * sa, 2.0 * cb - 4.0 * sb, 3.0 * ca + 1.0 * sa, 4.0 * cb + 2.0 * sb];
         for (g, w) in y.iter().zip(want) {
             assert!((g - w).abs() < 1e-6, "{y:?} against {want:?}");
+        }
+    }
+
+    /// The kernel against the chain it replaces: the norm and the rotation
+    /// in candle's ops, from the projection's answer rounded to `dt` first.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rotated_agrees_with_the_ops_it_replaces() {
+        let Ok(dev) = Device::new_metal(0) else { return };
+        let rand = |shape: &[usize], dt: DType| Tensor::randn(0f32, 1f32, shape, &dev).unwrap().to_dtype(dt).unwrap();
+        // The DiT's video and audio heads, and something small.
+        for (width, heads) in [(4096, 32), (2048, 32), (64, 2)] {
+            // From a q8 projection's f32, and from the model's own dtype.
+            for (from, dt) in [(DType::F32, DType::BF16), (DType::BF16, DType::BF16), (DType::F32, DType::F32), (DType::F16, DType::F16)] {
+                for rotate in [true, false] {
+                    let n = 5;
+                    let norm = RmsNorm { w: rand(&[width], DType::F32), eps: 1e-6 };
+                    let angles = (rand(&[n, heads, width / heads / 2], DType::F32) * 40.0).unwrap();
+                    let rope = Rope { cos: angles.cos().unwrap().to_dtype(dt).unwrap(), sin: angles.sin().unwrap().to_dtype(dt).unwrap() };
+                    let x = (rand(&[n, width], from) * 5.0).unwrap();
+                    let before = crate::fused::tests_ran();
+                    let got = norm.rotated(&x, rotate.then_some(&rope), heads, dt).unwrap();
+                    assert_eq!(crate::fused::tests_ran(), before + 1, "the kernel did not run");
+                    let y = norm.forward(&x.to_dtype(dt).unwrap()).unwrap();
+                    let want = match rotate {
+                        true => rope.rotate(&y.reshape((n, heads, width / heads)).unwrap()).unwrap().reshape((n, width)).unwrap(),
+                        false => y,
+                    };
+                    assert_eq!(got.dtype(), dt);
+                    let (a, b) = (got.to_dtype(DType::F32).unwrap(), want.to_dtype(DType::F32).unwrap());
+                    assert!(a.sum_all().unwrap().to_scalar::<f32>().unwrap().is_finite(), "a NaN or an infinity");
+                    let scale = b.abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+                    let worst = (a - b).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap() / scale;
+                    let ulp = match dt {
+                        DType::F32 => 1e-5,
+                        DType::F16 => 2e-3,
+                        _ => 1.6e-2,
+                    };
+                    assert!(worst < 4.0 * ulp, "{from:?} to {dt:?}, width {width}, rotate {rotate}: off by {worst}");
+                }
+            }
         }
     }
 }

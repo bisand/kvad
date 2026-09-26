@@ -18,6 +18,13 @@
 //! The pieces synchronise, so their total runs a little over the whole
 //! forward pass. Each piece is given per block, with the arithmetic it does
 //! where that is known and the rate it does it at.
+//!
+//! `--accuracy` instead runs the same inputs through the blocks in f32 and
+//! in bf16, unquantised, and says how far apart the two are after each
+//! block and at the velocities, in dB. The f32 path agreed with Lightricks'
+//! reference to 115–123 dB, so it stands in for it here. The inputs are the
+//! same from run to run, so `KVAD_GPU_FUSED=0` gives the unfused numbers to
+//! compare.
 
 use candle_core::{DType, Device, Tensor};
 use kvad::weights::{fetch_file, Watcher};
@@ -72,6 +79,9 @@ fn main() -> Res<()> {
 
     let device = Device::new_metal(0)?;
     let path = fetch_file(LTX_REPO, DIT_FILE, &Watcher::none())?;
+    if argv.iter().any(|a| a == "--accuracy") {
+        return accuracy(&path, shape, blocks, &device);
+    }
     let q8 = kvad_gpu::model::parse_quant("q8").ok_or("no q8")?;
     let dit = Dit::load(&path, &device, DType::BF16, Some(blocks), q8, &mut |_| {})?;
     let grid = dit.grid(shape)?;
@@ -116,5 +126,61 @@ fn main() -> Res<()> {
     println!("{:<28} {:>8.3} {:>5.1}%", "the rest", per(rest), 100.0 * rest / pieces);
     println!();
     println!("matmuls and attention: {:.1} TFLOP a block, at {:.2} TFLOP/s over the whole forward", total_flops / 1e12, total_flops / 1e12 / per(whole));
+    Ok(())
+}
+
+/// `rows × cols` numbers of about unit spread, the same every run: a sum of
+/// four uniforms from a fixed generator, centred.
+fn fixed(rows: usize, cols: usize, seed: u64) -> Res<Tensor> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let v: Vec<f32> = (0..rows * cols).map(|_| (next() + next() + next() + next() - 2.0) * 1.7).collect();
+    Ok(Tensor::from_vec(v, (rows, cols), &Device::Cpu)?)
+}
+
+/// Signal-to-error ratio in dB of `got` against `want`.
+fn db(got: &Tensor, want: &Tensor) -> Res<f32> {
+    let err = (got - want)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
+    let sig = want.sqr()?.sum_all()?.to_scalar::<f32>()?;
+    if !(err + sig).is_finite() {
+        return Err("a comparison met a NaN or an infinity".into());
+    }
+    Ok(10.0 * (sig / err.max(1e-30)).log10())
+}
+
+fn accuracy(path: &std::path::Path, shape: Shape, blocks: usize, device: &Device) -> Res<()> {
+    let (t, a) = (shape.video_tokens(), shape.audio_latents());
+    let (video, audio) = (fixed(t, 128, 1)?, fixed(a, 128, 2)?);
+    let (cv, ca) = (fixed(LENGTH, 4096, 3)?, fixed(LENGTH, 2048, 4)?);
+    // Both streams after every block, then the velocities, on the host in f32.
+    let run = |dt: DType| -> Res<Vec<(Tensor, Tensor)>> {
+        let dit = Dit::load(path, device, dt, Some(blocks), None, &mut |_| {})?;
+        let grid = dit.grid(shape)?;
+        let on = |x: &Tensor| -> Res<Tensor> { Ok(x.to_device(device)?.to_dtype(dt)?) };
+        let ctx = Contexts { video: on(&cv)?, audio: on(&ca)? };
+        let host = |x: &Tensor| -> candle_core::Result<Tensor> { x.to_device(&Device::Cpu)?.to_dtype(DType::F32) };
+        let mut out = Vec::new();
+        let (v, au) = dit.forward_watched(&on(&video)?, &on(&audio)?, (0.725, 0.725), &ctx, &grid, &mut |_, vx, ax| {
+            out.push((host(vx)?, host(ax)?));
+            Ok(())
+        })?;
+        out.push((host(&v)?, host(&au)?));
+        drop(dit);
+        device.synchronize()?;
+        Ok(out)
+    };
+    let want = run(DType::F32)?;
+    let got = run(DType::BF16)?;
+    let fused = !matches!(std::env::var("KVAD_GPU_FUSED").as_deref(), Ok("0") | Ok("false"));
+    println!("{}×{} × {}: bf16 against f32, fused kernels {}", shape.width, shape.height, shape.frames, if fused { "on" } else { "off" });
+    for (i, ((gv, ga), (wv, wa))) in got.iter().zip(&want).enumerate() {
+        let what = if i < blocks { format!("block {i}") } else { "velocity".into() };
+        println!("{what:<9} video {:>5.1} dB   audio {:>5.1} dB", db(gv, wv)?, db(ga, wa)?);
+    }
     Ok(())
 }

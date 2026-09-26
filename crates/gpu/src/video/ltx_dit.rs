@@ -18,7 +18,8 @@
 //! adds its own learned table to them. `docs/video-plan.md` has the table of
 //! rows, the positions, and where the reference was read for each.
 
-use super::ltx_nn::{gelu, rms, GatedAttention, Rope};
+use super::ltx_fused::{self, gated_add, gated_modulate};
+use super::ltx_nn::{GatedAttention, Rope};
 use super::ltx_text::Contexts;
 use super::metadata;
 use crate::common::{Loader, Reader};
@@ -269,9 +270,12 @@ fn row(t: &Tensor, i: usize) -> candle_core::Result<Tensor> {
     t.narrow(0, i, 1)
 }
 
+/// Every norm's epsilon in a block.
+const EPS: f32 = 1e-6;
+
 /// `rms(x)·(1 + scale) + shift`: how every norm in a block is modulated.
 fn ada(x: &Tensor, scale: &Tensor, shift: &Tensor) -> candle_core::Result<Tensor> {
-    rms(x, 1e-6)?.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)
+    ltx_fused::modulate(x, scale, shift, EPS)
 }
 
 /// A feed-forward: up, tanh-GELU, down.
@@ -290,8 +294,9 @@ impl Ff {
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (dtype, dev) = (x.dtype(), x.device());
-        let h = span(|| "up", dev, || self.up.forward(x)?.to_dtype(dtype))?;
-        let h = span(|| "gelu", dev, || gelu(&h))?;
+        // GELU reads the up projection's answer as it comes, f32 from q8.
+        let h = span(|| "up", dev, || self.up.forward(x))?;
+        let h = span(|| "gelu", dev, || ltx_fused::gelu(&h, dtype))?;
         span(|| "down", dev, || self.down.forward(&h)?.to_dtype(dtype))
     }
 }
@@ -340,17 +345,21 @@ impl Stream {
     /// the two for the text.
     fn attend(&self, x: &Tensor, m: &Tensor, p: &Tensor, context: &Tensor, rope: &Rope) -> candle_core::Result<Tensor> {
         let y = scope(self.names[0], || self.attn1.forward(&ada(x, &row(m, 1)?, &row(m, 0)?)?, None, Some(rope), Some(rope)))?;
-        let x = (x + y.broadcast_mul(&row(m, 2)?)?)?;
+        let (h, x) = gated_modulate(x, &y, &row(m, 2)?, &row(m, 7)?, &row(m, 6)?, EPS)?;
         // The text is modulated but not normalised, and σ moves the
         // modulation, so its keys and values change every step.
         let c = context.broadcast_mul(&(row(p, 1)? + 1.0)?)?.broadcast_add(&row(p, 0)?)?;
-        let y = scope(self.names[1], || self.attn2.forward(&ada(&x, &row(m, 7)?, &row(m, 6)?)?, Some(&c), None, None))?;
-        &x + y.broadcast_mul(&row(m, 8)?)?
+        let y = scope(self.names[1], || self.attn2.forward(&h, Some(&c), None, None))?;
+        gated_add(&x, &y, &row(m, 8)?)
     }
 
-    fn feed(&self, x: &Tensor, m: &Tensor) -> candle_core::Result<Tensor> {
-        let y = scope(self.names[2], || self.ff.forward(&ada(x, &row(m, 4)?, &row(m, 3)?)?))?;
-        x + y.broadcast_mul(&row(m, 5)?)?
+    /// The second half of a block: the audio–video attention's gated
+    /// residual `x + y·g`, which the feed-forward's norm reads straight
+    /// after, then the feed-forward and its own residual.
+    fn feed(&self, x: &Tensor, y: &Tensor, g: &Tensor, m: &Tensor) -> candle_core::Result<Tensor> {
+        let (h, x) = gated_modulate(x, y, g, &row(m, 4)?, &row(m, 3)?, EPS)?;
+        let y = scope(self.names[2], || self.ff.forward(&h))?;
+        gated_add(&x, &y, &row(m, 5)?)
     }
 }
 
@@ -390,10 +399,8 @@ impl Block {
                 Some(&g.video_time),
             )
         })?;
-        let vx = (&vx + a2v.broadcast_mul(&(row(&v.av, 4)? + &m.a2v_gate)?)?)?;
-        let ax = (&ax + v2a.broadcast_mul(&(row(&a.av, 4)? + &m.v2a_gate)?)?)?;
-
-        Ok((self.video.feed(&vx, &vm)?, self.audio.feed(&ax, &am)?))
+        let (vg, ag) = ((row(&v.av, 4)? + &m.a2v_gate)?, (row(&a.av, 4)? + &m.v2a_gate)?);
+        Ok((self.video.feed(&vx, &a2v, &vg, &vm)?, self.audio.feed(&ax, &v2a, &ag, &am)?))
     }
 }
 

@@ -7,7 +7,8 @@
 //! A latent is `[128, F, h, w]` and decodes to `8(F − 1) + 1` frames of
 //! `32h × 32w`. Three ideas make that up:
 //!
-//! - **3×3×3 convolutions** at every level ([`Conv3d`], built from 2D ones).
+//! - **3×3×3 convolutions** at every level ([`Conv3d`]: on the M5's matrix
+//!   units in bf16, and built from 2D ones elsewhere).
 //! - **Depth to space.** Each upsampling block widens the channels with a
 //!   convolution and then unfolds them into time and space: 4096 channels
 //!   become 512 channels at twice the frames, rows and columns. When time

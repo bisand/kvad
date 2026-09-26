@@ -223,7 +223,7 @@ impl Gemma {
     /// A projection, in the compute dtype whatever the weights' kind: a Q8_0
     /// matrix answers in f32 even when it was asked in bf16.
     fn lin(&self, l: &Linear, x: &Tensor) -> candle_core::Result<Tensor> {
-        l.forward(x)?.to_dtype(self.dtype)
+        l.forward_in(x, self.dtype)
     }
 
     fn layer(&self, l: &Layer, x: &Tensor, rope: &Rope, mask: &Tensor) -> candle_core::Result<Tensor> {

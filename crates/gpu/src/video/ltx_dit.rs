@@ -244,7 +244,7 @@ impl AdaLn {
     /// `[1, width]`.
     fn forward(&self, t: f32, device: &Device, dtype: DType) -> Res<(Tensor, Tensor)> {
         let x = sinusoid(t, device)?.to_dtype(dtype)?;
-        let e = self.l2.forward(&self.l1.forward(&x)?.to_dtype(dtype)?.silu()?)?.to_dtype(dtype)?;
+        let e = self.l2.forward_in(&self.l1.forward_in(&x, dtype)?.silu()?, dtype)?;
         let m = self.out.forward(&e.silu()?)?.to_dtype(dtype)?.reshape((self.rows, self.width))?;
         Ok((m, e))
     }
@@ -294,10 +294,17 @@ impl Ff {
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (dtype, dev) = (x.dtype(), x.device());
-        // GELU reads the up projection's answer as it comes, f32 from q8.
-        let h = span(|| "up", dev, || self.up.forward(x))?;
-        let h = span(|| "gelu", dev, || ltx_fused::gelu(&h, dtype))?;
-        span(|| "down", dev, || self.down.forward(&h)?.to_dtype(dtype))
+        // A q8 up projection takes the GELU as it stores its f32 sums, in
+        // `ltx_fused`'s formula, so the 16 384-wide answer is written once,
+        // in `dtype`. Otherwise GELU reads the answer as it comes.
+        let h = match span(|| "up", dev, || self.up.gelu_in(x, dtype))? {
+            Some(h) => h,
+            None => {
+                let h = span(|| "up", dev, || self.up.forward(x))?;
+                span(|| "gelu", dev, || ltx_fused::gelu(&h, dtype))?
+            }
+        };
+        span(|| "down", dev, || self.down.forward_in(&h, dtype))
     }
 }
 
@@ -415,7 +422,7 @@ impl Head {
     fn forward(&self, x: &Tensor, embedded: &Tensor) -> candle_core::Result<Tensor> {
         let t = self.table.broadcast_add(embedded)?;
         let x = layer_norm_plain(x, 1e-6)?.broadcast_mul(&(row(&t, 1)? + 1.0)?)?.broadcast_add(&row(&t, 0)?)?;
-        self.proj.forward(&x)?.to_dtype(x.dtype())
+        self.proj.forward_in(&x, x.dtype())
     }
 }
 

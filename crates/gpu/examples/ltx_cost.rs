@@ -11,9 +11,11 @@
 //! It times the forward pass twice over:
 //! 1. **Whole**, the median of `--rounds` runs, as the pipeline runs it.
 //! 2. **In pieces**, with [`kvad_gpu::prof`] synchronising around each
-//!    attention's projections, norms and RoPE, attention, gate and output
-//!    projection, and each feed-forward's up, GELU and down. What isn't in
-//!    a piece (modulation, residuals, patchify, heads) is "the rest".
+//!    attention's projections, norms and RoPE, gates' logits, attention
+//!    (which applies the gates) and output projection, and each
+//!    feed-forward's up (with its GELU, where the projection takes it), GELU
+//!    and down. What isn't in a piece (modulation, residuals, patchify,
+//!    heads) is "the rest".
 //!
 //! The pieces synchronise, so their total runs a little over the whole
 //! forward pass. Each piece is given per block, with the arithmetic it does

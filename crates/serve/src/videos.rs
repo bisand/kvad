@@ -14,7 +14,12 @@
 //!
 //! What OpenAI has no field for is taken beside its fields: `frames` (or
 //! `num_frames`, diffusers' name) where OpenAI has only `seconds`, `fps`,
-//! `seed`, and `audio: false` for a silent file. What this engine measured
+//! `seed`, and `audio: false` for a silent file.
+//!
+//! A request that gives no length leaves it to the model, which for LTX-2.5
+//! is its duration head reading the prompt. That happens after the text
+//! phase, so until then the video's `seconds` is `null`; the request was
+//! checked at the longest clip the model may choose at its size. What this engine measured
 //! comes back in a `kvad` object. Every endpoint in OpenAI's reference is
 //! marked deprecated as this is written; its shape is still the only one a
 //! client of theirs knows.
@@ -154,13 +159,15 @@ pub struct Stored {
     pub completed: Option<i64>,
     /// Whether it started from a picture, kept as `<id>.input`.
     pub picture: bool,
+    /// Whether the model chose its length. `frames` is 0 until it has.
+    pub chosen: bool,
 }
 
 const COLUMNS: &str = "id, model, backend, prompt, width, height, frames, fps, seed, audio, status, progress, \
                        phase, error, bytes, encode_secs, denoise_secs, decode_secs, created_at, \
                        CAST(strftime('%s', created_at) AS INTEGER), \
                        CAST(strftime('%s', started_at) AS INTEGER), CAST(strftime('%s', completed_at) AS INTEGER), \
-                       picture";
+                       picture, chosen";
 
 fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
     Ok(Stored {
@@ -187,6 +194,7 @@ fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
         started: r.get(20)?,
         completed: r.get(21)?,
         picture: r.get::<_, i64>(22)? != 0,
+        chosen: r.get::<_, i64>(23)? != 0,
     })
 }
 
@@ -223,7 +231,8 @@ impl Stored {
             "expires_at": null,
             "prompt": self.prompt,
             "size": format!("{}x{}", self.width, self.height),
-            "seconds": seconds(self.frames, self.fps),
+            // Not known until the model has chosen it.
+            "seconds": (self.frames > 0).then(|| seconds(self.frames, self.fps)),
             "remixed_from_video_id": null,
             "error": self.error.as_ref().map(|e| json!({
                 "code": if e == CANCELLED { "cancelled" } else { "generation_failed" },
@@ -234,7 +243,9 @@ impl Stored {
                 "backend": self.backend,
                 "width": self.width,
                 "height": self.height,
-                "frames": self.frames,
+                "frames": (self.frames > 0).then_some(self.frames),
+                // Whether the model chose the length, from the prompt.
+                "length_chosen": self.chosen,
                 "fps": self.fps,
                 "seed": self.seed,
                 "audio": self.audio,
@@ -274,12 +285,13 @@ fn seconds(frames: u32, fps: u32) -> String {
 const CANCELLED: &str = "cancelled";
 
 /// Write the row for a video about to be made; `picture` when it starts
-/// from one, which the caller keeps as `<id>.input`.
+/// from one, which the caller keeps as `<id>.input`. A length the model is
+/// to choose is written as 0 frames until it has.
 pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::video::Resolved, picture: bool) -> Res<Stored> {
     let id = db.with(|c| {
         c.execute(
-            "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio, picture) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio, picture, chosen) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 owner,
                 model,
@@ -287,11 +299,12 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
                 r.prompt,
                 r.width as i64,
                 r.height as i64,
-                r.frames as i64,
+                if r.chosen { 0 } else { r.frames as i64 },
                 r.fps as i64,
                 r.seed as i64,
                 r.audio as i64,
-                picture as i64
+                picture as i64,
+                r.chosen as i64
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -299,14 +312,15 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
     get_one(db, id, owner)?.ok_or_else(|| "the video was queued and then was not there".into())
 }
 
-/// Record where a generation has got to. `false` when the row is gone:
-/// somebody deleted the video, and the generation should stop.
+/// Record where a generation has got to, and the length once the model
+/// has chosen one. `false` when the row is gone: somebody deleted the
+/// video, and the generation should stop.
 pub fn advance(db: &Db, id: i64, step: &kvad::video::Step) -> Res<bool> {
     let n = db.with(|c| {
         c.execute(
-            "UPDATE videos SET status = 'in_progress', progress = ?2, phase = ?3, \
+            "UPDATE videos SET status = 'in_progress', progress = ?2, phase = ?3, frames = coalesce(?4, frames), \
              started_at = coalesce(started_at, datetime('now')) WHERE id = ?1",
-            params![id, step.progress as f64, step.phase],
+            params![id, step.progress as f64, step.phase, step.frames.map(|f| f as i64)],
         )
     })?;
     Ok(n > 0)
@@ -340,8 +354,8 @@ pub fn finish(db: &Db, dir: &FsPath, id: i64, f: &Filmed, ffmpeg: Option<&FsPath
     let n = db.with(|c| {
         c.execute(
             "UPDATE videos SET status = 'completed', progress = 1, phase = NULL, bytes = ?2, encode_secs = ?3, \
-             denoise_secs = ?4, decode_secs = ?5, completed_at = datetime('now') WHERE id = ?1",
-            params![id, bytes as i64, f.encode_secs, f.denoise_secs, f.decode_secs],
+             denoise_secs = ?4, decode_secs = ?5, frames = ?6, completed_at = datetime('now') WHERE id = ?1",
+            params![id, bytes as i64, f.encode_secs, f.denoise_secs, f.decode_secs, f.request.frames as i64],
         )
     })?;
     // Done with: the video itself is the preview now.
@@ -1234,7 +1248,7 @@ mod tests {
     use kvad::video::{Audio, Resolved, Video};
 
     fn resolved(seed: u64) -> Resolved {
-        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, fps: 24, seed, audio: true }
+        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, fps: 24, seed, audio: true }
     }
 
     fn filmed(seed: u64) -> Filmed {
@@ -1265,7 +1279,7 @@ mod tests {
         assert_eq!((q.status.as_str(), q.seed, q.started), ("queued", seed, None));
         assert_eq!(q.resource()["kvad"]["url"], Value::Null, "no link before there is a file");
 
-        let step = kvad::video::Step { phase: "stage 2", done: 1, total: 3, progress: 0.5, elapsed: 30.0, preview: None };
+        let step = kvad::video::Step { phase: "stage 2", frames: None, done: 1, total: 3, progress: 0.5, elapsed: 30.0, preview: None };
         assert!(advance(&db, q.id, &step).unwrap());
         let s = get_one(&db, q.id, None).unwrap().unwrap();
         assert_eq!((s.status.as_str(), s.phase.as_deref(), s.progress), ("in_progress", Some("stage 2"), 0.5));
@@ -1293,6 +1307,24 @@ mod tests {
         assert!(!dir.join(format!("{}.png", q.id)).exists());
         assert!(!advance(&db, q.id, &step).unwrap(), "a deleted video's generation is told to stop");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A video whose length the model chooses says nothing of its length
+    /// until the step that carries it, and keeps what was made.
+    #[test]
+    fn a_chosen_length_is_unknown_until_the_model_says() {
+        let db = Db::in_memory().unwrap();
+        let r = Resolved { chosen: true, frames: 121, ..resolved(1) };
+        let q = queue(&db, None, "m", "b", &r, false).unwrap();
+        let v = q.resource();
+        assert_eq!((v["seconds"].clone(), v["kvad"]["frames"].clone(), v["kvad"]["length_chosen"].clone()), (Value::Null, Value::Null, json!(true)));
+        let text = kvad::video::Step { phase: "text", frames: None, done: 0, total: 1, progress: 0.1, elapsed: 5.0, preview: None };
+        assert!(advance(&db, q.id, &text).unwrap());
+        assert_eq!(get_one(&db, q.id, None).unwrap().unwrap().frames, 0);
+        let step = kvad::video::Step { phase: "stage 1", frames: Some(97), ..text };
+        assert!(advance(&db, q.id, &step).unwrap());
+        let v = get_one(&db, q.id, None).unwrap().unwrap().resource();
+        assert_eq!((v["seconds"].as_str(), v["kvad"]["frames"].as_u64()), (Some("4.04"), Some(97)));
     }
 
     /// A video that started from a picture links to it, and its picture
@@ -1334,7 +1366,7 @@ mod tests {
             queue(&db, None, "m", "b", &resolved(2), false).unwrap(),
             queue(&db, None, "m", "b", &resolved(3), false).unwrap(),
         );
-        let step = kvad::video::Step { phase: "text", done: 0, total: 1, progress: 0.0, elapsed: 0.0, preview: None };
+        let step = kvad::video::Step { phase: "text", frames: None, done: 0, total: 1, progress: 0.0, elapsed: 0.0, preview: None };
         advance(&db, b.id, &step).unwrap();
         finish(&db, &dir, c.id, &filmed(3), None).unwrap();
         assert_eq!(abandon(&db).unwrap(), 2);
@@ -1439,6 +1471,7 @@ mod tests {
         max_frames: 121,
         max_volume: 1536 * 1024 * 121,
         image: true,
+        duration: false,
     };
 
     #[test]

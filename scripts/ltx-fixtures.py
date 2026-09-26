@@ -46,6 +46,12 @@ writes what it makes for the examples to compare against.
         scripts/ltx-fixtures.py --dit "$DIT" --contexts random --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx --held
 
+    cargo run --release -p kvad-gpu --example ltx_duration -- --contexts /tmp/ltx-fx "a door slams shut" "…"
+    HEAD=$(cargo run -q --release -p kvad-gpu --example ltx_duration -- --where)
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --duration "$HEAD" --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_duration -- --fixtures /tmp/ltx-fx
+
     UP=$(cargo run -q --release -p kvad-gpu --example ltx_upsample -- --where | head -1)
     cargo run --release -p kvad-gpu --example ltx -- --prompt "…" --stages 1 \\
         --width 512 --height 320 --frames 25 --latents /tmp/stage1.safetensors
@@ -85,6 +91,9 @@ What to expect, as measured on 2026-09-24 on an M5 Pro:
 - The DiT with its first latent frame held at sigma 0 (`--held`), on seeded
   contexts: 107-118 dB in f32 on the CPU; in bf16 on Metal video 47.1/46.0
   and velocity 42.9 dB, where the reference's own bf16 is 46.9/46.3 and 43.7.
+- The duration head, on eight prompts' contexts from kvad's text path: within
+  5e-7 of the reference's seconds in f32 on the CPU and on Metal, and the same
+  frames for each; the reference's own bf16 is within 1% and the same frames.
 - The latent upsampler, on a 512x320x25 latent from a generation: 98 dB in
   f32 on the CPU and on Metal. In bf16 it is 27 dB from exact, and so is
   the reference's own bf16 on MPS; kvad runs it in f32.
@@ -245,6 +254,32 @@ def picture(path, image, out):
     save_file(fx, f"{out}/picture_f32.safetensors")
     if fx16:
         save_file(fx16, f"{out}/picture_bf16.safetensors")
+
+
+def duration(path, out):
+    """The duration head, on contexts kvad's text path made
+    (`examples/ltx_duration.rs --contexts`): the head reads nothing else, so
+    the same contexts give the reference's prediction for the same prompts."""
+    from ltx_core.duration_head.model_configurator import DURATION_HEAD_KEY_OPS, DurationHeadConfigurator
+
+    meta, tensors = read(path)
+    head = load(DurationHeadConfigurator.from_metadata(meta), tensors, lambda k: k[len("duration_head."):] if k.startswith("duration_head.") else None)
+    ctx = load_file(f"{out}/duration_contexts.safetensors")
+    n = len([k for k in ctx if k.startswith("video_")])
+
+    def run(device, dtype):
+        h = head.to(device, dtype)
+        with torch.no_grad():
+            return {
+                f"seconds_{i}": h(ctx[f"video_{i}"][None].to(device, dtype), ctx[f"audio_{i}"][None].to(device, dtype)).float().cpu()
+                for i in range(n)
+            }
+
+    f32 = run("cpu", torch.float32)
+    save_file(f32, f"{out}/duration_f32.safetensors")
+    if torch.backends.mps.is_available():
+        save_file(run("mps", torch.bfloat16), f"{out}/duration_bf16.safetensors")
+    print("duration: " + ", ".join(f"{f32[f'seconds_{i}'].item():.3f} s" for i in range(n)))
 
 
 def audio(path, out):
@@ -544,6 +579,7 @@ if __name__ == "__main__":
     p.add_argument("--dit", help="diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors (for the connectors)")
     p.add_argument("--blocks", type=int, default=2, help="how many DiT blocks to run with --dit --contexts")
     p.add_argument("--contexts", help="text_contexts_f32.safetensors from --text, or `random`: the DiT's first blocks against them")
+    p.add_argument("--duration", help="model_patches/ltx-2.5-duration-head-bf16.safetensors, on OUT/duration_contexts.safetensors")
     p.add_argument("--picture", help="with --video: a picture for image-to-video, `synthetic` for one drawn here")
     p.add_argument("--upsampler", help="latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors, with --vae and --latent")
     p.add_argument("--vae", help="vae/ltx-2.5-video-vae-conv-bf16.safetensors, for the upsampler's statistics")
@@ -564,6 +600,8 @@ if __name__ == "__main__":
         text(a.text, a.dit, a.out)
     if a.dit and a.contexts:
         transformer(a.dit, a.out, a.contexts, a.blocks)
+    if a.duration:
+        duration(a.duration, a.out)
     if a.upsampler:
         upsampler(a.upsampler, a.vae, a.latent, a.out)
     print(f"wrote {a.out} in {time.time() - started:.0f} s")

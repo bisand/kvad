@@ -2,7 +2,7 @@
 //! model's two stages (`docs/video-plan.md`, steps 5 and 6).
 //!
 //!     cargo run --release -p kvad-gpu --example ltx -- --prompt "…" \
-//!         [--width 768] [--height 512] [--frames 121] [--fps 24] [--seed 0] \
+//!         [--width 768] [--height 512] [--frames N] [--fps 24] [--seed 0] \
 //!         [--stages 2] [--quant q8|bf16] [--out ltx.mp4] [--latents FILE] \
 //!         [--image PICTURE]
 //!
@@ -15,6 +15,10 @@
 //!    exact, the reference's own bf16 included); the DiT refines both
 //!    latents in three steps at the full size; and it is dropped;
 //! 3. the video decoder and the audio path decode, and the MP4 is written.
+//!
+//! Without `--frames`, the duration head chooses the length from the prompt,
+//! as the reference's CLI does: its prediction in seconds, clamped to 1 s
+//! and to 121 frames (the most measured here), on the 8k + 1 grid.
 //!
 //! `--stages 1` runs stage 1 alone at the full size instead: eight steps at
 //! full size rather than three, and no upsampler. Two stages want the width
@@ -45,11 +49,13 @@ fn main() -> Res<()> {
     let num = |f: &str, default: usize| -> Res<usize> { Ok(value(f).map(|v| v.parse()).transpose()?.unwrap_or(default)) };
     let prompt = value("--prompt").ok_or("--prompt TEXT is required")?;
     let fps: f64 = value("--fps").map(|v| v.parse()).transpose()?.unwrap_or(24.0);
-    let shape = Shape::new(num("--width", 768)?, num("--height", 512)?, num("--frames", 121)?, fps)?;
+    let frames: Option<usize> = value("--frames").map(|v| v.parse()).transpose()?;
+    // At the most the head may choose until it has, when it is to choose.
+    let mut shape = Shape::new(num("--width", 768)?, num("--height", 512)?, frames.unwrap_or(121), fps)?;
     let seed = num("--seed", 0)? as u64;
     let stages = num("--stages", 2)?;
     // Stage 1's size: half, for two stages.
-    let first = match stages {
+    let mut first = match stages {
         1 => shape,
         2 => Shape::new(shape.width / 2, shape.height / 2, shape.frames, fps)
             .map_err(|_| format!("{}×{}: two stages want both sides a multiple of 64", shape.width, shape.height))?,
@@ -67,16 +73,25 @@ fn main() -> Res<()> {
     let mut say = |m: &str| eprintln!("   {m}");
     let fetch = |f: &str| fetch_file(LTX_REPO, f, &Watcher::none());
     let (text, dit_path) = (fetch(TEXT_FILE)?, fetch(DIT_FILE)?);
-    eprintln!(
-        "{}×{}, {} frames at {fps} fps ({:.2} s): {} video tokens, {} audio latents; seed {seed}; {stages} stage{}",
-        shape.width,
-        shape.height,
-        shape.frames,
-        shape.frames as f64 / fps,
-        shape.video_tokens(),
-        shape.audio_latents(),
-        if stages == 1 { "" } else { "s" }
-    );
+    match frames {
+        Some(_) => eprintln!(
+            "{}×{}, {} frames at {fps} fps ({:.2} s): {} video tokens, {} audio latents; seed {seed}; {stages} stage{}",
+            shape.width,
+            shape.height,
+            shape.frames,
+            shape.frames as f64 / fps,
+            shape.video_tokens(),
+            shape.audio_latents(),
+            if stages == 1 { "" } else { "s" }
+        ),
+        None => eprintln!(
+            "{}×{} at {fps} fps, as long as the duration head says, up to {} frames; seed {seed}; {stages} stage{}",
+            shape.width,
+            shape.height,
+            shape.frames,
+            if stages == 1 { "" } else { "s" }
+        ),
+    }
 
     // 0. The picture, encoded at each stage's size.
     let stills = match value("--image") {
@@ -113,6 +128,16 @@ fn main() -> Res<()> {
         eprintln!("   {} tokens encoded in {:.2} s", enc.tokens(&prompt)?.len(), t.elapsed().as_secs_f64());
         c
     };
+    // The length, when none was given.
+    if frames.is_none() {
+        use kvad_gpu::video::ltx_duration::{frames_for, DurationHead, FILE, MAX_SECONDS, MIN_SECONDS};
+        let seconds = DurationHead::load(&fetch(FILE)?, &device)?.seconds(&ctx.video, &ctx.audio)?;
+        let most = ((MAX_SECONDS * fps).round() as usize).min(shape.frames);
+        let n = frames_for(seconds, fps, (MIN_SECONDS * fps).round() as usize, most);
+        eprintln!("   the duration head says {seconds:.2} s: {n} frames ({:.2} s)", n as f64 / fps);
+        shape = Shape::new(shape.width, shape.height, n, fps)?;
+        first = Shape::new(first.width, first.height, n, fps)?;
+    }
     // The text path is dropped, but candle's Metal pool only lets go of a
     // dropped tensor's buffer when the device is next synchronised. Without
     // this the text path's 13 GB stayed resident beside the DiT's 20 GB,

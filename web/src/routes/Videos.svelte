@@ -1,7 +1,7 @@
 <script>
   // Text to video, or a picture to video: a prompt, a size and a length, and
   // every video kept.
-  import { videos, SIZES, live } from "../lib/videos.svelte.js";
+  import { videos, SIZES, live, lengthOf } from "../lib/videos.svelte.js";
   import { models } from "../lib/models.svelte.js";
   import { navigate } from "../lib/router.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
@@ -167,7 +167,7 @@
             step="0.5"
             min="0.5"
             bind:value={v.seconds}
-            placeholder={d ? (d.frames / d.fps).toFixed(1) : "default"}
+            placeholder={d ? (d.duration ? "auto" : (d.frames / d.fps).toFixed(1)) : "default"}
           />
         </label>
         <label class="flex flex-col gap-1">
@@ -203,7 +203,8 @@
       <p class="text-xs opacity-60">
         Blank fields are the model's own defaults{#if !d}, which it reports once it is loaded{/if}.
         A length becomes the nearest number of frames the model can make{#if v.frames()}:
-          {v.frames()} frames{/if}. The same seed and settings make the same video.
+          {v.frames()} frames{/if}.{#if d?.duration && !v.seconds}{" "}Left blank, the model chooses it from the prompt: a second or more, and at most
+          {(v.longest / Number(v.fps || d.fps)).toFixed(1)} s at this size.{/if} The same seed and settings make the same video.
       </p>
       <p class="text-xs opacity-60">
         A video holds the GPU for its whole length, and everything else asked of this model waits
@@ -272,7 +273,7 @@
           ></video>
         {/key}
         <p class="text-xs opacity-70">
-          {current.size} · {current.seconds} s at {current.kvad.fps} fps · seed {current.kvad.seed}
+          {current.size} · {lengthOf(current)} at {current.kvad.fps} fps · seed {current.kvad.seed}
           · made in {took(current)} s: text {current.kvad.encode_secs.toFixed(1)} s, denoise
           {current.kvad.denoise_secs.toFixed(1)} s, decode {current.kvad.decode_secs.toFixed(1)} s
         </p>
@@ -317,7 +318,7 @@
             <figcaption class="flex flex-col gap-1 p-3">
               <p class="line-clamp-2 text-sm" title={g.prompt}>{g.prompt}</p>
               <p class="text-xs opacity-60">
-                {g.size} · {g.seconds} s · seed {g.kvad.seed}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
+                {g.size} · {lengthOf(g)} · seed {g.kvad.seed}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
                     class="link"
                     href={g.kvad.picture_url}
                     target="_blank"

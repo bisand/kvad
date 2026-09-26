@@ -8,6 +8,8 @@
 //! - [`ltx_dit`]: the 48-block DiT that denoises a video and its sound
 //!   together, and [`ltx_sample`], the steps that drive it: eight at half
 //!   size, then three at full size;
+//! - [`ltx_duration`]: how long a prompt's clip wants to be, from the same
+//!   contexts, when a request does not say;
 //! - [`ltx_upsample`]: the latent upsampler between the two stages;
 //! - [`ltx_vae`]: the convolutional video decoder, and [`ltx_audio`]: the
 //!   audio decoder, vocoder and bandwidth extension.
@@ -28,6 +30,7 @@ pub mod gemma;
 pub mod ltx;
 pub mod ltx_audio;
 pub mod ltx_dit;
+pub mod ltx_duration;
 mod ltx_fused;
 pub mod ltx_sample;
 pub(crate) mod ltx_nn;

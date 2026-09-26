@@ -43,7 +43,8 @@ video takes minutes, and is the server's job from the moment it is asked for:
 `make` follows it and writes it here, to --out or to video-ID.mp4, but
 stopping the wait does not stop the video. `show` says how far along one is,
 `watch` follows it again, `get` fetches it when it is done, and `rm` deletes
-it, stopping it if it is still being made. Anything left out is the model's own default.
+it, stopping it if it is still being made. Anything left out is the model's own default;
+with no --seconds or --frames, LTX-2.5 chooses the length from the prompt.
 
 --image starts the video from a picture, which becomes its first frame, scaled
 to cover the video's size and cut from the middle. Any format the server's
@@ -1143,7 +1144,7 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                         out::s(&v["kvad"]["id"]),
                         state(v),
                         out::s(&v["size"]),
-                        format!("{} s", out::s(&v["seconds"])),
+                        length(v),
                         out::s(&v["kvad"]["seed"]),
                         out::s(&v["model"]),
                         out::cut(&out::s(&v["prompt"]), 40),
@@ -1196,9 +1197,9 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
             let video = remote.post("/v1/videos", &body)?;
             let id = out::s(&video["id"]);
             eprintln!(
-                "{id}: {}, {} s — the server keeps making it if this stops waiting; `kvad videos get {}` fetches it",
+                "{id}: {}, {} — the server keeps making it if this stops waiting; `kvad videos get {}` fetches it",
                 out::s(&video["size"]),
-                out::s(&video["seconds"]),
+                length(&video),
                 out::s(&video["kvad"]["id"]),
             );
             let video = follow_video(remote, &id)?;
@@ -1239,8 +1240,8 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                 true => out::json(&v),
                 false => {
                     println!("{}  {}", out::s(&v["id"]), state(&v));
-                    let (size, secs, seed) = (out::s(&v["size"]), out::s(&v["seconds"]), out::s(&v["kvad"]["seed"]));
-                    println!("  {size}, {secs} s, seed {seed}, {}", out::s(&v["model"]));
+                    let (size, seed) = (out::s(&v["size"]), out::s(&v["kvad"]["seed"]));
+                    println!("  {size}, {}, seed {seed}, {}", length(&v), out::s(&v["model"]));
                     println!("  {}", out::s(&v["prompt"]));
                 }
             }
@@ -1274,6 +1275,17 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
 
 /// Where a video is, in a few words: `completed`, `stage 2, 61%, about 40 s
 /// left`, `queued`.
+/// A video's length: `4.04 s`, marked when the model chose it, or what it
+/// is waiting on when it has not yet.
+fn length(v: &Value) -> String {
+    let chosen = v["kvad"]["length_chosen"] == json!(true);
+    match (v["seconds"].as_str(), chosen) {
+        (Some(s), false) => format!("{s} s"),
+        (Some(s), true) => format!("{s} s, from the prompt"),
+        (None, _) => "as long as the prompt wants".into(),
+    }
+}
+
 fn state(v: &Value) -> String {
     let k = &v["kvad"];
     match v["status"].as_str().unwrap_or("?") {

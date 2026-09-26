@@ -74,7 +74,9 @@ pub struct VideoRequest {
     pub prompt: String,
     pub width: Option<usize>,
     pub height: Option<usize>,
-    /// Frames, the first one included.
+    /// Frames, the first one included. Left out, a model that can choose a
+    /// length from the prompt does ([`Defaults::duration`]), and one that
+    /// cannot makes [`Defaults::frames`].
     pub frames: Option<usize>,
     pub fps: Option<u32>,
     /// The noise the video starts from. The same seed and settings give the
@@ -98,6 +100,8 @@ pub struct VideoRequest {
 pub struct Defaults {
     pub width: usize,
     pub height: usize,
+    /// The length made when a request gives none and the model cannot
+    /// choose one.
     pub frames: usize,
     pub fps: u32,
     /// Width and height must both be a multiple of this.
@@ -118,6 +122,9 @@ pub struct Defaults {
     pub max_volume: usize,
     /// Whether it can start from a picture ([`VideoRequest::image`]).
     pub image: bool,
+    /// Whether it chooses a clip's length from the prompt when a request
+    /// gives none: LTX-2.5's duration head.
+    pub duration: bool,
 }
 
 /// A [`VideoRequest`] with every blank filled and checked.
@@ -126,7 +133,13 @@ pub struct Resolved {
     pub prompt: String,
     pub width: usize,
     pub height: usize,
+    /// Frames; or, when [`Resolved::chosen`] and the model has not chosen
+    /// yet, the most it may choose: the longest clip at this size that the
+    /// model makes here, which is what admission and every check use.
     pub frames: usize,
+    /// Whether the model chooses the length, from the prompt. A finished
+    /// generation's `frames` is what it chose.
+    pub chosen: bool,
     pub fps: u32,
     pub seed: u64,
     pub audio: bool,
@@ -149,8 +162,19 @@ impl VideoRequest {
     pub fn resolved(&self, d: &Defaults) -> Res<Resolved> {
         let width = self.width.unwrap_or(d.width);
         let height = self.height.unwrap_or(d.height);
-        let frames = self.frames.unwrap_or(d.frames);
         let fps = self.fps.unwrap_or(d.fps);
+        let chosen = self.frames.is_none() && d.duration;
+        // What the model may choose up to: its longest, or less where this
+        // size leaves room for less.
+        let longest = || {
+            let most = (d.max_volume / (width * height).max(1)).min(d.max_frames);
+            (most.saturating_sub(1) / d.frame_step * d.frame_step + 1).max(1)
+        };
+        let frames = match (self.frames, chosen) {
+            (Some(f), _) => f,
+            (None, true) => longest(),
+            (None, false) => d.frames,
+        };
         for (what, n) in [("width", width), ("height", height)] {
             if n == 0 || n % d.multiple != 0 {
                 return Err(format!(
@@ -191,6 +215,14 @@ impl VideoRequest {
             )
             .into());
         }
+        if chosen && frames < fps as usize {
+            // The model never chooses less than a second.
+            return Err(format!(
+                "at {width}×{height} this model makes at most {frames} frames here, less than a second; \
+                 ask for a smaller size, or give frames"
+            )
+            .into());
+        }
         if self.prompt.trim().is_empty() {
             return Err("the prompt is empty".into());
         }
@@ -216,6 +248,7 @@ impl VideoRequest {
             width,
             height,
             frames,
+            chosen,
             fps,
             seed,
             audio: self.audio.unwrap_or(true),
@@ -229,6 +262,9 @@ pub struct Step {
     /// What is running: for LTX, `text`, `stage 1`, `upsample`, `stage 2`,
     /// `decode`.
     pub phase: &'static str,
+    /// The clip's length in frames, once the model has chosen it; `None`
+    /// before, and for a length the request gave.
+    pub frames: Option<usize>,
     /// Of this phase, the steps done and how many there are; 0 of 1 for a
     /// phase that is one piece of work and has just begun.
     pub done: usize,
@@ -1477,7 +1513,25 @@ mod tests {
     }
 
     fn ltx() -> Defaults {
-        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true }
+        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false }
+    }
+
+    /// With a duration head, a request that gives no length is checked at
+    /// the longest the model may choose at its size, which is what it may
+    /// then choose up to; one that gives a length is as before.
+    #[test]
+    fn a_model_that_chooses_the_length_is_bounded_by_the_size() {
+        let d = Defaults { duration: true, ..ltx() };
+        let r = VideoRequest::new("a dog").resolved(&d).unwrap();
+        assert_eq!((r.frames, r.chosen), (121, true));
+        // Twice the measured size leaves room for 57 frames, floored to 57.
+        let r = VideoRequest { width: Some(2048), height: Some(1536), ..VideoRequest::new("a dog") }.resolved(&d).unwrap();
+        assert_eq!((r.frames, r.chosen), (57, true));
+        let r = VideoRequest { frames: Some(49), ..VideoRequest::new("a dog") }.resolved(&d).unwrap();
+        assert_eq!((r.frames, r.chosen), (49, false));
+        // Too big for even one frame is refused as before.
+        assert!(VideoRequest { width: Some(8192), height: Some(8192), ..VideoRequest::new("a dog") }.resolved(&d).is_err());
+        assert!(!VideoRequest::new("a dog").resolved(&ltx()).unwrap().chosen);
     }
 
     #[test]

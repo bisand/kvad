@@ -844,7 +844,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("delete", "/api/images/{id}", "kvad images rm"),
     ("post", "/v1/videos", "kvad videos make"),
     ("get", "/v1/videos", "kvad videos"),
-    ("get", "/v1/videos/{id}", "kvad videos show, kvad videos make"),
+    ("get", "/v1/videos/{id}", "kvad videos show, kvad videos get"),
+    ("get", "/v1/videos/{id}/events", "kvad videos make, kvad videos watch"),
     ("delete", "/v1/videos/{id}", "kvad videos rm"),
     ("get", "/v1/videos/{id}/content", "kvad videos get, kvad videos make"),
 ];

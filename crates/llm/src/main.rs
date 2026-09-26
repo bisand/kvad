@@ -235,7 +235,7 @@ fn usage() -> ! {
            tokenize TEXT       how the model splits a text\n  \
            conversations       ls, show ID, edit ID, rm ID\n  \
            images              ls, make PROMPT [--out FILE], rm ID\n  \
-           videos              ls, make PROMPT [--out FILE], show ID, get ID, rm ID\n  \
+           videos              ls, make PROMPT [--out FILE], show ID, watch ID, get ID, rm ID\n  \
            jobs                ls, show ID, watch ID, cancel ID\n  \
            datasets            ls, add FILE, crawl URL, show ID, check ID, search ID Q, rm ID\n  \
            evals               runs, show ID, suites, add FILE, edit ID FILE, rm ID,\n  \

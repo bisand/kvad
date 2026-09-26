@@ -1354,8 +1354,8 @@ client asks for a video, the way it asks an image model for a picture.
   278.5 s, decode 38.6 s), for a 288 MB file. The server's peak footprint
   over its whole life, the load and the generation, was 33.5 GB, under the
   35.3 GB admission charged. One run.
-- **Not done:** image-to-video; progress as a stream rather than polled.
-  Compression and a preview came after; see below.
+- **Not done:** image-to-video. Compression, a preview and progress as a
+  stream came after; see below.
 
 **Compressed with `ffmpeg`, when there is one.** The MP4 `kvad::video` writes
 compresses nothing: 14 MB a second at 768×512, 57 at 1536×1024. Each video
@@ -1403,3 +1403,26 @@ when the video is done; the Videos page shows it, scaled up smoothly.
   lake where the finished clip has them.
 - **It costs nothing that was not already paid:** reading the frame back is
   the synchronise each step's progress report already made.
+
+**Progress as a stream.** OpenAI's shape is polled, and stays. Beside it,
+`GET /v1/videos/{id}/events` is kvad's own: server-sent events carrying the
+same video object, once as it stands and again at every change, ending with
+`video.completed`, `video.failed` or `video.deleted`. A step can be most of a
+minute from the next, so the page's poll every two seconds asked the list
+thirty times for each answer that changed.
+
+- **Each video being made has a `broadcast` channel carrying nothing.** The
+  task making it tells the channel after every change it writes, and a
+  watcher that hears it reads the row again, so the row stays the one
+  account of a video and a watcher that falls behind skips to the latest.
+  The channel is made before the generation starts and closed when its task
+  ends, which a watcher takes as the last word. A watcher subscribes before
+  it reads the row, so a change between the two is not lost.
+- **Traced on the test server:** events at the start and after each step,
+  and a deletion in stage 1 reached the watcher in the same second. A
+  finished video's stream is one `video.completed` event.
+- **The Videos page** fetched the list once and followed the one video being
+  made on its stream, loading each step's preview as its event arrived. The
+  time left ticks on a clock of its own, since the events come once a step.
+- **`kvad videos make`** follows the stream, and `kvad videos watch ID`
+  follows one again after the wait was stopped.

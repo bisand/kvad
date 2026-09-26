@@ -33,15 +33,16 @@ pub const VIDEOS: &str = "usage: kvad videos [ls]
        kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]
                                [--seconds S | --frames N] [--fps N] [--seed N] [--silent]
        kvad videos show ID
+       kvad videos watch ID    follow it until it ends
        kvad videos get ID [--out FILE]
        kvad videos rm ID
 
 Clips made by a video model on the server — LTX-2.5 — with their sound. A
 video takes minutes, and is the server's job from the moment it is asked for:
-`make` waits and writes it here, to --out or to video-ID.mp4, but stopping
-the wait does not stop the video. `show` says how far along one is, `get`
-fetches it when it is done, and `rm` deletes it, stopping it if it is still
-being made. Anything left out is the model's own default.";
+`make` follows it and writes it here, to --out or to video-ID.mp4, but
+stopping the wait does not stop the video. `show` says how far along one is,
+`watch` follows it again, `get` fetches it when it is done, and `rm` deletes
+it, stopping it if it is still being made. Anything left out is the model's own default.";
 
 pub const JOBS: &str = "usage: kvad jobs [ls] [--limit N]
        kvad jobs show ID
@@ -1189,20 +1190,7 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                 out::s(&video["seconds"]),
                 out::s(&video["kvad"]["id"]),
             );
-            let mut progress = out::Progress::new();
-            let video = loop {
-                let v = remote.get(&format!("/v1/videos/{id}"))?;
-                match v["status"].as_str() {
-                    Some("completed") => break v,
-                    Some("failed") => {
-                        progress.done();
-                        return Err(out::s(&v["error"]["message"]).into());
-                    }
-                    _ => progress.show(format!("  {}", state(&v))),
-                }
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            };
-            progress.done();
+            let video = follow_video(remote, &id)?;
             let path = args.out.clone().unwrap_or_else(|| format!("video-{}.mp4", out::s(&video["kvad"]["id"])));
             fetch(remote, &video, &path)?;
             let k = &video["kvad"];
@@ -1220,6 +1208,15 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                     k["denoise_secs"].as_f64().unwrap_or(0.0),
                     k["decode_secs"].as_f64().unwrap_or(0.0),
                 ),
+            }
+            Ok(())
+        }
+        "watch" => {
+            let id = super::id(needs(words, "a video's id", VIDEOS))?;
+            let video = follow_video(remote, &format!("video_{id}"))?;
+            match args.json {
+                true => out::json(&video),
+                false => println!("video {id} is done: `kvad videos get {id}` fetches it"),
             }
             Ok(())
         }
@@ -1285,6 +1282,34 @@ fn state(v: &Value) -> String {
         "failed" => format!("failed: {}", out::s(&v["error"]["message"])),
         other => other.to_string(),
     }
+}
+
+/// Follow video `id` on its stream of events until it ends, showing where it
+/// is on one line; the finished video comes back.
+fn follow_video(remote: &Remote, id: &str) -> Res<Value> {
+    let mut progress = out::Progress::new();
+    for event in remote.stream("get", &format!("/v1/videos/{id}/events"), None)? {
+        let event = event?;
+        let v = event.json()?;
+        match event.name.as_str() {
+            "video.updated" => progress.show(format!("  {}", state(&v))),
+            "video.completed" => {
+                progress.done();
+                return Ok(v);
+            }
+            "video.failed" => {
+                progress.done();
+                return Err(out::s(&v["error"]["message"]).into());
+            }
+            "video.deleted" => {
+                progress.done();
+                return Err(format!("{id} was deleted").into());
+            }
+            _ => {}
+        }
+    }
+    progress.done();
+    Err(format!("the server stopped telling us about {id} before it ended; `kvad videos show` says where it is").into())
 }
 
 /// Write a finished video's file to `path`.

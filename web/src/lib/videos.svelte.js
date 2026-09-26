@@ -2,12 +2,14 @@
 //
 // The page talks to `/v1/videos` like any other client. That endpoint is a
 // job, not a stream: asking for a video answers at once, and the video is
-// the server's to make from then on. So the page asks, then watches the
-// gallery, which is where a video being made lives as well as a finished
-// one. Closing the tab stops the watching and nothing else; the video is
-// there when the page is opened again.
+// the server's to make from then on. So the page asks, then follows each
+// video still being made on its own stream of events (kvad's
+// `/v1/videos/{id}/events`), which sends the video again at every step and
+// when it ends. The gallery is where a video being made lives as well as a
+// finished one. Closing the tab stops the following and nothing else; the
+// video is there when the page is opened again.
 
-import { api } from "./api.js";
+import { api, sse } from "./api.js";
 import { toasts } from "./toasts.svelte.js";
 import { models } from "./models.svelte.js";
 
@@ -21,9 +23,6 @@ export const SIZES = [
   { label: "Large landscape", width: 1536, height: 1024 },
   { label: "Large portrait", width: 1024, height: 1536 },
 ];
-
-/** How often the gallery is asked again while something in it is live. */
-const POLL_MS = 2000;
 
 /** A video that is still to be made or being made. */
 export const live = (v) => v.status === "queued" || v.status === "in_progress";
@@ -44,7 +43,8 @@ class Videos {
   /** Loading the model, or sending the request. */
   starting = $state(false);
   gallery = $state([]);
-  #timer = null;
+  /** The videos being followed, by id, and how to stop following each. */
+  #following = new Map();
   #watchers = 0;
 
   /** Video models on this machine that could be asked, in memory first. */
@@ -95,15 +95,36 @@ class Videos {
     } catch (e) {
       toasts.error(e.message);
     }
-    this.#schedule();
+    this.#follow();
   }
 
-  /** Ask again while anything is live and anybody is watching. */
-  #schedule() {
-    clearTimeout(this.#timer);
-    this.#timer = null;
-    if (this.#watchers > 0 && this.running.length > 0) {
-      this.#timer = setTimeout(() => this.refresh(), POLL_MS);
+  /** Follow every live video not already followed, while the page is open. */
+  #follow() {
+    if (this.#watchers === 0) return;
+    for (const v of this.running) {
+      if (this.#following.has(v.id)) continue;
+      const stop = new AbortController();
+      this.#following.set(v.id, stop);
+      const put = (data) => {
+        const video = JSON.parse(data);
+        this.gallery = this.gallery.map((g) => (g.id === video.id ? video : g));
+      };
+      sse(
+        `/v1/videos/${v.id}/events`,
+        undefined,
+        {
+          "video.updated": put,
+          "video.completed": put,
+          "video.failed": put,
+          "video.deleted": () => (this.gallery = this.gallery.filter((g) => g.id !== v.id)),
+        },
+        stop.signal,
+        "GET",
+      )
+        .catch((e) => {
+          if (e.name !== "AbortError") toasts.error(e.message);
+        })
+        .finally(() => this.#following.delete(v.id));
     }
   }
 
@@ -113,7 +134,10 @@ class Videos {
     this.refresh();
     return () => {
       this.#watchers -= 1;
-      this.#schedule();
+      if (this.#watchers === 0) {
+        for (const stop of this.#following.values()) stop.abort();
+        this.#following.clear();
+      }
     };
   }
 
@@ -145,7 +169,7 @@ class Videos {
       // made again.
       this.seed = video.kvad.seed;
       this.gallery = [video, ...this.gallery];
-      this.#schedule();
+      this.#follow();
     } catch (e) {
       toasts.error(e.message);
     } finally {

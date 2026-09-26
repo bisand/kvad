@@ -54,6 +54,16 @@
 //! the channel, and the engine stops at the next step. A server that stops
 //! mid-generation marks what it was making as failed when it starts again
 //! ([`abandon`]).
+//!
+//! # Watching instead of asking
+//!
+//! OpenAI's shape is polled, and that stays. Beside it,
+//! `GET /v1/videos/{id}/events` is kvad's own: server-sent events carrying
+//! the same video object, sent once as it stands and again at every change
+//! — each step, the finish, a deletion — until it ends. A step can be a
+//! minute apart from the next, so polling every two seconds asked thirty
+//! times for each answer that changed; and a video that finishes is seen at
+//! once rather than up to two seconds later. See [`Herald`].
 
 use crate::api::{blocking, Fail};
 use crate::auth::{Identity, State};
@@ -78,6 +88,7 @@ pub fn routes() -> Router<State> {
         .route("/v1/videos", post(create).get(list_route))
         .route("/v1/videos/{id}", get(retrieve).delete(remove))
         .route("/v1/videos/{id}/content", get(content))
+        .route("/v1/videos/{id}/events", get(events))
 }
 
 /// Where the MP4s are: `videos` in the data directory.
@@ -373,6 +384,48 @@ pub fn find_ffmpeg(setting: &str, path: &[PathBuf]) -> Option<PathBuf> {
             .find(|f| f.is_file()),
         named => Some(PathBuf::from(named)).filter(|f| f.is_file()),
     }
+}
+
+/// Who is told when a video changes: one `broadcast` a video being made,
+/// carrying nothing. A watcher that hears it reads the row again, so the
+/// row stays the one account of a video, and a watcher that fell behind
+/// loses nothing by skipping to the latest.
+static HERALDS: std::sync::LazyLock<std::sync::Mutex<HashMap<i64, tokio::sync::broadcast::Sender<()>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn heralds() -> std::sync::MutexGuard<'static, HashMap<i64, tokio::sync::broadcast::Sender<()>>> {
+    HERALDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A video being made, as far as its watchers are concerned. Made before the
+/// generation starts, so that nobody can subscribe too early to hear it;
+/// dropped when the generation's task ends, which closes the channel and
+/// tells every watcher to read the row one last time.
+pub struct Herald(i64);
+
+impl Herald {
+    pub fn new(id: i64) -> Self {
+        heralds().insert(id, tokio::sync::broadcast::channel(16).0);
+        Herald(id)
+    }
+}
+
+impl Drop for Herald {
+    fn drop(&mut self) {
+        heralds().remove(&self.0);
+    }
+}
+
+/// Tell whoever is watching video `id` that its row has changed.
+fn tell(id: i64) {
+    if let Some(h) = heralds().get(&id) {
+        let _ = h.send(());
+    }
+}
+
+/// Listen for video `id`'s changes; `None` when nothing is making it.
+fn listen(id: i64) -> Option<tokio::sync::broadcast::Receiver<()>> {
+    heralds().get(&id).map(|h| h.subscribe())
 }
 
 /// Whether a video's row is still there.
@@ -681,18 +734,23 @@ pub async fn create(who: Identity, headers: HeaderMap, St(state): St<State>, bod
     let (db, owner, model, backend) =
         (state.db.clone(), who.id, resident.model.repo.clone(), resident.model.backend.clone());
     let stored = blocking(move || queue(&db, owner, &model, &backend, &resolved)).await?;
-    tokio::spawn(run(state, stored.id, resident.key, request));
+    let herald = Herald::new(stored.id);
+    tokio::spawn(run(state, stored.id, resident.key, request, herald));
     Ok(Json(stored.resource()))
 }
 
 /// Make the video, writing its progress into its row as it goes.
-async fn run(state: State, id: i64, key: Key, request: VideoRequest) {
+///
+/// `_herald` is held for as long as this runs, and every change to the row is
+/// told to it; see [`Herald`].
+async fn run(state: State, id: i64, key: Key, request: VideoRequest, _herald: Herald) {
     let db = state.db.clone();
     let failed = |why: String| {
         let db = db.clone();
         async move {
             let _ = std::fs::remove_file(dir().join(format!("{id}.preview.png")));
             let _ = blocking(move || fail(&db, id, &why)).await;
+            tell(id);
         }
     };
     let mut reels = match state.engine.film(&key, request) {
@@ -733,13 +791,15 @@ async fn run(state: State, id: i64, key: Key, request: VideoRequest) {
                 if !matches!(going.await, Ok(true)) {
                     return;
                 }
+                tell(id);
             }
             Reel::Done(filmed) => {
                 let db = db.clone();
                 let ffmpeg = FFMPEG.get().cloned().flatten();
                 let finished = blocking(move || finish(&db, &dir(), id, &filmed, ffmpeg.as_deref())).await;
-                if let Err(Fail(_, why)) = finished {
-                    failed(why).await;
+                match finished {
+                    Err(Fail(_, why)) => failed(why).await,
+                    Ok(_) => tell(id),
                 }
                 return;
             }
@@ -767,10 +827,57 @@ async fn retrieve(who: Identity, St(state): St<State>, Path(name): Path<String>)
 async fn remove(who: Identity, St(state): St<State>, Path(name): Path<String>) -> Result<Json<Value>, Fail> {
     let id = id_in(&name)?;
     let (db, owner) = (state.db.clone(), who.id);
-    match blocking(move || delete(&db, &dir(), id, owner)).await? {
+    let gone = blocking(move || delete(&db, &dir(), id, owner)).await?;
+    tell(id);
+    match gone {
         true => Ok(Json(json!({ "id": format!("video_{id}"), "object": "video.deleted", "deleted": true }))),
         false => Err(Fail::missing(format!("there is no video {name}"))),
     }
+}
+
+/// A video's changes as server-sent events, until it ends: the video object
+/// as `video.updated`, then `video.completed` or `video.failed` with the
+/// last of it, or `video.deleted`. The first event is the video as it
+/// stands, so a watcher needs no separate `GET`; one that ended long ago is
+/// that event alone.
+async fn events(who: Identity, St(state): St<State>, Path(name): Path<String>) -> Result<Response, Fail> {
+    let id = id_in(&name)?;
+    // Before the row is read, so that a change between the two is heard.
+    let heard = listen(id);
+    let first = one(&who, &state, &name).await?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<axum::response::sse::Event>(16);
+    tokio::spawn(async move {
+        let mut now = Some(first);
+        let mut heard = heard;
+        loop {
+            let (event, data, last) = match &now {
+                Some(v) => match v.status.as_str() {
+                    "completed" => ("video.completed", v.resource(), true),
+                    "failed" => ("video.failed", v.resource(), true),
+                    _ => ("video.updated", v.resource(), false),
+                },
+                None => ("video.deleted", json!({ "id": format!("video_{id}"), "deleted": true }), true),
+            };
+            if tx.send(crate::models::sse(event, &data)).await.is_err() || last {
+                return;
+            }
+            // Nothing is making it and it has not ended, or its maker has
+            // just ended: either way nothing more will be told. (A video
+            // left unfinished by a server that stopped is marked failed
+            // when the server starts again.)
+            let Some(h) = heard.as_mut() else { return };
+            // Lagged is as good as heard: the row is read afresh either way.
+            if let Err(tokio::sync::broadcast::error::RecvError::Closed) = h.recv().await {
+                heard = None;
+            }
+            let (db, owner) = (state.db.clone(), who.id);
+            now = match blocking(move || get_one(&db, id, owner)).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+        }
+    });
+    Ok(crate::models::stream(rx).into_response())
 }
 
 /// OpenAI's list: newest first unless `order=asc`, `limit` at a time (20
@@ -1092,6 +1199,21 @@ mod tests {
         assert!(finish(&db, &dir, q.id, &f, Some(&broken)).unwrap());
         assert_eq!(std::fs::read(dir.join(format!("{}.mp4", q.id))).unwrap(), raw);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A watcher hears each change while a video is made, and hears the
+    /// channel close when the generation's task lets its herald go.
+    #[tokio::test]
+    async fn a_herald_tells_its_listeners_and_closes_when_dropped() {
+        let id = -7; // no row, and no other test's
+        assert!(listen(id).is_none());
+        let herald = Herald::new(id);
+        let mut rx = listen(id).unwrap();
+        tell(id);
+        assert!(rx.recv().await.is_ok());
+        drop(herald);
+        assert!(matches!(rx.recv().await, Err(tokio::sync::broadcast::error::RecvError::Closed)));
+        assert!(listen(id).is_none());
     }
 
     #[test]

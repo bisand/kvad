@@ -483,7 +483,9 @@ to 8k + 1 frames.
 The CLI uses the head whenever no frame count is given. kvad should do the
 same, and let a request give `seconds` or `frames` instead. A 20 s ceiling at
 24 fps is 481 frames, which is not what anyone wants to wait for at first. The
-first milestone should take an explicit frame count.
+first milestone should take an explicit frame count. (It is the default now,
+under this machine's own ceiling; see "The duration head as the default"
+below.)
 
 ### One stage
 
@@ -837,7 +839,7 @@ The same kind of checks apply here:
    page. #51 has the shape. Video files are served with Range support, and
    `ffmpeg` re-encoding is optional. Done; see below.
 8. **Later, each in its own issue:**
-   - the duration head as the default;
+   - the duration head as the default (done; see below);
    - image-to-video (done; see below);
    - the dev model with its guidance;
    - the DiffVAE decoder;
@@ -1519,3 +1521,53 @@ made by FLUX.1-schnell here):
   shows the picture in place of the preview until the first step has one,
   marks a video made from a picture in the gallery, and "Reuse" fetches the
   picture back into the form.
+
+**The duration head as the default.** A request that gives neither
+`seconds` nor `frames` now gets the length the model chooses from the
+prompt, as the reference's pipelines do with their `AutoDuration`: the
+duration head reads the two contexts the text path has just made and
+predicts seconds, which become `round(s · fps)` frames, clamped to 1–20 s,
+floored to 8k + 1.
+
+- **Here the clamp's top is lower**: the longest clip the model makes here
+  at the request's size, 121 frames at 768×512 and at 1536×1024 on this
+  machine. A request is checked, and admitted, at that longest, since that
+  is the most the model may choose; a size that leaves room for less than a
+  second is refused, since the head never chooses less.
+- **The length is known after the text phase**, not when the video is asked
+  for. So the row holds 0 frames and a `chosen` flag until then; OpenAI's
+  `seconds` is `null` and `kvad.frames` too, and `kvad.length_chosen` says
+  the model chose it. The step after the head carries the length, and the
+  row, the plan the progress is weighted by, and the shapes the DiT runs at
+  are all set from it.
+- **The head is optional.** It is 4 MB in its own file, which a load fetches
+  as it fetches the other five; a load that cannot get it makes 121 frames,
+  as before, and says so.
+- **Against the reference**, on eight prompts' contexts from kvad's text
+  path (`examples/ltx_duration.rs`, `scripts/ltx-fixtures.py --duration`):
+  within 5e-7 of its seconds in f32, on the CPU and on Metal, and the same
+  frames for all eight. The reference's own bf16 head is within 1%, and the
+  same frames too. kvad runs it in f32: it is a few hundred million
+  multiply-adds, and bf16 could move a prediction near a frame boundary to
+  the other side.
+
+| Prompt | Head | Frames at 24 fps (up to 121) |
+|---|---|---|
+| a door slams shut | 4.25 s | 97 |
+| a glass falls off a table and shatters on the floor | 4.73 s | 113 |
+| a fox in the snow | 4.34 s | 97 |
+| the red car drives towards the camera and past it (two sentences) | 4.40 s | 105 |
+| two chefs argue in a kitchen (dialogue, four sentences) | 3.88 s | 89 |
+| a lighthouse at dusk, waves, gulls | 5.69 s | 121 |
+| a long, slow aerial shot over mountains at sunrise | 8.17 s | 121 |
+| a woman reads out a letter's worth of dialogue | 8.54 s | 121 |
+
+- **So it mostly shortens.** Five of the eight are shorter than the 121
+  frames every request used to get, and the rest are at the ceiling. "A
+  door slams shut" took 63.2 s at 97 frames, where 121 took 77.8 s.
+- **Through the server**, with OpenAI's Python SDK and no `seconds`: the
+  video came back `queued` with `seconds: None`, read 4.71 s from its first
+  stage-1 step, and finished at 113 frames, which is what ffprobe counts.
+  `kvad videos` shows "4.71 s, from the prompt"; the page's Seconds field
+  reads "auto" and says what the model may choose at the size in the form,
+  and "Reuse" leaves a chosen length for the model to choose again.

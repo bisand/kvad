@@ -23,7 +23,7 @@
 use super::ltx_dit::{video_tokens, Dit, Shape};
 use super::ltx_sample::{one_stage, refine, Latents, STAGE_1, STAGE_2};
 use super::ltx_text::{Contexts, TextEncoder, DIT_FILE, TEXT_FILE};
-use super::{ltx_audio, ltx_upsample, ltx_vae};
+use super::{ltx_audio, ltx_duration, ltx_upsample, ltx_vae};
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::Image;
@@ -107,6 +107,10 @@ fn volume_for_this_machine() -> usize {
 pub struct Ltx {
     repo: String,
     paths: [PathBuf; 5],
+    /// The duration head, which chooses a clip's length when a request
+    /// does not say. Optional: 4 MB fetched at load, and without it a clip
+    /// is [`Defaults::frames`] long, as before there was one.
+    head: Option<PathBuf>,
     quant: GgmlDType,
     device: Device,
     defaults: Defaults,
@@ -133,6 +137,13 @@ impl Ltx {
             paths.push(fetch_file(repo, f, watch)?);
         }
         let paths: [PathBuf; 5] = paths.try_into().map_err(|_| "five files")?;
+        let head = match fetch_file(repo, ltx_duration::FILE, watch) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                progress(&format!("no duration head, so a clip is 121 frames unless asked otherwise: {e}"));
+                None
+            }
+        };
 
         let tag = crate::qcache::tag(quant);
         let cached = |component: &str| kvad::qcache::path_for_tag(&format!("{}/{component}", super::LTX_REPO), &tag).is_file();
@@ -153,6 +164,7 @@ impl Ltx {
             header_params(&paths[2], &[])?,
             header_params(&paths[3], &["encoder."])?,
             header_params(&paths[4], &["audio_vae.encoder"])?,
+            head.as_deref().map(|h| header_params(h, &[])).transpose()?.unwrap_or(0),
         ]
         .iter()
         .sum();
@@ -167,8 +179,9 @@ impl Ltx {
             max_frames: 121,
             max_volume: volume_for_this_machine(),
             image: true,
+            duration: head.is_some(),
         };
-        Ok(Ltx { repo: repo.to_string(), paths, quant, device, defaults, params })
+        Ok(Ltx { repo: repo.to_string(), paths, head, quant, device, defaults, params })
     }
 }
 
@@ -233,18 +246,24 @@ impl Ltx {
     /// [`Director::film`], before the synchronise that frees what it held.
     fn run(&self, req: &VideoRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Filmed> {
         let r = req.resolved(&self.defaults)?;
+        let mut r = r;
         let fps = r.fps as f64;
-        let full = Shape::new(r.width, r.height, r.frames, fps)?;
-        let first = Shape::new(r.width / 2, r.height / 2, r.frames, fps)?;
+        // Until the head has chosen a length, the shapes and the plan are
+        // at the most it may choose; the size is all the picture needs.
+        let shapes = |frames: usize| -> Res<(Shape, Shape)> {
+            Ok((Shape::new(r.width / 2, r.height / 2, frames, fps)?, Shape::new(r.width, r.height, frames, fps)?))
+        };
+        let (mut first, mut full) = shapes(r.frames)?;
         let (device, dtype, quant) = (&self.device, DType::BF16, Some(self.quant));
-        let plan = Plan::new(first, full, req.image.is_some());
-        let total = plan.total();
+        let mut plan = Plan::new(first, full, req.image.is_some());
+        let total = std::cell::Cell::new(plan.total());
+        let chosen = std::cell::Cell::new(None);
         let started = Instant::now();
         // What the plan says is done by the time `phase` reaches step `done`.
         let mut report = |phase: &'static str, done: usize, of: usize, before: f64, preview: Option<Image>| -> Res<()> {
-            let progress = (before / total).clamp(0.0, 1.0) as f32;
+            let progress = (before / total.get()).clamp(0.0, 1.0) as f32;
             let elapsed = started.elapsed().as_secs_f64();
-            match on_step(Step { phase, done, total: of, progress, elapsed, preview }) {
+            match on_step(Step { phase, frames: chosen.get(), done, total: of, progress, elapsed, preview }) {
                 true => Ok(()),
                 false => Err("cancelled".into()),
             }
@@ -282,6 +301,18 @@ impl Ltx {
             let enc = TextEncoder::load(&self.paths[0], &self.paths[1], device, dtype, quant, &mut quiet)?;
             enc.encode(&r.prompt)?
         };
+        // The length, when the model chooses it: the head reads the two
+        // contexts just made, and chooses within the reference's 1–20 s and
+        // under what this size allows here, which `r.frames` holds.
+        if let (true, Some(path)) = (r.chosen, &self.head) {
+            let seconds = ltx_duration::DurationHead::load(path, device)?.seconds(&ctx.video, &ctx.audio)?;
+            let most = ((ltx_duration::MAX_SECONDS * fps).round() as usize).min(r.frames);
+            r.frames = ltx_duration::frames_for(seconds, fps, (ltx_duration::MIN_SECONDS * fps).round() as usize, most);
+            (first, full) = shapes(r.frames)?;
+            plan = Plan::new(first, full, req.image.is_some());
+            total.set(plan.total());
+            chosen.set(Some(r.frames));
+        }
         // candle's Metal pool lets a dropped tensor's buffer go only at the
         // next synchronise; without this the text path's 13 GB would sit
         // beside the DiT's 20.
@@ -335,7 +366,7 @@ impl Ltx {
         device.synchronize()?;
         let video = ltx_vae::to_video(&frames, r.fps)?;
         let decode_secs = t.elapsed().as_secs_f64();
-        report("decode", 1, 1, total, None)?;
+        report("decode", 1, 1, total.get(), None)?;
         Ok(Filmed { video, audio, request: r, encode_secs, denoise_secs, decode_secs })
     }
 }

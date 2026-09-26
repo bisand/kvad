@@ -443,7 +443,11 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       OpenAI's SDKs send it. Beside them: `frames` (or `num_frames`) \
                       instead of `seconds`, `fps`, `seed`, and `audio: false` for a \
                       silent file. A length in seconds becomes the nearest number of \
-                      frames the model can make. A negative prompt, guidance and steps \
+                      frames the model can make. With neither, the model chooses the \
+                      length from the prompt (LTX-2.5's duration head: a second or more, \
+                      at most what it makes here at that size); the video's `seconds` is \
+                      `null` until it has, after the text phase, and `kvad.length_chosen` \
+                      says it was chosen. A negative prompt, guidance and steps \
                       are refused: the one video model here runs a fixed schedule.\n\n\
                       `input_reference` is a picture to start from, 20 MiB at most: a \
                       file in the form, or in JSON `{ image_url }` with a `data:` URL. \

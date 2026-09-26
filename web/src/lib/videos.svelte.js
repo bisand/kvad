@@ -31,6 +31,10 @@ export const SIZES = [
 /** A video that is still to be made or being made. */
 export const live = (v) => v.status === "queued" || v.status === "in_progress";
 
+/** `4.04 s`, or, before the model has chosen a length, what it is waiting
+ *  on. */
+export const lengthOf = (v) => (v.seconds ? `${v.seconds} s` : "length from the prompt");
+
 class Videos {
   /** Which video model to ask: a repo id, or a resident's `repo@backend`. */
   model = $state(null);
@@ -83,13 +87,26 @@ class Videos {
     return Math.max(1, Math.round((Number(this.seconds) * fps) / d.frame_step)) * d.frame_step + 1;
   }
 
-  /** Whether what is in the form is more than the model makes here. */
+  /** The longest clip the model makes here at the size in the form, in
+   *  frames: what it may choose up to, when it chooses. */
+  get longest() {
+    const d = this.defaults;
+    if (!d) return null;
+    const w = Number(this.width || d.width);
+    const h = Number(this.height || d.height);
+    const most = Math.min(d.max_frames, Math.floor(d.max_volume / (w * h)));
+    return Math.max(1, Math.floor((most - 1) / d.frame_step) * d.frame_step + 1);
+  }
+
+  /** Whether what is in the form is more than the model makes here. A
+   *  length the model chooses is at least a second. */
   get tooBig() {
     const d = this.defaults;
     if (!d) return false;
     const w = Number(this.width || d.width);
     const h = Number(this.height || d.height);
-    const f = this.frames() ?? d.frames;
+    const fps = Number(this.fps || d.fps);
+    const f = this.frames() ?? (d.duration ? fps : d.frames);
     return w * h * f > d.max_volume || f > d.max_frames;
   }
 
@@ -222,7 +239,9 @@ class Videos {
     this.prompt = v.prompt;
     this.width = k.width;
     this.height = k.height;
-    this.seconds = Number(v.seconds);
+    // A length the model chose is left to it again: the same prompt makes
+    // the same choice.
+    this.seconds = k.length_chosen ? null : Number(v.seconds);
     this.fps = k.fps;
     this.seed = k.seed;
     this.fixSeed = true;

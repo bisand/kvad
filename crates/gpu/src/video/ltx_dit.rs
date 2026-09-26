@@ -369,9 +369,14 @@ impl Stream {
 
     /// Self-attention, then attention to the text: the first half of a
     /// block, for one stream. `m` is the nine rows with the table added, for
-    /// each set of tokens `held` says; `p` the two for the text.
-    fn attend(&self, x: &Tensor, m: &Tensor, p: &Tensor, context: &Tensor, rope: &Rope, held: Held) -> candle_core::Result<Tensor> {
-        let y = scope(self.names[0], || self.attn1.forward(&ada(x, &row(m, 1)?, &row(m, 0)?, held)?, None, Some(rope), Some(rope)))?;
+    /// each set of tokens `held` says; `p` the two for the text. `blind`
+    /// skips the self-attention for STG ([`Perturb`]).
+    fn attend(&self, x: &Tensor, m: &Tensor, p: &Tensor, context: &Tensor, rope: &Rope, held: Held, blind: bool) -> candle_core::Result<Tensor> {
+        let h = ada(x, &row(m, 1)?, &row(m, 0)?, held)?;
+        let y = match blind {
+            true => scope(self.names[0], || self.attn1.value_only(&h))?,
+            false => scope(self.names[0], || self.attn1.forward(&h, None, Some(rope), Some(rope)))?,
+        };
         let (h, x) = gated_modulate(x, &y, &row(m, 2)?, &row(m, 7)?, &row(m, 6)?, held, EPS)?;
         // The text is modulated but not normalised, and σ moves the
         // modulation, so its keys and values change every step.
@@ -382,9 +387,13 @@ impl Stream {
 
     /// The second half of a block: the audio–video attention's gated
     /// residual `x + y·g`, which the feed-forward's norm reads straight
-    /// after, then the feed-forward and its own residual.
-    fn feed(&self, x: &Tensor, y: &Tensor, g: &Tensor, m: &Tensor, held: Held) -> candle_core::Result<Tensor> {
-        let (h, x) = gated_modulate(x, y, g, &row(m, 4)?, &row(m, 3)?, held, EPS)?;
+    /// after, then the feed-forward and its own residual. No `y` is the
+    /// audio–video attention skipped ([`Perturb`]).
+    fn feed(&self, x: &Tensor, y: Option<&Tensor>, g: &Tensor, m: &Tensor, held: Held) -> candle_core::Result<Tensor> {
+        let (h, x) = match y {
+            Some(y) => gated_modulate(x, y, g, &row(m, 4)?, &row(m, 3)?, held, EPS)?,
+            None => (ada(x, &row(m, 4)?, &row(m, 3)?, held)?, x.clone()),
+        };
         let y = scope(self.names[2], || self.ff.forward(&h))?;
         gated_add(&x, &y, &row(m, 5)?, held)
     }
@@ -399,13 +408,20 @@ struct Block {
 }
 
 impl Block {
-    fn forward(&self, vx: &Tensor, ax: &Tensor, m: &Mods, ctx: &Contexts, g: &Grid) -> candle_core::Result<(Tensor, Tensor)> {
+    /// `blind` skips both streams' self-attention (STG), and `deaf` both
+    /// audio–video attentions.
+    fn forward(&self, vx: &Tensor, ax: &Tensor, m: &Mods, ctx: &Contexts, g: &Grid, blind: bool, deaf: bool) -> candle_core::Result<(Tensor, Tensor)> {
         let (v, a) = (&self.video.tables, &self.audio.tables);
         let (held, all) = (m.held, Held(0));
         let vm = v.main.broadcast_add(&m.video)?;
         let am = (&a.main + &m.audio)?;
-        let vx = self.video.attend(vx, &vm, &(&v.prompt + &m.video_prompt)?, &ctx.video, &g.video, held)?;
-        let ax = self.audio.attend(ax, &am, &(&a.prompt + &m.audio_prompt)?, &ctx.audio, &g.audio, all)?;
+        let vx = self.video.attend(vx, &vm, &(&v.prompt + &m.video_prompt)?, &ctx.video, &g.video, held, blind)?;
+        let ax = self.audio.attend(ax, &am, &(&a.prompt + &m.audio_prompt)?, &ctx.audio, &g.audio, all, blind)?;
+        if deaf {
+            // The reference multiplies both updates by zero; nothing is added.
+            let (vg, ag) = ((row(&v.av, 4)? + &m.a2v_gate)?, (row(&a.av, 4)? + &m.v2a_gate)?);
+            return Ok((self.video.feed(&vx, None, &vg, &vm, held)?, self.audio.feed(&ax, None, &ag, &am, all)?));
+        }
 
         // Each direction reads both streams as they were before either
         // update, so the order of the two does not matter.
@@ -428,7 +444,7 @@ impl Block {
             )
         })?;
         let (vg, ag) = ((row(&v.av, 4)? + &m.a2v_gate)?, (row(&a.av, 4)? + &m.v2a_gate)?);
-        Ok((self.video.feed(&vx, &a2v, &vg, &vm, held)?, self.audio.feed(&ax, &v2a, &ag, &am, all)?))
+        Ok((self.video.feed(&vx, Some(&a2v), &vg, &vm, held)?, self.audio.feed(&ax, Some(&v2a), &ag, &am, all)?))
     }
 }
 
@@ -456,6 +472,20 @@ impl Head {
             _ => one(x, &embedded.narrow(0, k - 1, 1)?),
         }
     }
+}
+
+/// What guidance takes away from a forward pass, to steer away from what
+/// the model makes without it.
+///
+/// - `blind` is spatio-temporal guidance (STG): these blocks' self-attention,
+///   video and audio, is skipped, its output the value projection alone.
+///   LTX-2.5's guidance names block 28.
+/// - `deaf` is modality guidance: every block's audio → video and video →
+///   audio attention is skipped, so each stream is made without the other.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Perturb {
+    pub blind: Vec<usize>,
+    pub deaf: bool,
 }
 
 pub struct Dit {
@@ -489,21 +519,53 @@ impl Dit {
     /// matrix and, for the whole DiT, caches the result, so the next load
     /// maps it instead.
     pub fn load(path: &Path, device: &Device, dtype: DType, layers: Option<usize>, quant: Option<GgmlDType>, progress: &mut dyn FnMut(&str)) -> Res<Self> {
+        Dit::load_as(path, None, "transformer", device, dtype, layers, quant, progress)
+    }
+
+    /// [`Dit::load`] of any DiT of this architecture: the distilled one, the
+    /// dev one, or the dev one with a LoRA fused in at a strength, `lora`.
+    /// `component` names its quantised cache, one per DiT: the distilled
+    /// model's is `transformer`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_as(
+        path: &Path,
+        lora: Option<(&Path, f64)>,
+        component: &str,
+        device: &Device,
+        dtype: DType,
+        layers: Option<usize>,
+        quant: Option<GgmlDType>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Res<Self> {
         let cfg = Config::read(&metadata(path, "config")?["transformer"])?;
         let n = layers.unwrap_or(cfg.layers).min(cfg.layers);
+        let whole = n == cfg.layers;
         let paths = [path.to_path_buf()];
+        // The cache knows the files it came from, the LoRA's among them.
+        let named: Vec<std::path::PathBuf> = paths.iter().cloned().chain(lora.map(|(p, _)| p.to_path_buf())).collect();
+        // The distilled model's header as it always was, so that its cache
+        // stays valid.
+        let shape = match lora {
+            Some((_, s)) => json!({ "component": component, "layers": n, "lora_strength": s }),
+            None => json!({ "component": component, "layers": n }),
+        };
         // Only the whole DiT is cached: a check that loads two blocks would
         // otherwise find the whole one's cache stale and replace it with its
         // own, and the next generation would quantise all 20 GB again.
-        let mut vault = match n == cfg.layers {
-            true => Vault::open_as(&format!("{}/transformer", super::LTX_REPO), &paths, json!({ "component": "transformer", "layers": n }), quant, progress),
+        let mut vault = match whole {
+            true => Vault::open_as(&format!("{}/{component}", super::LTX_REPO), &named, shape, quant, progress),
             false => Vault::off(),
         };
+        let lora = lora.map(|(p, s)| crate::common::Lora::open(p, s, "model.", DType::BF16, device).map(std::rc::Rc::new)).transpose()?;
         let dit = {
             let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
             // The tables are f32 in the file; read in f32 when computing in
             // it, so that they stay exact.
             let r = open(&paths, if dtype == DType::F32 { DType::F32 } else { DType::BF16 })?;
+            let r = match &lora {
+                Some(l) => r.with_lora(l.clone()),
+                None => r,
+            };
             let m = r.pp("model.diffusion_model");
             // The connectors are the text path's; see `ltx_text`.
             m.skip_under("video_embeddings_connector");
@@ -553,6 +615,13 @@ impl Dit {
             };
             dit
         };
+        // Every pair of the LoRA fused, when it was fused at all: one meant
+        // for another model would otherwise load as if it had been.
+        if let (Some(l), false, true) = (&lora, vault.is_reading(), whole) {
+            if l.unused() > 0 {
+                return Err(format!("the LoRA adapts {} weight(s) this DiT never read", l.unused()).into());
+            }
+        }
         vault.finish(progress);
         Ok(dit)
     }
@@ -630,7 +699,12 @@ impl Dit {
     /// `held` video tokens are held clean, at σ = 0: a picture the video
     /// starts from, or none.
     pub fn forward(&self, video: &Tensor, audio: &Tensor, sigma: (f32, f32), held: usize, ctx: &Contexts, grid: &Grid) -> Res<(Tensor, Tensor)> {
-        self.forward_watched(video, audio, sigma, held, ctx, grid, &mut |_, _, _| Ok(()))
+        self.forward_watched(video, audio, sigma, held, ctx, grid, &Perturb::default(), &mut |_, _, _| Ok(()))
+    }
+
+    /// [`Dit::forward`] with parts of the model taken away, as guidance asks.
+    pub fn forward_perturbed(&self, video: &Tensor, audio: &Tensor, sigma: (f32, f32), held: usize, ctx: &Contexts, grid: &Grid, p: &Perturb) -> Res<(Tensor, Tensor)> {
+        self.forward_watched(video, audio, sigma, held, ctx, grid, p, &mut |_, _, _| Ok(()))
     }
 
     /// [`Dit::forward`], showing `watch` both streams after every block.
@@ -642,6 +716,7 @@ impl Dit {
         held: usize,
         ctx: &Contexts,
         grid: &Grid,
+        p: &Perturb,
         watch: &mut dyn FnMut(usize, &Tensor, &Tensor) -> Res<()>,
     ) -> Res<(Tensor, Tensor)> {
         let dt = self.dtype;
@@ -655,7 +730,7 @@ impl Dit {
         let mut ax = self.audio_patchify.forward(&audio.to_dtype(dt)?)?.to_dtype(dt)?;
         let ctx = Contexts { video: ctx.video.to_dtype(dt)?, audio: ctx.audio.to_dtype(dt)? };
         for (i, b) in self.blocks.iter().enumerate() {
-            (vx, ax) = b.forward(&vx, &ax, &m, &ctx, grid)?;
+            (vx, ax) = b.forward(&vx, &ax, &m, &ctx, grid, p.blind.contains(&i), p.deaf)?;
             watch(i, &vx, &ax)?;
         }
         Ok((self.head.forward(&vx, &m.video_embedded, m.held)?, self.audio_head.forward(&ax, &m.audio_embedded, Held(0))?))

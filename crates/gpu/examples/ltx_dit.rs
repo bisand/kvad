@@ -15,14 +15,26 @@
 //!
 //! `--held` does steps 2 and 3 as image-to-video does them: the first latent
 //! frame held at σ = 0 while the rest is at the fixture's σ, against the
-//! reference's `dit_held_*`.
+//! reference's `dit_held_*`. `--blind` and `--deaf` do them with guidance's
+//! perturbations ([`Perturb`]): the last block's self-attention skipped, and
+//! every audio–video attention skipped, against `dit_blind_*` and
+//! `dit_deaf_*`.
+//!
+//! `--guided` compares one guided prediction of the clean latents
+//! (`ltx_sample::guided_x0`: four passes, combined by LTX-2.5's guidance)
+//! with the reference's `_guided_denoise`, against `dit_guided_*`
+//! (`scripts/ltx-fixtures.py --guided`).
+//!
+//! `--path FILE` loads another DiT of the same architecture, the dev model's;
+//! `--lora FILE` fuses a LoRA into it at strength 1, against `dit_lora_*`
+//! (`scripts/ltx-fixtures.py --lora`).
 //!
 //! `--only N` runs just step N; `--blocks N` loads that many blocks (the
 //! fixture's count by default); `--f32` runs step 3 in f32.
 
 use candle_core::{DType, Device, Tensor};
 use kvad::weights::{fetch_file, Watcher};
-use kvad_gpu::video::ltx_dit::{audio_tokens, video_tokens, Dit, Shape};
+use kvad_gpu::video::ltx_dit::{audio_tokens, video_tokens, Dit, Perturb, Shape};
 use kvad_gpu::video::ltx_text::{Contexts, DIT_FILE};
 use kvad_gpu::video::LTX_REPO;
 use std::collections::HashMap;
@@ -45,7 +57,10 @@ fn db(got: &Tensor, want: &Tensor) -> Res<f32> {
 fn main() -> Res<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let value = |f: &str| argv.iter().position(|a| a == f).and_then(|i| argv.get(i + 1)).cloned();
-    let path = fetch_file(LTX_REPO, DIT_FILE, &Watcher::none())?;
+    let path = match value("--path") {
+        Some(p) => p.into(),
+        None => fetch_file(LTX_REPO, DIT_FILE, &Watcher::none())?,
+    };
     let quant = match value("--quant").as_deref() {
         None | Some("bf16") => None,
         Some(q) => kvad_gpu::model::parse_quant(q).ok_or("--quant is bf16 or q8")?,
@@ -69,8 +84,16 @@ fn main() -> Res<()> {
         true => HashMap::from([("video".to_string(), get(&inputs, "video_context")?), ("audio".to_string(), get(&inputs, "audio_context")?)]),
         false => file("text_contexts_f32.safetensors")?,
     };
-    let held = argv.iter().any(|a| a == "--held");
-    let fixture = if held { "dit_held" } else { "dit" };
+    let flag = |f: &str| argv.iter().any(|a| a == f);
+    let held = flag("--held");
+    let lora = value("--lora");
+    let fixture = match (held, flag("--blind"), flag("--deaf")) {
+        _ if lora.is_some() => "dit_lora",
+        (true, ..) => "dit_held",
+        (_, true, _) => "dit_blind",
+        (_, _, true) => "dit_deaf",
+        _ => "dit",
+    };
     let want = file(&format!("{fixture}_f32.safetensors"))?;
     let held = if held { shape.frame_tokens() } else { 0 };
     let blocks: usize = match value("--blocks") {
@@ -104,14 +127,31 @@ fn main() -> Res<()> {
 
     let run = |device: &Device, dtype: DType, quant, label: &str, n: usize| -> Res<()> {
         let t = Instant::now();
-        let dit = Dit::load(&path, device, dtype, Some(blocks), quant, &mut |m| eprintln!("   {m}"))?;
+        let lora = lora.as_ref().map(|l| (std::path::Path::new(l), 1.0));
+        let dit = Dit::load_as(&path, lora, "transformer-check", device, dtype, Some(blocks), quant, &mut |m| eprintln!("   {m}"))?;
         eprintln!("{n}. {label}: {:.2} B parameters in {:.1} s", dit.params() as f64 / 1e9, t.elapsed().as_secs_f64());
         let ctx = Contexts { video: get(&contexts, "video")?.to_device(device)?, audio: get(&contexts, "audio")?.to_device(device)? };
         let grid = dit.grid(shape)?;
         let (v, a) = (video.to_device(device)?, audio.to_device(device)?);
         let mut out = vec![];
         let t = Instant::now();
-        let (vv, va) = dit.forward_watched(&v, &a, (sigma, sigma), held, &ctx, &grid, &mut |i, vx, ax| {
+        let p = Perturb { blind: if flag("--blind") { vec![blocks - 1] } else { vec![] }, deaf: flag("--deaf") };
+        if flag("--guided") {
+            use kvad_gpu::video::ltx_sample::{guided_x0, AUDIO_GUIDE, VIDEO_GUIDE};
+            let want = file(&format!("dit_guided_{}.safetensors", "f32"))?;
+            let neg = Contexts { video: get(&inputs, "video_negative")?.to_device(device)?, audio: get(&inputs, "audio_negative")?.to_device(device)? };
+            let (vt, at) = (v.to_dtype(dtype)?, a.to_dtype(dtype)?);
+            let t = Instant::now();
+            let (x0v, x0a) = guided_x0(&dit, &vt, &at, sigma, &ctx, &neg, &grid, (VIDEO_GUIDE, AUDIO_GUIDE), None)?;
+            device.synchronize()?;
+            eprintln!("   one guided prediction, four passes, in {:.2} s", t.elapsed().as_secs_f64());
+            eprintln!("   guided: video {:6.1} dB, audio {:6.1} dB", db(&x0v, &get(&want, "video")?)?, db(&x0a, &get(&want, "audio")?)?);
+            if let (DType::BF16, Ok(r)) = (dtype, file("dit_guided_bf16.safetensors")) {
+                eprintln!("   the reference's own bf16 on MPS: video {:.1} dB, audio {:.1} dB", db(&get(&r, "video")?, &get(&want, "video")?)?, db(&get(&r, "audio")?, &get(&want, "audio")?)?);
+            }
+            return Ok(());
+        }
+        let (vv, va) = dit.forward_watched(&v, &a, (sigma, sigma), held, &ctx, &grid, &p, &mut |i, vx, ax| {
             out.push((i, vx.clone(), ax.clone()));
             Ok(())
         })?;
@@ -136,7 +176,7 @@ fn main() -> Res<()> {
             _ => "bf16 on Metal",
         };
         run(&Device::new_metal(0)?, dtype, quant, label, 3)?;
-        if let Ok(r) = file(&format!("{fixture}_bf16.safetensors")) {
+        if let (false, Ok(r)) = (flag("--guided"), file(&format!("{fixture}_bf16.safetensors"))) {
             let mut line = String::new();
             for i in 0..blocks {
                 line += &format!(" block {i} {:.1}/{:.1},", db(&get(&r, &format!("video_{i}"))?, &get(&want, &format!("video_{i}"))?)?, db(&get(&r, &format!("audio_{i}"))?, &get(&want, &format!("audio_{i}"))?)?);

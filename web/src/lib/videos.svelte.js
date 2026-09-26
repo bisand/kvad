@@ -47,6 +47,11 @@ class Videos {
   seed = $state(null);
   fixSeed = $state(false);
   sound = $state(true);
+  /** Guidance: any of these runs the guided (dev) pipeline. Blank is the
+   *  pipeline's own default, and all blank is the fast unguided one. */
+  steps = $state(null);
+  guidance = $state(null);
+  negative = $state("");
   /** The picture to start from, a `File`, and a link to show it by. */
   picture = $state(null);
   pictureUrl = $state(null);
@@ -134,6 +139,11 @@ class Videos {
       : { sides: "top and bottom", share: 1 - pa / va };
   }
 
+  /** Whether the form asks for guidance, and so the dev pipeline. */
+  get guided() {
+    return Boolean(this.steps || this.guidance || this.negative.trim());
+  }
+
   /** The videos being made. */
   get running() {
     return this.gallery.filter(live);
@@ -210,6 +220,9 @@ class Videos {
       if (frames) body.frames = frames;
       if (this.fps) body.fps = Number(this.fps);
       if (this.fixSeed && this.seed != null && this.seed !== "") body.seed = Number(this.seed);
+      if (this.steps) body.steps = Number(this.steps);
+      if (this.guidance) body.guidance_scale = Number(this.guidance);
+      if (this.negative.trim()) body.negative_prompt = this.negative.trim();
       let request;
       if (this.picture) {
         // A form, whose content type the browser writes with its boundary.
@@ -246,6 +259,9 @@ class Videos {
     this.seed = k.seed;
     this.fixSeed = true;
     this.sound = k.audio;
+    this.steps = k.guided?.steps ?? null;
+    this.guidance = k.guided?.guidance ?? null;
+    this.negative = k.guided?.negative_prompt ?? "";
     const resident = models.videoResidents.find((r) => r.repo === v.model);
     this.model = resident?.id ?? v.model;
     if (!k.picture_url) return this.choosePicture(null);

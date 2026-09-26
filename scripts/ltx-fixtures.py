@@ -45,6 +45,16 @@ writes what it makes for the examples to compare against.
     PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
         scripts/ltx-fixtures.py --dit "$DIT" --contexts random --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx --held
+    cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx --blind
+    cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx --deaf
+
+    LORA=$(cargo run -q --release -p kvad-gpu --example ltx_fetch -- loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors | cut -d' ' -f1)
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --dit "$DIT" --contexts random --lora "$LORA" --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx --lora "$LORA"
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src:/tmp/LTX-2/packages/ltx-pipelines/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --dit "$DIT" --contexts random --guided --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx --guided
 
     cargo run --release -p kvad-gpu --example ltx_duration -- --contexts /tmp/ltx-fx "a door slams shut" "…"
     HEAD=$(cargo run -q --release -p kvad-gpu --example ltx_duration -- --where)
@@ -59,8 +69,9 @@ writes what it makes for the examples to compare against.
         scripts/ltx-fixtures.py --upsampler "$UP" --vae "$VIDEO" --latent /tmp/stage1.safetensors --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_upsample -- --fixtures /tmp/ltx-fx [--cpu | --f32]
 
-(the text fixtures also want `transformers` 5.8 to 5.14 in the venv, and the
-picture `pillow`). The
+(the text fixtures also want `transformers` 5.8 to 5.14 in the venv, the
+picture `pillow`, and `--guided` `torchaudio` and `scipy`, for the pipelines
+package it imports the guided denoiser from). The
 `--where` lines download each file first. The repo is gated: accept its
 licence on the Hub and have a token saved.)
 
@@ -94,6 +105,15 @@ What to expect, as measured on 2026-09-24 on an M5 Pro:
 - The duration head, on eight prompts' contexts from kvad's text path: within
   5e-7 of the reference's seconds in f32 on the CPU and on Metal, and the same
   frames for each; the reference's own bf16 is within 1% and the same frames.
+- Guidance's perturbations, on the DiT's first two blocks: the last block's
+  self-attention skipped (`--blind`) 112-120 dB in f32, and every audio-video
+  attention skipped (`--deaf`) 115-120 dB; in bf16 on Metal each where the
+  reference's own bf16 is. The distilled LoRA fused (`--lora`): 115-121 dB,
+  its fused weights rounded to bf16 as the reference rounds them. One guided
+  prediction, four passes combined (`--guided`): video 102.6 and audio
+  99.2 dB in f32; 35.6 and 27.4 in bf16, where the reference's own is 35.7
+  and 27.1. Any DiT of this architecture serves for these: `ltx_dit --path`
+  loads the dev model's.
 - The latent upsampler, on a 512x320x25 latent from a generation: 98 dB in
   f32 on the CPU and on Metal. In bf16 it is 27 dB from exact, and so is
   the reference's own bf16 on MPS; kvad runs it in f32.
@@ -443,7 +463,7 @@ def text(path, dit, out):
     print("text: contexts", tuple(o.video_encoding.shape), tuple(o.audio_encoding.shape))
 
 
-def transformer(path, out, contexts, blocks):
+def transformer(path, out, contexts, blocks, lora=None, guided=False):
     """The DiT's first `blocks` blocks, with everything around them: the
     patchify projections, the eight adaLN modules, the keyframe embedding,
     the RoPE tables built from the reference's own positions, and the output
@@ -463,6 +483,23 @@ def transformer(path, out, contexts, blocks):
         )
         tensors = {k: f.get_tensor(k) for k in f.keys() if keep(k)}
     meta["config"]["transformer"]["num_layers"] = blocks
+    if lora:
+        # The LoRA fused as the reference fuses it, by its own `apply_loras`:
+        # `(B · strength) @ A`, plus the weight, rounded to the weight's
+        # bf16. On MPS, as it does here, where it aggregates in f32; on the
+        # CPU it aggregates in bf16, on one core, for most of an hour. The
+        # LoRA's names are the DiT's without `model.`.
+        from ltx_core.loader.fuse_loras import apply_loras
+        from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
+
+        with safe_open(lora, framework="pt") as f:
+            lsd = {"model." + k: f.get_tensor(k) for k in f.keys() if keep("model." + k.split(".lora_")[0] + ".weight")}
+        n = sum(1 for k in lsd if k.endswith(".lora_A.weight"))
+        fuse = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        on = lambda d: {k: v.to(fuse) for k, v in d.items()}
+        sd = apply_loras(StateDict(on(tensors), fuse, 0, set()), [LoraStateDictWithStrength(StateDict(on(lsd), fuse, 0, set()), 1.0)])
+        tensors = {k: v.cpu() for k, v in sd.sd.items()}
+        print(f"dit: fused {n} LoRA pairs into the first {blocks} blocks and the rest")
 
     # 512×320, 25 frames at 24 fps: 4 latent frames of 10×16, 640 video
     # tokens, and 26 audio latents. Small enough for f32 on the CPU.
@@ -483,11 +520,33 @@ def transformer(path, out, contexts, blocks):
         ctx = {"video": torch.randn(64, 4096, generator=gc), "audio": torch.randn(64, 2048, generator=gc)}
     else:
         ctx = load_file(contexts)
+    # A negative prompt's contexts, for guidance: seeded too.
+    gn = torch.Generator().manual_seed(12)
+    neg = {"video": torch.randn(64, 4096, generator=gn), "audio": torch.randn(64, 2048, generator=gn)}
     # Image-to-video: the first latent frame is the picture, held at σ = 0
     # while the rest is denoised. Its tokens are the first h·w.
     frame = vstate.latent.shape[1] // VideoLatentShape.from_pixel_shape(pixels).frames
 
-    def run(device, dtype, held=False):
+    def perturbed(kind, device, dtype):
+        """Guidance's perturbations: `blind`, spatio-temporal guidance on the
+        last block loaded (LTX-2.5's is block 28, past what two blocks reach),
+        for video and audio; `deaf`, both audio-video attentions skipped in
+        every block."""
+        from ltx_core.guidance.perturbations import (
+            BatchedPerturbationConfig,
+            Perturbation,
+            PerturbationConfig,
+            PerturbationType,
+        )
+
+        last = [blocks - 1]
+        ptb = {
+            "blind": [Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=last), Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=last)],
+            "deaf": [Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None), Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None)],
+        }[kind]
+        return BatchedPerturbationConfig([PerturbationConfig(ptb)], num_blocks=blocks, device=device, dtype=dtype)
+
+    def run(device, dtype, held=False, kind=None):
         m = LTXModelConfigurator.from_metadata(meta)
         m = load(m, tensors, lambda k: k[len(prefix):])
         m = m.to(device=device, dtype=dtype)
@@ -512,8 +571,9 @@ def transformer(path, out, contexts, blocks):
 
         with torch.no_grad():
             t = time.time()
-            v, a = m(modality(vstate, vlat, ctx["video"]), modality(astate, alat, ctx["audio"]), None)
-            print(f"dit: {blocks} blocks in {dtype} on {device}{', the first frame held' if held else ''}, {time.time() - t:.1f} s")
+            ptb = perturbed(kind, device, dtype) if kind else None
+            v, a = m(modality(vstate, vlat, ctx["video"]), modality(astate, alat, ctx["audio"]), ptb)
+            print(f"dit: {blocks} blocks in {dtype} on {device}{', the first frame held' if held else ''}{', ' + kind if kind else ''}, {time.time() - t:.1f} s")
         caught.update({"video_out": v[0].float().cpu(), "audio_out": a[0].float().cpu()})
         return {k: v.contiguous() for k, v in caught.items()}
 
@@ -530,13 +590,56 @@ def transformer(path, out, contexts, blocks):
             "shape": torch.tensor([width, height, frames, fps]),
             "video_context": ctx["video"].contiguous(),
             "audio_context": ctx["audio"].contiguous(),
+            "video_negative": neg["video"].contiguous(),
+            "audio_negative": neg["audio"].contiguous(),
         },
         f"{out}/dit_inputs.safetensors",
     )
-    for held, name in ((False, "dit"), (True, "dit_held")):
-        save_file(run("cpu", torch.float32, held), f"{out}/{name}_f32.safetensors")
+    def run_guided(device, dtype):
+        """One guided prediction by the reference's own `_guided_denoise`:
+        four passes (the prompt, the negative prompt, STG on the last block
+        loaded, the streams without each other) combined by LTX-2.5's
+        guidance, CFG 3 and 7, STG 1, modality 3, rescale 0.7."""
+        import dataclasses
+        import sys
+        import types
+
+        sys.modules.setdefault("OpenImageIO", types.ModuleType("OpenImageIO"))
+        from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
+        from ltx_core.model.transformer import X0Model
+        from ltx_pipelines.utils.denoisers import _guided_denoise
+
+        m = load(LTXModelConfigurator.from_metadata(meta), tensors, lambda k: k[len(prefix):]).to(device=device, dtype=dtype)
+        def on(st, lat):
+            moved = {f.name: getattr(st, f.name).to(device) for f in dataclasses.fields(st) if isinstance(getattr(st, f.name), torch.Tensor)}
+            moved["latent"] = lat.to(device, dtype)
+            return dataclasses.replace(st, **moved)
+
+        guide = lambda cfg, n: MultiModalGuider(
+            params=MultiModalGuiderParams(cfg_scale=cfg, stg_scale=1.0, stg_blocks=[blocks - 1], rescale_scale=0.7, modality_scale=3.0),
+            negative_context=n.to(device, dtype)[None],
+        )
+        with torch.no_grad():
+            t = time.time()
+            v, a = _guided_denoise(
+                X0Model(m), on(vstate, vlat), on(astate, alat), torch.tensor(sigma, device=device), guide(3.0, neg["video"]), guide(7.0, neg["audio"]),
+                ctx["video"].to(device, dtype)[None], ctx["audio"].to(device, dtype)[None], last_denoised_video=None, last_denoised_audio=None, step_index=0,
+            )
+            print(f"dit: one guided prediction, {blocks} blocks in {dtype} on {device}, {time.time() - t:.1f} s")
+        return {"video": v.denoised[0].float().cpu().contiguous(), "audio": a.denoised[0].float().cpu().contiguous()}
+
+    runs = ((False, None, "dit"), (True, None, "dit_held"), (False, "blind", "dit_blind"), (False, "deaf", "dit_deaf"))
+    if lora:
+        runs = ((False, None, "dit_lora"),)
+    if guided:
+        runs = ()
+        save_file(run_guided("cpu", torch.float32), f"{out}/dit_guided_f32.safetensors")
         if torch.backends.mps.is_available():
-            save_file(run("mps", torch.bfloat16, held), f"{out}/{name}_bf16.safetensors")
+            save_file(run_guided("mps", torch.bfloat16), f"{out}/dit_guided_bf16.safetensors")
+    for held, kind, name in runs:
+        save_file(run("cpu", torch.float32, held, kind), f"{out}/{name}_f32.safetensors")
+        if torch.backends.mps.is_available():
+            save_file(run("mps", torch.bfloat16, held, kind), f"{out}/{name}_bf16.safetensors")
     print(f"dit: video {tuple(vlat.shape)}, audio {tuple(alat.shape)}, σ {sigma}")
 
 
@@ -578,6 +681,8 @@ if __name__ == "__main__":
     p.add_argument("--text", help="text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors")
     p.add_argument("--dit", help="diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors (for the connectors)")
     p.add_argument("--blocks", type=int, default=2, help="how many DiT blocks to run with --dit --contexts")
+    p.add_argument("--lora", help="with --dit --contexts: a LoRA fused into the DiT, writing dit_lora_*")
+    p.add_argument("--guided", action="store_true", help="with --dit --contexts: one guided prediction, writing dit_guided_*")
     p.add_argument("--contexts", help="text_contexts_f32.safetensors from --text, or `random`: the DiT's first blocks against them")
     p.add_argument("--duration", help="model_patches/ltx-2.5-duration-head-bf16.safetensors, on OUT/duration_contexts.safetensors")
     p.add_argument("--picture", help="with --video: a picture for image-to-video, `synthetic` for one drawn here")
@@ -599,7 +704,7 @@ if __name__ == "__main__":
     if a.text:
         text(a.text, a.dit, a.out)
     if a.dit and a.contexts:
-        transformer(a.dit, a.out, a.contexts, a.blocks)
+        transformer(a.dit, a.out, a.contexts, a.blocks, a.lora, a.guided)
     if a.duration:
         duration(a.duration, a.out)
     if a.upsampler:

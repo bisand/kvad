@@ -8,3 +8,6 @@
 /web/dist/*
 !/web/dist/.gitkeep
 *.env
+
+# Python bytecode, from running the fixture scripts.
+__pycache__/

@@ -278,8 +278,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
         summary: "Download a model without loading it",
         description: "A job, not a stream: a checkpoint of several gigabytes takes \
                       longer than a browser tab reliably stays open. Watch it at \
-                      `/api/jobs/{id}/events`.",
-        query: &[], body: json_body("`{ repo }`."), produces: JSON, events: &[],
+                      `/api/jobs/{id}/events`. `dev: true` also fetches LTX-2.5's dev \
+                      model and distilled LoRA, 51 GB, which guided videos read and \
+                      nothing else fetches.",
+        query: &[], body: json_body("`{ repo, dev? }`."), produces: JSON, events: &[],
     },
     Endpoint {
         method: "delete", path: "/api/qcache", tag: "Models", access: Access::Admin,
@@ -447,8 +449,14 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       length from the prompt (LTX-2.5's duration head: a second or more, \
                       at most what it makes here at that size); the video's `seconds` is \
                       `null` until it has, after the text phase, and `kvad.length_chosen` \
-                      says it was chosen. A negative prompt, guidance and steps \
-                      are refused: the one video model here runs a fixed schedule.\n\n\
+                      says it was chosen.\n\n\
+                      `steps` (or `num_inference_steps`), `guidance_scale` and \
+                      `negative_prompt` ask for guidance: any of them runs LTX-2.5's \
+                      dev model, 30 steps at CFG 3 unless given, each step four DiT \
+                      calls, rather than its distilled one; about four times as long. \
+                      Its files come from a pull with `dev: true`; a guided request \
+                      before that is a 400 that says so. `kvad.guided` says how a \
+                      video was guided.\n\n\
                       `input_reference` is a picture to start from, 20 MiB at most: a \
                       file in the form, or in JSON `{ image_url }` with a `data:` URL. \
                       A URL elsewhere and a `file_id` are refused. It becomes the first \
@@ -459,7 +467,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       generation is the server's from then on, and takes minutes. The \
                       engine that makes it answers nothing else meanwhile.",
         query: &[], body: json_body("`{ prompt, model?, size?, seconds?, frames?, fps?, seed?, \
-                                     audio?, input_reference? }`, or the same fields as \
+                                     audio?, input_reference?, steps?, guidance_scale?, \
+                                     negative_prompt? }`, or the same fields as \
                                      `multipart/form-data`, with `input_reference` a file."),
         produces: JSON, events: &[],
     },

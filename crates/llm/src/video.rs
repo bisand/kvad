@@ -57,6 +57,14 @@ pub const LTX_PIPELINE: &str = "LTX2Pipeline";
 /// The file that makes a repo LTX-2.5: its distilled DiT.
 pub const LTX_DENOISER: &str = "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors";
 
+/// What LTX-2.5's guided pipeline reads beyond the distilled one: the dev
+/// DiT, 42 GB, and the distilled LoRA that makes its second stage, 8.9 GB.
+/// Fetched only by `kvad pull Lightricks/LTX-2.5 --dev`, never by a load.
+pub const LTX_DEV_FILES: [&str; 2] = [
+    "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors",
+    "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
+];
+
 /// Whether a pipeline, by name, makes videos rather than images.
 pub fn is_video_pipeline(name: &str) -> bool {
     name == LTX_PIPELINE
@@ -92,6 +100,13 @@ pub struct VideoRequest {
     /// did to pictures, which for LTX-2.5 is one H.264 round trip at CRF 18
     /// (the server's `videos.rs` does it).
     pub image: Option<crate::image::Image>,
+    /// Guidance, which a model with a guided pipeline ([`Defaults::guided`])
+    /// runs when any of these is given: denoising steps, how hard to steer
+    /// towards the prompt, and what to steer away from. None given, the
+    /// fast unguided pipeline runs.
+    pub steps: Option<usize>,
+    pub guidance: Option<f32>,
+    pub negative_prompt: Option<String>,
 }
 
 /// A model's own answers for what a [`VideoRequest`] leaves out, and its
@@ -125,6 +140,28 @@ pub struct Defaults {
     /// Whether it chooses a clip's length from the prompt when a request
     /// gives none: LTX-2.5's duration head.
     pub duration: bool,
+    /// The guided pipeline's own defaults, when the model has one: LTX-2.5's
+    /// dev model. Whether its files are here is asked when a request wants
+    /// it, since they can be pulled after the model is loaded.
+    pub guided: Option<Guided>,
+}
+
+/// A guided pipeline's defaults and limits.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Guided {
+    pub steps: usize,
+    pub max_steps: usize,
+    /// The video's classifier-free guidance scale.
+    pub guidance: f32,
+}
+
+/// A request's guidance, every blank filled; the negative prompt is the
+/// model's own when `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuidedRun {
+    pub steps: usize,
+    pub guidance: f32,
+    pub negative_prompt: Option<String>,
 }
 
 /// A [`VideoRequest`] with every blank filled and checked.
@@ -140,6 +177,8 @@ pub struct Resolved {
     /// Whether the model chooses the length, from the prompt. A finished
     /// generation's `frames` is what it chose.
     pub chosen: bool,
+    /// The guided pipeline's settings, when the request asked for guidance.
+    pub guided: Option<GuidedRun>,
     pub fps: u32,
     pub seed: u64,
     pub audio: bool,
@@ -226,6 +265,25 @@ impl VideoRequest {
         if self.prompt.trim().is_empty() {
             return Err("the prompt is empty".into());
         }
+        let wants = self.steps.is_some() || self.guidance.is_some() || self.negative_prompt.is_some();
+        let guided = match (wants, d.guided) {
+            (false, _) => None,
+            (true, None) => {
+                return Err("this model runs without guidance, on a fixed schedule; leave out steps, guidance and the negative prompt".into())
+            }
+            (true, Some(g)) => {
+                let steps = self.steps.unwrap_or(g.steps);
+                if !(1..=g.max_steps).contains(&steps) {
+                    return Err(format!("steps must be between 1 and {}, not {steps}", g.max_steps).into());
+                }
+                let guidance = self.guidance.unwrap_or(g.guidance);
+                if !(guidance.is_finite() && (1.0..=20.0).contains(&guidance)) {
+                    return Err(format!("guidance must be between 1 (none) and 20, not {guidance}").into());
+                }
+                let negative_prompt = self.negative_prompt.as_ref().map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+                Some(GuidedRun { steps, guidance, negative_prompt })
+            }
+        };
         if let Some(p) = &self.image {
             if !d.image {
                 return Err("this model does not start a video from a picture".into());
@@ -249,6 +307,7 @@ impl VideoRequest {
             height,
             frames,
             chosen,
+            guided,
             fps,
             seed,
             audio: self.audio.unwrap_or(true),
@@ -1513,7 +1572,22 @@ mod tests {
     }
 
     fn ltx() -> Defaults {
-        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false }
+        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false, guided: None }
+    }
+
+    #[test]
+    fn guidance_is_asked_for_by_its_knobs_and_checked() {
+        let d = Defaults { guided: Some(Guided { steps: 30, max_steps: 60, guidance: 3.0 }), ..ltx() };
+        assert_eq!(VideoRequest::new("a dog").resolved(&d).unwrap().guided, None);
+        let r = VideoRequest { guidance: Some(4.0), ..VideoRequest::new("a dog") }.resolved(&d).unwrap();
+        assert_eq!(r.guided, Some(GuidedRun { steps: 30, guidance: 4.0, negative_prompt: None }));
+        let r = VideoRequest { negative_prompt: Some(" blur ".into()), ..VideoRequest::new("a dog") }.resolved(&d).unwrap();
+        assert_eq!(r.guided, Some(GuidedRun { steps: 30, guidance: 3.0, negative_prompt: Some("blur".into()) }));
+        let bad = |r: VideoRequest| r.resolved(&d).unwrap_err().to_string();
+        assert!(bad(VideoRequest { steps: Some(0), ..VideoRequest::new("a dog") }).contains("between 1 and 60"));
+        assert!(bad(VideoRequest { guidance: Some(0.5), ..VideoRequest::new("a dog") }).contains("guidance"));
+        // A model without a guided pipeline refuses the knobs by name.
+        assert!(VideoRequest { steps: Some(8), ..VideoRequest::new("a dog") }.resolved(&ltx()).unwrap_err().to_string().contains("without guidance"));
     }
 
     /// With a duration head, a request that gives no length is checked at

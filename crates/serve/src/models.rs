@@ -753,6 +753,10 @@ pub async fn set_active(
 #[derive(serde::Deserialize)]
 pub struct PullRequest {
     repo: String,
+    /// LTX-2.5's dev model and distilled LoRA as well: what guided videos
+    /// read, 51 GB that neither a pull nor a load fetches otherwise.
+    #[serde(default)]
+    dev: bool,
 }
 
 /// Download a model without loading it.
@@ -777,7 +781,8 @@ pub async fn pull(
     }
     let jobs = state.jobs.clone();
     let owner = who.0.id;
-    blocking(move || crate::jobs::pull(&jobs, repo, owner))
+    let dev = body.dev;
+    blocking(move || crate::jobs::pull(&jobs, repo, owner, dev))
         .await
         .map(Json)
         .map_err(|e| Fail::bad(e.1))

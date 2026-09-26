@@ -395,8 +395,10 @@ pub fn row(r: &rusqlite::Row) -> rusqlite::Result<Job> {
 // ---------------------------------------------------------------------------
 
 /// Download a model in the background.
-pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>) -> Res<Job> {
-    let id = jobs.create("pull", &repo, &serde_json::json!({ "repo": repo }), owner)?;
+/// `dev` fetches LTX-2.5's dev model and distilled LoRA instead
+/// ([`kvad::video::LTX_DEV_FILES`]), for an LTX repo.
+pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>, dev: bool) -> Res<Job> {
+    let id = jobs.create("pull", &repo, &serde_json::json!({ "repo": repo, "dev": dev }), owner)?;
     let (cancel, events) = jobs.register(id);
     let worker = Arc::clone(jobs);
 
@@ -413,7 +415,17 @@ pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>) -> Res<Job> {
         let mut progress = |message: &str| {
             let _ = say.send(Update::Status { message: message.to_string() });
         };
-        let outcome = kvad::weights::pull_watched(&repo, &mut progress, &watch);
+        // `dev` fetches the dev model's two files and nothing else: LTX's
+        // repo has no model index for a pull to read, and a load fetches the
+        // files the distilled model reads.
+        let outcome: Result<(), Box<dyn std::error::Error>> = match dev {
+            false => kvad::weights::pull_watched(&repo, &mut progress, &watch).map(|_| ()),
+            true if !crate::engine::is_ltx(&repo) => Err(format!("--dev is for LTX-2.5's repo, and {repo} is not one").into()),
+            true => kvad::video::LTX_DEV_FILES.iter().try_for_each(|f| {
+                progress(&format!("fetching {f}"));
+                kvad::weights::fetch_file(&repo, f, &watch).map(|_| ())
+            }),
+        };
 
         // `hf-hub` has no way to be interrupted, so a cancelled download is
         // one that is noticed as finished rather than stopped. Saying so is

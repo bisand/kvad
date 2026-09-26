@@ -24,6 +24,14 @@
 //! full size rather than three, and no upsampler. Two stages want the width
 //! and height to be multiples of 64.
 //!
+//! `--dev` runs the dev model as the reference's `ti2vid_two_stages` does:
+//! stage 1 in [`DEV_STEPS`] Euler steps, each guided by four DiT calls (the
+//! prompt, `--negative`, the model with block 28's self-attention skipped,
+//! and each stream without the other); stage 2 with the distilled LoRA fused
+//! into the dev DiT, three steps unguided, keeping stage 1's sound.
+//! `--steps` changes stage 1's count. The dev DiT and the LoRA are 51 GB,
+//! fetched on first use, and each gets a q8 cache of its own.
+//!
 //! `--image` starts the video from a picture, any format `ffmpeg` reads:
 //! it is put through LTX's H.264 round trip (`ffmpeg` is needed for that),
 //! scaled to cover each stage's size, encoded by the video VAE's encoder, and
@@ -36,8 +44,8 @@
 use candle_core::{DType, Device, Tensor};
 use kvad::weights::{fetch_file, Watcher};
 use kvad_gpu::video::ltx_dit::{Dit, Shape};
-use kvad_gpu::video::ltx_sample::{one_stage, refine, Latents, STAGE_1, STAGE_2};
-use kvad_gpu::video::ltx_text::{Contexts, TextEncoder, DIT_FILE, TEXT_FILE};
+use kvad_gpu::video::ltx_sample::{dev_sigmas, guided, one_stage, refine, Latents, AUDIO_GUIDE, DEV_STEPS, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
+use kvad_gpu::video::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
 use kvad_gpu::video::{ltx_audio, ltx_upsample, ltx_vae, LTX_REPO};
 use std::time::Instant;
 
@@ -73,6 +81,12 @@ fn main() -> Res<()> {
     let mut say = |m: &str| eprintln!("   {m}");
     let fetch = |f: &str| fetch_file(LTX_REPO, f, &Watcher::none());
     let (text, dit_path) = (fetch(TEXT_FILE)?, fetch(DIT_FILE)?);
+    let dev = match argv.iter().any(|a| a == "--dev") {
+        true => Some((fetch(DEV_FILE)?, fetch(DISTILLED_LORA)?)),
+        false => None,
+    };
+    let steps = num("--steps", DEV_STEPS)?;
+    let negative = value("--negative").unwrap_or_else(|| NEGATIVE_PROMPT.to_string());
     match frames {
         Some(_) => eprintln!(
             "{}×{}, {} frames at {fps} fps ({:.2} s): {} video tokens, {} audio latents; seed {seed}; {stages} stage{}",
@@ -124,10 +138,13 @@ fn main() -> Res<()> {
         eprintln!("1. text path: {:.1} B parameters, loaded in {:.1} s", enc.params() as f64 / 1e9, t.elapsed().as_secs_f64());
         let t = Instant::now();
         let c = enc.encode(&prompt)?;
+        // The dev model steers away from a negative prompt too.
+        let n = dev.as_ref().map(|_| enc.encode(&negative)).transpose()?;
         device.synchronize()?;
         eprintln!("   {} tokens encoded in {:.2} s", enc.tokens(&prompt)?.len(), t.elapsed().as_secs_f64());
-        c
+        (c, n)
     };
+    let (ctx, neg) = ctx;
     // The length, when none was given.
     if frames.is_none() {
         use kvad_gpu::video::ltx_duration::{frames_for, DurationHead, FILE, MAX_SECONDS, MIN_SECONDS};
@@ -147,8 +164,11 @@ fn main() -> Res<()> {
     // 2. The latents.
     let latents = {
         let t = Instant::now();
-        let dit = Dit::load(&dit_path, &device, dtype, None, quant, &mut say)?;
-        eprintln!("2. DiT: {:.1} B parameters, loaded in {:.1} s", dit.params() as f64 / 1e9, t.elapsed().as_secs_f64());
+        let dit = match &dev {
+            Some((d, _)) => Dit::load_as(d, None, "transformer-dev", &device, dtype, None, quant, &mut say)?,
+            None => Dit::load(&dit_path, &device, dtype, None, quant, &mut say)?,
+        };
+        eprintln!("2. {} DiT: {:.1} B parameters, loaded in {:.1} s", if dev.is_some() { "dev" } else { "distilled" }, dit.params() as f64 / 1e9, t.elapsed().as_secs_f64());
         let ctx = Contexts { video: ctx.video.clone(), audio: ctx.audio.clone() };
         // Each stage's steps timed from when the stage starts.
         let report = |stage: usize, of: usize| {
@@ -164,7 +184,10 @@ fn main() -> Res<()> {
         let t = Instant::now();
         let grid = dit.grid(first)?;
         eprintln!("   stage 1 at {}×{}: {} video tokens", first.width, first.height, first.video_tokens());
-        let l = one_stage(&dit, &ctx, &grid, seed, still_1, &mut report(1, STAGE_1.len() - 1))?;
+        let l = match (&dev, &neg) {
+            (Some(_), Some(neg)) => guided(&dit, &ctx, neg, &grid, seed, &dev_sigmas(steps), (VIDEO_GUIDE, AUDIO_GUIDE), still_1, &mut report(1, steps))?,
+            _ => one_stage(&dit, &ctx, &grid, seed, still_1, &mut report(1, STAGE_1.len() - 1))?,
+        };
         eprintln!("   stage 1 in {:.1} s", t.elapsed().as_secs_f64());
         match stages {
             1 => l,
@@ -176,10 +199,30 @@ fn main() -> Res<()> {
                 device.synchronize()?;
                 eprintln!("   upsampled {:?} to {:?} in {:.1} s", l.video.dims(), video.dims(), t.elapsed().as_secs_f64());
                 let t = Instant::now();
-                let grid = dit.grid(shape)?;
-                let l = refine(&dit, &ctx, &grid, &Latents { video, audio: l.audio }, seed, still_2, &mut report(2, STAGE_2.len() - 1))?;
+                // The dev model's second stage is the dev DiT with the
+                // distilled LoRA fused in, cached on its own; the first goes
+                // before it loads, so that the two are never resident at once.
+                let fused;
+                let second = match &dev {
+                    Some((d, lora)) => {
+                        drop(dit);
+                        device.synchronize()?;
+                        fused = Dit::load_as(d, Some((lora, 1.0)), "transformer-dev-distilled", &device, dtype, None, quant, &mut say)?;
+                        eprintln!("   dev DiT with the distilled LoRA loaded in {:.1} s", t.elapsed().as_secs_f64());
+                        &fused
+                    }
+                    None => &dit,
+                };
+                let grid = second.grid(shape)?;
+                let stage_1_audio = l.audio.clone();
+                let l = refine(second, &ctx, &grid, &Latents { video, audio: l.audio }, seed, still_2, &mut report(2, STAGE_2.len() - 1))?;
                 eprintln!("   stage 2 at {}×{} in {:.1} s", shape.width, shape.height, t.elapsed().as_secs_f64());
-                l
+                match dev {
+                    // The reference keeps stage 1's sound: stage 2 refines
+                    // the video only.
+                    Some(_) => Latents { video: l.video, audio: stage_1_audio },
+                    None => l,
+                }
             }
         }
     };

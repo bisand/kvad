@@ -46,6 +46,18 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// each with its config in the file's own metadata.
 pub const LTX_REPO: &str = "Lightricks/LTX-2.5";
 
+/// A safetensors file's `__metadata__`, its strings as they are.
+pub(crate) fn metadata_raw(path: &Path) -> Res<std::collections::HashMap<String, String>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut len = [0u8; 8];
+    f.read_exact(&mut len)?;
+    let mut header = vec![0u8; u64::from_le_bytes(len) as usize];
+    f.read_exact(&mut header)?;
+    let header: kvad::serde_json::Value = kvad::serde_json::from_slice(&header)?;
+    Ok(header["__metadata__"].as_object().map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default())
+}
+
 /// A string from a safetensors file's `__metadata__`, parsed as JSON.
 ///
 /// LTX's split checkpoints carry their configs there rather than in a

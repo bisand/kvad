@@ -30,6 +30,11 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 pub const TEXT_FILE: &str = "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors";
 /// The distilled DiT's file, which holds the connectors.
 pub const DIT_FILE: &str = kvad::video::LTX_DENOISER;
+/// The dev DiT's file: the full model, which the guided pipelines run.
+pub const DEV_FILE: &str = kvad::video::LTX_DEV_FILES[0];
+/// The distilled LoRA, rank 450: fused into the dev DiT, it is the guided
+/// pipelines' second stage.
+pub const DISTILLED_LORA: &str = kvad::video::LTX_DEV_FILES[1];
 
 /// Every prompt is this many tokens by the time the DiT sees it, padded if
 /// shorter and cut if longer.

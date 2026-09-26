@@ -32,7 +32,7 @@ kept there, with the settings that made it; `make` also writes it here, to
 pub const VIDEOS: &str = "usage: kvad videos [ls]
        kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]
                                [--seconds S | --frames N] [--fps N] [--seed N] [--silent]
-                               [--image PICTURE]
+                               [--image PICTURE] [--steps N] [--guidance G] [--negative TEXT]
        kvad videos show ID
        kvad videos watch ID    follow it until it ends
        kvad videos get ID [--out FILE]
@@ -45,6 +45,10 @@ stopping the wait does not stop the video. `show` says how far along one is,
 `watch` follows it again, `get` fetches it when it is done, and `rm` deletes
 it, stopping it if it is still being made. Anything left out is the model's own default;
 with no --seconds or --frames, LTX-2.5 chooses the length from the prompt.
+
+--steps, --guidance or --negative runs LTX-2.5's dev model, guided, rather than
+its distilled one: 30 steps at guidance 3 unless given, about four times as long.
+Its files come from `kvad pull Lightricks/LTX-2.5 --dev` (51 GB).
 
 --image starts the video from a picture, which becomes its first frame, scaled
 to cover the video's size and cut from the middle. Any format the server's
@@ -1187,6 +1191,16 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
             }
             if args.silent {
                 body["audio"] = json!(false);
+            }
+            // Any of these asks for the guided (dev) pipeline.
+            if let Some(n) = args.steps {
+                body["steps"] = json!(n);
+            }
+            if let Some(g) = args.guidance {
+                body["guidance_scale"] = json!(g);
+            }
+            if let Some(n) = &args.negative {
+                body["negative_prompt"] = json!(n);
             }
             if let Some(path) = &args.image {
                 let bytes = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;

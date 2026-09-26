@@ -193,6 +193,34 @@
         </label>
         <input class="input input-sm w-36" type="number" min="0" bind:value={v.seed} placeholder="random" disabled={!v.fixSeed} />
       </div>
+      {#if d?.guided}
+        <details class="collapse-arrow bg-base-200 rounded-box collapse" open={v.guided}>
+          <summary class="collapse-title text-sm">Guidance — the dev model, slower and closer to the prompt</summary>
+          <div class="collapse-content flex flex-col gap-3">
+            <div class="grid grid-cols-2 gap-3">
+              <label class="flex flex-col gap-1">
+                <span class="text-sm opacity-70">Steps</span>
+                <input class="input" type="number" min="1" max={d.guided.max_steps} bind:value={v.steps} placeholder={d.guided.steps} />
+              </label>
+              <label class="flex flex-col gap-1">
+                <span class="text-sm opacity-70">Guidance</span>
+                <input class="input" type="number" min="1" max="20" step="0.5" bind:value={v.guidance} placeholder={d.guided.guidance} />
+              </label>
+            </div>
+            <label class="flex flex-col gap-1">
+              <span class="text-sm opacity-70">Negative prompt</span>
+              <textarea class="textarea h-16 w-full" bind:value={v.negative} placeholder="the model's own: blur, flicker, distortions…"></textarea>
+            </label>
+            <p class="text-xs opacity-60">
+              Filling in any of these runs LTX-2.5's dev model rather than its distilled one: each step
+              asks the model four times — for the prompt, the negative prompt, and twice with parts of
+              it switched off — and steers away from the last three. At {d.guided.steps} steps it takes
+              about four times as long. Its 51 GB come from <code>kvad pull Lightricks/LTX-2.5 --dev</code>.
+            </p>
+          </div>
+        </details>
+      {/if}
+
       {#if v.tooBig}
         <p class="text-warning text-sm">
           That is more than this model makes here: at most {d.max_frames} frames, and
@@ -318,7 +346,7 @@
             <figcaption class="flex flex-col gap-1 p-3">
               <p class="line-clamp-2 text-sm" title={g.prompt}>{g.prompt}</p>
               <p class="text-xs opacity-60">
-                {g.size} · {lengthOf(g)} · seed {g.kvad.seed}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
+                {g.size} · {lengthOf(g)} · seed {g.kvad.seed}{#if g.kvad.guided}{" · "}guided, {g.kvad.guided.steps} steps{/if}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
                     class="link"
                     href={g.kvad.picture_url}
                     target="_blank"

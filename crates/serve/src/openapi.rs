@@ -495,6 +495,20 @@ pub const ENDPOINTS: &[Endpoint] = &[
         ],
         body: None, produces: "video/mp4 or image/png", events: &[],
     },
+    Endpoint {
+        method: "get", path: "/v1/videos/{id}/events", tag: "Videos", access: Access::SignedIn,
+        summary: "Follow a video until it ends",
+        description: "kvad's own, beside OpenAI's polled shape: the video object as it \
+                      stands, then again at every change — each step, the finish, a \
+                      deletion — until it ends. A video that ended long ago is one event.",
+        query: &[], body: None, produces: SSE,
+        events: &[
+            ("video.updated", "The video object, still queued or in progress."),
+            ("video.completed", "The video object, done; the stream ends."),
+            ("video.failed", "The video object, with its `error`; the stream ends."),
+            ("video.deleted", "`{ id, deleted }`: somebody deleted it; the stream ends."),
+        ],
+    },
 
     // -- Playground ---------------------------------------------------------
     Endpoint {

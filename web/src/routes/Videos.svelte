@@ -15,6 +15,14 @@
     return videos.watch();
   });
 
+  // A second-by-second clock for the time left, which the video's own
+  // events move only once a step, and a step can be most of a minute.
+  let now = $state(Date.now());
+  $effect(() => {
+    const tick = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(tick);
+  });
+
   const v = $derived(videos);
   const d = $derived(videos.defaults);
   /** What the right-hand panel shows: the oldest video still being made,
@@ -31,7 +39,7 @@
     // From the share done so far: rough early on, and not shown until
     // there is something to go on.
     if (k.started_at && k.progress > 0.05) {
-      const spent = Date.now() / 1000 - k.started_at;
+      const spent = now / 1000 - k.started_at;
       parts.push(`about ${Math.round((spent * (1 - k.progress)) / k.progress)} s left`);
     }
     return parts.join(" · ");

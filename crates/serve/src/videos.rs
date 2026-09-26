@@ -207,6 +207,14 @@ impl Stored {
                 "decode_secs": self.decode_secs,
                 "url": done.then(|| self.link("video")),
                 "thumbnail_url": done.then(|| self.link("thumbnail")),
+                // Named by how far along it is, so that each step's is a new
+                // link and a page showing it asks again. A 404 until the
+                // first denoising step is done.
+                "preview_url": (self.status == "in_progress").then(|| format!(
+                    "/v1/videos/{}/content?variant=preview&at={}",
+                    self.name(),
+                    (self.progress * 1000.0).round() as i64
+                )),
             },
         })
     }
@@ -292,6 +300,8 @@ pub fn finish(db: &Db, dir: &FsPath, id: i64, f: &Filmed, ffmpeg: Option<&FsPath
             params![id, bytes as i64, f.encode_secs, f.denoise_secs, f.decode_secs],
         )
     })?;
+    // Done with: the video itself is the preview now.
+    let _ = std::fs::remove_file(dir.join(format!("{id}.preview.png")));
     if n == 0 {
         remove_files(dir, id);
     }
@@ -371,6 +381,14 @@ fn exists(db: &Db, id: i64) -> Res<bool> {
         .map(|n| n > 0)
 }
 
+/// Keep a step's preview as `<id>.preview.png`, in place of the last one.
+pub fn look(dir: &FsPath, id: i64, preview: &kvad::image::Image) -> Res<()> {
+    std::fs::create_dir_all(dir)?;
+    let (path, aside) = (dir.join(format!("{id}.preview.png")), dir.join(format!("{id}.preview.png.part")));
+    std::fs::write(&aside, preview.png())?;
+    Ok(std::fs::rename(&aside, &path)?)
+}
+
 /// Record that a video will not be made, and why.
 pub fn fail(db: &Db, id: i64, why: &str) -> Res<()> {
     db.with(|c| {
@@ -429,7 +447,7 @@ pub fn delete(db: &Db, dir: &FsPath, id: i64, owner: Option<i64>) -> Res<bool> {
 }
 
 fn remove_files(dir: &FsPath, id: i64) {
-    for ext in ["mp4", "png"] {
+    for ext in ["mp4", "png", "preview.png"] {
         let _ = std::fs::remove_file(dir.join(format!("{id}.{ext}")));
     }
 }
@@ -673,6 +691,7 @@ async fn run(state: State, id: i64, key: Key, request: VideoRequest) {
     let failed = |why: String| {
         let db = db.clone();
         async move {
+            let _ = std::fs::remove_file(dir().join(format!("{id}.preview.png")));
             let _ = blocking(move || fail(&db, id, &why)).await;
         }
     };
@@ -700,7 +719,18 @@ async fn run(state: State, id: i64, key: Key, request: VideoRequest) {
         match reel {
             Reel::Step(step) => {
                 let db = db.clone();
-                if !matches!(blocking(move || advance(&db, id, &step)).await, Ok(true)) {
+                let going = blocking(move || {
+                    let going = advance(&db, id, &step)?;
+                    if let (true, Some(preview)) = (going, &step.preview) {
+                        // A preview that cannot be written is not worth a
+                        // failed video.
+                        if let Err(e) = look(&dir(), id, preview) {
+                            tracing::warn!("video {id}: could not keep a preview: {e}");
+                        }
+                    }
+                    Ok(going)
+                });
+                if !matches!(going.await, Ok(true)) {
                     return;
                 }
             }
@@ -795,9 +825,19 @@ async fn content(
     let (ext, kind) = match q.get("variant").map(String::as_str) {
         None | Some("video") => ("mp4", "video/mp4"),
         Some("thumbnail") => ("png", "image/png"),
-        Some(v) => return Err(Fail::bad(format!("variant is video or thumbnail here, not {v}"))),
+        Some("preview") => ("preview.png", "image/png"),
+        Some(v) => return Err(Fail::bad(format!("variant is video, thumbnail or preview here, not {v}"))),
     };
     let v = one(&who, &state, &name).await?;
+    // kvad's own variant: the latest step's rough look, while it is made.
+    if ext == "preview.png" {
+        let path = dir().join(format!("{}.preview.png", v.id));
+        let bytes = match (v.status.as_str(), std::fs::read(&path)) {
+            ("in_progress", Ok(bytes)) => bytes,
+            _ => return Err(Fail::missing(format!("{} has no preview now", v.name()))),
+        };
+        return Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-store")], bytes).into_response());
+    }
     if v.status != "completed" {
         return Err(Fail::missing(format!("{} is {}, not ready", v.name(), v.status.replace('_', " "))));
     }
@@ -936,12 +976,16 @@ mod tests {
         assert_eq!((q.status.as_str(), q.seed, q.started), ("queued", seed, None));
         assert_eq!(q.resource()["kvad"]["url"], Value::Null, "no link before there is a file");
 
-        let step = kvad::video::Step { phase: "stage 2", done: 1, total: 3, progress: 0.5, elapsed: 30.0 };
+        let step = kvad::video::Step { phase: "stage 2", done: 1, total: 3, progress: 0.5, elapsed: 30.0, preview: None };
         assert!(advance(&db, q.id, &step).unwrap());
         let s = get_one(&db, q.id, None).unwrap().unwrap();
         assert_eq!((s.status.as_str(), s.phase.as_deref(), s.progress), ("in_progress", Some("stage 2"), 0.5));
         assert!(s.started.is_some());
         assert_eq!(s.resource()["progress"], 50);
+        assert_eq!(s.resource()["kvad"]["preview_url"], json!(format!("/v1/videos/video_{}/content?variant=preview&at=500", q.id)));
+        let preview = kvad::image::Image { width: 2, height: 1, rgb: vec![1, 2, 3, 4, 5, 6] };
+        look(&dir, q.id, &preview).unwrap();
+        assert_eq!(std::fs::read(dir.join(format!("{}.preview.png", q.id))).unwrap(), preview.png());
 
         assert!(finish(&db, &dir, q.id, &filmed(seed), None).unwrap());
         let s = get_one(&db, q.id, None).unwrap().unwrap();
@@ -952,6 +996,8 @@ mod tests {
         assert_eq!((r["status"].as_str(), r["progress"].as_i64(), r["size"].as_str()), (Some("completed"), Some(100), Some("2x2")));
         assert!(r["kvad"]["url"].as_str().unwrap().starts_with(&format!("/v1/videos/video_{}/content?v=", q.id)));
         assert!(dir.join(format!("{}.png", q.id)).exists());
+        assert!(!dir.join(format!("{}.preview.png", q.id)).exists(), "a finished video's preview goes");
+        assert_eq!(r["kvad"]["preview_url"], Value::Null);
 
         assert!(delete(&db, &dir, q.id, None).unwrap());
         assert!(!dir.join(format!("{}.mp4", q.id)).exists());
@@ -981,7 +1027,7 @@ mod tests {
             queue(&db, None, "m", "b", &resolved(2)).unwrap(),
             queue(&db, None, "m", "b", &resolved(3)).unwrap(),
         );
-        let step = kvad::video::Step { phase: "text", done: 0, total: 1, progress: 0.0, elapsed: 0.0 };
+        let step = kvad::video::Step { phase: "text", done: 0, total: 1, progress: 0.0, elapsed: 0.0, preview: None };
         advance(&db, b.id, &step).unwrap();
         finish(&db, &dir, c.id, &filmed(3), None).unwrap();
         assert_eq!(abandon(&db).unwrap(), 2);

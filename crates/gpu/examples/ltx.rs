@@ -99,7 +99,7 @@ fn main() -> Res<()> {
         let report = |stage: usize, of: usize| {
             let device = device.clone();
             let mut last = Instant::now();
-            move |i: usize, sigma: f32| -> Res<()> {
+            move |i: usize, sigma: f32, _clean: &Tensor| -> Res<()> {
                 device.synchronize()?;
                 eprintln!("   stage {stage}, step {} of {of}: σ {sigma:.4} in {:.2} s", i + 1, last.elapsed().as_secs_f64());
                 last = Instant::now();

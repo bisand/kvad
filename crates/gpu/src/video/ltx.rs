@@ -25,7 +25,8 @@ use super::ltx_sample::{one_stage, refine, Latents, STAGE_1, STAGE_2};
 use super::ltx_text::{Contexts, TextEncoder, DIT_FILE, TEXT_FILE};
 use super::{ltx_audio, ltx_upsample, ltx_vae};
 use candle_core::quantized::GgmlDType;
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
+use kvad::image::Image;
 use kvad::video::{Defaults, Director, Filmed, Step, VideoRequest};
 use kvad::weights::{fetch_file, Watcher};
 use std::path::{Path, PathBuf};
@@ -236,9 +237,10 @@ impl Ltx {
         let total = plan.total();
         let started = Instant::now();
         // What the plan says is done by the time `phase` reaches step `done`.
-        let mut report = |phase: &'static str, done: usize, of: usize, before: f64| -> Res<()> {
+        let mut report = |phase: &'static str, done: usize, of: usize, before: f64, preview: Option<Image>| -> Res<()> {
             let progress = (before / total).clamp(0.0, 1.0) as f32;
-            match on_step(Step { phase, done, total: of, progress, elapsed: started.elapsed().as_secs_f64() }) {
+            let elapsed = started.elapsed().as_secs_f64();
+            match on_step(Step { phase, done, total: of, progress, elapsed, preview }) {
                 true => Ok(()),
                 false => Err("cancelled".into()),
             }
@@ -248,7 +250,7 @@ impl Ltx {
 
         // 1. The prompt.
         let t = Instant::now();
-        report("text", 0, 1, 0.0)?;
+        report("text", 0, 1, 0.0, None)?;
         let ctx = {
             let enc = TextEncoder::load(&self.paths[0], &self.paths[1], device, dtype, quant, &mut quiet)?;
             enc.encode(&r.prompt)?
@@ -262,30 +264,30 @@ impl Ltx {
         // 2. The latents.
         let t = Instant::now();
         let mut done = plan.text;
-        report("stage 1", 0, s1, done)?;
+        report("stage 1", 0, s1, done, None)?;
         let latents = {
             let dit = Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?;
             done += plan.load;
             let ctx = Contexts { video: ctx.video.clone(), audio: ctx.audio.clone() };
             let l = {
-                let mut step = |i: usize, _sigma: f32| -> Res<()> {
-                    device.synchronize()?;
-                    report("stage 1", i + 1, s1, done + plan.stage_1 * (i + 1) as f64)
+                let mut step = |i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
+                    let look = preview(clean, first)?;
+                    report("stage 1", i + 1, s1, done + plan.stage_1 * (i + 1) as f64, Some(look))
                 };
                 one_stage(&dit, &ctx, &dit.grid(first)?, r.seed, &mut step)?
             };
             done += plan.stage_1 * s1 as f64;
-            report("upsample", 0, 1, done)?;
+            report("upsample", 0, 1, done, None)?;
             let video = {
                 let up = ltx_upsample::Upsampler::load(&self.paths[2], &self.paths[3], device, DType::F32)?;
                 up.forward(&l.video)?
             };
             device.synchronize()?;
             done += plan.upsample;
-            report("stage 2", 0, s2, done)?;
-            let mut step = |i: usize, _sigma: f32| -> Res<()> {
-                device.synchronize()?;
-                report("stage 2", i + 1, s2, done + plan.stage_2 * (i + 1) as f64)
+            report("stage 2", 0, s2, done, None)?;
+            let mut step = |i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
+                let look = preview(clean, full)?;
+                report("stage 2", i + 1, s2, done + plan.stage_2 * (i + 1) as f64, Some(look))
             };
             refine(&dit, &ctx, &dit.grid(full)?, &Latents { video, audio: l.audio }, r.seed, &mut step)?
         };
@@ -296,7 +298,7 @@ impl Ltx {
 
         // 3. Pictures and sound.
         let t = Instant::now();
-        report("decode", 0, 1, plan.total() - plan.decode)?;
+        report("decode", 0, 1, plan.total() - plan.decode, None)?;
         let frames = ltx_vae::VideoDecoder::load(&self.paths[3], device, dtype)?.decode(&latents.video)?.to_device(&Device::Cpu)?;
         let audio = match r.audio {
             true => Some(ltx_audio::AudioPath::load(&self.paths[4], device)?.decode(&latents.audio)?),
@@ -306,7 +308,7 @@ impl Ltx {
         device.synchronize()?;
         let video = ltx_vae::to_video(&frames, r.fps)?;
         let decode_secs = t.elapsed().as_secs_f64();
-        report("decode", 1, 1, total)?;
+        report("decode", 1, 1, total, None)?;
         Ok(Filmed { video, audio, request: r, encode_secs, denoise_secs, decode_secs })
     }
 }
@@ -347,9 +349,189 @@ impl Director for Ltx {
     }
 }
 
+/// LTX-2.5's 128 latent channels as colour, roughly, and the bias after
+/// them: fitted by least squares from the final video latents of three
+/// 768×512 × 121 clips (a fox in snow, a city street at night in the rain, a
+/// dog on a beach at sunset; seeds 1 to 3) to their decoded frames, each
+/// averaged over the 32×32 pixels and 8 frames a latent cell covers.
+///
+/// Fitted on two clips and scored on the third, it explains 84–96% of the
+/// variance in each of red, green and blue, 22–26 dB from the pooled frames;
+/// on all three, 98%. Ridge regression did no better on the clip left out.
+const PREVIEW: [[f32; 3]; 128] = [
+    [0.0049, -0.0039, 0.0008],
+    [-0.0026, -0.0020, -0.0022],
+    [0.0021, 0.0038, 0.0047],
+    [0.0050, 0.0012, -0.0004],
+    [-0.0001, 0.0009, 0.0032],
+    [0.0033, 0.0012, 0.0033],
+    [-0.0066, -0.0085, -0.0110],
+    [-0.0097, 0.0112, 0.0155],
+    [-0.0037, 0.0029, 0.0030],
+    [-0.0010, -0.0020, -0.0083],
+    [-0.0002, 0.0014, 0.0016],
+    [0.0014, 0.0036, 0.0042],
+    [0.0110, 0.0092, 0.0029],
+    [0.0019, -0.0047, -0.0077],
+    [0.0010, 0.0029, 0.0033],
+    [-0.0030, -0.0037, -0.0030],
+    [0.0022, 0.0028, 0.0062],
+    [-0.0022, -0.0012, -0.0010],
+    [-0.0018, -0.0024, -0.0002],
+    [0.0011, -0.0007, 0.0024],
+    [0.0065, 0.0013, -0.0022],
+    [-0.0015, -0.0025, -0.0042],
+    [0.0038, 0.0016, 0.0046],
+    [0.0029, -0.0014, 0.0058],
+    [0.0064, 0.0053, 0.0081],
+    [-0.0016, -0.0022, 0.0009],
+    [-0.0079, -0.0046, -0.0053],
+    [-0.0053, -0.0014, 0.0001],
+    [0.0008, -0.0010, -0.0017],
+    [-0.0006, -0.0003, -0.0001],
+    [-0.0037, 0.0010, 0.0019],
+    [-0.0014, -0.0014, -0.0009],
+    [0.0037, 0.0020, 0.0024],
+    [-0.0007, -0.0016, -0.0017],
+    [0.0044, 0.0030, 0.0047],
+    [-0.0016, -0.0000, 0.0013],
+    [-0.0016, -0.0002, 0.0012],
+    [-0.0036, -0.0040, -0.0038],
+    [0.0019, -0.0011, -0.0020],
+    [0.0015, -0.0014, -0.0021],
+    [0.0018, 0.0014, 0.0008],
+    [-0.0073, -0.0032, 0.0002],
+    [0.0004, 0.0012, 0.0030],
+    [-0.0009, 0.0005, -0.0014],
+    [0.0042, 0.0030, 0.0028],
+    [0.0112, 0.0093, 0.0122],
+    [-0.0039, -0.0041, -0.0051],
+    [-0.0013, -0.0008, -0.0006],
+    [-0.0001, -0.0010, 0.0008],
+    [-0.0009, -0.0014, -0.0015],
+    [-0.0004, -0.0020, 0.0015],
+    [-0.0007, 0.0017, 0.0010],
+    [0.0043, 0.0029, 0.0032],
+    [0.0025, 0.0027, 0.0029],
+    [-0.0015, -0.0006, -0.0023],
+    [0.0060, 0.0072, 0.0117],
+    [-0.0007, -0.0008, -0.0020],
+    [0.0290, 0.0259, 0.0173],
+    [0.0033, 0.0028, 0.0033],
+    [-0.0031, -0.0024, -0.0019],
+    [0.0027, 0.0018, -0.0001],
+    [0.0002, 0.0006, 0.0007],
+    [-0.0008, 0.0028, 0.0036],
+    [0.0229, 0.0146, 0.0136],
+    [-0.0028, 0.0062, 0.0091],
+    [-0.0076, -0.0042, -0.0094],
+    [-0.0063, -0.0021, -0.0001],
+    [-0.0033, -0.0030, -0.0010],
+    [0.0015, -0.0008, -0.0027],
+    [0.0013, 0.0010, 0.0018],
+    [0.0010, 0.0003, -0.0016],
+    [0.0027, 0.0023, 0.0014],
+    [-0.0142, -0.0071, -0.0064],
+    [-0.0007, -0.0006, -0.0009],
+    [-0.0037, 0.0000, 0.0011],
+    [-0.0361, -0.0437, -0.0396],
+    [0.0037, -0.0011, -0.0012],
+    [-0.0005, 0.0006, -0.0004],
+    [0.0011, -0.0014, -0.0029],
+    [0.0021, 0.0009, 0.0037],
+    [0.0047, -0.0026, -0.0015],
+    [0.0065, 0.0057, 0.0027],
+    [0.0059, -0.0022, -0.0030],
+    [-0.0041, -0.0060, -0.0050],
+    [-0.0023, 0.0002, 0.0014],
+    [0.0007, -0.0002, -0.0005],
+    [0.0049, 0.0032, 0.0034],
+    [0.0054, -0.0010, -0.0031],
+    [0.0021, 0.0019, 0.0013],
+    [-0.0043, 0.0001, 0.0011],
+    [-0.0006, -0.0020, -0.0016],
+    [-0.0005, 0.0023, 0.0021],
+    [0.0020, -0.0007, 0.0047],
+    [0.0024, 0.0011, 0.0026],
+    [0.0031, 0.0035, 0.0018],
+    [-0.0011, -0.0003, -0.0020],
+    [-0.0093, -0.0052, -0.0116],
+    [-0.0329, -0.0512, -0.0597],
+    [-0.0021, 0.0053, 0.0026],
+    [0.0012, 0.0016, 0.0022],
+    [-0.0031, 0.0004, 0.0010],
+    [0.0095, 0.0016, 0.0015],
+    [-0.0009, -0.0023, -0.0001],
+    [0.0374, 0.0453, 0.0448],
+    [-0.0011, -0.0027, -0.0023],
+    [0.0020, 0.0009, 0.0052],
+    [-0.0016, -0.0010, -0.0011],
+    [0.0020, 0.0064, 0.0057],
+    [-0.0133, -0.0136, -0.0081],
+    [0.0045, 0.0035, 0.0048],
+    [-0.0044, 0.0005, -0.0139],
+    [-0.0020, 0.0024, 0.0025],
+    [0.0004, 0.0012, 0.0007],
+    [-0.0047, 0.0016, -0.0003],
+    [-0.0023, -0.0080, -0.0060],
+    [0.0089, 0.0065, 0.0058],
+    [-0.0390, -0.0399, -0.0397],
+    [0.0014, -0.0002, -0.0022],
+    [0.0014, 0.0024, 0.0011],
+    [0.0002, -0.0031, -0.0048],
+    [0.0045, 0.0015, 0.0012],
+    [0.0013, -0.0010, -0.0000],
+    [0.0002, 0.0011, 0.0019],
+    [-0.0043, -0.0032, -0.0040],
+    [0.0004, 0.0018, 0.0032],
+    [-0.0027, 0.0009, 0.0007],
+    [-0.0019, -0.0048, -0.0088],
+    [0.0002, -0.0010, -0.0010],
+];
+const PREVIEW_BIAS: [f32; 3] = [0.3907, 0.3650, 0.3519];
+
+/// The middle latent frame of `clean`, the DiT's prediction of the clean
+/// video as tokens `[n, 128]`, mixed straight into colour by [`PREVIEW`]:
+/// an image at the latent's size, one pixel a token.
+///
+/// Reading it back is what synchronises the step, which the progress report
+/// needs anyway: the time a step is reported at is the time it finished.
+fn preview(clean: &Tensor, shape: Shape) -> Res<Image> {
+    let (rows, cols) = shape.grid();
+    let middle = shape.latent_frames() / 2;
+    let z = clean.narrow(0, middle * rows * cols, rows * cols)?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+    let z = z.to_vec2::<f32>()?;
+    let rgb = z
+        .iter()
+        .flat_map(|t| {
+            (0..3).map(move |c| {
+                let v = PREVIEW_BIAS[c] + t.iter().zip(&PREVIEW).map(|(x, w)| x * w[c]).sum::<f32>();
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+            })
+        })
+        .collect();
+    Ok(Image { width: cols, height: rows, rgb })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The middle latent frame, one pixel a token, row by row: here the
+    /// only frame of three with nothing in it, so every pixel is the bias.
+    #[test]
+    fn a_preview_is_the_middle_frame_mixed_into_colour() {
+        let shape = Shape::new(96, 64, 17, 24.0).unwrap();
+        let (rows, cols) = shape.grid();
+        let n = rows * cols;
+        let mut z = vec![10f32; shape.video_tokens() * 128];
+        z[n * 128..2 * n * 128].fill(0.0);
+        let clean = Tensor::from_vec(z, (shape.video_tokens(), 128), &Device::Cpu).unwrap().to_dtype(DType::BF16).unwrap();
+        let look = preview(&clean, shape).unwrap();
+        assert_eq!((look.width, look.height), (3, 2));
+        let bias = PREVIEW_BIAS.map(|b| (b * 255.0).round() as u8);
+        assert!(look.rgb.chunks(3).all(|p| p == bias), "{:?}", look.rgb);
+    }
 
     #[test]
     fn the_peak_model_goes_through_both_measurements() {

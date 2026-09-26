@@ -225,6 +225,12 @@ pub struct Step {
     pub progress: f32,
     /// Seconds since the generation began.
     pub elapsed: f64,
+    /// A rough look at the middle of the clip so far, after a denoising
+    /// step: the latent's channels mixed straight into colour, as an
+    /// image's preview is, at the latent's size. That is a 32nd of the
+    /// width and height, and a 64th in stage 1: colours and composition,
+    /// not detail.
+    pub preview: Option<crate::image::Image>,
 }
 
 /// What a finished generation hands back.

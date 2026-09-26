@@ -20,7 +20,7 @@
 //! generation will need at its largest: [`Director::weight_bytes`] is the
 //! peak of the largest clip [`Defaults::max_volume`] allows.
 
-use super::ltx_dit::{Dit, Shape};
+use super::ltx_dit::{video_tokens, Dit, Shape};
 use super::ltx_sample::{one_stage, refine, Latents, STAGE_1, STAGE_2};
 use super::ltx_text::{Contexts, TextEncoder, DIT_FILE, TEXT_FILE};
 use super::{ltx_audio, ltx_upsample, ltx_vae};
@@ -166,6 +166,7 @@ impl Ltx {
             frame_step: 8,
             max_frames: 121,
             max_volume: volume_for_this_machine(),
+            image: true,
         };
         Ok(Ltx { repo: repo.to_string(), paths, quant, device, defaults, params })
     }
@@ -197,6 +198,8 @@ fn header_params(path: &Path, skip: &[&str]) -> Res<usize> {
 /// tokens plus attention's quadratic part, fitted through 2.2 s at 1536
 /// tokens, 9.6 s at 6144 and 52 s at 24576.
 struct Plan {
+    /// Encoding the picture a video starts from, when there is one.
+    picture: f64,
     text: f64,
     load: f64,
     stage_1: f64,
@@ -206,11 +209,12 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(first: Shape, full: Shape) -> Self {
+    fn new(first: Shape, full: Shape, picture: bool) -> Self {
         let step = |tokens: usize| tokens as f64 * (1.386e-3 + 2.86e-8 * tokens as f64);
         let at_768 = (768 * 512 * 121) as f64;
         let volume = (full.width * full.height * full.frames) as f64;
         Plan {
+            picture: if picture { 1.0 } else { 0.0 },
             text: 9.4,
             load: 3.5,
             stage_1: step(first.video_tokens()),
@@ -221,7 +225,7 @@ impl Plan {
     }
 
     fn total(&self) -> f64 {
-        self.text + self.load + self.stage_1 * (STAGE_1.len() - 1) as f64 + self.upsample + self.stage_2 * (STAGE_2.len() - 1) as f64 + self.decode
+        self.picture + self.text + self.load + self.stage_1 * (STAGE_1.len() - 1) as f64 + self.upsample + self.stage_2 * (STAGE_2.len() - 1) as f64 + self.decode
     }
 }
 
@@ -233,7 +237,7 @@ impl Ltx {
         let full = Shape::new(r.width, r.height, r.frames, fps)?;
         let first = Shape::new(r.width / 2, r.height / 2, r.frames, fps)?;
         let (device, dtype, quant) = (&self.device, DType::BF16, Some(self.quant));
-        let plan = Plan::new(first, full);
+        let plan = Plan::new(first, full, req.image.is_some());
         let total = plan.total();
         let started = Instant::now();
         // What the plan says is done by the time `phase` reaches step `done`.
@@ -248,9 +252,32 @@ impl Ltx {
         let mut quiet = |_: &str| {};
         let (s1, s2) = (STAGE_1.len() - 1, STAGE_2.len() - 1);
 
-        // 1. The prompt.
+        // 0. The picture, when the video starts from one: encoded at each
+        // stage's size, from the picture itself each time, as the reference
+        // does. The encoder is 0.6 GB and gone before the text path loads.
         let t = Instant::now();
-        report("text", 0, 1, 0.0, None)?;
+        let stills = match &req.image {
+            None => None,
+            Some(p) => {
+                report("picture", 0, 1, 0.0, None)?;
+                let enc = ltx_vae::ImageEncoder::load(&self.paths[3], device, dtype)?;
+                let at = |s: Shape| -> Res<Tensor> {
+                    let z = enc.encode(&ltx_vae::picture(&p.rgb, p.width, p.height, s.width, s.height)?.to_device(device)?)?;
+                    Ok(video_tokens(&z)?.to_dtype(dtype)?)
+                };
+                let stills = (at(first)?, at(full)?);
+                drop(enc);
+                device.synchronize()?;
+                Some(stills)
+            }
+        };
+        let (still_1, still_2) = match &stills {
+            Some((a, b)) => (Some(a), Some(b)),
+            None => (None, None),
+        };
+
+        // 1. The prompt.
+        report("text", 0, 1, plan.picture, None)?;
         let ctx = {
             let enc = TextEncoder::load(&self.paths[0], &self.paths[1], device, dtype, quant, &mut quiet)?;
             enc.encode(&r.prompt)?
@@ -263,7 +290,7 @@ impl Ltx {
 
         // 2. The latents.
         let t = Instant::now();
-        let mut done = plan.text;
+        let mut done = plan.picture + plan.text;
         report("stage 1", 0, s1, done, None)?;
         let latents = {
             let dit = Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?;
@@ -274,7 +301,7 @@ impl Ltx {
                     let look = preview(clean, first)?;
                     report("stage 1", i + 1, s1, done + plan.stage_1 * (i + 1) as f64, Some(look))
                 };
-                one_stage(&dit, &ctx, &dit.grid(first)?, r.seed, &mut step)?
+                one_stage(&dit, &ctx, &dit.grid(first)?, r.seed, still_1, &mut step)?
             };
             done += plan.stage_1 * s1 as f64;
             report("upsample", 0, 1, done, None)?;
@@ -289,7 +316,7 @@ impl Ltx {
                 let look = preview(clean, full)?;
                 report("stage 2", i + 1, s2, done + plan.stage_2 * (i + 1) as f64, Some(look))
             };
-            refine(&dit, &ctx, &dit.grid(full)?, &Latents { video, audio: l.audio }, r.seed, &mut step)?
+            refine(&dit, &ctx, &dit.grid(full)?, &Latents { video, audio: l.audio }, r.seed, still_2, &mut step)?
         };
         drop(ctx);
         // And the DiT's 20 GB, before the decoders need room for frames.
@@ -554,10 +581,13 @@ mod tests {
     fn the_plans_proportions_are_the_measured_ones() {
         let full = Shape::new(768, 512, 121, 24.0).unwrap();
         let first = Shape::new(384, 256, 121, 24.0).unwrap();
-        let p = Plan::new(first, full);
+        let p = Plan::new(first, full, false);
         // Stage 1's eight steps took 17.8 s and stage 2's three 28.8 s.
         assert!((p.stage_1 * 8.0 - 17.8).abs() < 0.5, "{}", p.stage_1 * 8.0);
         assert!((p.stage_2 * 3.0 - 28.8).abs() < 0.5, "{}", p.stage_2 * 3.0);
         assert!((p.total() - 75.0).abs() < 2.0, "{}", p.total());
+        // A picture adds its encoding, and nothing else.
+        let q = Plan::new(first, full, true);
+        assert!((q.total() - p.total() - q.picture).abs() < 1e-9 && q.picture > 0.0);
     }
 }

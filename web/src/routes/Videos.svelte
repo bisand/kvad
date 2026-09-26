@@ -1,5 +1,6 @@
 <script>
-  // Text to video: a prompt, a size and a length, and every video kept.
+  // Text to video, or a picture to video: a prompt, a size and a length, and
+  // every video kept.
   import { videos, SIZES, live } from "../lib/videos.svelte.js";
   import { models } from "../lib/models.svelte.js";
   import { navigate } from "../lib/router.svelte.js";
@@ -9,6 +10,8 @@
   const TRASH = "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6";
   const REUSE = "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5";
   const DOWNLOAD = "M12 3v12M7 10l5 5 5-5M5 21h14";
+  const PICTURE = "M4 5h16v14H4zM4 15l4-4 4 4 3-3 5 5M15 9h.01";
+  const CLOSE = "M6 6l12 12M18 6 6 18";
 
   $effect(() => {
     models.refresh();
@@ -46,8 +49,14 @@
   }
 
   // A preview is a 404 until the first denoising step is done, and each
-  // step's is a new link; so it is hidden until one loads.
-  const hide = (e) => (e.currentTarget.style.visibility = "hidden");
+  // step's is a new link; so it is hidden until one loads. A video that
+  // starts from a picture shows the picture until then.
+  const hide = (e) => {
+    const img = e.currentTarget;
+    const picture = img.dataset.picture;
+    if (picture && !img.src.endsWith(picture)) img.src = picture;
+    else img.style.visibility = "hidden";
+  };
   const show = (e) => (e.currentTarget.style.visibility = "visible");
 
   function took(g) {
@@ -95,6 +104,51 @@
           placeholder="What happens, what it looks like, and what it sounds like…"
         ></textarea>
       </label>
+
+      <!-- A picture to start from: the video's first frame. -->
+      <div class="flex items-start gap-3">
+        {#if v.pictureUrl}
+          <div class="relative shrink-0">
+            <img
+              src={v.pictureUrl}
+              alt="What the video will start from"
+              class="h-20 max-w-36 rounded object-cover"
+              onload={(e) => (v.pictureSize = { width: e.currentTarget.naturalWidth, height: e.currentTarget.naturalHeight })}
+            />
+            <button
+              class="btn btn-circle btn-xs absolute -top-2 -right-2"
+              onclick={() => v.choosePicture(null)}
+              title="Start from nothing"
+              aria-label="Remove the picture"
+            >
+              <Icon path={CLOSE} size={12} />
+            </button>
+          </div>
+        {/if}
+        <div class="flex flex-col gap-1">
+          <label class="btn btn-sm w-fit">
+            <Icon path={PICTURE} size={14} />
+            {v.picture ? "Another picture" : "Start from a picture"}
+            <input
+              type="file"
+              accept="image/*"
+              class="hidden"
+              onchange={(e) => {
+                v.choosePicture(e.currentTarget.files?.[0]);
+                e.currentTarget.value = "";
+              }}
+            />
+          </label>
+          <p class="text-xs opacity-60">
+            {#if v.picture}
+              The first frame, scaled to cover the video and cut from the middle{#if v.cut}: its
+                {v.cut.sides} go, {Math.round(v.cut.share * 100)}% of it{/if}. The prompt says what happens next.
+            {:else}
+              Optional. It becomes the first frame, and the prompt says what happens next.
+            {/if}
+          </p>
+        </div>
+      </div>
 
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <label class="flex flex-col gap-1">
@@ -175,13 +229,21 @@
     <!-- What is being made, or what was made last. -->
     <section class="bg-base-200 rounded-box flex min-h-80 flex-col items-center justify-center gap-3 p-4">
       {#if current && live(current)}
-        {#if current.status === "queued"}
+        {#if current.status === "queued" && current.kvad.picture_url}
+          <img
+            src={current.kvad.picture_url}
+            alt="What the video starts from"
+            class="w-full max-w-lg rounded object-cover opacity-60"
+            style:aspect-ratio="{current.kvad.width} / {current.kvad.height}"
+          />
+        {:else if current.status === "queued"}
           <span class="loading loading-spinner"></span>
         {:else if current.kvad.preview_url}
           <img
             src={current.kvad.preview_url}
+            data-picture={current.kvad.picture_url}
             alt="A rough preview of the middle of the clip so far"
-            class="w-full max-w-lg rounded"
+            class="w-full max-w-lg rounded object-cover"
             style:aspect-ratio="{current.kvad.width} / {current.kvad.height}"
             onload={show}
             onerror={hide}
@@ -234,8 +296,15 @@
               <video src={g.kvad.url} poster={g.kvad.thumbnail_url} controls preload="none" class="aspect-video w-full bg-black object-contain"></video>
             {:else if live(g)}
               <div class="relative flex aspect-video w-full flex-col items-center justify-center gap-2 p-4">
-                {#if g.kvad.preview_url}
-                  <img src={g.kvad.preview_url} alt="" class="absolute inset-0 h-full w-full object-contain opacity-60" onload={show} onerror={hide} />
+                {#if g.kvad.preview_url || g.kvad.picture_url}
+                  <img
+                    src={g.kvad.preview_url ?? g.kvad.picture_url}
+                    data-picture={g.kvad.picture_url}
+                    alt=""
+                    class="absolute inset-0 h-full w-full object-contain opacity-60"
+                    onload={show}
+                    onerror={hide}
+                  />
                 {/if}
                 <progress class="progress relative w-3/4" value={g.kvad.progress} max="1"></progress>
                 <p class="relative text-xs opacity-70">{where(g)}</p>
@@ -248,10 +317,15 @@
             <figcaption class="flex flex-col gap-1 p-3">
               <p class="line-clamp-2 text-sm" title={g.prompt}>{g.prompt}</p>
               <p class="text-xs opacity-60">
-                {g.size} · {g.seconds} s · seed {g.kvad.seed}{#if !g.kvad.audio} · no sound{/if}
+                {g.size} · {g.seconds} s · seed {g.kvad.seed}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
+                    class="link"
+                    href={g.kvad.picture_url}
+                    target="_blank"
+                    rel="noopener">from a picture</a
+                  >{/if}
               </p>
               <div class="flex gap-1">
-                <button class="btn btn-ghost btn-xs" onclick={() => v.reuse(g)} title="Put these settings back in the form">
+                <button class="btn btn-ghost btn-xs" onclick={() => v.reuse(g)} title="Put these settings back in the form, and its picture">
                   <Icon path={REUSE} size={14} /> Reuse
                 </button>
                 {#if g.status === "completed"}

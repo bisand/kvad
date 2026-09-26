@@ -443,14 +443,20 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       OpenAI's SDKs send it. Beside them: `frames` (or `num_frames`) \
                       instead of `seconds`, `fps`, `seed`, and `audio: false` for a \
                       silent file. A length in seconds becomes the nearest number of \
-                      frames the model can make. `input_reference`, a negative prompt, \
-                      guidance and steps are refused: the one video model here makes \
-                      videos from text on a fixed schedule.\n\n\
+                      frames the model can make. A negative prompt, guidance and steps \
+                      are refused: the one video model here runs a fixed schedule.\n\n\
+                      `input_reference` is a picture to start from, 20 MiB at most: a \
+                      file in the form, or in JSON `{ image_url }` with a `data:` URL. \
+                      A URL elsewhere and a `file_id` are refused. It becomes the first \
+                      frame, scaled to cover the video's size and cut from the middle. \
+                      It is read by `ffmpeg`, so it needs one on the server, and a file \
+                      that is not a picture is a 400.\n\n\
                       Answers at once with the video in OpenAI's shape, `queued`; the \
                       generation is the server's from then on, and takes minutes. The \
                       engine that makes it answers nothing else meanwhile.",
         query: &[], body: json_body("`{ prompt, model?, size?, seconds?, frames?, fps?, seed?, \
-                                     audio? }`, or the same fields as `multipart/form-data`."),
+                                     audio?, input_reference? }`, or the same fields as \
+                                     `multipart/form-data`, with `input_reference` a file."),
         produces: JSON, events: &[],
     },
     Endpoint {
@@ -459,7 +465,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
         description: "OpenAI's list: `{ object, data, first_id, last_id, has_more }`, \
                       newest first. Each video carries a `kvad` object with its \
                       settings, its finer progress and phase, what each part took, and \
-                      links to the file and its poster frame once it is done.",
+                      links to the file and its poster frame once it is done, and to the \
+                      picture it started from, if it did.",
         query: &[
             ("limit", false, "At most this many, 0 to 100; 20 when left out."),
             ("order", false, "`desc` (the default) or `asc`, by when each was asked for."),
@@ -491,9 +498,11 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       `completed`.",
         query: &[
             ("variant", false, "`video` (the default), or `thumbnail` for the middle frame as a \
-                         PNG. OpenAI's thumbnail is a WebP, and there is no `spritesheet`."),
+                         PNG. OpenAI's thumbnail is a WebP, and there is no `spritesheet`. \
+                         kvad's own: `preview`, a rough look while it is made, and `input`, \
+                         the picture it started from, as it was sent, at any status."),
         ],
-        body: None, produces: "video/mp4 or image/png", events: &[],
+        body: None, produces: "video/mp4, or a picture", events: &[],
     },
     Endpoint {
         method: "get", path: "/v1/videos/{id}/events", tag: "Videos", access: Access::SignedIn,

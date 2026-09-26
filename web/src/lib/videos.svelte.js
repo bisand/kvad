@@ -8,6 +8,10 @@
 // when it ends. The gallery is where a video being made lives as well as a
 // finished one. Closing the tab stops the following and nothing else; the
 // video is there when the page is opened again.
+//
+// A video can start from a picture. The request is then a form with the
+// picture as its `input_reference` file, as OpenAI's SDK sends one; without
+// one it is JSON.
 
 import { api, sse } from "./api.js";
 import { toasts } from "./toasts.svelte.js";
@@ -39,6 +43,11 @@ class Videos {
   seed = $state(null);
   fixSeed = $state(false);
   sound = $state(true);
+  /** The picture to start from, a `File`, and a link to show it by. */
+  picture = $state(null);
+  pictureUrl = $state(null);
+  /** Its size, once the page has shown it. */
+  pictureSize = $state(null);
 
   /** Loading the model, or sending the request. */
   starting = $state(false);
@@ -82,6 +91,30 @@ class Videos {
     const h = Number(this.height || d.height);
     const f = this.frames() ?? d.frames;
     return w * h * f > d.max_volume || f > d.max_frames;
+  }
+
+  /** Start from `file`, or from nothing. */
+  choosePicture(file) {
+    if (this.pictureUrl) URL.revokeObjectURL(this.pictureUrl);
+    this.picture = file ?? null;
+    this.pictureUrl = file ? URL.createObjectURL(file) : null;
+    this.pictureSize = null;
+  }
+
+  /** What scaling the picture to cover the video cuts off: `null` when the
+   *  shapes match, else which sides and how much of the picture goes. */
+  get cut() {
+    const d = this.defaults;
+    const p = this.pictureSize;
+    if (!p) return null;
+    const w = Number(this.width || d?.width || 0);
+    const h = Number(this.height || d?.height || 0);
+    if (!w || !h) return null;
+    const [pa, va] = [p.width / p.height, w / h];
+    if (Math.abs(pa / va - 1) < 0.01) return null;
+    return pa > va
+      ? { sides: "left and right", share: 1 - va / pa }
+      : { sides: "top and bottom", share: 1 - pa / va };
   }
 
   /** The videos being made. */
@@ -160,11 +193,17 @@ class Videos {
       if (frames) body.frames = frames;
       if (this.fps) body.fps = Number(this.fps);
       if (this.fixSeed && this.seed != null && this.seed !== "") body.seed = Number(this.seed);
-      const video = await api("/v1/videos", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      let request;
+      if (this.picture) {
+        // A form, whose content type the browser writes with its boundary.
+        const form = new FormData();
+        for (const [k, v] of Object.entries(body)) form.append(k, String(v));
+        form.append("input_reference", this.picture, this.picture.name || "picture");
+        request = { method: "POST", body: form };
+      } else {
+        request = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
+      }
+      const video = await api("/v1/videos", request);
       // A seed nobody fixed is still worth keeping: it is how this video is
       // made again.
       this.seed = video.kvad.seed;
@@ -177,8 +216,8 @@ class Videos {
     }
   }
 
-  /** Put an old video's settings back in the form. */
-  reuse(v) {
+  /** Put an old video's settings back in the form, and its picture. */
+  async reuse(v) {
     const k = v.kvad;
     this.prompt = v.prompt;
     this.width = k.width;
@@ -190,6 +229,13 @@ class Videos {
     this.sound = k.audio;
     const resident = models.videoResidents.find((r) => r.repo === v.model);
     this.model = resident?.id ?? v.model;
+    if (!k.picture_url) return this.choosePicture(null);
+    try {
+      const blob = await (await fetch(k.picture_url)).blob();
+      this.choosePicture(new File([blob], `video-${k.id}-picture`, { type: blob.type }));
+    } catch (e) {
+      toasts.error(`Could not fetch the picture ${v.id} started from (${e.message}).`);
+    }
   }
 
   /** Delete a video; one still being made stops at its next step. */

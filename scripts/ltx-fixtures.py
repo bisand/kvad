@@ -38,6 +38,14 @@ writes what it makes for the examples to compare against.
         scripts/ltx-fixtures.py --dit "$DIT" --contexts /tmp/ltx-fx/text_contexts_f32.safetensors --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx [--quant q8] [--f32]
 
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src:/tmp/LTX-2/packages/ltx-pipelines/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --video "$VIDEO" --picture synthetic --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_encode -- --fixtures /tmp/ltx-fx --picture /tmp/ltx-fx/picture.png
+
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --dit "$DIT" --contexts random --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx --held
+
     UP=$(cargo run -q --release -p kvad-gpu --example ltx_upsample -- --where | head -1)
     cargo run --release -p kvad-gpu --example ltx -- --prompt "…" --stages 1 \\
         --width 512 --height 320 --frames 25 --latents /tmp/stage1.safetensors
@@ -45,7 +53,8 @@ writes what it makes for the examples to compare against.
         scripts/ltx-fixtures.py --upsampler "$UP" --vae "$VIDEO" --latent /tmp/stage1.safetensors --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_upsample -- --fixtures /tmp/ltx-fx [--cpu | --f32]
 
-(the text fixtures also want `transformers` 5.8 to 5.14 in the venv). The
+(the text fixtures also want `transformers` 5.8 to 5.14 in the venv, and the
+picture `pillow`). The
 `--where` lines download each file first. The repo is gated: accept its
 licence on the Hub and have a token saved.)
 
@@ -68,6 +77,14 @@ What to expect, as measured on 2026-09-24 on an M5 Pro:
   and 118-123 on Metal. In bf16 on Metal, video 46.2/45.0 dB after the
   blocks and 42.0 at the velocity, audio 44.6-45.1, where the reference's
   own bf16 on MPS is 46.8/46.6, 43.6 and 45.5-46.1. At q8, much the same.
+- A picture for image-to-video (1000x700, drawn here): scaled and cut to
+  384x256 and 768x512 exactly as the reference does (150 dB); the encoder
+  105.9-108.0 dB in f32 on the CPU and 37.4-41.0 in bf16 on Metal, where the
+  reference's own bf16 on MPS is 37.0-40.1. kvad's H.264 round trip, by
+  ffmpeg, is 48.2 dB from the reference's, by PyAV.
+- The DiT with its first latent frame held at sigma 0 (`--held`), on seeded
+  contexts: 107-118 dB in f32 on the CPU; in bf16 on Metal video 47.1/46.0
+  and velocity 42.9 dB, where the reference's own bf16 is 46.9/46.3 and 43.7.
 - The latent upsampler, on a 512x320x25 latent from a generation: 98 dB in
   f32 on the CPU and on Metal. In bf16 it is 27 dB from exact, and so is
   the reference's own bf16 on MPS; kvad runs it in f32.
@@ -159,6 +176,75 @@ def video(path, out):
             x = d16(z.to("mps", torch.bfloat16)).float().add(1).mul(0.5).clamp(0, 1)[0].cpu()
         print(f"video: the reference in bf16 on MPS is {psnr(x, frames):.1f} dB from its f32")
         dec.float().cpu()
+
+
+def media_io():
+    """The reference's own picture handling, `ltx_pipelines.utils.media_io`'s
+    `decode` and `resize`, without the package `__init__`s above them, which
+    import every pipeline and model. OpenImageIO is only for EXR stills, and
+    stands in as an empty module."""
+    import importlib
+    import os
+    import sys
+    import types
+
+    import ltx_pipelines
+
+    root = os.path.dirname(ltx_pipelines.__file__)
+    for name in ("ltx_pipelines.utils", "ltx_pipelines.utils.media_io"):
+        if name not in sys.modules:
+            m = types.ModuleType(name)
+            m.__path__ = [os.path.join(root, *name.split(".")[1:])]
+            sys.modules[name] = m
+    sys.modules.setdefault("OpenImageIO", types.ModuleType("OpenImageIO"))
+    return importlib.import_module("ltx_pipelines.utils.media_io.decode"), importlib.import_module("ltx_pipelines.utils.media_io.resize")
+
+
+def picture(path, image, out):
+    """A picture through the reference's image-to-video preparation and its
+    video encoder: decoded, re-compressed as one H.264 frame at CRF 18 (the
+    value `detect_params` gives a 2.5 checkpoint), then, at stage 1's size
+    and stage 2's, scaled to cover, cut from the middle, and encoded."""
+    from ltx_core.model.video_vae.model_configurator import VideoEncoderConfigurator
+
+    decode, resize = media_io()
+    if image is None:
+        # Something to look at, deliberately not the shape of either target,
+        # so that both the scaling and the cut are exercised.
+        from PIL import Image
+
+        H, W = 700, 1000
+        yy, xx = torch.meshgrid(torch.arange(H).float(), torch.arange(W).float(), indexing="ij")
+        rgb = torch.stack([0.2 + 0.6 * xx / W, 0.3 + 0.5 * yy / H, 0.5 + 0.4 * torch.sin(xx / 37 + yy / 53)])
+        disc = (((xx - 420) ** 2 + (yy - 330) ** 2) < 150**2).float()
+        bars = ((xx // 40).long() % 2).float() * (yy > 560).float()
+        for c, v in enumerate((1.0, 0.85, 0.1)):
+            rgb[c] = rgb[c] * (1 - disc) + v * disc
+        rgb = rgb * (1 - bars) + bars
+        image = f"{out}/picture.png"
+        Image.fromarray((rgb.clamp(0, 1) * 255).round().byte().permute(1, 2, 0).numpy()).save(image)
+    rgb = decode.preprocess(decode.decode_image(image), crf=18)
+
+    meta, tensors = read(path)
+    stats = lambda k: k if k.startswith("per_channel_statistics.") else None
+    enc = load(VideoEncoderConfigurator.from_metadata(meta), tensors, lambda k: k[len("encoder."):] if k.startswith("encoder.") else stats(k))
+    fx = {"rgb": torch.from_numpy(rgb.copy()).contiguous()}
+    fx16 = {}
+    for w, h in ((384, 256), (768, 512)):
+        pixels = resize.resize_and_center_crop(torch.tensor(rgb, dtype=torch.float32), h, w) / 127.5 - 1.0
+        with torch.no_grad():
+            z = enc(pixels)
+        fx[f"pixels_{w}x{h}"] = pixels[0, :, 0].contiguous()
+        fx[f"latent_{w}x{h}"] = z[0].contiguous()
+        if torch.backends.mps.is_available():
+            e16 = enc.to("mps", torch.bfloat16)
+            with torch.no_grad():
+                fx16[f"latent_{w}x{h}"] = e16(pixels.to("mps", torch.bfloat16)).float()[0].cpu().contiguous()
+            enc.float().cpu()
+        print(f"picture: {rgb.shape[1]}×{rgb.shape[0]} to {w}×{h}, latent {tuple(z.shape[1:])}")
+    save_file(fx, f"{out}/picture_f32.safetensors")
+    if fx16:
+        save_file(fx16, f"{out}/picture_bf16.safetensors")
 
 
 def audio(path, out):
@@ -355,9 +441,18 @@ def transformer(path, out, contexts, blocks):
     vlat = torch.randn(vstate.latent.shape, generator=g)
     alat = torch.randn(astate.latent.shape, generator=g)
     sigma = 0.9875
-    ctx = load_file(contexts)
+    if contexts == "random":
+        # Any contexts check the DiT's arithmetic, and seeded ones need no
+        # 12B Gemma in f32 to make.
+        gc = torch.Generator().manual_seed(11)
+        ctx = {"video": torch.randn(64, 4096, generator=gc), "audio": torch.randn(64, 2048, generator=gc)}
+    else:
+        ctx = load_file(contexts)
+    # Image-to-video: the first latent frame is the picture, held at σ = 0
+    # while the rest is denoised. Its tokens are the first h·w.
+    frame = vstate.latent.shape[1] // VideoLatentShape.from_pixel_shape(pixels).frames
 
-    def run(device, dtype):
+    def run(device, dtype, held=False):
         m = LTXModelConfigurator.from_metadata(meta)
         m = load(m, tensors, lambda k: k[len(prefix):])
         m = m.to(device=device, dtype=dtype)
@@ -368,10 +463,13 @@ def transformer(path, out, contexts, blocks):
         def modality(state, lat, context):
             s = torch.tensor([sigma], device=device)
             mask = None if state.keyframes_mask is None else state.keyframes_mask.to(device)
+            denoise = state.denoise_mask.clone()
+            if held and state is vstate:
+                denoise[:, :frame] = 0
             return Modality(
                 latent=lat.to(device=device, dtype=dtype),
                 sigma=s,
-                timesteps=(state.denoise_mask.to(device) * s).float(),
+                timesteps=(denoise.to(device) * s).float(),
                 positions=state.positions.to(device),
                 context=context.to(device=device, dtype=dtype)[None],
                 keyframes_mask=mask,
@@ -380,7 +478,7 @@ def transformer(path, out, contexts, blocks):
         with torch.no_grad():
             t = time.time()
             v, a = m(modality(vstate, vlat, ctx["video"]), modality(astate, alat, ctx["audio"]), None)
-            print(f"dit: {blocks} blocks in {dtype} on {device}, {time.time() - t:.1f} s")
+            print(f"dit: {blocks} blocks in {dtype} on {device}{', the first frame held' if held else ''}, {time.time() - t:.1f} s")
         caught.update({"video_out": v[0].float().cpu(), "audio_out": a[0].float().cpu()})
         return {k: v.contiguous() for k, v in caught.items()}
 
@@ -395,12 +493,15 @@ def transformer(path, out, contexts, blocks):
             "audio_positions": astate.positions[0].contiguous(),
             "sigma": torch.tensor([sigma]),
             "shape": torch.tensor([width, height, frames, fps]),
+            "video_context": ctx["video"].contiguous(),
+            "audio_context": ctx["audio"].contiguous(),
         },
         f"{out}/dit_inputs.safetensors",
     )
-    save_file(run("cpu", torch.float32), f"{out}/dit_f32.safetensors")
-    if torch.backends.mps.is_available():
-        save_file(run("mps", torch.bfloat16), f"{out}/dit_bf16.safetensors")
+    for held, name in ((False, "dit"), (True, "dit_held")):
+        save_file(run("cpu", torch.float32, held), f"{out}/{name}_f32.safetensors")
+        if torch.backends.mps.is_available():
+            save_file(run("mps", torch.bfloat16, held), f"{out}/{name}_bf16.safetensors")
     print(f"dit: video {tuple(vlat.shape)}, audio {tuple(alat.shape)}, σ {sigma}")
 
 
@@ -442,7 +543,8 @@ if __name__ == "__main__":
     p.add_argument("--text", help="text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors")
     p.add_argument("--dit", help="diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors (for the connectors)")
     p.add_argument("--blocks", type=int, default=2, help="how many DiT blocks to run with --dit --contexts")
-    p.add_argument("--contexts", help="text_contexts_f32.safetensors from --text: the DiT's first blocks against them")
+    p.add_argument("--contexts", help="text_contexts_f32.safetensors from --text, or `random`: the DiT's first blocks against them")
+    p.add_argument("--picture", help="with --video: a picture for image-to-video, `synthetic` for one drawn here")
     p.add_argument("--upsampler", help="latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors, with --vae and --latent")
     p.add_argument("--vae", help="vae/ltx-2.5-video-vae-conv-bf16.safetensors, for the upsampler's statistics")
     p.add_argument("--latent", help="a stage-1 latent to upsample: a safetensors file with `video`, [128, F, h, w], as examples/ltx.rs --latents writes")
@@ -452,7 +554,9 @@ if __name__ == "__main__":
 
     os.makedirs(a.out, exist_ok=True)
     started = time.time()
-    if a.video:
+    if a.video and a.picture:
+        picture(a.video, None if a.picture == "synthetic" else a.picture, a.out)
+    elif a.video:
         video(a.video, a.out)
     if a.audio:
         audio(a.audio, a.out)

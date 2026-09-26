@@ -633,6 +633,12 @@ pub fn decode_base64(text: &str) -> Res<Vec<u8>> {
     base64_lite::decode(text).ok_or_else(|| "the server sent an image that is not base64".into())
 }
 
+/// Bytes to base64: how `kvad videos make --image` sends a picture, as a
+/// `data:` URL.
+pub fn encode_base64(bytes: &[u8]) -> String {
+    base64_lite::encode(bytes)
+}
+
 /// A tiny base64 encoder, for HTTP Basic, and its inverse, for the pictures
 /// `kvad images make` is sent. Forty lines is less than a dependency.
 mod base64_lite {

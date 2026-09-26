@@ -54,44 +54,122 @@ fn readable(t: &Tensor) -> bool {
     on && type_name(t.dtype()).is_some() && t.is_contiguous()
 }
 
-/// A row of `e` numbers in `x`'s dtype, as `[e]` or `[1, e]`.
+/// Rows of `e` numbers in `x`'s dtype: one, as `[e]` or `[1, e]`, or two,
+/// as `[2, e]`; see [`Held`].
 fn row_of(t: &Tensor, x: &Tensor, e: usize) -> bool {
-    readable(t) && t.dtype() == x.dtype() && t.elem_count() == e
+    readable(t) && t.dtype() == x.dtype() && (t.elem_count() == e || t.elem_count() == 2 * e)
+}
+
+/// How the tokens of `x` `[n, e]` read their modulation rows.
+///
+/// A row argument is one row, `[1, e]`, which every token reads; or two,
+/// `[2, e]`, where the first `held` tokens read row 0 and the rest row 1.
+/// That is image-to-video: the first latent frame is the picture, held at
+/// σ = 0 while the rest is denoised, and the DiT modulates each token by its
+/// own σ. So the picture's tokens have rows of their own, and they come
+/// first. `Held(0)` is every token alike.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Held(pub usize);
+
+impl Held {
+    /// The row the held tokens read, when `held`, or the rest: row 0 or 1
+    /// of a two-row argument, and a one-row argument as it is.
+    fn pick(t: &Tensor, e: usize, held: bool) -> candle_core::Result<Tensor> {
+        match t.elem_count() == 2 * e {
+            true => t.reshape((2, e))?.narrow(0, !held as usize, 1),
+            false => Ok(t.clone()),
+        }
+    }
+
+    /// Whether any of `rows` has two rows that tokens of `x` read apart.
+    fn splits(self, x: &Tensor, rows: &[&Tensor]) -> candle_core::Result<bool> {
+        let e = x.dim(candle_core::D::Minus1)?;
+        Ok(self.0 > 0 && rows.iter().any(|t| t.elem_count() == 2 * e))
+    }
+
+    /// `f` on the held tokens with their rows and on the rest with theirs,
+    /// the two answers joined again: the chain's way, where no kernel runs.
+    fn apart(self, x: &Tensor, rows: &[&Tensor], f: impl Fn(&Tensor, &[Tensor]) -> candle_core::Result<Tensor>) -> candle_core::Result<Tensor> {
+        let (n, e) = x.dims2()?;
+        let held = self.0.min(n);
+        let part = |lo: usize, len: usize, h: bool| -> candle_core::Result<Tensor> {
+            let rows = rows.iter().map(|t| Held::pick(t, e, h)).collect::<candle_core::Result<Vec<_>>>()?;
+            f(&x.narrow(0, lo, len)?, &rows)
+        };
+        match held == n {
+            true => part(0, n, true),
+            false => Tensor::cat(&[part(0, held, true)?, part(held, n - held, false)?], 0),
+        }
+    }
+
+    /// `rows` for a kernel: each two rows when any is, a one-row argument
+    /// repeated, so that every row is read at the same offset; and that
+    /// offset, `e` or 0.
+    fn paired(rows: &[&Tensor], e: usize) -> candle_core::Result<(Vec<Tensor>, usize)> {
+        if rows.iter().all(|t| t.elem_count() == e) {
+            return Ok((rows.iter().map(|t| (*t).clone()).collect(), 0));
+        }
+        let two = |t: &&Tensor| match t.elem_count() == e {
+            true => {
+                let r = t.reshape((1, e))?;
+                Tensor::cat(&[&r, &r], 0)
+            }
+            false => Ok((*t).clone()),
+        };
+        Ok((rows.iter().map(two).collect::<candle_core::Result<Vec<_>>>()?, e))
+    }
 }
 
 /// `rms(x)·(1 + scale) + shift`, over `x`'s last axis; `scale` and `shift`
-/// are one row each.
-pub(crate) fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
+/// are rows as [`Held`] says.
+pub(crate) fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor, held: Held, eps: f32) -> candle_core::Result<Tensor> {
     let e = x.dim(candle_core::D::Minus1)?;
     if !(readable(x) && row_of(scale, x, e) && row_of(shift, x, e)) {
+        if held.splits(x, &[scale, shift])? {
+            return held.apart(x, &[scale, shift], |x, r| modulate(x, &r[0], &r[1], Held(0), eps));
+        }
         return rms(x, eps as f64)?.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift);
     }
-    metal::modulate(x, None, scale, shift, eps)
+    let (r, later) = Held::paired(&[scale, shift], e)?;
+    metal::modulate(x, None, &r[0], &r[1], (held.0, later), eps)
 }
 
-/// `x + y·g`, and [`modulate`] of it: `(modulated, sum)`. `g` is one row.
+/// `x + y·g`, and [`modulate`] of it: `(modulated, sum)`. The rows are as
+/// [`Held`] says.
 ///
 /// Both come back from one buffer, the modulated norm first, so that it
 /// starts at offset zero: it goes straight into a projection, and candle's
 /// quantised matmul does not honour an offset (see `Proj::forward`).
-pub(crate) fn gated_modulate(x: &Tensor, y: &Tensor, g: &Tensor, scale: &Tensor, shift: &Tensor, eps: f32) -> candle_core::Result<(Tensor, Tensor)> {
+pub(crate) fn gated_modulate(x: &Tensor, y: &Tensor, g: &Tensor, scale: &Tensor, shift: &Tensor, held: Held, eps: f32) -> candle_core::Result<(Tensor, Tensor)> {
     let e = x.dim(candle_core::D::Minus1)?;
     let fits = readable(x) && readable(y) && y.dtype() == x.dtype() && y.dims() == x.dims() && [g, scale, shift].iter().all(|t| row_of(t, x, e));
     if !fits {
-        let sum = (x + y.broadcast_mul(g)?)?;
-        return Ok((modulate(&sum, scale, shift, eps)?, sum));
+        let sum = gated_add(x, y, g, held)?;
+        return Ok((modulate(&sum, scale, shift, held, eps)?, sum));
     }
-    let both = metal::modulate(x, Some((y, g)), scale, shift, eps)?;
+    let (r, later) = Held::paired(&[g, scale, shift], e)?;
+    let both = metal::modulate(x, Some((y, &r[0])), &r[1], &r[2], (held.0, later), eps)?;
     Ok((both.get(0)?, both.get(1)?))
 }
 
-/// `x + y·g`, with `g` one row.
-pub(crate) fn gated_add(x: &Tensor, y: &Tensor, g: &Tensor) -> candle_core::Result<Tensor> {
+/// `x + y·g`, with `g` rows as [`Held`] says.
+pub(crate) fn gated_add(x: &Tensor, y: &Tensor, g: &Tensor, held: Held) -> candle_core::Result<Tensor> {
     let e = x.dim(candle_core::D::Minus1)?;
     if !(readable(x) && readable(y) && y.dtype() == x.dtype() && y.dims() == x.dims() && row_of(g, x, e)) {
+        if held.splits(x, &[g])? {
+            let (n, h) = (x.dim(0)?, held.0.min(x.dim(0)?));
+            let ys = [y.narrow(0, 0, h)?, y.narrow(0, h, n - h)?];
+            let xs = [x.narrow(0, 0, h)?, x.narrow(0, h, n - h)?];
+            let parts = (0..2)
+                .filter(|&i| xs[i].dim(0).unwrap_or(0) > 0)
+                .map(|i| &xs[i] + ys[i].broadcast_mul(&Held::pick(g, e, i == 0)?)?)
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            return Tensor::cat(&parts, 0);
+        }
         return x + y.broadcast_mul(g)?;
     }
-    metal::gated_add(x, y, g)
+    let (r, later) = Held::paired(&[g], e)?;
+    metal::gated_add(x, y, &r[0], (held.0, later))
 }
 
 /// The RMS norm of `x` `[n, width]` over its whole width under the f32
@@ -165,6 +243,10 @@ mod metal {
         // 1: there is a residual, `x + y·g`, to add first and write to `sum`.
         uint flags;
         float eps;
+        // Rows below `held` read `g`, `scale` and `shift` from their start,
+        // and the rest from `later` on: `e` when each holds two rows, else 0.
+        uint held;
+        uint later;
     };
 
     // One threadgroup a row. `sum` is `x + y·g` rounded to T, which is what the
@@ -188,11 +270,12 @@ mod metal {
         threadgroup float part[32];
         const ulong base = ulong(row) * p.e;
         const bool res = p.flags & 1;
+        const uint r = row < p.held ? 0 : p.later;
         float acc = 0;
         for (uint j = tid; j < p.e; j += tpg) {
             float v = float(x[base + j]);
             if (res) {
-                const T s = T(v + float(y[base + j]) * float(g[j]));
+                const T s = T(v + float(y[base + j]) * float(g[r + j]));
                 sum[base + j] = s;
                 v = float(s);
             }
@@ -201,7 +284,7 @@ mod metal {
         const float inv = 1.0f / sqrt(group_sum(acc, part, tpg, lane, sg) / float(p.e) + p.eps);
         for (uint j = tid; j < p.e; j += tpg) {
             const float v = res ? float(sum[base + j]) : float(x[base + j]);
-            out[base + j] = T(v * inv * (1.0f + float(scale[j])) + float(shift[j]));
+            out[base + j] = T(v * inv * (1.0f + float(scale[r + j])) + float(shift[r + j]));
         }
     }
 
@@ -213,10 +296,13 @@ mod metal {
         device T *out [[buffer(3)]],
         constant uint &e [[buffer(4)]],
         constant uint &n [[buffer(5)]],
+        constant uint2 &held [[buffer(6)]],
         uint i [[thread_position_in_grid]])
     {
         if (i >= n) return;
-        out[i] = T(float(x[i]) + float(y[i]) * float(g[i % e]));
+        // `held`: rows below `.x` read `g` from its start, the rest from `.y`.
+        const uint r = i / e < held.x ? 0 : held.y;
+        out[i] = T(float(x[i]) + float(y[i]) * float(g[r + i % e]));
     }
 
     struct RopeParams {
@@ -316,7 +402,7 @@ mod metal {
         device const T *, device const T *, device const T *, device const T *, device const T *, \
         device T *, device T *, constant ModParams &, uint, uint, uint, uint, uint); \
     template [[host_name("gated_add_" #N)]] kernel void gated_add<T>( \
-        device const T *, device const T *, device const T *, device T *, constant uint &, constant uint &, uint); \
+        device const T *, device const T *, device const T *, device T *, constant uint &, constant uint &, constant uint2 &, uint); \
     template [[host_name("norm_silu_" #N)]] kernel void norm_silu<T>( \
         device const T *, device T *, constant PixParams &, uint2);
     ONE(float, f32)
@@ -360,13 +446,15 @@ mod metal {
         (MTLSize { width: n.div_ceil(256), height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 })
     }
 
-    pub(super) fn modulate(x: &Tensor, residual: Option<(&Tensor, &Tensor)>, scale: &Tensor, shift: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
-        let op = Modulate { residual: residual.map(|(y, g)| (y.clone(), g.clone())), scale: scale.clone(), shift: shift.clone(), eps };
+    /// `held`: tokens below `.0` read the rows from their start, the rest
+    /// from `.1` on.
+    pub(super) fn modulate(x: &Tensor, residual: Option<(&Tensor, &Tensor)>, scale: &Tensor, shift: &Tensor, held: (usize, usize), eps: f32) -> candle_core::Result<Tensor> {
+        let op = Modulate { residual: residual.map(|(y, g)| (y.clone(), g.clone())), scale: scale.clone(), shift: shift.clone(), held, eps };
         x.apply_op1_no_bwd(&op)
     }
 
-    pub(super) fn gated_add(x: &Tensor, y: &Tensor, g: &Tensor) -> candle_core::Result<Tensor> {
-        x.apply_op3_no_bwd(y, g, &GatedAdd)
+    pub(super) fn gated_add(x: &Tensor, y: &Tensor, g: &Tensor, held: (usize, usize)) -> candle_core::Result<Tensor> {
+        x.apply_op3_no_bwd(y, g, &GatedAdd { held })
     }
 
     pub(super) fn norm_rope(x: &Tensor, w: &Tensor, rope: Option<(&Tensor, &Tensor)>, half: usize, eps: f32, dt: DType) -> candle_core::Result<Tensor> {
@@ -428,6 +516,7 @@ mod metal {
         residual: Option<(Tensor, Tensor)>,
         scale: Tensor,
         shift: Tensor,
+        held: (usize, usize),
         eps: f32,
     }
 
@@ -436,6 +525,8 @@ mod metal {
         e: u32,
         flags: u32,
         eps: f32,
+        held: u32,
+        later: u32,
     }
 
     impl CustomOp1 for Modulate {
@@ -481,7 +572,8 @@ mod metal {
             enc.set_input_buffer(3, Some(&sc.0), sc.1);
             enc.set_input_buffer(4, Some(&sh.0), sh.1);
             enc.set_output_buffer(5, Some(&out), 0);
-            enc.set_bytes(7, &ModParams { e: e as u32, flags: res.is_some() as u32, eps: self.eps });
+            let (held, later) = (self.held.0.min(u32::MAX as usize) as u32, self.held.1 as u32);
+            enc.set_bytes(7, &ModParams { e: e as u32, flags: res.is_some() as u32, eps: self.eps, held, later });
             enc.dispatch_thread_groups(MTLSize { width: n / e, height: 1, depth: 1 }, row_threads(e));
             let mut shape = lx.dims().to_vec();
             if parts == 2 {
@@ -491,7 +583,9 @@ mod metal {
         }
     }
 
-    struct GatedAdd;
+    struct GatedAdd {
+        held: (usize, usize),
+    }
 
     impl CustomOp3 for GatedAdd {
         fn name(&self) -> &'static str {
@@ -526,6 +620,7 @@ mod metal {
             enc.set_output_buffer(3, Some(&out), 0);
             enc.set_bytes(4, &(e as u32));
             enc.set_bytes(5, &(n as u32));
+            enc.set_bytes(6, &[self.held.0.min(u32::MAX as usize) as u32, self.held.1 as u32]);
             let (groups, threads) = flat(n);
             enc.dispatch_thread_groups(groups, threads);
             Ok((MetalStorage::new(out, dev.clone(), n, dt), lx.shape().clone()))
@@ -714,7 +809,7 @@ mod tests {
                 let x = rand(&[m, e], dt, &dev);
                 let (scale, shift, _) = rows(e, dt, &dev);
                 let before = ran();
-                let got = modulate(&x, &scale, &shift, 1e-6).unwrap();
+                let got = modulate(&x, &scale, &shift, Held(0), 1e-6).unwrap();
                 assert_eq!(ran(), before + 1, "the kernel did not run");
                 let want = rms(&x, 1e-6).unwrap().broadcast_mul(&(&scale + 1.0).unwrap()).unwrap().broadcast_add(&shift).unwrap();
                 let got = off(&got, &want);
@@ -734,14 +829,59 @@ mod tests {
                 let y = rand(&[m, e], dt, &dev);
                 let (g, scale, shift) = rows(e, dt, &dev);
                 let before = ran();
-                let (h, sum) = gated_modulate(&x, &y, &g, &scale, &shift, 1e-6).unwrap();
-                let added = gated_add(&x, &y, &g).unwrap();
+                let (h, sum) = gated_modulate(&x, &y, &g, &scale, &shift, Held(0), 1e-6).unwrap();
+                let added = gated_add(&x, &y, &g, Held(0)).unwrap();
                 assert_eq!(ran(), before + 2, "a kernel did not run");
                 let want_sum = (&x + y.broadcast_mul(&g).unwrap()).unwrap();
                 let want = rms(&want_sum, 1e-6).unwrap().broadcast_mul(&(&scale + 1.0).unwrap()).unwrap().broadcast_add(&shift).unwrap();
                 for (what, got, want, tol) in [("sum", &sum, &want_sum, 2.0), ("add", &added, &want_sum, 2.0), ("norm", &h, &want, 4.0)] {
                     let got = off(got, want);
                     assert!(got < tol * ulp(dt), "{dt:?} [{m}, {e}] {what}: off by {got}");
+                }
+            }
+        }
+    }
+
+    /// Held tokens read row 0 of a two-row argument and the rest row 1, on
+    /// the kernels and down the chain alike, whichever arguments have two
+    /// rows; and each part is what the one-row ops make of it.
+    #[test]
+    fn held_tokens_read_their_own_rows() {
+        let Some(dev) = gpu() else { return };
+        let (m, e, h) = (7, 256, 3);
+        for dt in [DType::F32, DType::BF16] {
+            let x = rand(&[m, e], dt, &dev);
+            let y = rand(&[m, e], dt, &dev);
+            let two = |dev: &Device| (rand(&[2, e], dt, dev) * 0.3).unwrap();
+            let (g, scale, shift) = (two(&dev), two(&dev), two(&dev));
+            let one = rows(e, dt, &dev).0;
+            // What each part should be: the one-row ops on it.
+            let by_parts = |g: &Tensor, scale: &Tensor, shift: &Tensor| -> (Tensor, Tensor) {
+                let part = |lo: usize, len: usize, r: usize| {
+                    let pick = |t: &Tensor| match t.dim(0).unwrap() {
+                        2 => t.narrow(0, r, 1).unwrap(),
+                        _ => t.clone(),
+                    };
+                    let sum = (x.narrow(0, lo, len).unwrap() + y.narrow(0, lo, len).unwrap().broadcast_mul(&pick(g)).unwrap()).unwrap();
+                    let norm = rms(&sum, 1e-6).unwrap().broadcast_mul(&(pick(scale) + 1.0).unwrap()).unwrap().broadcast_add(&pick(shift)).unwrap();
+                    (norm, sum)
+                };
+                let (a, b) = (part(0, h, 0), part(h, m - h, 1));
+                (Tensor::cat(&[a.0, b.0], 0).unwrap(), Tensor::cat(&[a.1, b.1], 0).unwrap())
+            };
+            // Every argument two rows; and the gate one row, as the audio →
+            // video gate is.
+            for g in [&g, &one] {
+                let (want_norm, want_sum) = by_parts(g, &scale, &shift);
+                for device in [dev.clone(), Device::Cpu] {
+                    let on = |t: &Tensor| t.to_device(&device).unwrap();
+                    let (norm, sum) = gated_modulate(&on(&x), &on(&y), &on(g), &on(&scale), &on(&shift), Held(h), 1e-6).unwrap();
+                    let added = gated_add(&on(&x), &on(&y), &on(g), Held(h)).unwrap();
+                    let alone = modulate(&on(&want_sum), &on(&scale), &on(&shift), Held(h), 1e-6).unwrap();
+                    for (what, got, want, tol) in [("sum", &sum, &want_sum, 2.0), ("add", &added, &want_sum, 2.0), ("norm", &norm, &want_norm, 4.0), ("modulate", &alone, &want_norm, 4.0)] {
+                        let got = off(&got.to_device(&dev).unwrap(), want);
+                        assert!(got < tol * ulp(dt), "{dt:?} on {device:?}, {what}: off by {got}");
+                    }
                 }
             }
         }
@@ -773,11 +913,11 @@ mod tests {
         let (scale, shift, _) = rows(e, DType::F32, &dev);
         let before = ran();
         // A row in another dtype, a strided input, and the CPU.
-        modulate(&x, &scale.to_dtype(DType::BF16).unwrap(), &shift, 1e-6).unwrap_err();
+        modulate(&x, &scale.to_dtype(DType::BF16).unwrap(), &shift, Held(0), 1e-6).unwrap_err();
         let wide = rand(&[m, 2 * e], DType::F32, &dev).narrow(1, 0, e).unwrap();
-        modulate(&wide, &scale, &shift, 1e-6).unwrap();
+        modulate(&wide, &scale, &shift, Held(0), 1e-6).unwrap();
         let cpu = |t: &Tensor| t.to_device(&Device::Cpu).unwrap();
-        modulate(&cpu(&x), &cpu(&scale), &cpu(&shift), 1e-6).unwrap();
+        modulate(&cpu(&x), &cpu(&scale), &cpu(&shift), Held(0), 1e-6).unwrap();
         let w = Tensor::ones(e, DType::F32, &dev).unwrap();
         assert!(norm_rope(&wide, &w, None, 2, 1e-6, DType::F32).unwrap().is_none());
         assert!(norm_rope(&x, &w.to_dtype(DType::BF16).unwrap(), None, 2, 1e-6, DType::F32).unwrap().is_none());

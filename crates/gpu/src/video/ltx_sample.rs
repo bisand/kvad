@@ -15,6 +15,15 @@
 //! The DiT predicts velocity `v = ε − x₀`, with `x_σ = (1 − σ)·x₀ + σ·ε`, so
 //! `x₀ = x − σ·v`. The latents are kept in bf16 between steps, as the
 //! reference keeps them, and every update is computed in f32.
+//!
+//! **From a picture.** Image-to-video gives each stage the picture encoded
+//! at that stage's size, `still`: the first latent frame's tokens. They start
+//! as the picture instead of noise, the DiT sees them at σ = 0, and after
+//! every update they are put back, as the reference's `post_process_latent`
+//! does with a denoise mask of 0 there. Their prediction is the picture too:
+//! the reference's `x − σ·v` with their own σ, 0, is `x`. The noise is drawn
+//! for every token all the same, so a seed makes the same noise with a
+//! picture as without.
 
 use super::ltx_dit::{audio_latent, audio_tokens, video_latent, video_tokens, Dit, Grid};
 use super::ltx_text::Contexts;
@@ -78,22 +87,40 @@ pub struct Latents {
 /// noise.
 pub type OnStep<'a> = &'a mut dyn FnMut(usize, f32, &Tensor) -> Res<()>;
 
+/// `x` with its first tokens put back to `still`'s, when there is a picture.
+fn hold(x: &Tensor, still: Option<&Tensor>) -> candle_core::Result<Tensor> {
+    let Some(still) = still else { return Ok(x.clone()) };
+    let n = still.dim(0)?;
+    Tensor::cat(&[&still.to_device(x.device())?.to_dtype(x.dtype())?, &x.narrow(0, n, x.dim(0)? - n)?], 0)
+}
+
+/// How many tokens a picture holds, and checked against the grid.
+fn held(still: Option<&Tensor>, shape: super::ltx_dit::Shape) -> Res<usize> {
+    let Some(still) = still else { return Ok(0) };
+    match still.dims() {
+        [n, 128] if *n == shape.frame_tokens() => Ok(*n),
+        d => Err(format!("a picture of {d:?} tokens, where a {}×{} frame is [{}, 128]", shape.width, shape.height, shape.frame_tokens()).into()),
+    }
+}
+
 /// Stage 1 at the grid's own size, from pure noise to the latents the
-/// decoders read. `step` hears each step as it ends; see [`OnStep`].
-pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, step: OnStep<'_>) -> Res<Latents> {
+/// decoders read; from a picture, when `still` holds one as tokens of the
+/// first latent frame. `step` hears each step as it ends; see [`OnStep`].
+pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, still: Option<&Tensor>, step: OnStep<'_>) -> Res<Latents> {
     let shape = grid.shape();
     let (dev, keep) = (dit.device(), DType::BF16);
     let (nv, na) = (shape.video_tokens(), shape.audio_latents());
+    let n0 = held(still, shape)?;
     // Both latents start as noise (σ = 1 is all noise), drawn in token order.
-    let mut xv = noise(stream(seed, 0), &[nv, 128], dev, keep)?;
+    let mut xv = hold(&noise(stream(seed, 0), &[nv, 128], dev, keep)?, still)?;
     let mut xa = noise(stream(seed, 1), &[na, 128], dev, keep)?;
     let sigmas = &STAGE_1;
     for i in 0..sigmas.len() - 1 {
         let (s, next) = (sigmas[i], sigmas[i + 1]);
-        let (vv, va) = dit.forward(&xv, &xa, (s, s), ctx, grid)?;
+        let (vv, va) = dit.forward(&xv, &xa, (s, s), n0, ctx, grid)?;
         let f = |t: &Tensor| t.to_dtype(DType::F32);
         // The prediction, rounded to the latent's dtype as the reference's is.
-        let x0v = (f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?;
+        let x0v = hold(&(f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?, still)?;
         let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
         step(i, next, &x0v)?;
         if next == 0.0 {
@@ -105,7 +132,7 @@ pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, step: OnStep
                 let eps = noise(stream(seed, draw), x.dims(), dev, keep)?;
                 Ok(((det * k.a as f64)? + (f(&eps)? * k.c as f64)?)?.to_dtype(keep)?)
             };
-            xv = update(&xv, &x0v, 2 + 2 * i as u64)?;
+            xv = hold(&update(&xv, &x0v, 2 + 2 * i as u64)?, still)?;
             xa = update(&xa, &x0a, 3 + 2 * i as u64)?;
         }
     }
@@ -124,9 +151,11 @@ fn euler(x: &Tensor, x0: &Tensor, sigma: f32, next: f32) -> candle_core::Result<
 
 /// Stage 2: `latents`, the upsampled video and stage 1's sound, re-noised
 /// to [`STAGE_2`]'s first level and refined by three Euler steps at the
-/// grid's size. `step` hears each step as it ends; see [`OnStep`].
-pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u64, step: OnStep<'_>) -> Res<Latents> {
+/// grid's size; `still` is the picture at this size, when there is one.
+/// `step` hears each step as it ends; see [`OnStep`].
+pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u64, still: Option<&Tensor>, step: OnStep<'_>) -> Res<Latents> {
     let shape = grid.shape();
+    let n0 = held(still, shape)?;
     let (dev, keep) = (dit.device(), DType::BF16);
     let f = |t: &Tensor| t.to_dtype(DType::F32);
     let sigmas = &STAGE_2;
@@ -137,16 +166,17 @@ pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u
         let eps = noise(stream(seed, draw), x.dims(), dev, keep)?;
         Ok((&f(&x)? + ((f(&eps)? - f(&x)?)? * sigmas[0] as f64)?)?.to_dtype(keep)?)
     };
-    let mut xv = renoise(video_tokens(&latents.video)?, 100)?;
+    let mut xv = hold(&renoise(video_tokens(&latents.video)?, 100)?, still)?;
     let mut xa = renoise(audio_tokens(&latents.audio)?, 101)?;
     if xv.dim(0)? != shape.video_tokens() || xa.dim(0)? != shape.audio_latents() {
         return Err(format!("stage 2 at {}×{} wants {} video and {} audio tokens, and was given {} and {}", shape.width, shape.height, shape.video_tokens(), shape.audio_latents(), xv.dim(0)?, xa.dim(0)?).into());
     }
     for i in 0..sigmas.len() - 1 {
         let (s, next) = (sigmas[i], sigmas[i + 1]);
-        let (vv, va) = dit.forward(&xv, &xa, (s, s), ctx, grid)?;
-        let x0v = (f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?;
+        let (vv, va) = dit.forward(&xv, &xa, (s, s), n0, ctx, grid)?;
+        let x0v = hold(&(f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?, still)?;
         let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
+        // The picture's velocity is (x − x₀)/σ = 0, so it stays put.
         xv = euler(&xv, &x0v, s, next)?;
         xa = euler(&xa, &x0a, s, next)?;
         step(i, next, &x0v)?;

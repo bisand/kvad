@@ -116,6 +116,8 @@ struct Args {
     frames: Option<usize>,
     fps: Option<u32>,
     silent: bool,
+    /// The picture a video starts from.
+    image: Option<String>,
     quant: Precision,
     /// `crawl` only.
     out: Option<String>,
@@ -184,6 +186,7 @@ impl Default for Args {
             frames: None,
             fps: None,
             silent: false,
+            image: None,
             quant: Precision::F32,
             out: None,
             pages: None,
@@ -398,6 +401,7 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--seconds" => a.seconds = Some(num()),
             "--frames" => a.frames = Some(num() as usize),
             "--fps" => a.fps = Some(num() as u32),
+            "--image" => a.image = Some(value.clone()),
             "--out" => a.out = Some(value.clone()),
             "--pages" => a.pages = Some(num() as usize),
             "--mb" => a.megabytes = Some(num()),

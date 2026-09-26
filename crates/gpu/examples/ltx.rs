@@ -1,16 +1,23 @@
-//! LTX-2.5 from a prompt to an MP4 with sound, with no server: one stage of
-//! the distilled model at the requested size (`docs/video-plan.md`, step 5).
+//! LTX-2.5 from a prompt to an MP4 with sound, with no server: the distilled
+//! model's two stages (`docs/video-plan.md`, steps 5 and 6).
 //!
 //!     cargo run --release -p kvad-gpu --example ltx -- --prompt "…" \
-//!         [--width 512] [--height 320] [--frames 25] [--fps 24] [--seed 0] \
-//!         [--quant q8|bf16] [--out ltx.mp4] [--latents FILE]
+//!         [--width 768] [--height 512] [--frames 121] [--fps 24] [--seed 0] \
+//!         [--stages 2] [--quant q8|bf16] [--out ltx.mp4] [--latents FILE]
 //!
 //! In phases, so that no two large models are resident at once:
 //!
 //! 1. the text path (Gemma 4, projections, connectors) encodes the prompt,
 //!    and is dropped;
-//! 2. the DiT runs stage 1's eight steps, and is dropped;
+//! 2. the DiT runs stage 1's eight steps at half the width and height; the
+//!    upsampler doubles the video latent (in f32: in bf16 it is 27 dB from
+//!    exact, the reference's own bf16 included); the DiT refines both
+//!    latents in three steps at the full size; and it is dropped;
 //! 3. the video decoder and the audio path decode, and the MP4 is written.
+//!
+//! `--stages 1` runs stage 1 alone at the full size instead: eight steps at
+//! full size rather than three, and no upsampler. Two stages want the width
+//! and height to be multiples of 64.
 //!
 //! `--quant` is the text path's and the DiT's weights: q8 by default, about
 //! 19 GB for the text phase and 20 GB for the DiT. `--latents` also saves the
@@ -19,9 +26,9 @@
 use candle_core::{DType, Device, Tensor};
 use kvad::weights::{fetch_file, Watcher};
 use kvad_gpu::video::ltx_dit::{Dit, Shape};
-use kvad_gpu::video::ltx_sample::{one_stage, STAGE_1};
+use kvad_gpu::video::ltx_sample::{one_stage, refine, Latents, STAGE_1, STAGE_2};
 use kvad_gpu::video::ltx_text::{Contexts, TextEncoder, DIT_FILE, TEXT_FILE};
-use kvad_gpu::video::{ltx_audio, ltx_vae, LTX_REPO};
+use kvad_gpu::video::{ltx_audio, ltx_upsample, ltx_vae, LTX_REPO};
 use std::time::Instant;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -32,8 +39,16 @@ fn main() -> Res<()> {
     let num = |f: &str, default: usize| -> Res<usize> { Ok(value(f).map(|v| v.parse()).transpose()?.unwrap_or(default)) };
     let prompt = value("--prompt").ok_or("--prompt TEXT is required")?;
     let fps: f64 = value("--fps").map(|v| v.parse()).transpose()?.unwrap_or(24.0);
-    let shape = Shape::new(num("--width", 512)?, num("--height", 320)?, num("--frames", 25)?, fps)?;
+    let shape = Shape::new(num("--width", 768)?, num("--height", 512)?, num("--frames", 121)?, fps)?;
     let seed = num("--seed", 0)? as u64;
+    let stages = num("--stages", 2)?;
+    // Stage 1's size: half, for two stages.
+    let first = match stages {
+        1 => shape,
+        2 => Shape::new(shape.width / 2, shape.height / 2, shape.frames, fps)
+            .map_err(|_| format!("{}×{}: two stages want both sides a multiple of 64", shape.width, shape.height))?,
+        n => return Err(format!("--stages is 1 or 2, not {n}").into()),
+    };
     let quant = match value("--quant").as_deref() {
         Some("bf16") => None,
         None => kvad_gpu::model::parse_quant("q8").ok_or("no q8")?,
@@ -47,13 +62,14 @@ fn main() -> Res<()> {
     let fetch = |f: &str| fetch_file(LTX_REPO, f, &Watcher::none());
     let (text, dit_path) = (fetch(TEXT_FILE)?, fetch(DIT_FILE)?);
     eprintln!(
-        "{}×{}, {} frames at {fps} fps ({:.2} s): {} video tokens, {} audio latents; seed {seed}",
+        "{}×{}, {} frames at {fps} fps ({:.2} s): {} video tokens, {} audio latents; seed {seed}; {stages} stage{}",
         shape.width,
         shape.height,
         shape.frames,
         shape.frames as f64 / fps,
         shape.video_tokens(),
-        shape.audio_latents()
+        shape.audio_latents(),
+        if stages == 1 { "" } else { "s" }
     );
 
     // 1. The prompt.
@@ -78,18 +94,39 @@ fn main() -> Res<()> {
         let t = Instant::now();
         let dit = Dit::load(&dit_path, &device, dtype, None, quant, &mut say)?;
         eprintln!("2. DiT: {:.1} B parameters, loaded in {:.1} s", dit.params() as f64 / 1e9, t.elapsed().as_secs_f64());
-        let grid = dit.grid(shape)?;
         let ctx = Contexts { video: ctx.video.clone(), audio: ctx.audio.clone() };
+        // Each stage's steps timed from when the stage starts.
+        let report = |stage: usize, of: usize| {
+            let device = device.clone();
+            let mut last = Instant::now();
+            move |i: usize, sigma: f32| -> Res<()> {
+                device.synchronize()?;
+                eprintln!("   stage {stage}, step {} of {of}: σ {sigma:.4} in {:.2} s", i + 1, last.elapsed().as_secs_f64());
+                last = Instant::now();
+                Ok(())
+            }
+        };
         let t = Instant::now();
-        let mut last = Instant::now();
-        let l = one_stage(&dit, &ctx, &grid, seed, &mut |i, sigma| {
-            device.synchronize()?;
-            eprintln!("   step {} of {}: σ {sigma:.4} in {:.2} s", i + 1, STAGE_1.len() - 1, last.elapsed().as_secs_f64());
-            last = Instant::now();
-            Ok(())
-        })?;
-        eprintln!("   sampled in {:.1} s", t.elapsed().as_secs_f64());
-        l
+        let grid = dit.grid(first)?;
+        eprintln!("   stage 1 at {}×{}: {} video tokens", first.width, first.height, first.video_tokens());
+        let l = one_stage(&dit, &ctx, &grid, seed, &mut report(1, STAGE_1.len() - 1))?;
+        eprintln!("   stage 1 in {:.1} s", t.elapsed().as_secs_f64());
+        match stages {
+            1 => l,
+            _ => {
+                let t = Instant::now();
+                let up = ltx_upsample::Upsampler::load(&fetch(ltx_upsample::FILE)?, &fetch(ltx_vae::FILE)?, &device, DType::F32)?;
+                let video = up.forward(&l.video)?;
+                drop(up);
+                device.synchronize()?;
+                eprintln!("   upsampled {:?} to {:?} in {:.1} s", l.video.dims(), video.dims(), t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                let grid = dit.grid(shape)?;
+                let l = refine(&dit, &ctx, &grid, &Latents { video, audio: l.audio }, seed, &mut report(2, STAGE_2.len() - 1))?;
+                eprintln!("   stage 2 at {}×{} in {:.1} s", shape.width, shape.height, t.elapsed().as_secs_f64());
+                l
+            }
+        }
     };
     // And the DiT's 20 GB, before the decoders need room for full-size frames.
     device.synchronize()?;

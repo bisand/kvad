@@ -19,7 +19,7 @@
 //! There is no attention, no noise and no timestep. The decoder is a pure
 //! function of the latent.
 
-use super::conv3d::{pixel_norm, Conv3d};
+use super::conv3d::{norm_silu, Conv3d};
 use super::metadata;
 use crate::common::Loader;
 use crate::image::nn::Ctx;
@@ -147,22 +147,98 @@ impl VideoDecoder {
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?;
         let mut x = self.conv_in.forward(&z.to_dtype(self.dtype)?)?;
         for block in &self.blocks {
-            x = match block {
+            match block {
                 Block::Res(res) => {
                     for (c1, c2) in res {
-                        let h = c1.forward(&pixel_norm(&x, EPS)?.silu()?)?;
-                        let h = c2.forward(&pixel_norm(&h, EPS)?.silu()?)?;
-                        x = (x + h)?;
+                        x = residual(&x, c1, c2)?;
+                        // candle's pool lets go of what a step dropped only
+                        // when the device is synchronised.
+                        x.device().synchronize()?;
                     }
-                    x
                 }
-                Block::Up { conv, stride, out } => depth_to_space(&conv.forward(&x)?, *stride, *out)?,
-            };
+                Block::Up { conv, stride, out } => {
+                    x = up(&x, conv, *stride, *out)?;
+                    x.device().synchronize()?;
+                }
+            }
         }
-        let x = self.conv_out.forward(&pixel_norm(&x, EPS)?.silu()?)?;
-        let x = unpatchify(&x, self.patch)?.to_dtype(DType::F32)?;
-        ((x + 1.0)? * 0.5)?.clamp(0f32, 1f32)
+        let p = self.patch;
+        let (t, _, h, w) = x.dims4()?;
+        let frames = Tensor::zeros((t, 3, h * p, w * p), DType::F32, x.device())?;
+        for (f, n) in chunks(&x) {
+            let y = self.conv_out.frames(&norm_silu(&halo(&x, f, n, 1)?, EPS)?, (f.saturating_sub(1), t), (f, f + n))?;
+            let y = ((unpatchify(&y, p)?.to_dtype(DType::F32)? + 1.0)? * 0.5)?.clamp(0f32, 1f32)?;
+            frames.slice_set(&y, 0, f)?;
+        }
+        Ok(frames)
     }
+}
+
+/// The most elements of a layer's input [`chunks`] takes at once: 256 M,
+/// 512 MB in bf16. At 1536×1024 the decoder's last stage is 3 GB a tensor,
+/// and a residual step done whole kept five of them alive; the whole decode
+/// ran out of memory at 77 GB.
+const BUDGET: usize = 1 << 28;
+
+/// `(first frame, frames)` for each chunk of `x` a step works through.
+fn chunks(x: &Tensor) -> Vec<(usize, usize)> {
+    let t = x.dim(0).unwrap_or(0);
+    let n = (BUDGET / (x.elem_count() / t.max(1)).max(1)).clamp(1, t.max(1));
+    (0..t).step_by(n).map(|f| (f, n.min(t - f))).collect()
+}
+
+/// Frames `f − k .. f + n + k` of `x`, cut off at its ends: a chunk and the
+/// `k` frames either side that `k` convolutions in a row read.
+fn halo(x: &Tensor, f: usize, n: usize, k: usize) -> candle_core::Result<Tensor> {
+    let (lo, hi) = (f.saturating_sub(k), (f + n + k).min(x.dim(0)?));
+    x.narrow(0, lo, hi - lo)
+}
+
+/// One residual step, `x + conv(silu(pn(conv(silu(pn(x))))))`, a chunk of
+/// frames at a time.
+///
+/// A chunk's frames `f .. f + n` need the first convolution's output one
+/// frame beyond them each way, and that needs the input two frames beyond.
+/// Those halo frames are computed twice, once for each chunk that reads
+/// them: the price of never holding the steps in between at full size. A
+/// stage small enough for one chunk pays nothing.
+fn residual(x: &Tensor, c1: &Conv3d, c2: &Conv3d) -> candle_core::Result<Tensor> {
+    let t = x.dim(0)?;
+    let parts = chunks(x);
+    if parts.len() == 1 {
+        let h = c1.forward(&norm_silu(x, EPS)?)?;
+        return x + c2.forward(&norm_silu(&h, EPS)?)?;
+    }
+    let out = Tensor::zeros(x.shape(), x.dtype(), x.device())?;
+    for (f, n) in parts {
+        let (a, b) = (f.saturating_sub(1), (f + n + 1).min(t));
+        let h = c1.frames(&norm_silu(&halo(x, f, n, 2)?, EPS)?, (f.saturating_sub(2), t), (a, b))?;
+        let h = c2.frames(&norm_silu(&h, EPS)?, (a, t), (f, f + n))?;
+        out.slice_set(&(x.narrow(0, f, n)? + h)?, 0, f)?;
+    }
+    Ok(out)
+}
+
+/// An up block, the convolution and the depth to space, a chunk of frames
+/// at a time.
+fn up(x: &Tensor, conv: &Conv3d, stride: [usize; 3], c: usize) -> candle_core::Result<Tensor> {
+    let (t, _, h, w) = x.dims4()?;
+    let parts = chunks(x);
+    if parts.len() == 1 {
+        return depth_to_space(&conv.forward(x)?, stride, c);
+    }
+    let [p1, p2, p3] = stride;
+    // Doubling time drops the first frame of the result.
+    let drop = (p1 == 2) as usize;
+    let out = Tensor::zeros((t * p1 - drop, c, h * p2, w * p3), x.dtype(), x.device())?;
+    for (f, n) in parts {
+        let y = unfold(&conv.frames(&halo(x, f, n, 1)?, (f.saturating_sub(1), t), (f, f + n))?, stride, c)?;
+        match (f, drop) {
+            (0, 1) => out.slice_set(&y.narrow(0, 1, n * p1 - 1)?, 0, 0)?,
+            _ => out.slice_set(&y, 0, f * p1 - drop)?,
+        }
+    }
+    Ok(out)
 }
 
 /// `[T, (c·p₁·p₂·p₃), H, W]` to `[T·p₁ (− 1), c, H·p₂, W·p₃]`: each group of
@@ -171,18 +247,22 @@ impl VideoDecoder {
 /// The channel index is `((c·p₁ + i)·p₂ + j)·p₃ + k`, as the reference's
 /// `b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)` has it. When time
 /// doubles, the first frame of the result is dropped.
-fn depth_to_space(x: &Tensor, [p1, p2, p3]: [usize; 3], c: usize) -> candle_core::Result<Tensor> {
+fn depth_to_space(x: &Tensor, stride: [usize; 3], c: usize) -> candle_core::Result<Tensor> {
+    let x = unfold(x, stride, c)?;
+    match stride[0] {
+        2 => x.narrow(0, 1, x.dim(0)? - 1),
+        _ => Ok(x),
+    }
+}
+
+/// [`depth_to_space`] without dropping a frame: `[T·p₁, c, H·p₂, W·p₃]`.
+fn unfold(x: &Tensor, [p1, p2, p3]: [usize; 3], c: usize) -> candle_core::Result<Tensor> {
     let (t, _, h, w) = x.dims4()?;
-    let x = x
-        .reshape(&[t, c, p1, p2, p3, h, w][..])?
+    x.reshape(&[t, c, p1, p2, p3, h, w][..])?
         // [t, p1, c, h, p2, w, p3]
         .permute(&[0, 2, 1, 5, 3, 6, 4][..])?
         .contiguous()?
-        .reshape((t * p1, c, h * p2, w * p3))?;
-    match p1 {
-        2 => x.narrow(0, 1, t * p1 - 1),
-        _ => Ok(x),
-    }
+        .reshape((t * p1, c, h * p2, w * p3))
 }
 
 /// `[T, 3·p·p, H, W]` to `[T, 3, H·p, W·p]`.
@@ -199,6 +279,18 @@ fn unpatchify(x: &Tensor, p: usize) -> candle_core::Result<Tensor> {
         .permute(&[0, 1, 4, 3, 5, 2][..])?
         .contiguous()?
         .reshape((t, c, h * p, w * p))
+}
+
+/// The per-channel statistics video latents are normalised by, from the VAE
+/// file at `path`: `(mean, std)`, `[128]` each, in f32 on the CPU.
+///
+/// The latent upsampler works on un-normalised latents and reads these from
+/// the VAE's file, as the reference does; it has none of its own.
+pub fn statistics(path: &Path) -> Res<(Tensor, Tensor)> {
+    // SAFETY: a read-only cache entry, as in `open`.
+    let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(path)? };
+    let get = |n: &str| -> Res<Tensor> { Ok(st.load(&format!("per_channel_statistics.{n}"), &Device::Cpu)?.to_dtype(DType::F32)?) };
+    Ok((get("mean-of-means")?, get("std-of-means")?))
 }
 
 /// Frames `[T, 3, H, W]` in `[0, 1]` as a [`kvad::video::Video`].

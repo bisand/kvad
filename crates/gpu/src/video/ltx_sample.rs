@@ -1,17 +1,22 @@
 //! Sampling LTX-2.5's distilled DiT: noise to a video latent and its sound.
 //!
 //! The distilled model runs a fixed schedule with no guidance, one DiT call a
-//! step. Stage 1 is eight *ancestral* steps: each takes a deterministic
-//! step to below the next noise level and adds fresh noise back up to it.
-//! Two-stage generation then upsamples and refines with three plain Euler
-//! steps; that is step 6 of `docs/video-plan.md`. Here is one stage at the
-//! requested size, which is stage 1 with no upsampler.
+//! step, in two stages:
+//!
+//! 1. [`one_stage`]: eight *ancestral* steps from pure noise, at half the
+//!    requested width and height. Each takes a deterministic step to below
+//!    the next noise level and adds fresh noise back up to it.
+//! 2. The video latent is upsampled ×2 (`ltx_upsample`), and [`refine`]
+//!    re-noises both latents to σ = 0.909375 and takes three plain Euler
+//!    steps at the full size. The sound is refined too, not frozen.
+//!
+//! Stage 1 alone at the full size is the cheaper, rougher path.
 //!
 //! The DiT predicts velocity `v = ε − x₀`, with `x_σ = (1 − σ)·x₀ + σ·ε`, so
 //! `x₀ = x − σ·v`. The latents are kept in bf16 between steps, as the
 //! reference keeps them, and every update is computed in f32.
 
-use super::ltx_dit::{audio_latent, video_latent, Dit, Grid};
+use super::ltx_dit::{audio_latent, audio_tokens, video_latent, video_tokens, Dit, Grid};
 use super::ltx_text::Contexts;
 use crate::image::nn::noise;
 use candle_core::{DType, Tensor};
@@ -20,6 +25,11 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// Stage 1's noise levels: fixed, with no shift for resolution or length.
 pub const STAGE_1: [f32; 9] = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0];
+
+/// Stage 2's noise levels: the upsampled latent is re-noised to the first,
+/// then three Euler steps. (The reference's docs say four steps; four
+/// levels make three.)
+pub const STAGE_2: [f32; 4] = [0.909375, 0.725, 0.421875, 0.0];
 
 /// How much of each step's deterministic move is replaced by noise: 1 is
 /// fully ancestral, 0 plain Euler.
@@ -96,6 +106,48 @@ pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, step: &mut d
     Ok(Latents { video: video_latent(&xv.to_dtype(DType::F32)?, shape)?, audio: audio_latent(&xa.to_dtype(DType::F32)?, 8)? })
 }
 
+/// One Euler step from σ to σₙ, given the prediction `x0`: the velocity
+/// `(x − x₀)/σ`, rounded to the latent's dtype, then `x + v·(σₙ − σ)` in f32,
+/// rounded again, as the reference does both.
+fn euler(x: &Tensor, x0: &Tensor, sigma: f32, next: f32) -> candle_core::Result<Tensor> {
+    let keep = x.dtype();
+    let f = |t: &Tensor| t.to_dtype(DType::F32);
+    let v = ((f(x)? - f(x0)?)? / sigma as f64)?.to_dtype(keep)?;
+    (f(x)? + (f(&v)? * (next - sigma) as f64)?)?.to_dtype(keep)
+}
+
+/// Stage 2: `latents`, the upsampled video and stage 1's sound, re-noised
+/// to [`STAGE_2`]'s first level and refined by three Euler steps at the
+/// grid's size. `step` hears each step's number and σ after it runs.
+pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u64, step: &mut dyn FnMut(usize, f32) -> Res<()>) -> Res<Latents> {
+    let shape = grid.shape();
+    let (dev, keep) = (dit.device(), DType::BF16);
+    let f = |t: &Tensor| t.to_dtype(DType::F32);
+    let sigmas = &STAGE_2;
+    // `lerp(x, ε, σ₀)`: most of the way back to noise, keeping σ₀'s share of
+    // the signal. Draws 100 and 101, clear of stage 1's.
+    let renoise = |x: Tensor, draw: u64| -> Res<Tensor> {
+        let x = x.to_device(dev)?.to_dtype(keep)?;
+        let eps = noise(stream(seed, draw), x.dims(), dev, keep)?;
+        Ok((&f(&x)? + ((f(&eps)? - f(&x)?)? * sigmas[0] as f64)?)?.to_dtype(keep)?)
+    };
+    let mut xv = renoise(video_tokens(&latents.video)?, 100)?;
+    let mut xa = renoise(audio_tokens(&latents.audio)?, 101)?;
+    if xv.dim(0)? != shape.video_tokens() || xa.dim(0)? != shape.audio_latents() {
+        return Err(format!("stage 2 at {}×{} wants {} video and {} audio tokens, and was given {} and {}", shape.width, shape.height, shape.video_tokens(), shape.audio_latents(), xv.dim(0)?, xa.dim(0)?).into());
+    }
+    for i in 0..sigmas.len() - 1 {
+        let (s, next) = (sigmas[i], sigmas[i + 1]);
+        let (vv, va) = dit.forward(&xv, &xa, (s, s), ctx, grid)?;
+        let x0v = (f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?;
+        let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
+        xv = euler(&xv, &x0v, s, next)?;
+        xa = euler(&xa, &x0a, s, next)?;
+        step(i, next)?;
+    }
+    Ok(Latents { video: video_latent(&xv.to_dtype(DType::F32)?, shape)?, audio: audio_latent(&xa.to_dtype(DType::F32)?, 8)? })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +170,18 @@ mod tests {
         for (i, (a, r, c)) in table.into_iter().enumerate() {
             let k = Ancestral::new(STAGE_1[i], STAGE_1[i + 1]);
             assert!((k.a - a).abs() < 1e-5 && (k.r - r).abs() < 1e-5 && (k.c - c).abs() < 1e-5, "step {i}: {k:?}");
+        }
+    }
+
+    #[test]
+    fn the_last_euler_step_lands_on_the_prediction() {
+        // σₙ = 0: x + (x − x₀)/σ·(0 − σ) is x₀, up to the velocity's rounding.
+        let dev = candle_core::Device::Cpu;
+        let x = Tensor::new(&[0.8f32, -1.3, 2.0], &dev).unwrap();
+        let x0 = Tensor::new(&[0.1f32, 0.4, -0.7], &dev).unwrap();
+        let y = euler(&x, &x0, 0.421875, 0.0).unwrap().to_vec1::<f32>().unwrap();
+        for (a, b) in y.iter().zip([0.1f32, 0.4, -0.7]) {
+            assert!((a - b).abs() < 1e-6, "{y:?}");
         }
     }
 

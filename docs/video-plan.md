@@ -835,7 +835,8 @@ The same kind of checks apply here:
    121; see below.
 7. **The service:** the `video` kind, `/v1/videos`, storage, the CLI, the UI
    page. #51 has the shape. Video files are served with Range support, and
-   `ffmpeg` re-encoding is optional.
+   `ffmpeg` re-encoding is optional. Done, without the re-encoding; see
+   below.
 8. **Later, each in its own issue:**
    - the duration head as the default;
    - image-to-video;
@@ -1281,3 +1282,79 @@ was no faster.
   that the kernels build wherever the GPU has matrix units.
 - **Where 1536×1024's 6 minutes go now:** stage 2 about 215 s, of which
   attention is about 40%; stage 1 about 87 s; the decode about 40 s.
+
+**The service (step 7).** LTX-2.5 is now a model the server loads and a
+client asks for a video, the way it asks an image model for a picture.
+
+- **A peer, not a mode:** `kvad::video::Director` beside
+  `kvad::image::Painter`, `Model::Video`, `Cmd::Film` and its events, and a
+  third `Kind`, `video`, which every route that picks a model by kind
+  refuses or offers by name. `kvad-gpu`'s `video::ltx::Ltx` is
+  `examples/ltx.rs` phase for phase. The repo has no `model_index.json`, so
+  `hub::pipeline` knows it by its DiT's file and names it `LTX2Pipeline`, as
+  diffusers names LTX-2's pipeline; it lists as a runnable video model, and
+  a load fetches only the five files a generation reads.
+- **Nothing is kept between generations.** The plan was to keep the DiT and
+  reload the text path. Measured on `master` before this, from the q8 caches:
+  the text path loads in 8.9 s and the DiT in 3.5 s, of 75 s for 768×512 ×
+  121 all told. So the model holds paths and loads each phase as it gets
+  to it. A load builds the two q8 caches if they are missing, so that the
+  first generation does not spend two minutes quantising.
+- **Admission charges a generation's peak**, since that is what the next
+  request needs, not what is held: `24.2 GB + 58.2 bytes × w·h·frames`, the
+  line through 768×512 × 121 at 27.0 GB (the run above) and 1536×1024 × 121
+  at 35.3 GB, the higher of the two peaks measured there (#88; #89's was
+  33.0). A request past what was measured, 121 frames and 1536×1024 × 121
+  pixels × frames, is refused before it is queued, and so is one past what
+  the machine's usable memory holds by that line. A larger clip has never
+  run here, and a Metal allocation past memory reboots the Mac.
+- **`/v1/videos` is OpenAI's job shape**, checked against their published
+  spec: `POST` answers at once with a `queued` video, `GET /v1/videos/{id}`
+  reports `status` and `progress`, `/content` is the MP4 and
+  `?variant=thumbnail` its middle frame, as a PNG where OpenAI's is a WebP.
+  OpenAI's SDKs send the request as `multipart/form-data`, with or without
+  a file in it, so that is read by hand beside JSON. Beside their fields:
+  `frames` (or `num_frames`), `fps`, `seed`, `audio: false`. A length in
+  seconds becomes the nearest 8k + 1 frames. `input_reference`, a negative
+  prompt, guidance and steps are refused by name. Every endpoint in the spec
+  is marked deprecated, and the SDK warns that the Sora API was to shut down
+  on 2026-09-24; the shape is still the only one its clients know.
+- **Checked with OpenAI's own Python SDK** (3.19.2): `videos.create`,
+  `retrieve`, `download_content` for both variants, and `list`, unchanged,
+  against this server. A 4 s clip at 768×512 came back in 62.7 s, and
+  `ffprobe` reads 97 H.264 frames and FLAC sound.
+- **Progress is weighted by time**, from the measured cost of each part,
+  since stage 2's steps are four times stage 1's at 768×512 and the loads
+  and the decode are a quarter of the total. In that run it read 15% at
+  10 s, 43% at 28 s, 83% at 52 s, done at 62.7 s: within 3 points of the
+  share of time spent.
+- **Stored as images are:** a `videos` table and `videos/<id>.mp4` with a
+  poster PNG. The row is written when the video is asked for, and is the
+  job's state as well as its record. A restart marks what was running as
+  failed.
+- **Range requests are answered by hand**, streamed from the file a
+  megabyte at a time. Chromium seeks: a `<video>` in the new page reached
+  3 s with `readyState` 4 on 206 answers.
+- **Deleting a video stops it, promptly.** Measured with three queued: the
+  first, deleted in stage 1, and the second, deleted while queued, then the
+  third to finish. It finished at 89 s at first, because a queued video
+  only noticed its deletion at its first step, and a running one stopped
+  two steps after it. Now the task that watches a video asks every second
+  whether its row is there, the scheduler skips a video nobody is waiting
+  for, and the drain sets the engine's cancel flag as soon as the watcher
+  is gone rather than at the next step nobody received: the third finished
+  at 49 s. A generation that stops mid-stage now synchronises the device as
+  it returns. Without that, the DiT's 20 GB stayed in candle's pool, and
+  the next video's text phase took 15 s rather than 10.
+- **`kvad videos ls|make|show|get|rm`**: `make` waits and writes the file,
+  and says that stopping the wait does not stop the video. **The Videos
+  page** has a size, a length, sound, a seed, a gallery of players with
+  posters, and progress with a rough time left, and it says that a video
+  holds the GPU for its whole length.
+- **1536×1024 × 121 through the server** took 328 s (text 9.3 s, denoise
+  278.5 s, decode 38.6 s), for a 288 MB file. The server's peak footprint
+  over its whole life, the load and the generation, was 33.5 GB, under the
+  35.3 GB admission charged. One run.
+- **Not done:** re-encoding with `ffmpeg` (the files are 14 MB a second at
+  768×512 and 57 at 1536×1024); a latent preview while it runs;
+  image-to-video; progress as a stream rather than polled.

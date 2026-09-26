@@ -68,19 +68,20 @@ pub async fn models(_: Identity, St(state): St<State>) -> Result<Json<serde_json
     let found = blocking(move || {
         let listed = |trained: bool| {
             move |m: kvad::hub::LocalModel| {
-                let kind = match kvad::hub::pipeline(&m) {
-                    Some(_) => "image",
-                    None => "chat",
+                let kind = match Kind::of_pipeline(kvad::hub::pipeline(&m).as_deref()) {
+                    Kind::Chat => "chat",
+                    Kind::Image => "image",
+                    Kind::Video => "video",
                 };
                 (m.id.clone(), trained, takes_tools(&m), kind)
             }
         };
         // A language model is one this build has an architecture for; an
-        // image model is one whose pipeline it implements.
+        // image or video model is one whose pipeline it implements.
         let runs = |m: &kvad::hub::LocalModel| {
             m.complete
                 && match kvad::hub::pipeline(m) {
-                    Some(p) => crate::engine::paints(&p),
+                    Some(p) => crate::engine::implements(&p),
                     None => m.arch.is_some(),
                 }
         };
@@ -117,9 +118,9 @@ pub async fn models(_: Identity, St(state): St<State>) -> Result<Json<serde_json
             // model for an agent needs it before it picks — so it goes in the
             // extension field, beside the one on a completion. Whether it is
             // in memory goes there too: naming one that is not costs a load.
-            // `kind` too: an image model answers a different endpoint, and
-            // a client picking a model by name should not have to find that
-            // out from a refusal.
+            // `kind` too: an image or video model answers a different
+            // endpoint, and a client picking a model by name should not have
+            // to find that out from a refusal.
             "kvad": { "tools": tools, "resident": resident(&id), "kind": kind },
         }))
         .collect();
@@ -525,10 +526,7 @@ pub(crate) async fn resident_for(state: &State, model: Option<&str>, want: Kind)
         blocking(move || {
             let found = kvad::hub::find_local(&repo).or_else(|| kvad::hub::find_trained(&repo));
             let here = found.as_ref().is_some_and(|m| m.complete);
-            let kind = match found.as_ref().and_then(kvad::hub::pipeline) {
-                Some(_) => Kind::Image,
-                None => Kind::Chat,
-            };
+            let kind = Kind::of_pipeline(found.as_ref().and_then(kvad::hub::pipeline).as_deref());
             // The same answer the Models page would give, from the same
             // function: a load started from here and a load started from
             // there must not disagree about what "the default backend"
@@ -567,14 +565,16 @@ fn noun(kind: Kind) -> &'static str {
     match kind {
         Kind::Chat => "language",
         Kind::Image => "image",
+        Kind::Video => "video",
     }
 }
 
 /// A model asked for the other kind of work, said with where to send it.
 fn wrong_kind(name: &str, is: Kind) -> Fail {
     Fail::bad(match is {
-        Kind::Image => format!("{name} makes images; ask it at /v1/images/generations, not /v1/chat/completions"),
-        Kind::Chat => format!("{name} is a language model; it answers /v1/chat/completions, not image requests"),
+        Kind::Image => format!("{name} makes images; ask it at /v1/images/generations"),
+        Kind::Video => format!("{name} makes videos; ask it at /v1/videos"),
+        Kind::Chat => format!("{name} is a language model; it answers /v1/chat/completions, not image or video requests"),
     })
 }
 
@@ -1094,6 +1094,7 @@ mod tests {
             kv_bytes_per_token: 1024,
             kind: crate::scheduler::Kind::Chat,
             image: None,
+            video: None,
         };
         let stats = Stats {
             prompt_tokens: 100,

@@ -34,12 +34,17 @@ class Models {
 
   /** The language models in memory: what Chat and the Playground can use. */
   get chatResidents() {
-    return this.residents.filter((r) => r.kind !== "image");
+    return this.residents.filter((r) => r.kind !== "image" && r.kind !== "video");
   }
 
   /** The image models in memory: what the Images page can use. */
   get imageResidents() {
     return this.residents.filter((r) => r.kind === "image");
+  }
+
+  /** The video models in memory: what the Videos page can use. */
+  get videoResidents() {
+    return this.residents.filter((r) => r.kind === "video");
   }
 
   /** The budget the models in memory share: `{ total, left, context }`. */
@@ -59,12 +64,12 @@ class Models {
    */
   get loaded() {
     // Language models only: every page that asks this is one that talks,
-    // and an image model in memory is not somebody to talk to.
+    // and an image or video model in memory is not somebody to talk to.
     const residents = this.chatResidents;
     const picked = residents.find((r) => r.id === this.picked);
     if (picked) return picked;
     const last = this.listing?.loaded;
-    if (!last || last.kind === "image") return residents.at(-1) ?? null;
+    if (!last || last.kind === "image" || last.kind === "video") return residents.at(-1) ?? null;
     return residents.find((r) => r.repo === last.repo && r.backend === last.backend) ?? last;
   }
 

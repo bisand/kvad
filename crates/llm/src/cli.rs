@@ -50,6 +50,7 @@ pub fn remote_only(command: &str) -> bool {
             | "tokenize"
             | "conversations"
             | "images"
+            | "videos"
             | "jobs"
             | "datasets"
             | "evals"
@@ -108,6 +109,7 @@ pub fn remote(remote: &Remote, args: &Args) -> Res<()> {
         "train" => models::train(remote, args),
         "conversations" => api::conversations(remote, args),
         "images" => api::images(remote, args),
+        "videos" => api::videos(remote, args),
         "jobs" => api::jobs(remote, args),
         "datasets" => api::datasets(remote, args),
         "evals" => api::evals(remote, args),
@@ -131,6 +133,7 @@ pub fn help(command: &str) -> ! {
         "service" => service::USAGE,
         "conversations" => api::CONVERSATIONS,
         "images" => api::IMAGES,
+        "videos" => api::VIDEOS,
         "jobs" => api::JOBS,
         "datasets" => api::DATASETS,
         "evals" => api::EVALS,
@@ -202,6 +205,9 @@ mod tests {
     /// The client's calls that take the method as their first argument.
     const TAKES_A_METHOD: &[&str] = &["call", "call_for_cookie", "stream"];
 
+    /// The client's calls that are a GET under another name.
+    const GETS: &[&str] = &["download"];
+
     /// Every `(method, path)` the CLI's source requests.
     ///
     /// Read out of the source the way `kvad-serve` reads its router: every
@@ -252,7 +258,10 @@ mod tests {
         }
         let call = trimmed.trim_end().strip_suffix('(')?;
         let name = call.rsplit(['.', ' ', '\n', '(']).next()?;
-        METHODS.contains(&name).then(|| name.to_string())
+        match GETS.contains(&name) {
+            true => Some("get".into()),
+            false => METHODS.contains(&name).then(|| name.to_string()),
+        }
     }
 
     /// What the table promises and what the source does are the same set.
@@ -280,6 +289,7 @@ mod tests {
         assert_eq!(method_before("remote.get(").as_deref(), Some("get"));
         assert_eq!(method_before("r.delete(&format!(").as_deref(), Some("delete"));
         assert_eq!(method_before("remote.stream(\"post\", ").as_deref(), Some("post"));
+        assert_eq!(method_before("remote.download(&format!(").as_deref(), Some("get"));
         assert_eq!(method_before("remote\n        .call(\"patch\", &format!(").as_deref(), Some("patch"));
         assert_eq!(method_before("r.call_for_cookie(\n    \"post\",\n    ").as_deref(), Some("post"));
         assert_eq!(method_before("let path = "), None);
@@ -290,8 +300,8 @@ mod tests {
     fn every_command_the_table_names_exists() {
         let known: BTreeSet<&str> = [
             "ls", "ps", "search", "info", "pull", "use", "rm", "cache", "load", "unload", "cancel",
-            "tokenize", "run", "chat", "train", "service", "conversations", "images", "jobs", "datasets",
-            "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api",
+            "tokenize", "run", "chat", "train", "service", "conversations", "images", "videos", "jobs",
+            "datasets", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api",
         ]
         .into();
         for (method, path, commands) in client::COMMANDS {

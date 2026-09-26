@@ -852,8 +852,17 @@ pub fn model_file(model_dir: &Path, name: &str) -> Option<PathBuf> {
 /// Read here rather than kept on [`LocalModel`], because every listing would
 /// then pay for a file that only a server offering images asks about, and
 /// that asks about it for the few models it is about to show.
+///
+/// A video pipeline laid out without an index — LTX-2.5 — is named by its
+/// denoiser's file instead; see [`crate::video::LTX_PIPELINE`].
 pub fn pipeline(model: &LocalModel) -> Option<String> {
-    let index = model_file(&model.path, "model_index.json")?;
+    pipeline_in(&model.path)
+}
+
+fn pipeline_in(dir: &Path) -> Option<String> {
+    let Some(index) = model_file(dir, "model_index.json") else {
+        return model_file(dir, crate::video::LTX_DENOISER).map(|_| crate::video::LTX_PIPELINE.to_string());
+    };
     let json = crate::weights::read_json(&index).ok()?;
     json.get("_class_name")?.as_str().map(str::to_string)
 }
@@ -872,7 +881,10 @@ fn find_config(model_dir: &Path) -> Option<PathBuf> {
 /// present is the pipeline's own question, asked when it is offered.
 fn denoiser_is_here(model_dir: &Path) -> bool {
     if model_file(model_dir, "model_index.json").is_none() {
-        return false;
+        // LTX's denoiser is one file, and one in the snapshot is whole:
+        // `hf-hub` downloads to an `.incomplete` file and renames it, and
+        // links it into the snapshot after that.
+        return model_file(model_dir, crate::video::LTX_DENOISER).is_some();
     }
     let Ok(revisions) = std::fs::read_dir(model_dir.join("snapshots")) else { return false };
     revisions.filter_map(|e| e.ok()).any(|rev| {
@@ -1035,6 +1047,26 @@ mod tests {
         assert_eq!(cache_dir_from(None, p("/h"), p("/d")), PathBuf::from("/h/hub"));
         assert_eq!(cache_dir_from(None, None, p("/d")), PathBuf::from("/d/huggingface/hub"));
         assert_eq!(cache_dir_from(None, None, None), dirs_home().join(".cache/huggingface/hub"));
+    }
+
+    /// LTX-2.5 has no `model_index.json`, and is known by its DiT's file in
+    /// a snapshot: a video pipeline, downloaded, where a repo with neither
+    /// is nothing of the kind.
+    #[test]
+    fn a_repo_laid_out_as_ltx_is_a_video_pipeline() {
+        let dir = std::env::temp_dir().join(format!("kvad-hub-ltx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rev = dir.join("snapshots/abc");
+        std::fs::create_dir_all(rev.join("vae")).unwrap();
+        assert_eq!(pipeline_in(&dir), None);
+        assert!(!denoiser_is_here(&dir));
+        let dit = rev.join(crate::video::LTX_DENOISER);
+        std::fs::create_dir_all(dit.parent().unwrap()).unwrap();
+        std::fs::write(&dit, b"").unwrap();
+        assert_eq!(pipeline_in(&dir).as_deref(), Some(crate::video::LTX_PIPELINE));
+        assert!(crate::video::is_video_pipeline(&pipeline_in(&dir).unwrap()));
+        assert!(denoiser_is_here(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

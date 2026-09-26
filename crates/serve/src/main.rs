@@ -70,6 +70,7 @@ mod storage;
 mod watching;
 mod training;
 mod users;
+mod videos;
 
 use axum::Router;
 use std::net::SocketAddr;
@@ -217,6 +218,9 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
     // now, whatever its row says.
     let job_runner = std::sync::Arc::new(jobs::Jobs::new(db.clone()));
     let orphans = job_runner.abandon_orphans().unwrap_or(0);
+    // And any video that was being made: its generation died with the
+    // process that ran it.
+    let unfinished = videos::abandon(&db).unwrap_or(0);
 
     let setup = std::sync::Arc::new(auth::Setup::default());
     let accounts = users::count(&db)?;
@@ -349,6 +353,9 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
     }
     if swept > 0 {
         tracing::info!("swept {swept} expired session(s)");
+    }
+    if unfinished > 0 {
+        tracing::info!("{unfinished} video(s) were interrupted by a restart and are marked failed");
     }
     if orphans > 0 {
         tracing::info!("{orphans} job(s) were interrupted by a restart and are marked failed");

@@ -20,13 +20,18 @@ pub fn loader() -> Loader {
         Box::new(move |repo, backend, progress, watch| {
             // An image pipeline is not a language model at any precision,
             // and has no CPU implementation at all; see docs/image-plan.md.
-            let image = kvad_gpu::image::is_pipeline(repo, watch);
+            // Nor has a video pipeline. Video is asked first, because it
+            // never asks the Hub.
+            let video = kvad_gpu::video::ltx::is_pipeline(repo);
+            let image = !video && kvad_gpu::image::is_pipeline(repo, watch);
             match backend {
-                Backend::Cpu(_) if image => Err(format!(
-                    "{repo} makes images, and images are made on the GPU only; load it at a gpu backend"
+                Backend::Cpu(_) if image || video => Err(format!(
+                    "{repo} makes {}, and those are made on the GPU only; load it at a gpu backend",
+                    if video { "videos" } else { "images" }
                 )
                 .into()),
                 Backend::Cpu(_) => cpu(repo, backend, progress, watch),
+                Backend::Gpu(mode) if video => gpu::film(repo, mode, progress, watch),
                 Backend::Gpu(mode) if image => gpu::paint(repo, mode, progress, watch),
                 Backend::Gpu(mode) => gpu::load(repo, mode, progress, watch).map(Model::from),
             }
@@ -137,10 +142,11 @@ pub fn parse(id: &str) -> Option<Backend> {
         .find(|b| id_of(*b) == id)
 }
 
-/// Whether this build can load an image pipeline of this class.
-pub fn paints(pipeline: &str) -> bool {
+/// Whether this build can load a pipeline of this class: an image
+/// pipeline's, or a video pipeline's.
+pub fn implements(pipeline: &str) -> bool {
     #[cfg(feature = "gpu")]
-    return kvad_gpu::image::PIPELINES.contains(&pipeline);
+    return kvad_gpu::image::PIPELINES.contains(&pipeline) || kvad_gpu::video::ltx::PIPELINES.contains(&pipeline);
     #[cfg(not(feature = "gpu"))]
     {
         let _ = pipeline;
@@ -151,12 +157,12 @@ pub fn paints(pipeline: &str) -> bool {
 /// The pipelines this build implements, for a message.
 pub fn pipelines() -> String {
     #[cfg(feature = "gpu")]
-    return kvad_gpu::image::PIPELINES.join(", ");
+    return kvad_gpu::image::PIPELINES.iter().chain(&kvad_gpu::video::ltx::PIPELINES).copied().collect::<Vec<_>>().join(", ");
     #[cfg(not(feature = "gpu"))]
     String::from("none")
 }
 
-/// The backend an image pipeline gets when nobody has said which.
+/// The backend a pipeline gets when nobody has said which.
 ///
 /// SDXL runs in f16 whatever it is asked, so any GPU backend is the same load
 /// and `gpu-bf16` is the one whose name does not promise a quantisation that
@@ -164,22 +170,29 @@ pub fn pipelines() -> String {
 /// is likely to be on (41 GB of denoiser alone) and gets q8. So does FLUX:
 /// its 24 GB of transformer and 9.5 GB of T5 would fit in bf16 on their own,
 /// and leave room for nothing else.
-pub fn preferred_image(pipeline: &str) -> Backend {
+///
+/// LTX-2.5 runs at q8 or not at all: its DiT is 42 GB in bf16.
+pub fn preferred_pipeline(pipeline: &str) -> Backend {
     match pipeline {
-        "QwenImagePipeline" | "FluxPipeline" => Backend::Gpu(kvad::service::GpuMode::Q8),
+        "QwenImagePipeline" | "FluxPipeline" | kvad::video::LTX_PIPELINE => Backend::Gpu(kvad::service::GpuMode::Q8),
         _ => Backend::Gpu(kvad::service::GpuMode::Bf16),
     }
 }
 
-/// What an image pipeline on this disk will take at `backend`, or `None` for
-/// anything that is not one (and for everything, in a build with no GPU).
+/// What an image or video pipeline on this disk will take at `backend`, or
+/// `None` for anything that is not one (and for everything, in a build with
+/// no GPU).
 ///
 /// Asked of the pipeline rather than worked out from the repo's size: each
 /// reads only some of its repo, in its own precision. See
-/// [`kvad_gpu::image::weight_bytes`].
-pub fn image_weight_bytes(repo: &str, backend: Backend) -> Option<u64> {
+/// [`kvad_gpu::image::weight_bytes`], and [`kvad_gpu::video::ltx::weight_bytes`]
+/// for why a video pipeline's answer is a generation's peak instead.
+pub fn pipeline_weight_bytes(repo: &str, backend: Backend) -> Option<u64> {
     #[cfg(feature = "gpu")]
     if let Backend::Gpu(mode) = backend {
+        if kvad_gpu::video::ltx::is_pipeline(repo) {
+            return kvad_gpu::video::ltx::weight_bytes(repo, gpu::quant(mode));
+        }
         return kvad_gpu::image::weight_bytes(repo, gpu::quant(mode));
     }
     let _ = (repo, backend);
@@ -249,6 +262,15 @@ mod gpu {
         watch: &Watcher,
     ) -> Result<Model, Box<dyn std::error::Error>> {
         Ok(Model::Image(kvad_gpu::image::load(repo, quant(mode), progress, watch)?))
+    }
+
+    pub fn film(
+        repo: &str,
+        mode: GpuMode,
+        progress: &mut dyn FnMut(&str),
+        watch: &Watcher,
+    ) -> Result<Model, Box<dyn std::error::Error>> {
+        Ok(Model::Video(Box::new(kvad_gpu::video::ltx::Ltx::load(repo, quant(mode), progress, watch)?)))
     }
 
     pub fn load(

@@ -48,6 +48,13 @@ export const PAGES = [
     icon: "M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM21 15l-5-5L5 21",
   },
   {
+    path: "/videos",
+    label: "Videos",
+    phase: null,
+    blurb: "Text to video, with sound: a prompt, a size and a length, the generation as it goes, and a gallery.",
+    icon: "M3 6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM17 10l4-2.5v9L17 14",
+  },
+  {
     path: "/training",
     label: "Training",
     phase: null,

@@ -683,6 +683,9 @@ struct QActBatch {
     qs: Vec<i8>,
     scales: Vec<f32>,
     sums: Vec<i32>,
+    /// Read only by the `SMMLA` kernel, which exists on aarch64 alone;
+    /// elsewhere it is built empty and never read.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     packed: Vec<i8>,
 }
 
@@ -808,12 +811,20 @@ impl Weight {
                     // index arithmetic below stays inside `qs` / `packed`,
                     // whose sizes are fixed by `rows`, `cols` and `m`.
                     #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        self.smmla_row_pair(&act, r0, m, blocks, chunk, unpacked);
+                    {
+                        unsafe {
+                            self.smmla_row_pair(&act, r0, m, blocks, chunk, unpacked);
+                        }
+                        return;
                     }
+                    // `has_i8mm` is false off aarch64, so the branch is never
+                    // taken there, and nothing unpacks q4 weights into the
+                    // second buffer.
                     #[cfg(not(target_arch = "aarch64"))]
-                    unreachable!();
-                    return;
+                    {
+                        let _ = unpacked;
+                        unreachable!();
+                    }
                 }
 
                 // Fallback: one row at a time, in the same two passes as

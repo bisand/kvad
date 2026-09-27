@@ -1064,10 +1064,10 @@ mod metal {
 #[cfg(not(target_os = "macos"))]
 mod metal {
     use super::*;
-    pub(super) fn modulate(_: &Tensor, _: Option<(&Tensor, &Tensor)>, _: &Tensor, _: &Tensor, _: f32) -> candle_core::Result<Tensor> {
+    pub(super) fn modulate(_: &Tensor, _: Option<(&Tensor, &Tensor)>, _: &Tensor, _: &Tensor, _: (usize, usize), _: f32) -> candle_core::Result<Tensor> {
         unreachable!()
     }
-    pub(super) fn gated_add(_: &Tensor, _: &Tensor, _: &Tensor) -> candle_core::Result<Tensor> {
+    pub(super) fn gated_add(_: &Tensor, _: &Tensor, _: &Tensor, _: (usize, usize)) -> candle_core::Result<Tensor> {
         unreachable!()
     }
     pub(super) fn norm_rope(_: &Tensor, _: &Tensor, _: Option<(&Tensor, &Tensor)>, _: usize, _: f32, _: DType) -> candle_core::Result<Tensor> {

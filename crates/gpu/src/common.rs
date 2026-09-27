@@ -181,12 +181,19 @@ pub(crate) struct Loader<'v> {
     pub(crate) device: Device,
     vault: &'v Vault,
     /// Q8_0 projections as [`Proj::Blocks`], for the M5's matrix units.
+    #[cfg(target_os = "macos")]
     blocks: bool,
 }
 
 impl<'v> Loader<'v> {
     pub(crate) fn new(quant: Option<GgmlDType>, device: Device, vault: &'v Vault) -> Self {
-        Loader { quant, device, vault, blocks: false }
+        Loader {
+            quant,
+            device,
+            vault,
+            #[cfg(target_os = "macos")]
+            blocks: false,
+        }
     }
 
     /// The same load, with its Q8_0 projections on the M5's matrix units
@@ -194,11 +201,10 @@ impl<'v> Loader<'v> {
     ///
     /// Only for a model with no decode step: a [`Proj::Blocks`] has no
     /// one-row kernel behind it. `mpp` says why it cannot also keep one.
-    pub(crate) fn accelerated(mut self) -> Self {
+    pub(crate) fn accelerated(self) -> Self {
         #[cfg(target_os = "macos")]
-        {
-            self.blocks = self.quant == Some(GgmlDType::Q8_0) && crate::mpp::available(&self.device);
-        }
+        return Loader { blocks: self.quant == Some(GgmlDType::Q8_0) && crate::mpp::available(&self.device), ..self };
+        #[cfg(not(target_os = "macos"))]
         self
     }
 

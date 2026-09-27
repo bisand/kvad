@@ -238,6 +238,10 @@ pub(crate) fn norm_affine(x: &Tensor, a: &Tensor, b: &Tensor, eps: f32) -> candl
 }
 
 /// Where [`head_norm_rope`]'s tokens are and how they turn.
+///
+/// Built on every platform, but only the Metal kernel reads the grid's shape
+/// and the tables' lengths, so off macOS they are never read.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct HeadRope<'a> {
     /// The grid's rows and columns, and the chunk's first token in it.
     pub h: usize,

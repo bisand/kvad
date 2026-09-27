@@ -21,6 +21,15 @@
 //! - [`norm_silu`]: the decoder's pixel norm and SiLU, which come before
 //!   every convolution in its residual blocks and its output tail.
 //!
+//! Three more serve the diffusion decoder (`ltx_diffvae`), whose stage 5
+//! does the same kinds of thing over 3M tokens:
+//! - [`norm_affine`]: `rms(x)·a + b` with f32 rows, a weighted norm and its
+//!   modulation in one;
+//! - [`head_norm_rope`]: q and k from a fused `qkv` projection, each head
+//!   normed on its own and turned by 3D RoPE on adjacent pairs, and v with
+//!   them, written into q, k and v for the whole grid;
+//! - [`swiglu`]: `silu(g)·u`.
+//!
 //! Each does its arithmetic in f32 and rounds once, where candle's chains
 //! round after each op, so the two differ in the last bit of bf16; the tests
 //! hold each to the chain it replaces. Anything a kernel cannot take goes
@@ -215,6 +224,70 @@ pub(crate) fn gelu(x: &Tensor, dt: DType) -> candle_core::Result<Tensor> {
     metal::gelu(x, dt)
 }
 
+/// `rms(x)·a + b` over `x` `[n, e]`'s last axis, `a` and `b` `[e]` f32
+/// rows: a norm's weight, or its weight times `1 + scale` and a shift. In
+/// `x`'s dtype, computed in f32 and rounded once. `None` where the kernel
+/// cannot take it.
+pub(crate) fn norm_affine(x: &Tensor, a: &Tensor, b: &Tensor, eps: f32) -> candle_core::Result<Option<Tensor>> {
+    let e = x.dim(candle_core::D::Minus1)?;
+    let row = |t: &Tensor| readable(t) && t.dtype() == DType::F32 && t.elem_count() == e;
+    if !(readable(x) && x.rank() == 2 && row(a) && row(b)) {
+        return Ok(None);
+    }
+    metal::norm_affine(x, a, b, eps).map(Some)
+}
+
+/// Where [`head_norm_rope`]'s tokens are and how they turn.
+pub(crate) struct HeadRope<'a> {
+    /// The grid's rows and columns, and the chunk's first token in it.
+    pub h: usize,
+    pub w: usize,
+    pub row0: usize,
+    /// cos then sin of the angles, each for time, rows and columns in turn,
+    /// `[len, pairs]` of each axis, all in one f32 tensor; and the pairs
+    /// each axis takes of a head's 32.
+    pub tables: &'a Tensor,
+    pub pairs: [usize; 3],
+    pub lens: [usize; 3],
+}
+
+/// q, k and v for a chunk of tokens, from their fused projection `qkv`
+/// `[rows, 3·width]`: q and k each RMS-normed over every 64-wide head under
+/// `qn` and `kn` (f32 `[64]`), q scaled by `q_scale`, both turned pair by
+/// adjacent pair `(2i, 2i + 1)` by the angles of the token's place, and v as
+/// it is; written into `out` `[3, tokens, width]` at the chunk's rows.
+/// Returns whether the kernel ran; if not, nothing is written.
+pub(crate) fn head_norm_rope(qkv: &Tensor, qn: &Tensor, kn: &Tensor, rope: &HeadRope<'_>, eps: f32, q_scale: f32, out: &Tensor) -> candle_core::Result<bool> {
+    let (rows, three) = qkv.dims2()?;
+    let width = three / 3;
+    let fits = readable(qkv)
+        && readable(out)
+        && out.dtype() == qkv.dtype()
+        && out.rank() == 3
+        && out.dim(0)? == 3
+        && out.dim(2)? == width
+        && rope.row0 + rows <= out.dim(1)?
+        && width % 64 == 0
+        && rope.pairs.iter().sum::<usize>() == 32
+        && [qn, kn].iter().all(|t| readable(t) && t.dtype() == DType::F32 && t.elem_count() == 64)
+        && readable(rope.tables)
+        && rope.tables.dtype() == DType::F32;
+    if !fits {
+        return Ok(false);
+    }
+    metal::head_norm_rope(qkv, qn, kn, rope, eps, q_scale, out)?;
+    Ok(true)
+}
+
+/// `silu(g)·u`, in `g`'s dtype, computed in f32 and rounded once: a SwiGLU's
+/// gate and its up projection. `None` where the kernel cannot take it.
+pub(crate) fn swiglu(g: &Tensor, u: &Tensor) -> candle_core::Result<Option<Tensor>> {
+    if !(readable(g) && readable(u) && u.dtype() == g.dtype() && u.dims() == g.dims()) {
+        return Ok(None);
+    }
+    metal::swiglu(g, u).map(Some)
+}
+
 #[cfg(target_os = "macos")]
 mod metal {
     use super::{kernels, type_name};
@@ -397,6 +470,113 @@ mod metal {
         }
     }
 
+    // One threadgroup a row: `rms(x)·a + b`, `a` and `b` f32 rows.
+    template<typename T>
+    kernel void norm_affine(
+        device const T *x [[buffer(0)]],
+        device const float *a [[buffer(1)]],
+        device const float *b [[buffer(2)]],
+        device T *out [[buffer(3)]],
+        constant uint &e [[buffer(4)]],
+        constant float &eps [[buffer(5)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tpg [[threads_per_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]])
+    {
+        threadgroup float part[32];
+        const ulong base = ulong(row) * e;
+        float acc = 0;
+        for (uint j = tid; j < e; j += tpg) {
+            const float v = float(x[base + j]);
+            acc += v * v;
+        }
+        const float inv = 1.0f / sqrt(group_sum(acc, part, tpg, lane, sg) / float(e) + eps);
+        for (uint j = tid; j < e; j += tpg) {
+            out[base + j] = T(float(x[base + j]) * inv * a[j] + b[j]);
+        }
+    }
+
+    struct HeadRopeParams {
+        uint width, heads, rows, tokens, row0, h, w;
+        // Pairs for time and rows; columns take the rest of 32.
+        uint pt, ph;
+        float eps, q_scale;
+        // Where each table starts: cos for time, rows, columns, then sin.
+        uint at[6];
+    };
+
+    // One SIMD group a token's head of 64; lane l turns the pair (2l, 2l + 1).
+    template<typename T>
+    kernel void head_norm_rope(
+        device const T *qkv [[buffer(0)]],
+        device const float *qn [[buffer(1)]],
+        device const float *kn [[buffer(2)]],
+        device const float *tables [[buffer(3)]],
+        device T *out [[buffer(4)]],
+        constant HeadRopeParams &p [[buffer(5)]],
+        uint group [[threadgroup_position_in_grid]],
+        uint sg [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]])
+    {
+        // A whole SIMD group leaves together, so its sums stay whole.
+        const uint item = group * 4 + sg;
+        if (item >= p.rows * p.heads) return;
+        const uint r = item / p.heads, head = item % p.heads;
+        const ulong token = ulong(p.row0) + r;
+        const uint t = uint(token / (p.h * p.w)), y = uint(token / p.w) % p.h, x = uint(token % p.w);
+        uint axis, pos, i, np;
+        if (lane < p.pt) {
+            axis = 0; pos = t; i = lane; np = p.pt;
+        } else if (lane < p.pt + p.ph) {
+            axis = 1; pos = y; i = lane - p.pt; np = p.ph;
+        } else {
+            axis = 2; pos = x; i = lane - p.pt - p.ph; np = 32 - p.pt - p.ph;
+        }
+        const float c = tables[p.at[axis] + pos * np + i], s = tables[p.at[3 + axis] + pos * np + i];
+        const ulong src = ulong(r) * 3 * p.width + head * 64 + 2 * lane;
+        const ulong dst = token * p.width + head * 64 + 2 * lane;
+        const ulong part = ulong(p.tokens) * p.width;
+        for (uint which = 0; which < 2; which++) {
+            const float x0 = float(qkv[src + which * p.width]), x1 = float(qkv[src + which * p.width + 1]);
+            const float inv = 1.0f / sqrt(simd_sum(x0 * x0 + x1 * x1) / 64.0f + p.eps);
+            device const float *nw = which == 0 ? qn : kn;
+            const float k = which == 0 ? p.q_scale : 1.0f;
+            const float a0 = x0 * inv * nw[2 * lane] * k, a1 = x1 * inv * nw[2 * lane + 1] * k;
+            out[which * part + dst] = T(a0 * c - a1 * s);
+            out[which * part + dst + 1] = T(a0 * s + a1 * c);
+        }
+        out[2 * part + dst] = qkv[src + 2 * p.width];
+        out[2 * part + dst + 1] = qkv[src + 2 * p.width + 1];
+    }
+
+    template<typename T>
+    kernel void swiglu(
+        device const T *g [[buffer(0)]],
+        device const T *u [[buffer(1)]],
+        device T *out [[buffer(2)]],
+        constant uint &n [[buffer(3)]],
+        uint i [[thread_position_in_grid]])
+    {
+        if (i >= n) return;
+        const float v = float(g[i]);
+        out[i] = T(v / (1.0f + exp(-v)) * float(u[i]));
+    }
+
+    #define DIFF(T, N) \
+    template [[host_name("norm_affine_" #N)]] kernel void norm_affine<T>( \
+        device const T *, device const float *, device const float *, device T *, constant uint &, constant float &, \
+        uint, uint, uint, uint, uint); \
+    template [[host_name("head_norm_rope_" #N)]] kernel void head_norm_rope<T>( \
+        device const T *, device const float *, device const float *, device const float *, device T *, \
+        constant HeadRopeParams &, uint, uint, uint); \
+    template [[host_name("swiglu_" #N)]] kernel void swiglu<T>( \
+        device const T *, device const T *, device T *, constant uint &, uint);
+    DIFF(float, f32)
+    DIFF(half, f16)
+    DIFF(bfloat, bf16)
+
     #define ONE(T, N) \
     template [[host_name("modulate_" #N)]] kernel void modulate<T>( \
         device const T *, device const T *, device const T *, device const T *, device const T *, \
@@ -468,6 +648,168 @@ mod metal {
 
     pub(super) fn norm_silu(x: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
         x.apply_op1_no_bwd(&NormSilu { eps })
+    }
+
+    pub(super) fn norm_affine(x: &Tensor, a: &Tensor, b: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
+        x.apply_op3_no_bwd(a, b, &NormAffine { eps })
+    }
+
+    struct NormAffine {
+        eps: f32,
+    }
+
+    impl CustomOp3 for NormAffine {
+        fn name(&self) -> &'static str {
+            "ltx_norm_affine"
+        }
+
+        fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout)
+         -> candle_core::Result<(CpuStorage, Shape)> {
+            candle_core::bail!("ltx_norm_affine runs on Metal only")
+        }
+
+        fn metal_fwd(&self, x: &MetalStorage, lx: &Layout, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout)
+         -> candle_core::Result<(MetalStorage, Shape)> {
+            let (dt, dev) = (x.dtype(), x.device());
+            let (rows, e) = lx.shape().dims2()?;
+            let pipe = pipe(dev, &format!("norm_affine_{}", type_name(dt).unwrap()))?;
+            let out = output(dev, rows * e * dt.size_in_bytes())?;
+            let guard = dev.command_encoder()?;
+            let enc: &ComputeCommandEncoder = guard.as_ref();
+            enc.set_label("ltx_norm_affine");
+            enc.set_compute_pipeline_state(&pipe);
+            for (i, (bf, o)) in [(0, buffer(x, lx)), (1, buffer(a, la)), (2, buffer(b, lb))] {
+                enc.set_input_buffer(i, Some(&bf), o);
+            }
+            enc.set_output_buffer(3, Some(&out), 0);
+            enc.set_bytes(4, &(e as u32));
+            enc.set_bytes(5, &self.eps);
+            enc.dispatch_thread_groups(MTLSize { width: rows, height: 1, depth: 1 }, row_threads(e));
+            Ok((MetalStorage::new(out, dev.clone(), rows * e, dt), lx.shape().clone()))
+        }
+    }
+
+    pub(super) fn head_norm_rope(qkv: &Tensor, qn: &Tensor, kn: &Tensor, rope: &super::HeadRope<'_>, eps: f32, q_scale: f32, out: &Tensor)
+     -> candle_core::Result<()> {
+        let (rows, three) = qkv.dims2()?;
+        let width = three / 3;
+        let [pt, ph, pw] = rope.pairs;
+        let [lt, lh, lw] = rope.lens;
+        // cos for time, rows, columns, then sin, each `[len, pairs]`.
+        let sizes = [lt * pt, lh * ph, lw * pw];
+        let mut at = [0u32; 6];
+        for i in 1..6 {
+            at[i] = at[i - 1] + sizes[(i - 1) % 3] as u32;
+        }
+        let params = HeadRopeParams {
+            width: width as u32,
+            heads: (width / 64) as u32,
+            rows: rows as u32,
+            tokens: out.dim(1)? as u32,
+            row0: rope.row0 as u32,
+            h: rope.h as u32,
+            w: rope.w as u32,
+            pt: pt as u32,
+            ph: ph as u32,
+            eps,
+            q_scale,
+            at,
+        };
+        let op = HeadNormRope { qn: qn.clone(), kn: kn.clone(), tables: rope.tables.clone(), params };
+        out.inplace_op2(&qkv.contiguous()?, &op)
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct HeadRopeParams {
+        width: u32,
+        heads: u32,
+        rows: u32,
+        tokens: u32,
+        row0: u32,
+        h: u32,
+        w: u32,
+        pt: u32,
+        ph: u32,
+        eps: f32,
+        q_scale: f32,
+        at: [u32; 6],
+    }
+
+    struct HeadNormRope {
+        qn: Tensor,
+        kn: Tensor,
+        tables: Tensor,
+        params: HeadRopeParams,
+    }
+
+    impl candle_core::InplaceOp2 for HeadNormRope {
+        fn name(&self) -> &'static str {
+            "ltx_head_norm_rope"
+        }
+
+        fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> candle_core::Result<()> {
+            candle_core::bail!("ltx_head_norm_rope runs on Metal only")
+        }
+
+        fn metal_fwd(&self, out: &mut MetalStorage, lo: &Layout, qkv: &MetalStorage, lq: &Layout) -> candle_core::Result<()> {
+            if !lo.is_contiguous() || !lq.is_contiguous() {
+                candle_core::bail!("ltx_head_norm_rope: wants contiguous rows");
+            }
+            let dev = qkv.device().clone();
+            let pipe = pipe(&dev, &format!("head_norm_rope_{}", type_name(qkv.dtype()).unwrap()))?;
+            let (qn, kn, tables) = (metal(&self.qn)?, metal(&self.kn)?, metal(&self.tables)?);
+            let guard = dev.command_encoder()?;
+            let enc: &ComputeCommandEncoder = guard.as_ref();
+            enc.set_label("ltx_head_norm_rope");
+            enc.set_compute_pipeline_state(&pipe);
+            let (qb, qo) = buffer(qkv, lq);
+            enc.set_input_buffer(0, Some(&qb), qo);
+            enc.set_input_buffer(1, Some(&qn.0), qn.1);
+            enc.set_input_buffer(2, Some(&kn.0), kn.1);
+            enc.set_input_buffer(3, Some(&tables.0), tables.1);
+            enc.set_output_buffer(4, Some(out.buffer()), lo.start_offset() * out.dtype().size_in_bytes());
+            enc.set_bytes(5, &self.params);
+            let items = (self.params.rows * self.params.heads) as usize;
+            // Four SIMD groups a threadgroup, a (token, head) each.
+            enc.dispatch_thread_groups(MTLSize { width: items.div_ceil(4), height: 1, depth: 1 }, MTLSize { width: 32, height: 4, depth: 1 });
+            Ok(())
+        }
+    }
+
+    pub(super) fn swiglu(g: &Tensor, u: &Tensor) -> candle_core::Result<Tensor> {
+        g.apply_op2_no_bwd(u, &SwiGlu)
+    }
+
+    struct SwiGlu;
+
+    impl candle_core::CustomOp2 for SwiGlu {
+        fn name(&self) -> &'static str {
+            "ltx_swiglu"
+        }
+
+        fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+            candle_core::bail!("ltx_swiglu runs on Metal only")
+        }
+
+        fn metal_fwd(&self, g: &MetalStorage, lg: &Layout, u: &MetalStorage, lu: &Layout) -> candle_core::Result<(MetalStorage, Shape)> {
+            let (dt, dev) = (g.dtype(), g.device());
+            let n = lg.shape().elem_count();
+            let pipe = pipe(dev, &format!("swiglu_{}", type_name(dt).unwrap()))?;
+            let out = output(dev, n * dt.size_in_bytes())?;
+            let guard = dev.command_encoder()?;
+            let enc: &ComputeCommandEncoder = guard.as_ref();
+            enc.set_label("ltx_swiglu");
+            enc.set_compute_pipeline_state(&pipe);
+            let ((gb, go), (ub, uo)) = (buffer(g, lg), buffer(u, lu));
+            enc.set_input_buffer(0, Some(&gb), go);
+            enc.set_input_buffer(1, Some(&ub), uo);
+            enc.set_output_buffer(2, Some(&out), 0);
+            enc.set_bytes(3, &(n as u32));
+            let (groups, threads) = flat(n);
+            enc.dispatch_thread_groups(groups, threads);
+            Ok((MetalStorage::new(out, dev.clone(), n, dt), lg.shape().clone()))
+        }
     }
 
     struct NormSilu {
@@ -735,6 +1077,15 @@ mod metal {
         unreachable!()
     }
     pub(super) fn norm_silu(_: &Tensor, _: f32) -> candle_core::Result<Tensor> {
+        unreachable!()
+    }
+    pub(super) fn norm_affine(_: &Tensor, _: &Tensor, _: &Tensor, _: f32) -> candle_core::Result<Tensor> {
+        unreachable!()
+    }
+    pub(super) fn head_norm_rope(_: &Tensor, _: &Tensor, _: &Tensor, _: &super::HeadRope<'_>, _: f32, _: f32, _: &Tensor) -> candle_core::Result<()> {
+        unreachable!()
+    }
+    pub(super) fn swiglu(_: &Tensor, _: &Tensor) -> candle_core::Result<Tensor> {
         unreachable!()
     }
 }

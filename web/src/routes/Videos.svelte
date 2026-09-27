@@ -192,6 +192,18 @@
           Fixed seed
         </label>
         <input class="input input-sm w-36" type="number" min="0" bind:value={v.seed} placeholder="random" disabled={!v.fixSeed} />
+        {#if d?.decoder}
+          <select
+            class="select select-sm w-auto"
+            aria-label="Decoder"
+            title="How the latents become frames: the diffusion decoder is the reference's, finer; the convolutional one decodes in about half the time"
+            bind:value={v.decoder}
+          >
+            <option value={null}>Decoder: the default, {d.decoder}</option>
+            <option value="diffusion">Diffusion decoder</option>
+            <option value="conv">Convolutional decoder</option>
+          </select>
+        {/if}
       </div>
       {#if d?.guided}
         <details class="collapse-arrow bg-base-200 rounded-box collapse" open={v.guided}>
@@ -346,7 +358,7 @@
             <figcaption class="flex flex-col gap-1 p-3">
               <p class="line-clamp-2 text-sm" title={g.prompt}>{g.prompt}</p>
               <p class="text-xs opacity-60">
-                {g.size} · {lengthOf(g)} · seed {g.kvad.seed}{#if g.kvad.guided}{" · "}guided, {g.kvad.guided.steps} steps{/if}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
+                {g.size} · {lengthOf(g)} · seed {g.kvad.seed}{#if g.kvad.guided}{" · "}guided, {g.kvad.guided.steps} steps{/if}{#if g.kvad.decoder === "conv"}{" · "}conv decoder{/if}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
                     class="link"
                     href={g.kvad.picture_url}
                     target="_blank"

@@ -11,6 +11,8 @@
 //! - [`ltx_duration`]: how long a prompt's clip wants to be, from the same
 //!   contexts, when a request does not say;
 //! - [`ltx_upsample`]: the latent upsampler between the two stages;
+//! - [`ltx_diffvae`]: the diffusion video decoder, a neighbourhood-attention
+//!   transformer the conv decoder's alternative;
 //! - [`ltx_vae`]: the convolutional video decoder, and [`ltx_audio`]: the
 //!   audio decoder, vocoder and bandwidth extension.
 //!
@@ -29,6 +31,7 @@ pub mod conv3d;
 pub mod gemma;
 pub mod ltx;
 pub mod ltx_audio;
+pub mod ltx_diffvae;
 pub mod ltx_dit;
 pub mod ltx_duration;
 mod ltx_fused;

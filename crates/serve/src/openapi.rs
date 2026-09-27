@@ -457,6 +457,11 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       Its files come from a pull with `dev: true`; a guided request \
                       before that is a 400 that says so. `kvad.guided` says how a \
                       video was guided.\n\n\
+                      `decoder` picks how LTX-2.5's latents become frames: `diffusion`, \
+                      the default and the reference's, a transformer that finishes with \
+                      one step of diffusion from the seed's noise; or `conv`, the \
+                      convolutional decoder, lighter and about twice as fast to decode. \
+                      `kvad.decoder` says which made a video.\n\n\
                       `input_reference` is a picture to start from, 20 MiB at most: a \
                       file in the form, or in JSON `{ image_url }` with a `data:` URL. \
                       A URL elsewhere and a `file_id` are refused. It becomes the first \
@@ -468,7 +473,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       engine that makes it answers nothing else meanwhile.",
         query: &[], body: json_body("`{ prompt, model?, size?, seconds?, frames?, fps?, seed?, \
                                      audio?, input_reference?, steps?, guidance_scale?, \
-                                     negative_prompt? }`, or the same fields as \
+                                     negative_prompt?, decoder? }`, or the same fields as \
                                      `multipart/form-data`, with `input_reference` a file."),
         produces: JSON, events: &[],
     },

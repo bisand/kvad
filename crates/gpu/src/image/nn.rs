@@ -100,14 +100,23 @@ impl Linear {
         let dims = x.dims().to_vec();
         let rows: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((rows, dims[dims.len() - 1]))?;
+        let mut shape = dims;
+        *shape.last_mut().unwrap() = self.out;
+        // A dense matrix with a bias, on the M5's matrix units: the bias
+        // joins the f32 sums and the answer is rounded once, as PyTorch's
+        // `addmm` does, rather than rounded, added to and rounded again.
+        #[cfg(target_os = "macos")]
+        if let (Proj::Dense(w), Some(b)) = (&self.w, &self.b) {
+            if let Some(y) = crate::mpp::dense_bias(&x2, w, b)? {
+                return y.reshape(shape);
+            }
+        }
         let mut y = self.w.forward(&x2)?;
         if let Some(b) = &self.b {
             // A Q8_0 matrix answers in f32 even when asked in bf16, and the
             // bias is in the pipeline's dtype; add it in the answer's.
             y = y.broadcast_add(&b.to_dtype(y.dtype())?)?;
         }
-        let mut shape = dims;
-        *shape.last_mut().unwrap() = self.out;
         y.reshape(shape)
     }
 }
@@ -380,17 +389,79 @@ pub(crate) fn noise(seed: u64, shape: &[usize], device: &Device, dtype: DType) -
     Ok(Tensor::from_vec(out, shape, &Device::Cpu)?.to_dtype(dtype)?.to_device(device)?)
 }
 
+/// The block of [`noise`]'s field of `shape` that starts at `at` and is
+/// `size` long on each axis, row-major, in f32 on the host: the numbers
+/// `noise(seed, shape, …)` has there, without drawing the rest.
+///
+/// [`SplitMix`] is a counter, so its `j`th draw is a function of `seed + j·γ`
+/// alone, and element `k` of the field is the cosine or the sine of the
+/// Box–Muller pair from draws `k − k mod 2 + 1` and `+ 2`. A tile of a large
+/// canvas draws its own noise this way and still agrees with every other
+/// tile where they overlap. Rows are shared among the machine's cores.
+pub(crate) fn noise_block(seed: u64, shape: &[usize], at: &[usize], size: &[usize]) -> Vec<f32> {
+    let rank = shape.len();
+    let n: usize = size.iter().product();
+    let mut out = vec![0f32; n];
+    let row = *size.last().unwrap_or(&1);
+    if n == 0 || row == 0 {
+        return out;
+    }
+    // Where each of the block's rows starts in the field.
+    let first = |r: usize| -> usize {
+        let (mut rest, mut k, mut stride) = (r, 0, 1);
+        for a in (0..rank).rev() {
+            let i = if a == rank - 1 { at[a] } else {
+                let i = rest % size[a];
+                rest /= size[a];
+                at[a] + i
+            };
+            k += i * stride;
+            stride *= shape[a];
+        }
+        k
+    };
+    let draw = |j: u64| -> f64 { (SplitMix::mix(seed.wrapping_add(j.wrapping_mul(SplitMix::GAMMA))) >> 11) as f64 / (1u64 << 53) as f64 };
+    let value = |k: usize| -> f32 {
+        let p = (k / 2) as u64;
+        let u1 = draw(2 * p + 1).max(f64::MIN_POSITIVE);
+        let u2 = draw(2 * p + 2);
+        let r = (-2.0 * u1.ln()).sqrt();
+        let a = std::f64::consts::TAU * u2;
+        (if k % 2 == 0 { r * a.cos() } else { r * a.sin() }) as f32
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get()).min(n / row);
+    let rows_each = (n / row).div_ceil(threads.max(1));
+    std::thread::scope(|sc| {
+        for (c, part) in out.chunks_mut(rows_each * row).enumerate() {
+            sc.spawn(move || {
+                for (i, r) in part.chunks_mut(row).enumerate() {
+                    let k0 = first(c * rows_each + i);
+                    for (x, v) in r.iter_mut().enumerate() {
+                        *v = value(k0 + x);
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
 /// SplitMix64: a 64-bit counter pushed through a mixing function. Tiny,
 /// fast, and good enough that nothing about an image depends on its flaws.
 struct SplitMix(u64);
 
 impl SplitMix {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
+    const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    fn mix(mut z: u64) -> u64 {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(Self::GAMMA);
+        Self::mix(self.0)
     }
 
     /// Uniform in `[0, 1)`, from the top 53 bits.
@@ -408,6 +479,19 @@ mod tests {
         let worst = d.abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
         assert!(worst < tol, "differ by {worst}");
         worst
+    }
+
+    /// A block of the field is the same numbers as the whole field has
+    /// there: odd and even starts, a single element, the whole of it.
+    #[test]
+    fn noise_blocks_are_slices_of_the_field() {
+        let shape = [5, 3, 7, 9];
+        let whole = noise(11, &shape, &Device::Cpu, DType::F32).unwrap();
+        for (at, size) in [([1, 0, 2, 3], [3, 3, 4, 5]), ([0, 1, 6, 8], [1, 1, 1, 1]), ([0, 0, 0, 0], [5, 3, 7, 9]), ([4, 2, 1, 0], [1, 1, 5, 9])] {
+            let want = (0..4).fold(whole.clone(), |t, a| t.narrow(a, at[a], size[a]).unwrap());
+            let want = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(noise_block(11, &shape, &at, &size), want, "at {at:?}, {size:?}");
+        }
     }
 
     #[test]

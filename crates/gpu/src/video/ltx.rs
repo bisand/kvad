@@ -23,11 +23,11 @@
 use super::ltx_dit::{video_tokens, Dit, Shape};
 use super::ltx_sample::{dev_sigmas, guided, one_stage, refine, Guide, Latents, AUDIO_GUIDE, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
 use super::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
-use super::{ltx_audio, ltx_duration, ltx_upsample, ltx_vae};
+use super::{ltx_audio, ltx_diffvae, ltx_duration, ltx_upsample, ltx_vae};
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::Image;
-use kvad::video::{Defaults, Director, Filmed, Step, VideoRequest};
+use kvad::video::{Decoder, Defaults, Director, Filmed, Step, VideoRequest};
 use kvad::weights::{fetch_file, Watcher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -38,8 +38,12 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// [`kvad::hub::pipeline`] gives them.
 pub const PIPELINES: [&str; 1] = [kvad::video::LTX_PIPELINE];
 
-/// Every file a generation reads, in the order it reads them.
-const FILES: [&str; 5] = [TEXT_FILE, DIT_FILE, ltx_upsample::FILE, ltx_vae::FILE, ltx_audio::FILE];
+/// Every file a generation reads, in the order it reads them. Of the two
+/// video decoders' files a generation reads one, the diffusion decoder's by
+/// default; the convolutional one's encoder also starts a video from a
+/// picture, and is the same as the diffusion decoder's, byte for byte.
+const FILES: [&str; 6] = [TEXT_FILE, DIT_FILE, ltx_upsample::FILE, ltx_vae::FILE, ltx_audio::FILE, ltx_diffvae::FILE];
+
 
 /// The largest clip measured: 1536×1024 × 121 frames. Nothing bigger has
 /// been run, and on this hardware the price of finding out the hard way is
@@ -120,7 +124,7 @@ fn volume_for_this_machine() -> usize {
 /// LTX-2.5's distilled model in two stages, ready to make a clip.
 pub struct Ltx {
     repo: String,
-    paths: [PathBuf; 5],
+    paths: [PathBuf; 6],
     /// The duration head, which chooses a clip's length when a request
     /// does not say. Optional: 4 MB fetched at load, and without it a clip
     /// is [`Defaults::frames`] long, as before there was one.
@@ -150,7 +154,7 @@ impl Ltx {
             progress(&format!("finding {f}"));
             paths.push(fetch_file(repo, f, watch)?);
         }
-        let paths: [PathBuf; 5] = paths.try_into().map_err(|_| "five files")?;
+        let paths: [PathBuf; 6] = paths.try_into().map_err(|_| "six files")?;
         let head = match fetch_file(repo, ltx_duration::FILE, watch) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -178,6 +182,7 @@ impl Ltx {
             header_params(&paths[2], &[])?,
             header_params(&paths[3], &["encoder."])?,
             header_params(&paths[4], &["audio_vae.encoder"])?,
+            header_params(&paths[5], &["encoder."])?,
             head.as_deref().map(|h| header_params(h, &[])).transpose()?.unwrap_or(0),
         ]
         .iter()
@@ -196,6 +201,8 @@ impl Ltx {
             duration: head.is_some(),
             // The dev model, whose files `kvad pull … --dev` fetches.
             guided: Some(kvad::video::Guided { steps: super::ltx_sample::DEV_STEPS, max_steps: 60, guidance: VIDEO_GUIDE.cfg }),
+            // The reference's default: its README's video VAE.
+            decoder: Some(Decoder::Diffusion),
         };
         Ok(Ltx { repo: repo.to_string(), paths, head, quant, device, defaults, params })
     }
@@ -243,7 +250,7 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(first: Shape, full: Shape, picture: bool, guided: Option<usize>) -> Self {
+    fn new(first: Shape, full: Shape, picture: bool, guided: Option<usize>, decoder: Option<Decoder>) -> Self {
         let step = |tokens: usize| tokens as f64 * (1.386e-3 + 2.86e-8 * tokens as f64);
         let at_768 = (768 * 512 * 121) as f64;
         let volume = (full.width * full.height * full.frames) as f64;
@@ -262,7 +269,14 @@ impl Plan {
             stage_1: step(first.video_tokens()) * calls,
             upsample: 2.1 * full.video_tokens() as f64 / 6144.0,
             stage_2: step(full.video_tokens()),
-            decode: 13.0 * volume / at_768,
+            // The convolutional decoder, and the diffusion decoder, whose
+            // phase measured 8.6 s at 768×512 × 49 in the service and 92 s at
+            // 1536×1024 × 121 (six tiles), sound and conversion included:
+            // about 22 s for each 768×512 × 121 either way.
+            decode: match decoder {
+                Some(Decoder::Diffusion) => 22.0 * volume / at_768,
+                _ => 13.0 * volume / at_768,
+            },
         }
     }
 
@@ -285,7 +299,7 @@ impl Ltx {
         let (mut first, mut full) = shapes(r.frames)?;
         let (device, dtype, quant) = (&self.device, DType::BF16, Some(self.quant));
         let guided_steps = r.guided.as_ref().map(|g| g.steps);
-        let mut plan = Plan::new(first, full, req.image.is_some(), guided_steps);
+        let mut plan = Plan::new(first, full, req.image.is_some(), guided_steps, r.decoder);
         let total = std::cell::Cell::new(plan.total());
         let chosen = std::cell::Cell::new(None);
         let started = Instant::now();
@@ -356,7 +370,7 @@ impl Ltx {
             let most = ((ltx_duration::MAX_SECONDS * fps).round() as usize).min(r.frames);
             r.frames = ltx_duration::frames_for(seconds, fps, (ltx_duration::MIN_SECONDS * fps).round() as usize, most);
             (first, full) = shapes(r.frames)?;
-            plan = Plan::new(first, full, req.image.is_some(), guided_steps);
+            plan = Plan::new(first, full, req.image.is_some(), guided_steps, r.decoder);
             total.set(plan.total());
             chosen.set(Some(r.frames));
         }
@@ -437,8 +451,19 @@ impl Ltx {
 
         // 3. Pictures and sound.
         let t = Instant::now();
-        report("decode", 0, 1, plan.total() - plan.decode, None)?;
-        let frames = ltx_vae::VideoDecoder::load(&self.paths[3], device, dtype)?.decode(&latents.video)?.to_device(&Device::Cpu)?;
+        let before = plan.total() - plan.decode;
+        report("decode", 0, 1, before, None)?;
+        let frames = match r.decoder {
+            // Tile by tile, each a step of the phase; the sound and the
+            // frames' conversion after them are the rest of it.
+            Some(Decoder::Diffusion) => {
+                let dec = ltx_diffvae::DiffDecoder::load(&self.paths[5], device, dtype)?;
+                let mut tile = |i: usize, n: usize| report("decode", i, n, before + 0.85 * plan.decode * i as f64 / n as f64, None);
+                dec.decode(&latents.video, ltx_diffvae::noise_seed(r.seed), ltx_diffvae::BUDGET, &mut tile)?.0
+            }
+            _ => ltx_vae::VideoDecoder::load(&self.paths[3], device, dtype)?.decode(&latents.video)?.to_device(&Device::Cpu)?,
+        };
+        device.synchronize()?;
         let audio = match r.audio {
             true => Some(ltx_audio::AudioPath::load(&self.paths[4], device)?.decode(&latents.audio)?),
             false => None,
@@ -700,7 +725,7 @@ mod tests {
     fn a_guided_plan_charges_four_calls_a_step_and_a_second_load() {
         let full = Shape::new(768, 512, 121, 24.0).unwrap();
         let first = Shape::new(384, 256, 121, 24.0).unwrap();
-        let (p, g) = (Plan::new(first, full, false, None), Plan::new(first, full, false, Some(30)));
+        let (p, g) = (Plan::new(first, full, false, None, None), Plan::new(first, full, false, Some(30), None));
         assert!((g.stage_1 - 4.0 * p.stage_1).abs() < 1e-9 && g.steps_1 == 30 && p.steps_1 == 8);
         assert_eq!((p.load_2, g.load_2), (0.0, 3.5));
         // Measured: 283.8 s for stage 1's thirty steps at 768×512.
@@ -711,13 +736,24 @@ mod tests {
     fn the_plans_proportions_are_the_measured_ones() {
         let full = Shape::new(768, 512, 121, 24.0).unwrap();
         let first = Shape::new(384, 256, 121, 24.0).unwrap();
-        let p = Plan::new(first, full, false, None);
+        let p = Plan::new(first, full, false, None, None);
         // Stage 1's eight steps took 17.8 s and stage 2's three 28.8 s.
         assert!((p.stage_1 * 8.0 - 17.8).abs() < 0.5, "{}", p.stage_1 * 8.0);
         assert!((p.stage_2 * 3.0 - 28.8).abs() < 0.5, "{}", p.stage_2 * 3.0);
         assert!((p.total() - 75.0).abs() < 2.0, "{}", p.total());
         // A picture adds its encoding, and nothing else.
-        let q = Plan::new(first, full, true, None);
+        let q = Plan::new(first, full, true, None, None);
         assert!((q.total() - p.total() - q.picture).abs() < 1e-9 && q.picture > 0.0);
+    }
+
+    /// The diffusion decoder's phase, measured in the service: 8.6 s at
+    /// 768×512 × 49; and in `examples/ltx.rs`, 92 s at 1536×1024 × 121.
+    #[test]
+    fn the_diffusion_decoder_is_planned_as_measured() {
+        let at = |w: usize, h: usize, f: usize| Plan::new(Shape::new(w / 2, h / 2, f, 24.0).unwrap(), Shape::new(w, h, f, 24.0).unwrap(), false, None, Some(Decoder::Diffusion)).decode;
+        assert!((at(768, 512, 49) - 8.6).abs() / 8.6 < 0.15, "{}", at(768, 512, 49));
+        assert!((at(1536, 1024, 121) - 92.2).abs() / 92.2 < 0.15, "{}", at(1536, 1024, 121));
+        let conv = Plan::new(Shape::new(384, 256, 121, 24.0).unwrap(), Shape::new(768, 512, 121, 24.0).unwrap(), false, None, Some(Decoder::Conv));
+        assert!(conv.decode < at(768, 512, 121));
     }
 }

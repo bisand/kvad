@@ -166,13 +166,15 @@ pub struct Stored {
     pub steps: Option<u32>,
     pub guidance: Option<f64>,
     pub negative_prompt: Option<String>,
+    /// The decoder that made the frames, where the model has a choice.
+    pub decoder: Option<String>,
 }
 
 const COLUMNS: &str = "id, model, backend, prompt, width, height, frames, fps, seed, audio, status, progress, \
                        phase, error, bytes, encode_secs, denoise_secs, decode_secs, created_at, \
                        CAST(strftime('%s', created_at) AS INTEGER), \
                        CAST(strftime('%s', started_at) AS INTEGER), CAST(strftime('%s', completed_at) AS INTEGER), \
-                       picture, chosen, steps, guidance, negative_prompt";
+                       picture, chosen, steps, guidance, negative_prompt, decoder";
 
 fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
     Ok(Stored {
@@ -203,6 +205,7 @@ fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
         steps: r.get(24)?,
         guidance: r.get(25)?,
         negative_prompt: r.get(26)?,
+        decoder: r.get(27)?,
     })
 }
 
@@ -260,6 +263,9 @@ impl Stored {
                     "guidance": self.guidance,
                     "negative_prompt": self.negative_prompt,
                 })),
+                // Which decoder made the frames: `diffusion` or `conv`, or
+                // null for a model with one.
+                "decoder": self.decoder,
                 "fps": self.fps,
                 "seed": self.seed,
                 "audio": self.audio,
@@ -305,7 +311,8 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
     let id = db.with(|c| {
         c.execute(
             "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio, picture, chosen, \
-             steps, guidance, negative_prompt) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             steps, guidance, negative_prompt, decoder) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 owner,
                 model,
@@ -321,7 +328,8 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
                 r.chosen as i64,
                 r.guided.as_ref().map(|g| g.steps as i64),
                 r.guided.as_ref().map(|g| g.guidance as f64),
-                r.guided.as_ref().and_then(|g| g.negative_prompt.clone())
+                r.guided.as_ref().and_then(|g| g.negative_prompt.clone()),
+                r.decoder.map(|d| d.as_str())
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -809,6 +817,8 @@ impl Asked {
                 steps: f.number(&["steps", "num_inference_steps"])?,
                 guidance: f.number(&["guidance_scale", "guidance"])?,
                 negative_prompt: f.text(&["negative_prompt"]),
+                // A model with one decoder refuses this by name.
+                decoder: f.text(&["decoder"]).map(|d| kvad::video::Decoder::parse(&d)).transpose().map_err(|e| Fail::bad(e.to_string()))?,
             },
             seconds,
             picture,
@@ -1268,7 +1278,7 @@ mod tests {
     use kvad::video::{Audio, Resolved, Video};
 
     fn resolved(seed: u64) -> Resolved {
-        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, guided: None, fps: 24, seed, audio: true }
+        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, guided: None, decoder: None, fps: 24, seed, audio: true }
     }
 
     fn filmed(seed: u64) -> Filmed {
@@ -1358,6 +1368,15 @@ mod tests {
         let q = queue(&db, None, "m", "b", &Resolved { guided: Some(g), ..resolved(2) }, false).unwrap();
         assert_eq!(q.resource()["kvad"]["guided"]["negative_prompt"], Value::Null);
         assert_eq!(queue(&db, None, "m", "b", &resolved(3), false).unwrap().resource()["kvad"]["guided"], Value::Null);
+    }
+
+    /// A video says which decoder made it, where there was a choice.
+    #[test]
+    fn a_video_keeps_its_decoder() {
+        let db = Db::in_memory().unwrap();
+        let q = queue(&db, None, "m", "b", &Resolved { decoder: Some(kvad::video::Decoder::Conv), ..resolved(1) }, false).unwrap();
+        assert_eq!(q.resource()["kvad"]["decoder"], "conv");
+        assert_eq!(queue(&db, None, "m", "b", &resolved(2), false).unwrap().resource()["kvad"]["decoder"], Value::Null);
     }
 
     /// A video that started from a picture links to it, and its picture
@@ -1506,6 +1525,7 @@ mod tests {
         image: true,
         duration: false,
         guided: Some(kvad::video::Guided { steps: 30, max_steps: 60, guidance: 3.0 }),
+        decoder: Some(kvad::video::Decoder::Diffusion),
     };
 
     #[test]
@@ -1546,6 +1566,11 @@ mod tests {
         // The guidance knobs, in OpenAI-ish and diffusers' names.
         let a = Asked::read(&json_fields(json!({ "prompt": "a dog", "num_inference_steps": "20", "guidance_scale": 4.5, "negative_prompt": "blur" }))).unwrap();
         assert_eq!((a.request.steps, a.request.guidance, a.request.negative_prompt.as_deref()), (Some(20), Some(4.5), Some("blur")));
+        // The decoder, by name; left out, the model's own.
+        let a = Asked::read(&json_fields(json!({ "prompt": "a dog", "decoder": "conv" }))).unwrap();
+        assert_eq!(a.request.decoder, Some(kvad::video::Decoder::Conv));
+        assert_eq!(Asked::read(&json_fields(json!({ "prompt": "a dog" }))).unwrap().request.decoder, None);
+        assert!(refuse(json!({ "prompt": "a dog", "decoder": "vae" })).contains("diffusion or conv"));
     }
 
     /// The body OpenAI's Python SDK sends for `videos.create`, with a file

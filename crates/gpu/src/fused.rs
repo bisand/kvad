@@ -468,6 +468,50 @@ pub(crate) mod metal {
         pub(crate) static RAN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
+    /// A buffer of exactly `bytes`, outside candle's pool: freed when the last
+    /// tensor on it goes, and not before the GPU is done with it, since
+    /// candle's command buffers retain what they are given. Under test it
+    /// starts as NaN, as [`output`]'s do.
+    ///
+    /// candle's pool rounds every buffer up to a power of two and keeps it
+    /// until a synchronise: a 1.52 GB activation of the DiffVAE's stage 5
+    /// takes 2.15 GB there, and its q, k and v together 8.6 GB for 4.56.
+    pub(crate) fn unpooled(dev: &candle_core::MetalDevice, bytes: usize) -> candle_core::Result<std::sync::Arc<Buffer>> {
+        const OPTIONS: objc2_metal::MTLResourceOptions = objc2_metal::MTLResourceOptions(
+            objc2_metal::MTLResourceOptions::StorageModeShared.0 | objc2_metal::MTLResourceOptions::HazardTrackingModeUntracked.0,
+        );
+        let out = std::sync::Arc::new(dev.device().new_buffer(bytes.max(1), OPTIONS).map_err(candle_core::Error::wrap)?);
+        #[cfg(test)]
+        {
+            let mut blit = dev.blit_command_encoder()?;
+            blit.fill_buffer(&out, (0, bytes), 0xff);
+        }
+        Ok(out)
+    }
+
+    /// An uninitialised tensor of `shape` in [`unpooled`] memory.
+    pub(crate) fn exact(shape: &[usize], dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+        Tensor::zeros(1, dtype, device)?.apply_op1_no_bwd(&Exact(shape.to_vec()))
+    }
+
+    struct Exact(Vec<usize>);
+
+    impl candle_core::CustomOp1 for Exact {
+        fn name(&self) -> &'static str {
+            "exact"
+        }
+
+        fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+            candle_core::bail!("exact is for Metal")
+        }
+
+        fn metal_fwd(&self, s: &MetalStorage, _: &Layout) -> candle_core::Result<(MetalStorage, Shape)> {
+            let n: usize = self.0.iter().product();
+            let buf = unpooled(s.device(), n * s.dtype().size_in_bytes())?;
+            Ok((MetalStorage::new(buf, s.device().clone(), n, s.dtype()), Shape::from(self.0.clone())))
+        }
+    }
+
     /// A new output buffer. Under test it starts as NaN, so a kernel that left
     /// part of it unwritten cannot pass by agreeing with the last tenant.
     pub(crate) fn output(dev: &candle_core::MetalDevice, bytes: usize) -> candle_core::Result<std::sync::Arc<Buffer>> {

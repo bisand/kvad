@@ -282,7 +282,7 @@ fn unfold(x: &Tensor, [p1, p2, p3]: [usize; 3], c: usize) -> candle_core::Result
 /// and `r` the offset in the column — `b (c p r q) f h w -> b c (f p) (h q)
 /// (w r)` in the reference. Width is the middle factor, not height; the
 /// natural guess is the other way round.
-fn unpatchify(x: &Tensor, p: usize) -> candle_core::Result<Tensor> {
+pub(crate) fn unpatchify(x: &Tensor, p: usize) -> candle_core::Result<Tensor> {
     let (t, c, h, w) = x.dims4()?;
     let c = c / (p * p);
     x.reshape(&[t, c, p, p, h, w][..])?
@@ -457,7 +457,7 @@ impl ImageEncoder {
 /// The channel index is `c·p² + r·p + q`, `q` the offset in the row and `r`
 /// in the column: `b c (f p) (h q) (w r) -> b (c p r q) f h w` in the
 /// reference, with one frame a patch.
-fn patchify(x: &Tensor, p: usize) -> candle_core::Result<Tensor> {
+pub(crate) fn patchify(x: &Tensor, p: usize) -> candle_core::Result<Tensor> {
     let (t, c, h, w) = x.dims4()?;
     x.reshape(&[t, c, h / p, p, w / p, p][..])?
         // [t, c, h, q, w, r] → [t, c, r, q, h, w]

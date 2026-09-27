@@ -107,6 +107,42 @@ pub struct VideoRequest {
     pub steps: Option<usize>,
     pub guidance: Option<f32>,
     pub negative_prompt: Option<String>,
+    /// Which decoder makes the frames, where the model has a choice
+    /// ([`Defaults::decoder`]); its own default when `None`.
+    pub decoder: Option<Decoder>,
+}
+
+/// How a latent video becomes frames, where a model has more than one way.
+///
+/// LTX-2.5 ships two decoders for one latent space: a diffusion decoder
+/// (`NADiffusionDecoder`, the "DiffVAE"), the reference's default, a
+/// neighbourhood-attention transformer that finishes with one step of
+/// diffusion from seeded noise; and a convolutional one, lighter and faster.
+/// The two read the same latents and their encoders are the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Decoder {
+    Diffusion,
+    Conv,
+}
+
+impl Decoder {
+    /// Its name in a request and in a stored video.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Decoder::Diffusion => "diffusion",
+            Decoder::Conv => "conv",
+        }
+    }
+
+    /// From a request's name for it, refusing any other by listing both.
+    pub fn parse(name: &str) -> Res<Decoder> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "diffusion" | "diffvae" => Ok(Decoder::Diffusion),
+            "conv" | "convolutional" => Ok(Decoder::Conv),
+            other => Err(format!("decoder must be diffusion or conv, not {other:?}").into()),
+        }
+    }
 }
 
 /// A model's own answers for what a [`VideoRequest`] leaves out, and its
@@ -144,6 +180,10 @@ pub struct Defaults {
     /// dev model. Whether its files are here is asked when a request wants
     /// it, since they can be pulled after the model is loaded.
     pub guided: Option<Guided>,
+    /// The decoder a request gets when it names none, where the model has
+    /// a choice of [`Decoder`]s; `None` where it has one way only, and a
+    /// request that names one is refused.
+    pub decoder: Option<Decoder>,
 }
 
 /// A guided pipeline's defaults and limits.
@@ -179,6 +219,8 @@ pub struct Resolved {
     pub chosen: bool,
     /// The guided pipeline's settings, when the request asked for guidance.
     pub guided: Option<GuidedRun>,
+    /// The decoder, where the model has a choice.
+    pub decoder: Option<Decoder>,
     pub fps: u32,
     pub seed: u64,
     pub audio: bool,
@@ -284,6 +326,13 @@ impl VideoRequest {
                 Some(GuidedRun { steps, guidance, negative_prompt })
             }
         };
+        let decoder = match (self.decoder, d.decoder) {
+            (None, default) => default,
+            (Some(asked), Some(_)) => Some(asked),
+            (Some(asked), None) => {
+                return Err(format!("this model has one decoder; leave out decoder ({})", asked.as_str()).into())
+            }
+        };
         if let Some(p) = &self.image {
             if !d.image {
                 return Err("this model does not start a video from a picture".into());
@@ -308,6 +357,7 @@ impl VideoRequest {
             frames,
             chosen,
             guided,
+            decoder,
             fps,
             seed,
             audio: self.audio.unwrap_or(true),
@@ -1572,7 +1622,21 @@ mod tests {
     }
 
     fn ltx() -> Defaults {
-        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false, guided: None }
+        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false, guided: None, decoder: None }
+    }
+
+    #[test]
+    fn a_decoder_is_the_model_s_own_unless_asked_and_only_where_it_has_a_choice() {
+        let d = Defaults { decoder: Some(Decoder::Diffusion), ..ltx() };
+        assert_eq!(VideoRequest::new("a dog").resolved(&d).unwrap().decoder, Some(Decoder::Diffusion));
+        let r = VideoRequest { decoder: Some(Decoder::Conv), ..VideoRequest::new("a dog") }.resolved(&d).unwrap();
+        assert_eq!(r.decoder, Some(Decoder::Conv));
+        assert_eq!(VideoRequest::new("a dog").resolved(&ltx()).unwrap().decoder, None);
+        let e = VideoRequest { decoder: Some(Decoder::Conv), ..VideoRequest::new("a dog") }.resolved(&ltx()).unwrap_err();
+        assert!(e.to_string().contains("one decoder"), "{e}");
+        assert_eq!(Decoder::parse(" DiffVAE ").unwrap(), Decoder::Diffusion);
+        assert_eq!(Decoder::parse("conv").unwrap(), Decoder::Conv);
+        assert!(Decoder::parse("vae").unwrap_err().to_string().contains("diffusion or conv"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //!     cargo run --release -p kvad-gpu --example ltx -- --prompt "…" \
 //!         [--width 768] [--height 512] [--frames N] [--fps 24] [--seed 0] \
 //!         [--stages 2] [--quant q8|bf16] [--out ltx.mp4] [--latents FILE] \
-//!         [--image PICTURE]
+//!         [--image PICTURE] [--decoder diffusion|conv]
 //!
 //! In phases, so that no two large models are resident at once:
 //!
@@ -15,6 +15,9 @@
 //!    exact, the reference's own bf16 included); the DiT refines both
 //!    latents in three steps at the full size; and it is dropped;
 //! 3. the video decoder and the audio path decode, and the MP4 is written.
+//!    The video decoder is the diffusion decoder by default, as the
+//!    pipeline's is, its last step from the noise of the seed; `--decoder
+//!    conv` is the convolutional one.
 //!
 //! Without `--frames`, the duration head chooses the length from the prompt,
 //! as the reference's CLI does: its prediction in seconds, clamped to 1 s
@@ -46,7 +49,7 @@ use kvad::weights::{fetch_file, Watcher};
 use kvad_gpu::video::ltx_dit::{Dit, Shape};
 use kvad_gpu::video::ltx_sample::{dev_sigmas, guided, one_stage, refine, Latents, AUDIO_GUIDE, DEV_STEPS, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
 use kvad_gpu::video::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
-use kvad_gpu::video::{ltx_audio, ltx_upsample, ltx_vae, LTX_REPO};
+use kvad_gpu::video::{ltx_audio, ltx_diffvae, ltx_upsample, ltx_vae, LTX_REPO};
 use std::time::Instant;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -61,6 +64,7 @@ fn main() -> Res<()> {
     // At the most the head may choose until it has, when it is to choose.
     let mut shape = Shape::new(num("--width", 768)?, num("--height", 512)?, frames.unwrap_or(121), fps)?;
     let seed = num("--seed", 0)? as u64;
+    let decoder = kvad::video::Decoder::parse(value("--decoder").as_deref().unwrap_or("diffusion"))?;
     let stages = num("--stages", 2)?;
     // Stage 1's size: half, for two stages.
     let mut first = match stages {
@@ -244,8 +248,14 @@ fn main() -> Res<()> {
 
     // 3. Pictures and sound.
     let t = Instant::now();
-    let frames = ltx_vae::VideoDecoder::load(&fetch(ltx_vae::FILE)?, &device, dtype)?.decode(&latents.video)?.to_device(&Device::Cpu)?;
-    eprintln!("3. video decoded to {:?} in {:.1} s", frames.dims(), t.elapsed().as_secs_f64());
+    let frames = match decoder {
+        kvad::video::Decoder::Diffusion => {
+            let dec = ltx_diffvae::DiffDecoder::load(&fetch(ltx_diffvae::FILE)?, &device, dtype)?;
+            dec.decode(&latents.video, ltx_diffvae::noise_seed(seed), ltx_diffvae::BUDGET, &mut |_, _| Ok(()))?.0
+        }
+        kvad::video::Decoder::Conv => ltx_vae::VideoDecoder::load(&fetch(ltx_vae::FILE)?, &device, dtype)?.decode(&latents.video)?.to_device(&Device::Cpu)?,
+    };
+    eprintln!("3. video decoded to {:?} by the {} decoder in {:.1} s", frames.dims(), decoder.as_str(), t.elapsed().as_secs_f64());
     let t = Instant::now();
     let sound = ltx_audio::AudioPath::load(&fetch(ltx_audio::FILE)?, &device)?.decode(&latents.audio)?;
     eprintln!("   audio decoded to {:.2} s at {} Hz in {:.1} s", sound.samples.len() as f64 / (sound.rate as f64 * sound.channels as f64), sound.rate, t.elapsed().as_secs_f64());

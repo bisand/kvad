@@ -238,6 +238,10 @@ pub(crate) fn norm_affine(x: &Tensor, a: &Tensor, b: &Tensor, eps: f32) -> candl
 }
 
 /// Where [`head_norm_rope`]'s tokens are and how they turn.
+///
+/// Built on every platform, but only the Metal kernel reads the grid's shape
+/// and the tables' lengths, so off macOS they are never read.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct HeadRope<'a> {
     /// The grid's rows and columns, and the chunk's first token in it.
     pub h: usize,
@@ -1064,10 +1068,10 @@ mod metal {
 #[cfg(not(target_os = "macos"))]
 mod metal {
     use super::*;
-    pub(super) fn modulate(_: &Tensor, _: Option<(&Tensor, &Tensor)>, _: &Tensor, _: &Tensor, _: f32) -> candle_core::Result<Tensor> {
+    pub(super) fn modulate(_: &Tensor, _: Option<(&Tensor, &Tensor)>, _: &Tensor, _: &Tensor, _: (usize, usize), _: f32) -> candle_core::Result<Tensor> {
         unreachable!()
     }
-    pub(super) fn gated_add(_: &Tensor, _: &Tensor, _: &Tensor) -> candle_core::Result<Tensor> {
+    pub(super) fn gated_add(_: &Tensor, _: &Tensor, _: &Tensor, _: (usize, usize)) -> candle_core::Result<Tensor> {
         unreachable!()
     }
     pub(super) fn norm_rope(_: &Tensor, _: &Tensor, _: Option<(&Tensor, &Tensor)>, _: usize, _: f32, _: DType) -> candle_core::Result<Tensor> {

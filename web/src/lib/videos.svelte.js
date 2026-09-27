@@ -55,6 +55,9 @@ class Videos {
   /** Which decoder makes the frames, `diffusion` or `conv`; null is the
    *  model's own. */
   decoder = $state(null);
+  /** Which unguided pipeline, `fast` or `dfr`; null is the model's own
+   *  choice, which is DFR above 30 fps. */
+  pipeline = $state(null);
   /** The picture to start from, a `File`, and a link to show it by. */
   picture = $state(null);
   pictureUrl = $state(null);
@@ -87,12 +90,41 @@ class Videos {
     return this.chosen?.resident?.video ?? null;
   }
 
+  /** How many times DFR doubles the frame rate for the form's fps: halvings
+   *  to 30 or less, where the model has DFR and the form did not ask for the
+   *  fast pipeline; 0 otherwise, or where the rate does not halve. */
+  rounds(d = this.defaults) {
+    if (!d?.dfr || this.pipeline === "fast" || this.guided) return 0;
+    let f = Number(this.fps || d.fps);
+    let r = 0;
+    while (f > 30 && f % 2 === 0) {
+      f /= 2;
+      r += 1;
+    }
+    return f > 30 ? 0 : r;
+  }
+
+  /** Whether DFR makes the video: asked for, or above 30 fps. */
+  get dfr() {
+    const d = this.defaults;
+    return !!d?.dfr && !this.guided && (this.pipeline === "dfr" || this.rounds(d) > 0);
+  }
+
   /** The frames a length in seconds makes: the nearest the model can, which
-   *  for LTX is 8k + 1. */
+   *  for LTX is 8k + 1, and above 30 fps on DFR's doubled grid. */
   frames(d = this.defaults) {
     if (!d || !this.seconds) return null;
     const fps = Number(this.fps || d.fps);
-    return Math.max(1, Math.round((Number(this.seconds) * fps) / d.frame_step)) * d.frame_step + 1;
+    const step = d.frame_step << this.rounds(d);
+    return Math.max(1, Math.round((Number(this.seconds) * fps) / step)) * step + 1;
+  }
+
+  /** The fast pipeline's frames that `b` first-stage frames cost: their
+   *  own, or on DFR what its DiT holds at its most (`dfrFrames`). */
+  cost(b, d = this.defaults) {
+    if (!this.dfr) return b;
+    const l = dfrFrames(b, this.rounds(d));
+    return l == null ? Infinity : 8 * (l - 1) + 1;
   }
 
   /** The longest clip the model makes here at the size in the form, in
@@ -102,8 +134,15 @@ class Videos {
     if (!d) return null;
     const w = Number(this.width || d.width);
     const h = Number(this.height || d.height);
-    const most = Math.min(d.max_frames, Math.floor(d.max_volume / (w * h)));
-    return Math.max(1, Math.floor((most - 1) / d.frame_step) * d.frame_step + 1);
+    const top = Math.floor((d.max_frames - 1) / d.frame_step) * d.frame_step + 1;
+    let base = 1;
+    for (let b = top; b > 1; b -= d.frame_step) {
+      if (w * h * this.cost(b, d) <= d.max_volume) {
+        base = b;
+        break;
+      }
+    }
+    return (base - 1) * (1 << this.rounds(d)) + 1;
   }
 
   /** Whether what is in the form is more than the model makes here. A
@@ -114,8 +153,10 @@ class Videos {
     const w = Number(this.width || d.width);
     const h = Number(this.height || d.height);
     const fps = Number(this.fps || d.fps);
-    const f = this.frames() ?? (d.duration ? fps : d.frames);
-    return w * h * f > d.max_volume || f > d.max_frames;
+    const scale = 1 << this.rounds(d);
+    const f = this.frames() ?? (d.duration ? fps : (d.frames - 1) * scale + 1);
+    const base = Math.floor((f - 1) / scale) + 1;
+    return w * h * this.cost(base, d) > d.max_volume || base > d.max_frames;
   }
 
   /** Start from `file`, or from nothing. */
@@ -227,6 +268,7 @@ class Videos {
       if (this.guidance) body.guidance_scale = Number(this.guidance);
       if (this.negative.trim()) body.negative_prompt = this.negative.trim();
       if (this.decoder) body.decoder = this.decoder;
+      if (this.pipeline && !this.guided) body.pipeline = this.pipeline;
       let request;
       if (this.picture) {
         // A form, whose content type the browser writes with its boundary.
@@ -267,6 +309,8 @@ class Videos {
     this.guidance = k.guided?.guidance ?? null;
     this.negative = k.guided?.negative_prompt ?? "";
     this.decoder = k.decoder ?? null;
+    // DFR above 30 fps is the model's own choice; below, it was asked.
+    this.pipeline = k.pipeline === "dfr" && k.fps <= 30 ? "dfr" : null;
     const resident = models.videoResidents.find((r) => r.repo === v.model);
     this.model = resident?.id ?? v.model;
     if (!k.picture_url) return this.choosePicture(null);
@@ -290,3 +334,60 @@ class Videos {
 }
 
 export const videos = new Videos();
+
+/** DFR's canvas for `frames` (8k + 1): padded to whole segments of 24 or 32
+ *  pixel frames, whichever pads less and the longer on a tie, a keyframe at
+ *  the end of each. `kvad::video::dfr_canvas`. */
+function dfrCanvas(frames) {
+  if (frames < 9 || frames % 8 !== 1) return null;
+  const content = frames - 1;
+  const pad = (s) => (s - (content % s)) % s;
+  const segment = pad(24) < pad(32) ? 24 : 32;
+  const padded = content + pad(segment);
+  const keyframes = [];
+  for (let p = segment; p <= padded; p += segment) keyframes.push(p);
+  return { frames: padded + 1, keyframes };
+}
+
+/** A temporal round's tiles, `kvad::video::dfr_tiles`. */
+function dfrTiles(seams, frames, count) {
+  const bounds = [0, ...seams.map((p) => p / 8)];
+  const lead = bounds.length > 1 ? bounds[1] - bounds[0] + 1 : 0;
+  const segments = bounds.length - 1;
+  const n = Math.min(count, segments);
+  const base = Math.floor(segments / n);
+  const leftover = segments % n;
+  const out = [];
+  let cursor = 0;
+  for (let t = 0; t < n; t++) {
+    const resume = bounds[cursor] + 1;
+    const start = t === 0 ? 0 : Math.max(0, resume - lead);
+    cursor += base + (t < leftover ? 1 : 0);
+    const end = bounds[cursor] + 1;
+    const [ps, pe] = [start * 8, (end - 1) * 8];
+    const anchors = seams.filter((p) => ps <= p && p <= pe);
+    const marks = [ps, ...seams.filter((p) => ps < p && p <= pe)];
+    const slots = marks.slice(1).map((p, i) => Math.floor((marks[i] + p) / 2));
+    out.push({ start, end, anchors, slots });
+  }
+  return out;
+}
+
+/** The most latent frames of tokens DFR's DiT holds in one call, for
+ *  `frames` first-stage frames doubled `rounds` times; null where there is
+ *  no canvas. `kvad::video::dfr_frames`. */
+function dfrFrames(frames, rounds) {
+  const c = dfrCanvas(frames);
+  if (!c) return null;
+  const latent = (f) => Math.floor((f - 1) / 8) + 1;
+  let most = latent(c.frames) + c.keyframes.length + Math.ceil(latent(c.frames) / 4);
+  let [seams, f] = [c.keyframes, c.frames];
+  for (let r = 1; r <= rounds; r++) {
+    f = 2 * (f - 1) + 1;
+    const doubled = seams.map((p) => 2 * p);
+    const tiles = dfrTiles(doubled, f, 1 << r);
+    for (const t of tiles) most = Math.max(most, t.end - t.start + t.anchors.length + t.slots.length);
+    seams = [...new Set([...doubled, ...tiles.flatMap((t) => t.slots)])].sort((a, b) => a - b);
+  }
+  return most;
+}

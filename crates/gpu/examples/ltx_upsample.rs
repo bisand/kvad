@@ -1,6 +1,9 @@
-//! LTX-2.5's spatial latent upsampler, checked against the reference's own.
+//! LTX-2.5's latent upsamplers, checked against the reference's own.
 //!
-//!     cargo run --release -p kvad-gpu --example ltx_upsample -- --fixtures DIR [--cpu]
+//!     cargo run --release -p kvad-gpu --example ltx_upsample -- --fixtures DIR [--cpu] [--temporal]
+//!
+//! `--temporal` checks the temporal upsampler instead of the spatial one,
+//! against `temporal_*` in `DIR`: a latent with twice the frames, less one.
 //!
 //! `DIR` is what `scripts/ltx-fixtures.py --upsampler … --vae … --latent …`
 //! wrote: a stage-1 latent, and what the reference's `upsample_video` made of
@@ -37,7 +40,11 @@ fn main() -> Res<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| argv.iter().any(|a| a == f);
     let value = |f: &str| argv.iter().position(|a| a == f).and_then(|i| argv.get(i + 1)).cloned();
-    let path = fetch_file(LTX_REPO, ltx_upsample::FILE, &Watcher::none())?;
+    let (file, name) = match flag("--temporal") {
+        true => (ltx_upsample::TEMPORAL_FILE, "temporal"),
+        false => (ltx_upsample::FILE, "upsample"),
+    };
+    let path = fetch_file(LTX_REPO, file, &Watcher::none())?;
     let vae = fetch_file(LTX_REPO, ltx_vae::FILE, &Watcher::none())?;
     if flag("--where") {
         println!("{}\n{}", path.display(), vae.display());
@@ -59,7 +66,7 @@ fn main() -> Res<()> {
         (false, true) => (Device::new_metal(0)?, DType::F32),
         _ => (Device::new_metal(0)?, DType::BF16),
     };
-    let mut f32s = candle_core::safetensors::load(format!("{dir}/upsample_f32.safetensors"), &Device::Cpu)?;
+    let mut f32s = candle_core::safetensors::load(format!("{dir}/{name}_f32.safetensors"), &Device::Cpu)?;
     let latent = f32s.remove("latent").ok_or("no `latent`")?;
     let want = f32s.remove("upsampled").ok_or("no `upsampled`")?;
 
@@ -76,7 +83,7 @@ fn main() -> Res<()> {
         }
         eprintln!("   in {took:.2} s{}", if run == 0 { " (first run)" } else { "" });
     }
-    if let Ok(mut r) = candle_core::safetensors::load(format!("{dir}/upsample_bf16.safetensors"), &Device::Cpu) {
+    if let Ok(mut r) = candle_core::safetensors::load(format!("{dir}/{name}_bf16.safetensors"), &Device::Cpu) {
         let theirs = r.remove("upsampled").ok_or("no `upsampled`")?;
         eprintln!("the reference's own bf16 on MPS: {:.1} dB against its f32", db(&theirs, &want)?);
     }

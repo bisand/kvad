@@ -34,7 +34,7 @@
 
 use candle_core::{DType, Device, Tensor};
 use kvad::weights::{fetch_file, Watcher};
-use kvad_gpu::video::ltx_dit::{audio_tokens, video_tokens, Dit, Perturb, Shape};
+use kvad_gpu::video::ltx_dit::{audio_tokens, video_tokens, Dit, Perturb, Shape, Tokens};
 use kvad_gpu::video::ltx_text::{Contexts, DIT_FILE};
 use kvad_gpu::video::LTX_REPO;
 use std::collections::HashMap;
@@ -151,7 +151,7 @@ fn main() -> Res<()> {
             }
             return Ok(());
         }
-        let (vv, va) = dit.forward_watched(&v, &a, (sigma, sigma), held, &ctx, &grid, &p, &mut |i, vx, ax| {
+        let (vv, va) = dit.forward_watched(&v, &a, (sigma, sigma), Tokens::Held(held), &ctx, &grid, &p, &mut |i, vx, ax| {
             out.push((i, vx.clone(), ax.clone()));
             Ok(())
         })?;

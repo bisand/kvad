@@ -10,9 +10,13 @@
 //!   size, then three at full size;
 //! - [`ltx_duration`]: how long a prompt's clip wants to be, from the same
 //!   contexts, when a request does not say;
-//! - [`ltx_upsample`]: the latent upsampler between the two stages;
+//! - [`ltx_upsample`]: the latent upsamplers, spatial between the two
+//!   stages, and temporal for DFR's rounds;
+//! - [`ltx_cond`]: the tokens DFR appends to a video, its keyframes and
+//!   reference latent, each at its own σ and place, and [`ltx_dfr`], DFR's
+//!   canvas, stages and temporal rounds, which make them;
 //! - [`ltx_diffvae`]: the diffusion video decoder, a neighbourhood-attention
-//!   transformer the conv decoder's alternative;
+//!   transformer, the default, and the conv decoder's alternative;
 //! - [`ltx_vae`]: the convolutional video decoder, and [`ltx_audio`]: the
 //!   audio decoder, vocoder and bandwidth extension.
 //!
@@ -31,6 +35,8 @@ pub mod conv3d;
 pub mod gemma;
 pub mod ltx;
 pub mod ltx_audio;
+pub mod ltx_cond;
+pub mod ltx_dfr;
 pub mod ltx_diffvae;
 pub mod ltx_dit;
 pub mod ltx_duration;

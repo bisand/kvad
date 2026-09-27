@@ -59,10 +59,16 @@ pub struct Ancestral {
 
 impl Ancestral {
     pub fn new(sigma: f32, next: f32) -> Self {
-        let down = next * (1.0 + (next / sigma - 1.0) * ETA);
+        Self::with_eta(sigma, next, ETA)
+    }
+
+    /// At `eta`, which DFR's temporal rounds set to 0.5. The squares are
+    /// grouped as the reference's `σ_down² · α_next² / α_down²` groups them.
+    pub fn with_eta(sigma: f32, next: f32, eta: f32) -> Self {
+        let down = next * (1.0 + (next / sigma - 1.0) * eta);
         let r = down / sigma;
         let (alpha_next, alpha_down) = (1.0 - next, 1.0 - down);
-        let c = (next * next - down * down * alpha_next * alpha_next / (alpha_down * alpha_down)).max(0.0).sqrt();
+        let c = (next * next - (down * down) * (alpha_next * alpha_next) / (alpha_down * alpha_down)).max(0.0).sqrt();
         Ancestral { a: alpha_next / alpha_down, r, c }
     }
 }
@@ -142,7 +148,7 @@ pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, still: Optio
 /// One Euler step from σ to σₙ, given the prediction `x0`: the velocity
 /// `(x − x₀)/σ`, rounded to the latent's dtype, then `x + v·(σₙ − σ)` in f32,
 /// rounded again, as the reference does both.
-fn euler(x: &Tensor, x0: &Tensor, sigma: f32, next: f32) -> candle_core::Result<Tensor> {
+pub(crate) fn euler(x: &Tensor, x0: &Tensor, sigma: f32, next: f32) -> candle_core::Result<Tensor> {
     let keep = x.dtype();
     let f = |t: &Tensor| t.to_dtype(DType::F32);
     let v = ((f(x)? - f(x0)?)? / sigma as f64)?.to_dtype(keep)?;

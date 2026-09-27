@@ -168,13 +168,16 @@ pub struct Stored {
     pub negative_prompt: Option<String>,
     /// The decoder that made the frames, where the model has a choice.
     pub decoder: Option<String>,
+    /// The pipeline that made it, `fast` or `dfr`, where the model has a
+    /// choice and the request was not guided.
+    pub pipeline: Option<String>,
 }
 
 const COLUMNS: &str = "id, model, backend, prompt, width, height, frames, fps, seed, audio, status, progress, \
                        phase, error, bytes, encode_secs, denoise_secs, decode_secs, created_at, \
                        CAST(strftime('%s', created_at) AS INTEGER), \
                        CAST(strftime('%s', started_at) AS INTEGER), CAST(strftime('%s', completed_at) AS INTEGER), \
-                       picture, chosen, steps, guidance, negative_prompt, decoder";
+                       picture, chosen, steps, guidance, negative_prompt, decoder, pipeline";
 
 fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
     Ok(Stored {
@@ -206,6 +209,7 @@ fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
         guidance: r.get(25)?,
         negative_prompt: r.get(26)?,
         decoder: r.get(27)?,
+        pipeline: r.get(28)?,
     })
 }
 
@@ -266,6 +270,9 @@ impl Stored {
                 // Which decoder made the frames: `diffusion` or `conv`, or
                 // null for a model with one.
                 "decoder": self.decoder,
+                // Which pipeline made it: `fast`, or `dfr`, which also makes
+                // more than 30 fps; null for a guided video, or a model with one.
+                "pipeline": self.pipeline,
                 "fps": self.fps,
                 "seed": self.seed,
                 "audio": self.audio,
@@ -311,8 +318,8 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
     let id = db.with(|c| {
         c.execute(
             "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio, picture, chosen, \
-             steps, guidance, negative_prompt, decoder) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             steps, guidance, negative_prompt, decoder, pipeline) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 owner,
                 model,
@@ -329,7 +336,8 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
                 r.guided.as_ref().map(|g| g.steps as i64),
                 r.guided.as_ref().map(|g| g.guidance as f64),
                 r.guided.as_ref().and_then(|g| g.negative_prompt.clone()),
-                r.decoder.map(|d| d.as_str())
+                r.decoder.map(|d| d.as_str()),
+                r.pipeline.map(|p| p.as_str())
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -819,6 +827,9 @@ impl Asked {
                 negative_prompt: f.text(&["negative_prompt"]),
                 // A model with one decoder refuses this by name.
                 decoder: f.text(&["decoder"]).map(|d| kvad::video::Decoder::parse(&d)).transpose().map_err(|e| Fail::bad(e.to_string()))?,
+                // Above 30 fps a model with DFR runs it without being asked;
+                // one without refuses this by name.
+                pipeline: f.text(&["pipeline"]).map(|p| kvad::video::Pipeline::parse(&p)).transpose().map_err(|e| Fail::bad(e.to_string()))?,
             },
             seconds,
             picture,
@@ -830,9 +841,16 @@ impl Asked {
     fn request(&self, d: &kvad::video::Defaults) -> VideoRequest {
         let mut request = self.request.clone();
         if let Some(s) = self.seconds {
-            let fps = request.fps.unwrap_or(d.fps) as f64;
-            let steps = (s * fps / d.frame_step as f64).round().max(1.0) as usize;
-            request.frames = Some(steps * d.frame_step + 1);
+            let fps = request.fps.unwrap_or(d.fps);
+            // Above 30 fps DFR doubles a clip's frames once or twice, and
+            // its grid with them.
+            let rounds = match (d.dfr, request.pipeline) {
+                (true, None | Some(kvad::video::Pipeline::Dfr)) => kvad::video::rounds_for(fps).unwrap_or(0),
+                _ => 0,
+            };
+            let step = d.frame_step << rounds;
+            let steps = (s * fps as f64 / step as f64).round().max(1.0) as usize;
+            request.frames = Some(steps * step + 1);
         }
         request
     }
@@ -1278,7 +1296,7 @@ mod tests {
     use kvad::video::{Audio, Resolved, Video};
 
     fn resolved(seed: u64) -> Resolved {
-        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, guided: None, decoder: None, fps: 24, seed, audio: true }
+        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, guided: None, decoder: None, pipeline: None, rounds: 0, fps: 24, seed, audio: true }
     }
 
     fn filmed(seed: u64) -> Filmed {
@@ -1377,6 +1395,8 @@ mod tests {
         let q = queue(&db, None, "m", "b", &Resolved { decoder: Some(kvad::video::Decoder::Conv), ..resolved(1) }, false).unwrap();
         assert_eq!(q.resource()["kvad"]["decoder"], "conv");
         assert_eq!(queue(&db, None, "m", "b", &resolved(2), false).unwrap().resource()["kvad"]["decoder"], Value::Null);
+        let q = queue(&db, None, "m", "b", &Resolved { pipeline: Some(kvad::video::Pipeline::Dfr), ..resolved(3) }, false).unwrap();
+        assert_eq!(q.resource()["kvad"]["pipeline"], "dfr");
     }
 
     /// A video that started from a picture links to it, and its picture
@@ -1526,6 +1546,7 @@ mod tests {
         duration: false,
         guided: Some(kvad::video::Guided { steps: 30, max_steps: 60, guidance: 3.0 }),
         decoder: Some(kvad::video::Decoder::Diffusion),
+        dfr: true,
     };
 
     #[test]
@@ -1543,6 +1564,8 @@ mod tests {
         assert_eq!(five(json!(24)), Some(121));
         // 125 frames is not 8k + 1, and 129 is the nearest that is.
         assert_eq!(five(json!("25")), Some(129));
+        // At 48 fps DFR doubles 121 frames at 24 to 241, on a grid of 16.
+        assert_eq!(five(json!(48)), Some(241));
 
         let r = Asked::read(&json_fields(json!({ "prompt": "a dog", "num_frames": 49 }))).unwrap().request(&LTX);
         assert_eq!(r.frames, Some(49));
@@ -1571,6 +1594,10 @@ mod tests {
         assert_eq!(a.request.decoder, Some(kvad::video::Decoder::Conv));
         assert_eq!(Asked::read(&json_fields(json!({ "prompt": "a dog" }))).unwrap().request.decoder, None);
         assert!(refuse(json!({ "prompt": "a dog", "decoder": "vae" })).contains("diffusion or conv"));
+        // The pipeline, by name; left out, the model's own choice.
+        let a = Asked::read(&json_fields(json!({ "prompt": "a dog", "pipeline": "dfr" }))).unwrap();
+        assert_eq!(a.request.pipeline, Some(kvad::video::Pipeline::Dfr));
+        assert!(refuse(json!({ "prompt": "a dog", "pipeline": "slow" })).contains("fast or dfr"));
     }
 
     /// The body OpenAI's Python SDK sends for `videos.create`, with a file

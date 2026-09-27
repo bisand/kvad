@@ -54,6 +54,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("012-video-lengths", include_str!("migrations/012-video-lengths.sql")),
     ("013-video-guidance", include_str!("migrations/013-video-guidance.sql")),
     ("014-video-decoders", include_str!("migrations/014-video-decoders.sql")),
+    ("015-video-pipelines", include_str!("migrations/015-video-pipelines.sql")),
 ];
 
 #[derive(Clone)]

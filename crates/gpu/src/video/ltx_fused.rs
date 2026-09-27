@@ -63,24 +63,58 @@ fn readable(t: &Tensor) -> bool {
     on && type_name(t.dtype()).is_some() && t.is_contiguous()
 }
 
-/// Rows of `e` numbers in `x`'s dtype: one, as `[e]` or `[1, e]`, or two,
-/// as `[2, e]`; see [`Held`].
-fn row_of(t: &Tensor, x: &Tensor, e: usize) -> bool {
-    readable(t) && t.dtype() == x.dtype() && (t.elem_count() == e || t.elem_count() == 2 * e)
+/// Rows of `e` numbers in `x`'s dtype: one, as `[e]` or `[1, e]`; or two,
+/// as `[2, e]`, or with [`Held::Rows`] any number `[k, e]`; see [`Held`].
+fn row_of(t: &Tensor, x: &Tensor, e: usize, held: &Held) -> bool {
+    let n = t.elem_count();
+    let many = match held {
+        Held::First(_) => n == 2 * e,
+        Held::Rows(_) => n % e == 0,
+    };
+    readable(t) && t.dtype() == x.dtype() && (n == e || many)
 }
 
 /// How the tokens of `x` `[n, e]` read their modulation rows.
 ///
-/// A row argument is one row, `[1, e]`, which every token reads; or two,
-/// `[2, e]`, where the first `held` tokens read row 0 and the rest row 1.
-/// That is image-to-video: the first latent frame is the picture, held at
-/// σ = 0 while the rest is denoised, and the DiT modulates each token by its
-/// own σ. So the picture's tokens have rows of their own, and they come
-/// first. `Held(0)` is every token alike.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Held(pub usize);
+/// A row argument is one row, `[1, e]`, which every token reads, or more,
+/// one for each σ some tokens are at: the DiT modulates each token by its
+/// own σ.
+/// - [`Held::First`]: two rows `[2, e]`, where the first `n` tokens read row
+///   0 and the rest row 1. That is image-to-video: the first latent frame is
+///   the picture, held at σ = 0 while the rest is denoised, so the picture's
+///   tokens have rows of their own, and they come first. `First(0)` is
+///   every token alike.
+/// - [`Held::Rows`]: `[k, e]`, token `i` reading row `index[i]`: DFR's
+///   conditioning tokens, whose σ is the step's times their mask (1 for the
+///   video and its generated keyframes, 0.05 for anchor keyframes, 0 for a
+///   reference latent), in whatever order they were appended.
+#[derive(Clone, Debug)]
+pub(crate) enum Held {
+    First(usize),
+    /// `[n]` u32, on the tensors' device.
+    Rows(Tensor),
+}
 
 impl Held {
+    /// Every token alike.
+    pub(crate) const ALIKE: Held = Held::First(0);
+
+    /// Whether a kernel can read the index.
+    fn readable(&self, x: &Tensor) -> bool {
+        match self {
+            Held::First(_) => true,
+            Held::Rows(i) => i.dtype() == DType::U32 && i.is_contiguous() && i.elem_count() == x.dim(0).unwrap_or(0) && i.device().same_device(x.device()),
+        }
+    }
+
+    /// With [`Held::Rows`], every token's own row of `t`, `[n, e]`, for the
+    /// chain; a one-row `t` stays one row, to broadcast.
+    fn spread(&self, t: &Tensor, e: usize) -> candle_core::Result<Tensor> {
+        match (self, t.elem_count() == e) {
+            (Held::Rows(i), false) => t.reshape((t.elem_count() / e, e))?.index_select(i, 0),
+            _ => t.reshape((1, e)),
+        }
+    }
     /// The row the held tokens read, when `held`, or the rest: row 0 or 1
     /// of a two-row argument, and a one-row argument as it is.
     fn pick(t: &Tensor, e: usize, held: bool) -> candle_core::Result<Tensor> {
@@ -91,16 +125,19 @@ impl Held {
     }
 
     /// Whether any of `rows` has two rows that tokens of `x` read apart.
-    fn splits(self, x: &Tensor, rows: &[&Tensor]) -> candle_core::Result<bool> {
+    fn splits(&self, x: &Tensor, rows: &[&Tensor]) -> candle_core::Result<bool> {
         let e = x.dim(candle_core::D::Minus1)?;
-        Ok(self.0 > 0 && rows.iter().any(|t| t.elem_count() == 2 * e))
+        Ok(matches!(self, Held::First(n) if *n > 0) && rows.iter().any(|t| t.elem_count() == 2 * e))
     }
 
     /// `f` on the held tokens with their rows and on the rest with theirs,
     /// the two answers joined again: the chain's way, where no kernel runs.
-    fn apart(self, x: &Tensor, rows: &[&Tensor], f: impl Fn(&Tensor, &[Tensor]) -> candle_core::Result<Tensor>) -> candle_core::Result<Tensor> {
+    fn apart(&self, x: &Tensor, rows: &[&Tensor], f: impl Fn(&Tensor, &[Tensor]) -> candle_core::Result<Tensor>) -> candle_core::Result<Tensor> {
         let (n, e) = x.dims2()?;
-        let held = self.0.min(n);
+        let held = match self {
+            Held::First(h) => (*h).min(n),
+            Held::Rows(_) => candle_core::bail!("Held::apart is for a split, not an index"),
+        };
         let part = |lo: usize, len: usize, h: bool| -> candle_core::Result<Tensor> {
             let rows = rows.iter().map(|t| Held::pick(t, e, h)).collect::<candle_core::Result<Vec<_>>>()?;
             f(&x.narrow(0, lo, len)?, &rows)
@@ -111,36 +148,48 @@ impl Held {
         }
     }
 
-    /// `rows` for a kernel: each two rows when any is, a one-row argument
-    /// repeated, so that every row is read at the same offset; and that
-    /// offset, `e` or 0.
+    /// `rows` for a kernel: each as many rows as the most any has, a
+    /// one-row argument repeated, so that every row is read at the same
+    /// offset; and, for a split, the second row's offset, `e` or 0.
     fn paired(rows: &[&Tensor], e: usize) -> candle_core::Result<(Vec<Tensor>, usize)> {
-        if rows.iter().all(|t| t.elem_count() == e) {
+        let k = rows.iter().map(|t| t.elem_count() / e).max().unwrap_or(1);
+        if k == 1 {
             return Ok((rows.iter().map(|t| (*t).clone()).collect(), 0));
         }
-        let two = |t: &&Tensor| match t.elem_count() == e {
-            true => {
-                let r = t.reshape((1, e))?;
-                Tensor::cat(&[&r, &r], 0)
-            }
+        let all = |t: &&Tensor| match t.elem_count() == e {
+            true => t.reshape((1, e))?.broadcast_as((k, e))?.contiguous(),
             false => Ok((*t).clone()),
         };
-        Ok((rows.iter().map(two).collect::<candle_core::Result<Vec<_>>>()?, e))
+        Ok((rows.iter().map(all).collect::<candle_core::Result<Vec<_>>>()?, e))
+    }
+
+    /// What the kernels are told: the split point and the second row's
+    /// offset, and the index when there is one.
+    fn for_kernel(&self, later: usize) -> ((usize, usize), Option<Tensor>) {
+        match self {
+            Held::First(n) => ((*n, later), None),
+            Held::Rows(i) => ((0, later), Some(i.clone())),
+        }
     }
 }
 
 /// `rms(x)·(1 + scale) + shift`, over `x`'s last axis; `scale` and `shift`
 /// are rows as [`Held`] says.
-pub(crate) fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor, held: Held, eps: f32) -> candle_core::Result<Tensor> {
+pub(crate) fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor, held: &Held, eps: f32) -> candle_core::Result<Tensor> {
     let e = x.dim(candle_core::D::Minus1)?;
-    if !(readable(x) && row_of(scale, x, e) && row_of(shift, x, e)) {
+    if !(readable(x) && row_of(scale, x, e, held) && row_of(shift, x, e, held) && held.readable(x)) {
+        if let Held::Rows(_) = held {
+            let (scale, shift) = (held.spread(scale, e)?, held.spread(shift, e)?);
+            return rms(x, eps as f64)?.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(&shift);
+        }
         if held.splits(x, &[scale, shift])? {
-            return held.apart(x, &[scale, shift], |x, r| modulate(x, &r[0], &r[1], Held(0), eps));
+            return held.apart(x, &[scale, shift], |x, r| modulate(x, &r[0], &r[1], &Held::ALIKE, eps));
         }
         return rms(x, eps as f64)?.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift);
     }
     let (r, later) = Held::paired(&[scale, shift], e)?;
-    metal::modulate(x, None, &r[0], &r[1], (held.0, later), eps)
+    let (split, index) = held.for_kernel(later);
+    metal::modulate(x, None, &r[0], &r[1], split, index.as_ref(), eps)
 }
 
 /// `x + y·g`, and [`modulate`] of it: `(modulated, sum)`. The rows are as
@@ -149,24 +198,32 @@ pub(crate) fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor, held: Held, e
 /// Both come back from one buffer, the modulated norm first, so that it
 /// starts at offset zero: it goes straight into a projection, and candle's
 /// quantised matmul does not honour an offset (see `Proj::forward`).
-pub(crate) fn gated_modulate(x: &Tensor, y: &Tensor, g: &Tensor, scale: &Tensor, shift: &Tensor, held: Held, eps: f32) -> candle_core::Result<(Tensor, Tensor)> {
+pub(crate) fn gated_modulate(x: &Tensor, y: &Tensor, g: &Tensor, scale: &Tensor, shift: &Tensor, held: &Held, eps: f32) -> candle_core::Result<(Tensor, Tensor)> {
     let e = x.dim(candle_core::D::Minus1)?;
-    let fits = readable(x) && readable(y) && y.dtype() == x.dtype() && y.dims() == x.dims() && [g, scale, shift].iter().all(|t| row_of(t, x, e));
+    let fits = readable(x) && readable(y) && y.dtype() == x.dtype() && y.dims() == x.dims() && [g, scale, shift].iter().all(|t| row_of(t, x, e, held)) && held.readable(x);
     if !fits {
         let sum = gated_add(x, y, g, held)?;
         return Ok((modulate(&sum, scale, shift, held, eps)?, sum));
     }
     let (r, later) = Held::paired(&[g, scale, shift], e)?;
-    let both = metal::modulate(x, Some((y, &r[0])), &r[1], &r[2], (held.0, later), eps)?;
+    let (split, index) = held.for_kernel(later);
+    let both = metal::modulate(x, Some((y, &r[0])), &r[1], &r[2], split, index.as_ref(), eps)?;
     Ok((both.get(0)?, both.get(1)?))
 }
 
 /// `x + y·g`, with `g` rows as [`Held`] says.
-pub(crate) fn gated_add(x: &Tensor, y: &Tensor, g: &Tensor, held: Held) -> candle_core::Result<Tensor> {
+pub(crate) fn gated_add(x: &Tensor, y: &Tensor, g: &Tensor, held: &Held) -> candle_core::Result<Tensor> {
     let e = x.dim(candle_core::D::Minus1)?;
-    if !(readable(x) && readable(y) && y.dtype() == x.dtype() && y.dims() == x.dims() && row_of(g, x, e)) {
+    if !(readable(x) && readable(y) && y.dtype() == x.dtype() && y.dims() == x.dims() && row_of(g, x, e, held) && held.readable(x)) {
+        if let Held::Rows(_) = held {
+            return x + y.broadcast_mul(&held.spread(g, e)?)?;
+        }
         if held.splits(x, &[g])? {
-            let (n, h) = (x.dim(0)?, held.0.min(x.dim(0)?));
+            let h = match held {
+                Held::First(h) => *h,
+                Held::Rows(_) => unreachable!(),
+            };
+            let (n, h) = (x.dim(0)?, h.min(x.dim(0)?));
             let ys = [y.narrow(0, 0, h)?, y.narrow(0, h, n - h)?];
             let xs = [x.narrow(0, 0, h)?, x.narrow(0, h, n - h)?];
             let parts = (0..2)
@@ -178,7 +235,8 @@ pub(crate) fn gated_add(x: &Tensor, y: &Tensor, g: &Tensor, held: Held) -> candl
         return x + y.broadcast_mul(g)?;
     }
     let (r, later) = Held::paired(&[g], e)?;
-    metal::gated_add(x, y, &r[0], (held.0, later))
+    let (split, index) = held.for_kernel(later);
+    metal::gated_add(x, y, &r[0], split, index.as_ref())
 }
 
 /// The RMS norm of `x` `[n, width]` over its whole width under the f32
@@ -320,6 +378,8 @@ mod metal {
         // and the rest from `later` on: `e` when each holds two rows, else 0.
         uint held;
         uint later;
+        // 1: rows are read by the index instead, `index[row] · e`.
+        uint indexed;
     };
 
     // One threadgroup a row. `sum` is `x + y·g` rounded to T, which is what the
@@ -334,6 +394,7 @@ mod metal {
         device T *out [[buffer(5)]],
         device T *sum [[buffer(6)]],
         constant ModParams &p [[buffer(7)]],
+        device const uint *index [[buffer(8)]],
         uint row [[threadgroup_position_in_grid]],
         uint tid [[thread_position_in_threadgroup]],
         uint tpg [[threads_per_threadgroup]],
@@ -343,7 +404,7 @@ mod metal {
         threadgroup float part[32];
         const ulong base = ulong(row) * p.e;
         const bool res = p.flags & 1;
-        const uint r = row < p.held ? 0 : p.later;
+        const uint r = p.indexed ? index[row] * p.e : (row < p.held ? 0 : p.later);
         float acc = 0;
         for (uint j = tid; j < p.e; j += tpg) {
             float v = float(x[base + j]);
@@ -369,12 +430,14 @@ mod metal {
         device T *out [[buffer(3)]],
         constant uint &e [[buffer(4)]],
         constant uint &n [[buffer(5)]],
-        constant uint2 &held [[buffer(6)]],
+        constant uint4 &held [[buffer(6)]],
+        device const uint *index [[buffer(7)]],
         uint i [[thread_position_in_grid]])
     {
         if (i >= n) return;
-        // `held`: rows below `.x` read `g` from its start, the rest from `.y`.
-        const uint r = i / e < held.x ? 0 : held.y;
+        // `held`: rows below `.x` read `g` from its start, the rest from `.y`;
+        // or with `.z`, each row reads the row `index` gives.
+        const uint r = held.z ? index[i / e] * e : (i / e < held.x ? 0 : held.y);
         out[i] = T(float(x[i]) + float(y[i]) * float(g[r + i % e]));
     }
 
@@ -580,9 +643,10 @@ mod metal {
     #define ONE(T, N) \
     template [[host_name("modulate_" #N)]] kernel void modulate<T>( \
         device const T *, device const T *, device const T *, device const T *, device const T *, \
-        device T *, device T *, constant ModParams &, uint, uint, uint, uint, uint); \
+        device T *, device T *, constant ModParams &, device const uint *, uint, uint, uint, uint, uint); \
     template [[host_name("gated_add_" #N)]] kernel void gated_add<T>( \
-        device const T *, device const T *, device const T *, device T *, constant uint &, constant uint &, constant uint2 &, uint); \
+        device const T *, device const T *, device const T *, device T *, constant uint &, constant uint &, constant uint4 &, \
+        device const uint *, uint); \
     template [[host_name("norm_silu_" #N)]] kernel void norm_silu<T>( \
         device const T *, device T *, constant PixParams &, uint2);
     ONE(float, f32)
@@ -628,13 +692,14 @@ mod metal {
 
     /// `held`: tokens below `.0` read the rows from their start, the rest
     /// from `.1` on.
-    pub(super) fn modulate(x: &Tensor, residual: Option<(&Tensor, &Tensor)>, scale: &Tensor, shift: &Tensor, held: (usize, usize), eps: f32) -> candle_core::Result<Tensor> {
-        let op = Modulate { residual: residual.map(|(y, g)| (y.clone(), g.clone())), scale: scale.clone(), shift: shift.clone(), held, eps };
+    pub(super) fn modulate(x: &Tensor, residual: Option<(&Tensor, &Tensor)>, scale: &Tensor, shift: &Tensor, held: (usize, usize), index: Option<&Tensor>, eps: f32)
+     -> candle_core::Result<Tensor> {
+        let op = Modulate { residual: residual.map(|(y, g)| (y.clone(), g.clone())), scale: scale.clone(), shift: shift.clone(), held, index: index.cloned(), eps };
         x.apply_op1_no_bwd(&op)
     }
 
-    pub(super) fn gated_add(x: &Tensor, y: &Tensor, g: &Tensor, held: (usize, usize)) -> candle_core::Result<Tensor> {
-        x.apply_op3_no_bwd(y, g, &GatedAdd { held })
+    pub(super) fn gated_add(x: &Tensor, y: &Tensor, g: &Tensor, held: (usize, usize), index: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        x.apply_op3_no_bwd(y, g, &GatedAdd { held, index: index.cloned() })
     }
 
     pub(super) fn norm_rope(x: &Tensor, w: &Tensor, rope: Option<(&Tensor, &Tensor)>, half: usize, eps: f32, dt: DType) -> candle_core::Result<Tensor> {
@@ -859,6 +924,8 @@ mod metal {
         scale: Tensor,
         shift: Tensor,
         held: (usize, usize),
+        /// `[n]` u32: each row's modulation row, in place of the split.
+        index: Option<Tensor>,
         eps: f32,
     }
 
@@ -869,6 +936,7 @@ mod metal {
         eps: f32,
         held: u32,
         later: u32,
+        indexed: u32,
     }
 
     impl CustomOp1 for Modulate {
@@ -915,7 +983,13 @@ mod metal {
             enc.set_input_buffer(4, Some(&sh.0), sh.1);
             enc.set_output_buffer(5, Some(&out), 0);
             let (held, later) = (self.held.0.min(u32::MAX as usize) as u32, self.held.1 as u32);
-            enc.set_bytes(7, &ModParams { e: e as u32, flags: res.is_some() as u32, eps: self.eps, held, later });
+            let index = self.index.as_ref().map(metal).transpose()?;
+            enc.set_bytes(7, &ModParams { e: e as u32, flags: res.is_some() as u32, eps: self.eps, held, later, indexed: index.is_some() as u32 });
+            // Without an index, x's buffer stands in, bound but never read.
+            match &index {
+                Some((ib, io)) => enc.set_input_buffer(8, Some(ib), *io),
+                None => enc.set_input_buffer(8, Some(&xb), xo),
+            }
             enc.dispatch_thread_groups(MTLSize { width: n / e, height: 1, depth: 1 }, row_threads(e));
             let mut shape = lx.dims().to_vec();
             if parts == 2 {
@@ -927,6 +1001,7 @@ mod metal {
 
     struct GatedAdd {
         held: (usize, usize),
+        index: Option<Tensor>,
     }
 
     impl CustomOp3 for GatedAdd {
@@ -962,7 +1037,15 @@ mod metal {
             enc.set_output_buffer(3, Some(&out), 0);
             enc.set_bytes(4, &(e as u32));
             enc.set_bytes(5, &(n as u32));
-            enc.set_bytes(6, &[self.held.0.min(u32::MAX as usize) as u32, self.held.1 as u32]);
+            let index = self.index.as_ref().map(metal).transpose()?;
+            enc.set_bytes(6, &[self.held.0.min(u32::MAX as usize) as u32, self.held.1 as u32, index.is_some() as u32, 0]);
+            match &index {
+                Some((ib, io)) => enc.set_input_buffer(7, Some(ib), *io),
+                None => {
+                    let (xb, xo) = buffer(x, lx);
+                    enc.set_input_buffer(7, Some(&xb), xo)
+                }
+            }
             let (groups, threads) = flat(n);
             enc.dispatch_thread_groups(groups, threads);
             Ok((MetalStorage::new(out, dev.clone(), n, dt), lx.shape().clone()))
@@ -1064,10 +1147,10 @@ mod metal {
 #[cfg(not(target_os = "macos"))]
 mod metal {
     use super::*;
-    pub(super) fn modulate(_: &Tensor, _: Option<(&Tensor, &Tensor)>, _: &Tensor, _: &Tensor, _: f32) -> candle_core::Result<Tensor> {
+    pub(super) fn modulate(_: &Tensor, _: Option<(&Tensor, &Tensor)>, _: &Tensor, _: &Tensor, _: (usize, usize), _: Option<&Tensor>, _: f32) -> candle_core::Result<Tensor> {
         unreachable!()
     }
-    pub(super) fn gated_add(_: &Tensor, _: &Tensor, _: &Tensor) -> candle_core::Result<Tensor> {
+    pub(super) fn gated_add(_: &Tensor, _: &Tensor, _: &Tensor, _: (usize, usize), _: Option<&Tensor>) -> candle_core::Result<Tensor> {
         unreachable!()
     }
     pub(super) fn norm_rope(_: &Tensor, _: &Tensor, _: Option<(&Tensor, &Tensor)>, _: usize, _: f32, _: DType) -> candle_core::Result<Tensor> {
@@ -1160,7 +1243,7 @@ mod tests {
                 let x = rand(&[m, e], dt, &dev);
                 let (scale, shift, _) = rows(e, dt, &dev);
                 let before = ran();
-                let got = modulate(&x, &scale, &shift, Held(0), 1e-6).unwrap();
+                let got = modulate(&x, &scale, &shift, &Held::ALIKE, 1e-6).unwrap();
                 assert_eq!(ran(), before + 1, "the kernel did not run");
                 let want = rms(&x, 1e-6).unwrap().broadcast_mul(&(&scale + 1.0).unwrap()).unwrap().broadcast_add(&shift).unwrap();
                 let got = off(&got, &want);
@@ -1180,14 +1263,55 @@ mod tests {
                 let y = rand(&[m, e], dt, &dev);
                 let (g, scale, shift) = rows(e, dt, &dev);
                 let before = ran();
-                let (h, sum) = gated_modulate(&x, &y, &g, &scale, &shift, Held(0), 1e-6).unwrap();
-                let added = gated_add(&x, &y, &g, Held(0)).unwrap();
+                let (h, sum) = gated_modulate(&x, &y, &g, &scale, &shift, &Held::ALIKE, 1e-6).unwrap();
+                let added = gated_add(&x, &y, &g, &Held::ALIKE).unwrap();
                 assert_eq!(ran(), before + 2, "a kernel did not run");
                 let want_sum = (&x + y.broadcast_mul(&g).unwrap()).unwrap();
                 let want = rms(&want_sum, 1e-6).unwrap().broadcast_mul(&(&scale + 1.0).unwrap()).unwrap().broadcast_add(&shift).unwrap();
                 for (what, got, want, tol) in [("sum", &sum, &want_sum, 2.0), ("add", &added, &want_sum, 2.0), ("norm", &h, &want, 4.0)] {
                     let got = off(got, want);
                     assert!(got < tol * ulp(dt), "{dt:?} [{m}, {e}] {what}: off by {got}");
+                }
+            }
+        }
+    }
+
+    /// With an index, each token reads its own row of `[k, e]` arguments,
+    /// on the kernels and down the chain alike: three rows, read out of
+    /// order, as DFR's conditioning tokens read theirs; each token's answer
+    /// what the one-row ops make of it with its row.
+    #[test]
+    fn indexed_tokens_read_the_row_their_index_names() {
+        let Some(dev) = gpu() else { return };
+        let (m, e) = (9, 256);
+        let which: Vec<u32> = vec![0, 0, 2, 1, 1, 2, 0, 1, 2];
+        for dt in [DType::F32, DType::BF16] {
+            let x = rand(&[m, e], dt, &dev);
+            let y = rand(&[m, e], dt, &dev);
+            let three = |dev: &Device| (rand(&[3, e], dt, dev) * 0.3).unwrap();
+            let (g, scale, shift) = (three(&dev), three(&dev), three(&dev));
+            let token = |i: usize| {
+                let r = |t: &Tensor| t.narrow(0, which[i] as usize, 1).unwrap();
+                let sum = (x.narrow(0, i, 1).unwrap() + y.narrow(0, i, 1).unwrap().broadcast_mul(&r(&g)).unwrap()).unwrap();
+                let norm = rms(&sum, 1e-6).unwrap().broadcast_mul(&(r(&scale) + 1.0).unwrap()).unwrap().broadcast_add(&r(&shift)).unwrap();
+                (norm, sum)
+            };
+            let parts: Vec<(Tensor, Tensor)> = (0..m).map(token).collect();
+            let want_norm = Tensor::cat(&parts.iter().map(|p| p.0.clone()).collect::<Vec<_>>(), 0).unwrap();
+            let want_sum = Tensor::cat(&parts.iter().map(|p| p.1.clone()).collect::<Vec<_>>(), 0).unwrap();
+            for device in [dev.clone(), Device::Cpu] {
+                let on = |t: &Tensor| t.to_device(&device).unwrap();
+                let held = Held::Rows(Tensor::new(which.as_slice(), &device).unwrap());
+                let before = ran();
+                let (norm, sum) = gated_modulate(&on(&x), &on(&y), &on(&g), &on(&scale), &on(&shift), &held, 1e-6).unwrap();
+                let added = gated_add(&on(&x), &on(&y), &on(&g), &held).unwrap();
+                let alone = modulate(&on(&want_sum), &on(&scale), &on(&shift), &held, 1e-6).unwrap();
+                if device.is_metal() {
+                    assert_eq!(ran(), before + 3, "{dt:?}: the kernels did not all run");
+                }
+                for (what, got, want, tol) in [("sum", &sum, &want_sum, 2.0), ("add", &added, &want_sum, 2.0), ("norm", &norm, &want_norm, 4.0), ("modulate", &alone, &want_norm, 4.0)] {
+                    let got = off(&got.to_device(&dev).unwrap(), want);
+                    assert!(got < tol * ulp(dt), "{dt:?} on {device:?}, {what}: off by {got}");
                 }
             }
         }
@@ -1226,9 +1350,9 @@ mod tests {
                 let (want_norm, want_sum) = by_parts(g, &scale, &shift);
                 for device in [dev.clone(), Device::Cpu] {
                     let on = |t: &Tensor| t.to_device(&device).unwrap();
-                    let (norm, sum) = gated_modulate(&on(&x), &on(&y), &on(g), &on(&scale), &on(&shift), Held(h), 1e-6).unwrap();
-                    let added = gated_add(&on(&x), &on(&y), &on(g), Held(h)).unwrap();
-                    let alone = modulate(&on(&want_sum), &on(&scale), &on(&shift), Held(h), 1e-6).unwrap();
+                    let (norm, sum) = gated_modulate(&on(&x), &on(&y), &on(g), &on(&scale), &on(&shift), &Held::First(h), 1e-6).unwrap();
+                    let added = gated_add(&on(&x), &on(&y), &on(g), &Held::First(h)).unwrap();
+                    let alone = modulate(&on(&want_sum), &on(&scale), &on(&shift), &Held::First(h), 1e-6).unwrap();
                     for (what, got, want, tol) in [("sum", &sum, &want_sum, 2.0), ("add", &added, &want_sum, 2.0), ("norm", &norm, &want_norm, 4.0), ("modulate", &alone, &want_norm, 4.0)] {
                         let got = off(&got.to_device(&dev).unwrap(), want);
                         assert!(got < tol * ulp(dt), "{dt:?} on {device:?}, {what}: off by {got}");
@@ -1264,11 +1388,11 @@ mod tests {
         let (scale, shift, _) = rows(e, DType::F32, &dev);
         let before = ran();
         // A row in another dtype, a strided input, and the CPU.
-        modulate(&x, &scale.to_dtype(DType::BF16).unwrap(), &shift, Held(0), 1e-6).unwrap_err();
+        modulate(&x, &scale.to_dtype(DType::BF16).unwrap(), &shift, &Held::ALIKE, 1e-6).unwrap_err();
         let wide = rand(&[m, 2 * e], DType::F32, &dev).narrow(1, 0, e).unwrap();
-        modulate(&wide, &scale, &shift, Held(0), 1e-6).unwrap();
+        modulate(&wide, &scale, &shift, &Held::ALIKE, 1e-6).unwrap();
         let cpu = |t: &Tensor| t.to_device(&Device::Cpu).unwrap();
-        modulate(&cpu(&x), &cpu(&scale), &cpu(&shift), Held(0), 1e-6).unwrap();
+        modulate(&cpu(&x), &cpu(&scale), &cpu(&shift), &Held::ALIKE, 1e-6).unwrap();
         let w = Tensor::ones(e, DType::F32, &dev).unwrap();
         assert!(norm_rope(&wide, &w, None, 2, 1e-6, DType::F32).unwrap().is_none());
         assert!(norm_rope(&x, &w.to_dtype(DType::BF16).unwrap(), None, 2, 1e-6, DType::F32).unwrap().is_none());

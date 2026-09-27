@@ -53,6 +53,11 @@ impl RmsNorm {
         rms(&x.to_dtype(DType::F32)?, self.eps)?.broadcast_mul(&self.w)?.to_dtype(dtype)
     }
 
+    /// The weight, `[width]` in f32.
+    pub(crate) fn weight(&self) -> &Tensor {
+        &self.w
+    }
+
     /// `x` `[n, width]` normed over its whole width, then, with `rope`, each
     /// of its `heads` rotated: in `dt`, whatever `x` came in. One kernel
     /// where [`super::ltx_fused::norm_rope`] takes it.

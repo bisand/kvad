@@ -120,6 +120,9 @@ struct Args {
     dev: bool,
     /// The picture a video starts from.
     image: Option<String>,
+    /// `videos make` only: which of LTX-2.5's decoders, `diffusion` or
+    /// `conv`.
+    decoder: Option<String>,
     quant: Precision,
     /// `crawl` only.
     out: Option<String>,
@@ -190,6 +193,7 @@ impl Default for Args {
             silent: false,
             dev: false,
             image: None,
+            decoder: None,
             quant: Precision::F32,
             out: None,
             pages: None,
@@ -406,6 +410,7 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--frames" => a.frames = Some(num() as usize),
             "--fps" => a.fps = Some(num() as u32),
             "--image" => a.image = Some(value.clone()),
+            "--decoder" => a.decoder = Some(value.clone()),
             "--out" => a.out = Some(value.clone()),
             "--pages" => a.pages = Some(num() as usize),
             "--mb" => a.megabytes = Some(num()),

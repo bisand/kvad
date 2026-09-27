@@ -69,16 +69,16 @@ What text-to-video reads:
 | Gemma 4 12B + aggregate projections + tokenizer | `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors` | 13.15 B | 26.3 GB |
 | Spatial latent upsampler ×2 | `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` | 0.50 B | 1.0 GB |
 | Video VAE, conv decoder | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` | 0.72 B | 1.45 GB |
+| Video VAE, diffusion decoder (the default since step 3 below; its encoder is the conv file's) | `vae/ltx-2.5-video-vae-bf16.safetensors` | 0.74 B | 1.47 GB |
 | Audio VAE + vocoder + BWE | `vae/ltx-2.5-audio-vae-bf16.safetensors` | 0.18 B | 0.37 GB |
 | Duration head | `model_patches/ltx-2.5-duration-head-bf16.safetensors` | 1.9 M | 4 MB |
 
-That is about 71 GB to download.
+That is about 72.5 GB to download.
 
 The repo also holds files that text-to-video does not read:
 - the dev DiT, 42.0 GB, for later;
 - three Comfy-only int8 and NVFP4 files. The model card says these are not
   for PyTorch, and they are not for us;
-- the DiffVAE decoder (`vae/ltx-2.5-video-vae-bf16`, 1.47 GB), for later;
 - the temporal upsampler, 0.26 GB;
 - the distilled LoRA, 8.9 GB, used only by the dev model's pipelines.
 
@@ -584,20 +584,199 @@ dropped as soon as its chunked output exists.
 The encoder half, `encoder.*` with 319M parameters, is unread for
 text-to-video.
 
-### The DiffVAE decoder is for later
+### The DiffVAE decoder
 
-`vae/ltx-2.5-video-vae-bf16` is a neighbourhood-attention transformer:
-- about 420M parameters;
-- a 3D window of 11×11×11 in its last stage, over about 3M tokens;
-- one denoising step from seeded noise, so its output depends on the seed.
+At first this said: `vae/ltx-2.5-video-vae-bf16` is a neighbourhood-attention
+transformer of about 420M parameters, and kvad starts with the conv decoder.
+It did. Read in full, the file's own config (`_class_name`
+`NADiffusionDecoder`) is this:
 
-Its arithmetic is about the same as the conv decoder's. What it needs is a
-3D neighbourhood-attention kernel, which candle does not have. On macOS the
-reference itself falls back to a path it calls the slowest.
+| Stage | Blocks | Width | Window (t, h, w) | Then |
+|---|---|---|---|---|
+| in | | 128 → 2048 | | `conv_in`, a linear layer, after un-normalising |
+| 1 | 4 | 2048 | 3×7×7 | ×2 in space, to 1024 |
+| 2 | 6 | 1024 | 3×7×7 | ×2 in time, to 512, the first frame dropped |
+| 3 | 4 | 512 | 3×5×5 | ×2 in all three, 512, the first frame dropped |
+| 4 | 2 | 512 | 3×5×5 | ×2 in all three, to 256: the *context* |
+| 5 | 8 | 256 | **11×11×11** | `norm_out`, `conv_out` to 48, unpatchify 4×4 |
 
-The model card's example uses it, but the conv decoder is a documented,
-supported alternative, and the pipeline picks the decoder from the file's
-`_class_name`. **kvad starts with the conv decoder.**
+417M parameters, 0.83 GB in bf16, beside an encoder of 319M that image-to-video does not need (the conv VAE's serves).
+
+- **A block** is pre-norm: `x + NA(rms(x))`, then `x + SwiGLU(rms(x))`, the
+  MLP `w_down(silu(w_gate·x) · w_up·x)` 4× wide, no biases.
+- **NA** is 3D neighbourhood attention, NATTEN's `na3d`: each token attends
+  to exactly the window around it, which is shifted inward at the edges
+  rather than cut, `start = clamp(i − ⌊k/2⌋, 0, n − k)` on each axis, so
+  every axis must be at least its window. Heads of 64; the fused `qkv`
+  splits q, k, v in that order; `q_norm` and `k_norm` are RMS norms over a
+  head, and q is scaled by 1/8 before the rotation.
+- **RoPE** is absolute and 3D, with positions 0, 1, 2 … on each axis: 16 of
+  a head's 64 dimensions for time and 24 each for rows and columns, rotating
+  *adjacent pairs* (2i, 2i + 1), with frequencies `10000^(−2i/d)`. The
+  reference cuts the columns into four slabs to rotate them, but keeps the
+  positions running across them, so the slabs change nothing.
+- **Upsampling** is a linear layer to `p₁·p₂·p₃` times the channels, divided
+  by the reduction, then depth-to-space in the conv decoder's channel order;
+  doubling time drops the first frame.
+- **Stage 5 is one step of diffusion.** Its input is noise the size of the
+  frames, patchified 4×4 to 48 channels, at `t = 1` (`× 1000` into the
+  embedding). The step's embedding is PixArt's: a 256-wide sinusoid, cosines
+  first, `linear → silu → linear` to 384; a shared adaLN turns
+  `silu` of that into seven rows, and each block adds its own table. A block
+  adds `context_proj(context)` to x, then `x + NA(rms(x)(1 + s₀) + s₁)`, then
+  `x + SwiGLU(rms(x)(1 + s₃) + s₄)`; the gate rows are unused. The output is
+  the clean frames (`model_output_type: x0`, one step), so **the frames
+  depend on the seed** the noise is drawn from.
+- **Edges.** The last latent frame is repeated twice through stages 1–4 and
+  the copies are cut from the context before stage 5, to at least 11
+  frames; a latent smaller than 3×7×7 is edge-padded first. The reference
+  runs stages 1–3 on the whole clip and stages 4–5 in overlapping tiles,
+  blended.
+
+**The cost is stage 5.** At 768×512 × 121 it is 121×128×192 = 3M tokens,
+each attending to 1331 others: about 33 TFLOP of attention a clip, four
+times that at 1536×1024, where one stage-5 activation is 6 GB in bf16. candle has
+no neighbourhood attention, and the reference itself, on a Mac, falls back
+to a path it calls its slowest.
+
+In three steps:
+1. **Exact.** Every layer, with neighbourhood attention done plainly (a loop
+   over the window's offsets with an online softmax), checked stage by stage
+   against the reference's own eager path on small latents.
+2. **Fast.** A Metal kernel for neighbourhood attention, and stages 4–5 in
+   tiles, so that a real clip decodes.
+3. **In the pipeline**: a choice of decoder, the seed, and what it looks like
+   beside the conv decoder's frames.
+
+**Step 1, exact.** `video::ltx_diffvae` is every layer above, with
+neighbourhood attention as a loop over the window's offsets: each query's
+key at offset `(a, b, c)` is its window's corner plus a constant, so one
+gather per offset, and an online softmax in f32. It is checked against the
+reference's own modules on their eager path (`scripts/ltx-fixtures.py
+--diffvae`, `examples/ltx_diffvae.rs`), each stage from the reference's
+input to it, on a seeded 3×8×8 latent (17 frames of 256×256; stage 5 is
+17×64×64 tokens):
+
+| Stage | f32 on Metal | bf16 on Metal | The reference's own bf16 on MPS |
+|---|---|---|---|
+| 1–3, the latent to stage 4's input | 120.1 dB | 43.4 dB | 43.6 dB |
+| 4, to the context | 125.0 dB | 47.9 dB | 48.8 dB |
+| 5, the context and noise to the frames | 123.8 dB, 0.00 of a level | 47.5 dB, 3.4 levels at most | 50.8 dB |
+
+- **Exact in f32 at every stage**, the first time it ran: the layout of each
+  upsampling, the rotary pairs and their split of a head, the windows at the
+  edges, the fused `qkv`, the step's rows.
+- **Stage 5 in bf16 is 3.3 dB short of the reference's own bf16**, where the
+  earlier stages are within 1 dB of it. It is 3.4 of 255 levels at the
+  worst pixel. Step 2 found why: every layer rounded before its bias.
+- **The plain attention is far too slow**: stage 5 took 233 s here, where
+  the reference's eager path took 7.3 s on the CPU and its whole decode 2.2 s
+  on MPS. That path groups queries whose windows share a geometry and does
+  each group as one masked attention over their keys' bounding box, on the
+  matrix units. A real clip's stage 5 is 43 times this one.
+
+**Step 2, fast.** Five things, each measured on its own.
+
+1. **A neighbourhood-attention kernel** (`mpp_neighbourhood`), flash
+   attention on the M5's matrix units as `mpp_attention` does it. A SIMD
+   group takes a 4×4 patch of queries in one frame. They share their time
+   window, and with windows up to 13 wide their keys fit a box of runs of 16
+   consecutive tokens, one fragment each. So the group walks its box two
+   runs at a time and hides each query's keys outside its own window. At
+   11×11×11 that is 54% of the products used. It agrees with the plain loop
+   in f32 to 57.0–59.4 dB in bf16 (74.2–76.4 in f16), the answer's own
+   rounding. Stage 5's attention at 768×512 runs at 11.4 TFLOP/s of the
+   window's products, about 21 counting the hidden ones, where
+   `mpp_attention` runs: 47 ms for 16 frames of one block.
+2. **Every bias added before the rounding.** The 3.3 dB was rounding: the
+   dense product was rounded to bf16, the bias added, and the sum rounded
+   again, where PyTorch's `addmm` rounds once. `mpp::dense_bias` fills the
+   answer with the bias's rows and accumulates the product into it
+   (`matmul2d`'s multiply-accumulate), and `Linear` uses it for every dense
+   layer with a bias, one row included. The one-row products make the
+   step's modulation rows, and an error there is every token's: they were
+   2.0 of the 3.2 dB. It is faster too, 1.65–7× over the product and
+   candle's broadcast add (`dense_bias_race`). This is every image and video
+   model's dense `Linear`; the DiT's bf16 check is at or above the
+   reference's own bf16 at every point with it (velocity 44.2/46.1 dB,
+   the reference's 43.5/45.7).
+3. **Three fused kernels** in `ltx_fused`, where candle's chains of f32
+   casts and strided broadcasts took 5.5 s a stage-5 block for the norms and
+   RoPE alone: `norm_affine` (a weighted RMS norm and its modulation),
+   `head_norm_rope` (q and k from the fused projection, normed a head at a
+   time and turned on adjacent pairs, written with v straight into the
+   grid's q, k and v) and `swiglu`.
+4. **Memory.** Everything but the attention goes a few frames at a time.
+   And candle's pool rounds each buffer up to a power of two and keeps it
+   until a synchronise: a 1.52 GB activation took 2.15 GB, and q, k, v
+   together 8.6 GB for 4.56. So the whole-grid tensors are allocated at
+   their size outside the pool (`fused::metal::exact`), and each block ends
+   with a synchronise.
+5. **Tiles**, as the reference tiles: stages 1–3 on the whole clip, stages
+   4–5 on tiles of stage 4's input of at most `BUDGET` (3M) stage-5 tokens,
+   overlapping by the halo (20 stage-4 tokens: 40 frames, 160 pixels),
+   blended with complementary linear ramps. The noise is one field over the
+   whole clip, each tile drawing its own block of it
+   (`image::nn::noise_block`), where the reference draws each tile's afresh.
+   So tiled and whole decodes differ only by the edges.
+
+With all five, each stage from the reference's input, on the step-1
+fixture:
+
+| Stage | bf16 on Metal | The reference's own bf16 on MPS |
+|---|---|---|
+| 1–3 | 44.2 dB | 43.6 dB |
+| 4 | 49.2 dB | 48.8 dB |
+| 5 | 51.4 dB, 2.4 levels at most | 50.8 dB |
+
+f32 is still exact (120.1, 125.0, 123.8 dB). Whole clips, from latents the
+pipeline made, against the conv decoder on the same latents, decode alone,
+peak footprint:
+
+| Clip | DiffVAE | Conv decoder |
+|---|---|---|
+| 768×512 × 121 | 10.9–11.5 s, 15.9 GB; one tile of 2.97M tokens | 7.9 s, 8.2 GB |
+| 1536×1024 × 121 | 61.7–70.3 s, 22.3 GB; 1×2×3 tiles, 16.8M tokens | 30.7 s, 17.9 GB |
+
+Tiling's own cost, the 768×512 clip tiled against whole: 63.2 dB as 1×1×3
+tiles, at most 8 levels apart; 58.5 dB as 2×2×3, at most 14. Nothing shows
+where the tiles meet. Profiled at 768×512, a stage-5 block takes about
+1.5 s: 0.48 for the norms, `qkv` and the rotation, 0.40 for the attention,
+0.47 for the feed-forward and 0.14 for the context.
+
+**Step 3, in the pipeline.** The diffusion decoder is LTX-2.5's default, as
+it is the reference's: its README's split-file examples read
+`vae/ltx-2.5-video-vae-bf16`, and calls the conv file "lighter". A request can
+name either: `decoder: "diffusion" | "conv"` on `/v1/videos`, `--decoder` on
+`kvad videos make` and on `examples/ltx.rs`, and a selector beside the seed in
+the web UI. A model with one decoder refuses the field by name. The video
+keeps which decoder made it (`kvad.decoder`; migration 014). Videos made
+before this have none recorded, and all were conv.
+
+- **The file is fetched at load** with the rest, 1.47 GB more. The conv file
+  stays too: its encoder starts a video from a picture, and the upsampler
+  reads its latent statistics. Both are the same, byte for byte, in the
+  diffusion decoder's file (84 of 84 encoder tensors and both statistics), so
+  image-to-video is the same whichever decoder is used.
+- **The seed.** Stage 5's noise comes from the request's seed, turned
+  (`ltx_diffvae::noise_seed`) so that it is not the stream the DiT's noise
+  came from. The same seed and settings give the same video.
+- **Progress** counts the decode tile by tile, and a cancel stops it
+  between tiles.
+
+Whole generations, `examples/ltx.rs`, distilled, a dog on a beach, seed 1:
+
+| Clip | With the diffusion decoder | With the conv decoder, as before |
+|---|---|---|
+| 768×512 × 121 | 77.6 s, the decode 12.5 s; peak 26.9 GB | about 75 s; peak 27.0 GB |
+| 1536×1024 × 121 | 391 s, the decode 88.0 s; peak 31.4 GB | 366 s, the decode 35.3 s; peak 31.3 GB (#94's image-to-video run, another prompt) |
+
+The peak is still stage 2's, so admission's line stands. In the service, the
+same 2-second fox clip decoded in 8.6 s with the diffusion decoder and 5.9 s
+with the conv one. The frames are the same scene. The diffusion decoder's are
+a little finer in texture, sand and fur, and the difference is subtle at this
+size. At 1536×1024 the decode takes 88 s in the pipeline against 62–70 s on
+its own. That is not yet explained.
 
 ### Sound
 
@@ -843,7 +1022,7 @@ The same kind of checks apply here:
    - the duration head as the default (done; see below);
    - image-to-video (done; see below);
    - the dev model with its guidance (done; see below);
-   - the DiffVAE decoder;
+   - the DiffVAE decoder (done; see below);
    - the temporal upsampler;
    - the community GGUFs ([#42](https://github.com/bisand/kvad/issues/42));
    - LoRAs ([#41](https://github.com/bisand/kvad/issues/41)).

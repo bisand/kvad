@@ -52,6 +52,9 @@ class Videos {
   steps = $state(null);
   guidance = $state(null);
   negative = $state("");
+  /** Which decoder makes the frames, `diffusion` or `conv`; null is the
+   *  model's own. */
+  decoder = $state(null);
   /** The picture to start from, a `File`, and a link to show it by. */
   picture = $state(null);
   pictureUrl = $state(null);
@@ -223,6 +226,7 @@ class Videos {
       if (this.steps) body.steps = Number(this.steps);
       if (this.guidance) body.guidance_scale = Number(this.guidance);
       if (this.negative.trim()) body.negative_prompt = this.negative.trim();
+      if (this.decoder) body.decoder = this.decoder;
       let request;
       if (this.picture) {
         // A form, whose content type the browser writes with its boundary.
@@ -262,6 +266,7 @@ class Videos {
     this.steps = k.guided?.steps ?? null;
     this.guidance = k.guided?.guidance ?? null;
     this.negative = k.guided?.negative_prompt ?? "";
+    this.decoder = k.decoder ?? null;
     const resident = models.videoResidents.find((r) => r.repo === v.model);
     this.model = resident?.id ?? v.model;
     if (!k.picture_url) return this.choosePicture(null);

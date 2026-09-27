@@ -62,6 +62,11 @@ writes what it makes for the examples to compare against.
         scripts/ltx-fixtures.py --duration "$HEAD" --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_duration -- --fixtures /tmp/ltx-fx
 
+    DIFFVAE=$(cargo run -q --release -p kvad-gpu --example ltx_diffvae -- --where)
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --diffvae "$DIFFVAE" --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_diffvae -- --fixtures /tmp/ltx-fx [--f32 | --cpu]
+
     UP=$(cargo run -q --release -p kvad-gpu --example ltx_upsample -- --where | head -1)
     cargo run --release -p kvad-gpu --example ltx -- --prompt "…" --stages 1 \\
         --width 512 --height 320 --frames 25 --latents /tmp/stage1.safetensors
@@ -114,6 +119,10 @@ What to expect, as measured on 2026-09-24 on an M5 Pro:
   99.2 dB in f32; 35.6 and 27.4 in bf16, where the reference's own is 35.7
   and 27.1. Any DiT of this architecture serves for these: `ltx_dit --path`
   loads the dev model's.
+- The diffusion decoder (DiffVAE), each stage from the reference's input to
+  it, on a seeded 3x8x8 latent: 120.1, 125.0 and 123.8 dB in f32 on Metal
+  (stages 1-3, 4 and 5); in bf16 43.4, 47.9 and 47.5, where the reference's
+  own bf16 on MPS is 43.6, 48.8 and 50.8.
 - The latent upsampler, on a 512x320x25 latent from a generation: 98 dB in
   f32 on the CPU and on Metal. In bf16 it is 27 dB from exact, and so is
   the reference's own bf16 on MPS; kvad runs it in f32.
@@ -300,6 +309,87 @@ def duration(path, out):
     if torch.backends.mps.is_available():
         save_file(run("mps", torch.bfloat16), f"{out}/duration_bf16.safetensors")
     print("duration: " + ", ".join(f"{f32[f'seconds_{i}'].item():.3f} s" for i in range(n)))
+
+
+def diffvae(path, out):
+    """The diffusion decoder (DiffVAE), stage by stage, by the reference's own
+    modules on its eager neighbourhood-attention path, NATTEN's semantics
+    written out in torch. A seeded latent of 3 x 8 x 8 (17 frames of 256 x
+    256), the smallest the stages' windows allow in space; the stage-5 noise
+    is drawn here and saved, so that kvad's decoder starts from the same."""
+    from ltx_core.model.video_vae.model_configurator import VideoDecoderConfigurator
+    from ltx_core.model.video_vae import diffusion_tiling
+    from ltx_core.model.video_vae.transformer.apply import apply_diffvae_config
+    from ltx_core.model.video_vae.transformer.config import DiffVAEBlockKind, DiffVAEConfig, NAttentionKind
+
+    meta, tensors = read(path)
+    # The loader's renames: `decoder.` off, the fused qkv into its three, the
+    # timestep MLP under its module's names.
+    sd = {}
+    for k, v in tensors.items():
+        if k.startswith("per_channel_statistics."):
+            sd[k] = v
+        if not k.startswith("decoder."):
+            continue
+        k = k[len("decoder."):].replace("t_embedder.mlp.0.", "t_embedder.timestep_embedder.linear_1.").replace("t_embedder.mlp.2.", "t_embedder.timestep_embedder.linear_2.")
+        if ".qkv." in k:
+            d = v.shape[0] // 3
+            leaf = k.rsplit(".", 1)[1]
+            for i, name in enumerate(("to_q", "to_k", "to_v")):
+                sd[k.replace(f"qkv.{leaf}", f"qkv.{name}.{leaf}")] = v[i * d : (i + 1) * d]
+        else:
+            sd[k] = v
+    dec = VideoDecoderConfigurator.from_metadata(meta)
+    missing, unexpected = dec.load_state_dict(sd, strict=False)
+    assert not missing and not unexpected, (missing, unexpected)
+    dec = apply_diffvae_config(
+        dec.float().eval(),
+        DiffVAEConfig(block=DiffVAEBlockKind.COMBINED, w_chunks=1, natten_backend=None, attention=NAttentionKind.EAGER_SDPA, compile_blocks=False, compile_det_stages=False),
+    )
+
+    g = torch.Generator().manual_seed(5)
+    z = torch.randn(1, 128, 3, 8, 8, generator=g)
+    with torch.no_grad():
+        t = time.time()
+        padded = diffusion_tiling.pad_trailing_latent_for_natten_border(z, dec._natten_trailing_pad_latent_frames)
+        feat = dec.forward_stages_1_to_3(padded, drop_leading_frame=True)
+        print(f"diffvae: stages 1-3 to {tuple(feat.shape)} in {time.time() - t:.1f} s")
+        t = time.time()
+        context = dec.forward_stage_4(feat, drop_leading_frame=True, pad_trailing=True)
+        print(f"diffvae: stage 4 to {tuple(context.shape)} in {time.time() - t:.1f} s")
+        f5, h5, w5 = context.shape[1], context.shape[2] * dec.patch_size, context.shape[3] * dec.patch_size
+        noise = torch.randn(1, 3, f5, h5, w5, generator=g)
+        t = time.time()
+        pixels = dec.forward_diff_step(dec._context_and_x_for_diff_step(context, noise), torch.ones(1))
+        print(f"diffvae: stage 5 to {tuple(pixels.shape)} in {time.time() - t:.1f} s")
+    save_file(
+        {
+            "latent": z[0].contiguous(),
+            # Channels-last, as the reference keeps them: [T, H, W, C].
+            "stage4_input": feat[0].contiguous(),
+            "context": context[0].contiguous(),
+            # Frames first, as kvad keeps them: [T, 3, H, W].
+            "noise": noise[0].permute(1, 0, 2, 3).contiguous(),
+            "pixels": pixels[0].permute(1, 0, 2, 3).contiguous(),
+        },
+        f"{out}/diffvae_f32.safetensors",
+    )
+
+    # The reference's own bf16 on MPS, each stage from its f32 input, as
+    # kvad's check runs it: the drift bf16 costs the reference itself.
+    if torch.backends.mps.is_available():
+        m = dec.to("mps", torch.bfloat16)
+        on = lambda x: x.to("mps", torch.bfloat16)
+        with torch.no_grad():
+            t = time.time()
+            f16 = m.forward_stages_1_to_3(on(padded), drop_leading_frame=True).float().cpu()
+            c16 = m.forward_stage_4(on(feat), drop_leading_frame=True, pad_trailing=True).float().cpu()
+            p16 = m.forward_diff_step(m._context_and_x_for_diff_step(on(context), on(noise)), torch.ones(1, device="mps")).float().cpu()
+            print(f"diffvae: the reference in bf16 on MPS, {time.time() - t:.1f} s")
+        save_file(
+            {"stage4_input": f16[0].contiguous(), "context": c16[0].contiguous(), "pixels": p16[0].permute(1, 0, 2, 3).contiguous()},
+            f"{out}/diffvae_bf16.safetensors",
+        )
 
 
 def audio(path, out):
@@ -685,6 +775,7 @@ if __name__ == "__main__":
     p.add_argument("--guided", action="store_true", help="with --dit --contexts: one guided prediction, writing dit_guided_*")
     p.add_argument("--contexts", help="text_contexts_f32.safetensors from --text, or `random`: the DiT's first blocks against them")
     p.add_argument("--duration", help="model_patches/ltx-2.5-duration-head-bf16.safetensors, on OUT/duration_contexts.safetensors")
+    p.add_argument("--diffvae", help="vae/ltx-2.5-video-vae-bf16.safetensors: the diffusion decoder, stage by stage")
     p.add_argument("--picture", help="with --video: a picture for image-to-video, `synthetic` for one drawn here")
     p.add_argument("--upsampler", help="latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors, with --vae and --latent")
     p.add_argument("--vae", help="vae/ltx-2.5-video-vae-conv-bf16.safetensors, for the upsampler's statistics")
@@ -707,6 +798,8 @@ if __name__ == "__main__":
         transformer(a.dit, a.out, a.contexts, a.blocks, a.lora, a.guided)
     if a.duration:
         duration(a.duration, a.out)
+    if a.diffvae:
+        diffvae(a.diffvae, a.out)
     if a.upsampler:
         upsampler(a.upsampler, a.vae, a.latent, a.out)
     print(f"wrote {a.out} in {time.time() - started:.0f} s")

@@ -33,6 +33,7 @@ pub const VIDEOS: &str = "usage: kvad videos [ls]
        kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]
                                [--seconds S | --frames N] [--fps N] [--seed N] [--silent]
                                [--image PICTURE] [--steps N] [--guidance G] [--negative TEXT]
+                               [--decoder diffusion|conv]
        kvad videos show ID
        kvad videos watch ID    follow it until it ends
        kvad videos get ID [--out FILE]
@@ -49,6 +50,9 @@ with no --seconds or --frames, LTX-2.5 chooses the length from the prompt.
 --steps, --guidance or --negative runs LTX-2.5's dev model, guided, rather than
 its distilled one: 30 steps at guidance 3 unless given, about four times as long.
 Its files come from `kvad pull Lightricks/LTX-2.5 --dev` (51 GB).
+
+--decoder picks how LTX-2.5's latents become frames: diffusion, the default and
+the reference's, or conv, lighter and about twice as fast to decode.
 
 --image starts the video from a picture, which becomes its first frame, scaled
 to cover the video's size and cut from the middle. Any format the server's
@@ -1202,6 +1206,9 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
             if let Some(n) = &args.negative {
                 body["negative_prompt"] = json!(n);
             }
+            if let Some(d) = &args.decoder {
+                body["decoder"] = json!(d);
+            }
             if let Some(path) = &args.image {
                 let bytes = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;
                 // The server reads the picture by its bytes, not its name,
@@ -1224,7 +1231,7 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                 true => out::json(&video),
                 false => eprintln!(
                     "{path}: {}, {} frames at {} fps, seed {}{}\n  \
-                     {} {:.1} s, denoise {:.1} s, decode {:.1} s",
+                     {} {:.1} s, denoise {:.1} s, decode{} {:.1} s",
                     out::s(&video["size"]),
                     out::s(&k["frames"]),
                     out::s(&k["fps"]),
@@ -1233,6 +1240,7 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                     if k["picture_url"].is_string() { "picture and text" } else { "text" },
                     k["encode_secs"].as_f64().unwrap_or(0.0),
                     k["denoise_secs"].as_f64().unwrap_or(0.0),
+                    k["decoder"].as_str().map(|d| format!(" ({d})")).unwrap_or_default(),
                     k["decode_secs"].as_f64().unwrap_or(0.0),
                 ),
             }
@@ -1255,7 +1263,8 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                 false => {
                     println!("{}  {}", out::s(&v["id"]), state(&v));
                     let (size, seed) = (out::s(&v["size"]), out::s(&v["kvad"]["seed"]));
-                    println!("  {size}, {}, seed {seed}, {}", length(&v), out::s(&v["model"]));
+                    let decoder = v["kvad"]["decoder"].as_str().map(|d| format!(", {d} decoder")).unwrap_or_default();
+                    println!("  {size}, {}, seed {seed}{decoder}, {}", length(&v), out::s(&v["model"]));
                     println!("  {}", out::s(&v["prompt"]));
                 }
             }

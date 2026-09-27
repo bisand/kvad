@@ -375,7 +375,12 @@ Q8(bfloat, bf16, bfloat, bf16)
 // memory and walks all of `K` itself; the kernel only says which tile is
 // whose. Measured against feeding `K` in steps, or staging `B` in
 // threadgroup memory, this is the fastest there is.
-template <typename T, int TM, int TN, int TSG>
+//
+// With ACC, `C += A · B`: what is in `C` joins the f32 sums before they are
+// rounded, once. `C` filled with a bias's rows is then `A · B + b` rounded
+// as PyTorch's `addmm` rounds it, where adding the bias to the rounded
+// product rounds twice.
+template <typename T, int TM, int TN, int TSG, bool ACC>
 kernel void mm_dense(device T *a [[buffer(0)]],
                      device T *b [[buffer(1)]],
                      device T *c [[buffer(2)]],
@@ -386,7 +391,9 @@ kernel void mm_dense(device T *a [[buffer(0)]],
     tensor<device T, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
     tensor<device T, dextents<int32_t, 2>, tensor_inline> tb(b, dextents<int32_t, 2>(N, K));
     tensor<device T, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
-    constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), false, false, false,
+                                              ACC ? matmul2d_descriptor::mode::multiply_accumulate
+                                                  : matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroups<TSG>> op;
     auto ma = ta.slice(0, tg.y * TM);
     auto mb = tb.slice(tg.x * TN, 0);
@@ -396,7 +403,9 @@ kernel void mm_dense(device T *a [[buffer(0)]],
 
 #define DENSE(T, tn, TM, TN, TSG) \
     template [[host_name("mm_dense_" #tn "_" #TM "x" #TN)]] [[kernel]] \
-    decltype(mm_dense<T, TM, TN, TSG>) mm_dense<T, TM, TN, TSG>;
+    decltype(mm_dense<T, TM, TN, TSG, false>) mm_dense<T, TM, TN, TSG, false>; \
+    template [[host_name("mm_dense_acc_" #tn "_" #TM "x" #TN)]] [[kernel]] \
+    decltype(mm_dense<T, TM, TN, TSG, true>) mm_dense<T, TM, TN, TSG, true>;
 DENSE(half, f16, 64, 64, 4)
 DENSE(half, f16, 128, 128, 8)
 DENSE(bfloat, bf16, 64, 64, 4)
@@ -417,8 +426,9 @@ pub(crate) fn available(device: &Device) -> bool {
 struct Pipes {
     /// `[f16, bf16]` in, each `[f32, f16, bf16]` out.
     q8: [[ComputePipeline; 3]; 2],
-    /// `[f16, bf16]`, each in [`DENSE_TILES`]' order.
-    dense: [[ComputePipeline; 2]; 2],
+    /// `[C = A·B, C += A·B]`, each `[f16, bf16]`, each in [`DENSE_TILES`]'
+    /// order.
+    dense: [[[ComputePipeline; 2]; 2]; 2],
 }
 
 fn pipes(device: &Device) -> Option<&'static Pipes> {
@@ -443,11 +453,14 @@ fn pipes(device: &Device) -> Option<&'static Pipes> {
                 let [(m0, n0, _), (m1, n1, _)] = DENSE_TILES;
                 Ok([pipe(&format!("mm_dense_{tn}_{m0}x{n0}"))?, pipe(&format!("mm_dense_{tn}_{m1}x{n1}"))?])
             };
+            let dense = |acc: &str| -> Result<[[ComputePipeline; 2]; 2], candle_metal_kernels::MetalKernelError> {
+                Ok([dense(&format!("{acc}f16"))?, dense(&format!("{acc}bf16"))?])
+            };
             let q8 = |inp: &str| -> Result<[ComputePipeline; 3], candle_metal_kernels::MetalKernelError> {
                 let p = |on: &str| pipe(&format!("mm_q8_0_{inp}_{on}"));
                 Ok([p("f32")?, p("f16")?, p("bf16")?])
             };
-            Ok(Pipes { q8: [q8("f16")?, q8("bf16")?], dense: [dense("f16")?, dense("bf16")?] })
+            Ok(Pipes { q8: [q8("f16")?, q8("bf16")?], dense: [dense("")?, dense("acc_")?] })
         });
         match built {
             Ok(p) => Some(p),
@@ -654,18 +667,59 @@ const BIG_TILE_ROWS: usize = 1024;
 /// - `m` is below [`DENSE_ROWS`], a decode step above all, where a
 ///   matrix-vector kernel is the right tool and a matrix unit is not.
 pub(crate) fn dense(x: &Tensor, w: &Tensor) -> candle_core::Result<Option<Tensor>> {
-    if pipes(x.device()).is_none()
+    if dense_declines(x, w, DENSE_ROWS)? {
+        return Ok(None);
+    }
+    let tile = usize::from(x.dim(0)? >= BIG_TILE_ROWS);
+    Ok(Some(dense_with(x, w, tile)?))
+}
+
+fn dense_declines(x: &Tensor, w: &Tensor, rows: usize) -> candle_core::Result<bool> {
+    Ok(pipes(x.device()).is_none()
         || x.rank() != 2
         || w.rank() != 2
         || x.dtype() != w.dtype()
         || !matches!(x.dtype(), DType::F16 | DType::BF16)
         || !w.is_contiguous()
-        || x.dim(0)? < DENSE_ROWS
-    {
+        || x.dim(0)? < rows)
+}
+
+/// `x · w + b` on the matrix units, the bias added to the f32 sums and the
+/// answer rounded once, as PyTorch's `addmm` rounds it; or `None` where
+/// [`dense`] would decline, except that any number of rows is taken. `b` is
+/// `[n]`, in `x`'s dtype or any other.
+///
+/// Rounding the product and then adding the bias rounds twice, and in bf16
+/// that is not nothing. In the DiffVAE decoder, whose every layer has a
+/// bias, it cost 3.2 dB against the reference by the frames: 47.6 dB where
+/// the reference's own bf16 is 50.8. The token-wide layers taken here won
+/// back 1.2 of that, and the one-row products that make the step's
+/// modulation the other 2.0: an error there is every token's. So a single
+/// row is taken too, where [`dense`] leaves it to candle for speed; a layer
+/// with a bias and one row is an embedding, not a decode step.
+///
+/// It is faster too: filling the answer with the bias's rows and adding the
+/// product into it beat the product and candle's broadcast add by 1.65–7×
+/// (`dense_bias_race`).
+pub(crate) fn dense_bias(x: &Tensor, w: &Tensor, b: &Tensor) -> candle_core::Result<Option<Tensor>> {
+    if dense_declines(x, w, 1)? || b.elem_count() != w.dim(1)? {
         return Ok(None);
     }
     let tile = usize::from(x.dim(0)? >= BIG_TILE_ROWS);
-    Ok(Some(dense_with(x, w, tile)?))
+    Ok(Some(dense_bias_with(x, w, b, tile)?))
+}
+
+fn dense_bias_with(x: &Tensor, w: &Tensor, b: &Tensor, tile: usize) -> candle_core::Result<Tensor> {
+    let (m, n) = (x.dim(0)?, w.dim(1)?);
+    // The answer, starting as the bias's rows, and accumulated into. One
+    // row of the bias is already contiguous, and `contiguous` would hand
+    // back the bias's own storage to add the product into; so would `copy`,
+    // whose Metal storage shares its buffer. `affine(1, 0)` writes a new
+    // one, and is exact.
+    let rows = b.to_dtype(x.dtype())?.reshape((1, n))?.broadcast_as((m, n))?;
+    let c = if rows.is_contiguous() { rows.affine(1.0, 0.0)? } else { rows.contiguous()? };
+    c.inplace_op3(&x.contiguous()?, w, &Dense { tile })?;
+    Ok(c)
 }
 
 /// [`dense`] in a given tile, whatever the shape: for the tests, and for
@@ -677,6 +731,47 @@ fn dense_with(x: &Tensor, w: &Tensor, tile: usize) -> candle_core::Result<Tensor
 struct Dense {
     /// Which of [`DENSE_TILES`].
     tile: usize,
+}
+
+impl Dense {
+    /// `a · b` into `out`, or with `acc`, `out + a · b`.
+    fn run(&self, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout, out: &candle_metal_kernels::metal::Buffer, acc: bool)
+     -> candle_core::Result<()> {
+        let (m, k) = la.shape().dims2()?;
+        let (_, n) = lb.shape().dims2()?;
+        let dt = a.dtype();
+        let dev = a.device();
+        let Some(pipes) = pipes(&Device::Metal(dev.clone())) else {
+            candle_core::bail!("mpp_dense: this device cannot run it");
+        };
+        let (tm, tn, sg) = DENSE_TILES[self.tile];
+        let guard = dev.command_encoder()?;
+        let enc: &ComputeCommandEncoder = guard.as_ref();
+        enc.set_label("mpp_dense");
+        enc.set_compute_pipeline_state(&pipes.dense[usize::from(acc)][usize::from(dt == DType::BF16)][self.tile]);
+        enc.set_input_buffer(0, Some(a.buffer()), la.start_offset() * dt.size_in_bytes());
+        enc.set_input_buffer(1, Some(b.buffer()), lb.start_offset() * dt.size_in_bytes());
+        enc.set_output_buffer(2, Some(out), 0);
+        enc.set_bytes(3, &(m as i32));
+        enc.set_bytes(4, &(n as i32));
+        enc.set_bytes(5, &(k as i32));
+        enc.dispatch_thread_groups(
+            MTLSize { width: n.div_ceil(tn), height: m.div_ceil(tm), depth: 1 },
+            shape(sg),
+        );
+        Ok(())
+    }
+
+    /// `[m, n]` for `a · b`, if the two are what the kernel reads.
+    fn shape_of(a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout) -> candle_core::Result<(usize, usize)> {
+        let (m, k) = la.shape().dims2()?;
+        let (kb, n) = lb.shape().dims2()?;
+        let dt = a.dtype();
+        if !matches!(dt, DType::F16 | DType::BF16) || k != kb || b.dtype() != dt || !la.is_contiguous() || !lb.is_contiguous() {
+            candle_core::bail!("mpp_dense: [{m}, {k}] x [{kb}, {n}], {dt:?} x {:?}", b.dtype());
+        }
+        Ok((m, n))
+    }
 }
 
 impl CustomOp2 for Dense {
@@ -691,22 +786,9 @@ impl CustomOp2 for Dense {
 
     fn metal_fwd(&self, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout)
      -> candle_core::Result<(MetalStorage, Shape)> {
-        let (m, k) = la.shape().dims2()?;
-        let (kb, n) = lb.shape().dims2()?;
+        let (m, n) = Dense::shape_of(a, la, b, lb)?;
         let dt = a.dtype();
-        let which = match dt {
-            DType::F16 => 0,
-            DType::BF16 => 1,
-            _ => candle_core::bail!("mpp_dense: {dt:?} is not f16 or bf16"),
-        };
-        if k != kb || b.dtype() != dt || !la.is_contiguous() || !lb.is_contiguous() {
-            candle_core::bail!("mpp_dense: [{m}, {k}] x [{kb}, {n}], {dt:?} x {:?}", b.dtype());
-        }
         let dev = a.device();
-        let Some(pipes) = pipes(&Device::Metal(dev.clone())) else {
-            candle_core::bail!("mpp_dense: this device cannot run it");
-        };
-        let (tm, tn, sg) = DENSE_TILES[self.tile];
         let bytes = m * n * dt.size_in_bytes();
         let out = dev.allocate_buffer(bytes)?;
         // As for `Q8`: under test every output starts as NaN.
@@ -715,21 +797,29 @@ impl CustomOp2 for Dense {
             let mut blit = dev.blit_command_encoder()?;
             blit.fill_buffer(&out, (0, bytes), 0xff);
         }
-        let guard = dev.command_encoder()?;
-        let enc: &ComputeCommandEncoder = guard.as_ref();
-        enc.set_label("mpp_dense");
-        enc.set_compute_pipeline_state(&pipes.dense[which][self.tile]);
-        enc.set_input_buffer(0, Some(a.buffer()), la.start_offset() * dt.size_in_bytes());
-        enc.set_input_buffer(1, Some(b.buffer()), lb.start_offset() * dt.size_in_bytes());
-        enc.set_output_buffer(2, Some(&out), 0);
-        enc.set_bytes(3, &(m as i32));
-        enc.set_bytes(4, &(n as i32));
-        enc.set_bytes(5, &(k as i32));
-        enc.dispatch_thread_groups(
-            MTLSize { width: n.div_ceil(tn), height: m.div_ceil(tm), depth: 1 },
-            shape(sg),
-        );
+        self.run(a, la, b, lb, &out, false)?;
         Ok((MetalStorage::new(out, dev.clone(), m * n, dt), Shape::from((m, n))))
+    }
+}
+
+/// `c += a · b`, in place: [`dense_bias`], `c` holding the bias's rows.
+impl candle_core::InplaceOp3 for Dense {
+    fn name(&self) -> &'static str {
+        "mpp_dense_acc"
+    }
+
+    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout)
+     -> candle_core::Result<()> {
+        candle_core::bail!("mpp_dense runs on Metal only")
+    }
+
+    fn metal_fwd(&self, c: &mut MetalStorage, lc: &Layout, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout)
+     -> candle_core::Result<()> {
+        let (m, n) = Dense::shape_of(a, la, b, lb)?;
+        if lc.dims() != [m, n] || c.dtype() != a.dtype() || !lc.is_contiguous() || lc.start_offset() != 0 {
+            candle_core::bail!("mpp_dense: accumulating [{m}, {n}] {:?} into {lc:?} {:?}", a.dtype(), c.dtype());
+        }
+        self.run(a, la, b, lb, c.buffer(), true)
     }
 }
 
@@ -884,6 +974,100 @@ mod tests {
                     assert!(apart <= tol * scale, "{dt:?} tile {tile} [{m}, {k}] x [{k}, {n}]: {apart} apart at scale {scale}");
                 }
             }
+        }
+    }
+
+    /// With a bias, the answer is the f32 `x · w + b` rounded once: nearer
+    /// to it than the product rounded, the bias added and rounded again, in
+    /// both dtypes and tiles, and within one rounding of it everywhere.
+    #[test]
+    fn dense_bias_rounds_once() {
+        let Ok(dev) = Device::new_metal(0) else { return };
+        if !available(&dev) {
+            return;
+        }
+        for dt in [DType::F16, DType::BF16] {
+            for tile in 0..DENSE_TILES.len() {
+                for (m, k, n) in [(256, 128, 256), (77, 320, 192), (300, 96, 70), (129, 32, 130), (1, 256, 384), (7, 64, 20)] {
+                    let on = |t: Tensor| t.to_dtype(dt).unwrap().to_device(&dev).unwrap();
+                    let x = on((rand(m * k, m as f32).reshape((m, k)).unwrap() * 4.0).unwrap());
+                    let w = on(rand(k * n, n as f32 + 0.5).reshape((k, n)).unwrap());
+                    let b = on((rand(n, 7.0) * 8.0).unwrap());
+                    let f = |t: &Tensor| t.to_dtype(DType::F32).unwrap();
+                    let exact = f(&x).matmul(&f(&w)).unwrap().broadcast_add(&f(&b)).unwrap();
+                    let before = f(&b).to_vec1::<f32>().unwrap();
+                    let got = f(&dense_bias_with(&x, &w, &b, tile).unwrap());
+                    // The bias is read, never written: with one row it once
+                    // took the product itself.
+                    assert_eq!(f(&b).to_vec1::<f32>().unwrap(), before, "{dt:?} [{m}, {k}]: the bias changed");
+                    let twice = f(&dense_with(&x, &w, tile).unwrap().broadcast_add(&b).unwrap());
+                    assert!(got.sum_all().unwrap().to_scalar::<f32>().unwrap().is_finite(), "not all written");
+                    let off = |t: &Tensor| (t - &exact).unwrap().abs().unwrap();
+                    let mean = |t: &Tensor| off(t).mean_all().unwrap().to_scalar::<f32>().unwrap();
+                    let (ours, theirs) = (mean(&got), mean(&twice));
+                    let what = format!("{dt:?} tile {tile} [{m}, {k}] x [{k}, {n}]");
+                    assert!(ours < theirs, "{what}: {ours} from the exact answer, rounding twice {theirs}");
+                    // One rounding is at most half a unit in the last place;
+                    // allow a whole one for the order the sums are taken in.
+                    let ulp = if dt == DType::F16 { 1.0 / 1024.0 } else { 1.0 / 128.0 };
+                    let most = off(&got).broadcast_div(&exact.abs().unwrap().maximum(1e-3).unwrap()).unwrap()
+                        .max_all().unwrap().to_scalar::<f32>().unwrap();
+                    assert!(most <= ulp, "{what}: {most} of its own size from the exact answer");
+                }
+            }
+        }
+    }
+
+    /// Not a test, a measurement: [`dense_bias`] against the product and
+    /// then the bias added, taking turns.
+    ///
+    /// Measured when written, bf16: 1.65× at `[4096, 3072] × [3072, 3072]`,
+    /// 2.0× at the DiffVAE's stage-1 feed-forward, 6.6–7.1× at its stage 5's
+    /// 256-wide projections, where candle's broadcast add took six times as
+    /// long as the product.
+    ///
+    ///     cargo test --release -p kvad-gpu dense_bias_race -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dense_bias_race() {
+        let dev = Device::new_metal(0).unwrap();
+        assert!(available(&dev));
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        // (what, m, k, n)
+        for (what, m, k, n) in [
+            ("DiffVAE stage 5 w_gate", 262_144, 256, 1024),
+            ("DiffVAE stage 5 qkv", 262_144, 256, 768),
+            ("DiffVAE stage 1 w_up", 6912, 2048, 8192),
+            ("square, 4096 rows", 4096, 3072, 3072),
+        ] {
+            let x = Tensor::randn(0f32, 1.0, (m, k), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+            let w = Tensor::randn(0f32, 0.05, (k, n), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+            let b = Tensor::randn(0f32, 1.0, n, &dev).unwrap().to_dtype(DType::BF16).unwrap();
+            let time = |f: &dyn Fn()| {
+                dev.synchronize().unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..10 {
+                    f();
+                }
+                dev.synchronize().unwrap();
+                t.elapsed().as_secs_f64() / 10.0
+            };
+            let twice = || drop(dense(&x, &w).unwrap().unwrap().broadcast_add(&b).unwrap());
+            let once = || drop(dense_bias(&x, &w, &b).unwrap().unwrap());
+            time(&twice);
+            time(&once);
+            let (mut a, mut c) = (vec![], vec![]);
+            for _ in 0..5 {
+                a.push(time(&twice));
+                c.push(time(&once));
+            }
+            let (a, c) = (median(a), median(c));
+            let flops = 2.0 * (m * k * n) as f64;
+            println!("{what:<24} then added {:8.3} ms {:5.1} TFLOP/s | in the sums {:8.3} ms {:5.1} TFLOP/s | {:4.2}x",
+                     a * 1e3, flops / a / 1e12, c * 1e3, flops / c / 1e12, a / c);
         }
     }
 

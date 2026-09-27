@@ -6,6 +6,14 @@
 //! refines it at full size, and is dropped; the decoders make the frames and
 //! the sound.
 //!
+//! **DFR** (`ltx_dfr`), the reference's production pipeline, runs when a
+//! request asks for it and whenever it asks for more than 30 fps: stage 1
+//! with generated keyframes, both upsampled, stage 2 on the DiT with the
+//! detailing IC-LoRA fused in (cached apart, as the dev model's second DiT
+//! is), the temporal rounds on the plain DiT again, and the keyframe-aware
+//! decode. The LoRA is gated on the Hub and fetched by the first DFR
+//! request, so an account without access keeps the fast pipeline.
+//!
 //! # Nothing is kept between generations
 //!
 //! The plan was to keep the DiT resident and reload the text path for each
@@ -23,11 +31,11 @@
 use super::ltx_dit::{video_tokens, Dit, Shape};
 use super::ltx_sample::{dev_sigmas, guided, one_stage, refine, Guide, Latents, AUDIO_GUIDE, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
 use super::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
-use super::{ltx_audio, ltx_diffvae, ltx_duration, ltx_upsample, ltx_vae};
+use super::{ltx_audio, ltx_dfr, ltx_diffvae, ltx_duration, ltx_upsample, ltx_vae};
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::Image;
-use kvad::video::{Decoder, Defaults, Director, Filmed, Step, VideoRequest};
+use kvad::video::{Decoder, Defaults, Director, Filmed, Pipeline, Resolved, Step, VideoRequest};
 use kvad::weights::{fetch_file, Watcher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -203,6 +211,8 @@ impl Ltx {
             guided: Some(kvad::video::Guided { steps: super::ltx_sample::DEV_STEPS, max_steps: 60, guidance: VIDEO_GUIDE.cfg }),
             // The reference's default: its README's video VAE.
             decoder: Some(Decoder::Diffusion),
+            // DFR, whose detailing LoRA is fetched by its first request.
+            dfr: true,
         };
         Ok(Ltx { repo: repo.to_string(), paths, head, quant, device, defaults, params })
     }
@@ -289,6 +299,9 @@ impl Ltx {
     /// [`Director::film`], before the synchronise that frees what it held.
     fn run(&self, req: &VideoRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Filmed> {
         let r = req.resolved(&self.defaults)?;
+        if r.pipeline == Some(Pipeline::Dfr) {
+            return self.run_dfr(r, req, on_step);
+        }
         let mut r = r;
         let fps = r.fps as f64;
         // Until the head has chosen a length, the shapes and the plan are
@@ -473,6 +486,301 @@ impl Ltx {
         let video = ltx_vae::to_video(&frames, r.fps)?;
         let decode_secs = t.elapsed().as_secs_f64();
         report("decode", 1, 1, total.get(), None)?;
+        Ok(Filmed { video, audio, request: r, encode_secs, denoise_secs, decode_secs })
+    }
+}
+
+/// Seconds each part of a DFR generation is expected to take, as [`Plan`]'s,
+/// from the same fit of a DiT step's time to its tokens.
+struct DfrPlan {
+    picture: f64,
+    text: f64,
+    load: f64,
+    stage_1: f64,
+    upsample: f64,
+    /// Loading the DiT with the detailing LoRA; the first time, fusing and
+    /// quantising it too.
+    load_2: f64,
+    stage_2: f64,
+    /// Each round's tiles' steps, and loading the plain DiT again for them.
+    rounds: Vec<f64>,
+    load_3: f64,
+    decode: f64,
+}
+
+impl DfrPlan {
+    fn new(half: Shape, full: Shape, canvas: &ltx_dfr::Canvas, rounds: u32, picture: bool, decoder: Option<Decoder>) -> Self {
+        let step = |tokens: usize| tokens as f64 * (1.386e-3 + 2.86e-8 * tokens as f64);
+        let at_768 = (768 * 512 * 121) as f64;
+        let keys = canvas.keyframes.len();
+        // Each round's tiles, and what each holds: its frames, its anchors
+        // and its new keyframes, a latent frame each.
+        let mut seams = canvas.keyframes.clone();
+        let mut frames = canvas.frames;
+        let mut round_secs = Vec::new();
+        for r in 1..=rounds {
+            frames = 2 * (frames - 1) + 1;
+            let doubled: Vec<usize> = seams.iter().map(|p| 2 * p).collect();
+            let tiles = ltx_dfr::tiles(&doubled, frames, 1 << r).unwrap_or_default();
+            round_secs.push(tiles.iter().map(|t| step((t.end - t.start + t.anchors.len() + t.slots.len()) * full.frame_tokens()) * 4.0).sum());
+            let mut next: Vec<usize> = doubled.iter().copied().chain(tiles.iter().flat_map(|t| t.slots.iter().copied())).collect();
+            next.sort_unstable();
+            next.dedup();
+            seams = next;
+        }
+        let out = (full.width * full.height * frames) as f64;
+        DfrPlan {
+            picture: if picture { 1.0 } else { 0.0 },
+            text: 9.4,
+            load: 3.5,
+            stage_1: step(half.video_tokens() + keys * half.frame_tokens()),
+            upsample: 2.1 * full.video_tokens() as f64 / 6144.0,
+            load_2: 3.5,
+            stage_2: step(full.video_tokens() + keys * full.frame_tokens() + half.video_tokens()),
+            rounds: round_secs,
+            load_3: if rounds > 0 { 5.0 } else { 0.0 },
+            // As the fast decode's, and the keyframes' 8–21% more.
+            decode: match decoder {
+                Some(Decoder::Diffusion) => 1.15 * 22.0 * out / at_768,
+                _ => 13.0 * out / at_768,
+            },
+        }
+    }
+
+    fn total(&self) -> f64 {
+        let s1 = (STAGE_1.len() - 1) as f64;
+        let s2 = (STAGE_2.len() - 1) as f64;
+        self.picture + self.text + self.load + self.stage_1 * s1 + self.upsample + self.load_2 + self.stage_2 * s2 + self.load_3 + self.rounds.iter().sum::<f64>() + self.decode
+    }
+}
+
+/// DFR's detailing LoRA, fetched by the first request that runs DFR: its
+/// repo is gated, and an account that has not accepted its terms gets the
+/// fast pipeline all the same.
+fn detailing_lora() -> Res<PathBuf> {
+    fetch_file(ltx_dfr::DETAILING_REPO, ltx_dfr::DETAILING_FILE, &Watcher::none()).map_err(|e| {
+        let e = e.to_string();
+        match e.contains("Gated") || e.contains("403") || e.contains("401") || e.contains("restricted") {
+            true => format!(
+                "DFR needs its detailing LoRA, {}, which is gated: accept its terms at https://huggingface.co/{} with the \
+                 Hugging Face account whose token Kvad uses, then ask again ({e})",
+                ltx_dfr::DETAILING_FILE,
+                ltx_dfr::DETAILING_REPO
+            )
+            .into(),
+            false => e.into(),
+        }
+    })
+}
+
+impl Ltx {
+    /// [`Ltx::run`] for DFR (`ltx_dfr`): stage 1 at half size with its
+    /// keyframes, both upsampled, stage 2 with the detailing LoRA and the
+    /// half-size video as reference, the temporal rounds `r.rounds` asks
+    /// for, and the keyframe-aware decode. The clip `r` describes is the
+    /// one delivered; its first stages make `r.base()`.
+    fn run_dfr(&self, r: Resolved, req: &VideoRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Filmed> {
+        let mut r = r;
+        let (device, dtype, quant) = (&self.device, DType::BF16, Some(self.quant));
+        let rounds = r.rounds;
+        // The files DFR reads beyond the fast pipeline's, first: a request
+        // that cannot run should say so before anything loads.
+        let lora = detailing_lora()?;
+        let downscale = ltx_dfr::reference_downscale(&lora)?;
+        let temporal = match rounds {
+            0 => None,
+            _ => Some(fetch_file(&self.repo, ltx_upsample::TEMPORAL_FILE, &Watcher::none())?),
+        };
+        let (mut base, base_fps) = r.base();
+        let fps = base_fps as f64;
+        let cond = ltx_dfr::conditioning_fps(fps);
+        // Until the head has chosen, the canvas and plan are the longest.
+        let shapes = |frames: usize| -> Res<(ltx_dfr::Canvas, Shape, Shape, Shape)> {
+            let canvas = ltx_dfr::canvas(frames)?;
+            let half = Shape::new(r.width / 2, r.height / 2, canvas.frames, cond)?;
+            let full = Shape::new(r.width, r.height, canvas.frames, cond)?;
+            // The sound as long as the canvas plays, at the rate it plays.
+            let sound = Shape::new(r.width, r.height, canvas.frames, fps)?;
+            Ok((canvas, half, full, sound))
+        };
+        let (mut canvas, mut half, mut full, mut sound) = shapes(base)?;
+        let mut plan = DfrPlan::new(half, full, &canvas, rounds, req.image.is_some(), r.decoder);
+        let total = std::cell::Cell::new(plan.total());
+        let chosen = std::cell::Cell::new(None);
+        let started = Instant::now();
+        let mut report = |phase: &'static str, done: usize, of: usize, before: f64, preview: Option<Image>| -> Res<()> {
+            let progress = (before / total.get()).clamp(0.0, 1.0) as f32;
+            let elapsed = started.elapsed().as_secs_f64();
+            match on_step(Step { phase, frames: chosen.get(), done, total: of, progress, elapsed, preview }) {
+                true => Ok(()),
+                false => Err("cancelled".into()),
+            }
+        };
+        let mut quiet = |_: &str| {};
+        // Noise of its own streams, apart from the fast pipeline's.
+        let draws = std::cell::Cell::new(0u64);
+        let mut noise = |dims: &[usize]| -> Res<Vec<f32>> {
+            let n = crate::image::nn::noise(r.seed.wrapping_add(0xD0F0_0000_0000).wrapping_add(draws.get().wrapping_mul(0x9E37_79B9_7F4A_7C15)), dims, &Device::Cpu, DType::F32)?;
+            draws.set(draws.get() + 1);
+            Ok(n.flatten_all()?.to_vec1::<f32>()?)
+        };
+
+        // 0. The picture, at both stages' sizes.
+        let t = Instant::now();
+        let stills = match &req.image {
+            None => None,
+            Some(p) => {
+                report("picture", 0, 1, 0.0, None)?;
+                let enc = ltx_vae::ImageEncoder::load(&self.paths[3], device, dtype)?;
+                let at = |s: Shape| -> Res<Tensor> {
+                    let z = enc.encode(&ltx_vae::picture(&p.rgb, p.width, p.height, s.width, s.height)?.to_device(device)?)?;
+                    Ok(video_tokens(&z)?.to_dtype(DType::F32)?)
+                };
+                let stills = (at(half)?, at(full)?);
+                drop(enc);
+                device.synchronize()?;
+                Some(stills)
+            }
+        };
+        let (still_1, still_2) = match &stills {
+            Some((a, b)) => (Some(a), Some(b)),
+            None => (None, None),
+        };
+
+        // 1. The prompt, and the length the head chooses, at the first
+        // stages' rate: the rounds double the frames, not the seconds.
+        report("text", 0, 1, plan.picture, None)?;
+        let ctx = TextEncoder::load(&self.paths[0], &self.paths[1], device, dtype, quant, &mut quiet)?.encode(&r.prompt)?;
+        if let (true, Some(path)) = (r.chosen, &self.head) {
+            let seconds = ltx_duration::DurationHead::load(path, device)?.seconds(&ctx.video, &ctx.audio)?;
+            let most = ((ltx_duration::MAX_SECONDS * fps).round() as usize).min(base);
+            base = ltx_duration::frames_for(seconds, fps, (ltx_duration::MIN_SECONDS * fps).round() as usize, most);
+            r.frames = (base - 1) * (1 << rounds) + 1;
+            (canvas, half, full, sound) = shapes(base)?;
+            plan = DfrPlan::new(half, full, &canvas, rounds, req.image.is_some(), r.decoder);
+            total.set(plan.total());
+            chosen.set(Some(r.frames));
+        }
+        device.synchronize()?;
+        let encode_secs = t.elapsed().as_secs_f64();
+        let ctx = Contexts { video: ctx.video, audio: ctx.audio };
+
+        // 2. Stage 1, at half size with the keyframes.
+        let t = Instant::now();
+        let mut done = plan.picture + plan.text;
+        let s1 = STAGE_1.len() - 1;
+        report("stage 1", 0, s1, done, None)?;
+        let dit = Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?;
+        done += plan.load;
+        let one = {
+            let mut step = |i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
+                report("stage 1", i + 1, s1, done + plan.stage_1 * (i + 1) as f64, Some(preview(clean, half)?))
+            };
+            ltx_dfr::first(&dit, &ctx, half, sound, &canvas.keyframes, still_1, &mut noise, &mut step)?
+        };
+        done += plan.stage_1 * s1 as f64;
+        drop(dit);
+        device.synchronize()?;
+
+        // 3. The video and its keyframes upsampled, each on its own.
+        report("upsample", 0, 1, done, None)?;
+        let (upsampled, keys) = {
+            let up = ltx_upsample::Upsampler::load(&self.paths[2], &self.paths[3], device, DType::F32)?;
+            let k = one.keyframes.as_ref().ok_or("stage 1 made no keyframes")?;
+            (up.forward(&one.video.to_device(device)?)?, up.forward(&k.to_device(device)?)?)
+        };
+        device.synchronize()?;
+        done += plan.upsample;
+
+        // 4. Stage 2, with the detailing LoRA and stage 1's video beside.
+        let s2 = STAGE_2.len() - 1;
+        report("stage 2", 0, s2, done, None)?;
+        let detailing = Dit::load_as(&self.paths[1], Some((&lora, ltx_dfr::DETAILING_STRENGTH as f64)), "transformer-detailing", device, dtype, None, quant, &mut quiet)?;
+        done += plan.load_2;
+        let two = {
+            let from = ltx_dfr::Detailing { upsampled: &upsampled, keyframes: &keys, reference: &one.video, audio: &one.audio };
+            let mut step = |i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
+                report("stage 2", i + 1, s2, done + plan.stage_2 * (i + 1) as f64, Some(preview(clean, full)?))
+            };
+            ltx_dfr::second(&detailing, &ctx, full, sound, &canvas.keyframes, &from, downscale, still_2, &mut noise, &mut step)?
+        };
+        done += plan.stage_2 * s2 as f64;
+        drop((detailing, upsampled, keys));
+        device.synchronize()?;
+
+        // 5. The temporal rounds, on the plain DiT again.
+        let mut clip = ltx_dfr::Clip {
+            video: two.video,
+            keyframes: two.keyframes.ok_or("stage 2 made no keyframes")?,
+            positions: canvas.keyframes.clone(),
+            frames: canvas.frames,
+            fps,
+        };
+        if let Some(temporal) = &temporal {
+            let dit = Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?;
+            let up = ltx_upsample::Upsampler::load(temporal, &self.paths[3], device, DType::F32)?;
+            done += plan.load_3;
+            let duration = canvas.frames as f64 / fps;
+            for round in 1..=rounds {
+                let phase = if round == 1 { "round 1" } else { "round 2" };
+                let secs = plan.rounds[round as usize - 1];
+                let (w, h) = (r.width, r.height);
+                let mut step = |tile: usize, tiles: usize, i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
+                    let steps = ltx_dfr::TEMPORAL.len() - 1;
+                    let at = tile * steps + i + 1;
+                    let frames = clean.dim(0)? / full.frame_tokens();
+                    let look = preview(clean, Shape::new(w, h, 8 * (frames - 1) + 1, cond)?)?;
+                    report(phase, at, tiles * steps, done + secs * at as f64 / (tiles * steps) as f64, Some(look))
+                };
+                clip = ltx_dfr::round(&dit, &ctx, &up, &clip, round, &one.audio, duration, still_2, &mut noise, &mut step)?;
+                done += secs;
+                device.synchronize()?;
+            }
+        }
+        drop(ctx);
+        device.synchronize()?;
+        let denoise_secs = t.elapsed().as_secs_f64();
+
+        // 6. The clip asked for: the canvas padded its end, and the rounds
+        // map N frames to 2(N − 1) + 1. Keyframes past its end go.
+        let t = Instant::now();
+        let target = (base - 1) * (1 << rounds) + 1;
+        let latent = clip.video.narrow(1, 0, (target - 1) / 8 + 1)?;
+        let keep: Vec<usize> = (0..clip.positions.len()).filter(|&i| clip.positions[i] < target).collect();
+        let at = Tensor::from_vec(keep.iter().map(|&i| i as u32).collect::<Vec<_>>(), keep.len(), clip.keyframes.device())?;
+        let planes = clip.keyframes.index_select(&at, 1)?;
+        let positions: Vec<usize> = keep.iter().map(|&i| clip.positions[i]).collect();
+        let before = total.get() - plan.decode;
+        report("decode", 0, 1, before, None)?;
+        let frames = match r.decoder {
+            // With the keyframes beside the video, as DFR decodes.
+            Some(Decoder::Diffusion) => {
+                let dec = ltx_diffvae::DiffDecoder::load(&self.paths[5], device, dtype)?;
+                let mut tile = |i: usize, n: usize| report("decode", i, n, before + 0.85 * plan.decode * i as f64 / n as f64, None);
+                let keys = (!positions.is_empty()).then_some((&planes, positions.as_slice()));
+                dec.decode_keyed(&latent.to_device(device)?, keys, ltx_diffvae::noise_seed(r.seed), ltx_diffvae::BUDGET, &mut tile)?.0
+            }
+            // The conv decoder has no keyframes: the video alone.
+            _ => ltx_vae::VideoDecoder::load(&self.paths[3], device, dtype)?.decode(&latent.to_device(device)?)?.to_device(&Device::Cpu)?,
+        };
+        device.synchronize()?;
+        // Stage 1's sound, as long as the canvas: cut to the clip's length.
+        let play = r.fps;
+        let audio = match r.audio {
+            true => {
+                let mut a = ltx_audio::AudioPath::load(&self.paths[4], device)?.decode(&one.audio)?;
+                let keep = ((target as f64 / play as f64) * a.rate as f64).round() as usize * a.channels;
+                a.samples.truncate(keep);
+                Some(a)
+            }
+            false => None,
+        };
+        drop((latent, planes, clip, one));
+        device.synchronize()?;
+        let video = ltx_vae::to_video(&frames, play)?;
+        let decode_secs = t.elapsed().as_secs_f64();
+        report("decode", 1, 1, total.get(), None)?;
+        r.frames = target;
         Ok(Filmed { video, audio, request: r, encode_secs, denoise_secs, decode_secs })
     }
 }

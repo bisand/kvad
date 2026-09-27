@@ -462,6 +462,17 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       one step of diffusion from the seed's noise; or `conv`, the \
                       convolutional decoder, lighter and about twice as fast to decode. \
                       `kvad.decoder` says which made a video.\n\n\
+                      `pipeline` picks LTX-2.5's unguided pipeline: `fast`, its two \
+                      distilled stages, or `dfr`, the reference's production pipeline, \
+                      with generated keyframes, a detailing pass and a keyframe-aware \
+                      decode; slower, and finer. `fps` above 30 runs DFR whatever is \
+                      asked: its temporal rounds make the clip at half or a quarter of \
+                      the rate and double it, so fps must halve to 30 or less (48, 50, \
+                      60, 96, 100, 120), and frames are on a grid of 16 or 32. \
+                      `frames` and `fps` are the clip's as delivered. DFR's detailing \
+                      LoRA is gated on Hugging Face: its first request fetches it, and \
+                      is a 400 naming the page whose terms to accept when the server's \
+                      token may not. `kvad.pipeline` says which made a video.\n\n\
                       `input_reference` is a picture to start from, 20 MiB at most: a \
                       file in the form, or in JSON `{ image_url }` with a `data:` URL. \
                       A URL elsewhere and a `file_id` are refused. It becomes the first \
@@ -473,7 +484,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       engine that makes it answers nothing else meanwhile.",
         query: &[], body: json_body("`{ prompt, model?, size?, seconds?, frames?, fps?, seed?, \
                                      audio?, input_reference?, steps?, guidance_scale?, \
-                                     negative_prompt?, decoder? }`, or the same fields as \
+                                     negative_prompt?, decoder?, pipeline? }`, or the same fields as \
                                      `multipart/form-data`, with `input_reference` a file."),
         produces: JSON, events: &[],
     },

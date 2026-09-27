@@ -204,6 +204,19 @@
             <option value="conv">Convolutional decoder</option>
           </select>
         {/if}
+        {#if d?.dfr}
+          <select
+            class="select select-sm w-auto"
+            aria-label="Pipeline"
+            title="DFR is the reference's production pipeline: generated keyframes, a detailing pass and a keyframe-aware decode, slower and finer. Above 30 fps it runs whatever is chosen, doubling a clip made at half the rate or a quarter."
+            bind:value={v.pipeline}
+            disabled={v.guided}
+          >
+            <option value={null}>Pipeline: {v.dfr ? "DFR, for the frame rate" : "fast"}</option>
+            <option value="fast">Fast pipeline</option>
+            <option value="dfr">DFR, production quality</option>
+          </select>
+        {/if}
       </div>
       {#if d?.guided}
         <details class="collapse-arrow bg-base-200 rounded-box collapse" open={v.guided}>
@@ -358,7 +371,7 @@
             <figcaption class="flex flex-col gap-1 p-3">
               <p class="line-clamp-2 text-sm" title={g.prompt}>{g.prompt}</p>
               <p class="text-xs opacity-60">
-                {g.size} · {lengthOf(g)} · seed {g.kvad.seed}{#if g.kvad.guided}{" · "}guided, {g.kvad.guided.steps} steps{/if}{#if g.kvad.decoder === "conv"}{" · "}conv decoder{/if}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
+                {g.size} · {lengthOf(g)} · seed {g.kvad.seed}{#if g.kvad.guided}{" · "}guided, {g.kvad.guided.steps} steps{/if}{#if g.kvad.pipeline === "dfr"}{" · "}DFR{/if}{#if g.kvad.decoder === "conv"}{" · "}conv decoder{/if}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
                     class="link"
                     href={g.kvad.picture_url}
                     target="_blank"

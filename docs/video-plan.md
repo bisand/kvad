@@ -778,6 +778,322 @@ a little finer in texture, sand and fur, and the difference is subtle at this
 size. At 1536×1024 the decode takes 88 s in the pipeline against 62–70 s on
 its own. That is not yet explained.
 
+### The temporal upsampler, and DFR
+
+`latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0` doubles a
+latent's frames. The reference runs it in one place only: the temporal rounds
+of its DFR pipeline ("Diffusion Fidelity Rendering", `dfr_pipeline.py`), which
+it calls its production pipeline. Each round upsamples the finished latent in
+time, splits the clip into time tiles that meet at keyframes carried over
+from the round before, and denoises each tile again with the distilled DiT.
+Those keyframes only exist because DFR's own two stages generate them, and
+its decode reads them too. So the upsampler is one piece of DFR, which is
+built here in steps, each checked against the reference:
+
+1. the temporal upsampler;
+2. conditioning tokens in the DiT: generated keyframe slots, anchor
+   keyframes, a reference latent, each token at its own σ, and frozen sound;
+3. DFR's stages 1 and 2: its canvas and keyframe layout, a deterministic
+   stage 1, the keyframes upsampled together, and stage 2 with the detailing
+   IC-LoRA against the half-size video;
+4. the temporal rounds: tiles that meet at keyframes, four ancestral steps
+   at η 0.5 re-blended after each, the sound time-compressed per tile, the
+   tiles stitched and their keyframes carried on;
+5. the keyframe-aware decode: the DiffVAE attending to the keyframes as a
+   second stream;
+6. in the pipeline: 48 and 96 fps.
+
+What each needs was read from the reference's code; the riskiest are the
+keyframe-aware decode and the temporal rounds.
+
+**Step 1, the upsampler.** It is the spatial upsampler's class,
+`LatentUpsampler`, with `mid_channels` 512 rather than 1024 and time in place
+of space. Its upsampling is a conv3d to twice the channels, then channel
+`2c + p` of frame `f` goes to frame `2f + p`, and the first frame is dropped:
+a latent's first frame stands for one pixel frame, and each after it for
+eight. So `F` latent frames become `2F − 1`, and `8(F − 1) + 1` pixel frames
+become `16(F − 1) + 1`, twice the frame rate. 131M parameters. The config also
+says `rational_resampler: true`, which only the reference's spatial branch
+reads.
+
+`ltx_upsample::Upsampler` now loads either file. Against the reference's
+`upsample_video`, on a 768×512 × 121 latent from the pipeline (16 frames to 31;
+`scripts/ltx-fixtures.py --upsampler`, `examples/ltx_upsample.rs --temporal`):
+
+| | Against the reference's f32 |
+|---|---|
+| f32, CPU | 92.0 dB |
+| f32, Metal | 90.8 dB, in 1.4 s |
+| bf16, Metal | 26.9 dB |
+| the reference's own bf16, MPS | 26.8 dB |
+
+Exact in f32 the first time it ran. Like the spatial upsampler, it loses most
+of its precision in bf16, the reference's own included, so it runs in f32.
+
+**Step 2, conditioning tokens.** DFR's stages append tokens after the
+video's own, and the DiT reads each by its own σ, place and keyframe mark
+(`video::ltx_cond`, whose module notes have the table):
+
+- **Anchor keyframes** (`VideoConditionByKeyframeIndex`): a given latent
+  frame at one pixel frame, clean, its mask `1 − 0.95` rounded to bf16 as the
+  reference rounds it, 0.050048828125. Unmarked.
+- **Generated keyframes** (`VideoGeneratedKeyframeSlots`): one latent frame
+  of tokens each at one pixel frame, denoised like the video, and marked, so
+  the DiT adds its learned keyframe vector, as it always does to the first
+  latent frame. Read back out after a stage.
+- **A reference latent** (`VideoConditionByReferenceLatent`): the half-size
+  video, clean at σ 0, its rows and columns scaled to the target's pixels.
+
+Each token's σ is the step's times its mask, so a state has up to three
+sets of the DiT's per-token rows. `ltx_fused::Held` had two, in a fixed
+order: the rows of a picture held first, then the rest. It now also takes an
+index, each token reading the row it names, in the kernels and the chain
+alike. Frozen sound is the audio at σ 0, which the reference also feeds to
+the video's audio gate. Noising is the reference's `lerp`, which on the CPU
+is two fused multiply-adds: without the fusing, 159 dB; with it, identical.
+
+Against the reference's own items and its DiT's first two blocks, on its
+512×320 × 25 latent at 60 fps with two anchors, two generated keyframes and
+a half-size reference, 1440 tokens, the sound frozen
+(`scripts/ltx-fixtures.py --conditioned`, `examples/ltx_cond.rs`):
+
+| | Video | Audio |
+|---|---|---|
+| The state: every place, mask, mark, clean and noised latent | identical | |
+| f32, CPU | 114.0 dB (the 800 appended tokens 113.5) | 119.4 dB |
+| bf16, Metal | 44.5 dB (appended 44.7) | 45.3 dB |
+| the reference's own bf16, MPS | 44.0 dB | 44.8 dB |
+
+The DiT's other checks (plain, a picture held, both perturbations) are
+unchanged by the index, to the tenth of a dB.
+
+**Step 3, DFR's stages 1 and 2** (`video::ltx_dfr`). The canvas pads
+`frames − 1` to whole segments of 24 or 32 pixel frames, whichever pads
+less and the longer on a tie, and puts a keyframe at the end of each: 121
+frames are five segments of 24, keyframes at 24, 48, 72, 96 and 120. Above
+30 fps the DiT is told 60, with the sound still timed at the clip's own
+rate. Stage 1 is the distilled schedule's eight steps at half size with the
+keyframe slots, *plain* Euler where the plain pipeline's are ancestral. The
+video and the keyframes are then upsampled apart, the keyframes as a clip of
+their own. Stage 2 re-noises both to 0.909375 and takes three steps with
+stage 1's video appended as a clean reference latent at half size and the
+detailing IC-LoRA fused in at 0.5. Its sound is denoised with the video,
+which reads it, and then dropped: DFR ships stage 1's.
+
+A step is the reference's `X0Model` and `post_process_latent`. Each token's
+prediction is `x − σ·m·v`, rounded, blended `x₀·m + clean·(1 − m)` in f32 and
+rounded again, then one Euler step for every token at the step's σ.
+
+The LoRA is `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`, 0.33
+GB, a gated repo apart from LTX-2.5's own: its terms have to be accepted on
+the Hub by the account whose token fetches it. It is rank 32 on the blocks'
+attention and feed-forward only. Its metadata says `reference_downscale_factor`
+2, which the reference latent's places are scaled by.
+
+Against the reference's own `DiffusionStage`, stage 1, both upsamplings and
+stage 2, as `DFRPipeline` chains them, with the DiT cut to two blocks: a
+512×320 × 49 clip at 48 fps (keyframes at 24 and 48, the DiT told 60), from
+the noise the reference drew, stage 2 from Kvad's own stage 1
+(`scripts/ltx-fixtures.py --dfr --detailing`, `examples/ltx_dfr.rs`):
+
+| | Stage 1: video, keyframes, sound | Upsampled: video, keyframes | Stage 2: video, keyframes, sound |
+|---|---|---|---|
+| f32, CPU | 104.0, 104.2, 112.8 dB | 100.6, 100.9 dB | 103.1, 103.4, 113.7 dB |
+| bf16, Metal (upsampler f32) | 34.2, 34.2, 35.8 dB | 34.1, 32.7 dB | 33.3, 33.3, 30.5 dB |
+| the reference's own bf16, MPS | 33.7, 34.0, 34.3 dB | 31.6, 31.4 dB | 32.4, 32.5, 27.9 dB |
+
+Exact in f32 the first time it ran; in bf16, eleven steps from the
+reference's f32, a little closer than the reference's own bf16. Without the
+LoRA, stage 2 is 28.5 dB from the reference's with it, so it does its part.
+
+**Step 4, the temporal rounds** (`ltx_dfr::round`). A round doubles the
+frames with the temporal upsampler, 49 at 48 fps to 97 at 96, and the
+keyframes' places double with them into seams. The clip is cut at the seams
+into `2^round` tiles, the leftover segments going to the first. Every tile
+after the first starts a segment and one latent frame early, a lead-in that
+it denoises for context and then drops, so the tile before keeps the seam's
+frame and nothing is blended. Each tile holds its seams as anchors at 0.95
+and generates a keyframe halfway between each pair of marks, seeded from the
+video's nearest latent frame. It is re-noised to 0.975 and takes four
+ancestral steps at η 0.5, the tokens blended towards their clean latents
+again after each step's noise. Its sound is stage 1's, frozen at σ 0 and
+resampled linearly over the seconds the tile plays. The seams and the new
+keyframes, the earlier tile's where two tiles made the same one, are the
+next round's seams.
+
+Kvad's `Ancestral` now takes an η, and groups `σ_down²·α_next²/α_down²` as
+the reference does; η 1, the plain pipeline's, is otherwise unchanged. An
+anchor's latent is rounded to bf16, as DFR carries its keyframes, whatever
+the DiT runs in.
+
+Against the reference's own round loop, copied from `DFRPipeline.__call__`
+with its helpers (`TemporalTilePlan`, `_audio_latent_for_tile`, the carry
+merge) and its `euler_ancestral_denoising_loop`, on from step 3's stage 2:
+two rounds, 97 frames at 96 fps in two tiles, then 193 at 192 in four,
+keyframes at the reference's places, and every noise draw the reference made
+replayed and used. The fixture keeps the loop's latents in the run's dtype,
+where DFR keeps them in bf16, so that the f32 run is f32 throughout.
+
+| | Round 1: video, keyframes | Round 2: video, keyframes |
+|---|---|---|
+| f32, CPU | 105.7, 104.5 dB | 106.5, 105.4 dB |
+| bf16, Metal (upsamplers f32) | 33.2, 33.2 dB | 37.4, 34.8 dB |
+| the reference's own bf16, MPS | 33.5, 32.9 dB | 36.9, 34.5 dB |
+
+Exact in f32 the first time it ran. Unit tests pin the tile plans for both
+rounds and for five segments in two tiles, and a tile's sound.
+
+**Step 5, the keyframe-aware decode** (`ltx_diffvae::DiffDecoder::decode_keyed`).
+DFR decodes with its keyframes beside the video, as a second stream of
+*planes*:
+- **The planes' path:** one latent frame each, tagged with the file's
+  `type_emb` (its only keyframe weight), then through the video's own
+  weights.
+- **Upsampling:** each plane is upsampled as a clip of one frame, so in
+  space only.
+- **Place in time:** each plane has a place in each stage's time, the
+  middle of the cell that holds its pixel frame.
+- **Attention:** the streams meet only in the attention, which becomes
+  joint (`joint_na3d`), with one softmax per query:
+  - a frame's query sees its own window and the same rows and columns on
+    its two nearest planes;
+  - a plane's query sees its own window and the same on its two nearest
+    frames.
+- **Stage 5:** the planes are pixels of their own noise, denoised with the
+  video and dropped.
+- **Tiling:** each tile carries the planes inside it and the nearest one on
+  each side, at times counted from its own first frame.
+
+One thing differs from the plain decode: the reference's joint kernels cut
+a window at the grid's edges instead of shifting it inward as NATTEN does.
+Its eager and Triton versions agree on this, and Kvad follows them.
+
+The M5 kernel (`mpp_neighbourhood`) gained a joint specialisation. It walks
+the query's cut window, then the same rows of the other stream's frames, in
+one online softmax. The planes' side is the same kernel with the roles
+turned: a window of one plane, then the video's frames. Off the M5 each
+part is its own attention with its log-sum-exp, and the parts are merged
+into one softmax (`plain_part`, `merge`), which is what the kernel is
+tested against. A first version ran the video's side that way on the GPU
+too: three whole f32 activations and their merge at stage 5 made the decode
+2.1× slower and 13 GB larger, and merging them one part at a time ran out
+of memory.
+
+Against the reference's own keyframe decode, stage by stage, each stage
+from its input: the 3 × 8 × 8 latent of the plain check and two planes at
+pixel frames 8 and 16 (`scripts/ltx-fixtures.py --diffvae --keyframes`,
+`examples/ltx_diffvae.rs --keyframes`).
+
+| Stage | f32, CPU (video, planes) | bf16, Metal (video, planes) | the reference's own bf16 |
+|---|---|---|---|
+| 1–3 | 119.7, 119.2 dB | 44.2, 44.0 dB | 43.6, 43.3 dB |
+| 4 | 125.0, 125.1 dB | 49.2, 49.1 dB | 48.8, 48.7 dB |
+| 5 | 125.4 dB | 50.6 dB, 3.1 levels at most | 49.7 dB |
+
+The planes' stage-5 times are the reference's. Without the planes, the
+same step is 16.4 dB from the reference's with them, so they matter.
+
+Exact in f32 the first time it ran, and above the reference's own bf16 at
+every stage in bf16. The kernel is tested against the parts in f32 at
+57.1–58.8 dB, which is its answer's rounding to bf16.
+
+Whole clips from latents the pipeline made. There are no DFR keyframes
+until step 6, so the planes are the latent's own frames at DFR's places,
+24 to 120. That measures what planes cost, not what DFR's planes make.
+Decode alone, peak footprint:
+
+| Clip | Plain | Five planes |
+|---|---|---|
+| 768×512 × 121, one tile | 10.7–10.8 s, 18.4 GB | 11.5–11.8 s, 20.6 GB |
+| 1536×1024 × 121, 1×2×3 tiles | 64.1–73.4 s, 22.3 GB | 77.6–79.9 s, 24.6 GB |
+
+On their own at stage 5's size, the joint kernel with two planes a frame
+takes 45.4 ms where the plain one takes 44.2 (16 frames of 768×512). Its cut
+windows do less work at the time edges than shifted ones, which pays for
+the planes' rows. Tiling costs no more with planes: the 768×512 clip as
+2×2×2 tiles against whole is 61.5 dB PSNR with them and 59.2 without.
+
+The 15.9 GB in step 2's table for the 768×512 clip does not reproduce
+today: `master`'s own decode of the same latent peaks at 18.9–19.1 GB, and
+this branch's at 18.4. The cause is not found yet.
+
+**Step 6, in the pipeline.** A request picks its unguided pipeline:
+- `pipeline: "fast" | "dfr"` on `/v1/videos`;
+- `--pipeline` on `kvad videos make`;
+- a selector in the web UI.
+
+The fast pipeline stays the default at 30 fps and below. Above 30, DFR runs
+whatever is asked, since only its temporal rounds make those rates. `fps`
+must halve to 30 or less: 48 and 96 are 24 doubled once and twice, and 60
+and 120 are 30 so doubled. `frames` and `fps` describe the clip as it is
+delivered, so at 48 fps frames are on a grid of 16, and 241 is 121 at 24
+doubled. Guidance runs the dev model, which DFR does not, so a guided
+request above 30 fps is refused by name. The video keeps which pipeline
+made it (`kvad.pipeline`, migration 015).
+
+- **The detailing LoRA is fetched by the first DFR request**, not at load:
+  its repo is gated, and an account without access keeps the fast
+  pipeline. Without access, the request is a 400 that names the page
+  whose terms to accept.
+- **Three DiT loads a generation.** Stage 1 runs on the plain DiT, stage 2
+  on the DiT with the LoRA fused in (cached apart, as the dev model's
+  second DiT is), and the rounds on the plain one again. Each is dropped
+  before the next loads.
+- **The sound is stage 1's**, as the reference ships it, cut to the clip's
+  length. The canvas pads the end of a clip to whole segments, and that
+  padding is trimmed from the video too.
+- **A picture to start from** holds the first latent frame in stages 1 and
+  2 (`ltx_cond::State::held`), and in every temporal tile that starts at
+  the clip's first frame, as the reference re-attaches it.
+- **The conv decoder** has no keyframes: with `decoder: "conv"`, DFR's
+  clip is decoded without them.
+
+**Admission.** DFR's largest DiT call is not always stage 2. Each temporal
+round's tiles carry a segment of lead-in, their anchors and their new
+keyframes. For 121 frames, stage 2 holds 25 latent frames of tokens: 16 of
+video, 5 keyframes and a reference of 4. At 48 fps the round's second tile
+holds 26, and at 96 fps a tile holds 34. `kvad::video::dfr_frames` counts
+the largest call from the canvas and the tile plans, which now live in the
+`kvad` crate so that a request is checked before it is queued. A DFR clip is
+admitted when that call is no more than the fast pipeline's largest at the
+same size. That is conservative: DFR drops the upsampler before stage 2,
+and its measured peaks sit below the fast pipeline's at the same tokens
+(below). The web form counts the same way.
+
+Measured through the service on an M5 Pro, as requests: "A red fox trots
+through fresh snow in a pine forest at dawn…", seed 1. Peak footprint is the
+server's (`footprint`):
+
+| Clip | Text | Denoise | Decode | Peak |
+|---|---|---|---|---|
+| 768×512, 121 frames at 24 fps | 12.7 s | 113.6 s* | 18.3 s | 26 GB |
+| 768×512, 241 frames at 48 fps | 9.1 s | 212.3 s | 38.8 s | 27 GB |
+| 768×512, 481 frames at 96 fps | 9.0 s | 533.5 s | 78.9 s | 28 GB |
+| 1536×1024, 145 frames at 48 fps | 10.6 s | 975.9 s | 106.2 s | 30 GB |
+| 768×512, 97 frames at 48 fps, from a picture | 9.9 s | 102.9 s | 12.5 s | — |
+
+\* The first DFR request also fuses and quantises the detailing DiT's q8
+cache, 20 GB on disk.
+
+For comparison, the fast pipeline makes the first clip in about 77 s and
+peaks at 27 GB, and 1536×1024 × 121 at 31–35 GB. The 96 fps clip's second
+round is most of its time. Each of its four tiles denoises three segments
+and a fourth of lead-in, the reference's own layout, which its docs warn
+grows much faster than the four steps suggest.
+
+- **The clips are coherent** at every rate: the fox trots towards the
+  camera. At 48 and 96 fps the new frames are real in-betweens. Frame to
+  frame differences are even, not alternating as duplicates would make
+  them.
+- **The seams:** at 48 fps there is no jump where the tiles meet (frame
+  144: 1.44 against a mean of 1.53). At 96 fps the three seams of the
+  second round rise a little over their neighbours (0.87–0.92 against about
+  0.7), still under the clip's own largest steps (1.27–1.46).
+- **From a picture** the first frame is the picture's, and the clip moves
+  on from it.
+- **Refusals:** a guided request at 48 fps and a rate that does not halve
+  (45) are refused, each saying what to change.
+
 ### Sound
 
 Four steps: an audio VAE decoder to a mel spectrogram, a vocoder to 16 kHz,

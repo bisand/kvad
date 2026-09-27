@@ -55,6 +55,18 @@ writes what it makes for the examples to compare against.
     PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src:/tmp/LTX-2/packages/ltx-pipelines/src /tmp/ltx-venv/bin/python \\
         scripts/ltx-fixtures.py --dit "$DIT" --contexts random --guided --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_dit -- --fixtures /tmp/ltx-fx --guided
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --dit "$DIT" --contexts random --conditioned --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_cond -- --fixtures /tmp/ltx-fx
+
+    UP=$(cargo run -q --release -p kvad-gpu --example ltx_upsample -- --where | head -1)
+    DETAILING=$(cargo run -q --release -p kvad-gpu --example ltx_fetch -- --repo Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler \
+        ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors | cut -d' ' -f1)
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src:/tmp/LTX-2/packages/ltx-pipelines/src /tmp/ltx-venv/bin/python \
+        scripts/ltx-fixtures.py --dit "$DIT" --contexts random --dfr --detailing "$DETAILING" \
+        --upsampler "$UP" --temporal "$(cargo run -q --release -p kvad-gpu --example ltx_upsample -- --temporal --where | head -1)" \
+        --vae "$VIDEO" --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_dfr -- --fixtures /tmp/ltx-fx --detailing "$DETAILING"
 
     cargo run --release -p kvad-gpu --example ltx_duration -- --contexts /tmp/ltx-fx "a door slams shut" "…"
     HEAD=$(cargo run -q --release -p kvad-gpu --example ltx_duration -- --where)
@@ -73,6 +85,13 @@ writes what it makes for the examples to compare against.
     PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
         scripts/ltx-fixtures.py --upsampler "$UP" --vae "$VIDEO" --latent /tmp/stage1.safetensors --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_upsample -- --fixtures /tmp/ltx-fx [--cpu | --f32]
+
+    TUP=$(cargo run -q --release -p kvad-gpu --example ltx_upsample -- --where --temporal | head -1)
+    cargo run --release -p kvad-gpu --example ltx -- --prompt "…" \\
+        --width 768 --height 512 --frames 49 --latents /tmp/stage2.safetensors
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --upsampler "$TUP" --vae "$VIDEO" --latent /tmp/stage2.safetensors --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_upsample -- --fixtures /tmp/ltx-fx --temporal [--cpu | --f32]
 
 (the text fixtures also want `transformers` 5.8 to 5.14 in the venv, the
 picture `pillow`, and `--guided` `torchaudio` and `scipy`, for the pipelines
@@ -133,6 +152,7 @@ of `cargo test` because it needs Python, PyTorch and a clone of `LTX-2`.
 """
 
 import argparse
+import dataclasses
 import json
 import math
 import time
@@ -311,12 +331,10 @@ def duration(path, out):
     print("duration: " + ", ".join(f"{f32[f'seconds_{i}'].item():.3f} s" for i in range(n)))
 
 
-def diffvae(path, out):
-    """The diffusion decoder (DiffVAE), stage by stage, by the reference's own
-    modules on its eager neighbourhood-attention path, NATTEN's semantics
-    written out in torch. A seeded latent of 3 x 8 x 8 (17 frames of 256 x
-    256), the smallest the stages' windows allow in space; the stage-5 noise
-    is drawn here and saved, so that kvad's decoder starts from the same."""
+def diffvae_model(path):
+    """The diffusion decoder (DiffVAE) as the reference builds it, in f32, on
+    its eager neighbourhood-attention path: NATTEN's semantics written out
+    in torch, and for keyframes its joint attention, `joint_eager`."""
     from ltx_core.model.video_vae.model_configurator import VideoDecoderConfigurator
     from ltx_core.model.video_vae import diffusion_tiling
     from ltx_core.model.video_vae.transformer.apply import apply_diffvae_config
@@ -346,7 +364,17 @@ def diffvae(path, out):
         dec.float().eval(),
         DiffVAEConfig(block=DiffVAEBlockKind.COMBINED, w_chunks=1, natten_backend=None, attention=NAttentionKind.EAGER_SDPA, compile_blocks=False, compile_det_stages=False),
     )
+    return dec
 
+
+def diffvae(path, out):
+    """The diffusion decoder (DiffVAE), stage by stage, by the reference's own
+    modules. A seeded latent of 3 x 8 x 8 (17 frames of 256 x 256), the
+    smallest the stages' windows allow in space; the stage-5 noise is drawn
+    here and saved, so that kvad's decoder starts from the same."""
+    from ltx_core.model.video_vae import diffusion_tiling
+
+    dec = diffvae_model(path)
     g = torch.Generator().manual_seed(5)
     z = torch.randn(1, 128, 3, 8, 8, generator=g)
     with torch.no_grad():
@@ -389,6 +417,92 @@ def diffvae(path, out):
         save_file(
             {"stage4_input": f16[0].contiguous(), "context": c16[0].contiguous(), "pixels": p16[0].permute(1, 0, 2, 3).contiguous()},
             f"{out}/diffvae_bf16.safetensors",
+        )
+
+
+def diffvae_keyframes(path, out):
+    """The DiffVAE's keyframe-aware decode, stage by stage, as DFR runs it:
+    the same seeded latent as `diffvae`, and two keyframe planes, seeded
+    latents at pixel frames 8 and 16. Both streams through stages 1-3, stage
+    4 and the one step of stage 5, with the stage-5 noise of both drawn here
+    and saved. The joint attention is the reference's `joint_eager`: each
+    video query's window, cut at the edges, and the same rows and columns on
+    its two nearest planes, in one softmax; each plane's own window and the
+    same on its two nearest frames."""
+    import sys
+    import types
+
+    from ltx_core.model.video_vae import diffusion_tiling
+    from ltx_core.model.video_vae.keyframes import DecodeKeyframes
+
+    sys.modules.setdefault("OpenImageIO", types.ModuleType("OpenImageIO"))
+    dec = diffvae_model(path)
+    g = torch.Generator().manual_seed(5)
+    z = torch.randn(1, 128, 3, 8, 8, generator=g)
+    gk = torch.Generator().manual_seed(6)
+    planes = torch.randn(1, 128, 2, 8, 8, generator=gk)
+    indices = torch.tensor([8, 16])
+    keys = DecodeKeyframes(latents=planes, pixel_frame_indices=indices)
+
+    def run(m, on, z, feat=None, stream=None, context=None, kcontext=None, noise=None, knoise=None):
+        """Each stage from the f32 run's input to it, when given."""
+        out = {}
+        with torch.no_grad():
+            padded = diffusion_tiling.pad_trailing_latent_for_natten_border(on(z), m._natten_trailing_pad_latent_frames)
+            f, st = m.forward_stages_1_to_3_with_keyframes(padded, dataclasses.replace(keys, latents=on(keys.latents)), drop_leading_frame=True)
+            out["stage4_input"], out["kf_stage4_input"] = f[0].float().cpu(), st.x[0].float().cpu()
+            if feat is not None:
+                f, st = on(feat)[None], dataclasses.replace(st, x=on(stream)[None])
+            c, kst = m.forward_stage_4_with_keyframes(f, st, indices, drop_leading_frame=True, pad_trailing=True)
+            out["context"], out["kf_context"], out["kf_times"] = c[0].float().cpu(), kst.x[0].float().cpu(), kst.times.float().cpu()
+            if context is not None:
+                c, kst = on(context)[None], dataclasses.replace(kst, x=on(kcontext)[None])
+            f5, h5, w5 = c.shape[1], c.shape[2] * m.patch_size, c.shape[3] * m.patch_size
+            if noise is None:
+                noise = torch.randn(1, 3, f5, h5, w5, generator=g)
+                knoise = torch.randn(1, 3, kst.x.shape[1], h5, w5, generator=gk)
+            out["noise"], out["kf_noise"] = noise, knoise
+            px, kpx = m.forward_diff_step_with_keyframes(
+                m._context_and_x_for_diff_step(c, on(noise)), m._keyframe_context_and_x_for_diff_step(kst.x, on(knoise), kst.valid),
+                torch.ones(1, device=c.device, dtype=c.dtype), kst.times, kst.valid,
+            )
+            out["pixels"], out["kf_pixels"] = px[0].float().cpu(), kpx[0].float().cpu()
+        return out
+
+    t = time.time()
+    r = run(dec, lambda x: x, z)
+    print(f"diffvae: keyframe decode, 2 planes, f32 on the CPU, {time.time() - t:.1f} s")
+    frames = lambda x: x.permute(1, 0, 2, 3).contiguous()
+    save_file(
+        {
+            "latent": z[0].contiguous(),
+            "planes": planes[0].contiguous(),
+            "indices": indices.float(),
+            # Channels-last, as the reference keeps them: [T, H, W, C].
+            "stage4_input": r["stage4_input"].contiguous(),
+            "kf_stage4_input": r["kf_stage4_input"].contiguous(),
+            "context": r["context"].contiguous(),
+            "kf_context": r["kf_context"].contiguous(),
+            "kf_times": r["kf_times"].contiguous(),
+            # Frames first, as kvad keeps them: [T, 3, H, W].
+            "noise": frames(r["noise"][0]),
+            "kf_noise": frames(r["kf_noise"][0]),
+            "pixels": frames(r["pixels"]),
+            "kf_pixels": frames(r["kf_pixels"]),
+        },
+        f"{out}/diffvae_kf_f32.safetensors",
+    )
+    # The reference's own bf16 on MPS, each stage from its f32 input.
+    if torch.backends.mps.is_available():
+        m = dec.to("mps", torch.bfloat16)
+        on = lambda x: x.to("mps", torch.bfloat16)
+        t = time.time()
+        b = run(m, on, z, r["stage4_input"], r["kf_stage4_input"], r["context"], r["kf_context"], r["noise"], r["kf_noise"])
+        print(f"diffvae: keyframe decode, the reference in bf16 on MPS, {time.time() - t:.1f} s")
+        save_file(
+            {"stage4_input": b["stage4_input"].contiguous(), "kf_stage4_input": b["kf_stage4_input"].contiguous(),
+             "context": b["context"].contiguous(), "kf_context": b["kf_context"].contiguous(), "pixels": frames(b["pixels"])},
+            f"{out}/diffvae_kf_bf16.safetensors",
         )
 
 
@@ -553,7 +667,7 @@ def text(path, dit, out):
     print("text: contexts", tuple(o.video_encoding.shape), tuple(o.audio_encoding.shape))
 
 
-def transformer(path, out, contexts, blocks, lora=None, guided=False):
+def transformer(path, out, contexts, blocks, lora=None, guided=False, conditioned=False, dfr=None):
     """The DiT's first `blocks` blocks, with everything around them: the
     patchify projections, the eight adaLN modules, the keyframe embedding,
     the RoPE tables built from the reference's own positions, and the output
@@ -573,23 +687,6 @@ def transformer(path, out, contexts, blocks, lora=None, guided=False):
         )
         tensors = {k: f.get_tensor(k) for k in f.keys() if keep(k)}
     meta["config"]["transformer"]["num_layers"] = blocks
-    if lora:
-        # The LoRA fused as the reference fuses it, by its own `apply_loras`:
-        # `(B · strength) @ A`, plus the weight, rounded to the weight's
-        # bf16. On MPS, as it does here, where it aggregates in f32; on the
-        # CPU it aggregates in bf16, on one core, for most of an hour. The
-        # LoRA's names are the DiT's without `model.`.
-        from ltx_core.loader.fuse_loras import apply_loras
-        from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
-
-        with safe_open(lora, framework="pt") as f:
-            lsd = {"model." + k: f.get_tensor(k) for k in f.keys() if keep("model." + k.split(".lora_")[0] + ".weight")}
-        n = sum(1 for k in lsd if k.endswith(".lora_A.weight"))
-        fuse = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-        on = lambda d: {k: v.to(fuse) for k, v in d.items()}
-        sd = apply_loras(StateDict(on(tensors), fuse, 0, set()), [LoraStateDictWithStrength(StateDict(on(lsd), fuse, 0, set()), 1.0)])
-        tensors = {k: v.cpu() for k, v in sd.sd.items()}
-        print(f"dit: fused {n} LoRA pairs into the first {blocks} blocks and the rest")
 
     # 512×320, 25 frames at 24 fps: 4 latent frames of 10×16, 640 video
     # tokens, and 26 audio latents. Small enough for f32 on the CPU.
@@ -718,8 +815,313 @@ def transformer(path, out, contexts, blocks, lora=None, guided=False):
             print(f"dit: one guided prediction, {blocks} blocks in {dtype} on {device}, {time.time() - t:.1f} s")
         return {"video": v.denoised[0].float().cpu().contiguous(), "audio": a.denoised[0].float().cpu().contiguous()}
 
+    def run_conditioned(device, dtype):
+        """DFR's conditioning tokens on one state, built by the reference's
+        own items at the 60 fps DFR conditions at: the target video; two
+        anchor keyframes (`VideoConditionByKeyframeIndex`, strength 0.95, in
+        bf16 as DFR's carried keyframes are) at pixel frames 0 and 16; two
+        generated keyframe slots at 8 and 24, seeded with initial latents;
+        and a half-size reference latent (`VideoConditionByReferenceLatent`,
+        downscale 2, strength 1). Noised as `GaussianNoiser` noises, at 0.975,
+        from noise drawn here and saved. The sound frozen, as DFR's temporal
+        tiles freeze it: σ 0 everywhere."""
+        from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
+        from ltx_core.conditioning.types.keyframe_slots import VideoGeneratedKeyframeSlots
+        from ltx_core.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
+
+        ctools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), VideoLatentShape.from_pixel_shape(pixels), 60.0)
+        target = vtools.patchifier.unpatchify(vlat, vtools.target_shape)
+        st = ctools.create_initial_state("cpu", torch.float32, initial_latent=target)
+        gk = torch.Generator().manual_seed(21)
+        lat = target.shape
+        anchors = torch.randn(1, 128, 2, lat[3], lat[4], generator=gk).to(torch.bfloat16)
+        initials = torch.randn(1, 128, 2, lat[3], lat[4], generator=gk)
+        reference = torch.randn(1, 128, lat[2], lat[3] // 2, lat[4] // 2, generator=gk)
+        for i, f in enumerate((0, 16)):
+            st = VideoConditionByKeyframeIndex(anchors[:, :, i : i + 1], frame_idx=f, strength=0.95).apply_to(st, ctools)
+        st = VideoGeneratedKeyframeSlots((8, 24), initial_keyframes=initials).apply_to(st, ctools)
+        st = VideoConditionByReferenceLatent(reference, downscale_factor=2, strength=1.0).apply_to(st, ctools)
+        noise = torch.randn(st.latent.shape, generator=gk)
+        noiser = GaussianNoiser(torch.Generator())
+        noiser._sample_noise = lambda _st: noise
+        st = noiser(st, noise_scale=0.975)
+
+        m = load(LTXModelConfigurator.from_metadata(meta), tensors, lambda k: k[len(prefix):]).to(device=device, dtype=dtype)
+        s = torch.tensor([sigma], device=device)
+        zero = torch.tensor([0.0], device=device)
+        video = Modality(
+            latent=st.latent.to(device=device, dtype=dtype),
+            sigma=s,
+            timesteps=(st.denoise_mask.to(device) * s).float(),
+            positions=st.positions.to(device),
+            context=ctx["video"].to(device=device, dtype=dtype)[None],
+            keyframes_mask=st.keyframes_mask.to(device),
+        )
+        audio = Modality(
+            latent=alat.to(device=device, dtype=dtype),
+            sigma=zero,
+            timesteps=torch.zeros_like(astate.denoise_mask).to(device),
+            positions=astate.positions.to(device),
+            context=ctx["audio"].to(device=device, dtype=dtype)[None],
+        )
+        with torch.no_grad():
+            t = time.time()
+            v, a = m(video, audio, None)
+            print(f"dit: {blocks} blocks, conditioned, {st.latent.shape[1]} video tokens, in {dtype} on {device}, {time.time() - t:.1f} s")
+        state = {
+            "anchors": anchors.float()[0].contiguous(),
+            "initials": initials[0].contiguous(),
+            "reference": reference[0].contiguous(),
+            "noise": noise[0].contiguous(),
+            "noised": st.latent[0].contiguous(),
+            "clean": st.clean_latent[0].contiguous(),
+            "mask": st.denoise_mask[0, :, 0].contiguous(),
+            "positions": st.positions[0].contiguous(),
+            "marks": st.keyframes_mask[0, :, 0].contiguous(),
+        }
+        return state, {"video_out": v[0].float().cpu().contiguous(), "audio_out": a[0].float().cpu().contiguous()}
+
+    def run_dfr(device, dtype, replay=None):
+        """DFR's stages 1 and 2 as `DFRPipeline.__call__` runs them, through
+        the reference's own `DiffusionStage`, with the DiT cut to its first
+        blocks: 512×320 × 49 frames at 48 fps, so the canvas has keyframes
+        at 24 and 48 and the DiT is told 60 fps; stage 1 at 256×160, eight
+        plain Euler steps with the keyframe slots; the video and the slots
+        upsampled, apart, by the spatial upsampler; stage 2 at 512×320,
+        three steps, the slots seeded with the upsampled ones and stage 1's
+        video as the reference latent. With the temporal upsampler, then
+        two of DFR's temporal rounds on stage 2's answer, as its `__call__`
+        runs them: 97 frames at 96 fps in two tiles, then 193 at 192 in
+        four, each tile four ancestral steps at η 0.5 with its seams held and
+        the sound frozen. The noise every stage and step draws is saved, and
+        replayed in `replay`'s place when given.
+
+        The one departure: the ancestral loop keeps its latents in the
+        run's dtype, where DFR leaves them in its default bf16, so that the
+        f32 run is f32 throughout. The anchors are rounded to bf16 all the
+        same, as DFR's are when it carries them."""
+        import contextlib
+        import sys
+        import types
+        from types import SimpleNamespace
+
+        # The pipelines' media reader, which nothing here reads with.
+        sys.modules.setdefault("OpenImageIO", types.ModuleType("OpenImageIO"))
+        from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.conditioning import VideoConditionByReferenceLatent, VideoGeneratedKeyframeSlots
+        from ltx_core.model.transformer import X0Model
+        from ltx_core.model.upsampler.model import upsample_video
+        from ltx_core.model.upsampler.model_configurator import LatentUpsamplerConfigurator
+        from ltx_core.model.video_vae.ops import PerChannelStatistics
+        from ltx_pipelines.dfr_layout import resolve_canvas
+        from ltx_pipelines.dfr_pipeline import _conditioning_fps
+        from ltx_pipelines.utils.blocks import DiffusionStage
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, STAGE_2_DISTILLED_SIGMAS
+        from ltx_pipelines.utils.denoisers import SimpleDenoiser
+        from ltx_pipelines.utils.types import ModalitySpec
+
+        from dataclasses import replace
+        from functools import partial
+
+        from ltx_core.components.diffusion_steps import EulerAncestralDiffusionStep
+        from ltx_pipelines.dfr_layout import TemporalTilePlan
+        from ltx_pipelines.dfr_pipeline import (
+            _ANCHOR_KEYFRAME_STRENGTH,
+            _TEMPORAL_ANCESTRAL_ETA,
+            _audio_latent_for_tile,
+            _keyframe_conditionings_from_latents,
+            _merge_carry_forward_keyframes,
+            _slot_initials_from_video,
+        )
+        from ltx_pipelines.utils.samplers import euler_ancestral_denoising_loop
+
+        up_path, vae, detailing, downscale, temporal = dfr
+        width, height, frames, fps = 512, 320, 49, 48.0
+        frames, _, positions = resolve_canvas(frames)
+
+        def stage(sd):
+            m = X0Model(load(LTXModelConfigurator.from_metadata(meta), sd, lambda k: k[len(prefix):]).to(device=device, dtype=dtype))
+            st = DiffusionStage(SimpleNamespace(checkpoint=f"the first {blocks} blocks"), dtype, torch.device(device))
+            st._transformer_ctx = lambda **_kw: contextlib.nullcontext(m)
+            st._assert_supports_conditionings = lambda _v: None
+            return st
+
+        umeta, utensors = read(up_path)
+        up = load(LatentUpsamplerConfigurator.from_metadata(umeta), utensors, lambda k: k).to(device, dtype)
+        stats = PerChannelStatistics()
+        with safe_open(vae, framework="pt") as f:
+            for n in ("std-of-means", "mean-of-means"):
+                stats.get_buffer(n).copy_(f.get_tensor(f"per_channel_statistics.{n}").float())
+        enc = SimpleNamespace(per_channel_statistics=stats.to(device))
+        upsample = lambda z: upsample_video(z, enc, up)
+        if temporal:
+            tmeta, ttensors = read(temporal)
+            tup = load(LatentUpsamplerConfigurator.from_metadata(tmeta), ttensors, lambda k: k).to(device, dtype)
+
+        drawn = []
+        noiser = GaussianNoiser(torch.Generator(device).manual_seed(5))
+        own = noiser._sample_noise
+        def sample(state):
+            n = own(state) if replay is None else replay[len(drawn)].to(state.latent.device, state.latent.dtype)[None]
+            drawn.append(n[0].float().cpu().contiguous())
+            return n
+        noiser._sample_noise = sample
+        def draw(x, generator):
+            """The ancestral loop's noise, drawn or replayed, and saved."""
+            n = torch.randn(x.shape, generator=generator, dtype=x.dtype, device=x.device) if replay is None else replay[len(drawn)].to(x.device, x.dtype).reshape(x.shape)
+            drawn.append(n[0].float().cpu().contiguous())
+            return n
+        vc, ac = ctx["video"].to(device, dtype)[None], ctx["audio"].to(device, dtype)[None]
+        cfps = _conditioning_fps(fps)
+
+        with torch.no_grad():
+            t = time.time()
+            s1 = DISTILLED_SIGMAS.to(dtype=torch.float32, device=device)
+            v1, a1 = stage(tensors)(
+                denoiser=SimpleDenoiser(vc, ac), sigmas=s1, noiser=noiser, width=width // 2, height=height // 2, frames=frames, fps=cfps, audio_fps=fps,
+                video=ModalitySpec(context=vc, conditionings=[VideoGeneratedKeyframeSlots(pixel_frame_indices=positions)]),
+                audio=ModalitySpec(context=ac),
+            )
+            half = v1.latent[:1].detach().clone()
+            keys = upsample(v1.generated_keyframes)
+            upv = upsample(half)
+            s2 = STAGE_2_DISTILLED_SIGMAS.to(dtype=torch.float32, device=device)
+            sd2 = tensors if detailing is None else fused(detailing, 0.5)
+            v2, a2 = stage(sd2)(
+                denoiser=SimpleDenoiser(vc, ac), sigmas=s2, noiser=noiser, width=width, height=height, frames=frames, fps=cfps, audio_fps=fps,
+                video=ModalitySpec(
+                    context=vc, noise_scale=s2[0].item(), initial_latent=upv,
+                    conditionings=[
+                        VideoGeneratedKeyframeSlots(pixel_frame_indices=positions, initial_keyframes=keys),
+                        VideoConditionByReferenceLatent(latent=half, downscale_factor=downscale, strength=1.0),
+                    ],
+                ),
+                audio=ModalitySpec(context=ac, noise_scale=s2[0].item(), initial_latent=a1.latent),
+            )
+            print(f"dit: DFR stages 1 and 2, {blocks} blocks{', detailing' if detailing else ''}, in {dtype} on {device}, {time.time() - t:.1f} s")
+        c = lambda x: x[0].float().cpu().contiguous()
+        rounds = {}
+        if temporal:
+            # `DFRPipeline.__call__`'s temporal rounds, as it has them, less
+            # the pictures a request may give.
+            video_state, num_frames, current_fps = v2, frames, fps
+            carry_positions, carry_keyframes = list(positions), v2.generated_keyframes
+            temporal_sigmas = DISTILLED_SIGMAS[4:].to(dtype=torch.float32, device=device)
+            stage_1_audio_latent, stage_1_duration = a1.latent, frames / fps
+            seed = 10
+            # DFR's `self.stage`: the distilled DiT, without the detailing LoRA.
+            base = stage(tensors)
+            with torch.no_grad():
+                for round_idx in (1, 2):
+                    t = time.time()
+                    video_latent = upsample_video(video_state.latent[:1], enc, tup)
+                    rounds[f"round_{round_idx}_upsampled"] = c(video_latent)
+                    num_frames = 2 * (num_frames - 1) + 1
+                    current_fps = 2 * current_fps
+                    seam_positions = [2 * position for position in carry_positions]
+                    anchor_keyframes = carry_keyframes
+                    seam_to_index = {seam: index for index, seam in enumerate(seam_positions)}
+                    cond_fps = _conditioning_fps(current_fps)
+                    windows = TemporalTilePlan(seam_positions, num_frames, 2**round_idx, 8)
+                    tile_latents, slot_positions, slot_latent_slices = [], [], []
+                    for tile_index, (interval, pixel_start, pixel_end, anchor_global, slot_global) in enumerate(windows):
+                        local_frames = (interval.end - interval.start - 1) * 8 + 1
+                        tile_video = video_latent[:, :, interval.start : interval.end]
+                        round_conditionings = []
+                        if anchor_global:
+                            anchor_latents = torch.cat([anchor_keyframes[:, :, seam_to_index[p] : seam_to_index[p] + 1] for p in anchor_global], dim=2)
+                            round_conditionings.extend(
+                                _keyframe_conditionings_from_latents(
+                                    anchor_latents.to(torch.bfloat16),
+                                    [int(position) - pixel_start for position in anchor_global],
+                                    strength=_ANCHOR_KEYFRAME_STRENGTH,
+                                )
+                            )
+                        if slot_global:
+                            slot_local = [int(position) - pixel_start for position in slot_global]
+                            round_conditionings.append(
+                                VideoGeneratedKeyframeSlots(pixel_frame_indices=slot_local, initial_keyframes=_slot_initials_from_video(tile_video, slot_local, 8))
+                            )
+                        tile_state, _ = base(
+                            denoiser=SimpleDenoiser(vc, ac), sigmas=temporal_sigmas, noiser=noiser, width=width, height=height, frames=local_frames, fps=cond_fps,
+                            video=ModalitySpec(context=vc, conditionings=round_conditionings, noise_scale=temporal_sigmas[0].item(), initial_latent=tile_video),
+                            audio=ModalitySpec(
+                                context=ac, frozen=True, noise_scale=0.0,
+                                initial_latent=_audio_latent_for_tile(
+                                    stage_1_audio_latent, pixel_start=pixel_start, local_frames=local_frames, playback_fps=current_fps,
+                                    source_duration=stage_1_duration, cond_fps=cond_fps,
+                                ),
+                            ),
+                            stepper=EulerAncestralDiffusionStep(eta=_TEMPORAL_ANCESTRAL_ETA),
+                            loop=partial(euler_ancestral_denoising_loop, noise_seed=seed + 1000 * round_idx + tile_index, new_noise_fn=draw, model_dtype=dtype),
+                        )
+                        tile_latents.append(tile_state.latent[:1, :, interval.left_ramp :])
+                        if slot_global:
+                            slot_positions.extend(slot_global)
+                            slot_latent_slices.append(tile_state.generated_keyframes)
+                    stitched = torch.cat(tile_latents, dim=2)
+                    video_state = replace(video_state, latent=stitched, generated_keyframes=None)
+                    slot_latents = torch.cat(slot_latent_slices, dim=2) if slot_latent_slices else None
+                    if slot_positions and slot_latents is not None:
+                        first_index = {}
+                        for index, position in enumerate(slot_positions):
+                            first_index.setdefault(position, index)
+                        slot_positions = sorted(first_index)
+                        slot_latents = torch.cat([slot_latents[:, :, first_index[p] : first_index[p] + 1] for p in slot_positions], dim=2)
+                    carry_positions, carry_keyframes = _merge_carry_forward_keyframes(seam_positions, anchor_keyframes, slot_positions, slot_latents)
+                    rounds[f"round_{round_idx}_video"] = c(stitched)
+                    rounds[f"round_{round_idx}_keyframes"] = c(carry_keyframes)
+                    rounds[f"round_{round_idx}_positions"] = torch.tensor(carry_positions, dtype=torch.float32)
+                    print(f"dit: DFR round {round_idx}, {len(windows)} tiles, {num_frames} frames at {current_fps} fps, in {dtype} on {device}, {time.time() - t:.1f} s")
+        return {
+            "shape": torch.tensor([width, height, frames, fps]),
+            "positions": torch.tensor(positions, dtype=torch.float32),
+            "downscale": torch.tensor([float(downscale)]),
+            **{f"noise_{i}": n for i, n in enumerate(drawn)},
+            "stage_1_video": c(v1.latent), "stage_1_keyframes": c(v1.generated_keyframes), "stage_1_audio": c(a1.latent),
+            "upsampled_video": c(upv), "upsampled_keyframes": c(keys),
+            "stage_2_video": c(v2.latent), "stage_2_keyframes": c(v2.generated_keyframes), "stage_2_audio": c(a2.latent),
+            **rounds,
+        }
+
+    def fused(lora, strength):
+        """The DiT's kept tensors with `lora` fused in at `strength`, as the
+        reference fuses it by its own `apply_loras`: `(B · strength) @ A`,
+        plus the weight, rounded to the weight's bf16. On MPS, as it does
+        here, where it aggregates in f32; on the CPU it aggregates in bf16,
+        on one core, for most of an hour. The LoRA's names are the DiT's
+        without `model.`."""
+        from ltx_core.loader.fuse_loras import apply_loras
+        from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
+
+        with safe_open(lora, framework="pt") as f:
+            lsd = {"model." + k: f.get_tensor(k) for k in f.keys() if keep("model." + k.split(".lora_")[0] + ".weight")}
+        n = sum(1 for k in lsd if k.endswith(".lora_A.weight"))
+        fuse = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        on = lambda d: {k: v.to(fuse) for k, v in d.items()}
+        sd = apply_loras(StateDict(on(tensors), fuse, 0, set()), [LoraStateDictWithStrength(StateDict(on(lsd), fuse, 0, set()), strength)])
+        print(f"dit: fused {n} LoRA pairs at {strength} into the first {blocks} blocks and the rest")
+        return {k: v.cpu() for k, v in sd.sd.items()}
+
     runs = ((False, None, "dit"), (True, None, "dit_held"), (False, "blind", "dit_blind"), (False, "deaf", "dit_deaf"))
+    if dfr:
+        runs = ()
+        f32 = run_dfr("cpu", torch.float32)
+        save_file(f32, f"{out}/dfr_f32.safetensors")
+        if torch.backends.mps.is_available():
+            replay = [f32[f"noise_{i}"] for i in range(sum(1 for k in f32 if k.startswith("noise_")))]
+            save_file(run_dfr("mps", torch.bfloat16, replay), f"{out}/dfr_bf16.safetensors")
+    if conditioned:
+        runs = ()
+        state, f32 = run_conditioned("cpu", torch.float32)
+        save_file(state, f"{out}/dit_cond_state.safetensors")
+        save_file(f32, f"{out}/dit_cond_f32.safetensors")
+        if torch.backends.mps.is_available():
+            save_file(run_conditioned("mps", torch.bfloat16)[1], f"{out}/dit_cond_bf16.safetensors")
     if lora:
+        # Every run below with the LoRA fused in at 1.
+        tensors = fused(lora, 1.0)
         runs = ((False, None, "dit_lora"),)
     if guided:
         runs = ()
@@ -734,9 +1136,11 @@ def transformer(path, out, contexts, blocks, lora=None, guided=False):
 
 
 def upsampler(path, vae, latent, out):
-    """The spatial latent upsampler on a real stage-1 latent, through the
-    reference's own `upsample_video`: un-normalise with the VAE's statistics,
-    upsample, normalise again."""
+    """A latent upsampler on a real latent, through the reference's own
+    `upsample_video`: un-normalise with the VAE's statistics, upsample,
+    normalise again. The spatial one (on a stage-1 latent) writes
+    `upsample_*`; the temporal one, which DFR's temporal rounds run on stage
+    2's latent, writes `temporal_*`."""
     from types import SimpleNamespace
 
     from ltx_core.model.upsampler.model import upsample_video
@@ -745,11 +1149,13 @@ def upsampler(path, vae, latent, out):
 
     meta, tensors = read(path)
     up = load(LatentUpsamplerConfigurator.from_metadata(meta), tensors, lambda k: k)
+    name = "temporal" if up.temporal_upsample else "upsample"
     stats = PerChannelStatistics()
     with safe_open(vae, framework="pt") as f:
         for n in ("std-of-means", "mean-of-means"):
             stats.get_buffer(n).copy_(f.get_tensor(f"per_channel_statistics.{n}").float())
-    z = load_file(latent)["video"][None].float()
+    z = load_file(latent)
+    z = (z["video"] if "video" in z else z["latent"])[None].float()
 
     def run(device, dtype):
         enc = SimpleNamespace(per_channel_statistics=stats.to(device))
@@ -759,9 +1165,9 @@ def upsampler(path, vae, latent, out):
         print(f"upsampler: {tuple(z.shape[1:])} to {tuple(y.shape)} in {dtype} on {device}, {time.time() - t:.1f} s")
         return y
 
-    save_file({"latent": z[0].contiguous(), "upsampled": run("cpu", torch.float32).contiguous()}, f"{out}/upsample_f32.safetensors")
+    save_file({"latent": z[0].contiguous(), "upsampled": run("cpu", torch.float32).contiguous()}, f"{out}/{name}_f32.safetensors")
     if torch.backends.mps.is_available():
-        save_file({"upsampled": run("mps", torch.bfloat16).contiguous()}, f"{out}/upsample_bf16.safetensors")
+        save_file({"upsampled": run("mps", torch.bfloat16).contiguous()}, f"{out}/{name}_bf16.safetensors")
 
 
 if __name__ == "__main__":
@@ -773,11 +1179,16 @@ if __name__ == "__main__":
     p.add_argument("--blocks", type=int, default=2, help="how many DiT blocks to run with --dit --contexts")
     p.add_argument("--lora", help="with --dit --contexts: a LoRA fused into the DiT, writing dit_lora_*")
     p.add_argument("--guided", action="store_true", help="with --dit --contexts: one guided prediction, writing dit_guided_*")
+    p.add_argument("--conditioned", action="store_true", help="with --dit --contexts: DFR's conditioning tokens (anchors, slots, a reference latent) and frozen sound, writing dit_cond_*")
+    p.add_argument("--dfr", action="store_true", help="with --dit --contexts --upsampler (the spatial one) --vae: DFR's stages 1 and 2, writing dfr_*")
+    p.add_argument("--temporal", help="with --dfr: the temporal upsampler, for two temporal rounds after stage 2")
+    p.add_argument("--detailing", help="with --dfr: the detailing IC-LoRA, fused in at 0.5 for stage 2")
     p.add_argument("--contexts", help="text_contexts_f32.safetensors from --text, or `random`: the DiT's first blocks against them")
     p.add_argument("--duration", help="model_patches/ltx-2.5-duration-head-bf16.safetensors, on OUT/duration_contexts.safetensors")
     p.add_argument("--diffvae", help="vae/ltx-2.5-video-vae-bf16.safetensors: the diffusion decoder, stage by stage")
+    p.add_argument("--keyframes", action="store_true", help="with --diffvae: the keyframe-aware decode, writing diffvae_kf_*")
     p.add_argument("--picture", help="with --video: a picture for image-to-video, `synthetic` for one drawn here")
-    p.add_argument("--upsampler", help="latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors, with --vae and --latent")
+    p.add_argument("--upsampler", help="latent_upscale_models/ltx-2.5-latent-{spatial,temporal}-upscaler-x2-bf16-1.0.safetensors, with --vae and --latent")
     p.add_argument("--vae", help="vae/ltx-2.5-video-vae-conv-bf16.safetensors, for the upsampler's statistics")
     p.add_argument("--latent", help="a stage-1 latent to upsample: a safetensors file with `video`, [128, F, h, w], as examples/ltx.rs --latents writes")
     p.add_argument("--out", required=True)
@@ -795,11 +1206,22 @@ if __name__ == "__main__":
     if a.text:
         text(a.text, a.dit, a.out)
     if a.dit and a.contexts:
-        transformer(a.dit, a.out, a.contexts, a.blocks, a.lora, a.guided)
+        dfr = None
+        if a.dfr:
+            # The reference latent's downscale: the detailing LoRA's metadata
+            # says it, as DFR reads it; 2 without one, as its name says.
+            downscale = 2
+            if a.detailing:
+                with safe_open(a.detailing, framework="pt") as f:
+                    downscale = int((f.metadata() or {}).get("reference_downscale_factor", 1))
+            dfr = (a.upsampler, a.vae, a.detailing, downscale, a.temporal)
+        transformer(a.dit, a.out, a.contexts, a.blocks, a.lora, a.guided, a.conditioned, dfr)
     if a.duration:
         duration(a.duration, a.out)
-    if a.diffvae:
+    if a.diffvae and a.keyframes:
+        diffvae_keyframes(a.diffvae, a.out)
+    elif a.diffvae:
         diffvae(a.diffvae, a.out)
-    if a.upsampler:
+    if a.upsampler and a.latent:
         upsampler(a.upsampler, a.vae, a.latent, a.out)
     print(f"wrote {a.out} in {time.time() - started:.0f} s")

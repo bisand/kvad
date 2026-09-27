@@ -12,6 +12,10 @@
 //! 2. stage 4, to the context;
 //! 3. stage 5, the context and the noise to the frames.
 //!
+//! With `--keyframes`, the keyframe-aware decode instead, against what
+//! `--diffvae … --keyframes` wrote: the same latent and two keyframe planes
+//! at pixel frames 8 and 16, each stage's video and planes compared.
+//!
 //! On Metal in bf16 by default; `--f32` keeps Metal in f32, `--cpu` runs on
 //! the CPU in f32, the closest to the reference's arithmetic. `--where`
 //! prints where the file is (downloading it first).
@@ -25,11 +29,14 @@
 //! stage-5 tokens a tile may have (`ltx_diffvae::BUDGET` by default);
 //! `--against` decodes the clip a second time under another budget and says
 //! how far apart the two are, which is what tiling costs. `--profile` says
-//! where the time went ([`kvad_gpu::prof`]).
+//! where the time went ([`kvad_gpu::prof`]). `--keyframes-at 24,48,…`
+//! decodes with keyframe planes at those pixel frames, standing in for
+//! DFR's the latent's own frames there: a measure of what planes cost, not
+//! of what DFR's make.
 
 use candle_core::{DType, Device, Tensor};
 use kvad::weights::{fetch_file, Watcher};
-use kvad_gpu::video::ltx_diffvae::{DiffDecoder, Grid, BUDGET, FILE};
+use kvad_gpu::video::ltx_diffvae::{DiffDecoder, Grid, Planes, BUDGET, FILE};
 use kvad_gpu::video::{ltx_vae, LTX_REPO};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -69,6 +76,9 @@ fn main() -> Res<()> {
         return clip(&dec, &device, &file, &value);
     }
     let dir = value("--fixtures").ok_or("--fixtures DIR or --latent FILE is required")?;
+    if flag("--keyframes") {
+        return keyframes(&dec, &device, dtype, &dir);
+    }
     let fx: HashMap<String, Tensor> = candle_core::safetensors::load(format!("{dir}/diffvae_f32.safetensors"), &Device::Cpu)?;
     let get = |k: &str| -> Res<Tensor> { Ok(fx.get(k).ok_or_else(|| format!("no `{k}`"))?.to_device(&device)?) };
     // The reference's own bf16, each stage from the same f32 input, when the
@@ -144,9 +154,24 @@ fn clip(dec: &DiffDecoder, device: &Device, file: &str, value: &dyn Fn(&str) -> 
     }
     let latent = latent.to_device(device)?;
     let seed = value("--seed").map(|s| s.parse()).transpose()?.unwrap_or(0);
+    let at: Vec<usize> = match value("--keyframes-at") {
+        Some(v) => v.split(',').map(|p| p.trim().parse()).collect::<Result<_, _>>()?,
+        None => vec![],
+    };
+    let planes = match at.is_empty() {
+        true => None,
+        false => {
+            let pick = Tensor::from_vec(at.iter().map(|&p| (p / 8) as u32).collect::<Vec<_>>(), at.len(), device)?;
+            Some(latent.index_select(&pick, 1)?)
+        }
+    };
+    let keys = planes.as_ref().map(|p| (p, at.as_slice()));
+    if !at.is_empty() {
+        eprintln!("with {} keyframe planes, at pixel frames {at:?}", at.len());
+    }
     let run = |budget: usize| -> Res<Tensor> {
         let t = Instant::now();
-        let (frames, r) = dec.decode(&latent, seed, budget, &mut |i, n| Ok(eprint!("\r   tile {i} of {n}")))?;
+        let (frames, r) = dec.decode_keyed(&latent, keys, seed, budget, &mut |i, n| Ok(eprint!("\r   tile {i} of {n}")))?;
         eprintln!();
         let (n, _, h, w) = frames.dims4()?;
         eprintln!("{:?} to {n} frames of {w}×{h} in {:.1} s: stages 1-3 {:.1} s, 4-5 {:.1} s; tiles {:?}, {:.2} M stage-5 tokens, the largest {:.2} M",
@@ -175,5 +200,76 @@ fn clip(dec: &DiffDecoder, device: &Device, file: &str, value: &dyn Fn(&str) -> 
         std::fs::write(&out, video.mp4(None))?;
         eprintln!("{out}: {} frames", video.frames());
     }
+    Ok(())
+}
+
+/// The keyframe-aware decode, stage by stage, each from the reference's
+/// input to it, its video and its planes compared.
+fn keyframes(dec: &DiffDecoder, device: &Device, dtype: DType, dir: &str) -> Res<()> {
+    let fx: HashMap<String, Tensor> = candle_core::safetensors::load(format!("{dir}/diffvae_kf_f32.safetensors"), &Device::Cpu)?;
+    let bf16: Option<HashMap<String, Tensor>> = candle_core::safetensors::load(format!("{dir}/diffvae_kf_bf16.safetensors"), &Device::Cpu).ok();
+    let get = |k: &str| -> Res<Tensor> { Ok(fx.get(k).ok_or_else(|| format!("no `{k}`"))?.to_device(device)?) };
+    let tokens = |t: Tensor| -> Res<(Tensor, Grid)> {
+        let (tt, h, w, c) = t.dims4()?;
+        Ok((t.reshape((tt * h * w, c))?, Grid { t: tt, h, w }))
+    };
+    // What the reference's own bf16 made of the same, when there is one.
+    let theirs = |k: &str, want: &Tensor| -> Res<String> {
+        match (dtype, &bf16) {
+            (DType::BF16, Some(b)) => {
+                let t = b.get(k).ok_or_else(|| format!("no bf16 `{k}`"))?;
+                let t = if k == "pixels" { t.clone() } else { tokens(t.clone())?.0 };
+                Ok(format!("; the reference's own bf16 {:.1} dB", db(&t, want)?))
+            }
+            _ => Ok(String::new()),
+        }
+    };
+    let frames: Vec<usize> = get("indices")?.to_vec1::<f32>()?.iter().map(|&f| f as usize).collect();
+
+    // 1. Stages 1-3, both streams from the latents.
+    let z = get("latent")?;
+    let f = z.dim(1)?;
+    let last = z.narrow(1, f - 1, 1)?;
+    let padded = Tensor::cat(&[&z, &last, &last], 1)?;
+    let t = Instant::now();
+    let (feat, g4, planes) = dec.stages_1_to_3_keyed(&padded, dec.planes(&get("planes")?, &frames)?)?;
+    device.synchronize()?;
+    let (want, wg) = tokens(get("stage4_input")?)?;
+    let (pwant, pwg) = tokens(get("kf_stage4_input")?)?;
+    if g4 != wg || planes.grid != pwg {
+        return Err(format!("stages 1-3 made {g4:?} and {:?}; the reference {wg:?} and {pwg:?}", planes.grid).into());
+    }
+    eprintln!("1. stages 1-3 to {g4:?}, {:.1} s", t.elapsed().as_secs_f64());
+    eprintln!("   video  {:5.1} dB{}", db(&feat, &want)?, theirs("stage4_input", &want)?);
+    eprintln!("   planes {:5.1} dB{}", db(&planes.x, &pwant)?, theirs("kf_stage4_input", &pwant)?);
+
+    // 2. Stage 4, from the reference's inputs.
+    let t = Instant::now();
+    let given = Planes { x: pwant.to_dtype(dtype)?, grid: pwg, frames: frames.clone() };
+    let (ctx, g5, pctx) = dec.stage_4_keyed(&want.to_dtype(dtype)?, wg, 2, given)?;
+    device.synchronize()?;
+    let (want_ctx, wg5) = tokens(get("context")?)?;
+    let (pwant_ctx, pwg5) = tokens(get("kf_context")?)?;
+    if g5 != wg5 || pctx.grid != pwg5 {
+        return Err(format!("stage 4 made {g5:?} and {:?}; the reference {wg5:?} and {pwg5:?}", pctx.grid).into());
+    }
+    let times = dec.times(&frames, 4, 0.0);
+    let same = times == get("kf_times")?.to_vec1::<f32>()?;
+    eprintln!("2. stage 4 to {g5:?}, {:.1} s; the planes at stage 5's times {times:?}: {}", t.elapsed().as_secs_f64(), if same { "the reference's" } else { "DIFFERENT" });
+    eprintln!("   video  {:5.1} dB{}", db(&ctx, &want_ctx)?, theirs("context", &want_ctx)?);
+    eprintln!("   planes {:5.1} dB{}", db(&pctx.x, &pwant_ctx)?, theirs("kf_context", &pwant_ctx)?);
+
+    // 3. Stage 5, from the reference's contexts and noise.
+    let t = Instant::now();
+    let given = Planes { x: pwant_ctx.to_dtype(dtype)?, grid: pwg5, frames: frames.clone() };
+    let pixels = dec.stage_5_keyed(&want_ctx.to_dtype(dtype)?, wg5, &get("noise")?, Some((&given, &get("kf_noise")?, 0.0)))?;
+    device.synchronize()?;
+    let want_px = get("pixels")?;
+    eprintln!("3. stage 5 to {:?}: {:.1} dB, {:.1} s{}", pixels.dims(), db(&pixels, &want_px)?, t.elapsed().as_secs_f64(), theirs("pixels", &want_px)?);
+    let most = (pixels.to_dtype(DType::F32)? - want_px.to_dtype(DType::F32)?)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+    eprintln!("   at most {:.2} of an 8-bit level apart", most * 127.5);
+    // And how much the planes change the frames: the same step without them.
+    let alone = dec.stage_5(&want_ctx.to_dtype(dtype)?, wg5, &get("noise")?)?;
+    eprintln!("   without the planes: {:.1} dB from the reference's with them", db(&alone, &want_px)?);
     Ok(())
 }

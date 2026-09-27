@@ -33,7 +33,7 @@ pub const VIDEOS: &str = "usage: kvad videos [ls]
        kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]
                                [--seconds S | --frames N] [--fps N] [--seed N] [--silent]
                                [--image PICTURE] [--steps N] [--guidance G] [--negative TEXT]
-                               [--decoder diffusion|conv]
+                               [--decoder diffusion|conv] [--pipeline fast|dfr]
        kvad videos show ID
        kvad videos watch ID    follow it until it ends
        kvad videos get ID [--out FILE]
@@ -53,6 +53,12 @@ Its files come from `kvad pull Lightricks/LTX-2.5 --dev` (51 GB).
 
 --decoder picks how LTX-2.5's latents become frames: diffusion, the default and
 the reference's, or conv, lighter and about twice as fast to decode.
+
+--pipeline dfr runs LTX-2.5's production pipeline, DFR: generated keyframes, a
+detailing pass and a keyframe-aware decode, slower and finer. --fps above 30
+runs it without being asked, doubling a clip at half or a quarter of the rate
+(48, 50, 60, 96, 100, 120 fps). Its detailing LoRA is gated on Hugging Face,
+and the first DFR video fetches it.
 
 --image starts the video from a picture, which becomes its first frame, scaled
 to cover the video's size and cut from the middle. Any format the server's
@@ -1209,6 +1215,9 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
             if let Some(d) = &args.decoder {
                 body["decoder"] = json!(d);
             }
+            if let Some(p) = &args.pipeline {
+                body["pipeline"] = json!(p);
+            }
             if let Some(path) = &args.image {
                 let bytes = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;
                 // The server reads the picture by its bytes, not its name,
@@ -1230,12 +1239,13 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
             match args.json {
                 true => out::json(&video),
                 false => eprintln!(
-                    "{path}: {}, {} frames at {} fps, seed {}{}\n  \
+                    "{path}: {}, {} frames at {} fps, seed {}{}{}\n  \
                      {} {:.1} s, denoise {:.1} s, decode{} {:.1} s",
                     out::s(&video["size"]),
                     out::s(&k["frames"]),
                     out::s(&k["fps"]),
                     out::s(&k["seed"]),
+                    if k["pipeline"] == json!("dfr") { ", DFR" } else { "" },
                     if k["audio"] == json!(false) { ", no sound" } else { "" },
                     if k["picture_url"].is_string() { "picture and text" } else { "text" },
                     k["encode_secs"].as_f64().unwrap_or(0.0),
@@ -1264,6 +1274,10 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                     println!("{}  {}", out::s(&v["id"]), state(&v));
                     let (size, seed) = (out::s(&v["size"]), out::s(&v["kvad"]["seed"]));
                     let decoder = v["kvad"]["decoder"].as_str().map(|d| format!(", {d} decoder")).unwrap_or_default();
+                    let decoder = match v["kvad"]["pipeline"].as_str() {
+                        Some("dfr") => format!(", DFR{decoder}"),
+                        _ => decoder,
+                    };
                     println!("  {size}, {}, seed {seed}{decoder}, {}", length(&v), out::s(&v["model"]));
                     println!("  {}", out::s(&v["prompt"]));
                 }

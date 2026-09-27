@@ -28,6 +28,19 @@
 //!
 //! **Stage 5 is one step of diffusion**, from noise at `t = 1` straight to the
 //! clean frames, so the frames depend on the noise: the seed.
+//!
+//! **With keyframes** ([`DiffDecoder::decode_keyed`]), as DFR decodes, a
+//! second stream of *planes* runs beside the video: one latent frame each,
+//! tagged with the file's `type_emb` and then through the same weights, and
+//! upsampled each as a clip of one frame, so in space only. Each plane has
+//! a place in each stage's time ([`DiffDecoder::times`]). The streams meet
+//! only in the attention, which is then joint ([`joint`]): a frame's query
+//! sees its own window and the same rows and columns on its two nearest
+//! planes, a plane's its own and the same on its two nearest frames, all in
+//! one softmax, and windows are cut at the edges rather than shifted, as
+//! the reference's joint kernels have them. At stage 5 the planes are
+//! pixels of their own noise, denoised with the video and dropped. Each
+//! tile carries the planes near it ([`planes_for_tile`]).
 
 use super::metadata;
 use super::ltx_nn::RmsNorm;
@@ -132,6 +145,184 @@ pub fn plain(q: &Tensor, k: &Tensor, v: &Tensor, grid: Grid, kernel: [usize; 3],
     acc.broadcast_div(&total)?.reshape((n, width))
 }
 
+// ---------------------------------------------------------------------------
+// Keyframes: joint attention
+// ---------------------------------------------------------------------------
+
+/// How many planes a frame's queries see, and frames a plane's: the
+/// reference's `KEYFRAME_CONTEXT_SLOTS`.
+pub const SLOTS: usize = 2;
+
+/// Each of `frames` frames' nearest keyframe planes, and each plane's
+/// nearest frames, [`SLOTS`] of each: by distance in the stage's time, the
+/// lower index on a tie, −1 where there are too few. The reference's
+/// `video_keyframe_slots` and `keyframe_video_slots`, which rank by a
+/// stable sort of `|Δt|` in f32.
+pub fn slots(times: &[f32], frames: usize) -> (Vec<[i32; SLOTS]>, Vec<[i32; SLOTS]>) {
+    let nearest = |q: f32, candidates: &mut dyn Iterator<Item = f32>| -> [i32; SLOTS] {
+        let mut d: Vec<(f32, usize)> = candidates.enumerate().map(|(i, c)| ((q - c).abs(), i)).collect();
+        d.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        std::array::from_fn(|j| d.get(j).map_or(-1, |x| x.1 as i32))
+    };
+    let video = (0..frames).map(|t| nearest(t as f32, &mut times.iter().copied())).collect();
+    let planes = times.iter().map(|&p| nearest(p, &mut (0..frames).map(|t| t as f32))).collect();
+    (video, planes)
+}
+
+/// One part of a joint attention: keys and values `[frames·h·w, width]` on
+/// the queries' rows and columns, and for each query frame the key frame
+/// its window is centred on, −1 for none. A window here is cut at the
+/// edges rather than shifted inward: `(c + a − ⌊kt/2⌋, h + b − ⌊kh/2⌋, w + c −
+/// ⌊kw/2⌋)` for its offsets, those off the grid left out, as the
+/// reference's joint attention has it.
+pub(crate) struct Part<'a> {
+    pub(crate) k: &'a Tensor,
+    pub(crate) v: &'a Tensor,
+    pub(crate) frames: usize,
+    pub(crate) centres: Vec<i32>,
+    pub(crate) kernel: [usize; 3],
+}
+
+/// A part's attention for queries `q` `[n, heads·d]` on `grid`, written
+/// plainly as [`plain`] is, in f32: the answer `[n, heads, d]` and each
+/// row's log-sum-exp of scores `[n, heads, 1]`. An offset at a time, every
+/// query's key gathered, those off the grid kept out of the softmax; a row
+/// with no keys answers 0, at −∞.
+pub(crate) fn plain_part(q: &Tensor, grid: Grid, part: &Part<'_>, heads: usize) -> candle_core::Result<(Tensor, Tensor)> {
+    let (n, width) = q.dims2()?;
+    let [kt, kh, kw] = part.kernel;
+    if grid.tokens() != n || part.centres.len() != grid.t || part.k.dim(0)? != part.frames * grid.h * grid.w {
+        candle_core::bail!("joint attention: {n} queries on {grid:?}, keys {:?} in {} frames", part.k.dims(), part.frames);
+    }
+    let d = width / heads;
+    let dev = q.device();
+    let f = |t: &Tensor| t.to_dtype(DType::F32);
+    let (q, k, v) = (f(q)?.reshape((n, heads, d))?, f(part.k)?, f(part.v)?);
+    // −1e30 rather than −∞ for a key left out, so that no difference of
+    // two of them is a NaN; its weight is zeroed besides.
+    let mut best = Tensor::full(-1e30f32, (n, heads, 1), dev)?;
+    let mut total = Tensor::zeros((n, heads, 1), DType::F32, dev)?;
+    let mut acc = Tensor::zeros((n, heads, d), DType::F32, dev)?;
+    let (gh, gw) = (grid.h as i64, grid.w as i64);
+    for a in 0..kt {
+        for b in 0..kh {
+            for c in 0..kw {
+                let mut at = Vec::with_capacity(n);
+                let mut ok = Vec::with_capacity(n);
+                for &centre in &part.centres {
+                    let ft = centre as i64 + a as i64 - (kt / 2) as i64;
+                    let frame_ok = centre >= 0 && (0..part.frames as i64).contains(&ft);
+                    for h in 0..gh {
+                        let fh = h + b as i64 - (kh / 2) as i64;
+                        for w in 0..gw {
+                            let fw = w + c as i64 - (kw / 2) as i64;
+                            let valid = frame_ok && (0..gh).contains(&fh) && (0..gw).contains(&fw);
+                            at.push(if valid { ((ft * gh + fh) * gw + fw) as u32 } else { 0 });
+                            ok.push(if valid { 1f32 } else { 0.0 });
+                        }
+                    }
+                }
+                let at = Tensor::from_vec(at, n, dev)?;
+                let ok = Tensor::from_vec(ok, (n, 1, 1), dev)?;
+                let kk = k.index_select(&at, 0)?.reshape((n, heads, d))?;
+                let vv = v.index_select(&at, 0)?.reshape((n, heads, d))?;
+                let s = (&q * &kk)?.sum_keepdim(D::Minus1)?;
+                let s = (s.broadcast_mul(&ok)? + ((ok.clone() - 1.0)? * 1e30)?.broadcast_as(s.shape())?)?;
+                let next = best.maximum(&s)?;
+                let fade = (&best - &next)?.exp()?;
+                let p = (&s - &next)?.exp()?.broadcast_mul(&ok)?;
+                total = ((total * &fade)? + &p)?;
+                acc = (acc.broadcast_mul(&fade)? + vv.broadcast_mul(&p)?)?;
+                best = next;
+            }
+        }
+    }
+    let lse = (&best + total.log()?)?;
+    Ok((acc.broadcast_div(&total.maximum(1e-30)?)?, lse))
+}
+
+/// Parts' answers `[n, heads, d]` put together as one softmax over all
+/// their keys, into `[n, heads·d]` of `dtype`: each weighted by its share of
+/// the whole, `exp(lse − max)`. A run of rows at a time, so that its
+/// temporaries stay small beside the parts, which at stage 5 are whole
+/// activations in f32.
+pub(crate) fn merge(parts: &[(Tensor, Tensor)], dtype: DType) -> candle_core::Result<Tensor> {
+    let (n, heads, d) = parts[0].0.dims3()?;
+    let dev = parts[0].0.device().clone();
+    let step = (CHUNK_BYTES / (4 * heads * d)).max(1);
+    let spans: Vec<(usize, usize)> = (0..n).step_by(step).map(|r| (r, (r + step).min(n))).collect();
+    by_runs(n, heads * d, dtype, &dev, &spans, 1, |r0, len, _, _| {
+        let rows = |t: &Tensor| t.narrow(0, r0, len);
+        let mut top = rows(&parts[0].1)?;
+        for (_, l) in &parts[1..] {
+            top = top.maximum(&rows(l)?)?;
+        }
+        let (mut num, mut den) = (None::<Tensor>, None::<Tensor>);
+        for (o, l) in parts {
+            let w = (rows(l)? - &top)?.exp()?;
+            let y = rows(o)?.broadcast_mul(&w)?;
+            num = Some(match num {
+                Some(a) => (a + y)?,
+                None => y,
+            });
+            den = Some(match den {
+                Some(a) => (a + w)?,
+                None => w,
+            });
+        }
+        num.unwrap().broadcast_div(&den.unwrap())?.reshape((len, heads * d))
+    })
+}
+
+/// Joint neighbourhood attention over a video `q, k, v` `[n, heads·d]` on
+/// `grid` and keyframe planes `pq, pk, pv` on `planes`, the planes at stage
+/// times `times`, q already scaled: the reference's `joint_na3d`, one softmax
+/// per query over
+///
+/// - for a frame's query, its `kernel` window, cut at the edges, and the
+///   same rows and columns on each of its [`SLOTS`] nearest planes;
+/// - for a plane's, its window on its own plane, and the same on each of
+///   its nearest frames.
+///
+/// On the M5 each side is one kernel
+/// (`crate::mpp_neighbourhood::neighbourhood_joint`), which walks the other
+/// stream's rows after its own window's. Otherwise each part is its own
+/// attention with its log-sum-exp ([`plain_part`]), and [`merge`] makes them
+/// one. The answers `[n, heads·d]` and `[P·h·w, heads·d]`,
+/// in q's dtype.
+#[allow(clippy::too_many_arguments)]
+pub fn joint(q: &Tensor, k: &Tensor, v: &Tensor, grid: Grid, pq: &Tensor, pk: &Tensor, pv: &Tensor, planes: Grid, times: &[f32], kernel: [usize; 3], heads: usize)
+ -> candle_core::Result<(Tensor, Tensor)> {
+    let (video, plane) = slots(times, grid.t);
+    let flat = [1, kernel[1], kernel[2]];
+    let own = |k, v, frames, n: usize, kernel| Part { k, v, frames, centres: (0..n as i32).collect(), kernel };
+    let slot = |k, v, frames, table: &[[i32; SLOTS]], j: usize| Part { k, v, frames, centres: table.iter().map(|s| s[j]).collect(), kernel: flat };
+    let mut vp = vec![own(k, v, grid.t, grid.t, kernel)];
+    let mut pp = vec![own(pk, pv, planes.t, planes.t, flat)];
+    for j in 0..SLOTS {
+        vp.push(slot(pk, pv, planes.t, &video, j));
+        pp.push(slot(k, v, grid.t, &plane, j));
+    }
+    let run = |q: &Tensor, g: Grid, parts: &[Part<'_>]| -> candle_core::Result<Tensor> {
+        let answers = parts.iter().map(|p| plain_part(q, g, p, heads)).collect::<candle_core::Result<Vec<_>>>()?;
+        merge(&answers, q.dtype())
+    };
+    // Each side in one kernel where there is one: the video's parts at
+    // stage 5 would be whole activations in f32, three of them.
+    #[cfg(target_os = "macos")]
+    {
+        use crate::mpp_neighbourhood::neighbourhood_joint as fused;
+        // A plane's side is the same with the roles turned: its own plane's
+        // window, then the same rows and columns on its frames.
+        let o = fused(q, k, v, [grid.t, grid.h, grid.w], pk, pv, &video, kernel, heads, 1.0)?;
+        let po = fused(pq, pk, pv, [planes.t, planes.h, planes.w], k, v, &plane, flat, heads, 1.0)?;
+        if let (Some(o), Some(po)) = (o, po) {
+            return Ok((o, po));
+        }
+    }
+    Ok((run(q, grid, &vp)?, run(pq, planes, &pp)?))
+}
+
 /// Absolute 3D rotary positions for `[n, heads, 64]`: 16 of a head's
 /// dimensions for time, 24 for rows, 24 for columns, each rotating adjacent
 /// pairs `(2i, 2i + 1)` by the position times `10000^(−2i/d)`, positions
@@ -143,7 +334,8 @@ pub fn plain(q: &Tensor, k: &Tensor, v: &Tensor, grid: Grid, kernel: [usize; 3],
 /// clip's stage 5 would be 760 MB.
 ///
 /// The rotation is relative in every product of a query and a key, so a
-/// tile can count its positions from its own corner.
+/// tile can count its positions from its own corner; keyframe planes, which
+/// join a frame's keys, take their places in that count ([`Rope::at`]).
 struct Rope {
     /// cos and sin, for time, rows, columns.
     axes: [(Tensor, Tensor); 3],
@@ -156,14 +348,26 @@ struct Rope {
 
 impl Rope {
     fn new(grid: Grid, split: [usize; 3], device: &Device) -> candle_core::Result<Self> {
-        let axis = |len: usize, d: usize| -> candle_core::Result<(Tensor, Tensor)> {
+        let frames: Vec<f32> = (0..grid.t).map(|t| t as f32).collect();
+        Self::at(&frames, grid, split, device)
+    }
+
+    /// With frame `i` of `grid` at time `times[i]` rather than at `i`: keyframe
+    /// planes, each at its own place in the stage's time, fractional as the
+    /// reference's `keyframe_stage_times` makes it.
+    fn at(times: &[f32], grid: Grid, split: [usize; 3], device: &Device) -> candle_core::Result<Self> {
+        let axis = |positions: &[f32], d: usize| -> candle_core::Result<(Tensor, Tensor)> {
             let inv: Vec<f32> = (0..d / 2).map(|i| (1.0 / 10000f64.powf((2 * i) as f64 / d as f64)) as f32).collect();
-            let angles: Vec<f32> = (0..len).flat_map(|p| inv.iter().map(move |f| p as f32 * f)).collect();
+            let angles: Vec<f32> = positions.iter().flat_map(|&p| inv.iter().map(move |f| p * f)).collect();
             let cos = angles.iter().map(|a| a.cos()).collect();
             let sin = angles.iter().map(|a| a.sin()).collect();
-            Ok((Tensor::from_vec(cos, (len, d / 2), device)?, Tensor::from_vec(sin, (len, d / 2), device)?))
+            Ok((Tensor::from_vec(cos, (positions.len(), d / 2), device)?, Tensor::from_vec(sin, (positions.len(), d / 2), device)?))
         };
-        let axes = [axis(grid.t, split[0])?, axis(grid.h, split[1])?, axis(grid.w, split[2])?];
+        let count = |n: usize| (0..n).map(|i| i as f32).collect::<Vec<_>>();
+        if times.len() != grid.t {
+            candle_core::bail!("{} times for {} frames", times.len(), grid.t);
+        }
+        let axes = [axis(times, split[0])?, axis(&count(grid.h), split[1])?, axis(&count(grid.w), split[2])?];
         let flat = |i: usize| axes.iter().map(|a| if i == 0 { a.0.flatten_all() } else { a.1.flatten_all() }).collect::<candle_core::Result<Vec<_>>>();
         let packed = Tensor::cat(&[flat(0)?, flat(1)?].concat(), 0)?;
         Ok(Rope { axes, packed, pairs: split.map(|d| d / 2), grid })
@@ -341,18 +545,35 @@ impl Block {
     /// On Metal the norms, the q and k norms with their rotation, and the
     /// SwiGLU's product are one kernel each (`ltx_fused`).
     fn forward(&self, x: Tensor, grid: Grid, rope: &Rope, ctx: Option<(&Tensor, &Tensor)>) -> candle_core::Result<Tensor> {
-        let (n, width) = x.dims2()?;
+        Ok(self.forward_keyed(x, grid, rope, ctx, None)?.0)
+    }
+
+    /// [`Block::forward`], and with `keys` the keyframe planes beside the
+    /// video: the same weights and the same step's rows for both, each with
+    /// its own context, meeting only in the attention ([`joint`]). The
+    /// planes' answer is the second.
+    fn forward_keyed(&self, x: Tensor, grid: Grid, rope: &Rope, ctx: Option<(&Tensor, &Tensor)>, keys: Option<Keyed<'_>>)
+     -> candle_core::Result<(Tensor, Option<Tensor>)> {
+        let width = x.dim(1)?;
         let (dt, dev) = (x.dtype(), x.device().clone());
-        let plane = grid.h * grid.w;
-        let spans = runs(grid, width);
-        let (x, m) = match (&self.cond, ctx) {
-            (Some(c), Some((context, rows))) => {
-                let x = span(|| format!("{width}: context"), &dev, || by_runs(n, width, dt, &dev, &spans, plane, |r0, len, _, _| {
-                    x.narrow(0, r0, len)? + c.context.forward(&context.narrow(0, r0, len)?)?
-                }))?;
-                (x, Some((rows + &c.table)?))
+        let with_context = |x: Tensor, grid: Grid, context: Option<&Tensor>| -> candle_core::Result<Tensor> {
+            match (&self.cond, context) {
+                (Some(c), Some(context)) => span(|| format!("{width}: context"), &dev, || {
+                    by_runs(grid.tokens(), width, dt, &dev, &runs(grid, width), grid.h * grid.w, |r0, len, _, _| {
+                        x.narrow(0, r0, len)? + c.context.forward(&context.narrow(0, r0, len)?)?
+                    })
+                }),
+                _ => Ok(x),
             }
-            _ => (x, None),
+        };
+        let m = match (&self.cond, ctx) {
+            (Some(c), Some((_, rows))) => Some((rows + &c.table)?),
+            _ => None,
+        };
+        let x = with_context(x, grid, ctx.map(|c| c.0))?;
+        let keys = match keys {
+            Some(k) => Some(Keyed { x: with_context(k.x, k.grid, k.context)?, ..k }),
+            None => None,
         };
         // Each norm as `rms(x)·a + b`: its weight, times `1 + scale` and
         // plus the shift where the step modulates it, in f32.
@@ -375,35 +596,66 @@ impl Block {
                 None => Ok(y),
             }
         };
-        let qkv = span(|| format!("{width}: norm, qkv, rope"), &dev, || {
-            let all = blank(&[3, n, width], dt, &dev)?;
-            let d = width / self.attn.heads;
-            for &(t0, t1) in &spans {
-                let (r0, len) = (t0 * plane, (t1 - t0) * plane);
-                let h = normed(&self.norm1, &x.narrow(0, r0, len)?, &a1, &b1, 0, 1)?;
-                let fused = self.attn.qkv.forward(&h)?.to_dtype(dt)?;
-                let place = super::ltx_fused::HeadRope { h: grid.h, w: grid.w, row0: r0, tables: &rope.packed, pairs: rope.pairs, lens: [grid.t, grid.h, grid.w] };
-                let (qn, kn) = (self.attn.q_norm.weight(), self.attn.k_norm.weight());
-                if d == 64 && super::ltx_fused::head_norm_rope(&fused, qn, kn, &place, EPS as f32, 1.0 / (d as f32).sqrt(), &all)? {
+        // q, k and v `[3, n, width]` of tokens `x` on `grid`, rotated by `rope`.
+        let qkv_of = |x: &Tensor, grid: Grid, rope: &Rope| -> candle_core::Result<Tensor> {
+            span(|| format!("{width}: norm, qkv, rope"), &dev, || {
+                let (n, plane) = (grid.tokens(), grid.h * grid.w);
+                let all = blank(&[3, n, width], dt, &dev)?;
+                let d = width / self.attn.heads;
+                for &(t0, t1) in &runs(grid, width) {
+                    let (r0, len) = (t0 * plane, (t1 - t0) * plane);
+                    let h = normed(&self.norm1, &x.narrow(0, r0, len)?, &a1, &b1, 0, 1)?;
+                    let fused = self.attn.qkv.forward(&h)?.to_dtype(dt)?;
+                    let place = super::ltx_fused::HeadRope { h: grid.h, w: grid.w, row0: r0, tables: &rope.packed, pairs: rope.pairs, lens: [grid.t, grid.h, grid.w] };
+                    let (qn, kn) = (self.attn.q_norm.weight(), self.attn.k_norm.weight());
+                    if d == 64 && super::ltx_fused::head_norm_rope(&fused, qn, kn, &place, EPS as f32, 1.0 / (d as f32).sqrt(), &all)? {
                         continue;
+                    }
+                    let (cos, sin) = rope.frames(t0, t1)?;
+                    for (i, part) in self.attn.project(&fused, &cos, &sin)?.into_iter().enumerate() {
+                        all.get(i)?.slice_set(&part, 0, r0)?;
+                    }
                 }
-                let (cos, sin) = rope.frames(t0, t1)?;
-                for (i, part) in self.attn.project(&fused, &cos, &sin)?.into_iter().enumerate() {
-                    all.get(i)?.slice_set(&part, 0, r0)?;
-                }
+                Ok(all)
+            })
+        };
+        // `x + proj(o)`, then its feed-forward.
+        let finish = |x: &Tensor, o: &Tensor, grid: Grid| -> candle_core::Result<Tensor> {
+            span(|| format!("{width}: proj, feed-forward"), &dev, || by_runs(grid.tokens(), width, dt, &dev, &runs(grid, width), grid.h * grid.w, |r0, len, _, _| {
+                let y = (x.narrow(0, r0, len)? + self.attn.proj.forward(&o.narrow(0, r0, len)?)?.to_dtype(dt)?)?;
+                let h = normed(&self.norm2, &y, &a2, &b2, 3, 4)?;
+                &y + self.mlp.forward(&h)?.to_dtype(dt)?
+            }))
+        };
+        let qkv = qkv_of(&x, grid, rope)?;
+        let (kernel, heads) = (self.attn.kernel, self.attn.heads);
+        match keys {
+            None => {
+                let o = span(|| format!("{width}: attention"), &dev, || neighbourhood(&qkv.get(0)?, &qkv.get(1)?, &qkv.get(2)?, grid, kernel, heads))?;
+                drop(qkv);
+                Ok((finish(&x, &o, grid)?, None))
             }
-            Ok(all)
-        })?;
-        let o = span(|| format!("{width}: attention"), &dev, || {
-            neighbourhood(&qkv.get(0)?, &qkv.get(1)?, &qkv.get(2)?, grid, self.attn.kernel, self.attn.heads)
-        })?;
-        drop(qkv);
-        span(|| format!("{width}: proj, feed-forward"), &dev, || by_runs(n, width, dt, &dev, &spans, plane, |r0, len, _, _| {
-            let y = (x.narrow(0, r0, len)? + self.attn.proj.forward(&o.narrow(0, r0, len)?)?.to_dtype(dt)?)?;
-            let h = normed(&self.norm2, &y, &a2, &b2, 3, 4)?;
-            &y + self.mlp.forward(&h)?.to_dtype(dt)?
-        }))
+            Some(k) => {
+                let pqkv = qkv_of(&k.x, k.grid, k.rope)?;
+                let (o, po) = span(|| format!("{width}: joint attention"), &dev, || {
+                    joint(&qkv.get(0)?, &qkv.get(1)?, &qkv.get(2)?, grid, &pqkv.get(0)?, &pqkv.get(1)?, &pqkv.get(2)?, k.grid, k.times, kernel, heads)
+                })?;
+                drop((qkv, pqkv));
+                Ok((finish(&x, &o, grid)?, Some(finish(&k.x, &po, k.grid)?)))
+            }
+        }
     }
+}
+
+/// The keyframe planes' side of a block: their tokens on their grid
+/// (planes, rows, columns), their rotation at their `times`, and at stage 5
+/// their context.
+struct Keyed<'a> {
+    x: Tensor,
+    grid: Grid,
+    rope: &'a Rope,
+    times: &'a [f32],
+    context: Option<&'a Tensor>,
 }
 
 /// An upsampling: a linear layer to `p₁·p₂·p₃·c` channels, then each token's
@@ -439,12 +691,33 @@ impl Up {
             _ => Ok((y, g)),
         }
     }
+
+    /// Keyframe planes `[P·h·w, C]` on `grid` (planes, rows, columns),
+    /// each upsampled as a clip of one frame with its first dropped, the
+    /// reference's `upsample_keyframe_planes`: in space only, since a
+    /// doubling in time makes a plane two frames and keeps the second.
+    fn planes(&self, x: &Tensor, grid: Grid) -> candle_core::Result<(Tensor, Grid)> {
+        let p1 = self.stride[0];
+        if p1 > 2 {
+            candle_core::bail!("keyframe planes through a stride of {p1} in time");
+        }
+        let (y, g) = self.forward(x, grid, false)?;
+        let plane = g.h * g.w;
+        let y = y.reshape((grid.t, p1, plane, self.out))?.narrow(1, p1 - 1, 1)?.contiguous()?;
+        Ok((y.reshape((grid.t * plane, self.out))?, Grid { t: grid.t, ..g }))
+    }
 }
 
 /// The decoder: stages 1 to 4 turn a latent into a context, stage 5 turns
 /// noise and the context into frames.
 pub struct DiffDecoder {
     conv_in: Linear,
+    /// The keyframe stream's tag, `[1, 128]` in f32: added to a plane's
+    /// latent before `conv_in`, and nowhere else.
+    type_emb: Tensor,
+    /// The temporal upsampling still to come at each stage's input, and at
+    /// stage 5, 1: the reference's `remaining_time_strides`, (8, 8, 4, 2, 1).
+    time_strides: [usize; 5],
     stages: Vec<(Vec<Block>, Up)>,
     t1: Linear,
     t2: Linear,
@@ -486,10 +759,40 @@ pub fn noise_seed(seed: u64) -> u64 {
     seed ^ 0x6469_6666_7661_6500
 }
 
+/// The seed of the keyframe planes' stage-5 noise, turned again.
+fn plane_seed(seed: u64) -> u64 {
+    noise_seed(seed) ^ 0x706c_616e_6573_0000
+}
+
 /// The two latent frames' worth of stage-4 frames that the decoder's input
 /// repeats at its end and stage 4's answer loses: 2 latent frames, ×4 by
 /// stage 4.
 const GHOST_S4: usize = 8;
+
+/// Keyframe planes decoded beside a video: their tokens `[P·h·w, C]` so
+/// far on (planes, rows, columns), and each plane's pixel frame in the clip.
+pub struct Planes {
+    pub x: Tensor,
+    pub grid: Grid,
+    pub frames: Vec<usize>,
+}
+
+/// [`DiffDecoder::times`] for a stage whose upsampling in time to come is `r`.
+fn stage_times(frames: &[usize], r: usize, origin: f32) -> Vec<f32> {
+    let r = r as f32;
+    frames.iter().map(|&f| if f == 0 { 0.0 } else { (f as f32 + (r - 1.0) / 2.0) / r } - origin).collect()
+}
+
+/// Which of the planes at pixel frames `frames` a tile of frames `lo ..=
+/// hi` carries: those inside it, and the nearest outside it on each side,
+/// the reference's `planes_for_tile`. Without those two a frame near the
+/// tile's edge would see only the planes inside, and not the ones it sees
+/// in a whole decode. Indices into `frames`, in its order.
+pub fn planes_for_tile(frames: &[usize], lo: usize, hi: usize) -> Vec<usize> {
+    let before = (0..frames.len()).filter(|&i| frames[i] < lo).max_by(|&a, &b| frames[a].cmp(&frames[b]).then(b.cmp(&a)));
+    let after = (0..frames.len()).filter(|&i| frames[i] > hi).min_by(|&a, &b| frames[a].cmp(&frames[b]).then(a.cmp(&b)));
+    (0..frames.len()).filter(|&i| (lo..=hi).contains(&frames[i]) || Some(i) == before || Some(i) == after).collect()
+}
 
 /// How a decode was laid out, and how long it took.
 #[derive(Debug, Default)]
@@ -539,9 +842,13 @@ impl DiffDecoder {
         let r = open(&paths, if dtype == DType::F32 { DType::F32 } else { DType::BF16 })?;
         r.skip_under("encoder");
         let m = r.pp("decoder");
-        // The keyframe stream's tag, which a plain decode never reads.
-        m.record("type_emb");
         let latent = d["in_channels"].as_u64().unwrap_or(128) as usize;
+        // The keyframe stream's tag; a checkpoint from before the keyframe
+        // training has none, which the reference reads as zeros.
+        let type_emb = match m.try_get(latent, "type_emb") {
+            Some(t) => t.to_device(device)?.to_dtype(DType::F32)?.reshape((1, latent))?,
+            None => Tensor::zeros((1, latent), DType::F32, device)?,
+        };
         let conv_in = Linear::load(&cx, &m, "conv_in", latent, channels[0], true)?;
         let mut stages = Vec::new();
         let mut strides = Vec::new();
@@ -574,8 +881,14 @@ impl DiffDecoder {
         let stride4 = strides[3];
         let halo = [0, 1, 2].map(|a| (depths[3] * (kernels[3][a] / 2)).max((depths[4] * (s5[a] / 2)).div_ceil(stride4[a])));
         let min_tile = [0, 1, 2].map(|a| kernels[3][a].max(s5[a].div_ceil(stride4[a])));
+        let mut time_strides = [1; 5];
+        for i in (0..4).rev() {
+            time_strides[i] = time_strides[i + 1] * strides[i][0];
+        }
         let dec = DiffDecoder {
             conv_in,
+            type_emb,
+            time_strides,
             stages,
             t1: Linear::load(&cx, &m.pp("t_embedder.mlp"), "0", 256, t_dim, true)?,
             t2: Linear::load(&cx, &m.pp("t_embedder.mlp"), "2", t_dim, t_dim, true)?,
@@ -632,6 +945,72 @@ impl DiffDecoder {
         Ok((y.to_dtype(self.dtype)?, g))
     }
 
+    /// Planes' places in stage `stage`'s time (0 to 3, and 4 for stage 5),
+    /// less `origin` in its units: the reference's `keyframe_clip_times`
+    /// for a decode from frame 0. With `r` the upsampling in time still to
+    /// come, a stage's cells hold `r` pixel frames, but for the first, which
+    /// holds frame 0 alone; frame `f` is at `(f + (r − 1)/2)/r`, the middle
+    /// of its cell, and frame 0 at 0. In f32, in the reference's order.
+    pub fn times(&self, frames: &[usize], stage: usize, origin: f32) -> Vec<f32> {
+        stage_times(frames, self.time_strides[stage], origin)
+    }
+
+    /// Keyframe latents `[128, P, h, w]`, each one plane, at pixel frames
+    /// `frames`, as the keyframe stream's first tokens: un-normalised,
+    /// tagged with `type_emb`, and through the video's own `conv_in`.
+    pub fn planes(&self, latents: &Tensor, frames: &[usize]) -> candle_core::Result<Planes> {
+        let (c, p, h, w) = latents.dims4()?;
+        if p != frames.len() {
+            candle_core::bail!("{p} keyframe planes at {} frames", frames.len());
+        }
+        let z = latents.to_dtype(DType::F32)?.reshape((c, p * h * w))?.t()?.contiguous()?;
+        let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?.broadcast_add(&self.type_emb)?.to_dtype(self.dtype)?;
+        Ok(Planes { x: self.conv_in.forward(&z)?.to_dtype(self.dtype)?, grid: Grid { t: p, h, w }, frames: frames.to_vec() })
+    }
+
+    /// [`DiffDecoder::stages_1_to_3`] with keyframe planes beside the
+    /// video, both streams through every block, the planes' times global.
+    pub fn stages_1_to_3_keyed(&self, latent: &Tensor, planes: Planes) -> candle_core::Result<(Tensor, Grid, Planes)> {
+        let (c, t, h, w) = latent.dims4()?;
+        let g = Grid { t, h, w };
+        let z = latent.to_dtype(DType::F32)?.reshape((c, g.tokens()))?.t()?.contiguous()?;
+        let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?.to_dtype(self.dtype)?;
+        let (mut x, mut g, mut p) = (self.conv_in.forward(&z)?.to_dtype(self.dtype)?, g, planes);
+        for i in 0..3 {
+            (x, g, p) = self.stage_keyed(x, g, p, i, true, 0.0)?;
+        }
+        Ok((x, g, p))
+    }
+
+    /// Stage `i` on both streams, the planes' times less `origin` in its
+    /// units; the planes upsampled each on its own ([`Up::planes`]).
+    fn stage_keyed(&self, x: Tensor, g: Grid, planes: Planes, i: usize, drop_first: bool, origin: f32) -> candle_core::Result<(Tensor, Grid, Planes)> {
+        let (blocks, up) = &self.stages[i];
+        let times = self.times(&planes.frames, i, origin);
+        let rope = Rope::new(g, self.split, &self.device)?;
+        let prope = Rope::at(&times, planes.grid, self.split, &self.device)?;
+        let (mut x, mut px) = (x, planes.x);
+        for b in blocks {
+            let keys = Keyed { x: px, grid: planes.grid, rope: &prope, times: &times, context: None };
+            let (y, py) = b.forward_keyed(x, g, &rope, None, Some(keys))?;
+            (x, px) = (y, py.ok_or_else(|| candle_core::Error::Msg("a keyed block without its planes".into()))?);
+            self.device.synchronize()?;
+        }
+        let (y, g) = up.forward(&x, g, drop_first)?;
+        let (py, pg) = up.planes(&px, planes.grid)?;
+        self.device.synchronize()?;
+        Ok((y.to_dtype(self.dtype)?, g, Planes { x: py.to_dtype(self.dtype)?, grid: pg, frames: planes.frames }))
+    }
+
+    /// [`DiffDecoder::stage_4`] with keyframe planes: the context and the
+    /// planes' own, which stage 5 reads beside it.
+    pub fn stage_4_keyed(&self, feat: &Tensor, grid: Grid, ghost: usize, planes: Planes) -> candle_core::Result<(Tensor, Grid, Planes)> {
+        let (x, g, p) = self.stage_keyed(feat.clone(), grid, planes, 3, true, 0.0)?;
+        let content = g.t.saturating_sub(ghost * 8).max(1);
+        let keep = g.t.min(content.max(self.stage5_kernel[0]));
+        Ok((x.narrow(0, 0, keep * g.h * g.w)?, Grid { t: keep, ..g }, p))
+    }
+
     /// Stage 4, whole: the context, with the two repeated latent frames'
     /// worth (16 frames) cut from its end, to no fewer than stage 5's window.
     pub fn stage_4(&self, feat: &Tensor, grid: Grid, ghost: usize) -> candle_core::Result<(Tensor, Grid)> {
@@ -666,22 +1045,53 @@ impl DiffDecoder {
     /// (frames first, the grid's size in pixels), to the clean frames
     /// `[T, 3, H, W]` in `[−1, 1]`.
     pub fn stage_5(&self, context: &Tensor, grid: Grid, noise: &Tensor) -> candle_core::Result<Tensor> {
+        self.stage_5_keyed(context, grid, noise, None)
+    }
+
+    /// [`DiffDecoder::stage_5`], and with `keys` keyframe planes beside the
+    /// video: their context from [`DiffDecoder::stage_4_keyed`], their own
+    /// noise `[P, 3, H, W]`, and the pixel frame the video's first is, their
+    /// times' origin. The planes are a second stream of pixels, denoised
+    /// with the video so that what the joint attention reads of them is at
+    /// the noise it was trained at, and then dropped.
+    pub fn stage_5_keyed(&self, context: &Tensor, grid: Grid, noise: &Tensor, keys: Option<(&Planes, &Tensor, f32)>) -> candle_core::Result<Tensor> {
         let p = self.patch;
-        let x = super::ltx_vae::patchify(&noise.to_dtype(self.dtype)?, p)?;
-        // [T, 48, h, w] → tokens [T·h·w, 48].
-        let x = x.permute((0, 2, 3, 1))?.contiguous()?.reshape((grid.tokens(), 3 * p * p))?;
         let (c5, plane) = (self.norm_out.weight().elem_count(), grid.h * grid.w);
+        // Noise `[T, 3, H, W]` to its first tokens on `g`, `[T·h·w, 256]`.
+        let x_in = |noise: &Tensor, g: Grid| -> candle_core::Result<Tensor> {
+            let x = super::ltx_vae::patchify(&noise.to_dtype(self.dtype)?, p)?;
+            let x = x.permute((0, 2, 3, 1))?.contiguous()?.reshape((g.tokens(), 3 * p * p))?;
+            span(|| "stage 5 in", &self.device, || by_runs(g.tokens(), c5, self.dtype, &self.device, &runs(g, c5), g.h * g.w, |r0, len, _, _| {
+                self.x_in.forward(&x.narrow(0, r0, len)?)
+            }))
+        };
         let spans = runs(grid, c5);
-        let mut x = span(|| "stage 5 in", &self.device, || by_runs(grid.tokens(), c5, self.dtype, &self.device, &spans, plane, |r0, len, _, _| {
-            self.x_in.forward(&x.narrow(0, r0, len)?)
-        }))?;
+        let mut x = x_in(noise, grid)?;
         let rows = self.rows()?;
         let rope = Rope::new(grid, self.split, &self.device)?;
+        let keyed = match keys {
+            Some((planes, pnoise, origin)) => {
+                let times = self.times(&planes.frames, 4, origin);
+                let prope = Rope::at(&times, planes.grid, self.split, &self.device)?;
+                Some((planes, x_in(pnoise, planes.grid)?, times, prope))
+            }
+            None => None,
+        };
+        let mut px = keyed.as_ref().map(|k| k.1.clone());
         for b in &self.blocks {
-            x = b.forward(x, grid, &rope, Some((context, &rows)))?;
+            let keys = keyed.as_ref().map(|(planes, _, times, prope)| Keyed {
+                x: px.take().unwrap_or_else(|| planes.x.clone()),
+                grid: planes.grid,
+                rope: prope,
+                times,
+                context: Some(&planes.x),
+            });
+            let (y, py) = b.forward_keyed(x, grid, &rope, Some((context, &rows)), keys)?;
+            (x, px) = (y, py);
             // Let the pool have the block's buffers back before the next.
             self.device.synchronize()?;
         }
+        drop((px, keyed));
         span(|| "stage 5 out", &self.device, || {
             let y = by_runs(grid.tokens(), 3 * p * p, self.dtype, &self.device, &spans, plane, |r0, len, _, _| {
                 self.conv_out.forward(&self.norm_out.forward(&x.narrow(0, r0, len)?)?)
@@ -708,11 +1118,31 @@ impl DiffDecoder {
     /// noise where they overlap and a tiled decode differs from the whole
     /// one only by the edges' error.
     pub fn decode(&self, latent: &Tensor, seed: u64, budget: usize, progress: &mut dyn FnMut(usize, usize) -> Res<()>) -> Res<(Tensor, Report)> {
+        self.decode_keyed(latent, None, seed, budget, progress)
+    }
+
+    /// [`DiffDecoder::decode`] with keyframes: `keys`, latents `[128, P, h,
+    /// w]`, one plane each, and their pixel frames, which every frame's
+    /// attention reads beside its own window ([`joint`]), as DFR decodes.
+    /// Each tile carries the planes [`planes_for_tile`] gives it, at times
+    /// counted from its own first frame, and its planes' stage-5 noise from
+    /// a field of its own, a frame for each plane.
+    pub fn decode_keyed(&self, latent: &Tensor, keys: Option<(&Tensor, &[usize])>, seed: u64, budget: usize, progress: &mut dyn FnMut(usize, usize) -> Res<()>)
+     -> Res<(Tensor, Report)> {
         let (_, f, lh, lw) = latent.dims4()?;
         let t0 = std::time::Instant::now();
         let last = latent.narrow(1, f - 1, 1)?;
         let padded = Tensor::cat(&[latent, &last, &last], 1)?;
-        let (feat, g4) = self.stages_1_to_3(&padded)?;
+        let (feat, g4, planes) = match keys {
+            Some((k, frames)) => {
+                let (x, g, p) = self.stages_1_to_3_keyed(&padded, self.planes(&k.to_device(&self.device)?, frames)?)?;
+                (x, g, Some(p))
+            }
+            None => {
+                let (x, g) = self.stages_1_to_3(&padded)?;
+                (x, g, None)
+            }
+        };
         self.device.synchronize()?;
         let mut report = Report { stages_1_to_3: t0.elapsed().as_secs_f64(), ..Report::default() };
         let t0 = std::time::Instant::now();
@@ -746,7 +1176,23 @@ impl DiffDecoder {
                     let tile = feat.narrow(0, a, end - a)?.narrow(1, c, d - c)?.narrow(2, e, g - e)?.contiguous()?;
                     let grid = Grid { t: end - a, h: d - c, w: g - e };
                     let tile = tile.reshape((grid.tokens(), tile.dim(3)?))?;
-                    let (ctx, g5) = span(|| "stage 4", &self.device, || self.stage_4_tile(&tile, grid, origin))?;
+                    // The tile's planes, cut to its rows and columns.
+                    let (ctx, g5, tile_planes) = match &planes {
+                        None => {
+                            let (x, g) = span(|| "stage 4", &self.device, || self.stage_4_tile(&tile, grid, origin))?;
+                            (x, g, None)
+                        }
+                        Some(p) => {
+                            let pick = planes_for_tile(&p.frames, first, first + own.min(frames - first) - 1);
+                            let at = Tensor::from_vec(pick.iter().map(|&i| i as u32).collect::<Vec<_>>(), pick.len(), &self.device)?;
+                            let width = p.x.dim(1)?;
+                            let px = p.x.reshape((p.grid.t, g4.h, g4.w, width))?.index_select(&at, 0)?.narrow(1, c, d - c)?.narrow(2, e, g - e)?.contiguous()?;
+                            let pg = Grid { t: pick.len(), h: d - c, w: g - e };
+                            let tp = Planes { x: px.reshape((pg.tokens(), width))?, grid: pg, frames: pick.iter().map(|&i| p.frames[i]).collect() };
+                            let (x, g, tp) = span(|| "stage 4", &self.device, || self.stage_keyed(tile.clone(), grid, tp, 3, origin, a as f32))?;
+                            (x, g, Some((tp, pick)))
+                        }
+                    };
                     drop(tile);
                     // The tile's frames, or stage 5's window of them.
                     let keep = g5.t.min(own.max(self.stage5_kernel[0]));
@@ -758,8 +1204,17 @@ impl DiffDecoder {
                     let noise = span(|| "noise", &self.device, || {
                         Tensor::from_vec(noise_block(seed, &field, &[first, 0, h0, w0], &[keep, 3, th, tw]), (keep, 3, th, tw), &self.device)
                     })?;
-                    let pixels = self.stage_5(&ctx, g5, &noise)?;
-                    drop((ctx, noise));
+                    let pixels = match &tile_planes {
+                        None => self.stage_5(&ctx, g5, &noise)?,
+                        Some((tp, pick)) => {
+                            // A frame of their own field for each plane.
+                            let all = planes.as_ref().map_or(0, |p| p.frames.len());
+                            let pn = pick.iter().map(|&i| Tensor::from_vec(noise_block(plane_seed(seed), &[all, 3, height, width], &[i, 0, h0, w0], &[1, 3, th, tw]), (1, 3, th, tw), &self.device))
+                                .collect::<candle_core::Result<Vec<_>>>()?;
+                            self.stage_5_keyed(&ctx, g5, &noise, Some((tp, &Tensor::cat(&pn, 0)?, first as f32)))?
+                        }
+                    };
+                    drop((ctx, noise, tile_planes));
                     let own = own.min(frames - first);
                     span(|| "blend", &self.device, || {
                         let pixels = pixels.narrow(0, 0, own)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -995,5 +1450,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Planes in the stages' time: frame 0 at 0, and any other frame in
+    /// the middle of the cell that holds it; less a tile's origin.
+    #[test]
+    fn planes_sit_in_the_middle_of_their_cells() {
+        assert_eq!(stage_times(&[0, 8, 16], 8, 0.0), vec![0.0, 1.4375, 2.4375]);
+        assert_eq!(stage_times(&[8, 16], 2, 0.0), vec![4.25, 8.25]);
+        assert_eq!(stage_times(&[8, 16], 1, 5.0), vec![3.0, 11.0]);
+    }
+
+    /// The two nearest, the lower index on a tie, −1 when there are fewer.
+    #[test]
+    fn slots_rank_by_distance_then_index() {
+        let (video, planes) = slots(&[1.5, 3.0], 5);
+        assert_eq!(video, vec![[0, 1], [0, 1], [0, 1], [1, 0], [1, 0]]);
+        // Plane 0 at 1.5 is as near frames 1 and 2: 1 first.
+        assert_eq!(planes, vec![[1, 2], [3, 2]]);
+        let (video, planes) = slots(&[2.0], 1);
+        assert_eq!((video, planes), (vec![[0, -1]], vec![[0, -1]]));
+    }
+
+    /// A tile's planes are those inside it and the nearest on each side.
+    #[test]
+    fn a_tile_carries_its_planes_and_their_neighbours() {
+        let frames = [24, 48, 72, 96, 120];
+        assert_eq!(planes_for_tile(&frames, 50, 90), vec![1, 2, 3]);
+        assert_eq!(planes_for_tile(&frames, 0, 30), vec![0, 1]);
+        assert_eq!(planes_for_tile(&frames, 100, 130), vec![3, 4]);
+        // None inside: the two around it.
+        assert_eq!(planes_for_tile(&frames, 50, 60), vec![1, 2]);
     }
 }

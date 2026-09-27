@@ -110,6 +110,66 @@ pub struct VideoRequest {
     /// Which decoder makes the frames, where the model has a choice
     /// ([`Defaults::decoder`]); its own default when `None`.
     pub decoder: Option<Decoder>,
+    /// Which unguided pipeline makes the video, where the model has DFR
+    /// ([`Defaults::dfr`]): the fast one unless `fps` is above 30, which
+    /// only DFR's temporal rounds make.
+    pub pipeline: Option<Pipeline>,
+}
+
+/// How an unguided video is made, where a model has more than one way.
+///
+/// LTX-2.5's fast pipeline is its two distilled stages. DFR ("Diffusion
+/// Fidelity Rendering"), the reference's production pipeline, runs the same
+/// model with generated keyframes, a detailing pass and a keyframe-aware
+/// decode, slower and finer; and its temporal rounds double a clip's frame
+/// rate, once or twice, which is how LTX-2.5 makes more than 30 fps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Pipeline {
+    Fast,
+    Dfr,
+}
+
+impl Pipeline {
+    /// Its name in a request and in a stored video.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pipeline::Fast => "fast",
+            Pipeline::Dfr => "dfr",
+        }
+    }
+
+    /// From a request's name for it, refusing any other by listing both.
+    pub fn parse(name: &str) -> Res<Pipeline> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "fast" | "distilled" => Ok(Pipeline::Fast),
+            "dfr" => Ok(Pipeline::Dfr),
+            other => Err(format!("pipeline must be fast or dfr, not {other:?}").into()),
+        }
+    }
+}
+
+/// The frame rate the fast pipeline and DFR's first stages make at most:
+/// above it, DFR makes a clip at half the rate, or a quarter, and doubles it.
+pub const BASE_FPS: u32 = 30;
+
+/// How many times DFR doubles a clip's frame rate to make `fps`: halvings
+/// until it is [`BASE_FPS`] or less, each exact. 48 and 96 are 24 doubled
+/// once and twice; 45 cannot be made.
+pub fn rounds_for(fps: u32) -> Res<u32> {
+    let (mut f, mut r) = (fps, 0);
+    while f > BASE_FPS {
+        if f % 2 != 0 {
+            return Err(format!(
+                "above {BASE_FPS} fps a clip is made at half the rate or a quarter and doubled, so fps must halve to {BASE_FPS} or less; \
+                 {fps} does not (48, 50, 60, 96, 100 and 120 do)"
+            )
+            .into());
+        }
+        f /= 2;
+        r += 1;
+    }
+    Ok(r)
 }
 
 /// How a latent video becomes frames, where a model has more than one way.
@@ -143,6 +203,120 @@ impl Decoder {
             other => Err(format!("decoder must be diffusion or conv, not {other:?}").into()),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DFR's canvas and tiles, which its limits are counted from
+// ---------------------------------------------------------------------------
+
+/// The segments a canvas may be cut into, in pixel frames.
+pub const DFR_SEGMENTS: [usize; 2] = [24, 32];
+
+/// A clip's canvas: its frames padded to whole segments, the segment, and
+/// the pixel frames its keyframes are at, the end of each segment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DfrCanvas {
+    pub frames: usize,
+    pub segment: usize,
+    pub keyframes: Vec<usize>,
+}
+
+/// The reference's `resolve_canvas`: `frames − 1` padded up to a whole number
+/// of segments, of whichever [`DFR_SEGMENTS`] pads least, the longer on a tie.
+/// Frame 0 has no keyframe (it is one already, the first latent frame); the
+/// last frame has one.
+pub fn dfr_canvas(frames: usize) -> Res<DfrCanvas> {
+    if frames < 9 || frames % 8 != 1 {
+        return Err(format!("{frames} frames: DFR wants 8k + 1, at least 9").into());
+    }
+    let content = frames - 1;
+    let pad = |s: usize| (s - content % s) % s;
+    let segment = DFR_SEGMENTS.into_iter().min_by_key(|&s| (pad(s), std::cmp::Reverse(s))).unwrap_or(DFR_SEGMENTS[0]);
+    let padded = content + pad(segment);
+    Ok(DfrCanvas { frames: padded + 1, segment, keyframes: (1..=padded / segment).map(|i| i * segment).collect() })
+}
+
+/// One tile of a temporal round: its latent frames `start..end`, of which the
+/// first `lead` are its lead-in; the pixel frames `pixel_start..=pixel_end`
+/// they cover; the seams it holds as anchors and the pixel frames it
+/// generates keyframes at, all in the round's pixel frames.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DfrTile {
+    pub start: usize,
+    pub end: usize,
+    pub lead: usize,
+    pub pixel_start: usize,
+    pub pixel_end: usize,
+    pub anchors: Vec<usize>,
+    pub slots: Vec<usize>,
+}
+
+impl DfrTile {
+    /// Its pixel frames.
+    pub fn frames(&self) -> usize {
+        (self.end - self.start - 1) * 8 + 1
+    }
+}
+
+/// The reference's `TemporalTilePlan` for `seams`, the round's keyframes'
+/// pixel frames, in a clip of `frames`, cut into `count` tiles: its
+/// `split_at_seams`, with the lead-in one segment and one latent frame.
+pub fn dfr_tiles(seams: &[usize], frames: usize, count: usize) -> Res<Vec<DfrTile>> {
+    if seams.iter().any(|&p| p == 0 || p % 8 != 0) || seams.windows(2).any(|w| w[1] <= w[0]) || count == 0 {
+        return Err(format!("seams at {seams:?}, in {count} tiles").into());
+    }
+    let bounds: Vec<usize> = std::iter::once(0).chain(seams.iter().map(|p| p / 8)).collect();
+    let latent = (frames - 1) / 8 + 1;
+    if bounds[bounds.len() - 1] != latent - 1 {
+        return Err(format!("seams at {seams:?} end short of {frames} frames' last").into());
+    }
+    let lead = if bounds.len() > 1 { bounds[1] - bounds[0] + 1 } else { 0 };
+    // The segments dealt out, the leftovers to the first tiles.
+    let segments = bounds.len() - 1;
+    let n = count.min(segments);
+    let (base, leftover) = (segments / n, segments % n);
+    let mut out = Vec::with_capacity(n);
+    let mut cursor = 0;
+    for t in 0..n {
+        let resume = bounds[cursor] + 1;
+        let start = if t == 0 { 0 } else { resume.saturating_sub(lead) };
+        cursor += base + (t < leftover) as usize;
+        let end = bounds[cursor] + 1;
+        let (pixel_start, pixel_end) = (start * 8, (end - 1) * 8);
+        let anchors: Vec<usize> = seams.iter().copied().filter(|&p| pixel_start <= p && p <= pixel_end).collect();
+        let marks: Vec<usize> = std::iter::once(pixel_start).chain(seams.iter().copied().filter(|&p| pixel_start < p && p <= pixel_end)).collect();
+        let slots = marks.windows(2).map(|w| (w[0] + w[1]) / 2).collect();
+        out.push(DfrTile { start, end, lead: if t == 0 { 0 } else { resume - start }, pixel_start, pixel_end, anchors, slots });
+    }
+    Ok(out)
+}
+
+/// The most tokens a DFR generation's DiT holds in one call, in latent
+/// frames of the clip's size: stage 2's video, its keyframes, a latent frame
+/// each, and its half-size reference, a quarter of the video; or a temporal
+/// round's largest tile, with its lead-in, its anchors and its new
+/// keyframes, which in the second round can be more than stage 2. Stage 1 is
+/// at half size, a quarter of stage 2. `frames` is the first stages', which
+/// `rounds` rounds double.
+pub fn dfr_frames(frames: usize, rounds: u32) -> Res<usize> {
+    let c = dfr_canvas(frames)?;
+    let latent = |f: usize| (f - 1) / 8 + 1;
+    let mut most = latent(c.frames) + c.keyframes.len() + latent(c.frames).div_ceil(4);
+    let (mut seams, mut f) = (c.keyframes.clone(), c.frames);
+    for r in 1..=rounds {
+        f = 2 * (f - 1) + 1;
+        let doubled: Vec<usize> = seams.iter().map(|p| 2 * p).collect();
+        let tiles = dfr_tiles(&doubled, f, 1 << r)?;
+        for t in &tiles {
+            most = most.max(t.end - t.start + t.anchors.len() + t.slots.len());
+        }
+        // The next round's seams: these, and the new keyframes.
+        let mut next: Vec<usize> = doubled.iter().copied().chain(tiles.iter().flat_map(|t| t.slots.iter().copied())).collect();
+        next.sort_unstable();
+        next.dedup();
+        seams = next;
+    }
+    Ok(most)
 }
 
 /// A model's own answers for what a [`VideoRequest`] leaves out, and its
@@ -184,6 +358,10 @@ pub struct Defaults {
     /// a choice of [`Decoder`]s; `None` where it has one way only, and a
     /// request that names one is refused.
     pub decoder: Option<Decoder>,
+    /// Whether the model has DFR ([`Pipeline`]). Its clips are held to the
+    /// same `max_volume` by the most its DiT holds in one call
+    /// ([`dfr_frames`]), counted as the fast pipeline's frames.
+    pub dfr: bool,
 }
 
 /// A guided pipeline's defaults and limits.
@@ -221,6 +399,13 @@ pub struct Resolved {
     pub guided: Option<GuidedRun>,
     /// The decoder, where the model has a choice.
     pub decoder: Option<Decoder>,
+    /// The unguided pipeline, where the model has a choice; `None` for a
+    /// guided request.
+    pub pipeline: Option<Pipeline>,
+    /// How many times DFR doubles the frame rate: 0 unless `fps` is above
+    /// [`BASE_FPS`]. `frames` and `fps` are the clip's as it is delivered;
+    /// its first stages make `(frames − 1) / 2^rounds + 1` at `fps / 2^rounds`.
+    pub rounds: u32,
     pub fps: u32,
     pub seed: u64,
     pub audio: bool,
@@ -230,6 +415,12 @@ impl Resolved {
     /// The clip's length.
     pub fn seconds(&self) -> f64 {
         self.frames as f64 / self.fps as f64
+    }
+
+    /// The frames and frame rate DFR's first stages make, before the rounds
+    /// double them; the clip's own when there are none.
+    pub fn base(&self) -> (usize, u32) {
+        ((self.frames - 1) / (1 << self.rounds) + 1, self.fps >> self.rounds)
     }
 }
 
@@ -244,17 +435,65 @@ impl VideoRequest {
         let width = self.width.unwrap_or(d.width);
         let height = self.height.unwrap_or(d.height);
         let fps = self.fps.unwrap_or(d.fps);
+        if !(1..=120).contains(&fps) {
+            return Err(format!("fps must be between 1 and 120, not {fps}").into());
+        }
+        // Which pipeline, and how many times it doubles the frame rate:
+        // above 30 fps only DFR's rounds make the clip.
+        let guided_asked = self.steps.is_some() || self.guidance.is_some() || self.negative_prompt.is_some();
+        let (pipeline, rounds) = match (d.dfr, self.pipeline) {
+            (false, None) => (None, 0),
+            (false, Some(asked)) => return Err(format!("this model has one pipeline; leave out pipeline ({})", asked.as_str()).into()),
+            (true, asked) => {
+                let rounds = rounds_for(fps)?;
+                match (asked, guided_asked) {
+                    (Some(Pipeline::Dfr), true) => {
+                        return Err("DFR runs the distilled model, without guidance; leave out steps, guidance and the negative prompt, or pipeline".into())
+                    }
+                    (_, true) if rounds > 0 => {
+                        return Err(format!("above {BASE_FPS} fps a clip is made by DFR, which runs without guidance; leave out steps, guidance and the negative prompt, or ask for {BASE_FPS} fps or less").into())
+                    }
+                    (_, true) => (None, 0),
+                    (Some(Pipeline::Fast), false) if rounds > 0 => {
+                        return Err(format!("the fast pipeline makes {BASE_FPS} fps at most, and {fps} is DFR's; leave out pipeline, or ask for dfr").into())
+                    }
+                    (Some(p), false) => (Some(p), if p == Pipeline::Dfr { rounds } else { 0 }),
+                    (None, false) if rounds > 0 => (Some(Pipeline::Dfr), rounds),
+                    (None, false) => (Some(Pipeline::Fast), 0),
+                }
+            }
+        };
+        // DFR's rounds double the frames, `F` to `2(F − 1) + 1`, so the
+        // clip's frames are the first stages' so doubled: a step of 8 is 16
+        // after one round, and the defaults and limits go the same way.
+        let scale = 1usize << rounds;
+        let frame_step = d.frame_step * scale;
+        let doubled = |f: usize| (f - 1) * scale + 1;
+        let max_frames = doubled(d.max_frames);
+        let base = |f: usize| (f - 1) / scale + 1;
+        let dfr = pipeline == Some(Pipeline::Dfr);
+        // The fast pipeline's frames a clip of `b` first-stage frames costs
+        // as much as: its own, or what DFR's DiT holds at its most.
+        let cost = |b: usize| -> usize {
+            match dfr {
+                true => dfr_frames(b, rounds).map_or(usize::MAX, |l| 8 * (l - 1) + 1),
+                false => b,
+            }
+        };
+        let fits = |b: usize| (width * height).saturating_mul(cost(b)) <= d.max_volume;
+        // The longest first-stage clip that fits, on the grid; 1 for none.
+        let longest_base = || {
+            let top = d.max_frames.saturating_sub(1) / d.frame_step * d.frame_step + 1;
+            (0..=top / d.frame_step).map(|k| top - k * d.frame_step).find(|&b| b > 1 && fits(b)).unwrap_or(1)
+        };
         let chosen = self.frames.is_none() && d.duration;
         // What the model may choose up to: its longest, or less where this
         // size leaves room for less.
-        let longest = || {
-            let most = (d.max_volume / (width * height).max(1)).min(d.max_frames);
-            (most.saturating_sub(1) / d.frame_step * d.frame_step + 1).max(1)
-        };
+        let longest = || doubled(longest_base());
         let frames = match (self.frames, chosen) {
             (Some(f), _) => f,
             (None, true) => longest(),
-            (None, false) => d.frames,
+            (None, false) => doubled(d.frames),
         };
         for (what, n) in [("width", width), ("height", height)] {
             if n == 0 || n % d.multiple != 0 {
@@ -266,31 +505,33 @@ impl VideoRequest {
                 .into());
             }
         }
-        if frames == 0 || frames % d.frame_step != 1 % d.frame_step {
-            let below = frames.saturating_sub(1) / d.frame_step * d.frame_step + 1;
+        if frames == 0 || frames % frame_step != 1 % frame_step {
+            let below = frames.saturating_sub(1) / frame_step * frame_step + 1;
+            let at = match rounds {
+                0 => String::new(),
+                _ => format!(" at {fps} fps"),
+            };
             return Err(format!(
-                "frames must be one more than a multiple of {} for this model, and {frames} is not; try {below} or {}",
-                d.frame_step,
-                below + d.frame_step
+                "frames must be one more than a multiple of {frame_step} for this model{at}, and {frames} is not; try {below} or {}",
+                below + frame_step
             )
             .into());
         }
-        if frames > d.max_frames {
-            return Err(format!("this model makes at most {} frames, not {frames}", d.max_frames).into());
+        if frames > max_frames {
+            return Err(format!("this model makes at most {max_frames} frames at {fps} fps, not {frames}").into());
         }
-        if !(1..=120).contains(&fps) {
-            return Err(format!("fps must be between 1 and 120, not {fps}").into());
-        }
-        if width * height * frames > d.max_volume {
+        if !fits(base(frames)) {
             // The longest clip at this size that fits, as the likeliest fix.
-            let most = (d.max_volume / (width * height)).min(d.max_frames);
-            let most = most.saturating_sub(1) / d.frame_step * d.frame_step + 1;
+            let most = longest_base();
+            let what = match dfr {
+                true => format!("DFR makes here: its DiT holds as much as the fast pipeline's {} frames of it, and", cost(base(frames))),
+                false => "this model makes here,".to_string(),
+            };
             return Err(format!(
-                "{width}×{height} × {frames} frames is more than this model makes here, {} pixels × frames; \
-                 at {width}×{height} that is {}",
+                "{width}×{height} × {frames} frames is more than {what} {} pixels × frames is the most; at {width}×{height} that is {}",
                 d.max_volume,
                 match most >= d.frame_step + 1 {
-                    true => format!("{most} frames or fewer"),
+                    true => format!("{} frames or fewer", doubled(most)),
                     false => "not even one clip; ask for a smaller size".to_string(),
                 }
             )
@@ -307,8 +548,7 @@ impl VideoRequest {
         if self.prompt.trim().is_empty() {
             return Err("the prompt is empty".into());
         }
-        let wants = self.steps.is_some() || self.guidance.is_some() || self.negative_prompt.is_some();
-        let guided = match (wants, d.guided) {
+        let guided = match (guided_asked, d.guided) {
             (false, _) => None,
             (true, None) => {
                 return Err("this model runs without guidance, on a fixed schedule; leave out steps, guidance and the negative prompt".into())
@@ -358,6 +598,8 @@ impl VideoRequest {
             chosen,
             guided,
             decoder,
+            pipeline,
+            rounds,
             fps,
             seed,
             audio: self.audio.unwrap_or(true),
@@ -1622,7 +1864,102 @@ mod tests {
     }
 
     fn ltx() -> Defaults {
-        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false, guided: None, decoder: None }
+        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false, guided: None, decoder: None, dfr: false }
+    }
+
+    /// The reference's own layouts: 121 frames are whole in segments of 24
+    /// (in 32 they would pad by 8), a clip pads by whichever pads less, and
+    /// on a tie the longer segment wins.
+    #[test]
+    fn canvases_follow_the_reference() {
+        let c = |f| dfr_canvas(f).unwrap();
+        assert_eq!(c(121), DfrCanvas { frames: 121, segment: 24, keyframes: vec![24, 48, 72, 96, 120] });
+        assert_eq!(c(49), DfrCanvas { frames: 49, segment: 24, keyframes: vec![24, 48] });
+        assert_eq!(c(33), DfrCanvas { frames: 33, segment: 32, keyframes: vec![32] });
+        // 96 is whole in both: the longer.
+        assert_eq!(c(97), DfrCanvas { frames: 97, segment: 32, keyframes: vec![32, 64, 96] });
+        // 40 pads 8 to 48, or 24 to 64.
+        assert_eq!(c(41), DfrCanvas { frames: 49, segment: 24, keyframes: vec![24, 48] });
+        // 56 pads 16 to 72, or 8 to 64.
+        assert_eq!(c(57), DfrCanvas { frames: 65, segment: 32, keyframes: vec![32, 64] });
+        assert!(dfr_canvas(1).is_err() && dfr_canvas(24).is_err());
+    }
+
+    /// The reference's tile plans for DFR's first two rounds on a clip of
+    /// two segments of 24: the second tile's lead-in reaches back to the
+    /// start, and each tile adds keyframes between its marks.
+    #[test]
+    fn tiles_follow_the_reference() {
+        let t = dfr_tiles(&[48, 96], 97, 2).unwrap();
+        assert_eq!(t[0], DfrTile { start: 0, end: 7, lead: 0, pixel_start: 0, pixel_end: 48, anchors: vec![48], slots: vec![24] });
+        assert_eq!(t[1], DfrTile { start: 0, end: 13, lead: 7, pixel_start: 0, pixel_end: 96, anchors: vec![48, 96], slots: vec![24, 72] });
+        let t = dfr_tiles(&[48, 96, 144, 192], 193, 4).unwrap();
+        let spans: Vec<(usize, usize, usize)> = t.iter().map(|t| (t.start, t.end, t.lead)).collect();
+        assert_eq!(spans, vec![(0, 7, 0), (0, 13, 7), (6, 19, 7), (12, 25, 7)]);
+        assert_eq!((t[2].anchors.clone(), t[2].slots.clone()), (vec![48, 96, 144], vec![72, 120]));
+        // Five segments in two tiles: three to the first.
+        let t = dfr_tiles(&[48, 96, 144, 192, 240], 241, 2).unwrap();
+        assert_eq!((t[0].end, t[1].start, t[1].lead), (19, 12, 7));
+        assert!(dfr_tiles(&[48, 96], 105, 2).is_err());
+    }
+
+    fn with_dfr() -> Defaults {
+        Defaults { dfr: true, ..ltx() }
+    }
+
+    /// DFR's largest call: stage 2 for a clip at its own rate; the rounds'
+    /// tiles, with a segment of lead-in, more than that.
+    #[test]
+    fn dfr_is_held_to_its_largest_call() {
+        // 121 frames: 16 latent frames, 5 keyframes, a reference of 4.
+        assert_eq!(dfr_frames(121, 0).unwrap(), 25);
+        // At 48 fps the second tile: 19 latent frames, 4 anchors and 3 new
+        // keyframes.
+        assert_eq!(dfr_frames(121, 1).unwrap(), 26);
+        // At 96 fps, a tile of three segments and one of lead-in; and 73
+        // frames at 48, as the web form counts them too.
+        assert_eq!(dfr_frames(121, 2).unwrap(), 34);
+        assert_eq!(dfr_frames(73, 1).unwrap(), 18);
+        assert!(dfr_frames(1, 0).is_err());
+    }
+
+    #[test]
+    fn rounds_halve_the_rate_to_thirty_or_less() {
+        assert_eq!([24, 30, 48, 50, 60, 96, 100, 120].map(|f| rounds_for(f).unwrap()), [0, 0, 1, 1, 1, 2, 2, 2]);
+        assert!(rounds_for(45).is_err() && rounds_for(90).is_err());
+    }
+
+    /// Above 30 fps a model with DFR makes the clip by it, in frames of the
+    /// clip as delivered; at 30 or less, the fast pipeline unless asked.
+    #[test]
+    fn dfr_makes_the_clip_above_thirty_fps_and_when_asked() {
+        let d = with_dfr();
+        let r = VideoRequest::new("a dog").resolved(&d).unwrap();
+        assert_eq!((r.pipeline, r.rounds, r.frames), (Some(Pipeline::Fast), 0, 121));
+        let r = VideoRequest { fps: Some(48), ..VideoRequest::new("a dog") }.resolved(&d).unwrap();
+        assert_eq!((r.pipeline, r.rounds, r.frames, r.base()), (Some(Pipeline::Dfr), 1, 241, (121, 24)));
+        let r = VideoRequest { fps: Some(96), frames: Some(129), ..VideoRequest::new("a dog") }.resolved(&d).unwrap();
+        assert_eq!((r.rounds, r.base()), (2, (33, 24)));
+        let r = VideoRequest { pipeline: Some(Pipeline::Dfr), ..VideoRequest::new("a dog") }.resolved(&d).unwrap();
+        assert_eq!((r.pipeline, r.rounds), (Some(Pipeline::Dfr), 0));
+        // Frames on the doubled grid only: 16k + 1 at 48 fps.
+        let e = VideoRequest { fps: Some(48), frames: Some(121), ..VideoRequest::new("a dog") }.resolved(&d).unwrap_err().to_string();
+        assert!(e.contains("multiple of 16") && e.contains("try 113 or 129"), "{e}");
+        // The fast pipeline, or guidance, cannot make 48 fps.
+        let fast = VideoRequest { fps: Some(48), pipeline: Some(Pipeline::Fast), ..VideoRequest::new("a dog") };
+        assert!(fast.resolved(&d).is_err());
+        let guided = VideoRequest { fps: Some(48), guidance: Some(3.0), ..VideoRequest::new("a dog") };
+        assert!(guided.resolved(&Defaults { guided: Some(Guided { steps: 30, max_steps: 60, guidance: 3.0 }), ..d }).is_err());
+        // DFR is held to the fast pipeline's volume by its largest call:
+        // 1536×1024 × 121 is 25 latent frames, more than the fast 16.
+        let big = VideoRequest { width: Some(1536), height: Some(1024), pipeline: Some(Pipeline::Dfr), ..VideoRequest::new("a dog") };
+        assert!(big.resolved(&d).unwrap_err().to_string().contains("DFR makes here"));
+        let fits = VideoRequest { frames: Some(73), ..big.clone() }.resolved(&d).unwrap();
+        assert_eq!(fits.frames, 73);
+        // A model without DFR keeps any fps on its one pipeline.
+        let r = VideoRequest { fps: Some(48), ..VideoRequest::new("a dog") }.resolved(&ltx()).unwrap();
+        assert_eq!((r.pipeline, r.rounds, r.frames), (None, 0, 121));
+        assert!(VideoRequest { pipeline: Some(Pipeline::Dfr), ..VideoRequest::new("a dog") }.resolved(&ltx()).is_err());
     }
 
     #[test]

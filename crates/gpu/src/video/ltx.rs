@@ -91,14 +91,37 @@ pub fn is_pipeline(repo: &str) -> bool {
     if repo.eq_ignore_ascii_case(super::LTX_REPO) {
         return true;
     }
+    // A GGUF of its DiT, here, whose card names it.
+    if kvad::gguf::split(repo).is_some() {
+        return kvad::gguf::local(repo).and_then(|l| l.base).is_some_and(|b| b.eq_ignore_ascii_case(super::LTX_REPO));
+    }
     // By the file `kvad::hub::pipeline` knows it by, asked directly: the
     // listing would size every model in the cache to answer.
     crate::image::local_file(repo, kvad::video::LTX_DENOISER).is_some()
 }
 
+/// Whether `name` is a GGUF of LTX-2.5's DiT, asking the Hub for its card
+/// if it is not here: for a load of one that was never pulled.
+pub fn is_gguf_of_ltx(name: &str, watch: &Watcher) -> bool {
+    kvad::gguf::split(name).is_some() && (is_pipeline(name) || kvad::gguf::find(name, watch).is_ok_and(|f| f.base.eq_ignore_ascii_case(super::LTX_REPO)))
+}
+
+/// Every file of LTX-2.5 a GGUF of its DiT reads beside it: all a load
+/// reads but the DiT, and the duration head. What its pull fetches.
+pub fn fetch_base(progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
+    for f in FILES.iter().filter(|f| **f != DIT_FILE).chain([&ltx_duration::FILE]) {
+        progress(&format!("fetching {f}"));
+        fetch_file(super::LTX_REPO, f, watch)?;
+    }
+    Ok(())
+}
+
 /// Whether `repo`'s guided pipeline can run: its dev DiT and distilled LoRA
 /// on this machine, asked of the disk. `Err` says how to fetch them.
 pub fn guided_ready(repo: &str) -> Result<(), String> {
+    if kvad::gguf::split(repo).is_some() {
+        return Err(format!("{repo} is a GGUF of the distilled DiT, and guidance runs LTX-2.5's dev model; ask {} for a guided video", super::LTX_REPO));
+    }
     let missing: Vec<&str> = kvad::video::LTX_DEV_FILES.iter().copied().filter(|f| crate::image::local_file(repo, f).is_none()).collect();
     match missing.is_empty() {
         true => Ok(()),
@@ -117,6 +140,13 @@ pub fn weight_bytes(repo: &str, quant: Option<GgmlDType>) -> Option<u64> {
     if quant != Some(GgmlDType::Q8_0) || !is_pipeline(repo) {
         return None;
     }
+    // A GGUF's DiT is smaller than Kvad's q8 of it, and the peak is charged
+    // as if it were not: the peak was measured with Kvad's, and the DiT is
+    // loaded per generation and dropped, so the same charge is the safe one.
+    if kvad::gguf::split(repo).is_some() {
+        let here = FILES.iter().filter(|f| **f != DIT_FILE).all(|f| crate::image::local_file(super::LTX_REPO, f).is_some());
+        return here.then(|| peak_bytes(volume_for_this_machine()));
+    }
     FILES.iter().all(|f| crate::image::local_file(repo, f).is_some()).then(|| peak_bytes(volume_for_this_machine()))
 }
 
@@ -132,6 +162,10 @@ fn volume_for_this_machine() -> usize {
 /// LTX-2.5's distilled model in two stages, ready to make a clip.
 pub struct Ltx {
     repo: String,
+    /// The GGUF its DiT came from, when it came from one: then `paths[1]`
+    /// is that file, and DFR and the guided pipeline, which need Kvad's own
+    /// DiT, are off.
+    gguf: Option<(String, String)>,
     paths: [PathBuf; 6],
     /// The duration head, which chooses a clip's length when a request
     /// does not say. Optional: 4 MB fetched at load, and without it a clip
@@ -148,7 +182,26 @@ impl Ltx {
     /// exist, so that the first generation does not spend two minutes
     /// quantising.
     pub fn load(repo: &str, quant: Option<GgmlDType>, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Self> {
-        // bf16 is 42 GB of DiT on its own, and q4 has never been run.
+        // A GGUF of the distilled DiT by its name, `repo:QUANT`: the file,
+        // and everything else from its base, which must be LTX-2.5.
+        if kvad::gguf::split(repo).is_some() {
+            let found = kvad::gguf::find(repo, watch)?;
+            if !found.base.eq_ignore_ascii_case(super::LTX_REPO) {
+                return Err(format!("{repo} is a GGUF of {}, not of {}", found.base, super::LTX_REPO).into());
+            }
+            let g = kvad::gguf::fetch(&found, progress, watch)?;
+            return Self::load_with(super::LTX_REPO, Some(&g.file), quant, progress, watch);
+        }
+        Self::load_with(repo, None, quant, progress, watch)
+    }
+
+    /// [`Ltx::load`], with the distilled DiT, connectors and all, read from
+    /// `gguf` rather than from `repo`'s own file, which is then never
+    /// fetched. The fast pipeline only: DFR fuses a LoRA into the DiT and
+    /// the guided pipeline runs the dev model, and neither is in the file.
+    pub fn load_with(repo: &str, gguf: Option<&Path>, quant: Option<GgmlDType>, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Self> {
+        // bf16 is 42 GB of DiT on its own, and q4 has never been run. A
+        // GGUF's own blocks are its maker's; `quant` is the text path's.
         let quant = match quant {
             Some(GgmlDType::Q8_0) => GgmlDType::Q8_0,
             _ => return Err("LTX-2.5 runs at gpu-q8 only here: its DiT is 42 GB in bf16, and no other quantisation has been measured".into()),
@@ -159,8 +212,13 @@ impl Ltx {
         }
         let mut paths = Vec::with_capacity(FILES.len());
         for f in FILES {
-            progress(&format!("finding {f}"));
-            paths.push(fetch_file(repo, f, watch)?);
+            match (f, gguf) {
+                (DIT_FILE, Some(g)) => paths.push(g.to_path_buf()),
+                _ => {
+                    progress(&format!("finding {f}"));
+                    paths.push(fetch_file(repo, f, watch)?);
+                }
+            }
         }
         let paths: [PathBuf; 6] = paths.try_into().map_err(|_| "six files")?;
         let head = match fetch_file(repo, ltx_duration::FILE, watch) {
@@ -178,15 +236,22 @@ impl Ltx {
             drop(TextEncoder::load(&paths[0], &paths[1], &device, DType::BF16, Some(quant), progress)?);
             device.synchronize()?;
         }
-        if kvad::qcache::enabled() && !cached("transformer") {
+        if kvad::qcache::enabled() && !cached("transformer") && gguf.is_none() {
             progress("quantising the DiT to q8, once");
             drop(Dit::load(&paths[1], &device, DType::BF16, None, Some(quant), progress)?);
             device.synchronize()?;
         }
 
+        let made = gguf.map(|g| crate::gguf::Gguf::open(g).map(|f| f.make_up())).transpose()?;
         let params = [
             header_params(&paths[0], &["vision_model.", "multi_modal_projector.", "audio_projector."])?,
-            header_params(&paths[1], &[])?,
+            match gguf {
+                Some(g) => {
+                    let file = crate::gguf::Gguf::open(g)?;
+                    file.names().filter_map(|n| file.stored(n)).map(|t| t.elems()).sum()
+                }
+                None => header_params(&paths[1], &[])?,
+            },
             header_params(&paths[2], &[])?,
             header_params(&paths[3], &["encoder."])?,
             header_params(&paths[4], &["audio_vae.encoder"])?,
@@ -208,13 +273,20 @@ impl Ltx {
             image: true,
             duration: head.is_some(),
             // The dev model, whose files `kvad pull … --dev` fetches.
-            guided: Some(kvad::video::Guided { steps: super::ltx_sample::DEV_STEPS, max_steps: 60, guidance: VIDEO_GUIDE.cfg }),
+            guided: match gguf {
+                Some(_) => None,
+                None => Some(kvad::video::Guided { steps: super::ltx_sample::DEV_STEPS, max_steps: 60, guidance: VIDEO_GUIDE.cfg }),
+            },
             // The reference's default: its README's video VAE.
             decoder: Some(Decoder::Diffusion),
             // DFR, whose detailing LoRA is fetched by its first request.
-            dfr: true,
+            dfr: gguf.is_none(),
         };
-        Ok(Ltx { repo: repo.to_string(), paths, head, quant, device, defaults, params })
+        let gguf = gguf.zip(made).map(|(g, made)| (g.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), made));
+        if let Some((g, made)) = &gguf {
+            progress(&format!("the DiT is {g}'s, {made}: the fast pipeline only, with no DFR and no guidance"));
+        }
+        Ok(Ltx { repo: repo.to_string(), gguf, paths, head, quant, device, defaults, params })
     }
 }
 
@@ -801,8 +873,9 @@ impl Director for Ltx {
     }
 
     fn summary(&self) -> String {
+        let from = self.gguf.as_ref().map(|(g, _)| format!(", the DiT from {g}")).unwrap_or_default();
         format!(
-            "LTX-2.5 distilled ({}), {:.1} B parameters: Gemma 4 text path, 48-block DiT in two stages, video and audio decoders",
+            "LTX-2.5 distilled ({}), {:.1} B parameters: Gemma 4 text path, 48-block DiT in two stages, video and audio decoders{from}",
             self.repo,
             self.params as f64 / 1e9
         )
@@ -817,7 +890,10 @@ impl Director for Ltx {
     }
 
     fn backend(&self) -> String {
-        "metal q8".into()
+        match &self.gguf {
+            Some((_, made)) => format!("metal q8, DiT {made}"),
+            None => "metal q8".into(),
+        }
     }
 }
 

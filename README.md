@@ -2400,6 +2400,25 @@ schnell's four steps need no guidance, so each is one forward pass:
 (Single runs again. FLUX.1-dev takes guidance as an input and is refused by
 name until it has an implementation of its own.)
 
+The community's GGUFs of Qwen-Image's and FLUX.1-schnell's transformers load
+too, and of LTX-2.5's distilled DiT for its fast pipeline, by the repo and
+the quantisation together; the model card's `base_model` supplies the rest
+([docs/gguf-plan.md](docs/gguf-plan.md)):
+
+```bash
+kvad pull city96/Qwen-Image-gguf:Q4_K_S
+kvad images make "a red fox in fresh snow" --model city96/Qwen-Image-gguf:Q4_K_S
+```
+
+city96's FLUX files keep Black Forest Labs' layout, one `qkv` matrix where
+diffusers has three, and are read through a map of rows, so no block is
+requantised. city96's Q8_0 of either model is Kvad's own q8 block for block.
+The k-quants (Q4_K, Q5_K, Q6_K) run on the M5's matrix units in the same
+kernel as Kvad's q8, one decoder a format, at 75–90% of its rate. So a
+Q4_K_S holds 9.1 GB less for Qwen-Image and 5.5 GB less for FLUX at 1024²
+for a step 5–18% longer than q8's, and an LTX-2.5 Q4_K_M holds about 4 GB
+less and denoises as fast.
+
 Two things in it are measurements rather than code:
 
 - **The previews.** Each step can carry a picture of where it is heading,

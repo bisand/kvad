@@ -18,6 +18,7 @@ use super::metadata;
 use crate::common::{Loader, Reader};
 use crate::image::nn::{Ctx, Linear};
 use crate::image::{finish, open};
+use std::sync::Arc;
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
@@ -132,9 +133,12 @@ impl Connector {
         // the registers repeated to the full length, then its tail.
         let filled = self.registers.repeat((LENGTH / regs, 1))?.narrow(0, n, LENGTH - n)?;
         let mut x = Tensor::cat(&[x, &filled.to_dtype(x.dtype())?], 0)?;
+        // In the stream's dtype: a dense matrix answers in it anyway, and a
+        // GGUF's quantised one answers in f32.
+        let dt = x.dtype();
         for (attn, ff_in, ff_out) in &self.blocks {
             x = (&x + attn.forward(&rms(&x, 1e-6)?, None, Some(&self.rope), Some(&self.rope))?)?;
-            x = (&x + ff_out.forward(&gelu(&ff_in.forward(&rms(&x, 1e-6)?)?)?)?)?;
+            x = (&x + ff_out.forward_in(&gelu(&ff_in.forward_in(&rms(&x, 1e-6)?, dt)?)?, dt)?)?;
         }
         rms(&x, 1e-6)
     }
@@ -200,20 +204,34 @@ impl TextEncoder {
         vault.finish(progress);
 
         // From the DiT's file, only the connectors: the rest is the DiT's.
+        // A GGUF of the DiT has them quantised, and they are read as its
+        // maker quantised them.
         let off = Vault::off();
-        let cx = Ctx { ld: Loader::new(None, device.clone(), &off), dtype };
+        let gguf = super::is_gguf(dit).then(|| super::open_dit_gguf(dit).map(Arc::new)).transpose()?;
+        let cx = Ctx { ld: Loader::new(None, device.clone(), &off).accelerated(), dtype };
         let dit_paths = [dit.to_path_buf()];
-        let d = open(&dit_paths, DType::BF16)?;
+        let d = match &gguf {
+            Some(file) => Reader::gguf(Arc::clone(file), DType::BF16),
+            None => open(&dit_paths, DType::BF16)?,
+        };
         let m = d.pp("model.diffusion_model");
         let video = Connector::load(&cx, &m.pp("video_embeddings_connector"), t, false)?;
         let audio = Connector::load(&cx, &m.pp("audio_embeddings_connector"), t, true)?;
-        let left: Vec<String> = crate::common::unread(&dit_paths, &d.seen(), &d.skipped())?.into_iter().filter(|n| n.contains("_embeddings_connector.")).collect();
+        let seen = d.seen();
+        // Every connector tensor the file holds, with its size.
+        let all: Vec<(String, usize)> = match &gguf {
+            Some(file) => file.names().filter_map(|n| Some((n.to_string(), file.stored(n)?.elems()))).collect(),
+            None => {
+                let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(dit)? };
+                st.tensors().iter().map(|(n, v)| (n.clone(), v.shape().iter().product::<usize>())).collect()
+            }
+        };
+        let mut left: Vec<String> = all.iter().filter(|(n, _)| n.contains("_embeddings_connector.") && !seen.contains(n)).map(|(n, _)| n.clone()).collect();
+        left.sort();
         if !left.is_empty() {
             return Err(format!("LTX connectors: {} tensor(s) this loader never reads:\n  {}", left.len(), left.join("\n  ")).into());
         }
-        let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(dit)? };
-        let seen = d.seen();
-        params += st.tensors().iter().filter(|(n, _)| seen.contains(n)).map(|(_, v)| v.shape().iter().product::<usize>()).sum::<usize>();
+        params += all.iter().filter(|(n, _)| seen.contains(n)).map(|(_, e)| e).sum::<usize>();
 
         Ok(TextEncoder { tokenizer, gemma, video_proj, audio_proj, video, audio, params })
     }

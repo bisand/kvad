@@ -44,6 +44,7 @@ pub mod client;
 pub mod crawl;
 pub mod daemon;
 pub mod experts;
+pub mod gguf;
 pub mod hub;
 pub mod image;
 pub mod machine;

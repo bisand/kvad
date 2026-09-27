@@ -294,6 +294,12 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
                     .then(|| "not every file this pipeline reads is downloaded yet".to_string()),
             }
         }
+        // A GGUF whose base cannot be read here: say which part is missing.
+        _ if m.gguf.is_some() => Some(match m.gguf.as_ref().and_then(|g| g.base.as_deref()) {
+            None => "its model card is not here, or names no base model, so there is no telling what it goes with".into(),
+            Some(base) if !hub::repo_dir(base).exists() => format!("the rest of it comes from {base}, which is not downloaded; pull this again to fetch it"),
+            Some(base) => format!("a GGUF of {base}, which is not an image pipeline this build implements"),
+        }),
         (false, _, _) => Some(match trained {
             true => "no weights yet — the run was stopped before its first checkpoint".into(),
             false => "the download did not finish".to_string(),
@@ -818,19 +824,20 @@ pub async fn remove(
         let id = id.clone();
         blocking(move || {
             Ok(match hub::find_trained(&id) {
-                Some(m) => Some((m.path, true)),
-                None => hub::find_local(&id).map(|m| (m.path, false)),
+                Some(m) => Some((m, true)),
+                None => hub::find_local(&id).map(|m| (m, false)),
             })
         })
         .await?
     };
-    let Some((path, trained)) = target else {
+    let Some((model, trained)) = target else {
         return Err(Fail::missing(format!("{id} is not on this machine")));
     };
 
     let gone = id.clone();
     blocking(move || {
-        std::fs::remove_dir_all(&path)?;
+        // A GGUF is one file of its repo, and only that file goes.
+        hub::remove(&model)?;
         // The quantised weights are derived from what just went; keeping them
         // would mean a re-download silently reusing weights from a file that
         // no longer exists to compare against.
@@ -922,6 +929,7 @@ mod tests {
             params: None,
             unreadable_as: None,
             reads: hub::Reads::Everything,
+            gguf: None,
         }
     }
 

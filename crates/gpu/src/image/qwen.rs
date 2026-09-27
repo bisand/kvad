@@ -24,8 +24,9 @@
 use super::mmdit::{norm_out, Double, Names, Shape};
 use super::nn::{latent_preview, noise, timestep_embedding, to_rgb8, Conv2d, Ctx, Linear};
 use super::schedule;
-use super::{finish, local_file, open, read_json};
+use super::{finish, finish_gguf, local_file, open, read_json};
 use crate::common::{Loader, Reader, Stored};
+use crate::gguf::Gguf;
 use crate::qcache::Vault;
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Tensor, D};
@@ -33,7 +34,7 @@ use candle_nn::ops;
 use kvad::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use kvad::serde_json::{json, Value};
 use kvad::weights::{fetch_file, Watcher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -551,6 +552,8 @@ pub struct QwenImage {
     device: Device,
     dtype: DType,
     quant: Option<GgmlDType>,
+    /// The GGUF the transformer came from, and what it is made of.
+    gguf: Option<(String, String)>,
     params: usize,
     bytes: usize,
 }
@@ -582,8 +585,31 @@ impl QwenImage {
         progress: &mut dyn FnMut(&str),
         watch: &Watcher,
     ) -> Res<Self> {
+        Self::load_with(repo, None, quant, device, progress, watch)
+    }
+
+    /// [`QwenImage::load`], with the transformer read from `gguf` in place
+    /// of `repo`'s, in the blocks its maker chose; everything else is
+    /// `repo`'s, the text encoder at `quant`.
+    pub fn load_with(
+        repo: &str,
+        gguf: Option<&Path>,
+        quant: Option<GgmlDType>,
+        device: Device,
+        progress: &mut dyn FnMut(&str),
+        watch: &Watcher,
+    ) -> Res<Self> {
         // Quantised weights take f32 activations; dense ones run in the
-        // checkpoint's own bf16.
+        // checkpoint's own bf16. A GGUF's are quantised, so its pipeline is
+        // f32 throughout, and a text encoder read whole beside it would be
+        // f32 too: 28 GB. It is quantised instead.
+        let quant = match (gguf, quant) {
+            (Some(_), None) => {
+                progress("the text encoder runs at q8 beside a GGUF's transformer");
+                Some(GgmlDType::Q8_0)
+            }
+            _ => quant,
+        };
         let dtype = if quant.is_some() { DType::F32 } else { DType::BF16 };
         let label = quant.map(crate::common::ggml_name).unwrap_or("bf16");
 
@@ -615,20 +641,46 @@ impl QwenImage {
             text
         };
         vault.finish(progress);
+        bytes += weight_bytes_at(params, quant) as usize;
 
-        let (config, paths) = component(repo, "transformer", "diffusion_pytorch_model", watch)?;
-        progress(&format!("loading the transformer at {label} — twenty billion parameters, which takes a while the first time"));
-        let dcfg = DitConfig::from_json(&config)?;
-        let shape = json!({ "component": "transformer", "layers": dcfg.layers, "width": dcfg.width() });
-        let mut vault = Vault::open_as(&format!("{repo}/transformer"), &paths, shape, quant, progress);
-        let dit = {
-            let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
-            let r = open(&paths, dtype)?;
-            let dit = Dit::load(&cx, &r, dcfg)?;
-            params += finish("transformer", &paths, &r)?;
-            dit
+        let (dit, made) = match gguf {
+            Some(path) => {
+                let config = read_json(&fetch_file(repo, "transformer/config.json", watch)?)?;
+                let dcfg = DitConfig::from_json(&config)?;
+                let file = Arc::new(Gguf::open(path)?);
+                match file.text("general.architecture") {
+                    Some("qwen_image") => {}
+                    other => return Err(format!("{} is a GGUF of {}, not of Qwen-Image's transformer", path.display(), other.unwrap_or("an unnamed architecture")).into()),
+                }
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                progress(&format!("loading the transformer from {name}: {}", file.make_up()));
+                let vault = Vault::off();
+                let cx = Ctx { ld: Loader::new(None, device.clone(), &vault).accelerated(), dtype };
+                let r = Reader::gguf(Arc::clone(&file), dtype);
+                let dit = Dit::load(&cx, &r, dcfg)?;
+                params += finish_gguf("transformer", &file, &r)?;
+                bytes += file.device_bytes(dtype);
+                (dit, Some((name, file.make_up())))
+            }
+            None => {
+                let (config, paths) = component(repo, "transformer", "diffusion_pytorch_model", watch)?;
+                progress(&format!("loading the transformer at {label} — twenty billion parameters, which takes a while the first time"));
+                let dcfg = DitConfig::from_json(&config)?;
+                let shape = json!({ "component": "transformer", "layers": dcfg.layers, "width": dcfg.width() });
+                let mut vault = Vault::open_as(&format!("{repo}/transformer"), &paths, shape, quant, progress);
+                let dit = {
+                    let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
+                    let r = open(&paths, dtype)?;
+                    let dit = Dit::load(&cx, &r, dcfg)?;
+                    let n = finish("transformer", &paths, &r)?;
+                    params += n;
+                    bytes += weight_bytes_at(n, quant) as usize;
+                    dit
+                };
+                vault.finish(progress);
+                (dit, None)
+            }
         };
-        vault.finish(progress);
 
         progress("loading the VAE");
         let config = read_json(&fetch_file(repo, "vae/config.json", watch)?)?;
@@ -641,11 +693,12 @@ impl QwenImage {
         let vae = WanDecoder::load(&cx, &r, &config)?;
         let vae_params = finish("VAE", &paths, &r)?;
         params += vae_params;
+        bytes += vae_params * 2;
 
-        bytes += weight_bytes_at(params - vae_params, quant) as usize + vae_params * 2;
         device.synchronize()?;
-        progress(&format!("loaded Qwen-Image: {:.1} B parameters at {label}", params as f64 / 1e9));
-        Ok(QwenImage { tok, text, dit, vae, scheduler, device, dtype, quant, params, bytes })
+        let from = made.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
+        progress(&format!("loaded Qwen-Image: {:.1} B parameters at {label}{from}", params as f64 / 1e9));
+        Ok(QwenImage { tok, text, dit, vae, scheduler, device, dtype, quant, gguf: made, params, bytes })
     }
 
     /// The prompt as the transformer reads it: `[1, tokens, 3584]`.
@@ -662,6 +715,20 @@ impl QwenImage {
     }
 }
 
+/// Every file of `repo` this pipeline reads but its transformer's weights:
+/// what the pull of a GGUF of its transformer brings of the base. The same
+/// files [`QwenImage::load_with`] fetches for itself, and one of them the
+/// transformer's config, which a GGUF does not carry.
+pub(crate) fn fetch_base(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
+    progress(&format!("fetching what {repo} holds beside its transformer"));
+    fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?;
+    for f in ["model_index.json", "scheduler/scheduler_config.json", "transformer/config.json", "vae/config.json", "vae/diffusion_pytorch_model.safetensors"] {
+        fetch_file(repo, f, watch)?;
+    }
+    component(repo, "text_encoder", "model", watch)?;
+    Ok(())
+}
+
 /// Bytes for `params` weights at a quantisation, the way candle stores them.
 fn weight_bytes_at(params: usize, quant: Option<GgmlDType>) -> u64 {
     let per_block = |bytes: u64, block: u64| params as u64 * bytes / block;
@@ -676,7 +743,11 @@ fn weight_bytes_at(params: usize, quant: Option<GgmlDType>) -> u64 {
 /// What the pipeline will hold at `quant`, from the checkpoint headers on the
 /// disk: every language-tower and transformer parameter at that quantisation,
 /// the VAE's decoder in bf16. `None` until every shard is here.
-pub(crate) fn weight_bytes(repo: &str, quant: Option<GgmlDType>, size: &dyn Fn(&str, &str) -> Option<u64>) -> Option<u64> {
+///
+/// With `gguf`, the transformer is that file's, as its blocks and its plain
+/// tensors widened to f32, and the language tower is q8 if nothing else is
+/// asked, as [`QwenImage::load_with`] loads them.
+pub(crate) fn weight_bytes(repo: &str, quant: Option<GgmlDType>, size: &dyn Fn(&str, &str) -> Option<u64>, gguf: Option<&Path>) -> Option<u64> {
     let params = |dir: &str, weights: &str, keep: &dyn Fn(&str) -> bool| -> Option<usize> {
         let index = read_json(&local_file(repo, &format!("{dir}/{weights}.safetensors.index.json"))?).ok()?;
         let mut shards: Vec<&str> = index["weight_map"].as_object()?.values().filter_map(Value::as_str).collect();
@@ -688,11 +759,20 @@ pub(crate) fn weight_bytes(repo: &str, quant: Option<GgmlDType>, size: &dyn Fn(&
         Some(st.tensors().iter().filter(|(n, _)| keep(n)).map(|(_, v)| v.shape().iter().product::<usize>()).sum())
     };
     let text = params("text_encoder", "model", &|n| n.starts_with("model."))?;
-    let dit = params("transformer", "diffusion_pytorch_model", &|_| true)?;
     // The VAE is a quarter of a gigabyte whole; charging all of it is simpler
     // than reading its header and wrong by a hundred megabytes.
     let vae = size(repo, "vae/diffusion_pytorch_model.safetensors")?;
-    Some(weight_bytes_at(text + dit, quant) + vae)
+    match gguf {
+        Some(file) => {
+            let quant = quant.or(Some(GgmlDType::Q8_0));
+            let dit = Gguf::open(file).ok()?.device_bytes(DType::F32) as u64;
+            Some(weight_bytes_at(text, quant) + dit + vae)
+        }
+        None => {
+            let dit = params("transformer", "diffusion_pytorch_model", &|_| true)?;
+            Some(weight_bytes_at(text + dit, quant) + vae)
+        }
+    }
 }
 
 impl Painter for QwenImage {
@@ -769,7 +849,8 @@ impl Painter for QwenImage {
     }
 
     fn summary(&self) -> String {
-        format!("Qwen-Image, {:.1} B parameters", self.params as f64 / 1e9)
+        let from = self.gguf.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
+        format!("Qwen-Image, {:.1} B parameters{from}", self.params as f64 / 1e9)
     }
 
     fn params(&self) -> usize {
@@ -781,7 +862,11 @@ impl Painter for QwenImage {
     }
 
     fn backend(&self) -> String {
-        crate::common::label(&self.device, self.dtype, self.quant)
+        let label = crate::common::label(&self.device, self.dtype, self.quant);
+        match &self.gguf {
+            Some((_, made)) => format!("{label}, transformer {made}"),
+            None => label,
+        }
     }
 }
 

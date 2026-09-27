@@ -25,15 +25,17 @@ use super::nn::{latent_preview, noise, timestep_embedding, to_rgb8, Ctx, Linear}
 use super::schedule;
 use super::t5::T5;
 use super::vae::{Decoder, VaeConfig};
-use super::{finish, local_file, open, read_json};
+use super::{finish, finish_gguf, local_file, open, read_json};
 use crate::common::{Loader, Reader};
+use crate::gguf::{Gguf, Part};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use kvad::serde_json::{json, Value};
 use kvad::weights::{fetch_file, Watcher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -86,6 +88,98 @@ impl Config {
             axes: axes.try_into().map_err(|_| "`axes_dims_rope` should have three entries")?,
         })
     }
+}
+
+/// Black Forest Labs' own layout, which city96's GGUFs keep, under the
+/// names diffusers gives FLUX, which the loader asks for: diffusers' own
+/// conversion (`convert_flux_to_diffusers.py`), backwards.
+///
+/// Three things differ besides the names:
+/// - **q, k and v are one matrix**, `qkv`, in a double block's two streams,
+///   and diffusers' three are its thirds, by rows.
+/// - **A single block's `linear1` is four**: q, k and v, then the MLP's
+///   input, `proj_mlp`, at four times the width.
+/// - **The last modulation's halves are the other way round**: Black Forest
+///   Labs' `adaLN_modulation` gives shift then scale, and diffusers'
+///   `norm_out` scale then shift.
+fn gguf_map(cfg: &Config) -> Vec<(String, Vec<Part>)> {
+    let w = cfg.shape.width();
+    let mut m: Vec<(String, Vec<Part>)> = Vec::new();
+    // A linear layer's weight and bias, each made of the same rows.
+    let mut lin = |to: &str, parts: &[(&str, std::ops::Range<usize>)]| {
+        for kind in ["weight", "bias"] {
+            m.push((format!("{to}.{kind}"), parts.iter().map(|(from, rows)| Part::rows(format!("{from}.{kind}"), rows.clone())).collect()));
+        }
+    };
+    for i in 0..cfg.double {
+        let (b, d) = (format!("transformer_blocks.{i}"), format!("double_blocks.{i}"));
+        for (stream, modulate, qkv, out, mlp) in [
+            ("img", "norm1.linear", ["attn.to_q", "attn.to_k", "attn.to_v"], "attn.to_out.0", "ff"),
+            ("txt", "norm1_context.linear", ["attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj"], "attn.to_add_out", "ff_context"),
+        ] {
+            lin(&format!("{b}.{modulate}"), &[(&format!("{d}.{stream}_mod.lin"), 0..6 * w)]);
+            for (j, to) in qkv.iter().enumerate() {
+                lin(&format!("{b}.{to}"), &[(&format!("{d}.{stream}_attn.qkv"), j * w..(j + 1) * w)]);
+            }
+            lin(&format!("{b}.{out}"), &[(&format!("{d}.{stream}_attn.proj"), 0..w)]);
+            lin(&format!("{b}.{mlp}.net.0.proj"), &[(&format!("{d}.{stream}_mlp.0"), 0..4 * w)]);
+            lin(&format!("{b}.{mlp}.net.2"), &[(&format!("{d}.{stream}_mlp.2"), 0..w)]);
+        }
+    }
+    for i in 0..cfg.single {
+        let (b, s) = (format!("single_transformer_blocks.{i}"), format!("single_blocks.{i}"));
+        lin(&format!("{b}.norm.linear"), &[(&format!("{s}.modulation.lin"), 0..3 * w)]);
+        for (j, to) in ["attn.to_q", "attn.to_k", "attn.to_v"].iter().enumerate() {
+            lin(&format!("{b}.{to}"), &[(&format!("{s}.linear1"), j * w..(j + 1) * w)]);
+        }
+        lin(&format!("{b}.proj_mlp"), &[(&format!("{s}.linear1"), 3 * w..7 * w)]);
+        lin(&format!("{b}.proj_out"), &[(&format!("{s}.linear2"), 0..w)]);
+    }
+    let t = "time_text_embed";
+    lin("x_embedder", &[("img_in", 0..w)]);
+    lin("context_embedder", &[("txt_in", 0..w)]);
+    lin(&format!("{t}.timestep_embedder.linear_1"), &[("time_in.in_layer", 0..w)]);
+    lin(&format!("{t}.timestep_embedder.linear_2"), &[("time_in.out_layer", 0..w)]);
+    lin(&format!("{t}.text_embedder.linear_1"), &[("vector_in.in_layer", 0..w)]);
+    lin(&format!("{t}.text_embedder.linear_2"), &[("vector_in.out_layer", 0..w)]);
+    lin("norm_out.linear", &[("final_layer.adaLN_modulation.1", w..2 * w), ("final_layer.adaLN_modulation.1", 0..w)]);
+    lin("proj_out", &[("final_layer.linear", 0..cfg.in_channels)]);
+    // The per-head norms have one name each way.
+    let hd = cfg.shape.head_dim;
+    for i in 0..cfg.double {
+        let (b, d) = (format!("transformer_blocks.{i}.attn"), format!("double_blocks.{i}"));
+        for (to, from) in [("norm_q", "img_attn.norm.query_norm"), ("norm_k", "img_attn.norm.key_norm"), ("norm_added_q", "txt_attn.norm.query_norm"), ("norm_added_k", "txt_attn.norm.key_norm")] {
+            m.push((format!("{b}.{to}.weight"), vec![Part::all(format!("{d}.{from}.scale"), hd)]));
+        }
+    }
+    for i in 0..cfg.single {
+        let (b, s) = (format!("single_transformer_blocks.{i}.attn"), format!("single_blocks.{i}"));
+        for (to, from) in [("norm_q", "norm.query_norm"), ("norm_k", "norm.key_norm")] {
+            m.push((format!("{b}.{to}.weight"), vec![Part::all(format!("{s}.{from}.scale"), hd)]));
+        }
+    }
+    m
+}
+
+/// A GGUF of FLUX's transformer, under diffusers' names.
+fn open_gguf(path: &Path, cfg: &Config) -> Res<Gguf> {
+    let file = Gguf::open(path)?;
+    match file.text("general.architecture") {
+        Some("flux") => file.mapped(gguf_map(cfg)),
+        other => Err(format!("{} is a GGUF of {}, not of FLUX's transformer", path.display(), other.unwrap_or("an unnamed architecture")).into()),
+    }
+}
+
+/// Whether `repo`'s transformer is one this pipeline runs, from its config
+/// alone: FLUX.1-dev's is refused here for its guidance input, before a
+/// GGUF of it is downloaded, rather than after, at its load.
+pub(crate) fn runs(repo: &str, watch: &Watcher) -> Res<()> {
+    Config::from_json(&read_json(&fetch_file(repo, "transformer/config.json", watch)?)?).map(|_| ())
+}
+
+/// [`open_gguf`], with the config read from `repo`, the file's base.
+pub(crate) fn open_gguf_for(repo: &str, path: &Path, watch: &Watcher) -> Res<Gguf> {
+    open_gguf(path, &Config::from_json(&read_json(&fetch_file(repo, "transformer/config.json", watch)?)?)?)
 }
 
 struct Transformer {
@@ -198,6 +292,8 @@ pub struct Flux {
     device: Device,
     dtype: DType,
     quant: Option<GgmlDType>,
+    /// The GGUF the transformer came from, and what it is made of.
+    gguf: Option<(String, String)>,
     params: usize,
     bytes: usize,
 }
@@ -235,6 +331,27 @@ impl Flux {
         progress: &mut dyn FnMut(&str),
         watch: &Watcher,
     ) -> Res<Self> {
+        Self::load_with(repo, None, quant, device, progress, watch)
+    }
+
+    /// [`Flux::load`], with the transformer read from `gguf`, in Black
+    /// Forest Labs' layout ([`gguf_map`]); everything else is `repo`'s, T5
+    /// at `quant`, or q8 when nothing is asked, as beside Qwen-Image's.
+    pub fn load_with(
+        repo: &str,
+        gguf: Option<&Path>,
+        quant: Option<GgmlDType>,
+        device: Device,
+        progress: &mut dyn FnMut(&str),
+        watch: &Watcher,
+    ) -> Res<Self> {
+        let quant = match (gguf, quant) {
+            (Some(_), None) => {
+                progress("T5 runs at q8 beside a GGUF's transformer");
+                Some(GgmlDType::Q8_0)
+            }
+            _ => quant,
+        };
         let dtype = if quant.is_some() { DType::F32 } else { DType::BF16 };
         let label = quant.map(crate::common::ggml_name).unwrap_or("bf16");
 
@@ -273,20 +390,38 @@ impl Flux {
         };
         vault.finish(progress);
 
-        progress(&format!("loading the transformer at {label}"));
-        let (config, paths) = component(repo, "transformer", "diffusion_pytorch_model", watch)?;
-        let cfg = Config::from_json(&config)?;
-        let shape = json!({ "component": "transformer", "double": cfg.double, "single": cfg.single, "width": cfg.shape.width() });
-        let mut vault = Vault::open_as(&format!("{repo}/transformer"), &paths, shape, quant, progress);
-        let dit = {
-            let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
-            let r = open(&paths, dtype)?;
-            let dit = Transformer::load(&cx, &r, cfg)?;
-            let n = finish("transformer", &paths, &r)?;
-            (params, bytes) = (params + n, bytes + at(n, quant));
-            dit
+        let (dit, made) = match gguf {
+            Some(path) => {
+                let cfg = Config::from_json(&read_json(&fetch_file(repo, "transformer/config.json", watch)?)?)?;
+                let file = Arc::new(open_gguf(path, &cfg)?);
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                progress(&format!("loading the transformer from {name}: {}", file.make_up()));
+                let vault = Vault::off();
+                let cx = Ctx { ld: Loader::new(None, device.clone(), &vault).accelerated(), dtype };
+                let r = Reader::gguf(Arc::clone(&file), dtype);
+                let dit = Transformer::load(&cx, &r, cfg)?;
+                let n = finish_gguf("transformer", &file, &r)?;
+                (params, bytes) = (params + n, bytes + file.device_bytes(dtype) as u64);
+                (dit, Some((name, file.make_up())))
+            }
+            None => {
+                progress(&format!("loading the transformer at {label}"));
+                let (config, paths) = component(repo, "transformer", "diffusion_pytorch_model", watch)?;
+                let cfg = Config::from_json(&config)?;
+                let shape = json!({ "component": "transformer", "double": cfg.double, "single": cfg.single, "width": cfg.shape.width() });
+                let mut vault = Vault::open_as(&format!("{repo}/transformer"), &paths, shape, quant, progress);
+                let dit = {
+                    let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
+                    let r = open(&paths, dtype)?;
+                    let dit = Transformer::load(&cx, &r, cfg)?;
+                    let n = finish("transformer", &paths, &r)?;
+                    (params, bytes) = (params + n, bytes + at(n, quant));
+                    dit
+                };
+                vault.finish(progress);
+                (dit, None)
+            }
         };
-        vault.finish(progress);
 
         // The decoder is the one stage at full resolution, where f32
         // activations would be gigabytes; it keeps bf16, whose range is f32's.
@@ -301,8 +436,9 @@ impl Flux {
         (params, bytes) = (params + n, bytes + 2 * n as u64);
 
         device.synchronize()?;
-        progress(&format!("loaded FLUX.1-schnell: {:.1} B parameters at {label}", params as f64 / 1e9));
-        Ok(Flux { clip_tok, t5_tok, clip, t5, dit, vae, scheduler, device, dtype, quant, params, bytes: bytes as usize })
+        let from = made.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
+        progress(&format!("loaded FLUX.1-schnell: {:.1} B parameters at {label}{from}", params as f64 / 1e9));
+        Ok(Flux { clip_tok, t5_tok, clip, t5, dit, vae, scheduler, device, dtype, quant, gguf: made, params, bytes: bytes as usize })
     }
 
     /// T5's hidden states, `[1, 256, 4096]`, and CLIP's pooled vector,
@@ -325,9 +461,26 @@ impl Flux {
     }
 }
 
+/// Every file of `repo` this pipeline reads but its transformer's weights:
+/// what the pull of a GGUF of its transformer brings of the base.
+pub(crate) fn fetch_base(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
+    progress(&format!("fetching what {repo} holds beside its transformer"));
+    fetch_file(super::sdxl::TOKENIZER_REPO, "tokenizer.json", watch)?;
+    for f in ["model_index.json", "tokenizer_2/tokenizer.json", "scheduler/scheduler_config.json", "transformer/config.json", "vae/config.json", "vae/diffusion_pytorch_model.safetensors"] {
+        fetch_file(repo, f, watch)?;
+    }
+    component(repo, "text_encoder", "model", watch)?;
+    component(repo, "text_encoder_2", "model", watch)?;
+    Ok(())
+}
+
 /// What the pipeline will hold at `quant`, from the checkpoint headers on the
 /// disk. `None` until every shard is here.
-pub(crate) fn weight_bytes(repo: &str, quant: Option<GgmlDType>, size: &dyn Fn(&str, &str) -> Option<u64>) -> Option<u64> {
+///
+/// With `gguf`, the transformer is that file's, its plain tensors widened to
+/// f32, and T5 is q8 if nothing else is asked, as [`Flux::load_with`] loads
+/// them.
+pub(crate) fn weight_bytes(repo: &str, quant: Option<GgmlDType>, size: &dyn Fn(&str, &str) -> Option<u64>, gguf: Option<&Path>) -> Option<u64> {
     let params = |dir: &str, weights: &str| -> Option<usize> {
         let index = read_json(&local_file(repo, &format!("{dir}/{weights}.safetensors.index.json"))?).ok()?;
         let mut shards: Vec<&str> = index["weight_map"].as_object()?.values().filter_map(Value::as_str).collect();
@@ -338,11 +491,19 @@ pub(crate) fn weight_bytes(repo: &str, quant: Option<GgmlDType>, size: &dyn Fn(&
         let st = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&paths).ok()? };
         Some(st.tensors().iter().map(|(_, v)| v.shape().iter().product::<usize>()).sum())
     };
-    let quantised = params("text_encoder_2", "model")? + params("transformer", "diffusion_pytorch_model")?;
     // CLIP and the VAE are small and held as they are; their files' sizes
     // are close enough.
     let small = size(repo, "text_encoder/model.safetensors")? + size(repo, "vae/diffusion_pytorch_model.safetensors")?;
-    Some(at(quantised, quant) + small)
+    match gguf {
+        Some(file) => {
+            let dit = Gguf::open(file).ok()?.device_bytes(DType::F32) as u64;
+            Some(at(params("text_encoder_2", "model")?, quant.or(Some(GgmlDType::Q8_0))) + dit + small)
+        }
+        None => {
+            let quantised = params("text_encoder_2", "model")? + params("transformer", "diffusion_pytorch_model")?;
+            Some(at(quantised, quant) + small)
+        }
+    }
 }
 
 impl Painter for Flux {
@@ -399,7 +560,8 @@ impl Painter for Flux {
     }
 
     fn summary(&self) -> String {
-        format!("FLUX.1-schnell, {:.1} B parameters", self.params as f64 / 1e9)
+        let from = self.gguf.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
+        format!("FLUX.1-schnell, {:.1} B parameters{from}", self.params as f64 / 1e9)
     }
 
     fn params(&self) -> usize {
@@ -411,7 +573,11 @@ impl Painter for Flux {
     }
 
     fn backend(&self) -> String {
-        crate::common::label(&self.device, self.dtype, self.quant)
+        let label = crate::common::label(&self.device, self.dtype, self.quant);
+        match &self.gguf {
+            Some((_, made)) => format!("{label}, transformer {made}"),
+            None => label,
+        }
     }
 }
 

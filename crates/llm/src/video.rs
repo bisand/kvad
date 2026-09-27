@@ -54,6 +54,9 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// pipeline.
 pub const LTX_PIPELINE: &str = "LTX2Pipeline";
 
+/// Lightricks' repo: LTX-2.5, and the base of every GGUF of its DiT.
+pub const LTX_REPO: &str = "Lightricks/LTX-2.5";
+
 /// The file that makes a repo LTX-2.5: its distilled DiT.
 pub const LTX_DENOISER: &str = "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors";
 

@@ -408,7 +408,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
             }
 
             Cmd::Delete(id) => match hub::find_local(&id) {
-                Some(local) => match std::fs::remove_dir_all(&local.path) {
+                Some(local) => match hub::remove(&local) {
                     Ok(()) => {
                         if hub::State::active().as_deref() == Some(id.as_str()) {
                             let _ = hub::State::clear();

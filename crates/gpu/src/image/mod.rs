@@ -32,6 +32,7 @@ pub mod unet;
 pub mod vae;
 
 use crate::common::{unread, Reader};
+use crate::gguf::Gguf;
 use crate::uncached;
 use candle_core::{DType, Device, Shape, Tensor};
 use candle_nn::var_builder::SimpleBackend;
@@ -49,6 +50,9 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// `model_index.json` gives.
 pub const PIPELINES: [&str; 3] = ["StableDiffusionXLPipeline", "QwenImagePipeline", "FluxPipeline"];
 
+/// The pipelines whose denoiser can be read from a community GGUF.
+pub const GGUF_PIPELINES: [&str; 2] = ["QwenImagePipeline", "FluxPipeline"];
+
 /// What kind of model `repo` is, from its `model_index.json`, if it has one on
 /// this machine. `None` for a language model, a missing repo, or a pipeline
 /// with no implementation here.
@@ -56,6 +60,10 @@ pub const PIPELINES: [&str; 3] = ["StableDiffusionXLPipeline", "QwenImagePipelin
 /// Asked without downloading anything, because the server asks it about every
 /// model on disk each time it lists them.
 pub fn pipeline_of(repo: &str) -> Option<&'static str> {
+    // A GGUF of a denoiser is its base's pipeline.
+    if kvad::gguf::split(repo).is_some() {
+        return pipeline_of(&kvad::gguf::local(repo)?.base?);
+    }
     let index = local_file(repo, "model_index.json")?;
     let v: Value = kvad::serde_json::from_str(&std::fs::read_to_string(index).ok()?).ok()?;
     let class = v.get("_class_name")?.as_str()?;
@@ -75,6 +83,15 @@ pub fn pipeline_of(repo: &str) -> Option<&'static str> {
 pub fn is_pipeline(repo: &str, watch: &Watcher) -> bool {
     if pipeline_of(repo).is_some() {
         return true;
+    }
+    // A GGUF not here, or whose base is not: its card names the base, and
+    // the base says.
+    if let Some((gguf_repo, _)) = kvad::gguf::split(repo) {
+        let base = kvad::gguf::local(repo).and_then(|l| l.base).or_else(|| {
+            let card = fetch_file(gguf_repo, "README.md", watch).ok()?;
+            kvad::gguf::base_model(&std::fs::read_to_string(card).ok()?)
+        });
+        return base.is_some_and(|b| is_pipeline(&b, watch));
     }
     if kvad::weights::local_dir(repo).is_some() || !repo.contains('/') {
         return false;
@@ -102,6 +119,15 @@ pub fn is_pipeline(repo: &str, watch: &Watcher) -> bool {
 /// of bf16 is about half that at q8. `None` when the files are not here.
 pub fn weight_bytes(repo: &str, quant: Option<candle_core::quantized::GgmlDType>) -> Option<u64> {
     let size = |r: &str, f: &str| local_file(r, f).and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+    if kvad::gguf::split(repo).is_some() {
+        let g = kvad::gguf::local(repo)?;
+        let base = g.base?;
+        return match pipeline_of(&base)? {
+            "QwenImagePipeline" => qwen::weight_bytes(&base, quant, &size, Some(&g.file)),
+            "FluxPipeline" => flux::weight_bytes(&base, quant, &size, Some(&g.file)),
+            _ => None,
+        };
+    }
     match pipeline_of(repo)? {
         "StableDiffusionXLPipeline" => {
             let own = ["text_encoder/model.fp16.safetensors", "text_encoder_2/model.fp16.safetensors", "unet/diffusion_pytorch_model.fp16.safetensors"]
@@ -113,8 +139,8 @@ pub fn weight_bytes(repo: &str, quant: Option<candle_core::quantized::GgmlDType>
             let vae = size(sdxl::VAE_REPO, "diffusion_pytorch_model.safetensors").unwrap_or(335_000_000) / 2;
             Some(own + vae)
         }
-        "QwenImagePipeline" => qwen::weight_bytes(repo, quant, &size),
-        "FluxPipeline" => flux::weight_bytes(repo, quant, &size),
+        "QwenImagePipeline" => qwen::weight_bytes(repo, quant, &size, None),
+        "FluxPipeline" => flux::weight_bytes(repo, quant, &size, None),
         _ => None,
     }
 }
@@ -140,6 +166,29 @@ pub fn load(
     progress: &mut dyn FnMut(&str),
     watch: &Watcher,
 ) -> Res<Box<dyn Painter>> {
+    load_with(repo, None, quant, progress, watch)
+}
+
+/// [`load`], with the denoiser read from `gguf`, a community quantisation
+/// of it, and everything else from `repo`.
+pub fn load_with(
+    repo: &str,
+    gguf: Option<&Path>,
+    quant: Option<candle_core::quantized::GgmlDType>,
+    progress: &mut dyn FnMut(&str),
+    watch: &Watcher,
+) -> Res<Box<dyn Painter>> {
+    // A GGUF by its name, `repo:QUANT`: the file, and its base for the rest.
+    if kvad::gguf::split(repo).is_some() {
+        if gguf.is_some() {
+            return Err(format!("`{repo}` is a GGUF already, and another was given beside it").into());
+        }
+        let found = kvad::gguf::find(repo, watch)?;
+        gguf_pipeline(repo, &found.base, watch)?;
+        let g = kvad::gguf::fetch(&found, progress, watch)?;
+        progress(&format!("the rest is {}'s", found.base));
+        return load_with(&found.base, Some(&g.file), quant, progress, watch);
+    }
     let index = fetch_file(repo, "model_index.json", watch)?;
     let v = read_json(&index)?;
     let class = v.get("_class_name").and_then(Value::as_str).unwrap_or("?");
@@ -151,6 +200,9 @@ pub fn load(
         )
         .into());
     }
+    if gguf.is_some() && !GGUF_PIPELINES.contains(&class) {
+        return Err(format!("`{repo}` is a {class}, and a GGUF's denoiser is read for {} only, so far", GGUF_PIPELINES.join(" and ")).into());
+    }
     match class {
         "StableDiffusionXLPipeline" => {
             if quant.is_some() {
@@ -158,13 +210,61 @@ pub fn load(
             }
             Ok(Box::new(sdxl::Sdxl::load(repo, device, progress, watch)?))
         }
-        "QwenImagePipeline" => Ok(Box::new(qwen::QwenImage::load(repo, quant, device, progress, watch)?)),
-        "FluxPipeline" => Ok(Box::new(flux::Flux::load(repo, quant, device, progress, watch)?)),
+        "QwenImagePipeline" => Ok(Box::new(qwen::QwenImage::load_with(repo, gguf, quant, device, progress, watch)?)),
+        "FluxPipeline" => Ok(Box::new(flux::Flux::load_with(repo, gguf, quant, device, progress, watch)?)),
         other => Err(format!(
             "`{repo}` is a {other}; the pipelines implemented here are {}",
             PIPELINES.join(" and ")
         )
         .into()),
+    }
+}
+
+/// Fetch a GGUF, `repo:QUANT`, and everything else its model reads from
+/// its base, without loading any of it: a pull.
+///
+/// The base is asked what it is before anything large is fetched, so a GGUF
+/// of a model not implemented here costs a model card, not gigabytes.
+pub fn pull(name: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
+    let found = kvad::gguf::find(name, watch)?;
+    // LTX-2.5 is no diffusers pipeline, and is known by its name.
+    if found.base.eq_ignore_ascii_case(crate::video::LTX_REPO) {
+        kvad::gguf::fetch(&found, progress, watch)?;
+        return crate::video::ltx::fetch_base(progress, watch);
+    }
+    let pipeline = gguf_pipeline(name, &found.base, watch)?;
+    kvad::gguf::fetch(&found, progress, watch)?;
+    match pipeline {
+        "QwenImagePipeline" => qwen::fetch_base(&found.base, progress, watch),
+        "FluxPipeline" => flux::fetch_base(&found.base, progress, watch),
+        other => Err(format!("no pull is written for a GGUF of a {other}").into()),
+    }
+}
+
+/// A GGUF of `base`'s denoiser, under the names `base`'s loader asks for:
+/// FLUX's mapped from Black Forest Labs' layout, LTX-2.5's under its DiT
+/// file's prefix, Qwen-Image's as it is.
+pub fn open_gguf(path: &Path, base: &str, watch: &Watcher) -> Res<Gguf> {
+    let file = Gguf::open(path)?;
+    match file.text("general.architecture") {
+        Some("flux") => flux::open_gguf_for(base, path, watch),
+        Some("ltxv") => crate::video::open_dit_gguf(path),
+        _ => Ok(file),
+    }
+}
+
+/// The pipeline a GGUF's base is, if it is one whose denoiser can be read
+/// from a GGUF here.
+fn gguf_pipeline(name: &str, base: &str, watch: &Watcher) -> Res<&'static str> {
+    let index = fetch_file(base, "model_index.json", watch).map_err(|e| format!("{name} is a GGUF of {base}, and {base} is not an image pipeline: {e}"))?;
+    let class = read_json(&index)?.get("_class_name").and_then(Value::as_str).map(str::to_string).unwrap_or_default();
+    match GGUF_PIPELINES.iter().find(|p| **p == class) {
+        Some(&"FluxPipeline") => {
+            flux::runs(base, watch).map_err(|e| format!("{name} is a GGUF of {base}: {e}"))?;
+            Ok("FluxPipeline")
+        }
+        Some(p) => Ok(p),
+        None => Err(format!("{name} is a GGUF of {base}, a {class}, and a GGUF's denoiser is read for {} only, so far", GGUF_PIPELINES.join(" and ")).into()),
     }
 }
 
@@ -290,19 +390,37 @@ impl SimpleBackend for Uncached {
 /// a UNet missing one attention block's cross-attention draws a picture that
 /// ignores part of the prompt, and nothing about that looks like an error.
 pub(crate) fn finish(what: &str, paths: &[PathBuf], r: &Reader<'_>) -> Res<usize> {
-    let left = unread(paths, &r.seen(), &r.skipped())?;
-    if !left.is_empty() {
-        return Err(format!(
-            "{what}: the checkpoint holds {} tensor(s) that this loader never reads:\n  {}\n\
-             A weight nobody reads is a piece of the model that is not running.",
-            left.len(),
-            kvad::weights::collapsed(&left).join("\n  ")
-        )
-        .into());
-    }
+    refuse_unread(what, unread(paths, &r.seen(), &r.skipped())?)?;
     let st = Uncached::open(paths)?;
     let seen = r.seen();
     Ok(st.tensors.iter().filter(|(n, _)| seen.contains(*n)).map(|(_, t)| t.shape.iter().product::<usize>()).sum())
+}
+
+/// [`finish`], for a component read from a GGUF.
+pub(crate) fn finish_gguf(what: &str, file: &Gguf, r: &Reader<'_>) -> Res<usize> {
+    let (seen, skipped) = (r.seen(), r.skipped());
+    let mut left: Vec<String> = file
+        .names()
+        .filter(|n| !seen.contains(*n) && !kvad::weights::derived(n))
+        .filter(|n| !skipped.iter().any(|p| n.starts_with(p.as_str())))
+        .map(str::to_string)
+        .collect();
+    left.sort();
+    refuse_unread(what, left)?;
+    Ok(file.names().filter(|n| seen.contains(*n)).filter_map(|n| file.stored(n)).map(|t| t.elems()).sum())
+}
+
+fn refuse_unread(what: &str, left: Vec<String>) -> Res<()> {
+    if left.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{what}: the checkpoint holds {} tensor(s) that this loader never reads:\n  {}\n\
+         A weight nobody reads is a piece of the model that is not running.",
+        left.len(),
+        kvad::weights::collapsed(&left).join("\n  ")
+    )
+    .into())
 }
 
 #[cfg(test)]

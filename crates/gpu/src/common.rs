@@ -32,14 +32,15 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// either way.
 ///
 /// `Blocks` is a third way to hold a quantised matrix, for the M5's matrix
-/// units: the raw Q8_0 bytes, which `mpp`'s kernel reads itself. It is what
-/// [`Loader::accelerated`] gives, and only the image pipelines ask for it;
-/// `mpp` says why a language model cannot.
+/// units: the raw GGML blocks, Q8_0 or a GGUF's k-quants, which `mpp`'s
+/// kernel reads itself. It is what [`Loader::accelerated`] gives, and only
+/// the image and video pipelines ask for it; `mpp` says why a language model
+/// cannot.
 pub(crate) enum Proj {
     Dense(Tensor),
     Quant(QMatMul),
     #[cfg(target_os = "macos")]
-    Blocks(crate::mpp::Q8),
+    Blocks(crate::mpp::Blocks),
 }
 
 impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
@@ -65,6 +66,12 @@ impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<T
             // drew noise at full speed. `copy()` is no cure either: it copies
             // the whole buffer and keeps the offset. `force_contiguous` lays
             // the rows out afresh, at zero.
+            // candle's quantised kernels take f32 only: on Metal, anything
+            // else trips an assertion. A GGUF's K-quants can meet bf16, in
+            // LTX-2.5's DiT, so the input is widened, which also lays it out
+            // afresh. The answer is f32, as a Q8_0 matrix's on the M5's
+            // matrix units is.
+            Proj::Quant(q) if x.dtype() != candle_core::DType::F32 => q.forward(&x.to_dtype(candle_core::DType::F32)?),
             Proj::Quant(q) if x.layout().start_offset() != 0 => q.forward(&x.force_contiguous()?),
             Proj::Quant(q) => q.forward(x),
             // Casts to f16 on the way in, which lays the rows out afresh:
@@ -180,9 +187,10 @@ pub(crate) struct Loader<'v> {
     pub(crate) quant: Option<GgmlDType>,
     pub(crate) device: Device,
     vault: &'v Vault,
-    /// Q8_0 projections as [`Proj::Blocks`], for the M5's matrix units.
+    /// Projections as [`Proj::Blocks`], for the M5's matrix units: the Q8_0
+    /// ones this load quantises, and a GGUF's own Q8_0, Q4_K, Q5_K and Q6_K.
     #[cfg(target_os = "macos")]
-    blocks: bool,
+    m5: bool,
 }
 
 impl<'v> Loader<'v> {
@@ -192,7 +200,7 @@ impl<'v> Loader<'v> {
             device,
             vault,
             #[cfg(target_os = "macos")]
-            blocks: false,
+            m5: false,
         }
     }
 
@@ -203,9 +211,31 @@ impl<'v> Loader<'v> {
     /// one-row kernel behind it. `mpp` says why it cannot also keep one.
     pub(crate) fn accelerated(self) -> Self {
         #[cfg(target_os = "macos")]
-        return Loader { blocks: self.quant == Some(GgmlDType::Q8_0) && crate::mpp::available(&self.device), ..self };
+        return Loader { m5: crate::mpp::available(&self.device), ..self };
         #[cfg(not(target_os = "macos"))]
         self
+    }
+
+    /// Whether this load's own Q8_0 goes to the M5's matrix units.
+    #[cfg(target_os = "macos")]
+    fn blocks(&self) -> bool {
+        self.m5 && self.quant == Some(GgmlDType::Q8_0)
+    }
+
+    /// A matrix the checkpoint holds in blocks already, a GGUF's, on the
+    /// device as its maker quantised it, whatever this load's own
+    /// quantisation: it is never quantised twice.
+    fn stored(&self, vb: &Reader<'_>, name: &str, out: usize, inp: usize, stored: Stored) -> Res<Option<Proj>> {
+        let Some((gd, bytes)) = vb.blocks(name, &[out, inp])? else { return Ok(None) };
+        if let Stored::InOut = stored {
+            return Err(format!("{}: blocks for a matrix stored [in, out], which no GGUF writes", vb.full(name)).into());
+        }
+        #[cfg(target_os = "macos")]
+        if self.m5 && crate::mpp::reads(gd, inp) {
+            return Ok(Some(Proj::Blocks(crate::mpp::Blocks::new(gd, &bytes, out, inp, &self.device)?)));
+        }
+        let q = QTensor::new(QStorage::from_data(std::borrow::Cow::Borrowed(&bytes), &self.device, gd)?, (out, inp))?;
+        Ok(Some(Proj::Quant(QMatMul::from_qtensor(q)?)))
     }
 
     /// One projection matrix, in whichever layout this load will use it.
@@ -217,6 +247,9 @@ impl<'v> Loader<'v> {
         inp: usize,
         stored: Stored,
     ) -> Res<Proj> {
+        if let Some(p) = self.stored(vb, name, out, inp, stored)? {
+            return Ok(p);
+        }
         let Some(_) = self.quant else {
             // Transposed on the host and moved once, never transposed on the
             // device. `.t()?.contiguous()?` allocates a second buffer the
@@ -241,14 +274,14 @@ impl<'v> Loader<'v> {
             return Ok(Proj::Dense(w.to_device(&self.device)?));
         };
         #[cfg(target_os = "macos")]
-        if self.blocks {
+        if self.blocks() {
             let full = vb.full(name);
             if let Some(b) = self.vault.blocks(&full, (out, inp)) {
                 vb.record(name);
-                return Ok(Proj::Blocks(crate::mpp::Q8::new(&b, out, inp, &self.device)?));
+                return Ok(Proj::Blocks(crate::mpp::Blocks::new(GgmlDType::Q8_0, &b, out, inp, &self.device)?));
             }
             let blocks = self.quantize(vb, name, out, inp, stored)?.data()?.into_owned();
-            return Ok(Proj::Blocks(crate::mpp::Q8::new(&blocks, out, inp, &self.device)?));
+            return Ok(Proj::Blocks(crate::mpp::Blocks::new(GgmlDType::Q8_0, &blocks, out, inp, &self.device)?));
         }
         Ok(Proj::Quant(QMatMul::from_qtensor(self.quantized(vb, name, out, inp, stored)?)?))
     }
@@ -270,6 +303,11 @@ impl<'v> Loader<'v> {
     pub(crate) fn proj_cat(&self, vb: &Reader<'_>, parts: &[(&str, usize)], inp: usize, stored: Stored) -> Res<Proj> {
         if let [(name, out)] = parts {
             return self.proj(vb, name, *out, inp, stored);
+        }
+        // A GGUF's parts may each be a different type, and blocks of two
+        // types are not one matrix. No model read from one merges any yet.
+        if parts.iter().any(|(name, _)| vb.gguf.as_ref().is_some_and(|g| g.stored(&vb.full(name)).is_some_and(|t| t.quantised()))) {
+            return Err(format!("{}: merging matrices a GGUF already quantised is not implemented", vb.full(parts[0].0)).into());
         }
         let total = parts.iter().map(|p| p.1).sum();
         let Some(gd) = self.quant else {
@@ -306,8 +344,8 @@ impl<'v> Loader<'v> {
             }
         }
         #[cfg(target_os = "macos")]
-        if self.blocks {
-            return Ok(Proj::Blocks(crate::mpp::Q8::new(&bytes, total, inp, &self.device)?));
+        if self.blocks() {
+            return Ok(Proj::Blocks(crate::mpp::Blocks::new(GgmlDType::Q8_0, &bytes, total, inp, &self.device)?));
         }
         let q = QTensor::new(QStorage::from_data(bytes.into(), &self.device, gd)?, (total, inp))?;
         Ok(Proj::Quant(QMatMul::from_qtensor(q)?))
@@ -641,6 +679,9 @@ pub(crate) struct Reader<'a> {
     skipped: Rc<RefCell<Vec<String>>>,
     /// A LoRA fused into what is read; see [`Lora`].
     lora: Option<Rc<Lora>>,
+    /// The checkpoint, when it is a GGUF: where a matrix already in blocks
+    /// is read from as blocks ([`Reader::blocks`]).
+    gguf: Option<Arc<crate::gguf::Gguf>>,
 }
 
 /// A LoRA, fused into each weight it adapts as the weight is read:
@@ -721,7 +762,30 @@ impl<'a> Reader<'a> {
             seen: Rc::new(RefCell::new(HashSet::new())),
             skipped: Rc::new(RefCell::new(Vec::new())),
             lora: None,
+            gguf: None,
         }
+    }
+
+    /// A reader over a GGUF file: its plain tensors read in `dtype`, like
+    /// any checkpoint's, and its quantised matrices offered as they are.
+    pub(crate) fn gguf(file: Arc<crate::gguf::Gguf>, dtype: DType) -> Self {
+        let vb = VarBuilder::from_backend(Box::new(crate::gguf::Shared(Arc::clone(&file))), dtype, Device::Cpu);
+        Reader { gguf: Some(file), ..Reader::new(vb) }
+    }
+
+    /// `name`'s blocks, when the checkpoint holds it quantised already, as
+    /// a matrix of `shape`, and recorded as read. `None` means it is plain
+    /// numbers, which [`Reader::get`] reads and records.
+    pub(crate) fn blocks(&self, name: &str, shape: &[usize]) -> candle_core::Result<Option<(GgmlDType, crate::gguf::Bytes)>> {
+        let Some(g) = &self.gguf else { return Ok(None) };
+        let b = g.blocks(&self.full(name), shape)?;
+        if b.is_some() {
+            self.record(name);
+            if self.lora.is_some() {
+                candle_core::bail!("{}: a LoRA cannot be fused into a matrix that is already quantised", self.full(name));
+            }
+        }
+        Ok(b)
     }
 
     /// The same reader, with `lora` fused into every weight it adapts.
@@ -736,6 +800,7 @@ impl<'a> Reader<'a> {
             seen: Rc::clone(&self.seen),
             skipped: Rc::clone(&self.skipped),
             lora: self.lora.clone(),
+            gguf: self.gguf.clone(),
         }
     }
 

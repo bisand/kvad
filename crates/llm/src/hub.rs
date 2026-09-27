@@ -609,6 +609,19 @@ pub fn remote_config(id: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&body).ok()
 }
 
+/// Every file in a repo, by its path in the repo, from the Hub's API.
+///
+/// For a GGUF repo, whose quantisations are named only by the ends of its
+/// files' names ([`crate::gguf`]).
+pub fn repo_files(id: &str) -> Res<Vec<String>> {
+    let path = repo_path(id).ok_or_else(|| format!("`{id}` is not a Hub repo id"))?;
+    let url = format!("https://huggingface.co/api/models/{path}");
+    let body = ureq::get(&url).call().map_err(|e| format!("asking the Hub what {id} holds: {e}"))?.body_mut().read_to_string()?;
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    let siblings = json.get("siblings").and_then(|s| s.as_array()).ok_or_else(|| format!("the Hub listed no files for {id}"))?;
+    Ok(siblings.iter().filter_map(|s| s.get("rfilename")?.as_str().map(str::to_string)).collect())
+}
+
 /// `id` as a path under `/api/models/`, or `None` if it is not shaped like a
 /// repo id at all.
 ///
@@ -660,6 +673,9 @@ pub struct LocalModel {
     /// disk -- so, unlike a search result, a downloaded mixture always
     /// knows its sparsity.
     pub reads: Reads,
+    /// The GGUF this model is, when it is one: `repo:QUANT`, one file of a
+    /// repo of several ([`crate::gguf`]).
+    pub gguf: Option<crate::gguf::Local>,
 }
 
 impl LocalModel {
@@ -745,12 +761,35 @@ pub fn local_models() -> Vec<LocalModel> {
             // again inside `local_params`, and there are now three questions
             // to ask it.
             let config = find_config(&path).and_then(|c| crate::weights::read_json(&c).ok());
+            // A repo of GGUFs is a model per file. The repo itself is one
+            // only if it is something else as well.
+            let ggufs = crate::gguf::locals(&path, &id);
+            let mut models: Vec<LocalModel> = ggufs
+                .into_iter()
+                .map(|g| LocalModel {
+                    id: g.name(),
+                    path: path.clone(),
+                    bytes: std::fs::metadata(&g.file).map(|m| m.len()).unwrap_or(0),
+                    arch: None,
+                    model_type: None,
+                    // `hf-hub` downloads to a temporary file and links it
+                    // into the snapshot once it is whole.
+                    complete: true,
+                    params: None,
+                    unreadable_as: None,
+                    reads: Reads::Everything,
+                    gguf: Some(g),
+                })
+                .collect();
+            if !models.is_empty() && config.is_none() && !image_weights {
+                return Some(models);
+            }
             let model_type = config
                 .as_ref()
                 .and_then(|j| j.get("model_type")?.as_str().map(str::to_string));
             let unreadable_as = config.as_ref().and_then(quant_format);
             let params = local_params(&path, config.as_ref(), unreadable_as.is_some());
-            Some(LocalModel {
+            models.push(LocalModel {
                 params,
                 unreadable_as,
                 reads: Reads::of(config.as_ref()),
@@ -762,8 +801,11 @@ pub fn local_models() -> Vec<LocalModel> {
                 // A cache entry with a config but no weights is a half-finished
                 // `info` call, not a usable model.
                 complete: files.iter().any(|f| f.ends_with(".safetensors")) || image_weights,
-            })
+                gguf: None,
+            });
+            Some(models)
         })
+        .flatten()
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
@@ -814,6 +856,7 @@ pub fn trained_models() -> Vec<LocalModel> {
                 complete: path.join("model.safetensors").is_file()
                     && path.join("config.json").is_file(),
                 path,
+                gguf: None,
             }
         })
         .collect();
@@ -855,8 +898,32 @@ pub fn model_file(model_dir: &Path, name: &str) -> Option<PathBuf> {
 ///
 /// A video pipeline laid out without an index — LTX-2.5 — is named by its
 /// denoiser's file instead; see [`crate::video::LTX_PIPELINE`].
+///
+/// A GGUF is its base's pipeline, when the base is here to say.
 pub fn pipeline(model: &LocalModel) -> Option<String> {
-    pipeline_in(&model.path)
+    match &model.gguf {
+        // LTX-2.5 is known by its DiT's file, which a GGUF of that DiT is
+        // there not to need, so its base is known by name.
+        Some(g) if g.base.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(crate::video::LTX_REPO)) => Some(crate::video::LTX_PIPELINE.to_string()),
+        Some(g) => pipeline_in(&repo_dir(g.base.as_deref()?)),
+        None => pipeline_in(&model.path),
+    }
+}
+
+/// Where `repo` is, or would be, in the cache.
+pub fn repo_dir(repo: &str) -> PathBuf {
+    match crate::weights::local_dir(repo) {
+        Some(dir) => dir,
+        None => cache_dir().join(format!("models--{}", repo.replace('/', "--"))),
+    }
+}
+
+/// Delete a downloaded model: its cache entry, or for a GGUF its one file.
+pub fn remove(model: &LocalModel) -> std::io::Result<()> {
+    match &model.gguf {
+        Some(g) => crate::gguf::remove(g),
+        None => std::fs::remove_dir_all(&model.path),
+    }
 }
 
 fn pipeline_in(dir: &Path) -> Option<String> {

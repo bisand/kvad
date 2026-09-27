@@ -22,7 +22,7 @@ pub fn loader() -> Loader {
             // and has no CPU implementation at all; see docs/image-plan.md.
             // Nor has a video pipeline. Video is asked first, because it
             // never asks the Hub.
-            let video = kvad_gpu::video::ltx::is_pipeline(repo);
+            let video = kvad_gpu::video::ltx::is_pipeline(repo) || kvad_gpu::video::ltx::is_gguf_of_ltx(repo, watch);
             let image = !video && kvad_gpu::image::is_pipeline(repo, watch);
             match backend {
                 Backend::Cpu(_) if image || video => Err(format!(
@@ -197,6 +197,17 @@ pub fn pipeline_weight_bytes(repo: &str, backend: Backend) -> Option<u64> {
     }
     let _ = (repo, backend);
     None
+}
+
+/// Pull a GGUF, `repo:QUANT`, and what its model reads from its base.
+pub fn pull_gguf(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weights::Watcher) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "gpu")]
+    return kvad_gpu::image::pull(name, progress, watch);
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (progress, watch);
+        Err(format!("{name} is a GGUF of a denoiser, and this build has no GPU backend to run one").into())
+    }
 }
 
 /// Whether `repo` is LTX-2.5, by name or by the files it holds, asking the

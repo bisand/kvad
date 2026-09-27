@@ -419,6 +419,12 @@ pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>, dev: bool) -> Re
         // repo has no model index for a pull to read, and a load fetches the
         // files the distilled model reads.
         let outcome: Result<(), Box<dyn std::error::Error>> = match dev {
+            // A GGUF, `repo:QUANT`: one file of its repo, and its base's
+            // text encoder, VAE and configs.
+            false if kvad::gguf::split(&repo).is_some() => crate::engine::pull_gguf(&repo, &mut progress, &watch),
+            false if repo.contains(':') => {
+                Err(format!("`{repo}`: what follows the colon is a GGUF's quantisation, such as Q4_K_S or Q8_0").into())
+            }
             false => kvad::weights::pull_watched(&repo, &mut progress, &watch).map(|_| ()),
             true if !crate::engine::is_ltx(&repo) => Err(format!("--dev is for LTX-2.5's repo, and {repo} is not one").into()),
             true => kvad::video::LTX_DEV_FILES.iter().try_for_each(|f| {

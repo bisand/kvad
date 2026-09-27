@@ -41,7 +41,7 @@ use super::ltx_text::Contexts;
 use super::metadata;
 use crate::common::{Loader, Reader};
 use crate::image::nn::{layer_norm_plain, Ctx, Linear};
-use crate::image::{finish, open};
+use crate::image::{finish, finish_gguf, open};
 use crate::prof::{scope, span};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
@@ -572,6 +572,13 @@ impl Dit {
         let cfg = Config::read(&metadata(path, "config")?["transformer"])?;
         let n = layers.unwrap_or(cfg.layers).min(cfg.layers);
         let whole = n == cfg.layers;
+        // A community GGUF: quantised by its maker, so never by this load,
+        // and never cached; and no LoRA can be fused into its blocks.
+        let gguf = match super::is_gguf(path) {
+            true if lora.is_some() => return Err(format!("{}: a LoRA cannot be fused into a GGUF's DiT, whose matrices are quantised already", path.display()).into()),
+            true => Some(std::sync::Arc::new(super::open_dit_gguf(path)?)),
+            false => None,
+        };
         let paths = [path.to_path_buf()];
         // The cache knows the files it came from, the LoRA's among them.
         let named: Vec<std::path::PathBuf> = paths.iter().cloned().chain(lora.map(|(p, _)| p.to_path_buf())).collect();
@@ -584,16 +591,21 @@ impl Dit {
         // Only the whole DiT is cached: a check that loads two blocks would
         // otherwise find the whole one's cache stale and replace it with its
         // own, and the next generation would quantise all 20 GB again.
-        let mut vault = match whole {
+        let mut vault = match whole && gguf.is_none() {
             true => Vault::open_as(&format!("{}/{component}", super::LTX_REPO), &named, shape, quant, progress),
             false => Vault::off(),
         };
+        let quant = if gguf.is_some() { None } else { quant };
         let lora = lora.map(|(p, s)| crate::common::Lora::open(p, s, "model.", DType::BF16, device).map(std::rc::Rc::new)).transpose()?;
         let dit = {
             let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
             // The tables are f32 in the file; read in f32 when computing in
             // it, so that they stay exact.
-            let r = open(&paths, if dtype == DType::F32 { DType::F32 } else { DType::BF16 })?;
+            let read = if dtype == DType::F32 { DType::F32 } else { DType::BF16 };
+            let r = match &gguf {
+                Some(file) => Reader::gguf(std::sync::Arc::clone(file), read),
+                None => open(&paths, read)?,
+            };
             let r = match &lora {
                 Some(l) => r.with_lora(l.clone()),
                 None => r,
@@ -640,7 +652,10 @@ impl Dit {
                     table: cx.get(&m, (2, aw), "audio_scale_shift_table")?,
                     proj: Linear::load(&cx, &m, "audio_proj_out", aw, cfg.audio_channels, true)?,
                 },
-                params: finish("LTX DiT", &paths, &r)?,
+                params: match &gguf {
+                    Some(file) => finish_gguf("LTX DiT", file, &r)?,
+                    None => finish("LTX DiT", &paths, &r)?,
+                },
                 cfg,
                 device: device.clone(),
                 dtype,

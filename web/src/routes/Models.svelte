@@ -100,6 +100,11 @@
   }
 
   let query = $state("");
+  /** A GGUF named outright, `repo:QUANT`: the Hub's search lists text
+   *  models, and a GGUF of a denoiser is pulled by its name instead. */
+  const gguf = $derived(
+    /^[\w.-]+\/[\w.-]+:(I?Q\d+(_[A-Za-z0-9]+)*|BF16|F16|F32)$/i.test(query.trim()) ? query.trim() : null,
+  );
   let results = $state(null);
   let searching = $state(false);
   let confirming = $state(null);
@@ -438,7 +443,7 @@
     <form class="join w-full max-w-lg" onsubmit={search}>
       <input
         class="input join-item w-full"
-        placeholder="smollm, qwen2.5, gpt2…"
+        placeholder="smollm, qwen2.5, gpt2… or city96/Qwen-Image-gguf:Q4_K_S"
         bind:value={query}
         aria-label="Search the HuggingFace Hub"
       />
@@ -451,6 +456,16 @@
         Search
       </button>
     </form>
+    {#if gguf}
+      <!-- The model card names its base, whose text encoder and VAE come too. -->
+      <div class="mt-2 flex max-w-lg items-center gap-3 text-sm">
+        <span class="opacity-70">
+          <span class="font-medium">{gguf}</span> names one GGUF of a denoiser; the rest comes from
+          the model it was made from.
+        </span>
+        <button class="btn btn-sm" disabled={!!models.busy} onclick={() => models.pull(gguf)}>Pull</button>
+      </div>
+    {/if}
 
     {#if results?.length}
       <!-- Same accordion as the downloaded list, with its own radio group so

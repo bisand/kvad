@@ -254,10 +254,20 @@ pub fn pull(remote: &Remote, args: &Args) -> Res<()> {
     // video asks for by giving steps, guidance or a negative prompt.
     let job = remote.post("/api/models/pull", &json!({ "repo": repo, "dev": args.dev }))?;
     super::api::follow(remote, &job, args)?;
+    // What it makes decides how it is run, and the server's listing says.
+    let kind = || -> Option<String> {
+        let listing = remote.get("/api/models").ok()?;
+        let m = on_disk(&listing).find(|m| m["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(&repo)))?;
+        m["kind"].as_str().map(str::to_string)
+    };
     match (args.json, args.dev) {
         (true, _) => {}
         (false, true) => println!("\nguided videos, 30 steps unless --steps says:  kvad videos make \"…\" --guidance 3"),
-        (false, false) => println!("\nrun it with:  kvad run --model {repo}"),
+        (false, false) => match kind().as_deref() {
+            Some("image") => println!("\nmake a picture with:  kvad images make \"…\" --model {repo}"),
+            Some("video") => println!("\nmake a video with:  kvad videos make \"…\" --model {repo}"),
+            _ => println!("\nrun it with:  kvad run --model {repo}"),
+        },
     }
     Ok(())
 }

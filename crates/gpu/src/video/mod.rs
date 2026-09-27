@@ -53,7 +53,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// The repo LTX-2.5 is published in: one safetensors file per component,
 /// each with its config in the file's own metadata.
-pub const LTX_REPO: &str = "Lightricks/LTX-2.5";
+pub const LTX_REPO: &str = kvad::video::LTX_REPO;
 
 /// A safetensors file's `__metadata__`, its strings as they are.
 pub(crate) fn metadata_raw(path: &Path) -> Res<std::collections::HashMap<String, String>> {
@@ -67,6 +67,20 @@ pub(crate) fn metadata_raw(path: &Path) -> Res<std::collections::HashMap<String,
     Ok(header["__metadata__"].as_object().map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default())
 }
 
+/// Whether `path` is a GGUF, which LTX-2.5's DiT can be read from.
+pub(crate) fn is_gguf(path: &Path) -> bool {
+    path.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+}
+
+/// A GGUF of LTX-2.5's DiT under the names its own file uses.
+pub(crate) fn open_dit_gguf(path: &Path) -> Res<crate::gguf::Gguf> {
+    let file = crate::gguf::Gguf::open(path)?;
+    match file.text("general.architecture") {
+        Some("ltxv") => file.prefixed("model.diffusion_model."),
+        other => Err(format!("{} is a GGUF of {}, not of LTX-2.5's DiT", path.display(), other.unwrap_or("an unnamed architecture")).into()),
+    }
+}
+
 /// A string from a safetensors file's `__metadata__`, parsed as JSON.
 ///
 /// LTX's split checkpoints carry their configs there rather than in a
@@ -74,6 +88,12 @@ pub(crate) fn metadata_raw(path: &Path) -> Res<std::collections::HashMap<String,
 /// length) and the header, never the tensors.
 pub(crate) fn metadata(path: &Path, key: &str) -> Res<kvad::serde_json::Value> {
     use std::io::Read;
+    // A GGUF of the DiT carries the same strings in its own header.
+    if is_gguf(path) {
+        let file = crate::gguf::Gguf::open(path)?;
+        let text = file.text(key).ok_or_else(|| format!("{}: no `{key}` in the GGUF's header", path.display()))?;
+        return Ok(kvad::serde_json::from_str(text)?);
+    }
     let mut f = std::fs::File::open(path)?;
     let mut len = [0u8; 8];
     f.read_exact(&mut len)?;

@@ -280,7 +280,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       longer than a browser tab reliably stays open. Watch it at \
                       `/api/jobs/{id}/events`. `dev: true` also fetches LTX-2.5's dev \
                       model and distilled LoRA, 51 GB, which guided videos read and \
-                      nothing else fetches.",
+                      nothing else fetches. A GGUF of a denoiser is named `repo:QUANT`, \
+                      as `city96/Qwen-Image-gguf:Q4_K_S`: that one file, and the text \
+                      encoder, VAE and configs of the model its card names as \
+                      `base_model`. It is listed, loaded and deleted by that name.",
         query: &[], body: json_body("`{ repo, dev? }`."), produces: JSON, events: &[],
     },
     Endpoint {

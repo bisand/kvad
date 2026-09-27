@@ -1062,7 +1062,7 @@ fn remove(args: Args) -> Res<()> {
     // Deleting is irreversible and the download may have been slow, so say
     // exactly what will go and require a typed yes.
     println!("about to delete:");
-    println!("  {}", local.path.display());
+    println!("  {}", local.gguf.as_ref().map_or(&local.path, |g| &g.file).display());
     println!("  {} ({})", local.id, hub::human_bytes(local.bytes));
     match trained.is_some() {
         // There is nowhere to fetch a trained model back from. Say so
@@ -1080,7 +1080,8 @@ fn remove(args: Args) -> Res<()> {
         return Ok(());
     }
 
-    std::fs::remove_dir_all(&local.path)?;
+    // A GGUF is one file of its repo, and only that file goes.
+    hub::remove(&local)?;
     // The quantised copies are derived from what just went; leaving them
     // would be a cache with nothing behind it.
     match qcache::forget(&local.id) {

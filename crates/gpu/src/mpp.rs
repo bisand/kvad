@@ -1,5 +1,6 @@
-//! Matmuls on the M5 GPU's neural accelerators (#52): Q8_0 in [`Q8`], and
-//! f16 or bf16 in [`dense`].
+//! Matmuls on the M5 GPU's neural accelerators (#52): GGML blocks in
+//! [`Blocks`] (Kvad's own Q8_0, and a GGUF's Q4_K, Q5_K and Q6_K), and f16
+//! or bf16 in [`dense`].
 //!
 //! Every M5 GPU core carries a matrix unit, and a shader reaches it only
 //! through Metal 4's tensor API, `mpp::tensor_ops::matmul2d`. candle's
@@ -11,17 +12,17 @@
 //!
 //! # Only where there is no decode step
 //!
-//! `matmul2d` cannot read GGML blocks, so the kernel needs the raw Q8_0
+//! `matmul2d` cannot read GGML blocks, so the kernel needs the raw block
 //! bytes. `QTensor` keeps its Metal buffer private, and candle offers no way
 //! to build one around a buffer someone else holds. So a weight is either a
-//! `QTensor` or [`Q8`], never both, unless it is kept twice.
+//! `QTensor` or [`Blocks`], never both, unless it is kept twice.
 //!
 //! A language model needs `QTensor`: its decode step is one row, which is
 //! candle's matrix-vector kernel's job and no matrix unit's. An image model
 //! has no decode step. Every product it takes has hundreds or thousands of
 //! rows: patches, pixels, or a prompt's tokens. So the image pipelines hold
-//! their Q8_0 projections as [`Q8`] and nothing else, and the text models keep
-//! `QMatMul`.
+//! their Q8_0 projections as [`Blocks`] and nothing else, and the text models
+//! keep `QMatMul`.
 //!
 //! # The kernel
 //!
@@ -64,6 +65,22 @@
 //! as zeros, and the store writes only what exists. `K` is always a
 //! multiple of 32, because a Q8_0 block is 32 wide.
 //!
+//! # Other blocks
+//!
+//! Only step 1 knows what a block is. It turns a run of eight weights into
+//! f16, and one decoder for each format does that ([`KINDS`]): Q8_0's is
+//! `scale × int8` in f16, as it always was, and its output is the same bit
+//! for bit. GGML's k-quants, which the community's GGUFs are made of, pack
+//! 256 weights to a super-block, in sub-blocks of 32 (Q4_K, Q5_K) or 16
+//! (Q6_K), each with its own scale. Any run of eight lies in one sub-block,
+//! so it decodes on its own: the super-block's scales, then four or eight
+//! bytes of `q`s, in GGML's own arithmetic, in f32, rounded once. `K` is
+//! then a multiple of 256.
+//!
+//! At the LTX-2.5 DiT's shapes they run at 16–21 TFLOP/s, 75–90% of Q8_0's
+//! rate: the decoding is more arithmetic and more reads a run. candle's
+//! `QMatMul` runs the same blocks at 6–7, on the ALUs.
+//!
 //! # Where it runs
 //!
 //! Only on a GPU of Apple's tenth family, the M5's, because that is where
@@ -86,13 +103,21 @@
 //! job, and there `matmul2d` is slower.
 
 use candle_core::backend::BackendStorage;
+use candle_core::quantized::GgmlDType;
 use candle_core::{CpuStorage, CustomOp2, CustomOp3, DType, Device, Layout, MetalStorage, Shape, Tensor};
 use candle_metal_kernels::metal::{ComputeCommandEncoder, ComputePipeline};
 use objc2_metal::{MTLCompileOptions, MTLDevice, MTLGPUFamily, MTLLanguageVersion, MTLSize};
 use std::sync::OnceLock;
 
-/// Bytes in one Q8_0 block: an f16 scale and 32 `int8`s.
-const BLOCK: usize = 34;
+/// The block formats the kernel reads: GGML's type, the kernel's name for
+/// it, and one block's width in weights and size in bytes.
+const KINDS: [(GgmlDType, &str, usize, usize); 4] =
+    [(GgmlDType::Q8_0, "q8_0", 32, 34), (GgmlDType::Q4K, "q4_K", 256, 144), (GgmlDType::Q5K, "q5_K", 256, 176), (GgmlDType::Q6K, "q6_K", 256, 210)];
+
+/// Whether [`Blocks`] reads `kind`, a matrix `k` wide.
+pub(crate) fn reads(kind: GgmlDType, k: usize) -> bool {
+    KINDS.iter().any(|&(t, _, width, _)| t == kind && k % width == 0)
+}
 
 /// Rows of `C` per threadgroup, columns, and the SIMD groups sharing the
 /// tile, each a `32 × 32` corner.
@@ -211,6 +236,127 @@ struct block_q8_0 {
     int8_t qs[32];
 };
 
+// GGML's k-quants: super-blocks of 256 weights along a row.
+//
+// Q4_K and Q5_K: eight sub-blocks of 32, each with a 6-bit scale and a 6-bit
+// minimum packed into `scales`, under the super-block's own `d` and `dmin`:
+// a weight is `d·sc·q − dmin·m`. The 4-bit `q`s of sub-blocks `2c` and
+// `2c + 1` share the 32 bytes `qs[32c…]`, low nibble and high. Q5_K adds a
+// fifth bit, bit `2c` or `2c + 1` of `qh[l]`.
+struct block_q4_K {
+    half d;
+    half dmin;
+    uchar scales[12];
+    uchar qs[128];
+};
+
+struct block_q5_K {
+    half d;
+    half dmin;
+    uchar scales[12];
+    uchar qh[32];
+    uchar qs[128];
+};
+
+// Q6_K: sixteen sub-blocks of 16, each with an 8-bit scale, and 6-bit `q`s
+// centred on 32: a weight is `d·sc·(q − 32)`. Each half of the super-block
+// is 128 weights in four quarters of 32. Their low four bits share `ql`'s 64
+// bytes, two quarters to a nibble, and their top two bits share `qh`'s 32,
+// two bits a quarter.
+struct block_q6_K {
+    uchar ql[128];
+    uchar qh[64];
+    char scales[16];
+    half d;
+};
+
+static_assert(sizeof(block_q8_0) == 34 && sizeof(block_q4_K) == 144 && sizeof(block_q5_K) == 176 && sizeof(block_q6_K) == 210,
+              "the blocks are GGML's, byte for byte");
+
+// A sub-block's 6-bit scale and minimum, from Q4_K's and Q5_K's `scales`:
+// the first four whole in the low six bits of bytes 0–3 and 4–7, the last
+// four as nibbles of bytes 8–11 topped up with those bytes' spare two bits.
+inline uchar2 scale_min(device const uchar *q, int s) {
+    return s < 4 ? uchar2(q[s] & 63, q[s + 4] & 63)
+                 : uchar2((q[s + 4] & 0xF) | ((q[s - 4] >> 6) << 4), (q[s + 4] >> 4) | ((q[s] >> 6) << 4));
+}
+
+inline uchar4 bytes4(device const uchar *p) {
+    return uchar4(*(device const packed_uchar4 *)p);
+}
+
+// A run of eight weights of one row as f16, `lo` then `hi`: those at `k + j`
+// onwards, `j` a multiple of 8 below 32. `row` is the row's first block.
+// The arithmetic is GGML's own dequantisation in f32, rounded once; Q8_0's
+// is the multiply in f16 this kernel has always done.
+struct q8_0 {
+    static constant constexpr int WIDTH = 32;
+    static inline void run(device const uchar *row, int k, int j, thread half4 &lo, thread half4 &hi) {
+        device const block_q8_0 &b = ((device const block_q8_0 *)row)[k / 32];
+        // The `int8`s sit two bytes into a 34-byte block, so only a packed
+        // (byte-aligned) load may read them.
+        device const packed_char4 *q = (device const packed_char4 *)(b.qs + j);
+        lo = b.d * half4(char4(q[0]));
+        hi = b.d * half4(char4(q[1]));
+    }
+};
+
+struct q4_K {
+    static constant constexpr int WIDTH = 256;
+    static inline void run(device const uchar *row, int k, int j, thread half4 &lo, thread half4 &hi) {
+        device const block_q4_K &b = ((device const block_q4_K *)row)[k / 256];
+        const int p = k % 256 + j, c = p / 64, h = (p / 32) & 1, l = p % 32;
+        const uchar2 sm = scale_min(b.scales, 2 * c + h);
+        const float dl = float(b.d) * sm.x, ml = float(b.dmin) * sm.y;
+        const uchar shift = h * 4;
+        lo = half4(dl * float4((bytes4(b.qs + 32 * c + l) >> shift) & 0xF) - ml);
+        hi = half4(dl * float4((bytes4(b.qs + 32 * c + l + 4) >> shift) & 0xF) - ml);
+    }
+};
+
+struct q5_K {
+    static constant constexpr int WIDTH = 256;
+    static inline void run(device const uchar *row, int k, int j, thread half4 &lo, thread half4 &hi) {
+        device const block_q5_K &b = ((device const block_q5_K *)row)[k / 256];
+        const int p = k % 256 + j, c = p / 64, h = (p / 32) & 1, l = p % 32;
+        const uchar2 sm = scale_min(b.scales, 2 * c + h);
+        const float dl = float(b.d) * sm.x, ml = float(b.dmin) * sm.y;
+        const uchar shift = h * 4, bit = uchar(1 << (2 * c + h));
+        auto q = [&](int o) {
+            const uchar4 top = select(uchar4(0), uchar4(16), (bytes4(b.qh + l + o) & bit) != 0);
+            return float4(((bytes4(b.qs + 32 * c + l + o) >> shift) & 0xF) + top);
+        };
+        lo = half4(dl * q(0) - ml);
+        hi = half4(dl * q(4) - ml);
+    }
+};
+
+struct q6_K {
+    static constant constexpr int WIDTH = 256;
+    static inline void run(device const uchar *row, int k, int j, thread half4 &lo, thread half4 &hi) {
+        device const block_q6_K &b = ((device const block_q6_K *)row)[k / 256];
+        const int p = k % 256 + j, n = p / 128, quarter = (p % 128) / 32, l = p % 32;
+        const float d = float(b.d) * float(b.scales[8 * n + l / 16 + 2 * quarter]);
+        device const uchar *ql = b.ql + 64 * n + (quarter & 1) * 32 + l;
+        device const uchar *qh = b.qh + 32 * n + l;
+        const uchar shift = (quarter >> 1) * 4, up = 2 * quarter;
+        auto q = [&](int o) {
+            const uchar4 v = ((bytes4(ql + o) >> shift) & 0xF) | (((bytes4(qh + o) >> up) & 3) << 4);
+            return float4(v) - 32.0f;
+        };
+        lo = half4(d * q(0));
+        hi = half4(d * q(4));
+    }
+};
+
+// Each decoder's block, for a row's stride.
+template <typename B> struct block_of;
+template <> struct block_of<q8_0> { using type = block_q8_0; };
+template <> struct block_of<q4_K> { using type = block_q4_K; };
+template <> struct block_of<q5_K> { using type = block_q5_K; };
+template <> struct block_of<q6_K> { using type = block_q6_K; };
+template <typename B> using B_block = typename block_of<B>::type;
+
 // Each thread's share of a slab: `PER` runs of 8 weights. Adjacent threads
 // take adjacent runs of the same row, so a SIMD group reads a row
 // contiguously.
@@ -218,41 +364,35 @@ constant constexpr int RUN = 8;
 constant constexpr int PER = BN * BK / RUN / (32 * NSG);
 static_assert(PER * RUN * 32 * NSG == BN * BK, "every thread unpacks the same number of runs");
 
-// A step's raw blocks, from device memory into this thread's registers.
-// Rows past `N` read as zeros. The `int8`s sit two bytes into a 34-byte
-// block, so only a packed (byte-aligned) load may read them.
-inline void fetch(device const block_q8_0 *w, int N, int n0, int blocks, int k, ushort tid,
-                  thread half *d, thread char4 *lo, thread char4 *hi) {
+// A step's weights, from device memory into this thread's registers as f16.
+// Rows past `N` read as zeros. `stride` is a row's bytes.
+template <typename B>
+inline void fetch(device const uchar *w, int N, int n0, long stride, int k, ushort tid,
+                  thread half4 *lo, thread half4 *hi) {
     #pragma unroll
     for (int p = 0; p < PER; ++p) {
         const int r = tid + p * 32 * NSG;
         const int n = r / (BK / RUN);
         const int j = (r % (BK / RUN)) * RUN;
         if (n0 + n < N) {
-            device const block_q8_0 &b = w[(n0 + n) * blocks + k / 32];
-            device const packed_char4 *q = (device const packed_char4 *)(b.qs + j);
-            d[p] = b.d;
-            lo[p] = char4(q[0]);
-            hi[p] = char4(q[1]);
+            B::run(w + (n0 + n) * stride, k, j, lo[p], hi[p]);
         } else {
-            d[p] = 0;
-            lo[p] = char4(0);
-            hi[p] = char4(0);
+            lo[p] = half4(0);
+            hi[p] = half4(0);
         }
     }
 }
 
-// Those registers, as f16 weights, into a slab: `scale × int8`, rounded once.
-inline void unpack(threadgroup half *slab, ushort tid,
-                   thread half *d, thread char4 *lo, thread char4 *hi) {
+// Those registers into a slab.
+inline void unpack(threadgroup half *slab, ushort tid, thread half4 *lo, thread half4 *hi) {
     #pragma unroll
     for (int p = 0; p < PER; ++p) {
         const int r = tid + p * 32 * NSG;
         const int n = r / (BK / RUN);
         const int j = (r % (BK / RUN)) * RUN;
         threadgroup half4 *dst = (threadgroup half4 *)(slab + n * SLAB_ROW + j);
-        dst[0] = d[p] * half4(lo[p]);
-        dst[1] = d[p] * half4(hi[p]);
+        dst[0] = lo[p];
+        dst[1] = hi[p];
     }
 }
 
@@ -264,11 +404,12 @@ struct Epilogue {
     int gelu;
 };
 
-// TI is what `A` is read in, O what `C` is written in.
-template <typename TI, typename O>
-[[kernel, max_total_threads_per_threadgroup(128)]] void mm_q8_0(
+// B is the weights' block format, TI what `A` is read in, O what `C` is
+// written in.
+template <typename B, typename TI, typename O>
+[[kernel, max_total_threads_per_threadgroup(128)]] void mm_q(
         device const TI *a [[buffer(0)]],
-        device const block_q8_0 *w [[buffer(1)]],
+        device const uchar *w [[buffer(1)]],
         device O *c [[buffer(2)]],
         constant int &M [[buffer(3)]],
         constant int &N [[buffer(4)]],
@@ -293,11 +434,10 @@ template <typename TI, typename O>
     frag<float> acc[4];
     EACH(4, i, acc[i] = 0;);
 
-    const int blocks = K / 32;
-    half d[PER];
-    char4 lo[PER], hi[PER];
-    fetch(w, N, n0, blocks, 0, tid, d, lo, hi);
-    unpack(slab, tid, d, lo, hi);
+    const long stride = long(K / B::WIDTH) * sizeof(B_block<B>);
+    half4 lo[PER], hi[PER];
+    fetch<B>(w, N, n0, stride, 0, tid, lo, hi);
+    unpack(slab, tid, lo, hi);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // EDGE is a threadgroup whose tile runs past `M`: only there are rows
@@ -310,7 +450,7 @@ template <typename TI, typename O>
             // The next step's device reads go out before this step's
             // multiply, so they are in flight while it runs.
             if (more) {
-                fetch(w, N, n0, blocks, k + BK, tid, d, lo, hi);
+                fetch<B>(w, N, n0, stride, k + BK, tid, lo, hi);
             }
             threadgroup const half *ws = slab + (s & 1) * BN * SLAB_ROW + tn * SLAB_ROW;
             EACH(BK / 16, kk,
@@ -321,7 +461,7 @@ template <typename TI, typename O>
                 EACH(2, i, mma<true>(acc[i * 2], acc[i * 2 + 1], af[i], b0, b1););
             );
             if (more) {
-                unpack(slab + ((s + 1) & 1) * BN * SLAB_ROW, tid, d, lo, hi);
+                unpack(slab + ((s + 1) & 1) * BN * SLAB_ROW, tid, lo, hi);
             }
             // One barrier does both jobs. The slab written just now is
             // complete before anyone multiplies from it. And the slab the
@@ -360,14 +500,19 @@ template <typename TI, typename O>
     );););
 }
 
-#define Q8(TI, IN, O, ON) \
-    template [[host_name("mm_q8_0_" #IN "_" #ON)]] [[kernel]] decltype(mm_q8_0<TI, O>) mm_q8_0<TI, O>;
-Q8(half, f16, float, f32)
-Q8(half, f16, half, f16)
-Q8(half, f16, bfloat, bf16)
-Q8(bfloat, bf16, float, f32)
-Q8(bfloat, bf16, half, f16)
-Q8(bfloat, bf16, bfloat, bf16)
+#define MMQ(B, TI, IN, O, ON) \
+    template [[host_name("mm_" #B "_" #IN "_" #ON)]] [[kernel]] decltype(mm_q<B, TI, O>) mm_q<B, TI, O>;
+#define MMQ_ALL(B) \
+    MMQ(B, half, f16, float, f32) \
+    MMQ(B, half, f16, half, f16) \
+    MMQ(B, half, f16, bfloat, bf16) \
+    MMQ(B, bfloat, bf16, float, f32) \
+    MMQ(B, bfloat, bf16, half, f16) \
+    MMQ(B, bfloat, bf16, bfloat, bf16)
+MMQ_ALL(q8_0)
+MMQ_ALL(q4_K)
+MMQ_ALL(q5_K)
+MMQ_ALL(q6_K)
 
 // Dense: `C = A · B`, all three row-major and of one dtype. `A` is
 // `[M, K]`, `B` is `[K, N]` (a weight stored `[in, out]`, as `Proj::Dense`
@@ -413,7 +558,7 @@ DENSE(bfloat, bf16, 128, 128, 8)
 "#
 );
 
-/// Whether this device runs [`Q8`] and [`dense`], answered once per process.
+/// Whether this device runs [`Blocks`] and [`dense`], answered once per process.
 ///
 /// Compiling is part of the answer. A GPU of the right family on a macOS
 /// without Metal 4 fails here, and says why on stderr, instead of failing at
@@ -424,8 +569,8 @@ pub(crate) fn available(device: &Device) -> bool {
 
 /// Every kernel in [`SOURCE`], built.
 struct Pipes {
-    /// `[f16, bf16]` in, each `[f32, f16, bf16]` out.
-    q8: [[ComputePipeline; 3]; 2],
+    /// Each of [`KINDS`], `[f16, bf16]` in, each `[f32, f16, bf16]` out.
+    q: [[[ComputePipeline; 3]; 2]; 4],
     /// `[C = A·B, C += A·B]`, each `[f16, bf16]`, each in [`DENSE_TILES`]'
     /// order.
     dense: [[[ComputePipeline; 2]; 2]; 2],
@@ -456,11 +601,13 @@ fn pipes(device: &Device) -> Option<&'static Pipes> {
             let dense = |acc: &str| -> Result<[[ComputePipeline; 2]; 2], candle_metal_kernels::MetalKernelError> {
                 Ok([dense(&format!("{acc}f16"))?, dense(&format!("{acc}bf16"))?])
             };
-            let q8 = |inp: &str| -> Result<[ComputePipeline; 3], candle_metal_kernels::MetalKernelError> {
-                let p = |on: &str| pipe(&format!("mm_q8_0_{inp}_{on}"));
+            let q = |kind: &str, inp: &str| -> Result<[ComputePipeline; 3], candle_metal_kernels::MetalKernelError> {
+                let p = |on: &str| pipe(&format!("mm_{kind}_{inp}_{on}"));
                 Ok([p("f32")?, p("f16")?, p("bf16")?])
             };
-            Ok(Pipes { q8: [q8("f16")?, q8("bf16")?], dense: [dense("")?, dense("acc_")?] })
+            let q = |kind: &str| -> Result<[[ComputePipeline; 3]; 2], candle_metal_kernels::MetalKernelError> { Ok([q(kind, "f16")?, q(kind, "bf16")?]) };
+            let [a, b, c, d] = KINDS.map(|(_, name, _, _)| name);
+            Ok(Pipes { q: [q(a)?, q(b)?, q(c)?, q(d)?], dense: [dense("")?, dense("acc_")?] })
         });
         match built {
             Ok(p) => Some(p),
@@ -484,21 +631,29 @@ fn shape(sg: usize) -> MTLSize {
     MTLSize { width: 32, height: sg, depth: 1 }
 }
 
-/// One `[n, k]` weight matrix, in Q8_0 blocks on the GPU, for [`SOURCE`].
-pub(crate) struct Q8 {
+/// One `[n, k]` weight matrix, in GGML blocks on the GPU, for [`SOURCE`]:
+/// Q8_0, which is Kvad's own quantisation, or Q4_K, Q5_K or Q6_K, which is
+/// a GGUF's.
+pub(crate) struct Blocks {
     blocks: Tensor,
+    /// Its place in [`KINDS`].
+    kind: usize,
     n: usize,
     k: usize,
 }
 
-impl Q8 {
-    /// `blocks` are `[n, k]` as GGML lays Q8_0 out: row after row, each row
-    /// `k / 32` blocks.
-    pub(crate) fn new(blocks: &[u8], n: usize, k: usize, device: &Device) -> candle_core::Result<Self> {
-        if k % 32 != 0 || blocks.len() != n * k / 32 * BLOCK {
-            candle_core::bail!("{} bytes are not a [{n}, {k}] matrix of Q8_0 blocks", blocks.len());
+impl Blocks {
+    /// `blocks` are `[n, k]` as GGML lays `kind` out: row after row, each
+    /// row `k / width` blocks.
+    pub(crate) fn new(kind: GgmlDType, blocks: &[u8], n: usize, k: usize, device: &Device) -> candle_core::Result<Self> {
+        let Some(at) = KINDS.iter().position(|&(t, ..)| t == kind) else {
+            candle_core::bail!("the M5 kernel reads no {kind:?} blocks");
+        };
+        let (_, name, width, bytes) = KINDS[at];
+        if k % width != 0 || blocks.len() != n * k / width * bytes {
+            candle_core::bail!("{} bytes are not a [{n}, {k}] matrix of {name} blocks", blocks.len());
         }
-        Ok(Q8 { blocks: Tensor::from_slice(blocks, blocks.len(), device)?, n, k })
+        Ok(Blocks { blocks: Tensor::from_slice(blocks, blocks.len(), device)?, kind: at, n, k })
     }
 
     /// `x · Wᵀ` over the last axis, in f32, whatever `x`'s dtype and leading
@@ -521,7 +676,7 @@ impl Q8 {
             _ => x2.to_dtype(DType::F16)?,
         }
         .contiguous()?;
-        let op = Q8Op { n: self.n, k: self.k, out, gelu, bias: bias.is_some() };
+        let op = Q8Op { kind: self.kind, n: self.n, k: self.k, out, gelu, bias: bias.is_some() };
         let y = match bias {
             Some(b) => {
                 if b.elem_count() != self.n {
@@ -547,8 +702,10 @@ impl Q8 {
     }
 }
 
-/// One call of the Q8_0 kernel: the matrix's shape and what its store does.
+/// One call of the kernel: the matrix's blocks and shape, and what its
+/// store does.
 struct Q8Op {
+    kind: usize,
     n: usize,
     k: usize,
     out: DType,
@@ -611,7 +768,7 @@ impl CustomOp3 for Q8Op {
         let guard = dev.command_encoder()?;
         let enc: &ComputeCommandEncoder = guard.as_ref();
         enc.set_label("mpp_q8_0");
-        enc.set_compute_pipeline_state(&pipes.q8[inp][which]);
+        enc.set_compute_pipeline_state(&pipes.q[self.kind][inp][which]);
         enc.set_input_buffer(0, Some(a.buffer()), la.start_offset() * a.dtype().size_in_bytes());
         enc.set_input_buffer(1, Some(w.buffer()), 0);
         enc.set_output_buffer(2, Some(&out), 0);
@@ -791,7 +948,7 @@ impl CustomOp2 for Dense {
         let dev = a.device();
         let bytes = m * n * dt.size_in_bytes();
         let out = dev.allocate_buffer(bytes)?;
-        // As for `Q8`: under test every output starts as NaN.
+        // As for `Blocks`: under test every output starts as NaN.
         #[cfg(test)]
         {
             let mut blit = dev.blit_command_encoder()?;
@@ -864,7 +1021,7 @@ mod tests {
         for (m, k, n) in [(128, 256, 128), (77, 512, 192), (128, 256, 100), (300, 1024, 70), (65, 32, 65), (1, 256, 64)] {
             let w = rand(n * k, n as f32).reshape((n, k)).unwrap();
             let blocks = QTensor::quantize(&w, GgmlDType::Q8_0).unwrap().data().unwrap().into_owned();
-            let ours = Q8::new(&blocks, n, k, &dev).unwrap();
+            let ours = Blocks::new(GgmlDType::Q8_0, &blocks, n, k, &dev).unwrap();
             let theirs = QMatMul::from_qtensor(QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev).unwrap()).unwrap();
             let x = (rand(m * k, 7.0 + m as f32).reshape((m, k)).unwrap() * 4.0).unwrap().to_device(&dev).unwrap();
 
@@ -883,6 +1040,40 @@ mod tests {
         }
     }
 
+    /// Q4_K, Q5_K and Q6_K, against the same blocks dequantised by candle
+    /// and multiplied in f32 on the CPU: whole tiles, ragged edges, one
+    /// row, and a `k` of one super-block. What is left is the kernel's
+    /// rounding of weights and activations to f16, and it must be near
+    /// f16's own: 60 dB is a thousandth of the signal's amplitude.
+    #[test]
+    fn k_quants_agree_with_their_own_numbers() {
+        let Ok(dev) = Device::new_metal(0) else { return };
+        if !available(&dev) {
+            return;
+        }
+        for kind in [GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+            for (m, k, n) in [(128, 256, 128), (77, 512, 192), (300, 1024, 70), (1, 256, 64), (65, 2048, 33)] {
+                let w = rand(n * k, n as f32 + k as f32).reshape((n, k)).unwrap();
+                let q = QTensor::quantize(&w, kind).unwrap();
+                let ours = Blocks::new(kind, &q.data().unwrap(), n, k, &dev).unwrap();
+                // f32 in, as the image pipelines give it, and bf16, as
+                // LTX-2.5's DiT does: each against its own input in f32.
+                for dt in [DType::F32, DType::BF16] {
+                    let x = (rand(m * k, 7.0 + m as f32).reshape((m, k)).unwrap() * 4.0).unwrap().to_dtype(dt).unwrap();
+                    let want = x.to_dtype(DType::F32).unwrap().matmul(&q.dequantize(&Device::Cpu).unwrap().t().unwrap()).unwrap();
+                    let got = ours.forward(&x.to_device(&dev).unwrap()).unwrap().to_device(&Device::Cpu).unwrap();
+                    assert_eq!(got.dims(), &[m, n]);
+                    let sum = got.sum_all().unwrap().to_scalar::<f32>().unwrap();
+                    assert!(sum.is_finite(), "{kind:?} {dt:?} [{m}, {k}] x [{n}, {k}]: output not all written");
+                    let err = (&got - &want).unwrap().sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+                    let sig = want.sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+                    let db = 10.0 * (sig / err.max(1e-30)).log10();
+                    assert!(db > 60.0, "{kind:?} {dt:?} [{m}, {k}] x [{n}, {k}]: {db:.1} dB");
+                }
+            }
+        }
+    }
+
     /// The store's bias, GELU and rounding, against the same product in
     /// f32 with the ops written out after it.
     #[test]
@@ -894,7 +1085,7 @@ mod tests {
         for (m, k, n) in [(128, 256, 128), (77, 512, 192), (300, 1024, 70), (1, 64, 64)] {
             let w = rand(n * k, n as f32).reshape((n, k)).unwrap();
             let blocks = QTensor::quantize(&w, GgmlDType::Q8_0).unwrap().data().unwrap().into_owned();
-            let q = Q8::new(&blocks, n, k, &dev).unwrap();
+            let q = Blocks::new(GgmlDType::Q8_0, &blocks, n, k, &dev).unwrap();
             let x = (rand(m * k, 5.0 + m as f32).reshape((m, k)).unwrap() * 4.0).unwrap().to_device(&dev).unwrap();
             let b = (rand(n, 9.0) * 8.0).unwrap().to_dtype(DType::BF16).unwrap().to_device(&dev).unwrap();
             let plain = q.forward(&x).unwrap();
@@ -935,7 +1126,7 @@ mod tests {
         let (n, k) = (64, 64);
         let w = rand(n * k, 3.0).reshape((n, k)).unwrap();
         let blocks = QTensor::quantize(&w, GgmlDType::Q8_0).unwrap().data().unwrap().into_owned();
-        let q = Q8::new(&blocks, n, k, &dev).unwrap();
+        let q = Blocks::new(GgmlDType::Q8_0, &blocks, n, k, &dev).unwrap();
         let x = rand(2 * 5 * k, 1.0).reshape((2, 5, k)).unwrap().to_device(&dev).unwrap();
         let flat = q.forward(&x.reshape((10, k)).unwrap()).unwrap();
         assert_eq!(q.forward(&x).unwrap().reshape((10, n)).unwrap().to_vec2::<f32>().unwrap(),
@@ -1140,13 +1331,15 @@ mod tests {
         }
     }
 
-    /// The Q8_0 kernel's rate at the LTX-2.5 DiT's stage-2 shapes, bias and
-    /// bf16 in and out, as its projections run. Not a test, a measurement:
+    /// The kernel's rate for each kind of block at the LTX-2.5 DiT's stage-2
+    /// shapes, bias and bf16 in and out, as its projections run, and
+    /// candle's `QMatMul` on the same blocks, f32 in and out, for the
+    /// k-quants it would otherwise run. Not a test, a measurement:
     ///
-    ///     cargo test --release -p kvad-gpu q8_rates -- --ignored --nocapture
+    ///     cargo test --release -p kvad-gpu q_rates -- --ignored --nocapture
     #[test]
     #[ignore]
-    fn q8_rates() {
+    fn q_rates() {
         let dev = Device::new_metal(0).unwrap();
         assert!(available(&dev));
         let once = |f: &dyn Fn() -> Tensor| {
@@ -1157,18 +1350,32 @@ mod tests {
             dev.synchronize().unwrap();
             t.elapsed().as_secs_f64() / 4.0
         };
+        let median = |f: &dyn Fn() -> Tensor| {
+            let _ = once(f);
+            let mut v: Vec<f64> = (0..7).map(|_| once(f)).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[3]
+        };
         let m = 24576;
         for (k, n) in [(4096, 4096), (4096, 16384), (16384, 4096), (4096, 2048), (2048, 4096), (4096, 32)] {
             let w = rand(n * k, 1.0).reshape((n, k)).unwrap();
-            let blocks = QTensor::quantize(&w, GgmlDType::Q8_0).unwrap().data().unwrap().into_owned();
-            let q = Q8::new(&blocks, n, k, &dev).unwrap();
             let b = rand(n, 3.0).to_dtype(DType::BF16).unwrap().to_device(&dev).unwrap();
             let x = rand(m * k, 2.0).reshape((m, k)).unwrap().to_dtype(DType::BF16).unwrap().to_device(&dev).unwrap();
-            let f = || q.linear(&x, Some(&b), DType::BF16, false).unwrap();
-            let _ = once(&f);
-            let mut v: Vec<f64> = (0..7).map(|_| once(&f)).collect();
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            println!("[{m}, {k}] x [{k}, {n}]: {:5.1} TFLOP/s", 2.0 * (m * k * n) as f64 / 1e12 / v[3]);
+            let x32 = x.to_dtype(DType::F32).unwrap();
+            let flop = 2.0 * (m * k * n) as f64 / 1e12;
+            let mut line = format!("[{m}, {k}] x [{k}, {n}]:");
+            for kind in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+                let q = QTensor::quantize(&w, kind).unwrap();
+                let ours = Blocks::new(kind, &q.data().unwrap(), n, k, &dev).unwrap();
+                let f = || ours.linear(&x, Some(&b), DType::BF16, false).unwrap();
+                line += &format!(" {kind:?} {:5.1}", flop / median(&f));
+                if kind != GgmlDType::Q8_0 {
+                    let theirs = QMatMul::from_qtensor(QTensor::quantize_onto(&w, kind, &dev).unwrap()).unwrap();
+                    let g = || theirs.forward(&x32).unwrap();
+                    line += &format!(" (candle {:4.1})", flop / median(&g));
+                }
+            }
+            println!("{line} TFLOP/s");
         }
     }
 }

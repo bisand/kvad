@@ -6,8 +6,10 @@
 //! Options: `--negative TEXT`, `--steps N`, `--guidance F`, `--seed N`,
 //! `--width N`, `--height N`, `--repo REPO` (any repo whose
 //! `model_index.json` names a pipeline `kvad_gpu::image` implements),
-//! `--quant Q`, and `--gguf FILE`, a community GGUF of the repo's denoiser
-//! to read in place of its own (Qwen-Image's or FLUX.1-schnell's).
+//! `--quant Q`, `--gguf FILE`, a community GGUF of the repo's denoiser to
+//! read in place of its own (Qwen-Image's or FLUX.1-schnell's), and
+//! `--single FILE`, an SDXL checkpoint in Stability's one-file layout, whose
+//! configs come from `--repo` (SDXL's base unless it says otherwise).
 //!
 //! Reports the time spent in each of the three models, because they are
 //! nothing alike: the text encoders run once over 77 tokens, the denoiser
@@ -27,6 +29,7 @@ fn main() -> Res<()> {
     let mut repo = kvad_gpu::image::sdxl::REPO.to_string();
     let mut quant = None;
     let mut gguf = None;
+    let mut single = None;
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -42,6 +45,7 @@ fn main() -> Res<()> {
             "--out" => out = v,
             "--repo" => repo = v,
             "--gguf" => gguf = Some(std::path::PathBuf::from(v)),
+            "--single" => single = Some(std::path::PathBuf::from(v)),
             "--quant" => quant = kvad_gpu::model::parse_quant(&v).ok_or("--quant is none, q8, q4, q4k or q6k")?,
             other => return Err(format!("unknown option {other}").into()),
         }
@@ -49,7 +53,13 @@ fn main() -> Res<()> {
     }
 
     let t = Instant::now();
-    let mut painter = kvad_gpu::image::load_with(&repo, gguf.as_deref(), quant, &mut |m| eprintln!("  {m}"), &Watcher::none())?;
+    let mut painter: Box<dyn kvad::image::Painter> = match &single {
+        Some(file) => {
+            let device = kvad_gpu::model::pick_device(None)?;
+            Box::new(kvad_gpu::image::sdxl::Sdxl::load_with(&repo, Some(file), device, &mut |m| eprintln!("  {m}"), &Watcher::none())?)
+        }
+        None => kvad_gpu::image::load_with(&repo, gguf.as_deref(), quant, &mut |m| eprintln!("  {m}"), &Watcher::none())?,
+    };
     eprintln!("{} on {}, loaded in {:.1} s", painter.summary(), painter.backend(), t.elapsed().as_secs_f64());
 
     let mut last = Instant::now();

@@ -210,6 +210,18 @@ pub fn pull_gguf(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weigh
     }
 }
 
+/// Pull an SDXL checkpoint in one file, `repo`, `repo:file.safetensors` or a
+/// path, and what it reads beside it.
+pub fn pull_single(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weights::Watcher) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "gpu")]
+    return kvad_gpu::image::pull_single(name, progress, watch);
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (progress, watch);
+        Err(format!("{name} is an SDXL checkpoint, and this build has no GPU backend to run one").into())
+    }
+}
+
 /// Whether `repo` is LTX-2.5, by name or by the files it holds, asking the
 /// disk and never the Hub.
 pub fn is_ltx(repo: &str) -> bool {

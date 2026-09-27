@@ -524,7 +524,7 @@ pub(crate) async fn resident_for(state: &State, model: Option<&str>, want: Kind)
     let (on_disk, kind, default) = {
         let repo = repo.clone();
         blocking(move || {
-            let found = kvad::hub::find_local(&repo).or_else(|| kvad::hub::find_trained(&repo));
+            let found = kvad::hub::find_local(&repo).or_else(|| kvad::hub::find_trained(&repo)).or_else(|| kvad::hub::checkpoint_at(&repo));
             let here = found.as_ref().is_some_and(|m| m.complete);
             let kind = Kind::of_pipeline(found.as_ref().and_then(kvad::hub::pipeline).as_deref());
             // The same answer the Models page would give, from the same

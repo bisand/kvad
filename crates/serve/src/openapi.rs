@@ -283,7 +283,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       nothing else fetches. A GGUF of a denoiser is named `repo:QUANT`, \
                       as `city96/Qwen-Image-gguf:Q4_K_S`: that one file, and the text \
                       encoder, VAE and configs of the model its card names as \
-                      `base_model`. It is listed, loaded and deleted by that name.",
+                      `base_model`. It is listed, loaded and deleted by that name. An SDXL \
+                      checkpoint in one file, in Stability's layout, is `repo` when it is \
+                      the repo's only model, `repo:file.safetensors` otherwise, or a path \
+                      on this machine; its configs come from SDXL's base.",
         query: &[], body: json_body("`{ repo, dev? }`."), produces: JSON, events: &[],
     },
     Endpoint {

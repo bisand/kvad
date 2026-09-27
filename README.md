@@ -2419,6 +2419,19 @@ Q4_K_S holds 9.1 GB less for Qwen-Image and 5.5 GB less for FLUX at 1024²
 for a step 5–18% longer than q8's, and an LTX-2.5 Q4_K_M holds about 4 GB
 less and denoises as fast.
 
+SDXL fine-tunes load too: the diffusers folders nearly all of them ship,
+whichever names their files carry, and a checkpoint in one file in
+Stability's own layout, as Pony and Civitai's are. A repo whose only model
+is one file is named by the repo; one with several, `repo:file.safetensors`;
+a file on this machine, by its path. Its configs come from SDXL's base, and
+its VAE is the fp16-fix ([docs/checkpoint-plan.md](docs/checkpoint-plan.md)):
+
+```bash
+kvad pull LyliaEngine/Pony_Diffusion_V6_XL
+kvad images make "score_9, a red fox in fresh snow" --model LyliaEngine/Pony_Diffusion_V6_XL
+kvad images make "a lighthouse at dusk" --model ~/Downloads/some-sdxl-finetune.safetensors
+```
+
 Two things in it are measurements rather than code:
 
 - **The previews.** Each step can carry a picture of where it is heading,

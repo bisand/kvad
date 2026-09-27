@@ -254,6 +254,7 @@ fn at_path(repo: &str) -> Option<kvad::hub::LocalModel> {
         unreadable_as: None,
         reads: kvad::hub::Reads::of(config.as_ref()),
         gguf: None,
+        single: None,
     })
 }
 

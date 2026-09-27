@@ -254,8 +254,13 @@ pub fn pull(remote: &Remote, args: &Args) -> Res<()> {
     // video asks for by giving steps, guidance or a negative prompt.
     let job = remote.post("/api/models/pull", &json!({ "repo": repo, "dev": args.dev }))?;
     super::api::follow(remote, &job, args)?;
-    // What it makes decides how it is run, and the server's listing says.
+    // What it makes decides how it is run, and the server's listing says;
+    // a checkpoint file named by its path is in no listing, and makes
+    // pictures.
     let kind = || -> Option<String> {
+        if repo.to_ascii_lowercase().ends_with(".safetensors") {
+            return Some("image".into());
+        }
         let listing = remote.get("/api/models").ok()?;
         let m = on_disk(&listing).find(|m| m["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(&repo)))?;
         m["kind"].as_str().map(str::to_string)

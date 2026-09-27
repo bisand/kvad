@@ -422,10 +422,23 @@ pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>, dev: bool) -> Re
             // A GGUF, `repo:QUANT`: one file of its repo, and its base's
             // text encoder, VAE and configs.
             false if kvad::gguf::split(&repo).is_some() => crate::engine::pull_gguf(&repo, &mut progress, &watch),
-            false if repo.contains(':') => {
-                Err(format!("`{repo}`: what follows the colon is a GGUF's quantisation, such as Q4_K_S or Q8_0").into())
+            // An SDXL checkpoint in one file, named by the file or a path.
+            false if kvad::checkpoint::split(&repo).is_some() || kvad::checkpoint::is_path(&repo) => {
+                crate::engine::pull_single(&repo, &mut progress, &watch)
             }
-            false => kvad::weights::pull_watched(&repo, &mut progress, &watch).map(|_| ()),
+            false if repo.contains(':') => Err(format!(
+                "`{repo}`: what follows the colon is a GGUF's quantisation, such as Q4_K_S, or a checkpoint's file, such as model.safetensors"
+            )
+            .into()),
+            // A repo by its name alone: a language model, or one whose only
+            // model is a checkpoint file, which a language model's pull
+            // finds no config in. Asked of the Hub only then.
+            false => kvad::weights::pull_watched(&repo, &mut progress, &watch).map(|_| ()).or_else(|e| match kvad::checkpoint::candidates(&repo) {
+                // Checkpoint files and nothing else: the checkpoint's pull
+                // says which, or why none is one.
+                Ok(Some(files)) if !files.is_empty() => crate::engine::pull_single(&repo, &mut progress, &watch),
+                _ => Err(e),
+            }),
             true if !crate::engine::is_ltx(&repo) => Err(format!("--dev is for LTX-2.5's repo, and {repo} is not one").into()),
             true => kvad::video::LTX_DEV_FILES.iter().try_for_each(|f| {
                 progress(&format!("fetching {f}"));

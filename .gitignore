@@ -1,4 +1,8 @@
 /target
+# Cargo target directories for other platforms: `cargo zigbuild` is run with
+# one of its own (docs/releasing.md), and one run from the wrong directory
+# lands wherever that is.
+target-*/
 /data/*
 !/data/.gitkeep
 /out/

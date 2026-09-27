@@ -40,6 +40,7 @@
 pub use serde_json;
 
 pub mod chat;
+pub mod checkpoint;
 pub mod client;
 pub mod crawl;
 pub mod daemon;

@@ -9,13 +9,14 @@ use super::nn::{latent_preview, noise, to_rgb8, Ctx};
 use super::schedule;
 use super::unet::{Unet, UnetConfig};
 use super::vae::{Decoder, VaeConfig};
-use super::{finish, open, read_json};
-use crate::common::Loader;
+use super::{finish, finish_mapped, local_file, open, open_file, open_mapped, read_json, single};
+use crate::common::{Loader, Reader};
 use crate::qcache::Vault;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use kvad::serde_json::Value;
-use kvad::weights::{fetch_file, Watcher};
+use kvad::weights::{fetch_file, Cached, Watcher};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -45,6 +46,69 @@ const PREVIEW: [[f32; 3]; 4] =
     [[0.0550, 0.0538, 0.0513], [-0.0319, -0.0023, 0.0079], [0.0157, 0.0059, -0.0009], [-0.0416, -0.0268, -0.0241]];
 const PREVIEW_BIAS: [f32; 3] = [0.0897, -0.1454, -0.1718];
 
+/// A component's weights, `dir/stem`: the `.fp16` variant where the repo
+/// ships one, as Stability's does beside its f32 files, and the plain file
+/// otherwise, as nearly every fine-tune does, in f16 already. Either is read
+/// in f16, whatever it is stored in.
+///
+/// The cache is asked first, so a repo that is here asks the Hub nothing;
+/// then the Hub, `.fp16` first, so that a repo with both never downloads its
+/// f32 file.
+fn weights(repo: &str, dir: &str, stem: &str, watch: &Watcher) -> Res<PathBuf> {
+    let (fp16, plain) = (format!("{dir}/{stem}.fp16.safetensors"), format!("{dir}/{stem}.safetensors"));
+    for f in [&fp16, &plain] {
+        if let Cached::Here(p) = kvad::weights::cached(repo, f) {
+            return Ok(p);
+        }
+    }
+    fetch_file(repo, &fp16, watch).or_else(|_| fetch_file(repo, &plain, watch)).map_err(|e| format!("{repo} has neither {fp16} nor {plain}: {e}").into())
+}
+
+/// [`weights`], asked of this machine only.
+fn local_weights(repo: &str, dir: &str, stem: &str) -> Option<PathBuf> {
+    local_file(repo, &format!("{dir}/{stem}.fp16.safetensors")).or_else(|| local_file(repo, &format!("{dir}/{stem}.safetensors")))
+}
+
+/// What the pipeline will hold, from the files on this machine: both text
+/// encoders and the UNet in f16, from their headers, whatever they are
+/// stored in, and the VAE, which is f32 on disk, in f16 too. Not
+/// downloaded yet is not a reason to refuse for the VAE; it is small.
+pub(crate) fn weight_bytes(repo: &str, size: &dyn Fn(&str, &str) -> Option<u64>) -> Option<u64> {
+    let f16 = |dir: &str, stem: &str| -> Option<u64> {
+        let path = local_weights(repo, dir, stem)?;
+        // SAFETY: a read-only cache file, its header only.
+        let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(&path).ok()? };
+        Some(st.tensors().iter().map(|(_, v)| v.shape().iter().product::<usize>() as u64 * 2).sum())
+    };
+    let own = f16("text_encoder", "model")? + f16("text_encoder_2", "model")? + f16("unet", "diffusion_pytorch_model")?;
+    let vae = size(VAE_REPO, "diffusion_pytorch_model.safetensors").unwrap_or(335_000_000) / 2;
+    Some(own + vae)
+}
+
+/// What a checkpoint in one file reads besides the file: the tokenizer, the
+/// base's configs and scheduler, and the VAE. What its pull fetches.
+pub(crate) fn fetch_base(progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
+    progress(&format!("fetching {REPO}'s configs and {VAE_REPO}'s VAE"));
+    fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?;
+    for f in ["model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json", "text_encoder_2/config.json", "unet/config.json"] {
+        fetch_file(REPO, f, watch)?;
+    }
+    for f in ["config.json", "diffusion_pytorch_model.safetensors"] {
+        fetch_file(VAE_REPO, f, watch)?;
+    }
+    Ok(())
+}
+
+/// [`weight_bytes`] for a checkpoint in one file: everything in it but its
+/// VAE, in f16, and the fp16-fix VAE.
+pub(crate) fn single_weight_bytes(file: &Path, size: &dyn Fn(&str, &str) -> Option<u64>) -> Option<u64> {
+    // SAFETY: a read-only file, its header only.
+    let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(file).ok()? };
+    let own: u64 = st.tensors().iter().filter(|(n, _)| !n.starts_with("first_stage_model.")).map(|(_, v)| v.shape().iter().product::<usize>() as u64 * 2).sum();
+    let vae = size(VAE_REPO, "diffusion_pytorch_model.safetensors").unwrap_or(335_000_000) / 2;
+    Some(own + vae)
+}
+
 pub struct Sdxl {
     tok: tokenizers::Tokenizer,
     clip_l: Clip,
@@ -59,6 +123,14 @@ pub struct Sdxl {
 
 impl Sdxl {
     pub fn load(repo: &str, device: Device, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Self> {
+        Self::load_with(repo, None, device, progress, watch)
+    }
+
+    /// [`Sdxl::load`], with the UNet and both text encoders read from
+    /// `single`, one file in Stability's layout ([`single`]). `repo` then
+    /// gives only the tokenizer's settings, the components' configs and the
+    /// scheduler, which a single file does not carry.
+    pub fn load_with(repo: &str, single: Option<&Path>, device: Device, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Self> {
         let dtype = DType::F16;
         let get = |r: &str, f: &str| fetch_file(r, f, watch);
         let vault = Vault::off();
@@ -71,25 +143,37 @@ impl Sdxl {
         schedule::euler(&scheduler, 30)?;
 
         let mut params = 0;
-        let part = |dir_repo: &str, config: &str, weights: &str| -> Res<(Value, Vec<std::path::PathBuf>)> {
-            Ok((read_json(&get(dir_repo, config)?)?, vec![get(dir_repo, weights)?]))
+        let config = |dir: &str| -> Res<Value> { read_json(&get(repo, &format!("{dir}/config.json"))?) };
+        // One file for all three, read through a map each, and their unread
+        // weights counted together at the end; or each component's own file.
+        let file = single.map(open_file).transpose()?;
+        let maps = file.as_ref().map(|f| single::sdxl(f.names())).transpose()?;
+        let reader = |dir: &str, stem: &str, map: Option<&single::Map>| -> Res<(Reader<'static>, Vec<PathBuf>)> {
+            match (&file, map) {
+                (Some(f), Some(m)) => Ok((open_mapped(f, m.clone(), dtype), Vec::new())),
+                _ => {
+                    let paths = vec![weights(repo, dir, stem, watch)?];
+                    Ok((open(&paths, dtype)?, paths))
+                }
+            }
         };
 
         progress("loading the text encoders");
-        let (c, paths) = part(repo, "text_encoder/config.json", "text_encoder/model.fp16.safetensors")?;
-        let r = open(&paths, dtype)?;
-        let clip_l = Clip::load(&cx, &r, ClipConfig::from_json(&c)?, Pooled::No)?;
-        params += finish("text encoder", &paths, &r)?;
+        let (r_l, paths) = reader("text_encoder", "model", maps.as_ref().map(|m| &m.clip_l))?;
+        let clip_l = Clip::load(&cx, &r_l, ClipConfig::from_json(&config("text_encoder")?)?, Pooled::No)?;
+        if file.is_none() {
+            params += finish("text encoder", &paths, &r_l)?;
+        }
 
-        let (c, paths) = part(repo, "text_encoder_2/config.json", "text_encoder_2/model.fp16.safetensors")?;
-        let r = open(&paths, dtype)?;
-        let clip_g = Clip::load(&cx, &r, ClipConfig::from_json(&c)?, Pooled::Projected)?;
-        params += finish("second text encoder", &paths, &r)?;
+        let (r_g, paths) = reader("text_encoder_2", "model", maps.as_ref().map(|m| &m.clip_g))?;
+        let clip_g = Clip::load(&cx, &r_g, ClipConfig::from_json(&config("text_encoder_2")?)?, Pooled::Projected)?;
+        if file.is_none() {
+            params += finish("second text encoder", &paths, &r_g)?;
+        }
 
         progress("loading the UNet");
-        let (c, paths) = part(repo, "unet/config.json", "unet/diffusion_pytorch_model.fp16.safetensors")?;
-        let r = open(&paths, dtype)?;
-        let ucfg = UnetConfig::from_json(&c)?;
+        let (r, paths) = reader("unet", "diffusion_pytorch_model", maps.as_ref().map(|m| &m.unet))?;
+        let ucfg = UnetConfig::from_json(&config("unet")?)?;
         if ucfg.context != clip_l.width() + clip_g.width() {
             return Err(format!(
                 "the UNet attends to {}-wide text and the two encoders give {} + {}",
@@ -100,10 +184,18 @@ impl Sdxl {
             .into());
         }
         let unet = Unet::load(&cx, &r, ucfg)?;
-        params += finish("UNet", &paths, &r)?;
+        match (&file, &maps) {
+            (Some(f), Some(m)) => {
+                let parts = [(&m.clip_l, &r_l), (&m.clip_g, &r_g), (&m.unet, &r)];
+                let what = single.map(|p| p.display().to_string()).unwrap_or_default();
+                params += finish_mapped(&what, f, &parts, &m.unread)?;
+                progress(&format!("{} of the file's tensors left unread, its VAE's among them: the VAE is madebyollin's fp16-fix", m.unread.len()));
+            }
+            _ => params += finish("UNet", &paths, &r)?,
+        }
 
         progress("loading the VAE");
-        let (c, paths) = part(VAE_REPO, "config.json", "diffusion_pytorch_model.safetensors")?;
+        let (c, paths) = (read_json(&get(VAE_REPO, "config.json")?)?, vec![get(VAE_REPO, "diffusion_pytorch_model.safetensors")?]);
         let r = open(&paths, dtype)?;
         let vae = Decoder::load(&cx, &r, VaeConfig::from_json(&c)?)?;
         params += finish("VAE", &paths, &r)?;

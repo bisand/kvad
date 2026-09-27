@@ -676,6 +676,9 @@ pub struct LocalModel {
     /// The GGUF this model is, when it is one: `repo:QUANT`, one file of a
     /// repo of several ([`crate::gguf`]).
     pub gguf: Option<crate::gguf::Local>,
+    /// The SDXL checkpoint file this model is, when it is one: `repo` or
+    /// `repo:file.safetensors` ([`crate::checkpoint`]).
+    pub single: Option<PathBuf>,
 }
 
 impl LocalModel {
@@ -761,27 +764,34 @@ pub fn local_models() -> Vec<LocalModel> {
             // again inside `local_params`, and there are now three questions
             // to ask it.
             let config = find_config(&path).and_then(|c| crate::weights::read_json(&c).ok());
-            // A repo of GGUFs is a model per file. The repo itself is one
-            // only if it is something else as well.
-            let ggufs = crate::gguf::locals(&path, &id);
-            let mut models: Vec<LocalModel> = ggufs
+            // A repo of GGUFs is a model per file, and so is a repo of SDXL
+            // checkpoints; one whose only model is one checkpoint is that
+            // model by its own name. The repo itself is one only if it is
+            // something else as well. A language model's repo is never read
+            // for checkpoints: its files are its shards.
+            let file_model = |id: String, file: &Path| LocalModel {
+                id,
+                path: path.clone(),
+                bytes: std::fs::metadata(file).map(|m| m.len()).unwrap_or(0),
+                arch: None,
+                model_type: None,
+                // `hf-hub` downloads to a temporary file and links it into
+                // the snapshot once it is whole.
+                complete: true,
+                params: None,
+                unreadable_as: None,
+                reads: Reads::Everything,
+                gguf: None,
+                single: None,
+            };
+            let mut models: Vec<LocalModel> = crate::gguf::locals(&path, &id)
                 .into_iter()
-                .map(|g| LocalModel {
-                    id: g.name(),
-                    path: path.clone(),
-                    bytes: std::fs::metadata(&g.file).map(|m| m.len()).unwrap_or(0),
-                    arch: None,
-                    model_type: None,
-                    // `hf-hub` downloads to a temporary file and links it
-                    // into the snapshot once it is whole.
-                    complete: true,
-                    params: None,
-                    unreadable_as: None,
-                    reads: Reads::Everything,
-                    gguf: Some(g),
-                })
+                .map(|g| LocalModel { gguf: Some(g.clone()), ..file_model(g.name(), &g.file) })
                 .collect();
-            if !models.is_empty() && config.is_none() && !image_weights {
+            if config.is_none() {
+                models.extend(crate::checkpoint::locals(&path, &id).into_iter().map(|c| LocalModel { single: Some(c.file.clone()), ..file_model(c.name, &c.file) }));
+            }
+            if models.iter().any(|m| m.id == id) || (!models.is_empty() && config.is_none() && !image_weights) {
                 return Some(models);
             }
             let model_type = config
@@ -802,6 +812,7 @@ pub fn local_models() -> Vec<LocalModel> {
                 // `info` call, not a usable model.
                 complete: files.iter().any(|f| f.ends_with(".safetensors")) || image_weights,
                 gguf: None,
+                single: None,
             });
             Some(models)
         })
@@ -809,6 +820,29 @@ pub fn local_models() -> Vec<LocalModel> {
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+/// An SDXL checkpoint named by its path on this machine, as a model: what
+/// a request may load by name. Not in [`find_local`], whose models `kvad
+/// rm` deletes: a file outside the cache is not Kvad's to delete.
+pub fn checkpoint_at(path: &str) -> Option<LocalModel> {
+    if !crate::checkpoint::is_path(path) {
+        return None;
+    }
+    let c = crate::checkpoint::local(path)?;
+    Some(LocalModel {
+        id: path.to_string(),
+        bytes: std::fs::metadata(&c.file).map(|m| m.len()).unwrap_or(0),
+        path: c.file.clone(),
+        arch: None,
+        model_type: None,
+        complete: true,
+        params: None,
+        unreadable_as: None,
+        reads: Reads::Everything,
+        gguf: None,
+        single: Some(c.file),
+    })
 }
 
 pub fn find_local(id: &str) -> Option<LocalModel> {
@@ -857,6 +891,7 @@ pub fn trained_models() -> Vec<LocalModel> {
                     && path.join("config.json").is_file(),
                 path,
                 gguf: None,
+                single: None,
             }
         })
         .collect();
@@ -906,6 +941,7 @@ pub fn pipeline(model: &LocalModel) -> Option<String> {
         // there not to need, so its base is known by name.
         Some(g) if g.base.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(crate::video::LTX_REPO)) => Some(crate::video::LTX_PIPELINE.to_string()),
         Some(g) => pipeline_in(&repo_dir(g.base.as_deref()?)),
+        None if model.single.is_some() => Some("StableDiffusionXLPipeline".to_string()),
         None => pipeline_in(&model.path),
     }
 }
@@ -918,12 +954,36 @@ pub fn repo_dir(repo: &str) -> PathBuf {
     }
 }
 
-/// Delete a downloaded model: its cache entry, or for a GGUF its one file.
+/// Delete a downloaded model: its cache entry, or for a GGUF or a
+/// checkpoint file its one file.
 pub fn remove(model: &LocalModel) -> std::io::Result<()> {
-    match &model.gguf {
-        Some(g) => crate::gguf::remove(g),
-        None => std::fs::remove_dir_all(&model.path),
+    match (&model.gguf, &model.single) {
+        (Some(g), _) => remove_cached(&g.file, &g.repo),
+        (None, Some(file)) => remove_cached(file, model.id.split(':').next().unwrap_or(&model.id)),
+        (None, None) => std::fs::remove_dir_all(&model.path),
     }
+}
+
+/// Delete one file of `repo` from the cache: its link in the snapshot and
+/// the blob it points at, and the whole cache entry once no model is left
+/// in it: no GGUF, no checkpoint, and no config of a model of its own.
+pub fn remove_cached(file: &Path, repo: &str) -> std::io::Result<()> {
+    let blob = std::fs::canonicalize(file)?;
+    std::fs::remove_file(file)?;
+    if blob != file {
+        std::fs::remove_file(&blob)?;
+    }
+    // The cache entry is the file's ancestor named for the repo.
+    let entry = format!("models--{}", repo.replace('/', "--"));
+    let Some(dir) = file.ancestors().find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == entry)) else { return Ok(()) };
+    let empty = crate::gguf::locals(dir, repo).is_empty()
+        && crate::checkpoint::locals(dir, repo).is_empty()
+        && model_file(dir, "config.json").is_none()
+        && model_file(dir, "model_index.json").is_none();
+    if empty {
+        std::fs::remove_dir_all(dir)?;
+    }
+    Ok(())
 }
 
 fn pipeline_in(dir: &Path) -> Option<String> {

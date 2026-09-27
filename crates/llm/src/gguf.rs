@@ -213,18 +213,7 @@ pub fn fetch(found: &Found, progress: &mut dyn FnMut(&str), watch: &Watcher) -> 
 /// Delete one GGUF: its link in the snapshot and the blob it points at,
 /// and the whole cache entry once no GGUF or anything else is left in it.
 pub fn remove(l: &Local) -> std::io::Result<()> {
-    let blob = std::fs::canonicalize(&l.file)?;
-    std::fs::remove_file(&l.file)?;
-    if blob != l.file {
-        std::fs::remove_file(&blob)?;
-    }
-    // The cache entry is the file's ancestor named for the repo.
-    let entry = format!("models--{}", l.repo.replace('/', "--"));
-    let Some(dir) = l.file.ancestors().find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == entry)) else { return Ok(()) };
-    if locals(dir, &l.repo).is_empty() && crate::hub::model_file(dir, "config.json").is_none() && crate::hub::model_file(dir, "model_index.json").is_none() {
-        std::fs::remove_dir_all(dir)?;
-    }
-    Ok(())
+    crate::hub::remove_cached(&l.file, &l.repo)
 }
 
 #[cfg(test)]

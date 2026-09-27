@@ -404,7 +404,7 @@ pub struct QCache {
 /// run it on a blocking thread; the point is that it is on the way to a load,
 /// where seconds are the unit.
 pub fn default_backend(repo: Option<&str>) -> String {
-    let pipeline = repo.and_then(|r| hub::find_local(r)).and_then(|m| hub::pipeline(&m));
+    let pipeline = repo.and_then(|r| hub::find_local(r).or_else(|| hub::checkpoint_at(r))).and_then(|m| hub::pipeline(&m));
     if let Some(p) = pipeline {
         return crate::engine::id_of(crate::engine::preferred_pipeline(&p));
     }
@@ -930,6 +930,7 @@ mod tests {
             unreadable_as: None,
             reads: hub::Reads::Everything,
             gguf: None,
+            single: None,
         }
     }
 

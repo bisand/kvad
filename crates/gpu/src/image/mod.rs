@@ -27,6 +27,7 @@ pub mod nn;
 pub mod qwen;
 pub mod schedule;
 pub mod sdxl;
+pub(crate) mod single;
 pub mod t5;
 pub mod unet;
 pub mod vae;
@@ -60,6 +61,10 @@ pub const GGUF_PIPELINES: [&str; 2] = ["QwenImagePipeline", "FluxPipeline"];
 /// Asked without downloading anything, because the server asks it about every
 /// model on disk each time it lists them.
 pub fn pipeline_of(repo: &str) -> Option<&'static str> {
+    // An SDXL checkpoint in one file.
+    if kvad::checkpoint::local(repo).is_some() {
+        return Some("StableDiffusionXLPipeline");
+    }
     // A GGUF of a denoiser is its base's pipeline.
     if kvad::gguf::split(repo).is_some() {
         return pipeline_of(&kvad::gguf::local(repo)?.base?);
@@ -84,6 +89,10 @@ pub fn is_pipeline(repo: &str, watch: &Watcher) -> bool {
     if pipeline_of(repo).is_some() {
         return true;
     }
+    // A checkpoint in one file, not here: its header on the Hub says.
+    if kvad::checkpoint::split(repo).is_some() {
+        return kvad::checkpoint::find(repo).is_ok();
+    }
     // A GGUF not here, or whose base is not: its card names the base, and
     // the base says.
     if let Some((gguf_repo, _)) = kvad::gguf::split(repo) {
@@ -99,15 +108,24 @@ pub fn is_pipeline(repo: &str, watch: &Watcher) -> bool {
     match kvad::weights::cached(repo, "model_index.json") {
         // Here, and `pipeline_of` did not recognise it: a pipeline, but not
         // one implemented here — which is the same answer as a language model.
-        Cached::Here(_) | Cached::Absent => return false,
+        Cached::Here(_) => return false,
+        // No index, and no config here either: a repo whose only model is
+        // one checkpoint, not yet pulled, or nothing. A language model has
+        // its config, and never pays for the question.
+        Cached::Absent if matches!(kvad::weights::cached(repo, "config.json"), Cached::Here(_)) => return false,
+        Cached::Absent => return kvad::checkpoint::find(repo).is_ok(),
         Cached::Unknown if kvad::weights::in_cache(repo).is_some() => return false,
         Cached::Unknown => {}
     }
-    fetch_file(repo, "model_index.json", watch)
-        .ok()
-        .and_then(|p| read_json(&p).ok())
-        .and_then(|v| v.get("_class_name")?.as_str().map(str::to_string))
-        .is_some_and(|class| PIPELINES.contains(&class.as_str()))
+    match fetch_file(repo, "model_index.json", watch) {
+        Ok(p) => read_json(&p)
+            .ok()
+            .and_then(|v| v.get("_class_name")?.as_str().map(str::to_string))
+            .is_some_and(|class| PIPELINES.contains(&class.as_str())),
+        // No model index: a repo whose only model is one checkpoint, or
+        // not a pipeline at all. One request to the Hub for its files says.
+        Err(_) => kvad::checkpoint::find(repo).is_ok(),
+    }
 }
 
 /// What loading `repo` at `quant` will take, from the files on this machine,
@@ -119,6 +137,9 @@ pub fn is_pipeline(repo: &str, watch: &Watcher) -> bool {
 /// of bf16 is about half that at q8. `None` when the files are not here.
 pub fn weight_bytes(repo: &str, quant: Option<candle_core::quantized::GgmlDType>) -> Option<u64> {
     let size = |r: &str, f: &str| local_file(r, f).and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+    if let Some(c) = kvad::checkpoint::local(repo) {
+        return sdxl::single_weight_bytes(&c.file, &size);
+    }
     if kvad::gguf::split(repo).is_some() {
         let g = kvad::gguf::local(repo)?;
         let base = g.base?;
@@ -129,16 +150,7 @@ pub fn weight_bytes(repo: &str, quant: Option<candle_core::quantized::GgmlDType>
         };
     }
     match pipeline_of(repo)? {
-        "StableDiffusionXLPipeline" => {
-            let own = ["text_encoder/model.fp16.safetensors", "text_encoder_2/model.fp16.safetensors", "unet/diffusion_pytorch_model.fp16.safetensors"]
-                .iter()
-                .map(|f| size(repo, f))
-                .sum::<Option<u64>>()?;
-            // The VAE is f32 on disk and held in f16. Not downloaded yet is
-            // not a reason to refuse; it is small.
-            let vae = size(sdxl::VAE_REPO, "diffusion_pytorch_model.safetensors").unwrap_or(335_000_000) / 2;
-            Some(own + vae)
-        }
+        "StableDiffusionXLPipeline" => sdxl::weight_bytes(repo, &size),
         "QwenImagePipeline" => qwen::weight_bytes(repo, quant, &size, None),
         "FluxPipeline" => flux::weight_bytes(repo, quant, &size, None),
         _ => None,
@@ -189,7 +201,24 @@ pub fn load_with(
         progress(&format!("the rest is {}'s", found.base));
         return load_with(&found.base, Some(&g.file), quant, progress, watch);
     }
-    let index = fetch_file(repo, "model_index.json", watch)?;
+    // An SDXL checkpoint in one file: `repo`, `repo:file.safetensors`, or a
+    // path. The base gives its configs, and the fp16-fix its VAE.
+    let single = match kvad::checkpoint::local(repo) {
+        Some(c) => Some(c.file),
+        None if kvad::checkpoint::split(repo).is_some() || kvad::checkpoint::is_path(repo) => {
+            Some(kvad::checkpoint::fetch(&kvad::checkpoint::find(repo)?, progress, watch)?)
+        }
+        None => None,
+    };
+    let index = match (single, fetch_file(repo, "model_index.json", watch)) {
+        (None, Ok(index)) => index,
+        (Some(file), _) => return load_single(&file, progress, watch),
+        // No model index: one checkpoint, if the repo's files say so.
+        (None, Err(e)) => match kvad::checkpoint::find(repo) {
+            Ok(found) => return load_single(&kvad::checkpoint::fetch(&found, progress, watch)?, progress, watch),
+            Err(_) => return Err(e),
+        },
+    };
     let v = read_json(&index)?;
     let class = v.get("_class_name").and_then(Value::as_str).unwrap_or("?");
     let device = crate::model::pick_device(None)?;
@@ -218,6 +247,28 @@ pub fn load_with(
         )
         .into()),
     }
+}
+
+/// An SDXL checkpoint in one file, on this machine.
+fn load_single(file: &Path, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Box<dyn Painter>> {
+    let device = crate::model::pick_device(None)?;
+    Ok(Box::new(sdxl::Sdxl::load_with(sdxl::REPO, Some(file), device, progress, watch)?))
+}
+
+/// Fetch an SDXL checkpoint in one file, and what it reads beside it, without
+/// loading it: a pull. Its header is read on the Hub first, so a file that is
+/// not one costs two small requests.
+pub fn pull_single(name: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
+    // Here already, or a file on this machine: only what goes beside it.
+    if kvad::checkpoint::local(name).is_some() {
+        return sdxl::fetch_base(progress, watch);
+    }
+    if kvad::checkpoint::is_path(name) {
+        return Err(format!("{name} is not an SDXL checkpoint in Stability's layout on this machine").into());
+    }
+    let found = kvad::checkpoint::find(name)?;
+    kvad::checkpoint::fetch(&found, progress, watch)?;
+    sdxl::fetch_base(progress, watch)
 }
 
 /// Fetch a GGUF, `repo:QUANT`, and everything else its model reads from
@@ -292,6 +343,76 @@ pub(crate) fn open(paths: &[PathBuf], dtype: DType) -> Res<Reader<'static>> {
     Ok(Reader::new(vb))
 }
 
+/// One file in another layout, read under the names a loader asks for: each
+/// name a tensor of the file, some of its rows, or its transpose
+/// ([`single`]). The file is opened once and shared by every reader of it.
+pub(crate) fn open_file(path: &Path) -> Res<std::sync::Arc<Uncached>> {
+    Ok(std::sync::Arc::new(Uncached::open(&[path.to_path_buf()])?))
+}
+
+/// A [`Reader`] over `file`, under `map`'s names, in `dtype`.
+pub(crate) fn open_mapped(file: &std::sync::Arc<Uncached>, map: single::Map, dtype: DType) -> Reader<'static> {
+    let vb = VarBuilder::from_backend(Box::new(Mapped { file: std::sync::Arc::clone(file), map }), dtype, Device::Cpu);
+    Reader::new(vb)
+}
+
+/// [`finish`], for a file read through maps: every tensor in it read
+/// through one of `parts`, or listed in `unread` as deliberately not. The
+/// parameters of what was read.
+pub(crate) fn finish_mapped(what: &str, file: &Uncached, parts: &[(&single::Map, &Reader<'_>)], unread: &[String]) -> Res<usize> {
+    // What each loader read, and what it knows of and leaves under a
+    // prefix it skips: CLIP-L's last layer, which SDXL does not read.
+    // Only what was read is counted, as `finish` counts it.
+    let (mut read, mut known) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    for (map, r) in parts {
+        let (seen, skipped) = (r.seen(), r.skipped());
+        for (name, src) in map.iter() {
+            if seen.contains(name) {
+                read.insert(src.name.clone());
+                known.insert(src.name.clone());
+            } else if skipped.iter().any(|p| name.starts_with(p.as_str())) {
+                known.insert(src.name.clone());
+            }
+        }
+    }
+    let mut left: Vec<String> = file.tensors.keys().filter(|n| !known.contains(*n) && !unread.contains(n)).cloned().collect();
+    left.sort();
+    refuse_unread(what, left)?;
+    Ok(read.iter().filter_map(|n| file.tensors.get(n)).map(|t| t.shape.iter().product::<usize>()).sum())
+}
+
+struct Mapped {
+    file: std::sync::Arc<Uncached>,
+    map: single::Map,
+}
+
+impl SimpleBackend for Mapped {
+    fn get(&self, s: Shape, name: &str, _: candle_nn::Init, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+        let t = self.get_unchecked(name, dtype, dev)?;
+        if t.shape() != &s {
+            let msg = format!("shape mismatch for {name}");
+            return Err(candle_core::Error::UnexpectedShape { msg, expected: s, got: t.shape().clone() }.bt());
+        }
+        Ok(t)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+        let src = self.map.get(name).ok_or_else(|| candle_core::Error::CannotFindTensor { path: name.to_string() }.bt())?;
+        let mut t = self.file.load(&src.name)?;
+        if let Some(rows) = &src.rows {
+            t = t.narrow(0, rows.start, rows.len())?;
+        }
+        if src.transpose {
+            t = t.t()?;
+        }
+        t.contiguous()?.to_dtype(dtype)?.to_device(dev)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.map.contains_key(name)
+    }
+}
+
 /// Safetensors files read a tensor at a time, past the page cache.
 ///
 /// [`crate::uncached`] says why: read through candle's memory map, FLUX at
@@ -301,7 +422,7 @@ pub(crate) fn open(paths: &[PathBuf], dtype: DType) -> Res<Reader<'static>> {
 /// those take 0.33 and 1.96 s; the price is a tensor's buffers on the host,
 /// 0.3 GB at the peak. The headers are parsed here rather than by
 /// `safetensors`, which wants the whole file in memory to read one.
-struct Uncached {
+pub(crate) struct Uncached {
     files: Vec<File>,
     tensors: HashMap<String, Stored>,
 }
@@ -355,6 +476,10 @@ impl Uncached {
             files.push(file);
         }
         Ok(Uncached { files, tensors })
+    }
+
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
     }
 
     fn load(&self, name: &str) -> candle_core::Result<Tensor> {

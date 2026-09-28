@@ -68,6 +68,11 @@ pub struct Model {
     /// The diffusers pipeline an image or video model is, by its
     /// `model_index.json` or, for LTX, its files.
     pub pipeline: Option<String>,
+    /// A LoRA, which a request applies to a model it fits; never loaded on
+    /// its own, so never runnable.
+    pub lora: bool,
+    /// The pipeline a LoRA was made for, as far as its layers' names say.
+    pub adapts: Option<String>,
     /// What the config says this is, for a row somebody opened. `None`
     /// when there is no config, or when it describes an architecture this
     /// build has no reader for.
@@ -294,6 +299,7 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
                     .then(|| "not every file this pipeline reads is downloaded yet".to_string()),
             }
         }
+        _ if m.lora.is_some() => Some("a LoRA: a request applies it to a model it fits, and it is not loaded on its own".into()),
         // A GGUF whose base cannot be read here: say which part is missing.
         _ if m.gguf.is_some() => Some(match m.gguf.as_ref().and_then(|g| g.base.as_deref()) {
             None => "its model card is not here, or names no base model, so there is no telling what it goes with".into(),
@@ -334,6 +340,8 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
         mixture: m.reads.mixture(),
         kind: crate::scheduler::Kind::of_pipeline(pipeline.as_deref()),
         pipeline,
+        lora: m.lora.is_some(),
+        adapts: m.lora.as_ref().and_then(|l| l.adapts).map(str::to_string),
         detail: detail_of(m),
     }
 }
@@ -931,6 +939,7 @@ mod tests {
             reads: hub::Reads::Everything,
             gguf: None,
             single: None,
+            lora: None,
         }
     }
 

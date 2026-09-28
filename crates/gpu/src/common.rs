@@ -682,6 +682,9 @@ pub(crate) struct Reader<'a> {
     /// The checkpoint, when it is a GGUF: where a matrix already in blocks
     /// is read from as blocks ([`Reader::blocks`]).
     gguf: Option<Arc<crate::gguf::Gguf>>,
+    /// Where the linear layers read through it register for LoRAs applied at
+    /// run time ([`crate::image::lora`]).
+    adapters: Option<crate::image::lora::Part>,
 }
 
 /// A LoRA, fused into each weight it adapts as the weight is read:
@@ -763,6 +766,7 @@ impl<'a> Reader<'a> {
             skipped: Rc::new(RefCell::new(Vec::new())),
             lora: None,
             gguf: None,
+            adapters: None,
         }
     }
 
@@ -793,6 +797,16 @@ impl<'a> Reader<'a> {
         Reader { lora: Some(lora), ..self }
     }
 
+    /// The same reader, its linear layers and convolutions registered as
+    /// `part` of a model's adapters, for LoRAs applied at run time.
+    pub(crate) fn with_adapters(self, part: crate::image::lora::Part) -> Self {
+        Reader { adapters: Some(part), ..self }
+    }
+
+    pub(crate) fn adapters(&self) -> Option<&crate::image::lora::Part> {
+        self.adapters.as_ref()
+    }
+
     /// Descend into a prefix, keeping the shared record.
     pub(crate) fn pp(&self, s: impl std::fmt::Display) -> Self {
         Reader {
@@ -801,6 +815,7 @@ impl<'a> Reader<'a> {
             skipped: Rc::clone(&self.skipped),
             lora: self.lora.clone(),
             gguf: self.gguf.clone(),
+            adapters: self.adapters.clone(),
         }
     }
 
@@ -883,6 +898,12 @@ impl<'a> Reader<'a> {
     /// same here as the names around it do.
     pub(crate) fn skip_under(&self, prefix: &str) {
         self.skipped.borrow_mut().push(self.full(prefix));
+        // A LoRA may adapt what is skipped: SDXL's reads CLIP-L's last
+        // layer, which SDXL never computes. Its pairs there are known, and
+        // change nothing, as in the reference.
+        if let Some(part) = &self.adapters {
+            part.inert(&self.full(prefix));
+        }
     }
 
     pub(crate) fn seen(&self) -> HashSet<String> {

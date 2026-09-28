@@ -679,6 +679,9 @@ pub struct LocalModel {
     /// The checkpoint file this model is, SDXL's or SD 1.5's, when it is
     /// one: `repo` or `repo:file.safetensors` ([`crate::checkpoint`]).
     pub single: Option<crate::checkpoint::Local>,
+    /// The LoRA this is, when it is one ([`crate::lora`]): never loaded on
+    /// its own, but applied by a request to a model it fits.
+    pub lora: Option<crate::lora::Local>,
 }
 
 impl LocalModel {
@@ -783,6 +786,7 @@ pub fn local_models() -> Vec<LocalModel> {
                 reads: Reads::Everything,
                 gguf: None,
                 single: None,
+                lora: None,
             };
             let mut models: Vec<LocalModel> = crate::gguf::locals(&path, &id)
                 .into_iter()
@@ -790,6 +794,7 @@ pub fn local_models() -> Vec<LocalModel> {
                 .collect();
             if config.is_none() {
                 models.extend(crate::checkpoint::locals(&path, &id).into_iter().map(|c| LocalModel { single: Some(c.clone()), ..file_model(c.name, &c.file) }));
+                models.extend(crate::lora::locals(&path, &id).into_iter().map(|l| LocalModel { lora: Some(l.clone()), ..file_model(l.name, &l.file) }));
             }
             if models.iter().any(|m| m.id == id) || (!models.is_empty() && config.is_none() && !image_weights) {
                 return Some(models);
@@ -813,6 +818,7 @@ pub fn local_models() -> Vec<LocalModel> {
                 complete: files.iter().any(|f| f.ends_with(".safetensors")) || image_weights,
                 gguf: None,
                 single: None,
+                lora: None,
             });
             Some(models)
         })
@@ -842,6 +848,7 @@ pub fn checkpoint_at(path: &str) -> Option<LocalModel> {
         reads: Reads::Everything,
         gguf: None,
         single: Some(c),
+        lora: None,
     })
 }
 
@@ -892,6 +899,7 @@ pub fn trained_models() -> Vec<LocalModel> {
                 path,
                 gguf: None,
                 single: None,
+                lora: None,
             }
         })
         .collect();
@@ -959,10 +967,12 @@ pub fn repo_dir(repo: &str) -> PathBuf {
 /// Delete a downloaded model: its cache entry, or for a GGUF or a
 /// checkpoint file its one file.
 pub fn remove(model: &LocalModel) -> std::io::Result<()> {
-    match (&model.gguf, &model.single) {
-        (Some(g), _) => remove_cached(&g.file, &g.repo),
-        (None, Some(c)) => remove_cached(&c.file, model.id.split(':').next().unwrap_or(&model.id)),
-        (None, None) => std::fs::remove_dir_all(&model.path),
+    let repo = model.id.split(':').next().unwrap_or(&model.id);
+    match (&model.gguf, &model.single, &model.lora) {
+        (Some(g), _, _) => remove_cached(&g.file, &g.repo),
+        (None, Some(c), _) => remove_cached(&c.file, repo),
+        (None, None, Some(l)) => remove_cached(&l.file, repo),
+        (None, None, None) => std::fs::remove_dir_all(&model.path),
     }
 }
 
@@ -980,6 +990,7 @@ pub fn remove_cached(file: &Path, repo: &str) -> std::io::Result<()> {
     let Some(dir) = file.ancestors().find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == entry)) else { return Ok(()) };
     let empty = crate::gguf::locals(dir, repo).is_empty()
         && crate::checkpoint::locals(dir, repo).is_empty()
+        && crate::lora::locals(dir, repo).is_empty()
         && model_file(dir, "config.json").is_none()
         && model_file(dir, "model_index.json").is_none();
     if empty {

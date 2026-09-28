@@ -5,6 +5,7 @@
   import { models } from "../lib/models.svelte.js";
   import { navigate } from "../lib/router.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
+  import Loras from "../lib/components/Loras.svelte";
 
   const WARN = "M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z";
   const TRASH = "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6";
@@ -218,6 +219,7 @@
           </select>
         {/if}
       </div>
+      <Loras form={v} takes={d ? d.takes_loras : null} busy={v.starting} />
       {#if d?.guided}
         <details class="collapse-arrow bg-base-200 rounded-box collapse" open={v.guided}>
           <summary class="collapse-title text-sm">Guidance — the dev model, slower and closer to the prompt</summary>

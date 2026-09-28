@@ -171,13 +171,15 @@ pub struct Stored {
     /// The pipeline that made it, `fast` or `dfr`, where the model has a
     /// choice and the request was not guided.
     pub pipeline: Option<String>,
+    /// The LoRAs that made it, each at its strength; none for most.
+    pub loras: Vec<kvad::image::Lora>,
 }
 
 const COLUMNS: &str = "id, model, backend, prompt, width, height, frames, fps, seed, audio, status, progress, \
                        phase, error, bytes, encode_secs, denoise_secs, decode_secs, created_at, \
                        CAST(strftime('%s', created_at) AS INTEGER), \
                        CAST(strftime('%s', started_at) AS INTEGER), CAST(strftime('%s', completed_at) AS INTEGER), \
-                       picture, chosen, steps, guidance, negative_prompt, decoder, pipeline";
+                       picture, chosen, steps, guidance, negative_prompt, decoder, pipeline, loras";
 
 fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
     Ok(Stored {
@@ -210,6 +212,8 @@ fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
         negative_prompt: r.get(26)?,
         decoder: r.get(27)?,
         pipeline: r.get(28)?,
+        // Written by `queue` only, so JSON it can read.
+        loras: r.get::<_, Option<String>>(29)?.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
     })
 }
 
@@ -273,6 +277,7 @@ impl Stored {
                 // Which pipeline made it: `fast`, or `dfr`, which also makes
                 // more than 30 fps; null for a guided video, or a model with one.
                 "pipeline": self.pipeline,
+                "loras": self.loras,
                 "fps": self.fps,
                 "seed": self.seed,
                 "audio": self.audio,
@@ -318,8 +323,8 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
     let id = db.with(|c| {
         c.execute(
             "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio, picture, chosen, \
-             steps, guidance, negative_prompt, decoder, pipeline) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             steps, guidance, negative_prompt, decoder, pipeline, loras) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 owner,
                 model,
@@ -337,7 +342,8 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
                 r.guided.as_ref().map(|g| g.guidance as f64),
                 r.guided.as_ref().and_then(|g| g.negative_prompt.clone()),
                 r.decoder.map(|d| d.as_str()),
-                r.pipeline.map(|p| p.as_str())
+                r.pipeline.map(|p| p.as_str()),
+                (!r.loras.is_empty()).then(|| serde_json::to_string(&r.loras).unwrap_or_default())
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -705,6 +711,17 @@ impl Fields {
         text.parse().map(Some).map_err(|_| Fail::bad(format!("{name} must be a number, not {text}")))
     }
 
+    /// `loras`, `[{name, scale}]`: JSON's list, or a form's field holding
+    /// the same list as JSON text.
+    fn loras(&self) -> Result<Vec<kvad::image::Lora>, Fail> {
+        let Some((_, v)) = self.get(&["loras"]) else { return Ok(Vec::new()) };
+        let v = match v {
+            Value::String(s) => serde_json::from_str(s).map_err(|e| Fail::bad(format!("loras is not JSON: {e}")))?,
+            other => other.clone(),
+        };
+        serde_json::from_value(v).map_err(|e| Fail::bad(format!("loras is a list of {{name, scale}}: {e}")))
+    }
+
     fn flag(&self, name: &str) -> Result<Option<bool>, Fail> {
         match self.get(&[name]) {
             None => Ok(None),
@@ -830,6 +847,7 @@ impl Asked {
                 // Above 30 fps a model with DFR runs it without being asked;
                 // one without refuses this by name.
                 pipeline: f.text(&["pipeline"]).map(|p| kvad::video::Pipeline::parse(&p)).transpose().map_err(|e| Fail::bad(e.to_string()))?,
+                loras: f.loras()?,
             },
             seconds,
             picture,
@@ -922,6 +940,11 @@ pub async fn create(who: Identity, headers: HeaderMap, St(state): St<State>, bod
         }
     };
     request.seed = Some(resolved.seed);
+    // Each LoRA here, and all of them beside the models in memory.
+    if let Err(e) = crate::images::loras_fit(&state, &request.loras) {
+        forget(&upload);
+        return Err(e);
+    }
     // The guided pipeline's files, which a load does not fetch.
     if resolved.guided.is_some() {
         if let Err(why) = crate::engine::guided_ready(&resident.model.repo) {
@@ -1296,7 +1319,22 @@ mod tests {
     use kvad::video::{Audio, Resolved, Video};
 
     fn resolved(seed: u64) -> Resolved {
-        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, guided: None, decoder: None, pipeline: None, rounds: 0, fps: 24, seed, audio: true }
+        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, guided: None, decoder: None, pipeline: None, rounds: 0, fps: 24, seed, audio: true, loras: Vec::new() }
+    }
+
+    /// The LoRAs that made a video are kept with it, and one made without
+    /// any is kept as made without: `NULL`, as every video from before.
+    #[test]
+    fn a_video_keeps_the_loras_that_made_it() {
+        let db = Db::in_memory().unwrap();
+        let loras = vec![kvad::image::Lora { name: "SOLRICKS/LTX-2.5-BTS-Movie-Set".into(), scale: 0.8 }];
+        let q = queue(&db, None, "m", "b", &Resolved { loras: loras.clone(), ..resolved(1) }, false).unwrap();
+        assert_eq!(q.loras, loras);
+        assert_eq!(q.resource()["kvad"]["loras"][0]["scale"], 0.8);
+        let plain = queue(&db, None, "m", "b", &resolved(2), false).unwrap();
+        assert!(plain.loras.is_empty());
+        let stored: Option<String> = db.with(|c| c.query_row("SELECT loras FROM videos WHERE id = ?1", [plain.id], |r| r.get(0))).unwrap();
+        assert_eq!(stored, None);
     }
 
     fn filmed(seed: u64) -> Filmed {
@@ -1547,6 +1585,7 @@ mod tests {
         guided: Some(kvad::video::Guided { steps: 30, max_steps: 60, guidance: 3.0 }),
         decoder: Some(kvad::video::Decoder::Diffusion),
         dfr: true,
+        takes_loras: true,
     };
 
     #[test]

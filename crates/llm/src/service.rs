@@ -257,6 +257,9 @@ pub enum Evt {
     /// event would otherwise be sent at its size.
     Filmed(Box<Filmed>),
     Error(String),
+    /// A request refused by what served it, for the asker to change:
+    /// [`crate::image::Refused`].
+    Refused(String),
 }
 
 /// Turns a repo id and a [`Backend`] into a loaded model.
@@ -640,7 +643,12 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                     Ok(p) => {
                         let _ = tx.send(Evt::Painted(p));
                     }
-                    Err(e) => fail(e),
+                    Err(e) => match e.downcast_ref::<crate::image::Refused>() {
+                        Some(r) => {
+                            let _ = tx.send(Evt::Refused(r.0.clone()));
+                        }
+                        None => fail(e),
+                    },
                 }
             }
 

@@ -32,6 +32,8 @@ class Images {
   guidance = $state(null);
   seed = $state(null);
   fixSeed = $state(false);
+  /** LoRAs to apply, `{ name, scale }`, each as it was pulled. */
+  loras = $state([]);
 
   running = $state(false);
   /** `{ step, total, started, preview }` while a picture is being made. */
@@ -48,6 +50,31 @@ class Images {
       .filter((m) => m.kind === "image" && m.runnable && !models.resident(m.id))
       .map((m) => ({ id: m.id, label: `${m.id} (not loaded)`, resident: null }));
     return [...here, ...onDisk];
+  }
+
+  /** LoRAs on this machine for the chosen model: those whose layers' names
+   *  say they were made for its pipeline, and those whose names say
+   *  nothing. The file does not say which model it fits; one that does not
+   *  fit fails the request, naming what it adapts that the model has not. */
+  get loraChoices() {
+    const repo = this.chosen?.resident?.repo ?? this.chosen?.id;
+    const pipeline = models.all.find((m) => m.id === repo)?.pipeline ?? null;
+    return models.all.filter((m) => m.lora && (!m.adapts || !pipeline || m.adapts === pipeline)).map((m) => m.id);
+  }
+
+  /** Add the first LoRA not already chosen, at full strength. */
+  addLora() {
+    const name = this.loraChoices.find((n) => !this.loras.some((l) => l.name === n));
+    if (name) this.loras = [...this.loras, { name, scale: 1 }];
+  }
+
+  /** Change the `i`th LoRA: replaced, so that the page sees it. */
+  setLora(i, change) {
+    this.loras = this.loras.map((l, j) => (j === i ? { ...l, ...change } : l));
+  }
+
+  removeLora(i) {
+    this.loras = this.loras.filter((_, j) => j !== i);
   }
 
   /** The chosen model, or the first there is. */
@@ -105,6 +132,11 @@ class Images {
     if (this.steps) body.steps = this.steps;
     if (guided && this.guidance != null && this.guidance !== "") body.guidance_scale = Number(this.guidance);
     if (this.fixSeed && this.seed != null && this.seed !== "") body.seed = Number(this.seed);
+    // A model that takes none refuses them, as it refuses guidance; one not
+    // loaded yet says only when it is, so they are sent and it answers.
+    if (this.loras.length && this.defaults?.takes_loras !== false) {
+      body.loras = this.loras.map((l) => ({ name: l.name, scale: Number(l.scale) }));
+    }
 
     this.progress = { ...this.progress, loading: false, started: Date.now() };
     try {
@@ -158,6 +190,7 @@ class Images {
     this.guidance = image.guidance;
     this.seed = image.seed;
     this.fixSeed = true;
+    this.loras = (image.loras ?? []).map((l) => ({ name: l.name, scale: l.scale }));
     const resident = models.imageResidents.find((r) => r.repo === image.model);
     this.model = resident?.id ?? image.model;
   }

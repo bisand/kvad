@@ -13,6 +13,7 @@
 //! Every weight is read through a [`Reader`], so the unread-tensor guard that
 //! protects the text models protects these too.
 
+use super::lora::Slot;
 use crate::common::{Loader, Proj, Reader, Stored};
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::ops;
@@ -42,10 +43,14 @@ pub(crate) struct Linear {
     w: Proj,
     b: Option<Tensor>,
     out: usize,
+    /// Its place among the layers a LoRA may adapt, when it was loaded
+    /// through a reader that registers them ([`super::lora`]).
+    slot: Option<Slot>,
 }
 
 impl Linear {
     pub(crate) fn load(cx: &Ctx<'_>, r: &Reader<'_>, name: &str, inp: usize, out: usize, bias: bool) -> Res<Self> {
+        let slot = r.adapters().map(|a| a.linear(&r.full(name), inp, out));
         let r = r.pp(name);
         let w = cx.ld.proj(&r, "weight", out, inp, Stored::OutIn)?;
         let w = match w {
@@ -58,20 +63,36 @@ impl Linear {
             true => Some(cx.get(&r, out, "bias")?),
             false => None,
         };
-        Ok(Linear { w, b, out })
+        Ok(Linear { w, b, out, slot })
     }
 
     /// A 1×1 convolution as the linear layer it is: `[out, in, 1, 1]` is
     /// `[out, in]` with two axes of one. SD 1.5's transformers project in
     /// and out this way, over a grid Kvad has already made a sequence.
     pub(crate) fn load_1x1(cx: &Ctx<'_>, r: &Reader<'_>, name: &str, inp: usize, out: usize) -> Res<Self> {
+        let slot = r.adapters().map(|a| a.linear(&r.full(name), inp, out));
         let r = r.pp(name);
         let w = r.get((out, inp, 1, 1), "weight")?.reshape((out, inp))?.t()?.contiguous()?;
         let w = Proj::Dense(w.to_dtype(cx.dtype)?.to_device(cx.device())?);
-        Ok(Linear { w, b: Some(cx.get(&r, out, "bias")?), out })
+        Ok(Linear { w, b: Some(cx.get(&r, out, "bias")?), out, slot })
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let y = self.plain(x)?;
+        match &self.slot {
+            Some(s) => s.add(x, y),
+            None => Ok(y),
+        }
+    }
+
+    /// Whether a LoRA is set on this layer: its answer is then the layer's,
+    /// bias and all, and the LoRA's side path added to it, in that order,
+    /// so nothing may be fused after the bias.
+    fn adapted(&self) -> bool {
+        self.slot.as_ref().is_some_and(Slot::active)
+    }
+
+    fn plain(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         // The bias is added to the kernel's f32 sums as they are stored.
         #[cfg(target_os = "macos")]
         if let Proj::Blocks(q) = &self.w {
@@ -85,6 +106,9 @@ impl Linear {
     /// it stores it: the same numbers as `forward(x)?.to_dtype(dt)`, without
     /// writing the f32 answer and reading it back twice.
     pub(crate) fn forward_in(&self, x: &Tensor, dt: DType) -> candle_core::Result<Tensor> {
+        if self.adapted() {
+            return self.forward(x)?.to_dtype(dt);
+        }
         #[cfg(target_os = "macos")]
         if let Proj::Blocks(q) = &self.w {
             return q.linear(x, self.b.as_ref(), dt, false);
@@ -96,6 +120,9 @@ impl Linear {
     /// kernel can take it in its store: from the f32 sum, rounded once.
     /// `None` where it cannot, for the caller to apply its own.
     pub(crate) fn gelu_in(&self, x: &Tensor, dt: DType) -> candle_core::Result<Option<Tensor>> {
+        if self.adapted() {
+            return Ok(None);
+        }
         #[cfg(target_os = "macos")]
         if let Proj::Blocks(q) = &self.w {
             return q.linear(x, self.b.as_ref(), dt, true).map(Some);
@@ -143,6 +170,8 @@ pub(crate) struct Conv2d {
     b: Tensor,
     stride: usize,
     pad: usize,
+    /// Its place among the layers a LoRA may adapt ([`super::lora`]).
+    slot: Option<Slot>,
 }
 
 impl Conv2d {
@@ -153,25 +182,26 @@ impl Conv2d {
         (cin, cout, k): (usize, usize, usize),
         stride: usize,
     ) -> Res<Self> {
+        // "Same" padding: a 3×3 kernel keeps the grid its size.
+        let pad = k / 2;
+        let slot = r.adapters().map(|a| a.conv(&r.full(name), (cin, cout, k), stride, pad));
         let r = r.pp(name);
-        Ok(Conv2d {
-            w: cx.get(&r, (cout, cin, k, k), "weight")?,
-            b: cx.get(&r, cout, "bias")?.reshape((1, cout, 1, 1))?,
-            stride,
-            // "Same" padding: a 3×3 kernel keeps the grid its size.
-            pad: k / 2,
-        })
+        Ok(Conv2d { w: cx.get(&r, (cout, cin, k, k), "weight")?, b: cx.get(&r, cout, "bias")?.reshape((1, cout, 1, 1))?, stride, pad, slot })
     }
 
     /// From a weight already in hand, for a checkpoint that stores it some
     /// other way (see the Qwen-Image VAE, whose kernels are three-dimensional).
     pub(crate) fn from_parts(w: Tensor, b: Tensor, stride: usize) -> Res<Self> {
         let (cout, _, k, _) = w.dims4()?;
-        Ok(Conv2d { b: b.reshape((1, cout, 1, 1))?, w, stride, pad: k / 2 })
+        Ok(Conv2d { b: b.reshape((1, cout, 1, 1))?, w, stride, pad: k / 2, slot: None })
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        x.conv2d(&self.w, self.pad, self.stride, 1, 1)?.broadcast_add(&self.b)
+        let y = x.conv2d(&self.w, self.pad, self.stride, 1, 1)?.broadcast_add(&self.b)?;
+        match &self.slot {
+            Some(s) => s.add_conv(x, y),
+            None => Ok(y),
+        }
     }
 }
 

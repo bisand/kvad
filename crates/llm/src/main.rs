@@ -110,6 +110,9 @@ struct Args {
     /// `images make` only: how hard to follow the prompt, and what to avoid.
     guidance: Option<f32>,
     negative: Option<String>,
+    /// `images make` and `videos make`: LoRAs to apply, `NAME` or
+    /// `NAME:SCALE`, as often as `--lora` is given.
+    loras: Vec<String>,
     /// `videos make` only: how long, at how many frames a second, and
     /// whether without sound.
     seconds: Option<f64>,
@@ -190,6 +193,7 @@ impl Default for Args {
             seed_given: false,
             guidance: None,
             negative: None,
+            loras: Vec::new(),
             seconds: None,
             frames: None,
             fps: None,
@@ -410,6 +414,7 @@ fn parse_from(argv: Vec<String>) -> Args {
             }
             "--guidance" => a.guidance = Some(num() as f32),
             "--negative" => a.negative = Some(value.clone()),
+            "--lora" => a.loras.push(value.clone()),
             "--seconds" => a.seconds = Some(num()),
             "--frames" => a.frames = Some(num() as usize),
             "--fps" => a.fps = Some(num() as u32),

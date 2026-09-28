@@ -21,6 +21,7 @@
 //! the text models. Activations are f32, which is what candle's quantised
 //! kernels take.
 
+use super::lora::{self, Adapters};
 use super::mmdit::{norm_out, Double, Names, Shape};
 use super::nn::{latent_preview, noise, timestep_embedding, to_rgb8, Conv2d, Ctx, Linear};
 use super::schedule;
@@ -48,6 +49,24 @@ pub const TOKENIZER_REPO: &str = "Qwen/Qwen2.5-VL-7B-Instruct";
 /// throw away afterwards. Both from diffusers' `QwenImagePipeline`.
 const TEMPLATE: &str = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n";
 const DROP: usize = 34;
+
+/// The dtype a LoRA's factors are kept and run in: the pipeline's where it
+/// is half precision, and bf16 where the pipeline runs in f32 beside
+/// quantised weights. Lightning's side path is 47 dB below a layer's answer
+/// and bf16's rounding as far again below that, where f32 factors would
+/// double what it holds (1.7 GB for Lightning) and miss the M5's matrix
+/// units.
+fn lora_dtype(pipeline: DType) -> DType {
+    match pipeline {
+        DType::F32 => DType::BF16,
+        d => d,
+    }
+}
+
+/// What a LoRA's names for the transformer's layers may carry before
+/// diffusers' own, all of them the one part: diffusers' `transformer.`,
+/// ComfyUI's `diffusion_model.`, kohya's `lora_unet_`, or nothing.
+const TRANSFORMER_PREFIXES: [(&str, &str); 4] = [("transformer.", "transformer"), ("diffusion_model.", "transformer"), ("lora_unet_", "transformer"), ("", "transformer")];
 
 /// Latent channels, and the VAE's per-channel statistics come from its config.
 const Z: usize = 16;
@@ -554,6 +573,11 @@ pub struct QwenImage {
     quant: Option<GgmlDType>,
     /// The GGUF the transformer came from, and what it is made of.
     gguf: Option<(String, String)>,
+    /// The transformer's linear layers, for LoRAs ([`super::lora`]).
+    adapters: Adapters,
+    /// A fixed shift in place of the schedule's own; see
+    /// [`QwenImage::set_shift`].
+    shift: Option<f64>,
     params: usize,
     bytes: usize,
 }
@@ -643,6 +667,10 @@ impl QwenImage {
         vault.finish(progress);
         bytes += weight_bytes_at(params, quant) as usize;
 
+        // Every linear layer of the transformer may take a LoRA. Their names
+        // are diffusers', under `transformer.` in a diffusers LoRA,
+        // `diffusion_model.` in ComfyUI's, and kohya's `lora_unet_`.
+        let adapters = Adapters::new(&TRANSFORMER_PREFIXES);
         let (dit, made) = match gguf {
             Some(path) => {
                 let config = read_json(&fetch_file(repo, "transformer/config.json", watch)?)?;
@@ -656,7 +684,7 @@ impl QwenImage {
                 progress(&format!("loading the transformer from {name}: {}", file.make_up()));
                 let vault = Vault::off();
                 let cx = Ctx { ld: Loader::new(None, device.clone(), &vault).accelerated(), dtype };
-                let r = Reader::gguf(Arc::clone(&file), dtype);
+                let r = Reader::gguf(Arc::clone(&file), dtype).with_adapters(adapters.part("transformer"));
                 let dit = Dit::load(&cx, &r, dcfg)?;
                 params += finish_gguf("transformer", &file, &r)?;
                 bytes += file.device_bytes(dtype);
@@ -670,7 +698,7 @@ impl QwenImage {
                 let mut vault = Vault::open_as(&format!("{repo}/transformer"), &paths, shape, quant, progress);
                 let dit = {
                     let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
-                    let r = open(&paths, dtype)?;
+                    let r = open(&paths, dtype)?.with_adapters(adapters.part("transformer"));
                     let dit = Dit::load(&cx, &r, dcfg)?;
                     let n = finish("transformer", &paths, &r)?;
                     params += n;
@@ -698,7 +726,42 @@ impl QwenImage {
         device.synchronize()?;
         let from = made.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
         progress(&format!("loaded Qwen-Image: {:.1} B parameters at {label}{from}", params as f64 / 1e9));
-        Ok(QwenImage { tok, text, dit, vae, scheduler, device, dtype, quant, gguf: made, params, bytes })
+        Ok(QwenImage { tok, text, dit, vae, scheduler, device, dtype, quant, gguf: made, adapters, shift: None, params, bytes })
+    }
+
+    /// Run a fixed shift, the same at every size and with no stretch at the
+    /// end, in place of the one the repo's schedule works out from the
+    /// image's size; `None` for the repo's own again. Lightning was
+    /// distilled on a shift of 3 (`docs/lora-plan.md`).
+    pub fn set_shift(&mut self, shift: Option<f64>) {
+        self.shift = shift;
+    }
+
+    /// The scheduler's config, with [`QwenImage::set_shift`]'s shift in it:
+    /// diffusers' own settings for a fixed one, the dynamic shift's two ends
+    /// both at `ln shift`, and no terminal stretch, as Lightning's card sets
+    /// them.
+    fn schedule_config(&self) -> Value {
+        let mut c = self.scheduler.clone();
+        if let (Some(shift), Some(o)) = (self.shift, c.as_object_mut()) {
+            o.insert("base_shift".into(), json!(shift.ln()));
+            o.insert("max_shift".into(), json!(shift.ln()));
+            o.insert("shift_terminal".into(), Value::Null);
+        }
+        c
+    }
+
+    /// Apply `loras` to the transformer, each at its strength, in place of
+    /// any set before, until the next call; none, to take them off. The
+    /// layers adapted.
+    pub fn set_loras(&mut self, loras: &[(&lora::File, f64)]) -> Res<usize> {
+        match loras.is_empty() {
+            true => {
+                self.adapters.clear();
+                Ok(0)
+            }
+            false => self.adapters.set(loras, &self.device, lora_dtype(self.dtype)),
+        }
     }
 
     /// The prompt as the transformer reads it: `[1, tokens, 3584]`.
@@ -775,8 +838,9 @@ pub(crate) fn weight_bytes(repo: &str, quant: Option<GgmlDType>, size: &dyn Fn(&
     }
 }
 
-impl Painter for QwenImage {
-    fn paint(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+impl QwenImage {
+    /// One image, with whatever LoRAs the adapters hold.
+    fn draw(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
         let req = req.resolved(&self.defaults())?;
         let t0 = Instant::now();
         let cond = self.encode(&req.prompt)?;
@@ -792,7 +856,7 @@ impl Painter for QwenImage {
 
         // 8× from the VAE, 2× more from the patches.
         let (rows, cols) = (req.height / 16, req.width / 16);
-        let sched = schedule::flow(&self.scheduler, req.steps, rows * cols)?;
+        let sched = schedule::flow(&self.schedule_config(), req.steps, rows * cols)?;
         let patch = self.dit.cfg.in_channels;
         let mut x = noise(req.seed, &[1, rows * cols, patch], &self.device, DType::F32)?;
 
@@ -841,11 +905,19 @@ impl Painter for QwenImage {
         let decode_secs = t2.elapsed().as_secs_f64();
         Ok(Painted { image, request: req, encode_secs, denoise_secs, decode_secs })
     }
+}
+
+impl Painter for QwenImage {
+    /// With the request's LoRAs set for it and taken off after.
+    fn paint(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+        let (adapters, device, dtype) = (self.adapters.clone(), self.device.clone(), lora_dtype(self.dtype));
+        lora::painting(&adapters, req, &device, dtype, || self.draw(req, on_step))
+    }
 
     fn defaults(&self) -> Defaults {
         // The reference's own: 1328² (its 1:1 size), 50 steps, and a true-CFG
         // scale of 4, which applies only when a negative prompt is given.
-        Defaults { width: 1328, height: 1328, steps: 50, guidance: 4.0, multiple: 16, takes_guidance: true }
+        Defaults { width: 1328, height: 1328, steps: 50, guidance: 4.0, multiple: 16, takes_guidance: true, takes_loras: true }
     }
 
     fn summary(&self) -> String {
@@ -951,5 +1023,63 @@ mod tests {
         let t0 = rows * cols;
         assert_eq!((at(t0, frame), at(t0, row), at(t0, col)), (3.0, 3.0, 3.0));
         assert_eq!(at(t0 + 1, row), 4.0);
+    }
+
+    /// Qwen-Image's first blocks with Lightning, against diffusers with PEFT
+    /// (`scripts/lora-fixtures.py`): without it, with it and at half its
+    /// strength, and the LoRA's own part, the adapted output less the plain
+    /// one, which after two blocks is a small part of the whole. On the CPU
+    /// in f32, and on Metal at q8, as Kvad runs Qwen-Image:
+    ///
+    ///     KVAD_LORA_FIXTURES=/tmp/lora-fx cargo test --release -p kvad-gpu a_lora_agrees -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn a_lora_agrees_with_peft() {
+        let dir = std::env::var("KVAD_LORA_FIXTURES").expect("KVAD_LORA_FIXTURES, from scripts/lora-fixtures.py");
+        let fx = candle_core::safetensors::load(format!("{dir}/qwen_lora.safetensors"), &Device::Cpu).unwrap();
+        let blocks = 2;
+        let (config, paths) = component("Qwen/Qwen-Image", "transformer", "diffusion_pytorch_model", &Watcher::none()).unwrap();
+        let path = crate::image::local_file("lightx2v/Qwen-Image-Lightning", "Qwen-Image-Lightning-8steps-V2.0-bf16.safetensors").expect("fetch Lightning first");
+        let in_blocks = |m: &str| m.split('.').nth(1).and_then(|n| n.parse::<usize>().ok()).is_some_and(|n| n < blocks);
+        let file = lora::File::open(&path).unwrap().only(in_blocks);
+        let db = |want: &Tensor, got: &Tensor| -> f64 {
+            let e = (want - got).unwrap().sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap() as f64;
+            10.0 * (want.sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap() as f64 / e).log10()
+        };
+        let sigma = fx["sigma"].to_vec1::<f32>().unwrap()[0] as f64;
+        let (plain_ref, adapted_ref, half_ref) = (&fx["plain"], &fx["adapted"], &fx["half"]);
+        let part_ref = (adapted_ref - plain_ref).unwrap();
+        // The CPU in f32 throughout, to check the arithmetic; Metal as a
+        // q8 pipeline runs it, the factors in bf16.
+        let mut runs = vec![(Device::Cpu, None, DType::F32, "the CPU, f32")];
+        if let Ok(metal) = Device::new_metal(0) {
+            runs.push((metal, Some(GgmlDType::Q8_0), lora_dtype(DType::F32), "Metal, q8, bf16 factors"));
+        }
+        for (dev, quant, factors, what) in runs {
+            let vault = Vault::off();
+            let cx = Ctx { ld: Loader::new(quant, dev.clone(), &vault).accelerated(), dtype: DType::F32 };
+            let mut cfg = DitConfig::from_json(&config).unwrap();
+            cfg.layers = blocks;
+            let adapters = Adapters::new(&TRANSFORMER_PREFIXES);
+            let r = open(&paths, DType::F32).unwrap().with_adapters(adapters.part("transformer"));
+            let dit = Dit::load(&cx, &r, cfg).unwrap();
+            let run = || dit.forward(&fx["x"].to_device(&dev).unwrap(), &fx["txt"].to_device(&dev).unwrap(), sigma, 8, 8).unwrap().to_device(&Device::Cpu).unwrap();
+            let plain = run();
+            assert_eq!(adapters.set(&[(&file, 1.0)], &dev, factors).unwrap(), file.layers());
+            let adapted = run();
+            adapters.set(&[(&file, 0.5)], &dev, factors).unwrap();
+            let half = run();
+            let part = (&adapted - &plain).unwrap();
+            let (p, a, h, d) = (db(plain_ref, &plain), db(adapted_ref, &adapted), db(half_ref, &half), db(&part_ref, &part));
+            // The part is the difference of two outputs, each `p` dB from
+            // the reference's, and it is `size` dB below them: so it can be
+            // no nearer than about `p - size - 3` dB, the two outputs' own
+            // rounding, however exact the LoRA.
+            let size = db(plain_ref, adapted_ref);
+            eprintln!("{what}: plain {p:.1} dB, adapted {a:.1}, half {h:.1}; the LoRA's own part, {size:.1} dB below the output, {d:.1} dB, over {} layers", file.layers());
+            let floor = if quant.is_some() { 25.0 } else { 80.0 };
+            assert!(a > floor && h > floor, "{what}");
+            assert!(d > p - size - 6.0, "{what}: the LoRA's part is further from the reference's than the model's own rounding explains");
+        }
     }
 }

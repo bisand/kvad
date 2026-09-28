@@ -89,10 +89,12 @@ pub struct Stored {
     pub created_at: String,
     /// Where the picture is, on this server.
     pub url: String,
+    /// The LoRAs that made it, each at its strength; none for most.
+    pub loras: Vec<kvad::image::Lora>,
 }
 
 const COLUMNS: &str = "id, model, backend, prompt, negative_prompt, width, height, steps, guidance, \
-                       seed, bytes, secs, created_at";
+                       seed, bytes, secs, created_at, loras";
 
 fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
     let id: i64 = r.get(0)?;
@@ -111,6 +113,9 @@ fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
         secs: r.get(11)?,
         url: url_of(id, &r.get::<_, String>(12)?),
         created_at: r.get(12)?,
+        // Written by `save` only, so JSON it can read; anything else would
+        // be a row edited by hand, shown as made without.
+        loras: r.get::<_, Option<String>>(13)?.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
     })
 }
 
@@ -133,7 +138,7 @@ pub fn save(db: &Db, dir: &FsPath, owner: Option<i64>, model: &str, backend: &st
     let id = db.with(|c| {
         c.execute(
             "INSERT INTO images (owner, model, backend, prompt, negative_prompt, width, height, steps, \
-             guidance, seed, bytes, secs) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             guidance, seed, bytes, secs, loras) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 owner,
                 model,
@@ -146,7 +151,8 @@ pub fn save(db: &Db, dir: &FsPath, owner: Option<i64>, model: &str, backend: &st
                 r.guidance as f64,
                 r.seed as i64,
                 png.len() as i64,
-                secs
+                secs,
+                (!r.loras.is_empty()).then(|| serde_json::to_string(&r.loras).unwrap_or_default())
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -278,6 +284,10 @@ pub struct Generations {
     guidance_scale: Option<f32>,
     #[serde(default)]
     seed: Option<u64>,
+    /// kvad's own: LoRAs to apply for these images, `[{name, scale}]`,
+    /// each by the name it was pulled by.
+    #[serde(default)]
+    loras: Vec<kvad::image::Lora>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -307,6 +317,7 @@ impl Generations {
             guidance: self.guidance_scale,
             seed: self.seed,
             preview: self.preview.unwrap_or(false) || self.partial_images.unwrap_or(0) > 0,
+            loras: self.loras.clone(),
         })
     }
 
@@ -343,12 +354,38 @@ pub async fn generations(
     // and the ones after it, so each can be made again on its own.
     let resolved = request.resolved(&defaults).map_err(|e| Fail::bad(e.to_string()))?;
     request.seed = Some(resolved.seed);
+    loras_fit(&state, &request.loras)?;
 
     let job = Job { state, owner: who.id, resident, request, n, format, base: base_url(&headers) };
     Ok(match body.stream {
         true => streamed(job).into_response(),
         false => whole(job).await?.into_response(),
     })
+}
+
+/// Each LoRA on this machine, and all of them together in what no resident
+/// has been charged.
+///
+/// A LoRA is set for its request and taken off after it, so it is charged
+/// nothing standing; but while it is set its factors are on the device, and
+/// they have to fit beside everything that is. Loads are cache-first, so
+/// one that is not here is a 400 that says how to fetch it, not a download
+/// in the middle of a request.
+pub(crate) fn loras_fit(state: &State, loras: &[kvad::image::Lora]) -> Result<(), Fail> {
+    let mut bytes = 0;
+    for l in loras {
+        let here = kvad::lora::local(&l.name).ok_or_else(|| Fail::bad(format!("the LoRA {} is not on this machine; `kvad pull {}` fetches it", l.name, l.name)))?;
+        bytes += kvad::lora::device_bytes(&here.file).unwrap_or(0);
+    }
+    let left = state.engine.left();
+    if bytes > left {
+        return Err(Fail::bad(format!(
+            "the LoRAs take {:.2} GB while they are set, and {:.2} GB is left beside the models in memory",
+            bytes as f64 / 1e9,
+            left as f64 / 1e9
+        )));
+    }
+    Ok(())
 }
 
 /// What a generation needs once the request has been read.
@@ -394,6 +431,7 @@ impl Job {
             "height": stored.height,
             "steps": stored.steps,
             "guidance": stored.guidance,
+            "loras": stored.loras,
             "encode_secs": painted.encode_secs,
             "denoise_secs": painted.denoise_secs,
             "decode_secs": painted.decode_secs,
@@ -411,6 +449,7 @@ async fn whole(job: Job) -> Result<Json<serde_json::Value>, Fail> {
                 Some(Stroke::Step(_)) => continue,
                 Some(Stroke::Done(p)) => break *p,
                 Some(Stroke::Failed(e)) => return Err(Fail::internal(e)),
+                Some(Stroke::Refused(e)) => return Err(Fail::bad(e)),
                 None => return Err(Fail::internal("the engine stopped before it answered")),
             }
         };
@@ -475,7 +514,7 @@ fn streamed(job: Job) -> impl IntoResponse {
                         let _ = events.send(done).await;
                         break;
                     }
-                    Stroke::Failed(e) => {
+                    Stroke::Failed(e) | Stroke::Refused(e) => {
                         let _ = events.send(sse("error", &json!({ "error": e }))).await;
                         return;
                     }
@@ -523,6 +562,7 @@ mod tests {
                 guidance: 5.0,
                 seed,
                 preview: false,
+                loras: Vec::new(),
             },
             encode_secs: 0.1,
             denoise_secs: 1.0,
@@ -555,6 +595,24 @@ mod tests {
         assert!(!file.exists());
         assert!(list(&db, None).unwrap().is_empty());
         assert!(!delete(&db, &dir, s.id, None).unwrap(), "a second delete finds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The LoRAs that made an image are kept with it, and an image made
+    /// without any is kept as made without: `NULL`, as every image from
+    /// before there were LoRAs is.
+    #[test]
+    fn an_image_keeps_the_loras_that_made_it() {
+        let db = Db::in_memory().unwrap();
+        let dir = scratch("loras");
+        let mut p = painted(1);
+        let loras = vec![kvad::image::Lora { name: "lightx2v/Qwen-Image-Lightning:8steps.safetensors".into(), scale: 0.8 }];
+        p.request.loras = loras.clone();
+        assert_eq!(save(&db, &dir, None, "Qwen/Qwen-Image", "metal q8", &p).unwrap().loras, loras);
+        let plain = save(&db, &dir, None, "Qwen/Qwen-Image", "metal q8", &painted(2)).unwrap();
+        assert!(plain.loras.is_empty());
+        let stored: Option<String> = db.with(|c| c.query_row("SELECT loras FROM images WHERE id = ?1", [plain.id], |r| r.get(0))).unwrap();
+        assert_eq!(stored, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

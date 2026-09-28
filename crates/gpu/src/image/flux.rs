@@ -20,6 +20,7 @@
 //!   is refused here rather than run without its input.)
 
 use super::clip::{self, Clip, ClipConfig, Pooled};
+use super::lora::{self, Adapters};
 use super::mmdit::{norm_out, Double, Names, Shape, Single};
 use super::nn::{latent_preview, noise, timestep_embedding, to_rgb8, Ctx, Linear};
 use super::schedule;
@@ -161,6 +162,37 @@ fn gguf_map(cfg: &Config) -> Vec<(String, Vec<Part>)> {
     m
 }
 
+/// What a LoRA's names for FLUX may start with, and the part each is in:
+/// diffusers' `transformer.` and `text_encoder.`, ComfyUI's
+/// `diffusion_model.`, kohya's `lora_unet_`, `lora_transformer_` and
+/// `lora_te1_`, and the transformer's layers named bare. Under
+/// `diffusion_model.` and `lora_unet_` the names are Black Forest Labs'
+/// ([`bfl_loras`]).
+pub(crate) const PREFIXES: [(&str, &str); 7] = [
+    ("transformer.", "transformer"),
+    ("diffusion_model.", "transformer"),
+    ("lora_unet_", "transformer"),
+    ("lora_transformer_", "transformer"),
+    ("lora_te1_", "te1"),
+    ("text_encoder.", "te1"),
+    ("", "transformer"),
+];
+
+/// The transformer's layers also by Black Forest Labs' names, in which
+/// kohya's FLUX LoRAs are made: [`gguf_map`]'s rows, so that a LoRA's pair
+/// for a fused `qkv` or `linear1` is each of its layers', `B` cut as the
+/// weights are, and one for the last modulation has its halves the other
+/// way round as the weight does. Norms take no LoRA.
+fn bfl_loras(adapters: &Adapters, map: &[(String, Vec<Part>)]) {
+    for (to, parts) in map {
+        let (Some(to), Some(first)) = (to.strip_suffix(".weight"), parts.first()) else { continue };
+        let Some(from) = first.name.strip_suffix(".weight") else { continue };
+        if parts.iter().all(|p| p.name == first.name) {
+            adapters.fused("transformer", from, to, parts.iter().map(|p| p.rows.clone()).collect());
+        }
+    }
+}
+
 /// A GGUF of FLUX's transformer, under diffusers' names.
 fn open_gguf(path: &Path, cfg: &Config) -> Res<Gguf> {
     let file = Gguf::open(path)?;
@@ -294,6 +326,8 @@ pub struct Flux {
     quant: Option<GgmlDType>,
     /// The GGUF the transformer came from, and what it is made of.
     gguf: Option<(String, String)>,
+    /// CLIP's and the transformer's layers, for LoRAs ([`lora`]).
+    adapters: Adapters,
     params: usize,
     bytes: usize,
 }
@@ -372,7 +406,8 @@ impl Flux {
         let (config, paths) = component(repo, "text_encoder", "model", watch)?;
         let vault = Vault::off();
         let cx = Ctx { ld: Loader::new(None, device.clone(), &vault), dtype };
-        let r = open(&paths, dtype)?;
+        let adapters = Adapters::new(&PREFIXES);
+        let r = open(&paths, dtype)?.with_adapters(adapters.part("te1"));
         let clip = Clip::load(&cx, &r, ClipConfig::from_json(&config)?, Pooled::Normed)?;
         let n = finish("CLIP", &paths, &r)?;
         (params, bytes) = (params + n, bytes + (n * dtype.size_in_bytes()) as u64);
@@ -398,8 +433,10 @@ impl Flux {
                 progress(&format!("loading the transformer from {name}: {}", file.make_up()));
                 let vault = Vault::off();
                 let cx = Ctx { ld: Loader::new(None, device.clone(), &vault).accelerated(), dtype };
-                let r = Reader::gguf(Arc::clone(&file), dtype);
+                let r = Reader::gguf(Arc::clone(&file), dtype).with_adapters(adapters.part("transformer"));
+                let map = gguf_map(&cfg);
                 let dit = Transformer::load(&cx, &r, cfg)?;
+                bfl_loras(&adapters, &map);
                 let n = finish_gguf("transformer", &file, &r)?;
                 (params, bytes) = (params + n, bytes + file.device_bytes(dtype) as u64);
                 (dit, Some((name, file.make_up())))
@@ -412,8 +449,10 @@ impl Flux {
                 let mut vault = Vault::open_as(&format!("{repo}/transformer"), &paths, shape, quant, progress);
                 let dit = {
                     let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
-                    let r = open(&paths, dtype)?;
+                    let r = open(&paths, dtype)?.with_adapters(adapters.part("transformer"));
+                    let map = gguf_map(&cfg);
                     let dit = Transformer::load(&cx, &r, cfg)?;
+                    bfl_loras(&adapters, &map);
                     let n = finish("transformer", &paths, &r)?;
                     (params, bytes) = (params + n, bytes + at(n, quant));
                     dit
@@ -438,7 +477,7 @@ impl Flux {
         device.synchronize()?;
         let from = made.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
         progress(&format!("loaded FLUX.1-schnell: {:.1} B parameters at {label}{from}", params as f64 / 1e9));
-        Ok(Flux { clip_tok, t5_tok, clip, t5, dit, vae, scheduler, device, dtype, quant, gguf: made, params, bytes: bytes as usize })
+        Ok(Flux { clip_tok, t5_tok, clip, t5, dit, vae, scheduler, device, dtype, quant, gguf: made, adapters, params, bytes: bytes as usize })
     }
 
     /// T5's hidden states, `[1, 256, 4096]`, and CLIP's pooled vector,
@@ -506,8 +545,9 @@ pub(crate) fn weight_bytes(repo: &str, quant: Option<GgmlDType>, size: &dyn Fn(&
     }
 }
 
-impl Painter for Flux {
-    fn paint(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+impl Flux {
+    /// One image, with whatever LoRAs the adapters hold.
+    fn draw(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
         // A guidance scale or a negative prompt is refused here, because the
         // defaults say this model takes neither.
         let req = req.resolved(&self.defaults())?;
@@ -552,11 +592,21 @@ impl Painter for Flux {
         let decode_secs = t2.elapsed().as_secs_f64();
         Ok(Painted { image, request: req, encode_secs, denoise_secs, decode_secs })
     }
+}
+
+impl Painter for Flux {
+    /// With the request's LoRAs set for it and taken off after: their
+    /// factors in the pipeline's dtype, or bf16 beside quantised weights.
+    fn paint(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+        let factors = if self.dtype == DType::F32 { DType::BF16 } else { self.dtype };
+        let (adapters, device) = (self.adapters.clone(), self.device.clone());
+        lora::painting(&adapters, req, &device, factors, || self.draw(req, on_step))
+    }
 
     fn defaults(&self) -> Defaults {
         // Black Forest Labs' own settings for schnell: four steps, no
         // guidance, a megapixel.
-        Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false }
+        Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_loras: true }
     }
 
     fn summary(&self) -> String {
@@ -616,6 +666,88 @@ const PREVIEW_BIAS: [f32; 3] = [-0.0046, -0.0804, -0.1004];
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The block a LoRA's layer is in, in diffusers' names or Black Forest
+    /// Labs', dotted or kohya's: `(single, index)`, or `None` outside them.
+    fn block_of(m: &str) -> Option<(bool, usize)> {
+        let m = m.replace('_', ".");
+        for (mark, single) in [("single.transformer.blocks.", true), ("transformer.blocks.", false), ("double.blocks.", false), ("single.blocks.", true)] {
+            if let Some(at) = m.find(mark) {
+                let rest = &m[at + mark.len()..];
+                return rest.split('.').next().and_then(|n| n.parse().ok()).map(|n| (single, n));
+            }
+        }
+        None
+    }
+
+    /// FLUX's first double and single blocks with a LoRA, against diffusers
+    /// with PEFT (`scripts/lora-fixtures.py --pipeline flux --blocks 1`):
+    /// without it, with it and at half its strength, and the LoRA's own part.
+    /// One fixture a LoRA, found by the name in its file's: PEFT's names,
+    /// and kohya's in Black Forest Labs' layout, whose fused `qkv` and
+    /// `linear1` diffusers splits as [`bfl_loras`] does. CLIP's pairs are
+    /// left out, for this builds the transformer alone. On the CPU in f32,
+    /// and on Metal at q8, as Kvad runs FLUX:
+    ///
+    ///     KVAD_LORA_FIXTURES=/tmp/lora-fx cargo test --release -p kvad-gpu flux::tests::a_lora -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn a_lora_agrees_with_peft() {
+        let dir = std::env::var("KVAD_LORA_FIXTURES").expect("KVAD_LORA_FIXTURES, from scripts/lora-fixtures.py");
+        let (config, paths) = component("black-forest-labs/FLUX.1-schnell", "transformer", "diffusion_pytorch_model", &Watcher::none()).unwrap();
+        let db = |want: &Tensor, got: &Tensor| -> f64 {
+            let e = (want - got).unwrap().sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap() as f64;
+            10.0 * (want.sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap() as f64 / e).log10()
+        };
+        let mut fixtures: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        fixtures.sort();
+        let mut seen = 0;
+        for path in fixtures {
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            let Some(name) = stem.strip_prefix("flux_") else { continue };
+            let name = name.replace("--", "/").replace("@@", ":");
+            let fx = candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+            let here = kvad::lora::local(&name).unwrap_or_else(|| panic!("{name} is not on this machine"));
+            let file = lora::File::open(&here.file)
+                .unwrap()
+                .named(&name)
+                .only(|m| !m.starts_with("lora_te") && !m.starts_with("text_encoder.") && block_of(m).is_none_or(|(_, i)| i < 1));
+            let sigma = fx["sigma"].to_vec1::<f32>().unwrap()[0] as f64;
+            let (plain_ref, adapted_ref, half_ref) = (&fx["plain"], &fx["adapted"], &fx["half"]);
+            let part_ref = (adapted_ref - plain_ref).unwrap();
+            let mut runs = vec![(Device::Cpu, None, DType::F32, "the CPU, f32")];
+            if let Ok(metal) = Device::new_metal(0) {
+                runs.push((metal, Some(GgmlDType::Q8_0), DType::BF16, "Metal, q8, bf16 factors"));
+            }
+            for (dev, quant, factors, what) in runs {
+                let vault = Vault::off();
+                let cx = Ctx { ld: Loader::new(quant, dev.clone(), &vault).accelerated(), dtype: DType::F32 };
+                let mut cfg = Config::from_json(&config).unwrap();
+                (cfg.double, cfg.single) = (1, 1);
+                let adapters = Adapters::new(&PREFIXES);
+                let r = open(&paths, DType::F32).unwrap().with_adapters(adapters.part("transformer"));
+                let map = gguf_map(&cfg);
+                let dit = Transformer::load(&cx, &r, cfg).unwrap();
+                bfl_loras(&adapters, &map);
+                let on = |k: &str| fx[k].to_device(&dev).unwrap();
+                let run = || dit.forward(&on("x"), &on("txt"), &on("pooled"), sigma, 8, 8).unwrap().to_device(&Device::Cpu).unwrap();
+                let plain = run();
+                let n = adapters.set(&[(&file, 1.0)], &dev, factors).unwrap();
+                let adapted = run();
+                adapters.set(&[(&file, 0.5)], &dev, factors).unwrap();
+                let half = run();
+                let part = (&adapted - &plain).unwrap();
+                let (p, a, h, d) = (db(plain_ref, &plain), db(adapted_ref, &adapted), db(half_ref, &half), db(&part_ref, &part));
+                let size = db(plain_ref, adapted_ref);
+                eprintln!("{name}, {what}: plain {p:.1} dB, adapted {a:.1}, half {h:.1}; its own part, {size:.1} dB below the output, {d:.1} dB, on {n} layers");
+                let floor = if quant.is_some() { 25.0 } else { 80.0 };
+                assert!(a > floor && h > floor, "{name}, {what}");
+                assert!(d > p - size - 6.0, "{name}, {what}: the LoRA's part is further from the reference's than the model's own rounding explains");
+            }
+            seen += 1;
+        }
+        assert!(seen > 0, "no flux_ fixtures in {dir}");
+    }
 
     /// The positions diffusers' `_prepare_latent_image_ids` gives, and text at
     /// the origin: rows and columns from the top left, not centred.

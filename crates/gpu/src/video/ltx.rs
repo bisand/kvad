@@ -32,6 +32,7 @@ use super::ltx_dit::{video_tokens, Dit, Shape};
 use super::ltx_sample::{dev_sigmas, guided, one_stage, refine, Guide, Latents, AUDIO_GUIDE, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
 use super::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
 use super::{ltx_audio, ltx_dfr, ltx_diffvae, ltx_duration, ltx_upsample, ltx_vae};
+use crate::image::lora;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::Image;
@@ -174,6 +175,9 @@ pub struct Ltx {
     quant: GgmlDType,
     device: Device,
     defaults: Defaults,
+    /// The LoRAs of the video being made, opened once, and set on each DiT
+    /// its pipeline loads ([`Ltx::adapted`]); none between videos.
+    loras: Vec<(lora::File, f64)>,
     params: usize,
 }
 
@@ -281,12 +285,14 @@ impl Ltx {
             decoder: Some(Decoder::Diffusion),
             // DFR, whose detailing LoRA is fetched by its first request.
             dfr: gguf.is_none(),
+            // At run time, beside every DiT a pipeline loads, a GGUF's too.
+            takes_loras: true,
         };
         let gguf = gguf.zip(made).map(|(g, made)| (g.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), made));
         if let Some((g, made)) = &gguf {
             progress(&format!("the DiT is {g}'s, {made}: the fast pipeline only, with no DFR and no guidance"));
         }
-        Ok(Ltx { repo: repo.to_string(), gguf, paths, head, quant, device, defaults, params })
+        Ok(Ltx { repo: repo.to_string(), gguf, paths, head, quant, device, defaults, loras: Vec::new(), params })
     }
 }
 
@@ -369,6 +375,19 @@ impl Plan {
 
 impl Ltx {
     /// [`Director::film`], before the synchronise that frees what it held.
+    /// `dit` with the video's LoRAs set on it, at run time beside its
+    /// layers: every DiT a pipeline loads takes them, both stages', DFR's
+    /// detailing one, and the temporal rounds', as the reference applies a
+    /// request's LoRAs to its transformer in each. One that does not fit
+    /// the DiT is the asker's to change.
+    fn adapted(&self, dit: Dit) -> Res<Dit> {
+        if !self.loras.is_empty() {
+            let set: Vec<(&lora::File, f64)> = self.loras.iter().map(|(f, s)| (f, *s)).collect();
+            dit.set_loras(&set).map_err(|e| -> Box<dyn std::error::Error> { Box::new(kvad::image::Refused(e.to_string())) })?;
+        }
+        Ok(dit)
+    }
+
     fn run(&self, req: &VideoRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Filmed> {
         let r = req.resolved(&self.defaults)?;
         if r.pipeline == Some(Pipeline::Dfr) {
@@ -472,8 +491,8 @@ impl Ltx {
         report("stage 1", 0, s1, done, None)?;
         let latents = {
             let dit = match &dev {
-                Some((d, _)) => Dit::load_as(d, None, "transformer-dev", device, dtype, None, quant, &mut quiet)?,
-                None => Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?,
+                Some((d, _)) => self.adapted(Dit::load_as(d, None, "transformer-dev", device, dtype, None, quant, &mut quiet)?)?,
+                None => self.adapted(Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?)?,
             };
             done += plan.load;
             let ctx = Contexts { video: ctx.video.clone(), audio: ctx.audio.clone() };
@@ -509,7 +528,7 @@ impl Ltx {
                 Some((d, lora)) => {
                     drop(dit);
                     device.synchronize()?;
-                    fused = Dit::load_as(d, Some((lora, 1.0)), "transformer-dev-distilled", device, dtype, None, quant, &mut quiet)?;
+                    fused = self.adapted(Dit::load_as(d, Some((lora, 1.0)), "transformer-dev-distilled", device, dtype, None, quant, &mut quiet)?)?;
                     &fused
                 }
                 None => &dit,
@@ -742,7 +761,7 @@ impl Ltx {
         let mut done = plan.picture + plan.text;
         let s1 = STAGE_1.len() - 1;
         report("stage 1", 0, s1, done, None)?;
-        let dit = Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?;
+        let dit = self.adapted(Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?)?;
         done += plan.load;
         let one = {
             let mut step = |i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
@@ -767,7 +786,7 @@ impl Ltx {
         // 4. Stage 2, with the detailing LoRA and stage 1's video beside.
         let s2 = STAGE_2.len() - 1;
         report("stage 2", 0, s2, done, None)?;
-        let detailing = Dit::load_as(&self.paths[1], Some((&lora, ltx_dfr::DETAILING_STRENGTH as f64)), "transformer-detailing", device, dtype, None, quant, &mut quiet)?;
+        let detailing = self.adapted(Dit::load_as(&self.paths[1], Some((&lora, ltx_dfr::DETAILING_STRENGTH as f64)), "transformer-detailing", device, dtype, None, quant, &mut quiet)?)?;
         done += plan.load_2;
         let two = {
             let from = ltx_dfr::Detailing { upsampled: &upsampled, keyframes: &keys, reference: &one.video, audio: &one.audio };
@@ -789,7 +808,7 @@ impl Ltx {
             fps,
         };
         if let Some(temporal) = &temporal {
-            let dit = Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?;
+            let dit = self.adapted(Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?)?;
             let up = ltx_upsample::Upsampler::load(temporal, &self.paths[3], device, DType::F32)?;
             done += plan.load_3;
             let duration = canvas.frames as f64 / fps;
@@ -859,7 +878,19 @@ impl Ltx {
 
 impl Director for Ltx {
     fn film(&mut self, req: &VideoRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Filmed> {
+        // The request's LoRAs, found on this machine and opened, before
+        // anything is loaded: one that is not here is the asker's to change.
+        self.loras = req
+            .loras
+            .iter()
+            .map(|l| -> Res<(lora::File, f64)> {
+                let here = kvad::lora::local(&l.name).ok_or_else(|| format!("the LoRA {} is not on this machine; `kvad pull {}` fetches it", l.name, l.name))?;
+                Ok((lora::File::open(&here.file)?.named(&l.name), l.scale))
+            })
+            .collect::<Res<Vec<_>>>()
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(kvad::image::Refused(e.to_string())) })?;
         let filmed = self.run(req, on_step);
+        self.loras.clear();
         // Whatever `run` held is dropped by now, and candle's Metal pool
         // lets it go only here. A generation that was cancelled, or failed,
         // mid-stage returned before its own synchronise, and would leave the

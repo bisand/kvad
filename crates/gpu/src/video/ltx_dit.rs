@@ -36,6 +36,7 @@
 //! ones.
 
 use super::ltx_fused::{self, gated_add, gated_modulate, Held};
+use crate::image::lora::Adapters;
 use super::ltx_nn::{GatedAttention, Rope};
 use super::ltx_text::Contexts;
 use super::metadata;
@@ -540,8 +541,15 @@ pub struct Dit {
     audio_head: Head,
     device: Device,
     dtype: DType,
+    /// Every linear layer's place for a LoRA applied at run time
+    /// ([`crate::image::lora`]).
+    adapters: Adapters,
     params: usize,
 }
+
+/// What a LoRA's names for the DiT may start with: the reference's own,
+/// `diffusion_model.`, which ComfyUI's keep, the checkpoint's, or none.
+pub(crate) const PREFIXES: [(&str, &str); 3] = [("diffusion_model.", "dit"), ("model.diffusion_model.", "dit"), ("", "dit")];
 
 impl Dit {
     /// The DiT in the file at `path`, computing in `dtype` on `device`.
@@ -610,10 +618,16 @@ impl Dit {
                 Some(l) => r.with_lora(l.clone()),
                 None => r,
             };
+            // The connectors are the text path's; see `ltx_text`. Skipped
+            // before the adapters are attached, so that a LoRA's pairs for
+            // them are refused rather than taken as the model's and
+            // ignored: the text path takes no LoRA at run time.
             let m = r.pp("model.diffusion_model");
-            // The connectors are the text path's; see `ltx_text`.
             m.skip_under("video_embeddings_connector");
             m.skip_under("audio_embeddings_connector");
+            let adapters = Adapters::new(&PREFIXES);
+            let r = r.with_adapters(adapters.part_under("dit", "model.diffusion_model."));
+            let m = r.pp("model.diffusion_model");
             for i in n..cfg.layers {
                 m.skip_under(&format!("transformer_blocks.{i}"));
             }
@@ -659,6 +673,7 @@ impl Dit {
                 cfg,
                 device: device.clone(),
                 dtype,
+                adapters,
             };
             dit
         };
@@ -675,6 +690,19 @@ impl Dit {
 
     pub fn params(&self) -> usize {
         self.params
+    }
+
+    /// Apply `loras` at run time, each at its strength, in place of any set
+    /// before; none, to take them off. Their factors are in the DiT's own
+    /// dtype. The layers adapted.
+    pub fn set_loras(&self, loras: &[(&crate::image::lora::File, f64)]) -> Res<usize> {
+        match loras.is_empty() {
+            true => {
+                self.adapters.clear();
+                Ok(0)
+            }
+            false => self.adapters.set(loras, &self.device, self.dtype),
+        }
     }
 
     pub fn layers(&self) -> usize {

@@ -4,6 +4,7 @@
   import { models } from "../lib/models.svelte.js";
   import { navigate } from "../lib/router.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
+  import Loras from "../lib/components/Loras.svelte";
 
   const WARN = "M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z";
   const TRASH = "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6";
@@ -68,6 +69,8 @@
           placeholder={d && !d.takes_guidance ? "This model makes images without guidance" : "What to steer away from (optional)"}
         />
       </label>
+
+      <Loras form={im} takes={d ? d.takes_loras : null} busy={im.running} />
 
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <label class="flex flex-col gap-1">
@@ -172,7 +175,9 @@
             </button>
             <figcaption class="flex flex-col gap-1 p-3">
               <p class="line-clamp-2 text-sm" title={g.prompt}>{g.prompt}</p>
-              <p class="text-xs opacity-60">{g.width}×{g.height} · {g.steps} steps · seed {g.seed}</p>
+              <p class="text-xs opacity-60">
+                {g.width}×{g.height} · {g.steps} steps · seed {g.seed}{#if g.loras?.length} · {g.loras.length === 1 ? "a LoRA" : `${g.loras.length} LoRAs`}{/if}
+              </p>
               <div class="flex gap-1">
                 <button class="btn btn-ghost btn-xs" onclick={() => im.reuse(g)} title="Put these settings back in the form">
                   <Icon path={REUSE} size={14} /> Reuse
@@ -203,6 +208,11 @@
         {open.model} · {open.backend} · {open.width}×{open.height} · {open.steps} steps · guidance
         {open.guidance} · seed {open.seed} · {open.secs.toFixed(1)} s · {open.created_at}
       </p>
+      {#if open.loras?.length}
+        <p class="text-xs opacity-60">
+          LoRAs: {open.loras.map((l) => (l.scale === 1 ? l.name : `${l.name} at ${l.scale}`)).join(", ")}
+        </p>
+      {/if}
     </div>
     <form method="dialog" class="modal-backdrop">
       <button onclick={() => (open = null)}>close</button>

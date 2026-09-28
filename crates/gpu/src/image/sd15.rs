@@ -21,6 +21,7 @@ use super::sdxl::{weights, TOKENIZER_REPO};
 use super::unet::{Unet, UnetConfig};
 use super::vae::{Decoder, VaeConfig};
 use super::sdxl::local_weights;
+use super::lora::{self, Adapters};
 use super::{finish, finish_mapped, open, open_file, open_mapped, read_json, single};
 use crate::common::{Loader, Reader};
 use crate::qcache::Vault;
@@ -43,8 +44,15 @@ pub struct Sd15 {
     scheduler: Value,
     device: Device,
     dtype: DType,
+    /// The text encoder's and the UNet's layers, for LoRAs ([`lora`]).
+    adapters: Adapters,
     params: usize,
 }
+
+/// What a LoRA's names for SD 1.5 may start with, and the part each is in:
+/// kohya's `lora_unet_` and `lora_te_`, diffusers' `unet.` and
+/// `text_encoder.`, and a UNet's layers named bare.
+pub(crate) const PREFIXES: [(&str, &str); 6] = [("lora_unet_", "unet"), ("unet.", "unet"), ("lora_te_", "te1"), ("lora_te1_", "te1"), ("text_encoder.", "te1"), ("", "unet")];
 
 impl Sd15 {
     pub fn load(repo: &str, device: Device, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Self> {
@@ -85,8 +93,10 @@ impl Sd15 {
             }
         };
 
+        let adapters = Adapters::new(&PREFIXES);
         progress("loading the text encoder");
         let (r_t, paths) = reader("text_encoder", "model", maps.as_ref().map(|m| &m.clip))?;
+        let r_t = r_t.with_adapters(adapters.part("te1"));
         let clip = Clip::load(&cx, &r_t, ClipConfig::from_json(&config("text_encoder")?)?, Pooled::Last)?;
         if file.is_none() {
             params += finish("text encoder", &paths, &r_t)?;
@@ -94,6 +104,7 @@ impl Sd15 {
 
         progress("loading the UNet");
         let (r_u, paths) = reader("unet", "diffusion_pytorch_model", maps.as_ref().map(|m| &m.unet))?;
+        let r_u = r_u.with_adapters(adapters.part("unet"));
         let ucfg = UnetConfig::from_json(&config("unet")?)?;
         if ucfg.added.is_some() || ucfg.context != clip.width() {
             return Err(format!("this UNet attends to {}-wide text with size conditioning {:?}: not SD 1.5's", ucfg.context, ucfg.added).into());
@@ -107,6 +118,7 @@ impl Sd15 {
             }
         }
         let unet = Unet::load(&cx, &r_u, ucfg)?;
+        adapters.alias_ldm("unet");
         if file.is_none() {
             params += finish("UNet", &paths, &r_u)?;
         }
@@ -125,7 +137,7 @@ impl Sd15 {
 
         device.synchronize()?;
         progress(&format!("loaded SD 1.5: {:.2} B parameters in f16", params as f64 / 1e9));
-        Ok(Sd15 { tok, clip, unet, vae, scheduler, device, dtype, params })
+        Ok(Sd15 { tok, clip, unet, vae, scheduler, device, dtype, adapters, params })
     }
 
     /// The prompt as the UNet reads it: `[1, 77, 768]`.
@@ -135,8 +147,9 @@ impl Sd15 {
     }
 }
 
-impl Painter for Sd15 {
-    fn paint(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+impl Sd15 {
+    /// One image, with whatever LoRAs the adapters hold.
+    fn draw(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
         let req = req.resolved(&self.defaults())?;
         let t0 = Instant::now();
 
@@ -197,11 +210,19 @@ impl Painter for Sd15 {
         let decode_secs = t2.elapsed().as_secs_f64();
         Ok(Painted { image, request: req, encode_secs, denoise_secs, decode_secs })
     }
+}
+
+impl Painter for Sd15 {
+    /// With the request's LoRAs set for it and taken off after.
+    fn paint(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+        let (adapters, device, dtype) = (self.adapters.clone(), self.device.clone(), self.dtype);
+        lora::painting(&adapters, req, &device, dtype, || self.draw(req, on_step))
+    }
 
     fn defaults(&self) -> Defaults {
         // The model was trained at 512²; 25 steps and guidance 7.5 are what
         // its examples use.
-        Defaults { width: 512, height: 512, steps: 25, guidance: 7.5, multiple: 8, takes_guidance: true }
+        Defaults { width: 512, height: 512, steps: 25, guidance: 7.5, multiple: 8, takes_guidance: true, takes_loras: true }
     }
 
     fn summary(&self) -> String {

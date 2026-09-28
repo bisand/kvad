@@ -56,6 +56,18 @@
     return "Too large for memory. It is a mixture, which can stream well if it is sparse enough — the Hub's summary does not say how many experts it has. Open the row to find out.";
   }
 
+  /** A pipeline's class as the model it is, for a LoRA's badge. */
+  const PIPELINE_NAMES = {
+    QwenImagePipeline: "Qwen-Image",
+    StableDiffusionXLPipeline: "SDXL",
+    StableDiffusionPipeline: "SD 1.5",
+    FluxPipeline: "FLUX",
+    LTX2Pipeline: "LTX-2.5",
+  };
+  function loraFor(pipeline) {
+    return PIPELINE_NAMES[pipeline] ?? pipeline;
+  }
+
   /** The badge's words, beside the precision. */
   const diskWord = (f) => (f.crawls ? "crawls" : f.disk_per_token != null ? "streams" : "disk");
 
@@ -359,6 +371,11 @@
               <div class="flex min-w-40 flex-1 items-center gap-2">
                 <span class="truncate font-medium">{m.id}</span>
                 {#if m.trained}<span class="badge badge-sm">trained here</span>{/if}
+                {#if m.lora}
+                  <span class="badge badge-sm badge-soft" title="Applied by a request, on the Images page or with --lora">
+                    {m.adapts ? `LoRA for ${loraFor(m.adapts)}` : "LoRA"}
+                  </span>
+                {/if}
                 {#if models.listing.active === m.id}
                   <span class="badge badge-sm badge-soft">default</span>
                 {/if}
@@ -383,6 +400,7 @@
               <div class="relative z-1 flex gap-1" class:hidden={!may}>
                 <button
                   class="btn btn-sm"
+                  class:hidden={m.lora}
                   disabled={!m.runnable ||
                     !!models.busy ||
                     models.residents.some(
@@ -394,6 +412,7 @@
                 </button>
                 <button
                   class="btn btn-sm btn-ghost"
+                  class:hidden={m.lora}
                   disabled={models.listing.active === m.id}
                   onclick={notToggle(() => models.setActive(m.id))}
                   title="The model `kvad run` picks with no --model"

@@ -23,18 +23,21 @@ The ones started with `kvad chat --save`, and in the web UI. Carry one on with
 pub const IMAGES: &str = "usage: kvad images [ls]
        kvad images make PROMPT [--out FILE] [--model MODEL] [--size WxH] [--steps N]
                                [--guidance F] [--negative TEXT] [--seed N]
+                               [--lora NAME[:SCALE]]...
        kvad images rm ID
 
 Pictures made by an image model on the server — SDXL, SD 1.5, Qwen-Image.
 Every one is kept there, with the settings that made it; `make` also writes it
 here, to --out or to image-ID.png. Anything left out is the model's own
-default.";
+default. --lora applies a LoRA fetched with `kvad pull`, at the strength after
+a colon (1 if none), to Qwen-Image, FLUX, SDXL or SD 1.5.";
 
 pub const VIDEOS: &str = "usage: kvad videos [ls]
        kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]
                                [--seconds S | --frames N] [--fps N] [--seed N] [--silent]
                                [--image PICTURE] [--steps N] [--guidance G] [--negative TEXT]
                                [--decoder diffusion|conv] [--pipeline fast|dfr]
+                               [--lora NAME[:SCALE]]...
        kvad videos show ID
        kvad videos watch ID    follow it until it ends
        kvad videos get ID [--out FILE]
@@ -51,6 +54,9 @@ with no --seconds or --frames, LTX-2.5 chooses the length from the prompt.
 --steps, --guidance or --negative runs LTX-2.5's dev model, guided, rather than
 its distilled one: 30 steps at guidance 3 unless given, about four times as long.
 Its files come from `kvad pull Lightricks/LTX-2.5 --dev` (51 GB).
+
+--lora applies a LoRA fetched with `kvad pull` to every DiT the video's
+pipeline runs, at the strength after a colon (1 if none).
 
 --decoder picks how LTX-2.5's latents become frames: diffusion, the default and
 the reference's, or conv, lighter and about twice as fast to decode.
@@ -1075,6 +1081,9 @@ pub fn images(remote: &Remote, args: &Args) -> Res<()> {
             if args.seed_given {
                 body["seed"] = json!(args.seed);
             }
+            if !args.loras.is_empty() {
+                body["loras"] = json!(args.loras.iter().map(|l| kvad::image::Lora::parse(l)).collect::<Vec<_>>());
+            }
 
             let mut progress = out::Progress::new();
             let started = std::time::Instant::now();
@@ -1218,6 +1227,9 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
             }
             if let Some(p) = &args.pipeline {
                 body["pipeline"] = json!(p);
+            }
+            if !args.loras.is_empty() {
+                body["loras"] = json!(args.loras.iter().map(|l| kvad::image::Lora::parse(l)).collect::<Vec<_>>());
             }
             if let Some(path) = &args.image {
                 let bytes = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;

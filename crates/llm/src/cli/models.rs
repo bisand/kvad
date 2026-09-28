@@ -67,7 +67,11 @@ pub fn ls(remote: &Remote, args: &Args) -> Res<()> {
         if tools.contains(&id) {
             notes.push_str("  tools");
         }
-        let arch = m["arch"].as_str().unwrap_or("?");
+        // A LoRA has no architecture of its own; it is one, and says for what.
+        let arch = match m["lora"].as_bool() == Some(true) {
+            true => "lora",
+            false => m["arch"].as_str().unwrap_or("?"),
+        };
         println!("{:<46} {arch:<11} {:>9}{marker}{notes}", out::cut(&id, 46), out::bytes(&m["bytes"]));
     };
 
@@ -255,20 +259,24 @@ pub fn pull(remote: &Remote, args: &Args) -> Res<()> {
     let job = remote.post("/api/models/pull", &json!({ "repo": repo, "dev": args.dev }))?;
     super::api::follow(remote, &job, args)?;
     // What it makes decides how it is run, and the server's listing says;
-    // a checkpoint file named by its path is in no listing, and makes
+    // a file named by its path is in no listing, and a checkpoint makes
     // pictures.
     let kind = || -> Option<String> {
-        if repo.to_ascii_lowercase().ends_with(".safetensors") {
-            return Some("image".into());
+        let listing = remote.get("/api/models").ok();
+        let m = listing.as_ref().and_then(|l| on_disk(l).find(|m| m["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(&repo))));
+        match m {
+            Some(m) if m["lora"].as_bool() == Some(true) && m["adapts"].as_str() == Some(kvad::video::LTX_PIPELINE) => Some("video lora".into()),
+            Some(m) if m["lora"].as_bool() == Some(true) => Some("lora".into()),
+            Some(m) => m["kind"].as_str().map(str::to_string),
+            None => repo.to_ascii_lowercase().ends_with(".safetensors").then(|| "image".into()),
         }
-        let listing = remote.get("/api/models").ok()?;
-        let m = on_disk(&listing).find(|m| m["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(&repo)))?;
-        m["kind"].as_str().map(str::to_string)
     };
     match (args.json, args.dev) {
         (true, _) => {}
         (false, true) => println!("\nguided videos, 30 steps unless --steps says:  kvad videos make \"…\" --guidance 3"),
         (false, false) => match kind().as_deref() {
+            Some("lora") => println!("\napply it with:  kvad images make \"…\" --model MODEL --lora {repo}"),
+            Some("video lora") => println!("\napply it with:  kvad videos make \"…\" --lora {repo}"),
             Some("image") => println!("\nmake a picture with:  kvad images make \"…\" --model {repo}"),
             Some("video") => println!("\nmake a video with:  kvad videos make \"…\" --model {repo}"),
             _ => println!("\nrun it with:  kvad run --model {repo}"),

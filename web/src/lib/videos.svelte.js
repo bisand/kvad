@@ -60,6 +60,8 @@ class Videos {
   pipeline = $state(null);
   /** The picture to start from, a `File`, and a link to show it by. */
   picture = $state(null);
+  /** LoRAs to apply to every DiT the video's pipeline runs, `{ name, scale }`. */
+  loras = $state([]);
   pictureUrl = $state(null);
   /** Its size, once the page has shown it. */
   pictureSize = $state(null);
@@ -82,6 +84,25 @@ class Videos {
 
   get chosen() {
     return this.choices.find((c) => c.id === this.model) ?? this.choices[0] ?? null;
+  }
+
+  /** LoRAs on this machine for LTX-2.5, as far as their layers' names say,
+   *  and those whose names say nothing. */
+  get loraChoices() {
+    return models.all.filter((m) => m.lora && (!m.adapts || m.adapts === "LTX2Pipeline")).map((m) => m.id);
+  }
+
+  addLora() {
+    const name = this.loraChoices.find((n) => !this.loras.some((l) => l.name === n));
+    if (name) this.loras = [...this.loras, { name, scale: 1 }];
+  }
+
+  setLora(i, change) {
+    this.loras = this.loras.map((l, j) => (j === i ? { ...l, ...change } : l));
+  }
+
+  removeLora(i) {
+    this.loras = this.loras.filter((_, j) => j !== i);
   }
 
   /** What the chosen model does with a knob left blank, and its limits,
@@ -269,11 +290,13 @@ class Videos {
       if (this.negative.trim()) body.negative_prompt = this.negative.trim();
       if (this.decoder) body.decoder = this.decoder;
       if (this.pipeline && !this.guided) body.pipeline = this.pipeline;
+      if (this.loras.length) body.loras = this.loras.map((l) => ({ name: l.name, scale: Number(l.scale) }));
       let request;
       if (this.picture) {
         // A form, whose content type the browser writes with its boundary.
         const form = new FormData();
-        for (const [k, v] of Object.entries(body)) form.append(k, String(v));
+        // A form's fields are text: the LoRAs go as their list in JSON.
+        for (const [k, v] of Object.entries(body)) form.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
         form.append("input_reference", this.picture, this.picture.name || "picture");
         request = { method: "POST", body: form };
       } else {
@@ -311,6 +334,7 @@ class Videos {
     this.decoder = k.decoder ?? null;
     // DFR above 30 fps is the model's own choice; below, it was asked.
     this.pipeline = k.pipeline === "dfr" && k.fps <= 30 ? "dfr" : null;
+    this.loras = (k.loras ?? []).map((l) => ({ name: l.name, scale: l.scale }));
     const resident = models.videoResidents.find((r) => r.repo === v.model);
     this.model = resident?.id ?? v.model;
     if (!k.picture_url) return this.choosePicture(null);

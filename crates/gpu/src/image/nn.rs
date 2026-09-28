@@ -377,15 +377,79 @@ pub(crate) fn timestep_embedding(t: &[f64], dim: usize, cos_first: bool, shift: 
     Ok(Tensor::from_vec(data, (t.len(), dim), device)?)
 }
 
-/// Pixels in `[−1, 1]`, `[1, 3, H, W]`, to 8-bit RGB.
+/// What is wrong with numbers a failed step left behind, if anything: zero
+/// everywhere, or anything in them not finite.
+///
+/// On Metal, candle serves a command buffer that failed as zeros and raises
+/// nothing; an overflow leaves NaN or infinity. Neither a latent nor a VAE's
+/// output is ever exactly zero everywhere, so the test costs nothing real.
+///
+/// It reads the numbers on the host rather than as a reduction on the
+/// device: candle's `max` there skips NaN, so a latent part NaN and part
+/// finite used to pass the check before decoding. In chunks, so each test is
+/// a fold the autovectoriser can take: a 1536 × 1024 clip's 2.3 GB of frames
+/// in about 30 ms, where `all` short of a first failure takes 140.
+fn broken(values: &[f32]) -> Option<&'static str> {
+    let (finite, zero) = values.chunks(1024).fold((true, true), |(finite, zero), c| {
+        (finite && c.iter().fold(true, |a, v| a & v.is_finite()), zero && c.iter().fold(true, |a, &v| a & (v == 0.0)))
+    });
+    match (finite, zero) {
+        (false, _) => Some("with NaN or infinity in it"),
+        (true, true) => Some("zero everywhere"),
+        (true, false) => None,
+    }
+}
+
+/// Refuses a denoised latent that [`broken`] finds fault with, before the
+/// decode spends seconds on it. Copying it to the host is cheap: a 1024²
+/// image's latent is a megabyte in f32.
+pub(crate) fn check_latent(x: &Tensor) -> Res<()> {
+    let Some(what) = broken(&x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?) else { return Ok(()) };
+    Err(format!(
+        "the denoiser's result came back {what}; not decoding it. A failed command buffer on Metal reads as zeros \
+         rather than an error, most often for want of GPU memory, and an overflow leaves NaN"
+    )
+    .into())
+}
+
+/// Refuses what a failed decode leaves behind: pixels that [`broken`] finds
+/// fault with.
+///
+/// The likeliest reason a command buffer fails at the decode is memory: the
+/// VAE's last layers are the pipeline's one stage at full resolution. FLUX
+/// decoding 41 GB into swap, beside a second FLUX in another process, took
+/// 193 s rather than 9 and came back black. Zero is mid-grey in `[−1, 1]`
+/// and pure black in `[0, 1]`, and a real picture is neither to the last
+/// bit. The pixels are on the host by now anyway, and a check on the device
+/// would not see a conversion after it fail.
+pub(crate) fn check_decoded(pixels: &[f32]) -> Res<()> {
+    let Some(what) = broken(pixels) else { return Ok(()) };
+    Err(format!(
+        "the decoded image came back {what}: the decode failed, most likely for want of GPU memory, and a failed \
+         command buffer on Metal reads as zeros rather than an error. Nothing was saved; free some memory (another \
+         model loaded?) and try again"
+    )
+    .into())
+}
+
+/// Pixels in `[−1, 1]`, `[1, 3, H, W]`, to 8-bit RGB, once
+/// [`check_decoded`] has passed them.
+///
+/// The arithmetic is done here on the host, after the check, because on the
+/// device it would be three more command buffers that could fail unseen:
+/// the black 1024² FLUX image that prompted the check was that, or NaN,
+/// which Metal's clamp turns into −1. A VAE's zeros alone would be grey.
 pub(crate) fn to_rgb8(x: &Tensor) -> Res<kvad::image::Image> {
     let (_, c, h, w) = x.dims4()?;
     if c != 3 {
         return Err(format!("a decoded image should have 3 channels, not {c}").into());
     }
-    let x = ((x.to_dtype(DType::F32)?.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
-    let x = x.squeeze(0)?.permute((1, 2, 0))?.contiguous()?;
-    let rgb = x.flatten_all()?.to_vec1::<f32>()?.into_iter().map(|v| v.round() as u8).collect();
+    let planes = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    check_decoded(&planes)?;
+    // Channels first to channels last: the same f32 steps the device took,
+    // so the same bytes out.
+    let n = h * w;
+    let rgb = (0..n * 3).map(|i| ((planes[(i % 3) * n + i / 3].clamp(-1.0, 1.0) + 1.0) * 127.5).round() as u8).collect();
     Ok(kvad::image::Image { width: w, height: h, rgb })
 }
 
@@ -519,6 +583,58 @@ mod tests {
         let worst = d.abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
         assert!(worst < tol, "differ by {worst}");
         worst
+    }
+
+    /// A failed decode's zeros, and NaN or infinity anywhere, are refused,
+    /// in the latent before the decode and in the pixels after it —
+    /// in any chunk, not only the first — while a real image passes, black
+    /// ones included, and comes out as the bytes the device's arithmetic made.
+    #[test]
+    fn blank_or_not_finite_latents_and_pixels_are_refused() {
+        let dev = Device::Cpu;
+        let (h, w) = (5, 7);
+        let image = (Tensor::arange(0f32, (3 * h * w) as f32, &dev).unwrap().reshape((1, 3, h, w)).unwrap() * 0.29)
+            .unwrap()
+            .sin()
+            .unwrap()
+            * 1.3;
+        let image = image.unwrap();
+        let refused = |x: &Tensor| to_rgb8(x).err().map(|e| e.to_string()).unwrap_or_default();
+
+        assert!(refused(&image.zeros_like().unwrap()).contains("zero everywhere"));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut v = image.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            v[3 * h * w - 1] = bad;
+            let x = Tensor::from_vec(v, (1, 3, h, w), &dev).unwrap();
+            assert!(refused(&x).contains("NaN or infinity"), "{bad} passed");
+        }
+        // Past the first chunk: a NaN there is found, and a zero first
+        // chunk is not a zero image.
+        let mut v = vec![0f32; 3000];
+        assert!(check_decoded(&v).is_err());
+        v[2999] = 0.5;
+        assert!(check_decoded(&v).is_ok());
+        v[2500] = f32::NAN;
+        assert!(check_decoded(&v).is_err());
+
+        // A latent part NaN and part finite: what the device's `max`, which
+        // skips NaN, used to let through to the decode.
+        let mut v = image.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        v[17] = f32::NAN;
+        let latent = Tensor::from_vec(v, (1, 3, h, w), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+        assert!(check_latent(&latent).unwrap_err().to_string().contains("not decoding it"));
+        assert!(check_latent(&latent.zeros_like().unwrap()).is_err());
+        assert!(check_latent(&image.to_dtype(DType::BF16).unwrap()).is_ok());
+
+        let black = Tensor::full(-1f32, (1, 3, h, w), &dev).unwrap();
+        assert_eq!(to_rgb8(&black).unwrap().rgb, vec![0u8; 3 * h * w]);
+        // What `to_rgb8` did on the device before it did it here.
+        let x = ((image.clamp(-1f32, 1f32).unwrap() + 1.0).unwrap() * 127.5).unwrap();
+        let x = x.squeeze(0).unwrap().permute((1, 2, 0)).unwrap().contiguous().unwrap();
+        let want: Vec<u8> = x.flatten_all().unwrap().to_vec1::<f32>().unwrap().into_iter().map(|v| v.round() as u8).collect();
+        let got = to_rgb8(&image).unwrap();
+        assert_eq!((got.width, got.height), (w, h));
+        assert_eq!(got.rgb, want);
     }
 
     /// A block of the field is the same numbers as the whole field has

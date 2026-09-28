@@ -23,7 +23,7 @@
 use super::conv3d::{norm_silu, Conv3d};
 use super::metadata;
 use crate::common::Loader;
-use crate::image::nn::Ctx;
+use crate::image::nn::{check_decoded, Ctx};
 use crate::image::{finish, open};
 use crate::prof::span;
 use crate::qcache::Vault;
@@ -541,7 +541,11 @@ pub fn to_video(frames: &Tensor, fps: u32) -> Res<kvad::video::Video> {
     let (_, _, h, w) = frames.dims4()?;
     // Truncated rather than rounded, as the reference quantises.
     let x = (frames.to_dtype(DType::F32)?.permute((0, 2, 3, 1))?.contiguous()? * 255.0)?;
-    let rgb = x.flatten_all()?.to_vec1::<f32>()?.into_iter().map(|v| v as u8).collect();
+    let x = x.flatten_all()?.to_vec1::<f32>()?;
+    // Both decoders hand their frames over on the CPU, so a failed buffer is
+    // already in them as zeros, and the scaling above keeps a zero a zero.
+    check_decoded(&x)?;
+    let rgb = x.into_iter().map(|v| v as u8).collect();
     Ok(kvad::video::Video { width: w, height: h, fps, rgb })
 }
 

@@ -5,7 +5,7 @@
 //! decode. Everything it calls is one of the other files in this directory.
 
 use super::clip::{self, Clip, ClipConfig, Pooled};
-use super::nn::{latent_preview, noise, to_rgb8, Ctx};
+use super::nn::{check_latent, latent_preview, noise, to_rgb8, Ctx};
 use super::schedule;
 use super::unet::{Unet, UnetConfig};
 use super::vae::{Decoder, VaeConfig};
@@ -310,10 +310,7 @@ impl Sdxl {
         // A failed command buffer on Metal leaves zeros behind rather than an
         // error, and an overflow leaves NaN. Either one is worth a sentence
         // rather than a black square.
-        let worst = x.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
-        if !worst.is_finite() || worst == 0.0 {
-            return Err(format!("the denoiser's result is {worst} everywhere it is largest; not decoding it").into());
-        }
+        check_latent(&x)?;
 
         let t2 = Instant::now();
         let pixels = self.vae.decode(&x.to_dtype(self.dtype)?)?;

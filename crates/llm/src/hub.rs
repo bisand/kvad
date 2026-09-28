@@ -676,9 +676,9 @@ pub struct LocalModel {
     /// The GGUF this model is, when it is one: `repo:QUANT`, one file of a
     /// repo of several ([`crate::gguf`]).
     pub gguf: Option<crate::gguf::Local>,
-    /// The SDXL checkpoint file this model is, when it is one: `repo` or
-    /// `repo:file.safetensors` ([`crate::checkpoint`]).
-    pub single: Option<PathBuf>,
+    /// The checkpoint file this model is, SDXL's or SD 1.5's, when it is
+    /// one: `repo` or `repo:file.safetensors` ([`crate::checkpoint`]).
+    pub single: Option<crate::checkpoint::Local>,
 }
 
 impl LocalModel {
@@ -765,7 +765,7 @@ pub fn local_models() -> Vec<LocalModel> {
             // to ask it.
             let config = find_config(&path).and_then(|c| crate::weights::read_json(&c).ok());
             // A repo of GGUFs is a model per file, and so is a repo of SDXL
-            // checkpoints; one whose only model is one checkpoint is that
+            // or SD 1.5 checkpoints; one whose only model is one checkpoint is that
             // model by its own name. The repo itself is one only if it is
             // something else as well. A language model's repo is never read
             // for checkpoints: its files are its shards.
@@ -789,7 +789,7 @@ pub fn local_models() -> Vec<LocalModel> {
                 .map(|g| LocalModel { gguf: Some(g.clone()), ..file_model(g.name(), &g.file) })
                 .collect();
             if config.is_none() {
-                models.extend(crate::checkpoint::locals(&path, &id).into_iter().map(|c| LocalModel { single: Some(c.file.clone()), ..file_model(c.name, &c.file) }));
+                models.extend(crate::checkpoint::locals(&path, &id).into_iter().map(|c| LocalModel { single: Some(c.clone()), ..file_model(c.name, &c.file) }));
             }
             if models.iter().any(|m| m.id == id) || (!models.is_empty() && config.is_none() && !image_weights) {
                 return Some(models);
@@ -822,7 +822,7 @@ pub fn local_models() -> Vec<LocalModel> {
     out
 }
 
-/// An SDXL checkpoint named by its path on this machine, as a model: what
+/// A checkpoint named by its path on this machine, as a model: what
 /// a request may load by name. Not in [`find_local`], whose models `kvad
 /// rm` deletes: a file outside the cache is not Kvad's to delete.
 pub fn checkpoint_at(path: &str) -> Option<LocalModel> {
@@ -841,7 +841,7 @@ pub fn checkpoint_at(path: &str) -> Option<LocalModel> {
         unreadable_as: None,
         reads: Reads::Everything,
         gguf: None,
-        single: Some(c.file),
+        single: Some(c),
     })
 }
 
@@ -941,8 +941,10 @@ pub fn pipeline(model: &LocalModel) -> Option<String> {
         // there not to need, so its base is known by name.
         Some(g) if g.base.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(crate::video::LTX_REPO)) => Some(crate::video::LTX_PIPELINE.to_string()),
         Some(g) => pipeline_in(&repo_dir(g.base.as_deref()?)),
-        None if model.single.is_some() => Some("StableDiffusionXLPipeline".to_string()),
-        None => pipeline_in(&model.path),
+        None => match &model.single {
+            Some(c) => Some(c.kind.pipeline().to_string()),
+            None => pipeline_in(&model.path),
+        },
     }
 }
 
@@ -959,7 +961,7 @@ pub fn repo_dir(repo: &str) -> PathBuf {
 pub fn remove(model: &LocalModel) -> std::io::Result<()> {
     match (&model.gguf, &model.single) {
         (Some(g), _) => remove_cached(&g.file, &g.repo),
-        (None, Some(file)) => remove_cached(file, model.id.split(':').next().unwrap_or(&model.id)),
+        (None, Some(c)) => remove_cached(&c.file, model.id.split(':').next().unwrap_or(&model.id)),
         (None, None) => std::fs::remove_dir_all(&model.path),
     }
 }

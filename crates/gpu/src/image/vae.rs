@@ -55,7 +55,9 @@ impl VaeConfig {
             layers_per_block: n("layers_per_block")?,
             latent: n("latent_channels")?,
             groups: n("norm_num_groups")?,
-            scaling: v.get("scaling_factor").and_then(Value::as_f64).ok_or("VAE config has no `scaling_factor`")?,
+            // Left out, as SD 1.5's config leaves it, it is diffusers'
+            // default for `AutoencoderKL`, which is SD 1.5's own.
+            scaling: v.get("scaling_factor").and_then(Value::as_f64).unwrap_or(0.18215),
             shift: v.get("shift_factor").and_then(Value::as_f64).unwrap_or(0.0),
             post_quant: v.get("use_post_quant_conv").and_then(Value::as_bool).unwrap_or(true),
         })

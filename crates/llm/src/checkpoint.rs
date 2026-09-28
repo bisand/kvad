@@ -1,33 +1,74 @@
-//! Names for SDXL checkpoints in one file, in Stability's own layout.
+//! Names for SDXL and SD 1.5 checkpoints in one file, in Stability's own
+//! layout.
 //!
 //! A diffusers repo is a model by its name alone. A checkpoint in one file
 //! is named three ways:
 //!
 //! - **`repo`**, when the repo's only model is one checkpoint, as Pony's is:
 //!   no `config.json`, no `model_index.json`, and one `.safetensors` file at
-//!   its top.
+//!   its top. Only the Hub can say that a repo holds nothing else; the
+//!   cache holds what was fetched, and one file of `Lykon/DreamShaper`'s 37,
+//!   beside no model index, would look like the whole repo. So a pull that
+//!   found it so by the repo's name records it in the cache entry
+//!   ([`ONLY`]), and a checkpoint is listed by its repo's name only then.
 //! - **`repo:file.safetensors`**, for a repo with several, or with diffusers
 //!   folders beside it, as Illustrious' and the SDXL base's have.
 //! - **A path to a file on this machine**, for what the Hub does not have:
 //!   Civitai's, which Kvad cannot fetch.
 //!
-//! A file is one of these only if its header is SDXL's: the UNet under
-//! `model.diffusion_model.` and bigG under `conditioner.embedders.1.model.`.
-//! A LoRA beside a checkpoint, or an SD 1.5 file, is not. On the Hub the
-//! header is read with a range request, so a file that is not one is refused
-//! before its gigabytes are fetched. The GPU crate reads the file and knows
-//! the layout; this module finds it.
+//! A file is one of these only if its header is one of the two [`Kind`]s:
+//! the UNet under `model.diffusion_model.`, and SDXL's bigG under
+//! `conditioner.embedders.1.model.` or SD 1.5's CLIP-L under
+//! `cond_stage_model.transformer.`. A LoRA beside a checkpoint is neither,
+//! and nor is SD 2's, whose text encoder is OpenCLIP's under
+//! `cond_stage_model.model.`. On the Hub the header is read with a range
+//! request, so a file that is not one is refused before its gigabytes are
+//! fetched. The GPU crate reads the file and knows the layout; this module
+//! finds it, and says which it is.
 
 use crate::weights::{fetch_file, Watcher};
 use std::path::{Path, PathBuf};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// Which model a checkpoint in one file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Sdxl,
+    Sd15,
+}
+
+impl Kind {
+    /// The diffusers pipeline its models are, and so the one that runs it.
+    pub fn pipeline(self) -> &'static str {
+        match self {
+            Kind::Sdxl => "StableDiffusionXLPipeline",
+            Kind::Sd15 => "StableDiffusionPipeline",
+        }
+    }
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Kind::Sdxl => "SDXL",
+            Kind::Sd15 => "SD 1.5",
+        })
+    }
+}
+
+/// The file, at the top of a cache entry, that names the checkpoint a pull
+/// by the repo's name found to be the repo's only model: the one it is
+/// listed as the repo for. Beside `blobs/` and `snapshots/`, where `hf-hub`
+/// reads nothing, and deleted with the entry.
+pub const ONLY: &str = "kvad-only-checkpoint";
+
 /// A checkpoint on this machine, by the name it is known by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Local {
     pub name: String,
     pub file: PathBuf,
+    pub kind: Kind,
 }
 
 /// `repo:file.safetensors` as its two halves.
@@ -44,15 +85,25 @@ pub fn is_path(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".safetensors") && (crate::weights::looks_like_path(name) || Path::new(name).is_file())
 }
 
-/// Whether a file with these tensors is an SDXL checkpoint in Stability's
-/// layout.
-pub fn is_sdxl<'a>(names: impl IntoIterator<Item = &'a str>) -> bool {
-    let (mut unet, mut big_g) = (false, false);
+/// Which checkpoint in Stability's layout a file with these tensors is, if
+/// it is one: a UNet and one of the two text encoders, and not both.
+pub fn kind<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<Kind> {
+    let (mut unet, mut big_g, mut clip_l) = (false, false, false);
     for n in names {
         unet |= n.starts_with("model.diffusion_model.");
         big_g |= n.starts_with("conditioner.embedders.1.model.");
+        clip_l |= n.starts_with("cond_stage_model.transformer.");
     }
-    unet && big_g
+    match (unet, big_g, clip_l) {
+        (true, true, false) => Some(Kind::Sdxl),
+        (true, false, true) => Some(Kind::Sd15),
+        _ => None,
+    }
+}
+
+/// The kind of the file at `path`, from its header.
+fn kind_of(path: &Path) -> Option<Kind> {
+    kind(names(path)?.iter().map(String::as_str))
 }
 
 /// The tensor names in a safetensors file's header.
@@ -99,25 +150,28 @@ pub fn remote_names(repo: &str, file: &str) -> Res<Vec<String>> {
     header_names(&get(8, 8 + len - 1)?).ok_or_else(|| format!("{file} in {repo} has no safetensors header").into())
 }
 
-/// The SDXL checkpoints at the top of a cache entry, `dir`, of `repo`, by
-/// the names they are known by: the repo's own, if the file is all it holds.
+/// The checkpoints at the top of a cache entry, `dir`, of `repo`, by the
+/// names they are known by: the repo's own, if the file is all it holds.
 pub fn locals(dir: &Path, repo: &str) -> Vec<Local> {
     let Ok(revisions) = std::fs::read_dir(dir.join("snapshots")) else { return Vec::new() };
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let mut files: Vec<(String, PathBuf, Kind)> = Vec::new();
     for rev in revisions.filter_map(|e| e.ok()).map(|e| e.path()) {
         let Ok(entries) = std::fs::read_dir(&rev) else { continue };
         for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            if name.to_ascii_lowercase().ends_with(".safetensors") && path.is_file() && !files.iter().any(|(n, _)| *n == name) && names(&path).is_some_and(|n| is_sdxl(n.iter().map(String::as_str))) {
-                files.push((name, path));
+            if !name.to_ascii_lowercase().ends_with(".safetensors") || !path.is_file() || files.iter().any(|(n, _, _)| *n == name) {
+                continue;
+            }
+            if let Some(kind) = kind_of(&path) {
+                files.push((name, path, kind));
             }
         }
     }
-    files.sort();
-    let alone = files.len() == 1 && crate::hub::model_file(dir, "config.json").is_none() && crate::hub::model_file(dir, "model_index.json").is_none();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let only = std::fs::read_to_string(dir.join(ONLY)).ok();
     files
         .into_iter()
-        .map(|(f, file)| Local { name: if alone { repo.to_string() } else { format!("{repo}:{f}") }, file })
+        .map(|(f, file, kind)| Local { name: if only.as_deref() == Some(f.as_str()) { repo.to_string() } else { format!("{repo}:{f}") }, file, kind })
         .collect()
 }
 
@@ -125,7 +179,7 @@ pub fn locals(dir: &Path, repo: &str) -> Vec<Local> {
 pub fn local(name: &str) -> Option<Local> {
     if is_path(name) {
         let file = std::fs::canonicalize(name).ok()?;
-        return names(&file).is_some_and(|n| is_sdxl(n.iter().map(String::as_str))).then(|| Local { name: name.to_string(), file });
+        return kind_of(&file).map(|kind| Local { name: name.to_string(), file, kind });
     }
     let repo = split(name).map_or(name, |(r, _)| r);
     if !repo.contains('/') || crate::gguf::split(name).is_some() {
@@ -136,11 +190,14 @@ pub fn local(name: &str) -> Option<Local> {
 }
 
 /// A checkpoint on the Hub: the file `name` means in its repo, found
-/// without downloading it, and checked to be SDXL's.
+/// without downloading it, and which kind it is.
 #[derive(Debug, Clone)]
 pub struct Found {
     pub repo: String,
     pub file: String,
+    pub kind: Kind,
+    /// Named by the repo alone, and so the repo's only model.
+    pub only: bool,
 }
 
 /// A repo named alone, on the Hub: the `.safetensors` files at its top, if
@@ -154,34 +211,58 @@ pub fn candidates(repo: &str) -> Res<Option<Vec<String>>> {
     Ok(Some(files.into_iter().filter(|f| !f.contains('/') && f.to_ascii_lowercase().ends_with(".safetensors")).collect()))
 }
 
+/// The most files at a repo's top whose headers [`find`] reads to count
+/// its checkpoints; past it, the repo is a collection to name a file of.
+const PROBED: usize = 8;
+
 /// Find the checkpoint `name` means on the Hub.
 pub fn find(name: &str) -> Res<Found> {
-    let (repo, file) = match split(name) {
-        Some((repo, file)) => (repo.to_string(), file.to_string()),
+    let not_one = |file: &str, repo: &str| format!("{file} in {repo} is neither an SDXL nor an SD 1.5 checkpoint in Stability's layout, the kinds of single file read here");
+    match split(name) {
+        Some((repo, file)) => {
+            let kind = kind(remote_names(repo, file)?.iter().map(String::as_str)).ok_or_else(|| not_one(file, repo))?;
+            Ok(Found { repo: repo.to_string(), file: file.to_string(), kind, only: false })
+        }
         None if name.contains('/') && !crate::weights::looks_like_path(name) => {
             let tops = candidates(name)?.ok_or_else(|| format!("{name} is a model of its own, not one checkpoint in a file"))?;
-            match tops.as_slice() {
-                [one] => (name.to_string(), one.to_string()),
-                [] => return Err(format!("{name} has no checkpoint file").into()),
+            let list = |files: &[String]| files.iter().map(|f| format!("{name}:{f}")).collect::<Vec<_>>().join(", ");
+            if tops.len() > PROBED {
+                return Err(format!("{name} has {} .safetensors files at its top; name the checkpoint: {}", tops.len(), list(&tops)).into());
+            }
+            // Only a checkpoint counts: Pony's repo keeps SDXL's VAE beside
+            // its one model, which is no second one.
+            let mut found = Vec::new();
+            for f in &tops {
+                if let Some(k) = kind(remote_names(name, f)?.iter().map(String::as_str)) {
+                    found.push((f.clone(), k));
+                }
+            }
+            match found.as_slice() {
+                [(file, kind)] => Ok(Found { repo: name.to_string(), file: file.clone(), kind: *kind, only: true }),
+                [] if tops.len() == 1 => Err(not_one(&tops[0], name).into()),
+                [] => Err(format!("{name} has no SDXL or SD 1.5 checkpoint in Stability's layout among its {} .safetensors files", tops.len()).into()),
                 many => {
-                    let list: Vec<String> = many.iter().map(|f| format!("{name}:{f}")).collect();
-                    return Err(format!("{name} has {} .safetensors files at its top; name the checkpoint: {}", many.len(), list.join(", ")).into());
+                    let files: Vec<String> = many.iter().map(|(f, _)| f.clone()).collect();
+                    Err(format!("{name} has {} checkpoints at its top; name one: {}", many.len(), list(&files)).into())
                 }
             }
         }
-        None => return Err(format!("`{name}` is not a checkpoint's name").into()),
-    };
-    let names = remote_names(&repo, &file)?;
-    if !is_sdxl(names.iter().map(String::as_str)) {
-        return Err(format!("{file} in {repo} is not an SDXL checkpoint in Stability's layout, which is the one kind of single file read here").into());
+        None => Err(format!("`{name}` is not a checkpoint's name").into()),
     }
-    Ok(Found { repo, file })
 }
 
-/// Download what [`find`] found, or take it from the cache.
+/// Download what [`find`] found, or take it from the cache; and record, for
+/// one found as its repo's only model, that it is ([`ONLY`]).
 pub fn fetch(found: &Found, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<PathBuf> {
     progress(&format!("fetching {} from {}", found.file, found.repo));
-    fetch_file(&found.repo, &found.file, watch)
+    let path = fetch_file(&found.repo, &found.file, watch)?;
+    // In the cache entry the file is in: a directory standing in for the
+    // repo has none, and its files are named by their paths.
+    let entry = format!("models--{}", found.repo.replace('/', "--"));
+    if let (true, Some(dir)) = (found.only, path.ancestors().find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == entry))) {
+        std::fs::write(dir.join(ONLY), &found.file)?;
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -200,15 +281,19 @@ mod tests {
     }
 
     #[test]
-    fn an_sdxl_file_has_a_unet_and_big_g() {
-        assert!(is_sdxl(["model.diffusion_model.out.2.weight", "conditioner.embedders.1.model.ln_final.weight"]));
-        assert!(!is_sdxl(["model.diffusion_model.out.2.weight", "cond_stage_model.transformer.text_model.final_layer_norm.weight"]), "SD 1.5");
-        assert!(!is_sdxl(["lora_unet_down_blocks_0_attentions_0_proj_in.lora_down.weight"]), "a LoRA");
+    fn a_file_is_known_by_its_unet_and_text_encoder() {
+        let unet = "model.diffusion_model.out.2.weight";
+        assert_eq!(kind([unet, "conditioner.embedders.1.model.ln_final.weight"]), Some(Kind::Sdxl));
+        assert_eq!(kind([unet, "cond_stage_model.transformer.text_model.final_layer_norm.weight"]), Some(Kind::Sd15));
+        assert_eq!(kind([unet, "cond_stage_model.model.ln_final.weight"]), None, "SD 2's OpenCLIP");
+        assert_eq!(kind(["cond_stage_model.transformer.text_model.final_layer_norm.weight"]), None, "no UNet");
+        assert_eq!(kind(["lora_unet_down_blocks_0_attentions_0_proj_in.lora_down.weight"]), None, "a LoRA");
     }
 
-    /// A repo whose only model is one checkpoint is named by the repo; one
-    /// with a checkpoint beside its diffusers folders, by the file; a LoRA
-    /// beside it is no checkpoint at all.
+    /// A repo a pull found to have one checkpoint and nothing else is named
+    /// by the repo; one with a checkpoint beside its diffusers folders, or
+    /// one file of several fetched and nothing to say there are no others,
+    /// by the file; a LoRA beside it is no checkpoint at all.
     #[test]
     fn a_cache_entry_names_its_checkpoints() {
         let root = std::env::temp_dir().join(format!("kvad-checkpoint-{}", std::process::id()));
@@ -226,8 +311,17 @@ mod tests {
         let alone = root.join("models--o--pony/snapshots/abc");
         std::fs::create_dir_all(&alone).unwrap();
         file(&alone.join("pony.safetensors"), &sdxl);
+        std::fs::write(root.join("models--o--pony").join(ONLY), "pony.safetensors").unwrap();
         let got = locals(&root.join("models--o--pony"), "o/pony");
         assert_eq!(got.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["o/pony"]);
+
+        // One of a repo's several files, fetched by its name: the cache
+        // cannot tell it from a repo's only one, and the record is not there.
+        let one_of = root.join("models--o--shaper/snapshots/abc");
+        std::fs::create_dir_all(&one_of).unwrap();
+        file(&one_of.join("shaper_8.safetensors"), &sdxl);
+        let got = locals(&root.join("models--o--shaper"), "o/shaper");
+        assert_eq!(got.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["o/shaper:shaper_8.safetensors"]);
 
         let beside = root.join("models--o--base/snapshots/abc");
         std::fs::create_dir_all(&beside).unwrap();
@@ -236,6 +330,16 @@ mod tests {
         file(&beside.join("offset-lora.safetensors"), &["lora_unet_x.lora_down.weight"]);
         let got = locals(&root.join("models--o--base"), "o/base");
         assert_eq!(got.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["o/base:base.safetensors"]);
+        assert_eq!(got[0].kind, Kind::Sdxl);
+
+        // SD 1.5's base: its file beside its folders, and the schedule's
+        // tables beside its models.
+        let sd15 = root.join("models--o--sd15/snapshots/abc");
+        std::fs::create_dir_all(&sd15).unwrap();
+        std::fs::write(sd15.join("model_index.json"), "{}").unwrap();
+        file(&sd15.join("v1-5.safetensors"), &["model.diffusion_model.out.2.weight", "cond_stage_model.transformer.text_model.final_layer_norm.weight", "alphas_cumprod"]);
+        let got = locals(&root.join("models--o--sd15"), "o/sd15");
+        assert_eq!(got.iter().map(|l| (l.name.as_str(), l.kind)).collect::<Vec<_>>(), [("o/sd15:v1-5.safetensors", Kind::Sd15)]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

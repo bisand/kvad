@@ -2432,6 +2432,22 @@ kvad images make "score_9, a red fox in fresh snow" --model LyliaEngine/Pony_Dif
 kvad images make "a lighthouse at dusk" --model ~/Downloads/some-sdxl-finetune.safetensors
 ```
 
+Stable Diffusion 1.5 is SDXL's parts at a smaller size: one text encoder,
+read to its last layer; a UNet of four levels with no size conditioning,
+whose transformers project with 1×1 convolutions; and its own VAE, which,
+unlike SDXL's, stays in range in f16. Each part matches diffusers at
+112–121 dB in f32 ([docs/sd15-plan.md](docs/sd15-plan.md)). It is here for
+its fine-tunes, which load by the same three kinds of name as SDXL's, and
+from one file its VAE is the file's own, since a fine-tune's often is: all
+248 of DreamShaper 8's VAE tensors differ from the base's. At 512² and 25
+steps it takes 0.75 s a step on an M5 Pro, and the server charges 1.9 GB.
+
+```bash
+kvad images make "a red fox in fresh snow" --model stable-diffusion-v1-5/stable-diffusion-v1-5
+kvad pull ckpt/anything-v5.0
+kvad images make "1girl, reading in a library" --model ckpt/anything-v5.0
+```
+
 Two things in it are measurements rather than code:
 
 - **The previews.** Each step can carry a picture of where it is heading,

@@ -555,6 +555,13 @@ fn resolve(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher, ask: 
         shards.iter().all(|s| matches!(cache(s), Cached::Here(_))).then_some(index)
     };
 
+    // The config first: it is kilobytes, and a repo without one is no
+    // language model, which is better found out before its weights are
+    // fetched than after. A repo whose only model is a checkpoint in one
+    // file is refused here, and its pull then reads the file's header first
+    // (`crate::checkpoint`), and fetches it only if it is one.
+    let config = get("config.json")?;
+
     // Single file, or a shard index naming several.
     let weights = match cache("model.safetensors") {
         Cached::Here(single) => vec![fetched("model.safetensors", single)],
@@ -571,7 +578,7 @@ fn resolve(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher, ask: 
     let files = ModelFiles {
         weights,
         tokenizer: get("tokenizer.json")?,
-        config: get("config.json")?,
+        config,
         tokenizer_config: try_get("tokenizer_config.json"),
         generation_config: try_get("generation_config.json"),
     };
@@ -621,16 +628,19 @@ pub fn fetch_file(repo_id: &str, filename: &str, watch: &Watcher) -> Res<PathBuf
 /// Names a checkpoint may hold that are not weights, so leaving them unread is
 /// correct rather than a gap in the implementation.
 ///
-/// Both are constants an engine builds for itself. `rotary_emb.inv_freq` is the
+/// Each is a constant an engine builds for itself. `rotary_emb.inv_freq` is the
 /// RoPE frequency table, which Llama-2-era exports saved as a buffer and every
 /// loader here computes from `rope_theta`. GPT-2's `attn.bias` is its causal
 /// mask — a lower-triangular block of ones the size of the context window,
-/// stored because `torch` had nowhere else to put it.
+/// stored because `torch` had nowhere else to put it. CLIP's
+/// `embeddings.position_ids` is the numbers 0 to 76, which older exports of
+/// its text model (SD 1.5's) saved the same way.
 ///
 /// The list is exact on purpose. Anything not here that nobody reads is a piece
 /// of the model that is not running.
 pub fn derived(name: &str) -> bool {
     name.ends_with("rotary_emb.inv_freq")
+        || name.ends_with("embeddings.position_ids")
         || name.ends_with("attn.bias")
         || name.ends_with("attn.masked_bias")
 }

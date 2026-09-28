@@ -8,8 +8,9 @@
 //! `model_index.json` names a pipeline `kvad_gpu::image` implements),
 //! `--quant Q`, `--gguf FILE`, a community GGUF of the repo's denoiser to
 //! read in place of its own (Qwen-Image's or FLUX.1-schnell's), and
-//! `--single FILE`, an SDXL checkpoint in Stability's one-file layout, whose
-//! configs come from `--repo` (SDXL's base unless it says otherwise).
+//! `--single FILE`, an SDXL or SD 1.5 checkpoint in Stability's one-file
+//! layout, whose configs come from `--repo` (the base of its kind unless it
+//! says otherwise).
 //!
 //! Reports the time spent in each of the three models, because they are
 //! nothing alike: the text encoders run once over 77 tokens, the denoiser
@@ -56,7 +57,17 @@ fn main() -> Res<()> {
     let mut painter: Box<dyn kvad::image::Painter> = match &single {
         Some(file) => {
             let device = kvad_gpu::model::pick_device(None)?;
-            Box::new(kvad_gpu::image::sdxl::Sdxl::load_with(&repo, Some(file), device, &mut |m| eprintln!("  {m}"), &Watcher::none())?)
+            let names = kvad::checkpoint::names(file).ok_or("--single is no safetensors file")?;
+            match kvad::checkpoint::kind(names.iter().map(String::as_str)) {
+                Some(kvad::checkpoint::Kind::Sdxl) => Box::new(kvad_gpu::image::sdxl::Sdxl::load_with(&repo, Some(file), device, &mut |m| eprintln!("  {m}"), &Watcher::none())?),
+                None => return Err("--single is neither an SDXL nor an SD 1.5 checkpoint in Stability's layout".into()),
+                // Its configs are SD 1.5's base's unless `--repo` names
+                // another.
+                Some(kvad::checkpoint::Kind::Sd15) => {
+                    let repo = if repo == kvad_gpu::image::sdxl::REPO { kvad_gpu::image::sd15::REPO } else { &repo };
+                    Box::new(kvad_gpu::image::sd15::Sd15::load_with(repo, Some(file), device, &mut |m| eprintln!("  {m}"), &Watcher::none())?)
+                }
+            }
         }
         None => kvad_gpu::image::load_with(&repo, gguf.as_deref(), quant, &mut |m| eprintln!("  {m}"), &Watcher::none())?,
     };

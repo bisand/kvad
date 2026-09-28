@@ -422,7 +422,8 @@ pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>, dev: bool) -> Re
             // A GGUF, `repo:QUANT`: one file of its repo, and its base's
             // text encoder, VAE and configs.
             false if kvad::gguf::split(&repo).is_some() => crate::engine::pull_gguf(&repo, &mut progress, &watch),
-            // An SDXL checkpoint in one file, named by the file or a path.
+            // A checkpoint in one file, SDXL's or SD 1.5's, named by the file
+            // or a path.
             false if kvad::checkpoint::split(&repo).is_some() || kvad::checkpoint::is_path(&repo) => {
                 crate::engine::pull_single(&repo, &mut progress, &watch)
             }

@@ -23,7 +23,7 @@
 
 use super::lora::{self, Adapters};
 use super::mmdit::{norm_out, Double, Names, Shape};
-use super::nn::{latent_preview, noise, timestep_embedding, to_rgb8, Conv2d, Ctx, Linear};
+use super::nn::{check_latent, latent_preview, noise, timestep_embedding, to_rgb8, Conv2d, Ctx, Linear};
 use super::schedule;
 use super::{finish, finish_gguf, local_file, open, read_json};
 use crate::common::{Loader, Reader, Stored};
@@ -895,10 +895,7 @@ impl QwenImage {
         }
         let denoise_secs = t1.elapsed().as_secs_f64();
 
-        let worst = x.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
-        if !worst.is_finite() || worst == 0.0 {
-            return Err(format!("the denoiser's result is {worst} everywhere it is largest; not decoding it").into());
-        }
+        check_latent(&x)?;
         let t2 = Instant::now();
         let pixels = self.vae.decode(&unpack(&x, rows, cols)?.to_dtype(DType::BF16)?)?;
         let image = to_rgb8(&pixels)?;

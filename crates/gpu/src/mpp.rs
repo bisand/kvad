@@ -524,18 +524,19 @@ MMQ_ALL(q6_K)
 // With ACC, `C += A · B`: what is in `C` joins the f32 sums before they are
 // rounded, once. `C` filled with a bias's rows is then `A · B + b` rounded
 // as PyTorch's `addmm` rounds it, where adding the bias to the rounded
-// product rounds twice.
-template <typename T, int TM, int TN, int TSG, bool ACC>
+// product rounds twice. `C` may be f32 where `A` and `B` are halves: a
+// LoRA's side path added into an f32 layer's answer (`dense_acc`).
+template <typename T, typename TC, int TM, int TN, int TSG, bool ACC>
 kernel void mm_dense(device T *a [[buffer(0)]],
                      device T *b [[buffer(1)]],
-                     device T *c [[buffer(2)]],
+                     device TC *c [[buffer(2)]],
                      constant int &M [[buffer(3)]],
                      constant int &N [[buffer(4)]],
                      constant int &K [[buffer(5)]],
                      uint2 tg [[threadgroup_position_in_grid]]) {
     tensor<device T, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
     tensor<device T, dextents<int32_t, 2>, tensor_inline> tb(b, dextents<int32_t, 2>(N, K));
-    tensor<device T, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
+    tensor<device TC, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
     constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), false, false, false,
                                               ACC ? matmul2d_descriptor::mode::multiply_accumulate
                                                   : matmul2d_descriptor::mode::multiply);
@@ -548,9 +549,11 @@ kernel void mm_dense(device T *a [[buffer(0)]],
 
 #define DENSE(T, tn, TM, TN, TSG) \
     template [[host_name("mm_dense_" #tn "_" #TM "x" #TN)]] [[kernel]] \
-    decltype(mm_dense<T, TM, TN, TSG, false>) mm_dense<T, TM, TN, TSG, false>; \
+    decltype(mm_dense<T, T, TM, TN, TSG, false>) mm_dense<T, T, TM, TN, TSG, false>; \
     template [[host_name("mm_dense_acc_" #tn "_" #TM "x" #TN)]] [[kernel]] \
-    decltype(mm_dense<T, TM, TN, TSG, true>) mm_dense<T, TM, TN, TSG, true>;
+    decltype(mm_dense<T, T, TM, TN, TSG, true>) mm_dense<T, T, TM, TN, TSG, true>; \
+    template [[host_name("mm_dense_acc32_" #tn "_" #TM "x" #TN)]] [[kernel]] \
+    decltype(mm_dense<T, float, TM, TN, TSG, true>) mm_dense<T, float, TM, TN, TSG, true>;
 DENSE(half, f16, 64, 64, 4)
 DENSE(half, f16, 128, 128, 8)
 DENSE(bfloat, bf16, 64, 64, 4)
@@ -571,9 +574,9 @@ pub(crate) fn available(device: &Device) -> bool {
 struct Pipes {
     /// Each of [`KINDS`], `[f16, bf16]` in, each `[f32, f16, bf16]` out.
     q: [[[ComputePipeline; 3]; 2]; 4],
-    /// `[C = A·B, C += A·B]`, each `[f16, bf16]`, each in [`DENSE_TILES`]'
-    /// order.
-    dense: [[[ComputePipeline; 2]; 2]; 2],
+    /// `[C = A·B, C += A·B, f32 C += A·B]`, each `[f16, bf16]`, each in
+    /// [`DENSE_TILES`]' order.
+    dense: [[[ComputePipeline; 2]; 2]; 3],
 }
 
 fn pipes(device: &Device) -> Option<&'static Pipes> {
@@ -607,7 +610,7 @@ fn pipes(device: &Device) -> Option<&'static Pipes> {
             };
             let q = |kind: &str| -> Result<[[ComputePipeline; 3]; 2], candle_metal_kernels::MetalKernelError> { Ok([q(kind, "f16")?, q(kind, "bf16")?]) };
             let [a, b, c, d] = KINDS.map(|(_, name, _, _)| name);
-            Ok(Pipes { q: [q(a)?, q(b)?, q(c)?, q(d)?], dense: [dense("")?, dense("acc_")?] })
+            Ok(Pipes { q: [q(a)?, q(b)?, q(c)?, q(d)?], dense: [dense("")?, dense("acc_")?, dense("acc32_")?] })
         });
         match built {
             Ok(p) => Some(p),
@@ -879,6 +882,30 @@ fn dense_bias_with(x: &Tensor, w: &Tensor, b: &Tensor, tile: usize) -> candle_co
     Ok(c)
 }
 
+/// `c += x · w` on the matrix units, in place, `c` in `x`'s dtype or in
+/// f32, where `x` and `w` are f16 or bf16: what `c` holds joins the sums,
+/// and the answer is rounded once, into `c`'s dtype. `false` where [`dense`]
+/// would decline, or `c` is not a contiguous `[m, n]` of its own, and the
+/// caller adds the product itself.
+///
+/// A LoRA's side path, `y + (x·A)·B`, is this with `c` the layer's answer:
+/// one kernel where the product, its cast to `y`'s dtype and the sum were
+/// three passes over the answer, each as long as the product itself
+/// (`lora::cost`).
+pub(crate) fn dense_acc(c: &Tensor, x: &Tensor, w: &Tensor) -> candle_core::Result<bool> {
+    if dense_declines(x, w, DENSE_ROWS)?
+        || c.dims() != [x.dim(0)?, w.dim(1)?]
+        || !(c.dtype() == x.dtype() || c.dtype() == DType::F32)
+        || !c.is_contiguous()
+        || c.layout().start_offset() != 0
+    {
+        return Ok(false);
+    }
+    let tile = usize::from(x.dim(0)? >= BIG_TILE_ROWS);
+    c.inplace_op3(&x.contiguous()?, w, &Dense { tile })?;
+    Ok(true)
+}
+
 /// [`dense`] in a given tile, whatever the shape: for the tests, and for
 /// measuring where the thresholds belong.
 fn dense_with(x: &Tensor, w: &Tensor, tile: usize) -> candle_core::Result<Tensor> {
@@ -891,8 +918,9 @@ struct Dense {
 }
 
 impl Dense {
-    /// `a · b` into `out`, or with `acc`, `out + a · b`.
-    fn run(&self, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout, out: &candle_metal_kernels::metal::Buffer, acc: bool)
+    /// `a · b` into `out`; with `acc` 1, `out + a · b`; with 2, the same into
+    /// an f32 `out`.
+    fn run(&self, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout, out: &candle_metal_kernels::metal::Buffer, acc: usize)
      -> candle_core::Result<()> {
         let (m, k) = la.shape().dims2()?;
         let (_, n) = lb.shape().dims2()?;
@@ -905,7 +933,7 @@ impl Dense {
         let guard = dev.command_encoder()?;
         let enc: &ComputeCommandEncoder = guard.as_ref();
         enc.set_label("mpp_dense");
-        enc.set_compute_pipeline_state(&pipes.dense[usize::from(acc)][usize::from(dt == DType::BF16)][self.tile]);
+        enc.set_compute_pipeline_state(&pipes.dense[acc][usize::from(dt == DType::BF16)][self.tile]);
         enc.set_input_buffer(0, Some(a.buffer()), la.start_offset() * dt.size_in_bytes());
         enc.set_input_buffer(1, Some(b.buffer()), lb.start_offset() * dt.size_in_bytes());
         enc.set_output_buffer(2, Some(out), 0);
@@ -954,7 +982,7 @@ impl CustomOp2 for Dense {
             let mut blit = dev.blit_command_encoder()?;
             blit.fill_buffer(&out, (0, bytes), 0xff);
         }
-        self.run(a, la, b, lb, &out, false)?;
+        self.run(a, la, b, lb, &out, 0)?;
         Ok((MetalStorage::new(out, dev.clone(), m * n, dt), Shape::from((m, n))))
     }
 }
@@ -973,10 +1001,10 @@ impl candle_core::InplaceOp3 for Dense {
     fn metal_fwd(&self, c: &mut MetalStorage, lc: &Layout, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout)
      -> candle_core::Result<()> {
         let (m, n) = Dense::shape_of(a, la, b, lb)?;
-        if lc.dims() != [m, n] || c.dtype() != a.dtype() || !lc.is_contiguous() || lc.start_offset() != 0 {
+        if lc.dims() != [m, n] || (c.dtype() != a.dtype() && c.dtype() != DType::F32) || !lc.is_contiguous() || lc.start_offset() != 0 {
             candle_core::bail!("mpp_dense: accumulating [{m}, {n}] {:?} into {lc:?} {:?}", a.dtype(), c.dtype());
         }
-        self.run(a, la, b, lb, c.buffer(), true)
+        self.run(a, la, b, lb, c.buffer(), if c.dtype() == a.dtype() { 1 } else { 2 })
     }
 }
 
@@ -1205,6 +1233,42 @@ mod tests {
                         .max_all().unwrap().to_scalar::<f32>().unwrap();
                     assert!(most <= ulp, "{what}: {most} of its own size from the exact answer");
                 }
+            }
+        }
+    }
+
+    /// `c += x · w` into an f32 `c`, halves in: the f32 product added to
+    /// what `c` held, to within f32's own rounding of the sums, in both
+    /// dtypes and tiles and at ragged edges; and into a `c` of the inputs'
+    /// own dtype, within one rounding of that.
+    #[test]
+    fn dense_acc_adds_into_what_is_there() {
+        let Ok(dev) = Device::new_metal(0) else { return };
+        if !available(&dev) {
+            return;
+        }
+        for dt in [DType::F16, DType::BF16] {
+            for (m, k, n) in [(4096, 64, 3072), (77, 64, 192), (300, 16, 70), (129, 32, 130), (8, 64, 20)] {
+                let on = |t: Tensor, d: DType| t.to_dtype(d).unwrap().to_device(&dev).unwrap();
+                let x = on((rand(m * k, m as f32).reshape((m, k)).unwrap() * 4.0).unwrap(), dt);
+                let w = on(rand(k * n, n as f32 + 0.5).reshape((k, n)).unwrap(), dt);
+                let y = (rand(m * n, 3.0).reshape((m, n)).unwrap() * 8.0).unwrap();
+                let f = |t: &Tensor| t.to_dtype(DType::F32).unwrap().to_device(&Device::Cpu).unwrap();
+                let exact = (f(&x).matmul(&f(&w)).unwrap() + &y).unwrap();
+                let what = format!("{dt:?} [{m}, {k}] x [{k}, {n}]");
+                let c = on(y.clone(), DType::F32);
+                assert!(dense_acc(&c, &x, &w).unwrap(), "{what}: declined");
+                let apart = (f(&c) - &exact).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+                assert!(apart <= 1e-3, "{what}: {apart} from the f32 answer");
+                // In the inputs' dtype, `c` starts rounded; the sum from
+                // there is rounded once more.
+                let c = on(y.clone(), dt);
+                let exact = (f(&x).matmul(&f(&w)).unwrap() + f(&c)).unwrap();
+                assert!(dense_acc(&c, &x, &w).unwrap(), "{what}: declined in {dt:?}");
+                let ulp = if dt == DType::F16 { 1.0 / 1024.0 } else { 1.0 / 128.0 };
+                let most = (f(&c) - &exact).unwrap().abs().unwrap().broadcast_div(&exact.abs().unwrap().maximum(1e-3).unwrap()).unwrap()
+                    .max_all().unwrap().to_scalar::<f32>().unwrap();
+                assert!(most <= ulp, "{what}: {most} of its own size from the exact answer");
             }
         }
     }

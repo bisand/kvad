@@ -48,6 +48,7 @@ pub mod experts;
 pub mod gguf;
 pub mod hub;
 pub mod image;
+pub mod lora;
 pub mod machine;
 pub mod model;
 pub mod qcache;

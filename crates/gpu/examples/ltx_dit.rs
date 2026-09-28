@@ -27,7 +27,8 @@
 //!
 //! `--path FILE` loads another DiT of the same architecture, the dev model's;
 //! `--lora FILE` fuses a LoRA into it at strength 1, against `dit_lora_*`
-//! (`scripts/ltx-fixtures.py --lora`).
+//! (`scripts/ltx-fixtures.py --lora`), or with `--at-run-time` applies it
+//! as a request's LoRAs are, beside the layers, against the same.
 //!
 //! `--only N` runs just step N; `--blocks N` loads that many blocks (the
 //! fixture's count by default); `--f32` runs step 3 in f32.
@@ -128,7 +129,17 @@ fn main() -> Res<()> {
     let run = |device: &Device, dtype: DType, quant, label: &str, n: usize| -> Res<()> {
         let t = Instant::now();
         let lora = lora.as_ref().map(|l| (std::path::Path::new(l), 1.0));
-        let dit = Dit::load_as(&path, lora, "transformer-check", device, dtype, Some(blocks), quant, &mut |m| eprintln!("   {m}"))?;
+        let (fused, at_run_time) = match flag("--at-run-time") {
+            true => (None, lora),
+            false => (lora, None),
+        };
+        let dit = Dit::load_as(&path, fused, "transformer-check", device, dtype, Some(blocks), quant, &mut |m| eprintln!("   {m}"))?;
+        if let Some((l, s)) = at_run_time {
+            let file = kvad_gpu::image::lora::File::open(l)?;
+            let t = Instant::now();
+            let n = dit.set_loras(&[(&file, s)])?;
+            eprintln!("   the LoRA set at run time on {n} layers in {:.2} s", t.elapsed().as_secs_f64());
+        }
         eprintln!("{n}. {label}: {:.2} B parameters in {:.1} s", dit.params() as f64 / 1e9, t.elapsed().as_secs_f64());
         let ctx = Contexts { video: get(&contexts, "video")?.to_device(device)?, audio: get(&contexts, "audio")?.to_device(device)? };
         let grid = dit.grid(shape)?;

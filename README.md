@@ -2448,6 +2448,27 @@ kvad pull ckpt/anything-v5.0
 kvad images make "1girl, reading in a library" --model ckpt/anything-v5.0
 ```
 
+LoRAs apply to Qwen-Image, FLUX, SDXL, SD 1.5 and LTX-2.5, at run time, per
+request: the model stays as it was loaded, q8 or a GGUF, and each request
+chooses its own LoRAs and strengths ([docs/lora-plan.md](docs/lora-plan.md)).
+Each is a side path `(x·A)·B` beside a layer it adapts, added into the
+layer's answer by the M5 dense kernel's store, for 4.5% a step on Qwen-Image.
+They are read in the spellings people publish: PEFT's, kohya's under `ldm`'s
+names, diffusers' or Black Forest Labs' (whose fused `qkv` is split by rows),
+diffusers' two older ones, with their text encoders' and their convolutions'
+pairs. Against diffusers with PEFT, Qwen-Image's first two blocks with
+Lightning agree to 95.8 dB in f32, three FLUX LoRAs to 111 dB, and seven SDXL
+and SD 1.5 LoRAs of every one of those kinds to 108–121 dB. On LTX-2.5 a
+video's LoRAs go on every DiT its pipeline loads, and in bf16 they are level
+with the reference's own run of its distilled LoRA. Lightning's 8 steps take
+68 s at 1024², where the base's 50 took 448 s, and draw a sharper picture:
+
+```bash
+kvad pull lightx2v/Qwen-Image-Lightning:Qwen-Image-Lightning-8steps-V2.0-bf16.safetensors
+kvad images make "a tiny astronaut hatching from an egg on the moon" --model Qwen/Qwen-Image \
+    --steps 8 --lora lightx2v/Qwen-Image-Lightning:Qwen-Image-Lightning-8steps-V2.0-bf16.safetensors
+```
+
 Two things in it are measurements rather than code:
 
 - **The previews.** Each step can carry a picture of where it is heading,

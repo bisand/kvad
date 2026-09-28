@@ -28,6 +28,7 @@ pub mod qwen;
 pub mod schedule;
 pub mod sd15;
 pub mod sdxl;
+pub mod lora;
 pub(crate) mod single;
 pub mod t5;
 pub mod unet;
@@ -280,20 +281,33 @@ fn fetch_base(kind: Kind, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Re
     }
 }
 
-/// Fetch a checkpoint in one file, and what it reads beside it, without
-/// loading it: a pull. Its header is read on the Hub first, so a file that is
-/// not one costs two small requests.
+/// Fetch a checkpoint in one file, and what it reads beside it, or a LoRA,
+/// without loading either: a pull. The header is read on the Hub first, so
+/// a file that is neither costs a few small requests.
 pub fn pull_single(name: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
     // Here already, or a file on this machine: only what goes beside it.
     if let Some(c) = kvad::checkpoint::local(name) {
         return fetch_base(c.kind, progress, watch);
     }
-    if kvad::checkpoint::is_path(name) {
-        return Err(format!("{name} is neither an SDXL nor an SD 1.5 checkpoint in Stability's layout on this machine").into());
+    if kvad::lora::local(name).is_some() {
+        progress("a LoRA, on this machine already; nothing to fetch");
+        return Ok(());
     }
-    let found = kvad::checkpoint::find(name)?;
-    kvad::checkpoint::fetch(&found, progress, watch)?;
-    fetch_base(found.kind, progress, watch)
+    if kvad::checkpoint::is_path(name) {
+        return Err(format!("{name} is neither an SDXL or SD 1.5 checkpoint in Stability's layout nor a LoRA").into());
+    }
+    // A checkpoint, and if its header says it is none, a LoRA: which needs
+    // nothing beside it, the model it is applied to having its own.
+    match kvad::checkpoint::find(name) {
+        Ok(found) => {
+            kvad::checkpoint::fetch(&found, progress, watch)?;
+            fetch_base(found.kind, progress, watch)
+        }
+        Err(not_checkpoint) => match kvad::lora::find(name) {
+            Ok(found) => kvad::lora::fetch(&found, progress, watch).map(|_| ()),
+            Err(not_lora) => Err(format!("{not_checkpoint}; and as a LoRA: {not_lora}").into()),
+        },
+    }
 }
 
 /// Fetch a GGUF, `repo:QUANT`, and everything else its model reads from
@@ -511,6 +525,11 @@ impl Uncached {
 
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
+    }
+
+    /// The bytes `name` is stored in, or none if the file has no such tensor.
+    fn bytes_of(&self, name: &str) -> usize {
+        self.tensors.get(name).map_or(0, |t| t.len)
     }
 
     fn load(&self, name: &str) -> candle_core::Result<Tensor> {

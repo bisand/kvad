@@ -117,6 +117,9 @@ pub struct VideoRequest {
     /// ([`Defaults::dfr`]): the fast one unless `fps` is above 30, which
     /// only DFR's temporal rounds make.
     pub pipeline: Option<Pipeline>,
+    /// LoRAs to apply for this video, each at its strength, to every DiT
+    /// its pipeline runs ([`crate::image::Lora`]).
+    pub loras: Vec<crate::image::Lora>,
 }
 
 /// How an unguided video is made, where a model has more than one way.
@@ -365,6 +368,8 @@ pub struct Defaults {
     /// same `max_volume` by the most its DiT holds in one call
     /// ([`dfr_frames`]), counted as the fast pipeline's frames.
     pub dfr: bool,
+    /// Whether a request may apply LoRAs to it.
+    pub takes_loras: bool,
 }
 
 /// A guided pipeline's defaults and limits.
@@ -412,6 +417,7 @@ pub struct Resolved {
     pub fps: u32,
     pub seed: u64,
     pub audio: bool,
+    pub loras: Vec<crate::image::Lora>,
 }
 
 impl Resolved {
@@ -435,6 +441,7 @@ impl VideoRequest {
     /// Fill the blanks from `d` and refuse what cannot be made, naming the
     /// nearest request that can.
     pub fn resolved(&self, d: &Defaults) -> Res<Resolved> {
+        crate::image::check_loras(&self.loras, d.takes_loras)?;
         let width = self.width.unwrap_or(d.width);
         let height = self.height.unwrap_or(d.height);
         let fps = self.fps.unwrap_or(d.fps);
@@ -606,6 +613,7 @@ impl VideoRequest {
             fps,
             seed,
             audio: self.audio.unwrap_or(true),
+            loras: self.loras.clone(),
         })
     }
 }
@@ -1867,7 +1875,7 @@ mod tests {
     }
 
     fn ltx() -> Defaults {
-        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false, guided: None, decoder: None, dfr: false }
+        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false, guided: None, decoder: None, dfr: false, takes_loras: true }
     }
 
     /// The reference's own layouts: 121 frames are whole in segments of 24

@@ -9,6 +9,7 @@ use super::nn::{latent_preview, noise, to_rgb8, Ctx};
 use super::schedule;
 use super::unet::{Unet, UnetConfig};
 use super::vae::{Decoder, VaeConfig};
+use super::lora::{self, Adapters};
 use super::{finish, finish_mapped, local_file, open, open_file, open_mapped, read_json, single};
 use crate::common::{Loader, Reader};
 use crate::qcache::Vault;
@@ -118,8 +119,23 @@ pub struct Sdxl {
     scheduler: Value,
     device: Device,
     dtype: DType,
+    /// The text encoders' and the UNet's layers, for LoRAs ([`lora`]).
+    adapters: Adapters,
     params: usize,
 }
+
+/// What a LoRA's names for SDXL may start with, and the part each is in:
+/// kohya's `lora_unet_`, `lora_te1_` and `lora_te2_`, diffusers' `unet.`,
+/// `text_encoder.` and `text_encoder_2.`, and a UNet's layers named bare.
+pub(crate) const PREFIXES: [(&str, &str); 7] = [
+    ("lora_unet_", "unet"),
+    ("unet.", "unet"),
+    ("lora_te1_", "te1"),
+    ("text_encoder.", "te1"),
+    ("lora_te2_", "te2"),
+    ("text_encoder_2.", "te2"),
+    ("", "unet"),
+];
 
 impl Sdxl {
     pub fn load(repo: &str, device: Device, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Self> {
@@ -158,14 +174,17 @@ impl Sdxl {
             }
         };
 
+        let adapters = Adapters::new(&PREFIXES);
         progress("loading the text encoders");
         let (r_l, paths) = reader("text_encoder", "model", maps.as_ref().map(|m| &m.clip_l))?;
+        let r_l = r_l.with_adapters(adapters.part("te1"));
         let clip_l = Clip::load(&cx, &r_l, ClipConfig::from_json(&config("text_encoder")?)?, Pooled::No)?;
         if file.is_none() {
             params += finish("text encoder", &paths, &r_l)?;
         }
 
         let (r_g, paths) = reader("text_encoder_2", "model", maps.as_ref().map(|m| &m.clip_g))?;
+        let r_g = r_g.with_adapters(adapters.part("te2"));
         let clip_g = Clip::load(&cx, &r_g, ClipConfig::from_json(&config("text_encoder_2")?)?, Pooled::Projected)?;
         if file.is_none() {
             params += finish("second text encoder", &paths, &r_g)?;
@@ -173,6 +192,7 @@ impl Sdxl {
 
         progress("loading the UNet");
         let (r, paths) = reader("unet", "diffusion_pytorch_model", maps.as_ref().map(|m| &m.unet))?;
+        let r = r.with_adapters(adapters.part("unet"));
         let ucfg = UnetConfig::from_json(&config("unet")?)?;
         if ucfg.context != clip_l.width() + clip_g.width() {
             return Err(format!(
@@ -184,6 +204,7 @@ impl Sdxl {
             .into());
         }
         let unet = Unet::load(&cx, &r, ucfg)?;
+        adapters.alias_ldm("unet");
         match (&file, &maps) {
             (Some(f), Some(m)) => {
                 let parts = [(&m.clip_l, &r_l), (&m.clip_g, &r_g), (&m.unet, &r)];
@@ -202,7 +223,7 @@ impl Sdxl {
 
         device.synchronize()?;
         progress(&format!("loaded SDXL: {:.2} B parameters in f16", params as f64 / 1e9));
-        Ok(Sdxl { tok, clip_l, clip_g, unet, vae, scheduler, device, dtype, params })
+        Ok(Sdxl { tok, clip_l, clip_g, unet, vae, scheduler, device, dtype, adapters, params })
     }
 
     /// The prompt as the UNet reads it: `[1, 77, 2048]` per token and
@@ -218,8 +239,9 @@ impl Sdxl {
     }
 }
 
-impl Painter for Sdxl {
-    fn paint(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+impl Sdxl {
+    /// One image, with whatever LoRAs the adapters hold.
+    fn draw(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
         let req = req.resolved(&self.defaults())?;
         let t0 = Instant::now();
 
@@ -299,12 +321,20 @@ impl Painter for Sdxl {
         let decode_secs = t2.elapsed().as_secs_f64();
         Ok(Painted { image, request: req, encode_secs, denoise_secs, decode_secs })
     }
+}
+
+impl Painter for Sdxl {
+    /// With the request's LoRAs set for it and taken off after.
+    fn paint(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+        let (adapters, device, dtype) = (self.adapters.clone(), self.device.clone(), self.dtype);
+        lora::painting(&adapters, req, &device, dtype, || self.draw(req, on_step))
+    }
 
     fn defaults(&self) -> Defaults {
         // 30 steps and guidance 5: the middle of what Stability's own
         // examples use. The model was trained at 1024², and the VAE needs
         // multiples of 8.
-        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true }
+        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: true }
     }
 
     fn summary(&self) -> String {

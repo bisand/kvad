@@ -51,6 +51,80 @@ pub struct ImageRequest {
     pub seed: Option<u64>,
     /// Whether each [`Step`] should carry a rough preview of the image so far.
     pub preview: bool,
+    /// LoRAs to apply for this image, each at its strength.
+    pub loras: Vec<Lora>,
+}
+
+/// A LoRA a request applies: its name, as a checkpoint's is (`repo`,
+/// `repo:file.safetensors` or a path; [`crate::lora`]), and how strongly.
+///
+/// Applied for the one request and taken off after it, at run time beside
+/// the model's own layers, so the model stays as it was loaded and the next
+/// request chooses its own. `docs/lora-plan.md` says why.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Lora {
+    pub name: String,
+    /// The LoRA's product is multiplied by this: 1 as it was trained, 0.5
+    /// half as strongly. Its own `alpha / rank` scale comes on top.
+    #[serde(default = "full_strength")]
+    pub scale: f64,
+}
+
+fn full_strength() -> f64 {
+    1.0
+}
+
+impl Lora {
+    /// `NAME` or `NAME:SCALE`, as the CLI takes one. A name holds colons of
+    /// its own (`repo:file.safetensors`), so only a last part that is a
+    /// number is a scale.
+    pub fn parse(s: &str) -> Lora {
+        match s.rsplit_once(':').map(|(n, x)| (n, x.parse::<f64>())) {
+            Some((name, Ok(scale))) => Lora { name: name.to_string(), scale },
+            _ => Lora { name: s.to_string(), scale: 1.0 },
+        }
+    }
+}
+
+/// A request a [`Painter`] found it cannot honour only once it tried: a
+/// LoRA that does not fit the model, above all. The asker's to change, not
+/// a fault of the server's, and answered as such.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The most LoRAs one request may apply.
+pub const MAX_LORAS: usize = 4;
+
+/// A request's LoRAs, for a model that `takes` them or does not: none for
+/// one that does not; at most [`MAX_LORAS`], each named, each once, each at
+/// a scale between −10 and 10. The same for a picture and a video.
+pub fn check_loras(loras: &[Lora], takes: bool) -> Res<()> {
+    if !loras.is_empty() && !takes {
+        return Err("this model takes no LoRAs; so far Qwen-Image, FLUX, SDXL, SD 1.5 and LTX-2.5 do".into());
+    }
+    if loras.len() > MAX_LORAS {
+        return Err(format!("at most {MAX_LORAS} LoRAs, not {}", loras.len()).into());
+    }
+    for (i, l) in loras.iter().enumerate() {
+        if l.name.trim().is_empty() {
+            return Err("a LoRA has no name".into());
+        }
+        if !(l.scale.is_finite() && (-10.0..=10.0).contains(&l.scale)) {
+            return Err(format!("{}'s scale must be between -10 and 10, not {}", l.name, l.scale).into());
+        }
+        if loras[..i].iter().any(|o| o.name == l.name) {
+            return Err(format!("{} is asked for twice; give it one scale", l.name).into());
+        }
+    }
+    Ok(())
 }
 
 /// A model's own answers for everything an [`ImageRequest`] may leave out.
@@ -67,6 +141,8 @@ pub struct Defaults {
     /// model — FLUX.1-schnell — was trained to make an image without it, and
     /// has no use for a guidance scale or a negative prompt either.
     pub takes_guidance: bool,
+    /// Whether a request may apply LoRAs to it ([`Lora`]).
+    pub takes_loras: bool,
 }
 
 /// An [`ImageRequest`] with every blank filled and checked.
@@ -80,6 +156,7 @@ pub struct Resolved {
     pub guidance: f32,
     pub seed: u64,
     pub preview: bool,
+    pub loras: Vec<Lora>,
 }
 
 /// The largest side a request may ask for. Past this the VAE decode alone
@@ -147,6 +224,7 @@ impl ImageRequest {
                 .map(|d| d.as_nanos() as u64 % (1 << 32))
                 .unwrap_or(0)
         });
+        check_loras(&self.loras, d.takes_loras)?;
         let negative_prompt = self.negative_prompt.clone().filter(|n| !n.is_empty());
         Ok(Resolved {
             prompt: self.prompt.clone(),
@@ -157,6 +235,7 @@ impl ImageRequest {
             guidance,
             seed,
             preview: self.preview,
+            loras: self.loras.clone(),
         })
     }
 }
@@ -422,7 +501,35 @@ mod tests {
     }
 
     fn sdxl() -> Defaults {
-        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true }
+        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: false }
+    }
+
+    /// A LoRA is refused by a model that takes none, and checked by one that
+    /// does: its name, its scale, how many, and each once. A CLI name keeps
+    /// its colons and gives up only a last part that is a number.
+    #[test]
+    fn loras_are_checked_against_the_model() {
+        let lora = |name: &str, scale: f64| Lora { name: name.into(), scale };
+        let mut req = ImageRequest::new("a fox");
+        req.loras = vec![lora("o/r:l.safetensors", 1.0)];
+        let e = req.resolved(&sdxl()).unwrap_err().to_string();
+        assert!(e.contains("takes no LoRAs"), "{e}");
+        let takes = Defaults { takes_loras: true, ..sdxl() };
+        assert_eq!(req.resolved(&takes).unwrap().loras, req.loras);
+        for (loras, why) in [
+            (vec![lora("a/b", f64::NAN)], "between -10 and 10"),
+            (vec![lora(" ", 1.0)], "no name"),
+            (vec![lora("a/b", 1.0), lora("a/b", 0.5)], "twice"),
+            ((0..=MAX_LORAS).map(|i| lora(&format!("a/b{i}"), 1.0)).collect(), "at most"),
+        ] {
+            req.loras = loras;
+            let e = req.resolved(&takes).unwrap_err().to_string();
+            assert!(e.contains(why), "{e}");
+        }
+        assert_eq!(Lora::parse("o/r:l.safetensors:0.8"), lora("o/r:l.safetensors", 0.8));
+        assert_eq!(Lora::parse("o/r:l.safetensors"), lora("o/r:l.safetensors", 1.0));
+        assert_eq!(Lora::parse("o/r"), lora("o/r", 1.0));
+        assert_eq!(Lora::parse("./style.safetensors:-0.5"), lora("./style.safetensors", -0.5));
     }
 
     #[test]
@@ -448,7 +555,7 @@ mod tests {
 
     #[test]
     fn a_model_without_guidance_refuses_a_guidance_scale_and_a_negative_prompt() {
-        let schnell = Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false };
+        let schnell = Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_loras: false };
         let ask = |g: Option<f32>, n: Option<&str>| {
             ImageRequest { guidance: g, negative_prompt: n.map(str::to_string), ..ImageRequest::new("a cat") }.resolved(&schnell)
         };

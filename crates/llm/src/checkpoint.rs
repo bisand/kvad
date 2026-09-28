@@ -108,6 +108,12 @@ fn kind_of(path: &Path) -> Option<Kind> {
 
 /// The tensor names in a safetensors file's header.
 pub fn names(path: &Path) -> Option<Vec<String>> {
+    Some(header(path)?.into_iter().map(|(k, _)| k).collect())
+}
+
+/// A safetensors file's header: each tensor's entry, by its name, without
+/// `__metadata__`.
+pub(crate) fn header(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let mut len = [0u8; 8];
@@ -119,7 +125,9 @@ pub fn names(path: &Path) -> Option<Vec<String>> {
     }
     let mut header = vec![0u8; n as usize];
     f.read_exact(&mut header).ok()?;
-    header_names(&header)
+    let mut v: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header).ok()?;
+    v.remove("__metadata__");
+    Some(v)
 }
 
 fn header_names(header: &[u8]) -> Option<Vec<String>> {
@@ -150,28 +158,51 @@ pub fn remote_names(repo: &str, file: &str) -> Res<Vec<String>> {
     header_names(&get(8, 8 + len - 1)?).ok_or_else(|| format!("{file} in {repo} has no safetensors header").into())
 }
 
-/// The checkpoints at the top of a cache entry, `dir`, of `repo`, by the
-/// names they are known by: the repo's own, if the file is all it holds.
-pub fn locals(dir: &Path, repo: &str) -> Vec<Local> {
+/// The `.safetensors` files at the top of a cache entry, `dir`, by their
+/// names, in order: each name once, whichever revision holds it.
+pub(crate) fn tops(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(revisions) = std::fs::read_dir(dir.join("snapshots")) else { return Vec::new() };
-    let mut files: Vec<(String, PathBuf, Kind)> = Vec::new();
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
     for rev in revisions.filter_map(|e| e.ok()).map(|e| e.path()) {
         let Ok(entries) = std::fs::read_dir(&rev) else { continue };
         for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            if !name.to_ascii_lowercase().ends_with(".safetensors") || !path.is_file() || files.iter().any(|(n, _, _)| *n == name) {
-                continue;
-            }
-            if let Some(kind) = kind_of(&path) {
-                files.push((name, path, kind));
+            if name.to_ascii_lowercase().ends_with(".safetensors") && path.is_file() && !files.iter().any(|(n, _)| *n == name) {
+                files.push((name, path));
             }
         }
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    let only = std::fs::read_to_string(dir.join(ONLY)).ok();
+    files.sort();
     files
+}
+
+/// `file`'s name in `repo`: the repo's own when `dir`'s record `only` names
+/// it as the repo's one model, `repo:file` otherwise.
+pub(crate) fn name_in(dir: &Path, only: &str, repo: &str, file: &str) -> String {
+    match std::fs::read_to_string(dir.join(only)).ok().as_deref() == Some(file) {
+        true => repo.to_string(),
+        false => format!("{repo}:{file}"),
+    }
+}
+
+/// Record in the cache entry `path` is in that `file` is `repo`'s one model,
+/// in the record `only`. Nothing for a directory standing in for the repo,
+/// whose files are named by their paths.
+pub(crate) fn record_only(path: &Path, repo: &str, only: &str, file: &str) -> Res<()> {
+    let entry = format!("models--{}", repo.replace('/', "--"));
+    if let Some(dir) = path.ancestors().find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == entry)) {
+        std::fs::write(dir.join(only), file)?;
+    }
+    Ok(())
+}
+
+/// The checkpoints at the top of a cache entry, `dir`, of `repo`, by the
+/// names they are known by: the repo's own, if a pull found it to be all
+/// the repo holds.
+pub fn locals(dir: &Path, repo: &str) -> Vec<Local> {
+    tops(dir)
         .into_iter()
-        .map(|(f, file, kind)| Local { name: if only.as_deref() == Some(f.as_str()) { repo.to_string() } else { format!("{repo}:{f}") }, file, kind })
+        .filter_map(|(f, file)| Some(Local { name: name_in(dir, ONLY, repo, &f), kind: kind_of(&file)?, file }))
         .collect()
 }
 
@@ -213,7 +244,7 @@ pub fn candidates(repo: &str) -> Res<Option<Vec<String>>> {
 
 /// The most files at a repo's top whose headers [`find`] reads to count
 /// its checkpoints; past it, the repo is a collection to name a file of.
-const PROBED: usize = 8;
+pub(crate) const PROBED: usize = 8;
 
 /// Find the checkpoint `name` means on the Hub.
 pub fn find(name: &str) -> Res<Found> {
@@ -256,11 +287,8 @@ pub fn find(name: &str) -> Res<Found> {
 pub fn fetch(found: &Found, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<PathBuf> {
     progress(&format!("fetching {} from {}", found.file, found.repo));
     let path = fetch_file(&found.repo, &found.file, watch)?;
-    // In the cache entry the file is in: a directory standing in for the
-    // repo has none, and its files are named by their paths.
-    let entry = format!("models--{}", found.repo.replace('/', "--"));
-    if let (true, Some(dir)) = (found.only, path.ancestors().find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == entry))) {
-        std::fs::write(dir.join(ONLY), &found.file)?;
+    if found.only {
+        record_only(&path, &found.repo, ONLY, &found.file)?;
     }
     Ok(path)
 }

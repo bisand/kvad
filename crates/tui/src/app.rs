@@ -224,7 +224,8 @@ impl App {
             | Evt::Painting(_)
             | Evt::Painted(_)
             | Evt::Filming(_)
-            | Evt::Filmed(_) => {}
+            | Evt::Filmed(_)
+            | Evt::Refused(_) => {}
         }
     }
 

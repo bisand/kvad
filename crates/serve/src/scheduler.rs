@@ -195,6 +195,9 @@ pub enum Stroke {
     Step(kvad::image::Step),
     Done(Box<kvad::image::Painted>),
     Failed(String),
+    /// The request asked for what the model cannot do, found only once it
+    /// tried: a LoRA that does not fit it.
+    Refused(String),
 }
 
 /// Where a video has got to, or the video.
@@ -877,6 +880,7 @@ fn drain_paint(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Stroke>, cancel: &At
             Ok(Evt::Painting(step)) => Stroke::Step(step),
             Ok(Evt::Painted(p)) => Stroke::Done(Box::new(p)),
             Ok(Evt::Error(e)) => Stroke::Failed(e),
+            Ok(Evt::Refused(e)) => Stroke::Refused(e),
             Ok(Evt::Status(message)) => Stroke::Failed(message),
             Ok(_) => continue,
             Err(_) => Stroke::Failed("the engine thread has stopped".into()),

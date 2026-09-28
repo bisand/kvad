@@ -212,14 +212,15 @@ pub fn pull_gguf(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weigh
 }
 
 /// Pull an SDXL or SD 1.5 checkpoint in one file, `repo`,
-/// `repo:file.safetensors` or a path, and what it reads beside it.
+/// `repo:file.safetensors` or a path, and what it reads beside it; or a
+/// LoRA, named the same ways.
 pub fn pull_single(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weights::Watcher) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "gpu")]
     return kvad_gpu::image::pull_single(name, progress, watch);
     #[cfg(not(feature = "gpu"))]
     {
         let _ = (progress, watch);
-        Err(format!("{name} is a checkpoint of an image model, and this build has no GPU backend to run one").into())
+        Err(format!("{name} is a checkpoint or LoRA of an image model, and this build has no GPU backend to run one").into())
     }
 }
 

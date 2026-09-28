@@ -403,6 +403,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       fits; a language model is refused. Every image is kept, and a \
                       `url` is this server's link to it, which asks for the same \
                       credential this request did.\n\n\
+                      `loras`, kvad's own, is `[{name, scale}]`: LoRAs to apply for \
+                      this request and take off after it, at most 4, each by the name \
+                      it was pulled by (`repo`, `repo:file.safetensors` or a path) and \
+                      a `scale` of 1 unless given. A LoRA not on this machine, or a \
+                      model that takes none (Qwen-Image, FLUX, SDXL and SD 1.5 do), is a 400; one \
+                      that does not fit the model fails the request when it is set, \
+                      naming the layers it adapts that the model has not.\n\n\
                       `stream: true` sends a step event per denoising step, a preview \
                       beside each when `partial_images` or `preview` asks, and one \
                       completed event per image. Each image carries a `kvad` object: \
@@ -479,6 +486,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       LoRA is gated on Hugging Face: its first request fetches it, and \
                       is a 400 naming the page whose terms to accept when the server's \
                       token may not. `kvad.pipeline` says which made a video.\n\n\
+                      `loras`, kvad's own, is `[{name, scale}]`, in a form as that list \
+                      in JSON text: LoRAs to apply to every DiT the video's pipeline \
+                      runs, at most 4, each by the name it was pulled by and a `scale` of \
+                      1 unless given. A LoRA not on this machine, or more than fits \
+                      beside the models in memory, is a 400; one that does not fit the \
+                      DiT fails the video, naming what it adapts that the DiT has not. \
+                      `kvad.loras` says which made a video.\n\n\
                       `input_reference` is a picture to start from, 20 MiB at most: a \
                       file in the form, or in JSON `{ image_url }` with a `data:` URL. \
                       A URL elsewhere and a `file_id` are refused. It becomes the first \
@@ -490,7 +504,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       engine that makes it answers nothing else meanwhile.",
         query: &[], body: json_body("`{ prompt, model?, size?, seconds?, frames?, fps?, seed?, \
                                      audio?, input_reference?, steps?, guidance_scale?, \
-                                     negative_prompt?, decoder?, pipeline? }`, or the same fields as \
+                                     negative_prompt?, decoder?, pipeline?, loras? }`, or the same fields as \
                                      `multipart/form-data`, with `input_reference` a file."),
         produces: JSON, events: &[],
     },

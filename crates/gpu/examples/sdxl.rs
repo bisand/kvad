@@ -10,7 +10,9 @@
 //! read in place of its own (Qwen-Image's or FLUX.1-schnell's), and
 //! `--single FILE`, an SDXL or SD 1.5 checkpoint in Stability's one-file
 //! layout, whose configs come from `--repo` (the base of its kind unless it
-//! says otherwise).
+//! says otherwise); `--lora NAME[:STRENGTH]`, as often as wanted, a LoRA by
+//! the name it was pulled by or its path; and, for Qwen-Image, `--shift F`, a
+//! fixed shift in place of the schedule's own.
 //!
 //! Reports the time spent in each of the three models, because they are
 //! nothing alike: the text encoders run once over 77 tokens, the denoiser
@@ -31,6 +33,7 @@ fn main() -> Res<()> {
     let mut quant = None;
     let mut gguf = None;
     let mut single = None;
+    let mut shift = None;
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -47,6 +50,8 @@ fn main() -> Res<()> {
             "--repo" => repo = v,
             "--gguf" => gguf = Some(std::path::PathBuf::from(v)),
             "--single" => single = Some(std::path::PathBuf::from(v)),
+            "--lora" => req.loras.push(kvad::image::Lora::parse(&v)),
+            "--shift" => shift = Some(v.parse()?),
             "--quant" => quant = kvad_gpu::model::parse_quant(&v).ok_or("--quant is none, q8, q4, q4k or q6k")?,
             other => return Err(format!("unknown option {other}").into()),
         }
@@ -68,6 +73,13 @@ fn main() -> Res<()> {
                     Box::new(kvad_gpu::image::sd15::Sd15::load_with(repo, Some(file), device, &mut |m| eprintln!("  {m}"), &Watcher::none())?)
                 }
             }
+        }
+        // A fixed shift: Qwen-Image's.
+        None if shift.is_some() => {
+            let device = kvad_gpu::model::pick_device(None)?;
+            let mut q = kvad_gpu::image::qwen::QwenImage::load_with(&repo, gguf.as_deref(), quant, device, &mut |m| eprintln!("  {m}"), &Watcher::none())?;
+            q.set_shift(shift);
+            Box::new(q)
         }
         None => kvad_gpu::image::load_with(&repo, gguf.as_deref(), quant, &mut |m| eprintln!("  {m}"), &Watcher::none())?,
     };

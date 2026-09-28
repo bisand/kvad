@@ -244,6 +244,53 @@ fn unet(k: &str) -> Option<String> {
     }
 }
 
+/// The names `ldm` gives the UNet layer diffusers calls `d`, a layer's name
+/// without its `.weight`: [`unet`] backwards, for LoRAs made for Stability's
+/// layout, as kohya's for SDXL are. Two for an upsampler's convolution,
+/// which `ldm` numbers after the resnet, or after the attention where the
+/// level has one, which a name alone does not say; the other names nothing.
+/// None for what no LoRA adapts, the norms.
+pub(crate) fn ldm_of(d: &str) -> Vec<String> {
+    for (to, from) in [
+        ("time_embedding.linear_1", "time_embed.0"),
+        ("time_embedding.linear_2", "time_embed.2"),
+        ("add_embedding.linear_1", "label_emb.0.0"),
+        ("add_embedding.linear_2", "label_emb.0.2"),
+        ("conv_in", "input_blocks.0.0"),
+        ("conv_out", "out.2"),
+    ] {
+        if d == to {
+            return vec![from.to_string()];
+        }
+    }
+    let resnet = |r: &str| -> Option<&str> {
+        [("conv1", "in_layers.2"), ("time_emb_proj", "emb_layers.1"), ("conv2", "out_layers.3"), ("conv_shortcut", "skip_connection")]
+            .iter()
+            .find_map(|(to, from)| (r == *to).then_some(*from))
+    };
+    let num = |s: &str| s.parse::<usize>().ok();
+    let one = |s: Option<String>| s.into_iter().collect::<Vec<_>>();
+    if let Some(rest) = d.strip_prefix("mid_block.") {
+        let p: Vec<&str> = rest.splitn(3, '.').collect();
+        return one(match p.as_slice() {
+            ["resnets", i, r] => resnet(r).and_then(|r| Some(format!("middle_block.{}.{r}", 2 * num(i)?))),
+            ["attentions", "0", r] => Some(format!("middle_block.1.{r}")),
+            _ => None,
+        });
+    }
+    let p: Vec<&str> = d.splitn(5, '.').collect();
+    let (Some(block), Some(l)) = (p.first(), p.get(1).and_then(|l| num(l))) else { return Vec::new() };
+    match (block, &p[2..]) {
+        (&"down_blocks", ["resnets", i, r]) => one(num(i).zip(resnet(r)).map(|(i, r)| format!("input_blocks.{}.0.{r}", 3 * l + i + 1))),
+        (&"down_blocks", ["attentions", i, r]) => one(num(i).map(|i| format!("input_blocks.{}.1.{r}", 3 * l + i + 1))),
+        (&"down_blocks", ["downsamplers", "0", "conv"]) => vec![format!("input_blocks.{}.0.op", 3 * l + 3)],
+        (&"up_blocks", ["resnets", i, r]) => one(num(i).zip(resnet(r)).map(|(i, r)| format!("output_blocks.{}.0.{r}", 3 * l + i))),
+        (&"up_blocks", ["attentions", i, r]) => one(num(i).map(|i| format!("output_blocks.{}.1.{r}", 3 * l + i))),
+        (&"up_blocks", ["upsamplers", "0", "conv"]) => (1..=2).map(|m| format!("output_blocks.{}.{m}.conv", 3 * l + 2)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Inside a resnet, `ldm`'s numbered layers by diffusers' names.
 fn resnet(rest: &str) -> Option<String> {
     for (from, to) in [
@@ -391,6 +438,39 @@ mod tests {
         }
         assert_eq!(unet("input_blocks.1.2.weight"), None);
         assert_eq!(unet("zero_block.0.weight"), None);
+    }
+
+    /// `ldm_of` undoes `unet`: for each of the forward test's layers that
+    /// takes a LoRA, the `ldm` name it came from is among those it gives.
+    #[test]
+    fn ldm_names_come_back_from_diffusers() {
+        let cases = [
+            "time_embed.0",
+            "label_emb.0.2",
+            "input_blocks.0.0",
+            "input_blocks.1.0.in_layers.2",
+            "input_blocks.2.0.emb_layers.1",
+            "input_blocks.3.0.op",
+            "input_blocks.4.0.skip_connection",
+            "input_blocks.5.1.proj_in",
+            "input_blocks.8.1.transformer_blocks.9.attn2.to_k",
+            "middle_block.0.out_layers.3",
+            "middle_block.1.transformer_blocks.0.ff.net.0.proj",
+            "middle_block.2.in_layers.2",
+            "output_blocks.2.1.proj_out",
+            "output_blocks.2.2.conv",
+            "output_blocks.5.2.conv",
+            "output_blocks.8.0.skip_connection",
+            "output_blocks.2.1.conv",
+            "input_blocks.11.0.in_layers.2",
+            "out.2",
+        ];
+        for ldm in cases {
+            let d = unet(&format!("{ldm}.weight")).unwrap_or_else(|| panic!("{ldm}"));
+            let back = ldm_of(d.strip_suffix(".weight").unwrap());
+            assert!(back.iter().any(|b| b == ldm), "{ldm} → {d} → {back:?}");
+        }
+        assert!(ldm_of("down_blocks.0.resnets.0.norm1").is_empty(), "a norm takes no LoRA");
     }
 
     #[test]

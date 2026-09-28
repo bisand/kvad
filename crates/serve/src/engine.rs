@@ -164,7 +164,8 @@ pub fn pipelines() -> String {
 
 /// The backend a pipeline gets when nobody has said which.
 ///
-/// SDXL runs in f16 whatever it is asked, so any GPU backend is the same load
+/// SDXL and SD 1.5 run in f16 whatever they are asked, so any GPU backend is
+/// the same load
 /// and `gpu-bf16` is the one whose name does not promise a quantisation that
 /// will not happen. Qwen-Image does not fit in bf16 on a machine this server
 /// is likely to be on (41 GB of denoiser alone) and gets q8. So does FLUX:
@@ -210,15 +211,15 @@ pub fn pull_gguf(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weigh
     }
 }
 
-/// Pull an SDXL checkpoint in one file, `repo`, `repo:file.safetensors` or a
-/// path, and what it reads beside it.
+/// Pull an SDXL or SD 1.5 checkpoint in one file, `repo`,
+/// `repo:file.safetensors` or a path, and what it reads beside it.
 pub fn pull_single(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weights::Watcher) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "gpu")]
     return kvad_gpu::image::pull_single(name, progress, watch);
     #[cfg(not(feature = "gpu"))]
     {
         let _ = (progress, watch);
-        Err(format!("{name} is an SDXL checkpoint, and this build has no GPU backend to run one").into())
+        Err(format!("{name} is a checkpoint of an image model, and this build has no GPU backend to run one").into())
     }
 }
 

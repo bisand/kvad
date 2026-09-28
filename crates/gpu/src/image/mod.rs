@@ -26,6 +26,7 @@ pub mod mmdit;
 pub mod nn;
 pub mod qwen;
 pub mod schedule;
+pub mod sd15;
 pub mod sdxl;
 pub(crate) mod single;
 pub mod t5;
@@ -38,6 +39,7 @@ use crate::uncached;
 use candle_core::{DType, Device, Shape, Tensor};
 use candle_nn::var_builder::SimpleBackend;
 use candle_nn::VarBuilder;
+use kvad::checkpoint::Kind;
 use kvad::image::Painter;
 use kvad::serde_json::Value;
 use kvad::weights::{fetch_file, Cached, Watcher};
@@ -49,7 +51,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// The pipelines this backend implements, by the `_class_name` their repos'
 /// `model_index.json` gives.
-pub const PIPELINES: [&str; 3] = ["StableDiffusionXLPipeline", "QwenImagePipeline", "FluxPipeline"];
+pub const PIPELINES: [&str; 4] = ["StableDiffusionXLPipeline", "QwenImagePipeline", "FluxPipeline", "StableDiffusionPipeline"];
 
 /// The pipelines whose denoiser can be read from a community GGUF.
 pub const GGUF_PIPELINES: [&str; 2] = ["QwenImagePipeline", "FluxPipeline"];
@@ -61,9 +63,9 @@ pub const GGUF_PIPELINES: [&str; 2] = ["QwenImagePipeline", "FluxPipeline"];
 /// Asked without downloading anything, because the server asks it about every
 /// model on disk each time it lists them.
 pub fn pipeline_of(repo: &str) -> Option<&'static str> {
-    // An SDXL checkpoint in one file.
-    if kvad::checkpoint::local(repo).is_some() {
-        return Some("StableDiffusionXLPipeline");
+    // A checkpoint in one file: its header says which.
+    if let Some(c) = kvad::checkpoint::local(repo) {
+        return Some(c.kind.pipeline());
     }
     // A GGUF of a denoiser is its base's pipeline.
     if kvad::gguf::split(repo).is_some() {
@@ -138,7 +140,10 @@ pub fn is_pipeline(repo: &str, watch: &Watcher) -> bool {
 pub fn weight_bytes(repo: &str, quant: Option<candle_core::quantized::GgmlDType>) -> Option<u64> {
     let size = |r: &str, f: &str| local_file(r, f).and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
     if let Some(c) = kvad::checkpoint::local(repo) {
-        return sdxl::single_weight_bytes(&c.file, &size);
+        return match c.kind {
+            Kind::Sdxl => sdxl::single_weight_bytes(&c.file, &size),
+            Kind::Sd15 => sd15::single_weight_bytes(&c.file),
+        };
     }
     if kvad::gguf::split(repo).is_some() {
         let g = kvad::gguf::local(repo)?;
@@ -151,6 +156,7 @@ pub fn weight_bytes(repo: &str, quant: Option<candle_core::quantized::GgmlDType>
     }
     match pipeline_of(repo)? {
         "StableDiffusionXLPipeline" => sdxl::weight_bytes(repo, &size),
+        "StableDiffusionPipeline" => sd15::weight_bytes(repo),
         "QwenImagePipeline" => qwen::weight_bytes(repo, quant, &size, None),
         "FluxPipeline" => flux::weight_bytes(repo, quant, &size, None),
         _ => None,
@@ -201,21 +207,22 @@ pub fn load_with(
         progress(&format!("the rest is {}'s", found.base));
         return load_with(&found.base, Some(&g.file), quant, progress, watch);
     }
-    // An SDXL checkpoint in one file: `repo`, `repo:file.safetensors`, or a
-    // path. The base gives its configs, and the fp16-fix its VAE.
+    // A checkpoint in one file: `repo`, `repo:file.safetensors`, or a path.
+    // Its kind's base gives its configs.
     let single = match kvad::checkpoint::local(repo) {
-        Some(c) => Some(c.file),
+        Some(c) => Some((c.file, c.kind)),
         None if kvad::checkpoint::split(repo).is_some() || kvad::checkpoint::is_path(repo) => {
-            Some(kvad::checkpoint::fetch(&kvad::checkpoint::find(repo)?, progress, watch)?)
+            let found = kvad::checkpoint::find(repo)?;
+            Some((kvad::checkpoint::fetch(&found, progress, watch)?, found.kind))
         }
         None => None,
     };
     let index = match (single, fetch_file(repo, "model_index.json", watch)) {
         (None, Ok(index)) => index,
-        (Some(file), _) => return load_single(&file, progress, watch),
+        (Some((file, kind)), _) => return load_single(&file, kind, progress, watch),
         // No model index: one checkpoint, if the repo's files say so.
         (None, Err(e)) => match kvad::checkpoint::find(repo) {
-            Ok(found) => return load_single(&kvad::checkpoint::fetch(&found, progress, watch)?, progress, watch),
+            Ok(found) => return load_single(&kvad::checkpoint::fetch(&found, progress, watch)?, found.kind, progress, watch),
             Err(_) => return Err(e),
         },
     };
@@ -239,6 +246,12 @@ pub fn load_with(
             }
             Ok(Box::new(sdxl::Sdxl::load(repo, device, progress, watch)?))
         }
+        "StableDiffusionPipeline" => {
+            if quant.is_some() {
+                progress("SD 1.5 runs in f16; ignoring the quantisation asked for");
+            }
+            Ok(Box::new(sd15::Sd15::load(repo, device, progress, watch)?))
+        }
         "QwenImagePipeline" => Ok(Box::new(qwen::QwenImage::load_with(repo, gguf, quant, device, progress, watch)?)),
         "FluxPipeline" => Ok(Box::new(flux::Flux::load_with(repo, gguf, quant, device, progress, watch)?)),
         other => Err(format!(
@@ -249,26 +262,38 @@ pub fn load_with(
     }
 }
 
-/// An SDXL checkpoint in one file, on this machine.
-fn load_single(file: &Path, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Box<dyn Painter>> {
+/// A checkpoint in one file, on this machine, by its kind's pipeline, with
+/// the configs of that kind's base.
+fn load_single(file: &Path, kind: Kind, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Box<dyn Painter>> {
     let device = crate::model::pick_device(None)?;
-    Ok(Box::new(sdxl::Sdxl::load_with(sdxl::REPO, Some(file), device, progress, watch)?))
+    Ok(match kind {
+        Kind::Sdxl => Box::new(sdxl::Sdxl::load_with(sdxl::REPO, Some(file), device, progress, watch)?),
+        Kind::Sd15 => Box::new(sd15::Sd15::load_with(sd15::REPO, Some(file), device, progress, watch)?),
+    })
 }
 
-/// Fetch an SDXL checkpoint in one file, and what it reads beside it, without
+/// What a checkpoint of `kind` reads besides its file.
+fn fetch_base(kind: Kind, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
+    match kind {
+        Kind::Sdxl => sdxl::fetch_base(progress, watch),
+        Kind::Sd15 => sd15::fetch_base(progress, watch),
+    }
+}
+
+/// Fetch a checkpoint in one file, and what it reads beside it, without
 /// loading it: a pull. Its header is read on the Hub first, so a file that is
 /// not one costs two small requests.
 pub fn pull_single(name: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
     // Here already, or a file on this machine: only what goes beside it.
-    if kvad::checkpoint::local(name).is_some() {
-        return sdxl::fetch_base(progress, watch);
+    if let Some(c) = kvad::checkpoint::local(name) {
+        return fetch_base(c.kind, progress, watch);
     }
     if kvad::checkpoint::is_path(name) {
-        return Err(format!("{name} is not an SDXL checkpoint in Stability's layout on this machine").into());
+        return Err(format!("{name} is neither an SDXL nor an SD 1.5 checkpoint in Stability's layout on this machine").into());
     }
     let found = kvad::checkpoint::find(name)?;
     kvad::checkpoint::fetch(&found, progress, watch)?;
-    sdxl::fetch_base(progress, watch)
+    fetch_base(found.kind, progress, watch)
 }
 
 /// Fetch a GGUF, `repo:QUANT`, and everything else its model reads from
@@ -405,6 +430,11 @@ impl SimpleBackend for Mapped {
         if src.transpose {
             t = t.t()?;
         }
+        // Squeezing leaves a dimension that is not 1 as it is, and `get`'s
+        // check of the shape then says so.
+        if src.matrix {
+            t = t.squeeze(3)?.squeeze(2)?;
+        }
         t.contiguous()?.to_dtype(dtype)?.to_device(dev)
     }
 
@@ -458,6 +488,7 @@ impl Uncached {
                     Some("F64") => DType::F64,
                     Some("U8") => DType::U8,
                     Some("U32") => DType::U32,
+                    Some("I32") => DType::I32,
                     Some("I64") => DType::I64,
                     other => return Err(bad(&format!("`{name}` in {other:?}, which is not read here")).into()),
                 };

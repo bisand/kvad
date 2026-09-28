@@ -38,6 +38,9 @@ pub(crate) enum Pooled {
     /// That, through `text_projection` — `CLIPTextModelWithProjection`,
     /// SDXL's second encoder.
     Projected,
+    /// No pooled vector, and the hidden states are the last layer's through
+    /// the final norm: `last_hidden_state`, which SD 1.5 conditions on.
+    Last,
 }
 
 /// The shape of one CLIP text model, from its `config.json`.
@@ -99,6 +102,8 @@ pub(crate) struct Clip {
     /// model loaded [`Pooled::Projected`], the projection into the joint
     /// space.
     pooled: Option<(LayerNorm, Option<Linear>)>,
+    /// Loaded [`Pooled::Last`]: the final norm, over every row.
+    last: Option<LayerNorm>,
 }
 
 impl Clip {
@@ -129,7 +134,12 @@ impl Clip {
                 fc2: Linear::load(cx, &l, "mlp.fc2", cfg.inter, w, true)?,
             });
         }
+        let last = match pooled {
+            Pooled::Last => Some(LayerNorm::load(cx, &tm, "final_layer_norm", w, 1e-5)?),
+            _ => None,
+        };
         let pooled = match pooled {
+            Pooled::Last => None,
             Pooled::No => {
                 tm.skip_under(&format!("encoder.layers.{}.", cfg.layers - 1));
                 tm.skip_under("final_layer_norm");
@@ -141,7 +151,7 @@ impl Clip {
                 Some(Linear::load(cx, r, "text_projection", w, w, false)?),
             )),
         };
-        Ok(Clip { cfg, tokens, positions, layers, pooled })
+        Ok(Clip { cfg, tokens, positions, layers, pooled, last })
     }
 
     pub(crate) fn width(&self) -> usize {
@@ -150,7 +160,9 @@ impl Clip {
 
     /// The penultimate hidden state, `[1, 77, width]`, and — when this model
     /// was loaded for it — the pooled vector, `[1, width]`, taken at `end`,
-    /// the position of the end-of-text marker.
+    /// the position of the end-of-text marker. Loaded [`Pooled::Last`], the
+    /// last hidden state through the final norm instead, and no pooled
+    /// vector.
     pub(crate) fn encode(&self, ids: &[u32], end: usize) -> Res<(Tensor, Option<Tensor>)> {
         let dev = self.tokens.device();
         let ids_t = Tensor::new(ids, dev)?;
@@ -164,6 +176,9 @@ impl Clip {
                 penultimate = Some(x.clone());
             }
             x = self.layer(l, &x, &mask)?;
+        }
+        if let Some(ln) = &self.last {
+            return Ok((ln.forward(&x)?, None));
         }
         let penultimate = match penultimate {
             Some(p) => p,

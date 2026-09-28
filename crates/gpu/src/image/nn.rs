@@ -61,6 +61,16 @@ impl Linear {
         Ok(Linear { w, b, out })
     }
 
+    /// A 1×1 convolution as the linear layer it is: `[out, in, 1, 1]` is
+    /// `[out, in]` with two axes of one. SD 1.5's transformers project in
+    /// and out this way, over a grid Kvad has already made a sequence.
+    pub(crate) fn load_1x1(cx: &Ctx<'_>, r: &Reader<'_>, name: &str, inp: usize, out: usize) -> Res<Self> {
+        let r = r.pp(name);
+        let w = r.get((out, inp, 1, 1), "weight")?.reshape((out, inp))?.t()?.contiguous()?;
+        let w = Proj::Dense(w.to_dtype(cx.dtype)?.to_device(cx.device())?);
+        Ok(Linear { w, b: Some(cx.get(&r, out, "bias")?), out })
+    }
+
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         // The bias is added to the kernel's f32 sums as they are stored.
         #[cfg(target_os = "macos")]

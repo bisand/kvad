@@ -36,6 +36,10 @@ pub(crate) struct UnetConfig {
     /// Transformer blocks per attention stage, per level; 0 for a level
     /// without attention.
     pub(crate) depth: Vec<usize>,
+    /// The middle block's transformer blocks: the last level's as the
+    /// config gives them, whether or not that level attends. SD 1.5's last
+    /// level does not, and its middle block does.
+    pub(crate) mid_depth: usize,
     /// Attention heads per level. The config calls this
     /// `attention_head_dim`, which it is not (see the plan).
     pub(crate) heads: Vec<usize>,
@@ -43,9 +47,13 @@ pub(crate) struct UnetConfig {
     pub(crate) in_channels: usize,
     pub(crate) groups: usize,
     pub(crate) eps: f64,
-    /// SDXL's size conditioning: each of six numbers as a sinusoid this wide.
-    pub(crate) time_ids_dim: usize,
-    pub(crate) added_in: usize,
+    /// SDXL's size conditioning: each of six numbers as a sinusoid this
+    /// wide, and the width of those beside the pooled prompt. `None` for a
+    /// UNet without it, SD 1.5's.
+    pub(crate) added: Option<(usize, usize)>,
+    /// Whether the transformers project in and out with linear layers,
+    /// SDXL's, or with 1×1 convolutions, SD 1.5's.
+    pub(crate) linear: bool,
 }
 
 impl UnetConfig {
@@ -64,19 +72,27 @@ impl UnetConfig {
         // What this file implements, said as refusals rather than assumed: a
         // UNet from another pipeline reads the same keys and means other
         // things by some of them.
-        if s("addition_embed_type") != "text_time" {
-            return Err("this UNet implements SDXL's `text_time` conditioning and no other".into());
-        }
-        if v.get("use_linear_projection").and_then(Value::as_bool) != Some(true) {
-            return Err("this UNet implements linear `proj_in`/`proj_out` only".into());
-        }
+        let added = match s("addition_embed_type") {
+            "text_time" => Some((n("addition_time_embed_dim")?, n("projection_class_embeddings_input_dim")?)),
+            "" => None,
+            other => return Err(format!("this UNet implements SDXL's `text_time` conditioning, or none, and not {other:?}").into()),
+        };
         let channels = list("block_out_channels")?;
+        // A number for every level, or one list with a number a level.
+        let per_level = |k: &str, missing: usize| -> Res<Vec<usize>> {
+            match v.get(k) {
+                None | Some(Value::Null) => Ok(vec![missing; channels.len()]),
+                Some(Value::Number(x)) => Ok(vec![x.as_u64().ok_or_else(|| format!("UNet config's `{k}` is not a count"))? as usize; channels.len()]),
+                Some(_) => list(k),
+            }
+        };
         let down: Vec<String> = v
             .get("down_block_types")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
             .unwrap_or_default();
-        let depth = list("transformer_layers_per_block")?;
+        let depth = per_level("transformer_layers_per_block", 1)?;
+        let mid_depth = *depth.last().ok_or("UNet config has no levels")?;
         let depth = down
             .iter()
             .zip(&depth)
@@ -84,13 +100,14 @@ impl UnetConfig {
             .collect::<Vec<_>>();
         let cfg = UnetConfig {
             layers_per_block: n("layers_per_block")?,
-            heads: list("attention_head_dim")?,
+            heads: per_level("attention_head_dim", 8)?,
             context: n("cross_attention_dim")?,
             in_channels: n("in_channels")?,
             groups: n("norm_num_groups")?,
             eps: v.get("norm_eps").and_then(Value::as_f64).unwrap_or(1e-5),
-            time_ids_dim: n("addition_time_embed_dim")?,
-            added_in: n("projection_class_embeddings_input_dim")?,
+            added,
+            linear: v.get("use_linear_projection").and_then(Value::as_bool).unwrap_or(false),
+            mid_depth,
             depth,
             channels,
         };
@@ -216,11 +233,17 @@ impl Transformer {
     fn load(cx: &Ctx<'_>, r: &Reader<'_>, cfg: &UnetConfig, c: usize, depth: usize, heads: usize) -> Res<Self> {
         Ok(Transformer {
             norm: GroupNorm::load(cx, r, "norm", c, cfg.groups, 1e-6)?,
-            proj_in: Linear::load(cx, r, "proj_in", c, c, true)?,
+            proj_in: match cfg.linear {
+                true => Linear::load(cx, r, "proj_in", c, c, true)?,
+                false => Linear::load_1x1(cx, r, "proj_in", c, c)?,
+            },
             blocks: (0..depth)
                 .map(|i| Block::load(cx, &r.pp(format!("transformer_blocks.{i}")), c, cfg.context, heads))
                 .collect::<Res<_>>()?,
-            proj_out: Linear::load(cx, r, "proj_out", c, c, true)?,
+            proj_out: match cfg.linear {
+                true => Linear::load(cx, r, "proj_out", c, c, true)?,
+                false => Linear::load_1x1(cx, r, "proj_out", c, c)?,
+            },
         })
     }
 
@@ -261,8 +284,8 @@ pub(crate) struct Unet {
     cfg: UnetConfig,
     time1: Linear,
     time2: Linear,
-    add1: Linear,
-    add2: Linear,
+    /// SDXL's size conditioning's two layers, where there is any.
+    add: Option<(Linear, Linear)>,
     conv_in: Conv2d,
     down: Vec<Level>,
     mid: (Resnet, Transformer, Resnet),
@@ -303,7 +326,7 @@ impl Unet {
         let mr = r.pp("mid_block");
         let mid = (
             Resnet::load(cx, &mr.pp("resnets.0"), &cfg, top, top)?,
-            Transformer::load(cx, &mr.pp("attentions.0"), &cfg, top, cfg.depth[levels - 1], cfg.heads[levels - 1])?,
+            Transformer::load(cx, &mr.pp("attentions.0"), &cfg, top, cfg.mid_depth, cfg.heads[levels - 1])?,
             Resnet::load(cx, &mr.pp("resnets.1"), &cfg, top, top)?,
         );
 
@@ -342,8 +365,13 @@ impl Unet {
         let unet = Unet {
             time1: Linear::load(cx, r, "time_embedding.linear_1", ch[0], tw, true)?,
             time2: Linear::load(cx, r, "time_embedding.linear_2", tw, tw, true)?,
-            add1: Linear::load(cx, r, "add_embedding.linear_1", cfg.added_in, tw, true)?,
-            add2: Linear::load(cx, r, "add_embedding.linear_2", tw, tw, true)?,
+            add: match cfg.added {
+                Some((_, inp)) => Some((
+                    Linear::load(cx, r, "add_embedding.linear_1", inp, tw, true)?,
+                    Linear::load(cx, r, "add_embedding.linear_2", tw, tw, true)?,
+                )),
+                None => None,
+            },
             conv_in: Conv2d::load(cx, r, "conv_in", (cfg.in_channels, ch[0], 3), 1)?,
             norm_out: GroupNorm::load(cx, r, "conv_norm_out", ch[0], cfg.groups, cfg.eps)?,
             conv_out: Conv2d::load(cx, r, "conv_out", (ch[0], cfg.in_channels, 3), 1)?,
@@ -357,17 +385,11 @@ impl Unet {
 
     /// One prediction of the noise in `x`.
     ///
-    /// `x` is `[B, 4, h, w]`, `ctx` the prompt as `[B, 77, 2048]`, `pooled`
-    /// `[B, 1280]` and `time_ids` the six size numbers, the same for every
-    /// image in the batch.
-    pub(crate) fn forward(
-        &self,
-        x: &Tensor,
-        t: f64,
-        ctx: &Tensor,
-        pooled: &Tensor,
-        time_ids: &[f64; 6],
-    ) -> candle_core::Result<Tensor> {
+    /// `x` is `[B, 4, h, w]` and `ctx` the prompt, `[B, 77, 2048]` for SDXL
+    /// and `[B, 77, 768]` for SD 1.5. `added` is SDXL's: the pooled prompt,
+    /// `[B, 1280]`, and the six size numbers, the same for every image in
+    /// the batch.
+    pub(crate) fn forward(&self, x: &Tensor, t: f64, ctx: &Tensor, added: Option<(&Tensor, &[f64; 6])>) -> candle_core::Result<Tensor> {
         let b = x.dim(0)?;
         let dev = x.device();
         let dtype = x.dtype();
@@ -378,13 +400,19 @@ impl Unet {
         let t_emb = self.time2.forward(&self.time1.forward(&t_emb)?.silu()?)?;
         // SDXL's addition: the image's size and crop, each a sinusoid of its
         // own, beside the pooled prompt.
-        let ids = timestep_embedding(time_ids, self.cfg.time_ids_dim, true, 0.0, dev).map_err(err)?;
-        let ids = ids.reshape((1, 6 * self.cfg.time_ids_dim))?.to_dtype(dtype)?.repeat((b, 1))?;
-        let added = Tensor::cat(&[pooled, &ids], 1)?;
-        let added = self.add2.forward(&self.add1.forward(&added)?.silu()?)?;
+        let t_emb = match (&self.add, self.cfg.added, added) {
+            (Some((add1, add2)), Some((width, _)), Some((pooled, time_ids))) => {
+                let ids = timestep_embedding(time_ids, width, true, 0.0, dev).map_err(err)?;
+                let ids = ids.reshape((1, 6 * width))?.to_dtype(dtype)?.repeat((b, 1))?;
+                let added = Tensor::cat(&[pooled, &ids], 1)?;
+                t_emb.broadcast_add(&add2.forward(&add1.forward(&added)?.silu()?)?)?
+            }
+            (None, None, None) => t_emb,
+            _ => candle_core::bail!("the UNet's size conditioning and what it was given disagree"),
+        };
         // Every resnet applies a SiLU to this before its own projection, so
         // it is applied once here instead of forty times.
-        let temb = t_emb.broadcast_add(&added)?.silu()?;
+        let temb = t_emb.silu()?;
 
         let mut h = self.conv_in.forward(x)?;
         let mut skips = vec![h.clone()];

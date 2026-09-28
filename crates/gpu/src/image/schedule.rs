@@ -67,9 +67,23 @@ impl Schedule {
 /// Only the settings SDXL ships are implemented, and anything else in the
 /// config is refused rather than ignored: a scheduler that silently runs the
 /// wrong schedule draws a worse picture and says nothing.
+///
+/// A setting the config leaves out means what diffusers' class for it
+/// defaults to, and the class is the config's own even though Euler runs:
+/// SD 1.5's PNDM config says neither `prediction_type` nor
+/// `timestep_spacing`, which for PNDM are `epsilon` and `leading`.
 pub(crate) fn euler(config: &Value, steps: usize) -> Res<Schedule> {
     let f = |k: &str| config.get(k).and_then(Value::as_f64).ok_or_else(|| format!("scheduler config has no `{k}`"));
-    let s = |k: &str| config.get(k).and_then(Value::as_str).unwrap_or("");
+    let class = config.get("_class_name").and_then(Value::as_str).unwrap_or("");
+    let default = |k: &str| match (k, class) {
+        ("prediction_type", _) => "epsilon",
+        ("beta_schedule", _) => "linear",
+        // diffusers' default spacing is the class's own.
+        ("timestep_spacing", "PNDMScheduler" | "DDIMScheduler" | "DDPMScheduler") => "leading",
+        ("timestep_spacing", _) => "linspace",
+        _ => "",
+    };
+    let s = |k: &str| config.get(k).and_then(Value::as_str).unwrap_or_else(|| default(k));
     let expect = |k: &str, want: &str| -> Res<()> {
         match s(k) == want {
             true => Ok(()),
@@ -194,6 +208,21 @@ mod tests {
         let mut c = sdxl();
         c["prediction_type"] = json!("v_prediction");
         assert!(euler(&c, 30).unwrap_err().to_string().contains("prediction_type"));
+
+        // Left out, a setting is the class's default: SD 1.5's PNDM config
+        // runs as SDXL's Euler does, and an Euler config without a spacing
+        // is `linspace`, which is refused.
+        let pndm = json!({
+            "_class_name": "PNDMScheduler", "beta_end": 0.012, "beta_schedule": "scaled_linear", "beta_start": 0.00085,
+            "num_train_timesteps": 1000, "set_alpha_to_one": false, "skip_prk_steps": true, "steps_offset": 1,
+        });
+        let mut sdxl = pndm.clone();
+        sdxl["prediction_type"] = json!("epsilon");
+        sdxl["timestep_spacing"] = json!("leading");
+        assert_eq!(euler(&pndm, 25).unwrap().sigmas, euler(&sdxl, 25).unwrap().sigmas);
+        let mut plain = pndm.clone();
+        plain["_class_name"] = json!("EulerDiscreteScheduler");
+        assert!(euler(&plain, 25).unwrap_err().to_string().contains("linspace"));
     }
 
     fn qwen() -> Value {

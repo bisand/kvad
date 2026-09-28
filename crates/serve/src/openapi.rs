@@ -284,9 +284,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       as `city96/Qwen-Image-gguf:Q4_K_S`: that one file, and the text \
                       encoder, VAE and configs of the model its card names as \
                       `base_model`. It is listed, loaded and deleted by that name. An SDXL \
-                      checkpoint in one file, in Stability's layout, is `repo` when it is \
-                      the repo's only model, `repo:file.safetensors` otherwise, or a path \
-                      on this machine; its configs come from SDXL's base.",
+                      or SD 1.5 checkpoint in one file, in Stability's layout, is `repo` \
+                      when it is the repo's only model, `repo:file.safetensors` otherwise, \
+                      or a path on this machine; its configs come from its kind's base.",
         query: &[], body: json_body("`{ repo, dev? }`."), produces: JSON, events: &[],
     },
     Endpoint {

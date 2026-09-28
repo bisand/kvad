@@ -25,9 +25,10 @@ pub const IMAGES: &str = "usage: kvad images [ls]
                                [--guidance F] [--negative TEXT] [--seed N]
        kvad images rm ID
 
-Pictures made by an image model on the server — SDXL, Qwen-Image. Every one is
-kept there, with the settings that made it; `make` also writes it here, to
---out or to image-ID.png. Anything left out is the model's own default.";
+Pictures made by an image model on the server — SDXL, SD 1.5, Qwen-Image.
+Every one is kept there, with the settings that made it; `make` also writes it
+here, to --out or to image-ID.png. Anything left out is the model's own
+default.";
 
 pub const VIDEOS: &str = "usage: kvad videos [ls]
        kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]

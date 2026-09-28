@@ -42,9 +42,9 @@ pub const TOKENIZER_REPO: &str = "openai/clip-vit-large-patch14";
 /// squares against the mean of the 8×8 block of pixels it decoded to. The
 /// fit explains 83%, 81% and 76% of the variance in R, G and B — a blurry,
 /// slightly wrong-coloured picture, which is what a preview is for.
-const PREVIEW: [[f32; 3]; 4] =
+pub(crate) const PREVIEW: [[f32; 3]; 4] =
     [[0.0550, 0.0538, 0.0513], [-0.0319, -0.0023, 0.0079], [0.0157, 0.0059, -0.0009], [-0.0416, -0.0268, -0.0241]];
-const PREVIEW_BIAS: [f32; 3] = [0.0897, -0.1454, -0.1718];
+pub(crate) const PREVIEW_BIAS: [f32; 3] = [0.0897, -0.1454, -0.1718];
 
 /// A component's weights, `dir/stem`: the `.fp16` variant where the repo
 /// ships one, as Stability's does beside its f32 files, and the plain file
@@ -54,7 +54,7 @@ const PREVIEW_BIAS: [f32; 3] = [0.0897, -0.1454, -0.1718];
 /// The cache is asked first, so a repo that is here asks the Hub nothing;
 /// then the Hub, `.fp16` first, so that a repo with both never downloads its
 /// f32 file.
-fn weights(repo: &str, dir: &str, stem: &str, watch: &Watcher) -> Res<PathBuf> {
+pub(crate) fn weights(repo: &str, dir: &str, stem: &str, watch: &Watcher) -> Res<PathBuf> {
     let (fp16, plain) = (format!("{dir}/{stem}.fp16.safetensors"), format!("{dir}/{stem}.safetensors"));
     for f in [&fp16, &plain] {
         if let Cached::Here(p) = kvad::weights::cached(repo, f) {
@@ -65,7 +65,7 @@ fn weights(repo: &str, dir: &str, stem: &str, watch: &Watcher) -> Res<PathBuf> {
 }
 
 /// [`weights`], asked of this machine only.
-fn local_weights(repo: &str, dir: &str, stem: &str) -> Option<PathBuf> {
+pub(crate) fn local_weights(repo: &str, dir: &str, stem: &str) -> Option<PathBuf> {
     local_file(repo, &format!("{dir}/{stem}.fp16.safetensors")).or_else(|| local_file(repo, &format!("{dir}/{stem}.safetensors")))
 }
 
@@ -255,7 +255,7 @@ impl Painter for Sdxl {
         for i in 0..sched.steps() {
             let xin = (&x * sched.input_scale(i))?.to_dtype(self.dtype)?;
             let xin = if guided { Tensor::cat(&[&xin, &xin], 0)? } else { xin };
-            let eps = self.unet.forward(&xin, sched.timesteps[i], &ctx, &pooled, &time_ids)?.to_dtype(DType::F32)?;
+            let eps = self.unet.forward(&xin, sched.timesteps[i], &ctx, Some((&pooled, &time_ids)))?.to_dtype(DType::F32)?;
             let eps = match guided {
                 true => {
                     let (u, c) = (eps.narrow(0, 0, 1)?, eps.narrow(0, 1, 1)?);

@@ -744,8 +744,7 @@ pub struct DiffDecoder {
     /// The stage to leave as zeros, as a Metal command buffer that failed
     /// leaves them, counted from `conv_in` (0) through each block and
     /// upsampling, `x_in` and stage 5's blocks to `conv_out` (the last);
-    /// and the stages run so far. Set by the tests, and otherwise `None`:
-    /// [`Self::done`] is then the identity.
+    /// and the stages run so far. Set by the tests, and otherwise `None`.
     pub(crate) fail: std::cell::Cell<Option<usize>>,
     stage: std::cell::Cell<usize>,
 }
@@ -926,15 +925,29 @@ impl DiffDecoder {
         self.params
     }
 
-    /// A stage's result, or zeros in its place if it is the one
-    /// [`Self::fail`] names.
-    fn done(&self, x: Tensor) -> candle_core::Result<Tensor> {
+    /// A stage's result, refused if it came back zeros
+    /// (`ltx_vae::check_stage`).
+    ///
+    /// The frames cannot show it, as the conv decoder's do
+    /// (`ltx_vae::check_lattice`). After a stage of zeros, stages 1 to 4
+    /// make a context that is the same at every cell but knows nothing of
+    /// the latent, and stage 5 denoises its noise against that into a murky
+    /// texture, different at every pixel; after a stage 5 of zeros, the
+    /// context alone draws the picture, recognisable and wrong: colours
+    /// shifted, a faint grid, 17 to 26 dB from the decode that did not fail
+    /// where another seed's is 42. So each stage's result is looked at
+    /// itself.
+    ///
+    /// In the tests, the stage [`Self::fail`] names is zeros in its place.
+    fn checked(&self, x: Tensor) -> candle_core::Result<Tensor> {
         let n = self.stage.get();
         self.stage.set(n + 1);
-        match self.fail.get() == Some(n) {
-            true => x.zeros_like(),
-            false => Ok(x),
-        }
+        let x = match self.fail.get() == Some(n) {
+            true => x.zeros_like()?,
+            false => x,
+        };
+        super::ltx_vae::check_stage(&x, "diffusion decoder", n)?;
+        Ok(x)
     }
 
     /// How many stages [`Self::fail`] counts in a decode of one tile.
@@ -950,7 +963,7 @@ impl DiffDecoder {
         let g = Grid { t, h, w };
         let z = latent.to_dtype(DType::F32)?.reshape((c, g.tokens()))?.t()?.contiguous()?;
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?.to_dtype(self.dtype)?;
-        let mut x = self.done(self.conv_in.forward(&z)?.to_dtype(self.dtype)?)?;
+        let mut x = self.checked(self.conv_in.forward(&z)?.to_dtype(self.dtype)?)?;
         let mut g = g;
         for (blocks, up) in &self.stages[..3] {
             (x, g) = self.stage(x, g, blocks, up, true)?;
@@ -962,13 +975,14 @@ impl DiffDecoder {
         let rope = Rope::new(g, self.split, &self.device)?;
         let mut x = x;
         for b in blocks {
-            x = self.done(b.forward(x, g, &rope, None)?)?;
+            x = b.forward(x, g, &rope, None)?;
             // As in stage 5: the pool lets the block's buffers go only here.
             self.device.synchronize()?;
+            x = self.checked(x)?;
         }
         let (y, g) = up.forward(&x, g, drop_first)?;
         self.device.synchronize()?;
-        Ok((self.done(y.to_dtype(self.dtype)?)?, g))
+        Ok((self.checked(y.to_dtype(self.dtype)?)?, g))
     }
 
     /// Planes' places in stage `stage`'s time (0 to 3, and 4 for stage 5),
@@ -1001,7 +1015,7 @@ impl DiffDecoder {
         let g = Grid { t, h, w };
         let z = latent.to_dtype(DType::F32)?.reshape((c, g.tokens()))?.t()?.contiguous()?;
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?.to_dtype(self.dtype)?;
-        let (mut x, mut g, mut p) = (self.conv_in.forward(&z)?.to_dtype(self.dtype)?, g, planes);
+        let (mut x, mut g, mut p) = (self.checked(self.conv_in.forward(&z)?.to_dtype(self.dtype)?)?, g, planes);
         for i in 0..3 {
             (x, g, p) = self.stage_keyed(x, g, p, i, true, 0.0)?;
         }
@@ -1021,11 +1035,12 @@ impl DiffDecoder {
             let (y, py) = b.forward_keyed(x, g, &rope, None, Some(keys))?;
             (x, px) = (y, py.ok_or_else(|| candle_core::Error::Msg("a keyed block without its planes".into()))?);
             self.device.synchronize()?;
+            x = self.checked(x)?;
         }
         let (y, g) = up.forward(&x, g, drop_first)?;
         let (py, pg) = up.planes(&px, planes.grid)?;
         self.device.synchronize()?;
-        Ok((y.to_dtype(self.dtype)?, g, Planes { x: py.to_dtype(self.dtype)?, grid: pg, frames: planes.frames }))
+        Ok((self.checked(y.to_dtype(self.dtype)?)?, g, Planes { x: py.to_dtype(self.dtype)?, grid: pg, frames: planes.frames }))
     }
 
     /// [`DiffDecoder::stage_4`] with keyframe planes: the context and the
@@ -1092,7 +1107,7 @@ impl DiffDecoder {
             }))
         };
         let spans = runs(grid, c5);
-        let mut x = self.done(x_in(noise, grid)?)?;
+        let mut x = self.checked(x_in(noise, grid)?)?;
         let rows = self.rows()?;
         let rope = Rope::new(grid, self.split, &self.device)?;
         let keyed = match keys {
@@ -1113,7 +1128,7 @@ impl DiffDecoder {
                 context: Some(&planes.x),
             });
             let (y, py) = b.forward_keyed(x, grid, &rope, Some((context, &rows)), keys)?;
-            (x, px) = (self.done(y)?, py);
+            (x, px) = (self.checked(y)?, py);
             // Let the pool have the block's buffers back before the next.
             self.device.synchronize()?;
         }
@@ -1122,7 +1137,7 @@ impl DiffDecoder {
             let y = by_runs(grid.tokens(), 3 * p * p, self.dtype, &self.device, &spans, plane, |r0, len, _, _| {
                 self.conv_out.forward(&self.norm_out.forward(&x.narrow(0, r0, len)?)?)
             })?;
-            let y = self.done(y)?.reshape((grid.t, grid.h, grid.w, 3 * p * p))?.permute((0, 3, 1, 2))?.contiguous()?;
+            let y = self.checked(y)?.reshape((grid.t, grid.h, grid.w, 3 * p * p))?.permute((0, 3, 1, 2))?.contiguous()?;
             super::ltx_vae::unpatchify(&y, p)
         })
     }
@@ -1513,34 +1528,34 @@ mod tests {
         assert_eq!(planes_for_tile(&frames, 50, 60), vec![1, 2]);
     }
 
-    /// The diffusion decoder with its last two stages each left as zeros,
-    /// as a failed Metal command buffer leaves them, is refused: the norm
-    /// before `conv_out`, and `conv_out`. Its other stages failing are not
-    /// seen, and it says which (`ltx_vae::check_lattice` has why); the
-    /// decode that did not fail passes. At 768×512 and 9 frames in bf16 on
-    /// Metal, one tile, from a latent of noise:
+    /// The diffusion decoder with any one of its stages left as zeros, as a
+    /// failed Metal command buffer leaves it, is refused at that stage
+    /// ([`DiffDecoder::checked`]); the decode that did not fail passes. At
+    /// 768×512 and 9 frames in bf16 on Metal, one tile, from a latent of
+    /// noise:
     ///
     ///     cargo test --release -p kvad-gpu ltx_diffvae::tests::a_decode -- --ignored --nocapture
     #[test]
     #[ignore]
-    fn a_decode_that_fails_at_its_end_is_refused() {
+    fn a_decode_that_fails_part_way_is_refused() {
         let path = crate::image::local_file(super::super::LTX_REPO, FILE).expect("fetch LTX-2.5 first");
         let device = Device::new_metal(0).unwrap();
         let dec = DiffDecoder::load(&path, &device, DType::BF16).unwrap();
         let z = crate::image::nn::noise(5, &[128, 2, 16, 24], &device, DType::F32).unwrap();
-        let video = |dec: &DiffDecoder| {
-            let (x, r) = dec.decode(&z, 7, BUDGET, &mut |_, _| Ok(())).unwrap();
-            assert_eq!(r.tiles, [1, 1, 1]);
-            super::super::ltx_vae::to_video(&x, 24).err().map(|e| e.to_string())
+        let video = |dec: &DiffDecoder| match dec.decode(&z, 7, BUDGET, &mut |_, _| Ok(())) {
+            Ok((x, r)) => {
+                assert_eq!(r.tiles, [1, 1, 1]);
+                super::super::ltx_vae::to_video(&x, 24).err().map(|e| e.to_string())
+            }
+            Err(e) => Some(e.to_string()),
         };
 
         assert_eq!(video(&dec), None);
-        let n = dec.stages();
-        for stage in 0..n {
+        for stage in 0..dec.stages() {
             dec.fail.set(Some(stage));
-            let e = video(&dec);
-            eprintln!("stage {stage}: {}", e.as_deref().unwrap_or("passed"));
-            assert!(stage < n - 2 || e.is_some(), "stage {stage} failed and was not refused");
+            let e = video(&dec).unwrap_or_default();
+            eprintln!("stage {stage}: {}", if e.is_empty() { "passed" } else { &e });
+            assert!(e.starts_with(&format!("stage {stage} of the diffusion decoder came back zeros")), "stage {stage}: {e}");
         }
     }
 }

@@ -153,15 +153,19 @@ impl VideoDecoder {
     /// [`Self::decode`], with the stage numbered `fail` counted from
     /// `conv_in` (0) through each residual step and up block to `conv_out`
     /// (the last) left as zeros, as a Metal command buffer that failed
-    /// leaves them, and the rest run on them.
+    /// leaves them. Each stage's result is looked at as it comes
+    /// ([`check_stage`]), so that one is refused there.
     pub(crate) fn decode_failing(&self, latent: &Tensor, fail: Option<usize>) -> candle_core::Result<Tensor> {
         let mut stage = 0;
-        let mut done = |h: Tensor| -> candle_core::Result<Tensor> {
+        let mut checked = |h: Tensor| -> candle_core::Result<Tensor> {
+            let n = stage;
             stage += 1;
-            match fail == Some(stage - 1) {
-                true => h.zeros_like(),
-                false => Ok(h),
-            }
+            let h = match fail == Some(n) {
+                true => h.zeros_like()?,
+                false => h,
+            };
+            check_stage(&h, "conv decoder", n)?;
+            Ok(h)
         };
         // Frames first from here on: the frames are every convolution's batch.
         let z = latent.permute((1, 0, 2, 3))?.to_dtype(DType::F32)?;
@@ -172,19 +176,19 @@ impl VideoDecoder {
             let (t, c, h, w) = x.dims4().unwrap_or_default();
             format!("{kind} {c} × {t} × {h}×{w}")
         };
-        let mut x = done(span(|| at("conv in", &z), dev, || self.conv_in.forward(&z.to_dtype(self.dtype)?))?)?;
+        let mut x = checked(span(|| at("conv in", &z), dev, || self.conv_in.forward(&z.to_dtype(self.dtype)?))?)?;
         for block in &self.blocks {
             match block {
                 Block::Res(res) => {
                     for (c1, c2) in res {
-                        x = done(span(|| at("residual", &x), dev, || residual(&x, c1, c2))?)?;
+                        x = checked(span(|| at("residual", &x), dev, || residual(&x, c1, c2))?)?;
                         // candle's pool lets go of what a step dropped only
                         // when the device is synchronised.
                         x.device().synchronize()?;
                     }
                 }
                 Block::Up { conv, stride, out } => {
-                    x = done(span(|| at("up", &x), dev, || up(&x, conv, *stride, *out))?)?;
+                    x = checked(span(|| at("up", &x), dev, || up(&x, conv, *stride, *out))?)?;
                     x.device().synchronize()?;
                 }
             }
@@ -192,12 +196,14 @@ impl VideoDecoder {
         let p = self.patch;
         let (t, _, h, w) = x.dims4()?;
         let frames = Tensor::zeros((t, 3, h * p, w * p), DType::F32, x.device())?;
-        // The last stage, however many chunks it takes: counted once.
-        let last = fail == Some(stage);
+        // The last stage, however many chunks it takes: counted once, and
+        // each chunk looked at.
+        let last = stage;
         span(|| at("out", &x), dev, || {
             for (f, n) in chunks(&x) {
                 let y = self.conv_out.frames(&norm_silu(&halo(&x, f, n, 1)?, EPS)?, (f.saturating_sub(1), t), (f, f + n))?;
-                let y = if last { y.zeros_like()? } else { y };
+                let y = if fail == Some(last) { y.zeros_like()? } else { y };
+                check_stage(&y, "conv decoder", last)?;
                 let y = ((unpatchify(&y, p)?.to_dtype(DType::F32)? + 1.0)? * 0.5)?;
                 frames.slice_set(&y, 0, f)?;
             }
@@ -583,6 +589,37 @@ pub fn to_video(frames: &Tensor, fps: u32) -> Res<kvad::video::Video> {
     Ok(kvad::video::Video { width: w, height: h, fps, rgb })
 }
 
+/// Refuses a stage's result that came back zeros: what a Metal command
+/// buffer that failed leaves, most often for want of GPU memory, and with
+/// no error said. `stage` counts from the decoder's first, for the message.
+///
+/// Both decoders synchronise the device after each step anyway, to let the
+/// pool have its buffers back, so a look at [`STAGE_SAMPLE`] values from the
+/// middle of the result costs a few kilobytes and no waiting. A real
+/// stage's result is a residual stream, a convolution's or a linear layer's
+/// with its bias, or noise through one, and is never all zeros. Looked at
+/// here, a failure is caught at the stage that failed, whatever it goes on
+/// to draw: the conv decoder's first stage, whose lattice [`check_lattice`]
+/// cannot tell at 768×512, and the diffusion decoder's, whose frames are
+/// drawn from noise and show nothing but the last two
+/// (`ltx_diffvae::DiffDecoder::checked`).
+pub(crate) fn check_stage(x: &Tensor, decoder: &str, stage: usize) -> candle_core::Result<()> {
+    let flat = x.flatten_all()?;
+    let (len, k) = (flat.dim(0)?, flat.dim(0)?.min(STAGE_SAMPLE));
+    let sample = flat.narrow(0, (len - k) / 2, k)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    if sample.iter().all(|&v| v == 0.0) {
+        candle_core::bail!(
+            "stage {stage} of the {decoder} came back zeros: its work on the GPU failed, most likely for want of \
+             memory, and a failed command buffer on Metal reads as zeros rather than an error. Nothing was saved; \
+             free some memory (another model loaded?) and try again"
+        );
+    }
+    Ok(())
+}
+
+/// How many values [`check_stage`] reads: 16 KB in f32.
+const STAGE_SAMPLE: usize = 4096;
+
 /// Pixels per side of a latent cell, in both decoders.
 const CELL: usize = 32;
 
@@ -602,11 +639,14 @@ const CELL: usize = 32;
 /// side's eighth and never under 128 pixels, repeated to within half an
 /// 8-bit level at all but at most 1.12% of its places. A failure of the
 /// first stage let the edges' structure reach most of the middle at that
-/// size (43% did not repeat), and passes. The diffusion decoder draws its
-/// frames from noise, and only the last two of its 31 stages failing left
-/// a pattern: the others drew a murky texture, or, failing in stage 5,
+/// size (43% did not repeat), and passes here. The diffusion decoder draws
+/// its frames from noise, and only the last two of its 31 stages failing
+/// left a pattern: the others drew a murky texture, or, failing in stage 5,
 /// where the context still carries the picture, frames much like a real
-/// decode's; none of that repeats, and none of it is caught.
+/// decode's, and none of that repeats. Both decoders look at each stage's
+/// result as they go ([`check_stage`]), and that catches every one of those
+/// stages; this is what is left for a failure that stage missed, the pattern
+/// it still draws.
 ///
 /// A real frame does not repeat, even a plain one: its grain differs from
 /// cell to cell. Of 30 clips from both decoders at 768×512, plain walls,
@@ -753,12 +793,12 @@ mod tests {
         assert!(to_video(&x, 24).err().map(|e| e.to_string()).unwrap_or_default().contains("pattern"));
     }
 
-    /// The conv decoder with any one of its stages from the second on left
-    /// as zeros, as a failed Metal command buffer leaves it, and the rest
-    /// run on them, is refused rather than saved; the decode that did not
-    /// fail is not. At 768×512 and 9 frames in bf16 on Metal, as the
-    /// pipeline runs it, from a latent of noise: what a failure draws does
-    /// not depend on the latent, only on the size.
+    /// The conv decoder with any one of its stages left as zeros, as a
+    /// failed Metal command buffer leaves it, is refused at that stage
+    /// ([`check_stage`]); the decode that did not fail passes. At 768×512
+    /// and 9 frames in bf16 on Metal, as the pipeline runs it, from a latent
+    /// of noise: what a failure draws does not depend on the latent, only
+    /// on the size.
     ///
     ///     cargo test --release -p kvad-gpu ltx_vae::tests::a_decode -- --ignored --nocapture
     #[test]
@@ -768,14 +808,13 @@ mod tests {
         let device = Device::new_metal(0).unwrap();
         let dec = VideoDecoder::load(&path, &device, DType::BF16).unwrap();
         let z = crate::image::nn::noise(5, &[128, 2, 16, 24], &device, DType::F32).unwrap();
-        let video = |x: Tensor| to_video(&x.to_device(&Device::Cpu).unwrap(), 24).err().map(|e| e.to_string());
 
-        assert_eq!(video(dec.decode(&z).unwrap()), None);
+        let frames = dec.decode(&z).unwrap().to_device(&Device::Cpu).unwrap();
+        to_video(&frames, 24).unwrap();
         for stage in 0..dec.stages() {
-            let e = video(dec.decode_failing(&z, Some(stage)).unwrap());
-            eprintln!("stage {stage}: {}", e.as_deref().unwrap_or("passed"));
-            // The first's edges reach most of the middle at this size.
-            assert!(stage == 0 || e.is_some(), "stage {stage} failed and was not refused");
+            let e = dec.decode_failing(&z, Some(stage)).err().map(|e| e.to_string()).unwrap_or_default();
+            eprintln!("stage {stage}: {e}");
+            assert!(e.starts_with(&format!("stage {stage} of the conv decoder came back zeros")), "stage {stage}: {e}");
         }
     }
 }

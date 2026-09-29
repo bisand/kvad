@@ -11,6 +11,7 @@
 //! for it. Compare its total with an unprofiled run's before trusting the
 //! parts.
 
+use crate::common::{drain, report_failures, settle};
 use candle_core::{Device, Result};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -67,11 +68,15 @@ pub(crate) fn span<T, L: Into<Cow<'static, str>>>(label: impl FnOnce() -> L, dev
     if !ON.load(Ordering::Relaxed) {
         return f();
     }
-    device.synchronize()?;
+    // Waited for by a readback, not a synchronise, and failures reported
+    // once the clock has stopped: a synchronise waiting on a command buffer
+    // that fails drops it unread (`crate::common::settle`).
+    settle(device)?;
     let t = Instant::now();
     let r = f()?;
-    device.synchronize()?;
+    drain(device)?;
     let seconds = t.elapsed().as_secs_f64();
+    report_failures(device)?;
     let (scope, label) = (SCOPE.with(|s| s.get()), label().into());
     let mut rows = ROWS.lock().unwrap();
     match rows.iter_mut().find(|r| r.scope == scope && r.label == label) {

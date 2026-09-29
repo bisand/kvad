@@ -192,24 +192,46 @@ impl Decoder {
     /// `[1, latent, h, w]`, as the denoiser left it, to `[1, 3, H, W]` in
     /// `[−1, 1]`.
     pub(crate) fn decode(&self, latent: &Tensor) -> candle_core::Result<Tensor> {
+        self.decode_failing(latent, None)
+    }
+
+    /// [`Self::decode`], with the stage numbered `fail` counted from
+    /// `conv_in` (0) to `conv_out` (the last) left as zeros, as a Metal
+    /// command buffer that failed leaves them, and the rest run on them.
+    pub(crate) fn decode_failing(&self, latent: &Tensor, fail: Option<usize>) -> candle_core::Result<Tensor> {
+        let mut stage = 0;
+        let mut done = |h: Tensor| -> candle_core::Result<Tensor> {
+            stage += 1;
+            match fail == Some(stage - 1) {
+                true => h.zeros_like(),
+                false => Ok(h),
+            }
+        };
         let z = ((latent / self.cfg.scaling)? + self.cfg.shift)?;
         let z = match &self.post_quant {
             Some(conv) => conv.forward(&z)?,
             None => z,
         };
-        let mut h = self.conv_in.forward(&z)?;
-        h = self.mid.0.forward(&h)?;
-        h = self.mid.1.forward(&h)?;
-        h = self.mid.2.forward(&h)?;
+        let mut h = done(self.conv_in.forward(&z)?)?;
+        h = done(self.mid.0.forward(&h)?)?;
+        h = done(self.mid.1.forward(&h)?)?;
+        h = done(self.mid.2.forward(&h)?)?;
         for (resnets, upsample) in &self.up {
             for r in resnets {
-                h = r.forward(&h)?;
+                h = done(r.forward(&h)?)?;
             }
             if let Some(conv) = upsample {
                 let (_, _, hh, ww) = h.dims4()?;
-                h = conv.forward(&h.upsample_nearest2d(hh * 2, ww * 2)?)?;
+                h = done(conv.forward(&h.upsample_nearest2d(hh * 2, ww * 2)?)?)?;
             }
         }
-        self.conv_out.forward(&self.norm_out.forward(&h)?.silu()?)
+        let h = done(self.norm_out.forward(&h)?.silu()?)?;
+        done(self.conv_out.forward(&h)?)
+    }
+
+    /// How many stages [`Self::decode_failing`] counts.
+    #[cfg(test)]
+    pub(crate) fn stages(&self) -> usize {
+        4 + self.up.iter().map(|(r, u)| r.len() + u.is_some() as usize).sum::<usize>() + 2
     }
 }

@@ -432,8 +432,61 @@ pub(crate) fn check_decoded(pixels: &[f32]) -> Res<()> {
     .into())
 }
 
+/// Refuses an 8-bit image that is one flat colour but for a frame: what a
+/// decode that failed part-way and carried on draws.
+///
+/// A stage of the VAE left as zeros is not zeros at the end, because the
+/// layers after it add their biases: the SD 1.5 VAE, with each of its 21
+/// stages in turn zeroed on Metal, drew a grey-brown square whose middle
+/// was one colour from any stage in its first up block on, and 14 to 70
+/// colours from earlier ones. Its edges are not flat — every convolution
+/// after the failure pads with zeros, and that leaves a frame of structure
+/// up to 64 pixels deep at 512² — so the count is of the middle, inside a
+/// margin of a side's eighth and never under 64 pixels.
+///
+/// A real picture has hundreds at the least, since the VAE's own grain
+/// alone makes them. Of 27 FLUX.1-schnell images, the fewest in that middle
+/// was 4,856, a logo on a plain ground, and one 85% a single grey still had
+/// 12,168. Asked for plain walls, swatches, black and a lone circle on
+/// white, SDXL at 1024² drew 3,636 to 17,367, and SD 1.5 at 512² 592 to
+/// 24,766: 592 for "solid flat uniform mid grey colour swatch". The count
+/// stops at [`FLAT`], so a real picture costs a few rows of it.
+/// Smaller than 256 pixels a side, there is too little middle to judge,
+/// and nothing is refused.
+pub(crate) fn check_flat(rgb: &[u8], width: usize, height: usize) -> Res<()> {
+    if width < 256 || height < 256 {
+        return Ok(());
+    }
+    let (mx, my) = ((width / 8).max(64), (height / 8).max(64));
+    let mut seen = std::collections::HashSet::with_capacity(FLAT);
+    for y in my..height - my {
+        for p in rgb[(y * width + mx) * 3..(y * width + width - mx) * 3].chunks_exact(3) {
+            if seen.insert(p) && seen.len() >= FLAT {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "the decoded image is flat: {} in all of its middle, where a picture has thousands. The decode failed \
+         part-way, most likely for want of GPU memory, and the layers after the failure drew only their biases. \
+         Nothing was saved; free some memory (another model loaded?) and try again",
+        match seen.len() {
+            1 => "one colour".to_string(),
+            n => format!("{n} colours"),
+        }
+    )
+    .into())
+}
+
+/// As few colours as a picture's middle may have and pass [`check_flat`]:
+/// 1.8 times the most a failed decode left, and under a quarter of the
+/// fewest a real picture had. Nearer the failures than the pictures on
+/// purpose: refusing a real picture blames memory for nothing, where
+/// missing a failure saves what was saved before the check.
+const FLAT: usize = 128;
+
 /// Pixels in `[−1, 1]`, `[1, 3, H, W]`, to 8-bit RGB, once
-/// [`check_decoded`] has passed them.
+/// [`check_decoded`] has passed them and [`check_flat`] the bytes.
 ///
 /// The arithmetic is done here on the host, after the check, because on the
 /// device it would be three more command buffers that could fail unseen:
@@ -449,7 +502,8 @@ pub(crate) fn to_rgb8(x: &Tensor) -> Res<kvad::image::Image> {
     // Channels first to channels last: the same f32 steps the device took,
     // so the same bytes out.
     let n = h * w;
-    let rgb = (0..n * 3).map(|i| ((planes[(i % 3) * n + i / 3].clamp(-1.0, 1.0) + 1.0) * 127.5).round() as u8).collect();
+    let rgb: Vec<u8> = (0..n * 3).map(|i| ((planes[(i % 3) * n + i / 3].clamp(-1.0, 1.0) + 1.0) * 127.5).round() as u8).collect();
+    check_flat(&rgb, w, h)?;
     Ok(kvad::image::Image { width: w, height: h, rgb })
 }
 
@@ -635,6 +689,42 @@ mod tests {
         let got = to_rgb8(&image).unwrap();
         assert_eq!((got.width, got.height), (w, h));
         assert_eq!(got.rgb, want);
+    }
+
+    /// A flat middle inside a frame of structure, as a decode that failed
+    /// part-way draws it, is refused; a logo's plain ground with something
+    /// in its middle passes, and so does anything too small to judge.
+    #[test]
+    fn flat_images_are_refused() {
+        let (w, h) = (512, 512);
+        let mut rng = SplitMix(3);
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let edge = x.min(y).min(w - 1 - x).min(h - 1 - y) < 40;
+                for c in 0..3 {
+                    rgb[(y * w + x) * 3 + c] = if edge { (rng.next() % 256) as u8 } else { [126, 118, 109][c] };
+                }
+            }
+        }
+        let e = check_flat(&rgb, w, h).unwrap_err().to_string();
+        assert!(e.contains("flat: one colour in"), "{e}");
+        assert!(check_flat(&vec![200; w * h * 3], w, h).is_err());
+        assert!(check_flat(&vec![200; 128 * 1024 * 3], 128, 1024).is_ok(), "too narrow to judge");
+
+        // A logo: 238 grey everywhere but a 100² mark in the middle.
+        let mut logo = vec![238u8; w * h * 3];
+        for y in 206..306 {
+            for x in 206..306 {
+                logo[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&[(x * 2) as u8, (y * 2) as u8, 40]);
+            }
+        }
+        check_flat(&logo, w, h).unwrap();
+
+        // Through `to_rgb8`, from what the last layer's bias alone makes.
+        let bias = Tensor::new(&[0.1f32, -0.05, -0.2], &Device::Cpu).unwrap().reshape((1, 3, 1, 1)).unwrap();
+        let x = bias.broadcast_as((1, 3, 256, 320)).unwrap().contiguous().unwrap();
+        assert!(to_rgb8(&x).err().map(|e| e.to_string()).unwrap_or_default().contains("flat"));
     }
 
     /// A block of the field is the same numbers as the whole field has

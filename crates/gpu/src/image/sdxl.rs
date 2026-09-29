@@ -11,7 +11,7 @@ use super::unet::{Unet, UnetConfig};
 use super::vae::{Decoder, VaeConfig};
 use super::lora::{self, Adapters};
 use super::{finish, finish_mapped, local_file, open, open_file, open_mapped, read_json, single};
-use crate::common::{Loader, Reader};
+use crate::common::{settle, Loader, Reader};
 use crate::qcache::Vault;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::{Defaults, ImageRequest, Painted, Painter, Step};
@@ -221,7 +221,7 @@ impl Sdxl {
         let vae = Decoder::load(&cx, &r, VaeConfig::from_json(&c)?)?;
         params += finish("VAE", &paths, &r)?;
 
-        device.synchronize()?;
+        settle(&device)?;
         progress(&format!("loaded SDXL: {:.2} B parameters in f16", params as f64 / 1e9));
         Ok(Sdxl { tok, clip_l, clip_g, unet, vae, scheduler, device, dtype, adapters, params })
     }
@@ -258,7 +258,7 @@ impl Sdxl {
             }
             (true, None) => (Tensor::cat(&[&ctx.zeros_like()?, &ctx], 0)?, Tensor::cat(&[&pooled.zeros_like()?, &pooled], 0)?),
         };
-        self.device.synchronize()?;
+        settle(&self.device)?;
         let encode_secs = t0.elapsed().as_secs_f64();
 
         // Original size, crop origin, target size: the conditioning SDXL was
@@ -296,7 +296,7 @@ impl Sdxl {
                 false => {
                     // Without a preview nothing reads the step back, and the
                     // GPU would run ahead of the progress report.
-                    self.device.synchronize()?;
+                    settle(&self.device)?;
                     None
                 }
             };

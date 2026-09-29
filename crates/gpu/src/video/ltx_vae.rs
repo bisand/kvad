@@ -22,7 +22,7 @@
 
 use super::conv3d::{norm_silu, Conv3d};
 use super::metadata;
-use crate::common::Loader;
+use crate::common::{settle, Loader};
 use crate::image::nn::{check_decoded, Ctx};
 use crate::image::{finish, open};
 use crate::prof::span;
@@ -184,12 +184,12 @@ impl VideoDecoder {
                         x = checked(span(|| at("residual", &x), dev, || residual(&x, c1, c2))?)?;
                         // candle's pool lets go of what a step dropped only
                         // when the device is synchronised.
-                        x.device().synchronize()?;
+                        settle(x.device())?;
                     }
                 }
                 Block::Up { conv, stride, out } => {
                     x = checked(span(|| at("up", &x), dev, || up(&x, conv, *stride, *out))?)?;
-                    x.device().synchronize()?;
+                    settle(x.device())?;
                 }
             }
         }
@@ -480,7 +480,7 @@ impl ImageEncoder {
                     (fold(&conv.forward(&x)?, *stride)?.to_dtype(DType::F32)? + skip)?.to_dtype(self.dtype)?
                 }
             };
-            x.device().synchronize()?;
+            settle(x.device())?;
         }
         let x = self.conv_out.forward(&norm_silu(&x, EPS)?)?;
         let means = x.narrow(1, 0, self.latent)?.to_dtype(DType::F32)?;

@@ -33,7 +33,7 @@
 
 use super::conv3d::{Conv3d, Time};
 use super::metadata;
-use crate::common::{Loader, Reader};
+use crate::common::{settle, Loader, Reader};
 use crate::image::nn::{Conv2d, Ctx};
 use crate::image::{finish, open};
 use crate::qcache::Vault;
@@ -195,7 +195,7 @@ impl Upsampler {
         // allocated to the end.
         let step = |x: candle_core::Result<Tensor>| -> candle_core::Result<Tensor> {
             let x = x?;
-            x.device().synchronize()?;
+            settle(x.device())?;
             Ok(x)
         };
         let mut x = step(self.norm.forward(&self.initial.forward(&z)?)?.silu())?;

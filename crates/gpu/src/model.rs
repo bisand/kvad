@@ -421,9 +421,11 @@ impl GpuLlama {
 /// So the wait is not an optimisation barrier or a correctness fix for the
 /// arithmetic. It is the point at which a load that failed is allowed to say
 /// so. Microseconds against the seconds a load already takes, paid once, in
-/// exchange for never again serving a model that is quietly half zeros.
+/// exchange for never again serving a model that is quietly half zeros. A
+/// plain synchronise misses a buffer that fails while it waits on it, so
+/// this is [`crate::common::settle`], which does not.
 pub(crate) fn settled(device: &Device) -> Res<()> {
-    device.synchronize()?;
+    crate::common::settle(device)?;
     Ok(())
 }
 

@@ -26,7 +26,7 @@ use super::mmdit::{norm_out, Double, Names, Shape};
 use super::nn::{check_latent, latent_preview, noise, timestep_embedding, to_rgb8, Conv2d, Ctx, Linear};
 use super::schedule;
 use super::{finish, finish_gguf, local_file, open, read_json};
-use crate::common::{Loader, Reader, Stored};
+use crate::common::{settle, Loader, Reader, Stored};
 use crate::gguf::Gguf;
 use crate::qcache::Vault;
 use candle_core::quantized::{GgmlDType, QTensor};
@@ -749,7 +749,7 @@ impl QwenImage {
         params += vae_params;
         bytes += vae_params * 2;
 
-        device.synchronize()?;
+        settle(&device)?;
         let from = made.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
         progress(&format!("loaded Qwen-Image: {:.1} B parameters at {label}{from}", params as f64 / 1e9));
         Ok(QwenImage { tok, text, dit, vae, scheduler, device, dtype, quant, gguf: made, adapters, shift: None, params, bytes })
@@ -877,7 +877,7 @@ impl QwenImage {
             (Some(neg), true) => Some(self.encode(neg)?),
             _ => None,
         };
-        self.device.synchronize()?;
+        settle(&self.device)?;
         let encode_secs = t0.elapsed().as_secs_f64();
 
         // 8× from the VAE, 2× more from the patches.
@@ -910,7 +910,7 @@ impl QwenImage {
                     Some(latent_preview(&unpack(&clean, rows, cols)?, &PREVIEW, PREVIEW_BIAS)?)
                 }
                 false => {
-                    self.device.synchronize()?;
+                    settle(&self.device)?;
                     None
                 }
             };

@@ -32,6 +32,7 @@ use super::ltx_dit::{video_tokens, Dit, Shape};
 use super::ltx_sample::{dev_sigmas, guided, one_stage, refine, Guide, Latents, AUDIO_GUIDE, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
 use super::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
 use super::{ltx_audio, ltx_dfr, ltx_diffvae, ltx_duration, ltx_upsample, ltx_vae};
+use crate::common::settle;
 use crate::image::lora;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
@@ -238,12 +239,12 @@ impl Ltx {
         if kvad::qcache::enabled() && !cached("text_encoder") {
             progress("quantising the text path to q8, once");
             drop(TextEncoder::load(&paths[0], &paths[1], &device, DType::BF16, Some(quant), progress)?);
-            device.synchronize()?;
+            settle(&device)?;
         }
         if kvad::qcache::enabled() && !cached("transformer") && gguf.is_none() {
             progress("quantising the DiT to q8, once");
             drop(Dit::load(&paths[1], &device, DType::BF16, None, Some(quant), progress)?);
-            device.synchronize()?;
+            settle(&device)?;
         }
 
         let made = gguf.map(|g| crate::gguf::Gguf::open(g).map(|f| f.make_up())).transpose()?;
@@ -444,7 +445,7 @@ impl Ltx {
                 };
                 let stills = (at(first)?, at(full)?);
                 drop(enc);
-                device.synchronize()?;
+                settle(device)?;
                 Some(stills)
             }
         };
@@ -481,7 +482,7 @@ impl Ltx {
         // candle's Metal pool lets a dropped tensor's buffer go only at the
         // next synchronise; without this the text path's 13 GB would sit
         // beside the DiT's 20.
-        device.synchronize()?;
+        settle(device)?;
         let encode_secs = t.elapsed().as_secs_f64();
 
         // 2. The latents.
@@ -517,7 +518,7 @@ impl Ltx {
                 let up = ltx_upsample::Upsampler::load(&self.paths[2], &self.paths[3], device, DType::F32)?;
                 up.forward(&l.video)?
             };
-            device.synchronize()?;
+            settle(device)?;
             done += plan.upsample;
             report("stage 2", 0, s2, done, None)?;
             // The dev model's second stage is its DiT with the distilled
@@ -527,7 +528,7 @@ impl Ltx {
             let second = match &dev {
                 Some((d, lora)) => {
                     drop(dit);
-                    device.synchronize()?;
+                    settle(device)?;
                     fused = self.adapted(Dit::load_as(d, Some((lora, 1.0)), "transformer-dev-distilled", device, dtype, None, quant, &mut quiet)?)?;
                     &fused
                 }
@@ -550,7 +551,7 @@ impl Ltx {
         drop(neg);
         drop(ctx);
         // And the DiT's 20 GB, before the decoders need room for frames.
-        device.synchronize()?;
+        settle(device)?;
         let denoise_secs = t.elapsed().as_secs_f64();
 
         // 3. Pictures and sound.
@@ -567,13 +568,13 @@ impl Ltx {
             }
             _ => ltx_vae::VideoDecoder::load(&self.paths[3], device, dtype)?.decode(&latents.video)?.to_device(&Device::Cpu)?,
         };
-        device.synchronize()?;
+        settle(device)?;
         let audio = match r.audio {
             true => Some(ltx_audio::AudioPath::load(&self.paths[4], device)?.decode(&latents.audio)?),
             false => None,
         };
         drop(latents);
-        device.synchronize()?;
+        settle(device)?;
         let video = ltx_vae::to_video(&frames, r.fps)?;
         let decode_secs = t.elapsed().as_secs_f64();
         report("decode", 1, 1, total.get(), None)?;
@@ -729,7 +730,7 @@ impl Ltx {
                 };
                 let stills = (at(half)?, at(full)?);
                 drop(enc);
-                device.synchronize()?;
+                settle(device)?;
                 Some(stills)
             }
         };
@@ -752,7 +753,7 @@ impl Ltx {
             total.set(plan.total());
             chosen.set(Some(r.frames));
         }
-        device.synchronize()?;
+        settle(device)?;
         let encode_secs = t.elapsed().as_secs_f64();
         let ctx = Contexts { video: ctx.video, audio: ctx.audio };
 
@@ -771,7 +772,7 @@ impl Ltx {
         };
         done += plan.stage_1 * s1 as f64;
         drop(dit);
-        device.synchronize()?;
+        settle(device)?;
 
         // 3. The video and its keyframes upsampled, each on its own.
         report("upsample", 0, 1, done, None)?;
@@ -780,7 +781,7 @@ impl Ltx {
             let k = one.keyframes.as_ref().ok_or("stage 1 made no keyframes")?;
             (up.forward(&one.video.to_device(device)?)?, up.forward(&k.to_device(device)?)?)
         };
-        device.synchronize()?;
+        settle(device)?;
         done += plan.upsample;
 
         // 4. Stage 2, with the detailing LoRA and stage 1's video beside.
@@ -797,7 +798,7 @@ impl Ltx {
         };
         done += plan.stage_2 * s2 as f64;
         drop((detailing, upsampled, keys));
-        device.synchronize()?;
+        settle(device)?;
 
         // 5. The temporal rounds, on the plain DiT again.
         let mut clip = ltx_dfr::Clip {
@@ -825,11 +826,11 @@ impl Ltx {
                 };
                 clip = ltx_dfr::round(&dit, &ctx, &up, &clip, round, &one.audio, duration, still_2, &mut noise, &mut step)?;
                 done += secs;
-                device.synchronize()?;
+                settle(device)?;
             }
         }
         drop(ctx);
-        device.synchronize()?;
+        settle(device)?;
         let denoise_secs = t.elapsed().as_secs_f64();
 
         // 6. The clip asked for: the canvas padded its end, and the rounds
@@ -854,7 +855,7 @@ impl Ltx {
             // The conv decoder has no keyframes: the video alone.
             _ => ltx_vae::VideoDecoder::load(&self.paths[3], device, dtype)?.decode(&latent.to_device(device)?)?.to_device(&Device::Cpu)?,
         };
-        device.synchronize()?;
+        settle(device)?;
         // Stage 1's sound, as long as the canvas: cut to the clip's length.
         let play = r.fps;
         let audio = match r.audio {
@@ -867,7 +868,7 @@ impl Ltx {
             false => None,
         };
         drop((latent, planes, clip, one));
-        device.synchronize()?;
+        settle(device)?;
         let video = ltx_vae::to_video(&frames, play)?;
         let decode_secs = t.elapsed().as_secs_f64();
         report("decode", 1, 1, total.get(), None)?;
@@ -895,7 +896,7 @@ impl Director for Ltx {
         // lets it go only here. A generation that was cancelled, or failed,
         // mid-stage returned before its own synchronise, and would leave the
         // DiT's 20 GB in the pool for the next one to load beside.
-        self.device.synchronize()?;
+        settle(&self.device)?;
         filmed
     }
 

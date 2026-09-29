@@ -27,7 +27,7 @@ use super::schedule;
 use super::t5::T5;
 use super::vae::{Decoder, VaeConfig};
 use super::{finish, finish_gguf, local_file, open, read_json};
-use crate::common::{Loader, Reader};
+use crate::common::{settle, Loader, Reader};
 use crate::gguf::{Gguf, Part};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
@@ -474,7 +474,7 @@ impl Flux {
         let n = finish("VAE", &paths, &r)?;
         (params, bytes) = (params + n, bytes + 2 * n as u64);
 
-        device.synchronize()?;
+        settle(&device)?;
         let from = made.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
         progress(&format!("loaded FLUX.1-schnell: {:.1} B parameters at {label}{from}", params as f64 / 1e9));
         Ok(Flux { clip_tok, t5_tok, clip, t5, dit, vae, scheduler, device, dtype, quant, gguf: made, adapters, params, bytes: bytes as usize })
@@ -554,7 +554,7 @@ impl Flux {
 
         let t0 = Instant::now();
         let (txt, pooled) = self.encode(&req.prompt)?;
-        self.device.synchronize()?;
+        settle(&self.device)?;
         let encode_secs = t0.elapsed().as_secs_f64();
 
         let (rows, cols) = (req.height / 16, req.width / 16);
@@ -571,7 +571,7 @@ impl Flux {
                     Some(latent_preview(&unpack(&clean, rows, cols)?, &PREVIEW, PREVIEW_BIAS)?)
                 }
                 false => {
-                    self.device.synchronize()?;
+                    settle(&self.device)?;
                     None
                 }
             };

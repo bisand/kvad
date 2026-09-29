@@ -142,8 +142,27 @@ impl VideoDecoder {
     }
 
     /// Normalised latents `[128, F, h, w]` to frames `[8(F − 1) + 1, 3,
-    /// 32h, 32w]` in `[0, 1]`, as f32.
+    /// 32h, 32w]` in f32, to be clamped to `[0, 1]`. Not clamped here:
+    /// [`to_video`] does it on the host, after its check, and on the device
+    /// a clamp is `x > y ? x : y` both ways, which turns NaN into 0, black,
+    /// and hides it from the check.
     pub fn decode(&self, latent: &Tensor) -> candle_core::Result<Tensor> {
+        self.decode_failing(latent, None)
+    }
+
+    /// [`Self::decode`], with the stage numbered `fail` counted from
+    /// `conv_in` (0) through each residual step and up block to `conv_out`
+    /// (the last) left as zeros, as a Metal command buffer that failed
+    /// leaves them, and the rest run on them.
+    pub(crate) fn decode_failing(&self, latent: &Tensor, fail: Option<usize>) -> candle_core::Result<Tensor> {
+        let mut stage = 0;
+        let mut done = |h: Tensor| -> candle_core::Result<Tensor> {
+            stage += 1;
+            match fail == Some(stage - 1) {
+                true => h.zeros_like(),
+                false => Ok(h),
+            }
+        };
         // Frames first from here on: the frames are every convolution's batch.
         let z = latent.permute((1, 0, 2, 3))?.to_dtype(DType::F32)?;
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?;
@@ -153,19 +172,19 @@ impl VideoDecoder {
             let (t, c, h, w) = x.dims4().unwrap_or_default();
             format!("{kind} {c} × {t} × {h}×{w}")
         };
-        let mut x = span(|| at("conv in", &z), dev, || self.conv_in.forward(&z.to_dtype(self.dtype)?))?;
+        let mut x = done(span(|| at("conv in", &z), dev, || self.conv_in.forward(&z.to_dtype(self.dtype)?))?)?;
         for block in &self.blocks {
             match block {
                 Block::Res(res) => {
                     for (c1, c2) in res {
-                        x = span(|| at("residual", &x), dev, || residual(&x, c1, c2))?;
+                        x = done(span(|| at("residual", &x), dev, || residual(&x, c1, c2))?)?;
                         // candle's pool lets go of what a step dropped only
                         // when the device is synchronised.
                         x.device().synchronize()?;
                     }
                 }
                 Block::Up { conv, stride, out } => {
-                    x = span(|| at("up", &x), dev, || up(&x, conv, *stride, *out))?;
+                    x = done(span(|| at("up", &x), dev, || up(&x, conv, *stride, *out))?)?;
                     x.device().synchronize()?;
                 }
             }
@@ -173,15 +192,28 @@ impl VideoDecoder {
         let p = self.patch;
         let (t, _, h, w) = x.dims4()?;
         let frames = Tensor::zeros((t, 3, h * p, w * p), DType::F32, x.device())?;
+        // The last stage, however many chunks it takes: counted once.
+        let last = fail == Some(stage);
         span(|| at("out", &x), dev, || {
             for (f, n) in chunks(&x) {
                 let y = self.conv_out.frames(&norm_silu(&halo(&x, f, n, 1)?, EPS)?, (f.saturating_sub(1), t), (f, f + n))?;
-                let y = ((unpatchify(&y, p)?.to_dtype(DType::F32)? + 1.0)? * 0.5)?.clamp(0f32, 1f32)?;
+                let y = if last { y.zeros_like()? } else { y };
+                let y = ((unpatchify(&y, p)?.to_dtype(DType::F32)? + 1.0)? * 0.5)?;
                 frames.slice_set(&y, 0, f)?;
             }
             Ok(())
         })?;
         Ok(frames)
+    }
+
+    /// How many stages [`Self::decode_failing`] counts.
+    #[cfg(test)]
+    pub(crate) fn stages(&self) -> usize {
+        let steps = |b: &Block| match b {
+            Block::Res(res) => res.len(),
+            Block::Up { .. } => 1,
+        };
+        2 + self.blocks.iter().map(steps).sum::<usize>()
     }
 }
 
@@ -545,9 +577,84 @@ pub fn to_video(frames: &Tensor, fps: u32) -> Res<kvad::video::Video> {
     // Both decoders hand their frames over on the CPU, so a failed buffer is
     // already in them as zeros, and the scaling above keeps a zero a zero.
     check_decoded(&x)?;
+    check_lattice(&x, w, h)?;
+    // `as u8` saturates: the clamp to [0, 1], after the checks.
     let rgb = x.into_iter().map(|v| v as u8).collect();
     Ok(kvad::video::Video { width: w, height: h, fps, rgb })
 }
+
+/// Pixels per side of a latent cell, in both decoders.
+const CELL: usize = 32;
+
+/// Refuses a clip every frame of which repeats itself a latent cell
+/// ([`CELL`]) across and down: what a decode that failed part-way and
+/// carried on draws.
+///
+/// After a stage left as zeros, every layer after it sees the same numbers
+/// everywhere but near the edges, and adds its biases. In the image VAEs
+/// that makes a flat colour (`image::nn::check_flat`); here each up block
+/// unfolds a position's channels into a block of pixels, so the same
+/// becomes the same block at every latent cell, 32 pixels a side, and a
+/// flat colour is only the case of plain blocks. The conv decoder, with
+/// each of its 24 stages in turn zeroed on Metal at 768×512, drew such
+/// lattices, grey, purple, black and white, one colour to thousands; and
+/// from the second stage on, each frame's middle, inside a margin of a
+/// side's eighth and never under 128 pixels, repeated to within half an
+/// 8-bit level at all but at most 1.12% of its places. A failure of the
+/// first stage let the edges' structure reach most of the middle at that
+/// size (43% did not repeat), and passes. The diffusion decoder draws its
+/// frames from noise, and only the last two of its 31 stages failing left
+/// a pattern: the others drew a murky texture, or, failing in stage 5,
+/// where the context still carries the picture, frames much like a real
+/// decode's; none of that repeats, and none of it is caught.
+///
+/// A real frame does not repeat, even a plain one: its grain differs from
+/// cell to cell. Of 30 clips from both decoders at 768×512, plain walls,
+/// grey, white paper, a fade and black screens among them, the frame that
+/// repeated most was a black screen's from the diffusion decoder, and
+/// 14.7% of its middle did not. The frames are not yet clamped here, so
+/// what lies below black is still grain. Every frame must repeat, so a real
+/// clip passes at its first frame, most often a few rows into it. Smaller
+/// than 320 pixels a side, there is too little middle to judge.
+fn check_lattice(x: &[f32], width: usize, height: usize) -> Res<()> {
+    let (mx, my) = ((width / 8).max(128), (height / 8).max(128));
+    if width < 2 * (mx + CELL) || height < 2 * (my + CELL) {
+        return Ok(());
+    }
+    // Each place in the middle against the one a cell to its right and the
+    // one a cell below, all three still in the middle.
+    let (row, frame) = (width * 3, width * height * 3);
+    let (cols, rows) = (width - 2 * mx - CELL, height - 2 * my - CELL);
+    let allowed = cols * 3 * rows / MISSES;
+    for f in x.chunks_exact(frame) {
+        let mut misses = 0;
+        for y in my..my + rows {
+            let at = y * row + mx * 3;
+            let here = &f[at..at + cols * 3];
+            let right = &f[at + CELL * 3..at + (CELL + cols) * 3];
+            let below = &f[at + CELL * row..at + CELL * row + cols * 3];
+            // Half a level: the early stages' lattices repeat to within it,
+            // not exactly, their edges' structure still fading.
+            misses += here.iter().zip(right).zip(below).filter(|((a, r), b)| (*a - *r).abs() > 0.5 || (*a - *b).abs() > 0.5).count();
+            // A picture: a frame that does not repeat is enough.
+            if misses > allowed {
+                return Ok(());
+            }
+        }
+    }
+    Err("the decoded video is a pattern: every frame repeats itself every 32 pixels across and down, where a picture \
+         never does. The decode failed part-way, most likely for want of GPU memory, and the layers after the failure \
+         drew only their biases, the same at every latent cell. Nothing was saved; free some memory (another model \
+         loaded?) and try again"
+        .into())
+}
+
+/// A frame repeats if fewer than one place in this many in its middle does
+/// not: about 3%, 2.8 times the most a failed decode left and under a
+/// quarter of the fewest a real frame had. Nearer the failures on purpose,
+/// as `image::nn::FLAT` is: refusing a real clip blames memory for nothing,
+/// where missing a failure saves what was saved before the check.
+const MISSES: usize = 32;
 
 #[cfg(test)]
 mod tests {
@@ -601,5 +708,74 @@ mod tests {
         let y = unpatchify(&x, 2).unwrap();
         // Rows: (q = 0: r = 0, 1 → channels 0, 2), (q = 1 → channels 1, 3).
         assert_eq!(y.flatten_all().unwrap().to_vec1::<f32>().unwrap(), [0.0, 2.0, 1.0, 3.0]);
+    }
+
+    /// Frames that repeat a latent cell across and down, in a frame of
+    /// structure, as a decode that failed part-way draws them, are refused,
+    /// and so are frames one flat colour; a clip with a frame that does not
+    /// repeat passes, and so does a plain one with a level's grain.
+    #[test]
+    fn a_lattice_is_refused_and_a_picture_is_not() {
+        let (t, h, w) = (3, 384, 448);
+        // Xorshift: uniform enough in [0, n) for grain.
+        let mut state = 5u64;
+        let mut grain = |n: f32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1000) as f32 / 1000.0 * n
+        };
+        let mut frames = vec![0f32; t * h * w * 3];
+        for (i, v) in frames.iter_mut().enumerate() {
+            let (y, x, c) = (i / (w * 3) % h, i / 3 % w, i % 3);
+            let edge = x.min(y).min(w - 1 - x).min(h - 1 - y) < 100;
+            *v = if edge { grain(255.0) } else { ((x % CELL) * 5 + (y % CELL) * 3 + c * 40) as f32 % 255.0 + grain(0.4) };
+        }
+        let e = check_lattice(&frames, w, h).unwrap_err().to_string();
+        assert!(e.contains("repeats itself every 32 pixels"), "{e}");
+        assert!(check_lattice(&vec![77.0; t * h * w * 3], w, h).is_err());
+        assert!(check_lattice(&vec![77.0; t * 300 * w * 3], w, 300).is_ok(), "too short to judge");
+
+        // One frame of the three a picture, or all a black with a level's
+        // grain, and the clip passes.
+        let mut one = frames.clone();
+        let f = h * w * 3;
+        for v in &mut one[f..2 * f] {
+            *v = grain(255.0);
+        }
+        check_lattice(&one, w, h).unwrap();
+        let black: Vec<f32> = (0..t * h * w * 3).map(|_| grain(2.0) - 1.0).collect();
+        check_lattice(&black, w, h).unwrap();
+
+        // Through `to_video`, frames first in [0, 1].
+        let x = Tensor::from_vec(frames, (t, h, w, 3), &Device::Cpu).unwrap().permute((0, 3, 1, 2)).unwrap();
+        let x = (x.contiguous().unwrap() / 255.0).unwrap();
+        assert!(to_video(&x, 24).err().map(|e| e.to_string()).unwrap_or_default().contains("pattern"));
+    }
+
+    /// The conv decoder with any one of its stages from the second on left
+    /// as zeros, as a failed Metal command buffer leaves it, and the rest
+    /// run on them, is refused rather than saved; the decode that did not
+    /// fail is not. At 768×512 and 9 frames in bf16 on Metal, as the
+    /// pipeline runs it, from a latent of noise: what a failure draws does
+    /// not depend on the latent, only on the size.
+    ///
+    ///     cargo test --release -p kvad-gpu ltx_vae::tests::a_decode -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn a_decode_that_fails_part_way_is_refused() {
+        let path = crate::image::local_file(super::super::LTX_REPO, FILE).expect("fetch LTX-2.5 first");
+        let device = Device::new_metal(0).unwrap();
+        let dec = VideoDecoder::load(&path, &device, DType::BF16).unwrap();
+        let z = crate::image::nn::noise(5, &[128, 2, 16, 24], &device, DType::F32).unwrap();
+        let video = |x: Tensor| to_video(&x.to_device(&Device::Cpu).unwrap(), 24).err().map(|e| e.to_string());
+
+        assert_eq!(video(dec.decode(&z).unwrap()), None);
+        for stage in 0..dec.stages() {
+            let e = video(dec.decode_failing(&z, Some(stage)).unwrap());
+            eprintln!("stage {stage}: {}", e.as_deref().unwrap_or("passed"));
+            // The first's edges reach most of the middle at this size.
+            assert!(stage == 0 || e.is_some(), "stage {stage} failed and was not refused");
+        }
     }
 }

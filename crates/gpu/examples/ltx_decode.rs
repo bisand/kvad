@@ -73,6 +73,8 @@ fn main() -> Res<()> {
         }
         // The reference is channels first, [3, T, H, W]; ours is frames first.
         let want = want.permute((1, 0, 2, 3))?.to_dtype(DType::F32)?;
+        // Clamped as the reference's are; the decoder leaves it to `to_video`.
+        let frames = frames.clamp(0f32, 1f32)?;
         let diff = (&frames - &want)?.abs()?.flatten_all()?;
         let worst = diff.max(0)?.to_scalar::<f32>()?;
         let mean = diff.mean_all()?.to_scalar::<f32>()?;

@@ -741,6 +741,13 @@ pub struct DiffDecoder {
     dtype: DType,
     device: Device,
     params: usize,
+    /// The stage to leave as zeros, as a Metal command buffer that failed
+    /// leaves them, counted from `conv_in` (0) through each block and
+    /// upsampling, `x_in` and stage 5's blocks to `conv_out` (the last);
+    /// and the stages run so far. Set by the tests, and otherwise `None`:
+    /// [`Self::done`] is then the identity.
+    pub(crate) fail: std::cell::Cell<Option<usize>>,
+    stage: std::cell::Cell<usize>,
 }
 
 /// A config field as a list of numbers.
@@ -908,6 +915,8 @@ impl DiffDecoder {
             dtype,
             device: device.clone(),
             params: 0,
+            fail: std::cell::Cell::new(None),
+            stage: std::cell::Cell::new(0),
         };
         let params = finish("LTX diffusion decoder", &paths, &r)?;
         Ok(DiffDecoder { params, ..dec })
@@ -917,6 +926,23 @@ impl DiffDecoder {
         self.params
     }
 
+    /// A stage's result, or zeros in its place if it is the one
+    /// [`Self::fail`] names.
+    fn done(&self, x: Tensor) -> candle_core::Result<Tensor> {
+        let n = self.stage.get();
+        self.stage.set(n + 1);
+        match self.fail.get() == Some(n) {
+            true => x.zeros_like(),
+            false => Ok(x),
+        }
+    }
+
+    /// How many stages [`Self::fail`] counts in a decode of one tile.
+    #[cfg(test)]
+    pub(crate) fn stages(&self) -> usize {
+        1 + self.stages.iter().map(|(b, _)| b.len() + 1).sum::<usize>() + 1 + self.blocks.len() + 1
+    }
+
     /// Stages 1 to 3 on a latent `[128, F, h, w]`, already padded: the
     /// stage-4 input as tokens, and its grid.
     pub fn stages_1_to_3(&self, latent: &Tensor) -> candle_core::Result<(Tensor, Grid)> {
@@ -924,7 +950,7 @@ impl DiffDecoder {
         let g = Grid { t, h, w };
         let z = latent.to_dtype(DType::F32)?.reshape((c, g.tokens()))?.t()?.contiguous()?;
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?.to_dtype(self.dtype)?;
-        let mut x = self.conv_in.forward(&z)?.to_dtype(self.dtype)?;
+        let mut x = self.done(self.conv_in.forward(&z)?.to_dtype(self.dtype)?)?;
         let mut g = g;
         for (blocks, up) in &self.stages[..3] {
             (x, g) = self.stage(x, g, blocks, up, true)?;
@@ -936,13 +962,13 @@ impl DiffDecoder {
         let rope = Rope::new(g, self.split, &self.device)?;
         let mut x = x;
         for b in blocks {
-            x = b.forward(x, g, &rope, None)?;
+            x = self.done(b.forward(x, g, &rope, None)?)?;
             // As in stage 5: the pool lets the block's buffers go only here.
             self.device.synchronize()?;
         }
         let (y, g) = up.forward(&x, g, drop_first)?;
         self.device.synchronize()?;
-        Ok((y.to_dtype(self.dtype)?, g))
+        Ok((self.done(y.to_dtype(self.dtype)?)?, g))
     }
 
     /// Planes' places in stage `stage`'s time (0 to 3, and 4 for stage 5),
@@ -1066,7 +1092,7 @@ impl DiffDecoder {
             }))
         };
         let spans = runs(grid, c5);
-        let mut x = x_in(noise, grid)?;
+        let mut x = self.done(x_in(noise, grid)?)?;
         let rows = self.rows()?;
         let rope = Rope::new(grid, self.split, &self.device)?;
         let keyed = match keys {
@@ -1087,7 +1113,7 @@ impl DiffDecoder {
                 context: Some(&planes.x),
             });
             let (y, py) = b.forward_keyed(x, grid, &rope, Some((context, &rows)), keys)?;
-            (x, px) = (y, py);
+            (x, px) = (self.done(y)?, py);
             // Let the pool have the block's buffers back before the next.
             self.device.synchronize()?;
         }
@@ -1096,14 +1122,14 @@ impl DiffDecoder {
             let y = by_runs(grid.tokens(), 3 * p * p, self.dtype, &self.device, &spans, plane, |r0, len, _, _| {
                 self.conv_out.forward(&self.norm_out.forward(&x.narrow(0, r0, len)?)?)
             })?;
-            let y = y.reshape((grid.t, grid.h, grid.w, 3 * p * p))?.permute((0, 3, 1, 2))?.contiguous()?;
+            let y = self.done(y)?.reshape((grid.t, grid.h, grid.w, 3 * p * p))?.permute((0, 3, 1, 2))?.contiguous()?;
             super::ltx_vae::unpatchify(&y, p)
         })
     }
 
     /// A latent `[128, F, h, w]` to its frames, `[8(F − 1) + 1, 3, 32h, 32w]`
-    /// in `[0, 1]`, in f32 on the host, as `ltx_vae::VideoDecoder::decode`
-    /// answers; stage 5 starting from the noise of `seed`. `progress` hears
+    /// in f32 on the host, to be clamped to `[0, 1]`, as
+    /// `ltx_vae::VideoDecoder::decode` answers; stage 5 starting from the noise of `seed`. `progress` hears
     /// of each tile done, and of how many there are, and an `Err` from it
     /// stops the decode there.
     ///
@@ -1131,6 +1157,7 @@ impl DiffDecoder {
      -> Res<(Tensor, Report)> {
         let (_, f, lh, lw) = latent.dims4()?;
         let t0 = std::time::Instant::now();
+        self.stage.set(0);
         let last = latent.narrow(1, f - 1, 1)?;
         let padded = Tensor::cat(&[latent, &last, &last], 1)?;
         let (feat, g4, planes) = match keys {
@@ -1228,9 +1255,12 @@ impl DiffDecoder {
             }
         }
         // [−1, 1] to [0, 1], as the reference's `to_rgb`, in place: the
-        // frames of a 1536 × 1024 clip are 2.3 GB in f32.
+        // frames of a 1536 × 1024 clip are 2.3 GB in f32. Its clamp is left
+        // to `ltx_vae::to_video`, after the checks: what lies below black
+        // and above white is still grain there, and a clamped black would
+        // be one value from edge to edge, as a failed decode draws it.
         for v in acc.iter_mut() {
-            *v = ((*v + 1.0) * 0.5).clamp(0.0, 1.0);
+            *v = (*v + 1.0) * 0.5;
         }
         report.stages_4_to_5 = t0.elapsed().as_secs_f64();
         Ok((Tensor::from_vec(acc, (frames, 3, height, width), &Device::Cpu)?, report))
@@ -1481,5 +1511,36 @@ mod tests {
         assert_eq!(planes_for_tile(&frames, 100, 130), vec![3, 4]);
         // None inside: the two around it.
         assert_eq!(planes_for_tile(&frames, 50, 60), vec![1, 2]);
+    }
+
+    /// The diffusion decoder with its last two stages each left as zeros,
+    /// as a failed Metal command buffer leaves them, is refused: the norm
+    /// before `conv_out`, and `conv_out`. Its other stages failing are not
+    /// seen, and it says which (`ltx_vae::check_lattice` has why); the
+    /// decode that did not fail passes. At 768×512 and 9 frames in bf16 on
+    /// Metal, one tile, from a latent of noise:
+    ///
+    ///     cargo test --release -p kvad-gpu ltx_diffvae::tests::a_decode -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn a_decode_that_fails_at_its_end_is_refused() {
+        let path = crate::image::local_file(super::super::LTX_REPO, FILE).expect("fetch LTX-2.5 first");
+        let device = Device::new_metal(0).unwrap();
+        let dec = DiffDecoder::load(&path, &device, DType::BF16).unwrap();
+        let z = crate::image::nn::noise(5, &[128, 2, 16, 24], &device, DType::F32).unwrap();
+        let video = |dec: &DiffDecoder| {
+            let (x, r) = dec.decode(&z, 7, BUDGET, &mut |_, _| Ok(())).unwrap();
+            assert_eq!(r.tiles, [1, 1, 1]);
+            super::super::ltx_vae::to_video(&x, 24).err().map(|e| e.to_string())
+        };
+
+        assert_eq!(video(&dec), None);
+        let n = dec.stages();
+        for stage in 0..n {
+            dec.fail.set(Some(stage));
+            let e = video(&dec);
+            eprintln!("stage {stage}: {}", e.as_deref().unwrap_or("passed"));
+            assert!(stage < n - 2 || e.is_some(), "stage {stage} failed and was not refused");
+        }
     }
 }

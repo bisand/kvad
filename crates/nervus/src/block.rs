@@ -41,7 +41,7 @@
 //! puts a norm on the highway; it needed careful learning-rate warm-up to
 //! train at all, and everything since GPT-2 does it this way round.
 
-use crate::attention::CausalSelfAttention;
+use crate::attention::SelfAttention;
 use crate::matrix::Matrix;
 use crate::nn::{prefixed, Gelu, Layer, Linear, Param};
 use crate::norm::LayerNorm;
@@ -117,7 +117,7 @@ impl Block {
         Block {
             attn: Residual::new(vec![
                 Box::new(LayerNorm::new(d_model)),
-                Box::new(CausalSelfAttention::new(d_model, n_heads, rng)),
+                Box::new(SelfAttention::causal(d_model, n_heads, rng)),
             ]),
             mlp: Residual::new(vec![
                 Box::new(LayerNorm::new(d_model)),

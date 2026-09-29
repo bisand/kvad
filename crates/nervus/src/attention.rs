@@ -1,4 +1,4 @@
-//! Causal self-attention, forward and backward.
+//! Self-attention, forward and backward, with the causal mask or without it.
 //!
 //! # What is new here, and what is not
 //!
@@ -40,6 +40,17 @@
 //! gradient buffers accumulate until `zero_grad`, which is what they were
 //! for all along.
 //!
+//! # With the mask and without it
+//!
+//! A GPT masks the future because it is trained to predict it: a position
+//! that could read the next token would be copying the answer. A diffusion
+//! model has nothing to predict in order. Every patch of a noisy image is
+//! equally given, and the patch in the corner should be allowed to look at
+//! the one in the middle. So [`SelfAttention::bidirectional`] is the same
+//! layer with the mask switched off, and the backward pass needs no change
+//! at all: it never mentioned the mask in the first place (see
+//! `softmax_backward`).
+//!
 //! [`nn`]: crate::nn
 //! [`matrix`]: crate::matrix
 
@@ -47,9 +58,11 @@ use crate::matrix::Matrix;
 use crate::nn::{prefixed, Layer, Linear, Param};
 use crate::rng::Rng;
 
-/// Multi-head causal self-attention over one sequence: `[seq, d_model]` in,
+/// Multi-head self-attention over one sequence: `[seq, d_model]` in,
 /// `[seq, d_model]` out.
-pub struct CausalSelfAttention {
+pub struct SelfAttention {
+    /// Whether position `i` may read only positions `0..=i`.
+    causal: bool,
     n_heads: usize,
     head_dim: usize,
     wq: Linear,
@@ -73,10 +86,21 @@ struct HeadCache {
     probs: Matrix,
 }
 
-impl CausalSelfAttention {
-    pub fn new(d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
+impl SelfAttention {
+    /// Each position reads itself and what came before it: a GPT's attention.
+    pub fn causal(d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
+        Self::new(true, d_model, n_heads, rng)
+    }
+
+    /// Every position reads every position: a diffusion transformer's.
+    pub fn bidirectional(d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
+        Self::new(false, d_model, n_heads, rng)
+    }
+
+    fn new(causal: bool, d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
         assert_eq!(d_model % n_heads, 0, "d_model {d_model} does not split into {n_heads} heads");
-        CausalSelfAttention {
+        SelfAttention {
+            causal,
             n_heads,
             head_dim: d_model / n_heads,
             wq: Linear::new(d_model, d_model, rng),
@@ -100,7 +124,7 @@ impl CausalSelfAttention {
     }
 }
 
-impl Layer for CausalSelfAttention {
+impl Layer for SelfAttention {
     fn forward(&mut self, x: &Matrix) -> Matrix {
         let q = self.wq.forward(x);
         let k = self.wk.forward(x);
@@ -120,7 +144,7 @@ impl Layer for CausalSelfAttention {
             // matches position j's label.
             let mut probs = qh.matmul_a_bt(&kh);
             probs.data.iter_mut().for_each(|s| *s *= scale);
-            causal_softmax_rows(&mut probs);
+            softmax_rows(&mut probs, self.causal);
 
             // Each output row is a weighted average of the value rows.
             let out = probs.matmul(&vh);
@@ -194,7 +218,8 @@ impl Layer for CausalSelfAttention {
 
     fn describe(&self) -> String {
         format!(
-            "CausalSelfAttention({} heads x {}, {} params)",
+            "{}SelfAttention({} heads x {}, {} params)",
+            if self.causal { "Causal" } else { "Bidirectional" },
             self.n_heads,
             self.head_dim,
             self.param_count()
@@ -202,15 +227,17 @@ impl Layer for CausalSelfAttention {
     }
 }
 
-/// Softmax each row in place, with row `i` allowed to see only columns `0..=i`.
+/// Softmax each row in place. With `causal`, row `i` may see only columns
+/// `0..=i`.
 ///
 /// The usual description of the causal mask is "set the future scores to -inf
 /// before the softmax". Leaving them out of the sum is the same thing, since
 /// exp(-inf) = 0, and needs no infinities.
-fn causal_softmax_rows(scores: &mut Matrix) {
+fn softmax_rows(scores: &mut Matrix, causal: bool) {
     for i in 0..scores.rows {
         let row = scores.row_mut(i);
-        let (seen, future) = row.split_at_mut(i + 1);
+        let seen = if causal { i + 1 } else { row.len() };
+        let (seen, future) = row.split_at_mut(seen);
 
         // Subtract the max first, for the same reason as in the loss.
         let max = seen.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -287,20 +314,24 @@ mod tests {
     const SEQ: usize = 5;
     const D_MODEL: usize = 8;
 
-    fn setup() -> (CausalSelfAttention, Matrix, Vec<usize>) {
+    fn setup() -> (SelfAttention, Matrix, Vec<usize>) {
+        setup_with(SelfAttention::causal)
+    }
+
+    fn setup_with(build: fn(usize, usize, &mut Rng) -> SelfAttention) -> (SelfAttention, Matrix, Vec<usize>) {
         let mut rng = Rng::new(7);
-        let attn = CausalSelfAttention::new(D_MODEL, 2, &mut rng);
+        let attn = build(D_MODEL, 2, &mut rng);
         let x = Matrix::from_vec(SEQ, D_MODEL, (0..SEQ * D_MODEL).map(|_| rng.normal()).collect());
         // One target per position, as in next-token prediction.
         let targets = vec![3, 0, 7, 1, 4];
         (attn, x, targets)
     }
 
-    fn loss(attn: &mut CausalSelfAttention, x: &Matrix, targets: &[usize]) -> f32 {
+    fn loss(attn: &mut SelfAttention, x: &Matrix, targets: &[usize]) -> f32 {
         softmax_cross_entropy(&attn.forward(x), targets).0
     }
 
-    fn projection(attn: &mut CausalSelfAttention, i: usize) -> &mut Linear {
+    fn projection(attn: &mut SelfAttention, i: usize) -> &mut Linear {
         match i {
             0 => &mut attn.wq,
             1 => &mut attn.wk,
@@ -311,7 +342,18 @@ mod tests {
 
     #[test]
     fn analytic_gradient_matches_numerical() {
-        let (mut attn, mut x, targets) = setup();
+        check_gradients(setup());
+    }
+
+    /// The same check with the mask off. Nothing in backward changed, and this
+    /// is what says that nothing had to: the masked entries were zeros that
+    /// the backward pass multiplied through, not a case it handled.
+    #[test]
+    fn bidirectional_gradient_matches_numerical() {
+        check_gradients(setup_with(SelfAttention::bidirectional));
+    }
+
+    fn check_gradients((mut attn, mut x, targets): (SelfAttention, Matrix, Vec<usize>)) {
         let eps = 1e-3;
 
         attn.zero_grad();
@@ -393,6 +435,21 @@ mod tests {
             assert_eq!(before.row(r), after.row(r), "position {r} saw the last token");
         }
         assert_ne!(before.row(SEQ - 1), after.row(SEQ - 1));
+    }
+
+    /// And with the mask off, it must leak everywhere: that is the point of
+    /// taking it off.
+    #[test]
+    fn without_the_mask_every_position_sees_every_other() {
+        let (mut attn, mut x, _) = setup_with(SelfAttention::bidirectional);
+        let before = attn.forward(&x);
+
+        x.row_mut(SEQ - 1).iter_mut().for_each(|v| *v += 1.0);
+        let after = attn.forward(&x);
+
+        for r in 0..SEQ {
+            assert_ne!(before.row(r), after.row(r), "position {r} did not see the last one");
+        }
     }
 
     /// The same, seen from the gradient's side: a loss on the first position

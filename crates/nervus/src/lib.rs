@@ -18,13 +18,22 @@
 //! 11. [`checkpoint`] — a trained model on disk, laid out so that `kvad` can run it.
 //!     ([`json`] is there because it has to be; it teaches nothing about networks.)
 //!
+//! Then the same transformer, taught to draw instead of write:
+//!
+//! 12. [`dit`]   — a diffusion transformer: patches for tokens, no mask, and
+//!     the conditioning steering every norm (adaLN-Zero).
+//! 13. [`flow`]  — flow matching: the loss it is trained with, and the loop
+//!     that draws with it. ([`png`] is [`json`]'s counterpart for pictures.)
+//!
 //! Then run `cargo test -p nervus`: the gradient check in `nn` verifies the
 //! hand-derived derivatives against numerically measured ones.
 
 pub mod attention;
 pub mod block;
 pub mod checkpoint;
+pub mod dit;
 pub mod embedding;
+pub mod flow;
 #[cfg(test)]
 mod gradcheck;
 pub mod json;
@@ -34,5 +43,6 @@ pub mod model;
 pub mod nn;
 pub mod norm;
 pub mod optim;
+pub mod png;
 pub mod rng;
 pub mod text;

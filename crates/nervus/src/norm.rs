@@ -50,6 +50,11 @@ pub const EPS: f32 = 1e-5;
 /// `gamma` and `beta` give back the freedom normalising took away: if the
 /// network would rather a feature were large, or off-centre, it can learn that.
 pub struct LayerNorm {
+    /// False for a norm whose gamma and beta are fixed at 1 and 0 and are not
+    /// parameters. A diffusion transformer's norms are like that: the scale
+    /// and shift come from the conditioning instead (see `dit`), and a learned
+    /// pair on top would be a second, redundant copy of the same freedom.
+    affine: bool,
     gamma: Vec<f32>,
     beta: Vec<f32>,
     dgamma: Vec<f32>,
@@ -66,6 +71,7 @@ pub struct LayerNorm {
 impl LayerNorm {
     pub fn new(features: usize) -> Self {
         LayerNorm {
+            affine: true,
             // Start as a plain normalisation: scale by 1, shift by 0.
             gamma: vec![1.0; features],
             beta: vec![0.0; features],
@@ -76,6 +82,11 @@ impl LayerNorm {
             x_hat: Matrix::zeros(0, features),
             inv_std: Vec::new(),
         }
+    }
+
+    /// Normalisation and nothing else: no gamma, no beta, no parameters.
+    pub fn plain(features: usize) -> Self {
+        LayerNorm { affine: false, ..LayerNorm::new(features) }
     }
 }
 
@@ -131,8 +142,10 @@ impl Layer for LayerNorm {
     }
 
     fn step(&mut self, lr: f32, momentum: f32) {
-        sgd(&mut self.gamma, &self.dgamma, &mut self.vgamma, lr, momentum);
-        sgd(&mut self.beta, &self.dbeta, &mut self.vbeta, lr, momentum);
+        if self.affine {
+            sgd(&mut self.gamma, &self.dgamma, &mut self.vgamma, lr, momentum);
+            sgd(&mut self.beta, &self.dbeta, &mut self.vbeta, lr, momentum);
+        }
     }
 
     fn zero_grad(&mut self) {
@@ -141,10 +154,16 @@ impl Layer for LayerNorm {
     }
 
     fn describe(&self) -> String {
-        format!("LayerNorm({}, {} params)", self.gamma.len(), 2 * self.gamma.len())
+        match self.affine {
+            true => format!("LayerNorm({}, {} params)", self.gamma.len(), 2 * self.gamma.len()),
+            false => format!("LayerNorm({}, no params)", self.gamma.len()),
+        }
     }
 
     fn params(&mut self) -> Vec<Param<'_>> {
+        if !self.affine {
+            return Vec::new();
+        }
         vec![
             Param::new("gamma", &mut self.gamma, &mut self.dgamma),
             Param::new("beta", &mut self.beta, &mut self.dbeta),

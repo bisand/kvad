@@ -55,7 +55,7 @@
 //! sixty-four run and fifty-eight are never touched.
 
 use crate::common::{
-    causal_mask, check_block, embedding, label, unread, unread_error, Embed, KvCache, Loader, Proj, Reader,
+    causal_mask, check_block, embedding, label, report_failures, unread, unread_error, Embed, KvCache, Loader, Proj, Reader,
     Stored,
 };
 use crate::ffn::{Ffn, Mlp, Moe};
@@ -373,7 +373,9 @@ impl GpuDeepSeek {
         let last = x.i(m - 1)?.unsqueeze(0)?;
         let last = ops::rms_norm(&last, &self.final_norm, spec.eps)?;
         let logits = self.head.forward(&last)?.to_dtype(DType::F32)?;
-        Ok(logits.flatten_all()?.to_vec1::<f32>()?)
+        let logits = logits.flatten_all()?.to_vec1::<f32>()?;
+        report_failures(last.device())?;
+        Ok(logits)
     }
 
     fn params(&self) -> usize {

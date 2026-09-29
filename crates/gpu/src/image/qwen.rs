@@ -520,23 +520,49 @@ impl WanDecoder {
         })
     }
 
-    /// `[1, 16, h, w]` normalised latents to `[1, 3, H, W]` in `[−1, 1]`.
+    /// `[1, 16, h, w]` normalised latents to `[1, 3, H, W]`, to be clamped
+    /// to `[−1, 1]`. Not clamped here: `to_rgb8` does it on the host, after
+    /// its check, and on the device a clamp is `x > y ? x : y` both ways,
+    /// which turns NaN into −1, black, and hides it from the check.
     fn decode(&self, z: &Tensor) -> candle_core::Result<Tensor> {
+        self.decode_failing(z, None)
+    }
+
+    /// [`Self::decode`], with the stage numbered `fail` counted from
+    /// `conv_in` (0) to `conv_out` (the last) left as zeros, as a Metal
+    /// command buffer that failed leaves them, and the rest run on them.
+    /// As `vae::Decoder::decode_failing` counts them for the other VAEs.
+    fn decode_failing(&self, z: &Tensor, fail: Option<usize>) -> candle_core::Result<Tensor> {
+        let mut stage = 0;
+        let mut done = |h: Tensor| -> candle_core::Result<Tensor> {
+            stage += 1;
+            match fail == Some(stage - 1) {
+                true => h.zeros_like(),
+                false => Ok(h),
+            }
+        };
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?;
-        let mut h = self.conv_in.forward(&self.post_quant.forward(&z)?)?;
-        h = self.mid.0.forward(&h)?;
-        h = self.attend(&h)?;
-        h = self.mid.2.forward(&h)?;
+        let mut h = done(self.conv_in.forward(&self.post_quant.forward(&z)?)?)?;
+        h = done(self.mid.0.forward(&h)?)?;
+        h = done(self.attend(&h)?)?;
+        h = done(self.mid.2.forward(&h)?)?;
         for (resnets, upsample) in &self.up {
             for r in resnets {
-                h = r.forward(&h)?;
+                h = done(r.forward(&h)?)?;
             }
             if let Some(conv) = upsample {
                 let (_, _, hh, ww) = h.dims4()?;
-                h = conv.forward(&h.upsample_nearest2d(hh * 2, ww * 2)?)?;
+                h = done(conv.forward(&h.upsample_nearest2d(hh * 2, ww * 2)?)?)?;
             }
         }
-        self.conv_out.forward(&self.norm_out.forward(&h)?.silu()?)?.clamp(-1f32, 1f32)
+        let h = done(self.norm_out.forward(&h)?.silu()?)?;
+        done(self.conv_out.forward(&h)?)
+    }
+
+    /// How many stages [`Self::decode_failing`] counts.
+    #[cfg(test)]
+    fn stages(&self) -> usize {
+        4 + self.up.iter().map(|(r, u)| r.len() + u.is_some() as usize).sum::<usize>() + 2
     }
 
     /// One head as wide as the channels, over every position.
@@ -1020,6 +1046,45 @@ mod tests {
         let t0 = rows * cols;
         assert_eq!((at(t0, frame), at(t0, row), at(t0, col)), (3.0, 3.0, 3.0));
         assert_eq!(at(t0 + 1, row), 4.0);
+    }
+
+    /// A decode with any one of the Wan VAE's stages left as zeros, as a
+    /// failed Metal command buffer leaves it, and the rest run on them, is
+    /// refused rather than saved; the decode that did not fail is not; and
+    /// NaN in the decode reaches the check rather than turning black. In
+    /// bf16 on Metal as the pipeline runs it, at 512², from a latent of
+    /// noise, as `sd15::tests::a_decode_that_fails_part_way_is_refused`
+    /// does the other VAE:
+    ///
+    ///     cargo test --release -p kvad-gpu qwen::tests::a_decode -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn a_decode_that_fails_part_way_is_refused() {
+        let w = Watcher::none();
+        let config = read_json(&fetch_file("Qwen/Qwen-Image", "vae/config.json", &w).unwrap()).unwrap();
+        let paths = vec![fetch_file("Qwen/Qwen-Image", "vae/diffusion_pytorch_model.safetensors", &w).unwrap()];
+        let device = Device::new_metal(0).unwrap();
+        let vault = Vault::off();
+        let cx = Ctx { ld: Loader::new(None, device.clone(), &vault), dtype: DType::BF16 };
+        let vae = WanDecoder::load(&cx, &open(&paths, DType::BF16).unwrap(), &config).unwrap();
+        let z = noise(5, &[1, Z, 64, 64], &device, DType::BF16).unwrap();
+
+        to_rgb8(&vae.decode(&z).unwrap()).unwrap();
+        for stage in 0..vae.stages() {
+            let e = to_rgb8(&vae.decode_failing(&z, Some(stage)).unwrap()).err().map(|e| e.to_string());
+            eprintln!("stage {stage}: {}", e.as_deref().unwrap_or("passed"));
+            assert!(e.is_some(), "stage {stage} failed and was not refused");
+        }
+
+        // One NaN in the latent spreads through the first 3×3 convolution
+        // and the RMS norms after it; the device's clamp used to make it
+        // black, and what `to_rgb8` saw was a finite image.
+        let mut v = z.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        v[32 * 64 + 32] = f32::NAN;
+        let z = Tensor::from_vec(v, (1, Z, 64, 64), &device).unwrap().to_dtype(DType::BF16).unwrap();
+        let e = to_rgb8(&vae.decode(&z).unwrap()).err().map(|e| e.to_string()).unwrap_or_default();
+        eprintln!("NaN: {e}");
+        assert!(e.contains("NaN"), "NaN in the decode was not refused as NaN: {e}");
     }
 
     /// Qwen-Image's first blocks with Lightning, against diffusers with PEFT

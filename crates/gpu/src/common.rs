@@ -1040,10 +1040,19 @@ pub(crate) fn check_block(quant: Option<GgmlDType>, dims: &[(&str, usize)]) -> R
 /// or out of memory fails a buffer, and running out of memory has taken
 /// this machine down. The argument is candle's source, read.
 pub(crate) fn settle(device: &Device) -> candle_core::Result<()> {
-    if device.is_metal() {
-        Tensor::zeros(1, DType::U8, device)?.to_vec1::<u8>()?;
-    }
+    drain(device)?;
     report_failures(device)
+}
+
+/// [`settle`]'s first half: waits for everything queued on `device`, on
+/// Metal by a one-byte readback, which keeps a command buffer that failed
+/// for [`report_failures`] to find. As long as a synchronise, so the
+/// profiler times with it (`prof::span`) and reports after its clock stops.
+pub(crate) fn drain(device: &Device) -> candle_core::Result<()> {
+    match device.is_metal() {
+        true => Tensor::zeros(1, DType::U8, device)?.to_vec1::<u8>().map(|_| ()),
+        false => device.synchronize(),
+    }
 }
 
 /// [`settle`]'s second half, for just after a readback: the synchronise

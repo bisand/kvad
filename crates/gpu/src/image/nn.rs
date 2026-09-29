@@ -14,7 +14,7 @@
 //! protects the text models protects these too.
 
 use super::lora::Slot;
-use crate::common::{Loader, Proj, Reader, Stored};
+use crate::common::{settle, Loader, Proj, Reader, Stored};
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::ops;
 
@@ -404,7 +404,11 @@ fn broken(values: &[f32]) -> Option<&'static str> {
 /// decode spends seconds on it. Copying it to the host is cheap: a 1024²
 /// image's latent is a megabyte in f32.
 pub(crate) fn check_latent(x: &Tensor) -> Res<()> {
-    let Some(what) = broken(&x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?) else { return Ok(()) };
+    let values = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    // A failure that left a stale tensor's numbers, not zeros, shows only
+    // as the error `settle` reads.
+    settle(x.device())?;
+    let Some(what) = broken(&values) else { return Ok(()) };
     Err(format!(
         "the denoiser's result came back {what}; not decoding it. A failed command buffer on Metal reads as zeros \
          rather than an error, most often for want of GPU memory, and an overflow leaves NaN"
@@ -500,6 +504,9 @@ pub(crate) fn to_rgb8(x: &Tensor) -> Res<kvad::image::Image> {
         return Err(format!("a decoded image should have 3 channels, not {c}").into());
     }
     let planes = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    // A failure that left a stale tensor's numbers, not zeros, shows only
+    // as the error `settle` reads.
+    settle(x.device())?;
     check_decoded(&planes)?;
     // Channels first to channels last: the same f32 steps the device took,
     // so the same bytes out.

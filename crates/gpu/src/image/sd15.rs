@@ -23,7 +23,7 @@ use super::vae::{Decoder, VaeConfig};
 use super::sdxl::local_weights;
 use super::lora::{self, Adapters};
 use super::{finish, finish_mapped, open, open_file, open_mapped, read_json, single};
-use crate::common::{Loader, Reader};
+use crate::common::{settle, Loader, Reader};
 use crate::qcache::Vault;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::{Defaults, ImageRequest, Painted, Painter, Step};
@@ -135,7 +135,7 @@ impl Sd15 {
             _ => params += finish("VAE", &paths, &r_v)?,
         }
 
-        device.synchronize()?;
+        settle(&device)?;
         progress(&format!("loaded SD 1.5: {:.2} B parameters in f16", params as f64 / 1e9));
         Ok(Sd15 { tok, clip, unet, vae, scheduler, device, dtype, adapters, params })
     }
@@ -162,7 +162,7 @@ impl Sd15 {
             true => Tensor::cat(&[&self.encode(req.negative_prompt.as_deref().unwrap_or(""))?, &ctx], 0)?,
             false => ctx,
         };
-        self.device.synchronize()?;
+        settle(&self.device)?;
         let encode_secs = t0.elapsed().as_secs_f64();
 
         let sched = schedule::euler(&self.scheduler, req.steps)?;
@@ -189,7 +189,7 @@ impl Sd15 {
                     Some(latent_preview(&(clean / self.vae.config().scaling)?, &PREVIEW, PREVIEW_BIAS)?)
                 }
                 false => {
-                    self.device.synchronize()?;
+                    settle(&self.device)?;
                     None
                 }
             };

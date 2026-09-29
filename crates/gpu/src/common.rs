@@ -1015,6 +1015,42 @@ pub(crate) fn check_block(quant: Option<GgmlDType>, dims: &[(&str, usize)]) -> R
     Ok(())
 }
 
+/// Waits for everything queued on `device`, and fails if any of it failed.
+///
+/// A plain `synchronize` misses a failure on Metal. candle 0.11.0's
+/// (`candle-metal-kernels`, `Commands::flush_and_wait`) commits the current
+/// command buffer and waits on the last one in flight, but reads that
+/// one's status only *before* the wait: a buffer still running when asked,
+/// which then fails, is taken off the list with its error unread. Earlier
+/// buffers, done by then, are checked; the last is the one most often
+/// still running. Nothing is said, and the outputs hold whatever their
+/// buffers held: zeros if fresh, or — the pool hands a buffer dropped since
+/// the last wait to the next tensor that fits — a stale tensor's numbers,
+/// which no look at the numbers could tell from real ones. Only the error
+/// can.
+///
+/// A readback waits another way (`flush_and_wait_current`). It too reads
+/// the status before its wait, but it keeps every buffer that has not
+/// completed on the list, and a synchronise after it finds that buffer done
+/// and failed, and says so. So this reads one byte back, then synchronises.
+///
+/// Not tried against a real failure: none that could be made safely here.
+/// An out-of-bounds read or write, a purged buffer and an oversized
+/// dispatch all complete on Apple's GPUs; only running past the watchdog
+/// or out of memory fails a buffer, and running out of memory has taken
+/// this machine down. The argument is candle's source, read.
+pub(crate) fn settle(device: &Device) -> candle_core::Result<()> {
+    if device.is_metal() {
+        Tensor::zeros(1, DType::U8, device)?.to_vec1::<u8>()?;
+    }
+    device.synchronize().map_err(|e| {
+        candle_core::Error::Msg(format!(
+            "work on the GPU failed ({e}), most likely for want of memory, so what it made is not used. Free some \
+             memory (another model loaded?) and try again"
+        ))
+    })
+}
+
 /// What a loaded model calls the place it runs: `metal bf16`, `cpu q8`.
 pub(crate) fn label(device: &Device, dtype: DType, quant: Option<GgmlDType>) -> String {
     let kind = if device.is_metal() {
@@ -1047,6 +1083,24 @@ pub(crate) fn unread_error(arch: &str, left: &[String]) -> String {
 mod tests {
     use super::*;
     use candle_core::quantized::GgmlDType;
+
+    /// `settle` waits for what is queued and passes when none of it failed,
+    /// on the CPU and on Metal, and what was queued is there after it. That
+    /// it fails when a command buffer did is candle's source read, not
+    /// tested: see `settle` for why.
+    #[test]
+    fn settle_waits_and_passes_when_nothing_failed() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(metal) = Device::new_metal(0) {
+            devices.push(metal);
+        }
+        for dev in devices {
+            let y = (Tensor::ones((256, 256), DType::F32, &dev).unwrap() * 3.0).unwrap();
+            settle(&dev).unwrap();
+            assert_eq!(y.sum_all().unwrap().to_scalar::<f32>().unwrap(), 3.0 * 256.0 * 256.0);
+            settle(&dev).unwrap();
+        }
+    }
 
     /// A quantised projection of rows taken from the middle of a tensor gives
     /// those rows' answers, not the first rows' — see `Proj::forward` for the

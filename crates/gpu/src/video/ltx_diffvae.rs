@@ -44,7 +44,7 @@
 
 use super::metadata;
 use super::ltx_nn::RmsNorm;
-use crate::common::Loader;
+use crate::common::{settle, Loader};
 use crate::image::nn::{noise_block, Ctx, Linear};
 use crate::image::{finish, open};
 use crate::prof::span;
@@ -977,11 +977,11 @@ impl DiffDecoder {
         for b in blocks {
             x = b.forward(x, g, &rope, None)?;
             // As in stage 5: the pool lets the block's buffers go only here.
-            self.device.synchronize()?;
+            settle(&self.device)?;
             x = self.checked(x)?;
         }
         let (y, g) = up.forward(&x, g, drop_first)?;
-        self.device.synchronize()?;
+        settle(&self.device)?;
         Ok((self.checked(y.to_dtype(self.dtype)?)?, g))
     }
 
@@ -1034,12 +1034,12 @@ impl DiffDecoder {
             let keys = Keyed { x: px, grid: planes.grid, rope: &prope, times: &times, context: None };
             let (y, py) = b.forward_keyed(x, g, &rope, None, Some(keys))?;
             (x, px) = (y, py.ok_or_else(|| candle_core::Error::Msg("a keyed block without its planes".into()))?);
-            self.device.synchronize()?;
+            settle(&self.device)?;
             x = self.checked(x)?;
         }
         let (y, g) = up.forward(&x, g, drop_first)?;
         let (py, pg) = up.planes(&px, planes.grid)?;
-        self.device.synchronize()?;
+        settle(&self.device)?;
         Ok((self.checked(y.to_dtype(self.dtype)?)?, g, Planes { x: py.to_dtype(self.dtype)?, grid: pg, frames: planes.frames }))
     }
 
@@ -1130,7 +1130,7 @@ impl DiffDecoder {
             let (y, py) = b.forward_keyed(x, grid, &rope, Some((context, &rows)), keys)?;
             (x, px) = (self.checked(y)?, py);
             // Let the pool have the block's buffers back before the next.
-            self.device.synchronize()?;
+            settle(&self.device)?;
         }
         drop((px, keyed));
         span(|| "stage 5 out", &self.device, || {
@@ -1185,7 +1185,7 @@ impl DiffDecoder {
                 (x, g, None)
             }
         };
-        self.device.synchronize()?;
+        settle(&self.device)?;
         let mut report = Report { stages_1_to_3: t0.elapsed().as_secs_f64(), ..Report::default() };
         let t0 = std::time::Instant::now();
 

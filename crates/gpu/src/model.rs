@@ -25,7 +25,7 @@
 //! framework's matmul does not care.
 
 use crate::common::{
-    causal_mask, check_block, embedding, label, linear, unread, unread_error, Embed, KvCache, kv_store, Loader, Proj,
+    causal_mask, check_block, embedding, label, linear, report_failures, unread, unread_error, Embed, KvCache, kv_store, Loader, Proj,
     Reader, Stored,
 };
 use crate::ffn::{Ffn, Mlp, Moe};
@@ -342,7 +342,9 @@ impl GpuLlama {
         let f = pending.ok_or("a model with no layers")?;
         let (last, _) = fused::add_rms_norm(&last(&x)?, &last(&f)?, &self.final_norm, spec.eps)?;
         let logits = self.head.forward(&last)?.to_dtype(DType::F32)?;
-        Ok(logits.flatten_all()?.to_vec1::<f32>()?)
+        let logits = logits.flatten_all()?.to_vec1::<f32>()?;
+        report_failures(&self.device)?;
+        Ok(logits)
     }
 
     fn params(&self) -> usize {

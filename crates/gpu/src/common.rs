@@ -1043,6 +1043,14 @@ pub(crate) fn settle(device: &Device) -> candle_core::Result<()> {
     if device.is_metal() {
         Tensor::zeros(1, DType::U8, device)?.to_vec1::<u8>()?;
     }
+    report_failures(device)
+}
+
+/// [`settle`]'s second half, for just after a readback: the synchronise
+/// that finds a command buffer the readback kept because it failed, and
+/// says so. A readback alone never does. The work is done by then, so it
+/// waits for nothing; LLM decoding runs it once a token, after the logits.
+pub(crate) fn report_failures(device: &Device) -> candle_core::Result<()> {
     device.synchronize().map_err(|e| {
         candle_core::Error::Msg(format!(
             "work on the GPU failed ({e}), most likely for want of memory, so what it made is not used. Free some \

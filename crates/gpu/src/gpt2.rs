@@ -34,7 +34,7 @@
 //! full speed and says something else.
 
 use crate::common::{
-    causal_mask, check_block, embedding, label, linear, unread, unread_error, Embed, KvCache, Loader, Proj,
+    causal_mask, check_block, embedding, label, linear, report_failures, unread, unread_error, Embed, KvCache, Loader, Proj,
     Reader, Stored,
 };
 use crate::qcache::Vault;
@@ -292,7 +292,10 @@ impl GpuGpt2 {
             None => self.head.forward(&last)?,
             Some(b) => self.head.forward(&last)?.broadcast_add(b)?,
         };
-        Ok(logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?)
+        let device = logits.device().clone();
+        let logits = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        report_failures(&device)?;
+        Ok(logits)
     }
 
     fn params(&self) -> usize {

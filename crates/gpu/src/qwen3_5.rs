@@ -21,7 +21,7 @@
 //! engine writes as an index shift.
 
 use crate::common::{
-    check_block, embedding, label, linear, unread, unread_error, Embed, KvCache, kv_store, Loader, Proj, Reader,
+    check_block, embedding, label, linear, report_failures, unread, unread_error, Embed, KvCache, kv_store, Loader, Proj, Reader,
     Stored,
 };
 use crate::ffn::{Ffn, Mlp, Moe};
@@ -511,6 +511,8 @@ impl GpuQwen35 {
             let logits = self.head.forward(&h)?.to_dtype(DType::F32)?;
             last = logits.flatten_all()?.to_vec1::<f32>()?;
         }
+        // Once for all the positions: each readback kept what failed.
+        report_failures(&self.device)?;
         Ok(last)
     }
 

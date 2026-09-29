@@ -1039,6 +1039,12 @@ pub(crate) fn check_block(quant: Option<GgmlDType>, dims: &[(&str, usize)]) -> R
 /// dispatch all complete on Apple's GPUs; only running past the watchdog
 /// or out of memory fails a buffer, and running out of memory has taken
 /// this machine down. The argument is candle's source, read.
+///
+/// candle has fixed it since: `ensure_completed` reads the status again
+/// after its wait (huggingface/candle#3862, merged 2026-08-14, after 0.11.0
+/// and in no release yet). On a candle with it, a plain synchronise says
+/// so itself, and [`drain`] can be `device.synchronize()` again: the
+/// readback, and this paragraph's reason for it, go.
 pub(crate) fn settle(device: &Device) -> candle_core::Result<()> {
     drain(device)?;
     report_failures(device)

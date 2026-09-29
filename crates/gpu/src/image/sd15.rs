@@ -290,6 +290,32 @@ const PREVIEW_BIAS: [f32; 3] = [0.0155, -0.1923, -0.3309];
 mod tests {
     use super::*;
 
+    /// A decode with any one of the VAE's stages left as zeros, as a failed
+    /// Metal command buffer leaves it, and the rest run on them, is refused
+    /// rather than saved; the decode that did not fail is not. In f16 on
+    /// Metal as the pipeline runs it, at 512², from a latent of noise.
+    ///
+    ///     cargo test --release -p kvad-gpu sd15::tests::a_decode -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn a_decode_that_fails_part_way_is_refused() {
+        let w = Watcher::none();
+        let config = read_json(&fetch_file(REPO, "vae/config.json", &w).unwrap()).unwrap();
+        let file = vec![weights(REPO, "vae", "diffusion_pytorch_model", &w).unwrap()];
+        let device = Device::new_metal(0).unwrap();
+        let vault = Vault::off();
+        let cx = Ctx { ld: Loader::new(None, device.clone(), &vault), dtype: DType::F16 };
+        let vae = Decoder::load(&cx, &open(&file, DType::F16).unwrap(), VaeConfig::from_json(&config).unwrap()).unwrap();
+        let z = noise(5, &[1, 4, 64, 64], &device, DType::F16).unwrap();
+
+        to_rgb8(&vae.decode(&z).unwrap()).unwrap();
+        for stage in 0..vae.stages() {
+            let e = to_rgb8(&vae.decode_failing(&z, Some(stage)).unwrap()).err().map(|e| e.to_string());
+            eprintln!("stage {stage}: {}", e.as_deref().unwrap_or("passed"));
+            assert!(e.is_some(), "stage {stage} failed and was not refused");
+        }
+    }
+
     /// kvad's text encoder, UNet and VAE against diffusers' own, on the
     /// same weights and inputs: `scripts/sd15-fixtures.py` writes theirs,
     /// in f32. Each part runs from the reference's own input, in f32 on the

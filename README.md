@@ -256,6 +256,11 @@ Zero dependencies. Read in this order:
     Qwen-Image were trained with, which turns out to be a straight line
     between an image and noise. See [Drawing instead of
     writing](#drawing-instead-of-writing) below.
+13. **[`moving.rs`](crates/nervus/src/moving.rs)** and
+    **[`bin/train_video.rs`](crates/nervus/src/bin/train_video.rs)** — one
+    more axis: clips of two digits moving apart, made up on the spot, and
+    attention that reads within a frame or across frames rather than
+    everything at once. See [Drawing a clip](#drawing-a-clip).
 
 ### The test worth running first
 
@@ -1097,6 +1102,120 @@ difference that no round trip through our own save and load could have:
 diffusers computes DiT's timestep frequencies by dividing by `half − 1`, where
 Facebook's code divides by `half`, a 7% difference in the slowest wave. Put
 Facebook's formula back and the check fails by 0.12.
+
+### Drawing a clip
+
+```bash
+cargo run --release -p nervus --bin train_video
+```
+
+The same model again, now drawing eight frames at once: two digits that start
+together in the middle and move apart. It is the smallest honest version of
+what LTX-2.5 does in crate 3, trained from random weights on this machine's
+CPU:
+
+![Eight clips of two digits moving apart, frame by frame](docs/video/apart.gif)
+
+*After 10,000 steps, an hour on the CPU (validation 0.061). Each clip was asked
+for two digits: 3 and 7, 0 and 1, 2 and 5, 4 and 9 along the top; 6 and 8, 1
+and 1, 7 and 2, 8 and 3 along the bottom.*
+
+A video is a picture with one more axis, and the model barely notices.
+[`dit.rs`](crates/nervus/src/dit.rs) cuts every frame into patches as before
+and lays the frames end to end, so a clip of eight 32×32 frames at 4×4 is a
+sequence of 512 tokens. Each token's position gets a third wave, for which
+frame it is in. The two labels are looked up and added, so "a 3 and a 7" and
+"a 7 and a 3" are one request. Nothing else changes: the loss, the sampler
+and the classifier-free guidance are the picture's.
+
+**Attention is what gets expensive.** Every token reading every other is
+512² scores per head per block. The cheaper design, which Latte uses and many
+video models use some form of, alternates two kinds of block: one where each
+frame's 64 patches read only each other, and one where each place's 8 frames
+read only each other. A patch still hears from anywhere in the clip, in two
+hops instead of one. [`attention.rs`](crates/nervus/src/attention.rs) does it
+by computing each group on its own rather than masking the rest, because a
+mask would do all the arithmetic it pretends to save. A test checks that
+attending within groups gives exactly what running each group alone would.
+
+Five interleaved runs of 60 steps each, batch 32, 18 threads:
+
+| attention | clips a second, 5 runs | median |
+|---|---|---|
+| factorised | 92.5–130.3 | 101.9 |
+| full | 53.4–61.0 | 58.4 |
+
+1.74x by the medians, and 1.73x to 2.14x within each round. Per step, full
+attention ends slightly ahead: trained side by side for 3,000 steps on the
+same seed, it was behind at first (validation 0.125 against 0.108 at step
+1000) and ahead at the end (0.084 against 0.088). Per minute it is not: 34
+minutes against 19 for the same 3,000 steps, and about 0.11 at the 19-minute
+mark. The drawings are hard to tell apart:
+
+![The same eight clips from factorised (left) and full attention (right)](docs/video/full-vs-factorised.png)
+
+*Factorised on the left, full on the right, after 3,000 steps each. A row is
+one clip, frames left to right, drawn from the same noise.*
+
+**Flicker is how a video model usually goes wrong**: every frame a good
+picture, but not the same picture a moment later. Each frame would pass any
+test of one frame. So [`moving.rs`](crates/nervus/src/moving.rs), which makes
+the clips up from the MNIST digits on disk, also measures how much a clip
+changes from frame to frame, and a real clip of digits moving 1.5 pixels a
+frame changes by 0.054. The drawn clips come in at 0.041 to 0.044 after
+3,000 steps, and 0.046 after 10,000: they move no more jerkily than the real
+thing. A drawing that changed much less than the real clips would be one that
+is not moving at all.
+
+And a low number is not the whole story, which the clips above show. The 3
+and 7 and the two 1s are right all the way through, and the 4 and 9 nearly
+(its 9 ends up looking like a 0). The 7 and 2 start right and end as a 7 and
+a 3. In the 6 and 8, an 8 becomes a 6 on its way to the corner and the other
+digit ends as a 5. Nothing jumps, every frame is a clean digit, and the
+flicker is as low as anywhere else: the digit turns into another one a little
+at a time. That is the harder kind of consistency — the same thing, all the
+way through — and a frame-to-frame difference cannot see it. Checking it
+needs something that knows what a digit is, as the picture model's
+classifier did, and that is still to do.
+
+**It took two failures to get here, and both are worth seeing.** The first
+was Moving MNIST as published: 28-pixel digits in a 64-pixel box, cut into
+8×8 patches to keep it at 512 tokens. After 3,000 steps it drew this:
+
+![Ink in patch-sized blocks and no digits](docs/video/blocks.png)
+
+Nothing was broken. A test that trains on just two clips of a moving square
+learned them in both layouts. What it showed instead is that to predict the
+noise, a token has to carry its patch's noise through the whole network, and
+an 8×8 patch is 64 numbers. In that test, a model 16 wide left the clips
+speckled with noise it could not carry (distance 55 from the right clip,
+still 49 after 10,000 steps), and 32 or 64 wide drew them exactly (0.2 to
+0.3). Both real models are 128 wide: the picture model's tokens carry 16
+numbers each, and these carried 64. Half the size, with 4×4 patches, is 16
+again, and fixed it.
+
+The second failure was the digits themselves. Scattered anywhere in the box,
+moving any way, they barely got drawn at all:
+
+![Strokes, mostly not the digits asked for](docs/video/anywhere.png)
+
+The label is the lesson here. Told "a 3 and a 7", this model did almost as
+well when told the wrong two digits: after 12,000 steps of single frames,
+the wrong labels cost 0.0033 more validation loss than the right ones. The
+picture model's gap is 0.059, eighteen times as much. MNIST digits are
+centred, so a label says nearly everything about a picture; two small digits
+anywhere in a box are mostly a question of *where*, which the label does not
+answer, and the model has to learn that before the label is worth anything.
+Redrawing at guidance 1, 2 or 4, and with 20 or 100 steps, changed almost
+nothing, which is what a model that ignores its labels would do. Starting the
+digits together and sending them apart takes the where away, and the motion
+is right from the first checkpoint.
+
+`train_video` keeps the tools that found this: the label gap at every
+checkpoint, `--load` with `--steps 0` to redraw a saved model with other
+settings, and a strip of the model's one-step guess at a half-noised real
+clip (`guess-*.png`), which separates a model that cannot clean up a clip
+from one that cannot invent one.
 
 ---
 

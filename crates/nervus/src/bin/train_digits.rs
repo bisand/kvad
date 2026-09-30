@@ -251,14 +251,20 @@ fn main() -> std::io::Result<()> {
     const VALIDATION_IMAGES: usize = 200;
     let started = Instant::now();
     let (mut running, mut since, mut best) = (0.0, 0, f32::INFINITY);
+    // Time spent in training steps alone: checkpoints draw a hundred digits
+    // and train nothing, and a rate that counted them would change with
+    // `--eval-every`.
+    let mut training = std::time::Duration::ZERO;
 
     for step in 1..=args.steps {
         opt.lr = schedule.at(step, args.steps);
+        let stepping = Instant::now();
         let examples = flow::draw(&train_images, &train.labels, config.unconditional(), args.batch, &mut rng);
         running += match threads {
             1 => flow::train_step(&mut model, &mut opt, &train_images, &examples),
             _ => replicas.train_step(&mut model, &mut opt, &train_images, &examples),
         };
+        training += stepping.elapsed();
         since += 1;
 
         if step == 20.min(args.steps) {
@@ -295,6 +301,12 @@ fn main() -> std::io::Result<()> {
         human_secs(started.elapsed().as_secs_f32()),
         args.out.join("model").display(),
         args.out.join("samples.png").display()
+    );
+    println!(
+        "trained at {:.0} images/s ({} in training steps, {} in all)",
+        (args.steps * args.batch) as f64 / training.as_secs_f64(),
+        human_secs(training.as_secs_f32()),
+        human_secs(started.elapsed().as_secs_f32())
     );
     // kvad finds a model by name in its data directory's `models`, and this
     // crate does not know where kvad keeps that; its default is below.

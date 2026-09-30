@@ -1174,9 +1174,35 @@ a 3. In the 6 and 8, an 8 becomes a 6 on its way to the corner and the other
 digit ends as a 5. Nothing jumps, every frame is a clean digit, and the
 flicker is as low as anywhere else: the digit turns into another one a little
 at a time. That is the harder kind of consistency — the same thing, all the
-way through — and a frame-to-frame difference cannot see it. Checking it
-needs something that knows what a digit is, as the picture model's
-classifier did, and that is still to do.
+way through — and a frame-to-frame difference cannot see it.
+
+**So a judge reads the clips back.** Every clip of digits moving apart makes
+the same journey, so where each digit is in every frame is known without
+looking, and reading a clip is reading one 14×14 window at a time. The reader
+is `train_mnist`'s network, trained at the start of every run on windows cut
+from 6,000 real clips. It is measured frame by frame before it judges
+anything, because early on the two windows overlap: it reads real windows
+49% right in frame 0, where they are the same window and it can only guess
+which digit is meant, 84% in frame 1, and 93% to 96% from frame 2 on. Frames
+2 to 7 are what it judges. Every pair of digits, 55 of them, is drawn and read
+back, either way round, since a model that adds its two labels up cannot
+know which is meant to go where:
+
+| | both right, per frame | clips mostly right | held every frame | held and right |
+|---|---|---|---|---|
+| real clips (the most there is to score) | 91% | 92% | 88% | 85% |
+| factorised, 10,000 steps | 38% | 45% | 25% | 13% |
+| full, 3,000 steps | 15% | 16% | 4% | 0% |
+| factorised, 3,000 steps | 8% | 13% | 0% | 0% |
+
+*Mostly right* is the digit read most often in each place; *held* is the same
+digit in every judged frame, which a single misread also breaks, so the real
+clips set the ceiling. The hour-long model draws the digits asked for about
+half the time, and in three clips out of four a digit reads differently
+somewhere along the way, where on real clips the judge's own misreads do that
+in one clip in eight. At equal
+steps, full attention is a little ahead here too, as its validation loss
+was; three times the training is worth far more than either.
 
 **It took two failures to get here, and both are worth seeing.** The first
 was Moving MNIST as published: 28-pixel digits in a 64-pixel box, cut into

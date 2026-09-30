@@ -18,6 +18,11 @@ pub fn loader() -> Loader {
     {
         let mut cpu = kvad::service::cpu_loader();
         Box::new(move |repo, backend, progress, watch| {
+            // A DiT trained by nervus draws on the CPU at any backend, and
+            // the CPU loader is the one that knows it; see `kvad::dit`.
+            if kvad::dit::is_one(repo) {
+                return cpu(repo, backend, progress, watch);
+            }
             // An image pipeline is not a language model at any precision,
             // and has no CPU implementation at all; see docs/image-plan.md.
             // Nor has a video pipeline. Video is asked first, because it
@@ -144,22 +149,24 @@ pub fn parse(id: &str) -> Option<Backend> {
 
 /// Whether this build can load a pipeline of this class: an image
 /// pipeline's, or a video pipeline's.
+///
+/// A DiT trained by nervus is one in every build: it draws on the CPU.
 pub fn implements(pipeline: &str) -> bool {
+    if pipeline == kvad::dit::PIPELINE {
+        return true;
+    }
     #[cfg(feature = "gpu")]
     return kvad_gpu::image::PIPELINES.contains(&pipeline) || kvad_gpu::video::ltx::PIPELINES.contains(&pipeline);
     #[cfg(not(feature = "gpu"))]
-    {
-        let _ = pipeline;
-        false
-    }
+    false
 }
 
 /// The pipelines this build implements, for a message.
 pub fn pipelines() -> String {
     #[cfg(feature = "gpu")]
-    return kvad_gpu::image::PIPELINES.iter().chain(&kvad_gpu::video::ltx::PIPELINES).copied().collect::<Vec<_>>().join(", ");
+    return kvad_gpu::image::PIPELINES.iter().chain(&kvad_gpu::video::ltx::PIPELINES).chain(&[kvad::dit::PIPELINE]).copied().collect::<Vec<_>>().join(", ");
     #[cfg(not(feature = "gpu"))]
-    String::from("none")
+    String::from(kvad::dit::PIPELINE)
 }
 
 /// The backend a pipeline gets when nobody has said which.
@@ -175,6 +182,9 @@ pub fn pipelines() -> String {
 /// LTX-2.5 runs at q8 or not at all: its DiT is 42 GB in bf16.
 pub fn preferred_pipeline(pipeline: &str) -> Backend {
     match pipeline {
+        // Drawn on the CPU in f32 whatever it is asked, so the backend that
+        // says so is the one it gets.
+        kvad::dit::PIPELINE => Backend::Cpu(kvad::quant::Precision::F32),
         "QwenImagePipeline" | "FluxPipeline" | kvad::video::LTX_PIPELINE => Backend::Gpu(kvad::service::GpuMode::Q8),
         _ => Backend::Gpu(kvad::service::GpuMode::Bf16),
     }
@@ -189,6 +199,9 @@ pub fn preferred_pipeline(pipeline: &str) -> Backend {
 /// [`kvad_gpu::image::weight_bytes`], and [`kvad_gpu::video::ltx::weight_bytes`]
 /// for why a video pipeline's answer is a generation's peak instead.
 pub fn pipeline_weight_bytes(repo: &str, backend: Backend) -> Option<u64> {
+    if kvad::dit::is_one(repo) {
+        return kvad::dit::weight_bytes(repo);
+    }
     #[cfg(feature = "gpu")]
     if let Backend::Gpu(mode) = backend {
         if kvad_gpu::video::ltx::is_pipeline(repo) {

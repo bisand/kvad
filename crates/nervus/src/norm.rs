@@ -55,6 +55,10 @@ pub struct LayerNorm {
     /// and shift come from the conditioning instead (see `dit`), and a learned
     /// pair on top would be a second, redundant copy of the same freedom.
     affine: bool,
+    /// [`EPS`], unless a checkpoint's layout says otherwise: DiT's norms use
+    /// 1e-6 in some places and 1e-5 in others, and a model run with a
+    /// different one than it was trained with is, very slightly, another model.
+    eps: f32,
     gamma: Vec<f32>,
     beta: Vec<f32>,
     dgamma: Vec<f32>,
@@ -72,6 +76,7 @@ impl LayerNorm {
     pub fn new(features: usize) -> Self {
         LayerNorm {
             affine: true,
+            eps: EPS,
             // Start as a plain normalisation: scale by 1, shift by 0.
             gamma: vec![1.0; features],
             beta: vec![0.0; features],
@@ -85,8 +90,8 @@ impl LayerNorm {
     }
 
     /// Normalisation and nothing else: no gamma, no beta, no parameters.
-    pub fn plain(features: usize) -> Self {
-        LayerNorm { affine: false, ..LayerNorm::new(features) }
+    pub fn plain(features: usize, eps: f32) -> Self {
+        LayerNorm { affine: false, eps, ..LayerNorm::new(features) }
     }
 }
 
@@ -101,7 +106,7 @@ impl Layer for LayerNorm {
             let row = x.row(r);
             let mean = row.iter().sum::<f32>() / n;
             let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
-            let inv_std = 1.0 / (var + EPS).sqrt();
+            let inv_std = 1.0 / (var + self.eps).sqrt();
 
             let x_hat = self.x_hat.row_mut(r);
             for (j, out) in y.row_mut(r).iter_mut().enumerate() {

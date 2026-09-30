@@ -247,6 +247,7 @@ fn main() -> std::io::Result<()> {
     let mut replicas = Replicas::new(&model, threads);
 
     const COLUMNS: usize = 10;
+    const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
     const VALIDATION_IMAGES: usize = 200;
     let started = Instant::now();
     let (mut running, mut since, mut best) = (0.0, 0, f32::INFINITY);
@@ -271,7 +272,7 @@ fn main() -> std::io::Result<()> {
             let saved = val < best;
             if saved {
                 best = val;
-                dit::save(&args.out.join("model"), &mut model)?;
+                dit::save(&args.out.join("model"), &mut model, &DIGITS)?;
             }
             let (read, drawn) = checkpoint_grid(&mut model, &mut replicas, &mut judge, &args, COLUMNS, &format!("step-{step:06}.png"))?;
             println!(
@@ -294,6 +295,12 @@ fn main() -> std::io::Result<()> {
         human_secs(started.elapsed().as_secs_f32()),
         args.out.join("model").display(),
         args.out.join("samples.png").display()
+    );
+    // kvad finds a model by name in its data directory's `models`, and this
+    // crate does not know where kvad keeps that; its default is below.
+    println!(
+        "\nto draw with kvad, give it a name:\n  cp -R {} ~/.local/share/kvad/models/digits\n  kvad images make 7 --model digits",
+        args.out.join("model").display()
     );
     Ok(())
 }

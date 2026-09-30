@@ -82,6 +82,17 @@ row for each of 0 to 9, into `out/digits/`. Those digits are also read by a
 classifier trained on real MNIST, and the run prints how many of them it
 recognises as the digit that was asked for.
 
+The model is saved as a diffusers pipeline whose transformer is a
+`DiTTransformer2DModel`, with a flow-matching scheduler and no VAE (it draws
+pixels). `kvad` runs it on the CPU, by name, like any other image model:
+
+```
+cp -R out/digits/model ~/.local/share/kvad/models/digits
+kvad images make 7 --model digits
+```
+
+The prompt is one of the labels, `0` to `9`, or `any`.
+
 ## Every derivative by hand
 
 There is no autograd engine here. Each layer's `backward` was derived by hand

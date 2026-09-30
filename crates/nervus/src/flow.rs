@@ -252,6 +252,20 @@ const VALIDATION_SEED: u64 = 20_260_929;
 /// this file. At exactly 1 the second run could change nothing, so it is
 /// skipped.
 pub fn sample(model: &mut Dit, label: usize, steps: usize, guidance: f32, rng: &mut Rng) -> Vec<f32> {
+    sample_watched(model, label, steps, guidance, rng, &mut |_, _| true).expect("nothing asked it to stop")
+}
+
+/// [`sample`], calling `on_step(done, x)` after every step with the image as
+/// it stands. Returning `false` stops the drawing, which then returns `None`
+/// rather than a half-drawn image.
+pub fn sample_watched(
+    model: &mut Dit,
+    label: usize,
+    steps: usize,
+    guidance: f32,
+    rng: &mut Rng,
+    on_step: &mut dyn FnMut(usize, &[f32]) -> bool,
+) -> Option<Vec<f32>> {
     let config = model.config();
     let mut x: Vec<f32> = (0..config.pixels()).map(|_| rng.normal()).collect();
     let dt = 1.0 / steps as f32;
@@ -263,8 +277,11 @@ pub fn sample(model: &mut Dit, label: usize, steps: usize, guidance: f32, rng: &
             v.iter_mut().zip(&none).for_each(|(v, n)| *v = n + guidance * (*v - n));
         }
         x.iter_mut().zip(&v).for_each(|(x, v)| *x -= dt * v);
+        if !on_step(k + 1, &x) {
+            return None;
+        }
     }
-    x
+    Some(x)
 }
 
 #[cfg(test)]

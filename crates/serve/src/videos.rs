@@ -1581,6 +1581,8 @@ mod tests {
         max_frames: 121,
         max_volume: 1536 * 1024 * 121,
         image: true,
+        sound: true,
+        fixed: false,
         duration: false,
         guided: Some(kvad::video::Guided { steps: 30, max_steps: 60, guidance: 3.0 }),
         decoder: Some(kvad::video::Decoder::Diffusion),

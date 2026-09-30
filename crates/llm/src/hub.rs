@@ -894,10 +894,12 @@ pub fn trained_models() -> Vec<LocalModel> {
                 model_type,
                 // A directory left behind by a run that was stopped before
                 // its first checkpoint has a tokeniser and no weights. An
-                // image model trained by `nervus` is a pipeline directory
-                // instead, with its config and weights under `transformer/`.
+                // image or clip model trained by `nervus` is a pipeline
+                // directory instead, with its config and weights under
+                // `transformer/`.
                 complete: (path.join("model.safetensors").is_file() && path.join("config.json").is_file())
-                    || (path.join("model_index.json").is_file() && path.join(nervus::dit::WEIGHTS).is_file()),
+                    || (path.join("model_index.json").is_file()
+                        && (path.join(nervus::dit::WEIGHTS).is_file() || path.join("transformer/state.safetensors").is_file())),
                 path,
                 gguf: None,
                 single: None,

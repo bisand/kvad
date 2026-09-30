@@ -1217,6 +1217,20 @@ settings, and a strip of the model's one-step guess at a half-noised real
 clip (`guess-*.png`), which separates a model that cannot clean up a clip
 from one that cannot invent one.
 
+**Drawing it with `kvad`.** The best model of a run is saved as a pipeline
+directory of its own (`NervusVideoDiTPipeline`: diffusers has no DiT for
+clips like these), and `kvad` runs it on the CPU by name, as a video model
+beside LTX-2.5:
+
+```bash
+cp -R out/video/model ~/.local/share/kvad/models/moving
+kvad videos make "a 3 and a 7 moving apart" --model moving
+```
+
+The prompt names two digits among its words, or says `any`. What comes back
+is an MP4 of 8 frames at 32×32 and 8 fps, with no sound, because the model
+has none to make and says so.
+
 ---
 
 ## Crate 2: `kvad` — the same ideas, at scale

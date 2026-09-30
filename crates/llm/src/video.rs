@@ -70,7 +70,7 @@ pub const LTX_DEV_FILES: [&str; 2] = [
 
 /// Whether a pipeline, by name, makes videos rather than images.
 pub fn is_video_pipeline(name: &str) -> bool {
-    name == LTX_PIPELINE
+    name == LTX_PIPELINE || name == crate::dit::CLIP_PIPELINE
 }
 
 /// What a caller asks a [`Director`] for.
@@ -353,6 +353,14 @@ pub struct Defaults {
     pub max_volume: usize,
     /// Whether it can start from a picture ([`VideoRequest::image`]).
     pub image: bool,
+    /// Whether it makes sound. A model that does not makes silent files, and
+    /// a request that asks it for sound is refused rather than given none.
+    pub sound: bool,
+    /// Whether `width × height × frames` is the only clip it makes: a model
+    /// trained at one shape and nothing else, like `nervus`'s. A request for
+    /// another is refused by naming the one it makes, rather than by the
+    /// limits below, whose nearest fit would be refused in turn.
+    pub fixed: bool,
     /// Whether it chooses a clip's length from the prompt when a request
     /// gives none: LTX-2.5's duration head.
     pub duration: bool,
@@ -505,6 +513,13 @@ impl VideoRequest {
             (None, true) => longest(),
             (None, false) => doubled(d.frames),
         };
+        if d.fixed && (width, height, frames) != (d.width, d.height, doubled(d.frames)) {
+            return Err(format!(
+                "this model makes {}×{} × {} frames and nothing else, not {width}×{height} × {frames}",
+                d.width, d.height, d.frames
+            )
+            .into());
+        }
         for (what, n) in [("width", width), ("height", height)] {
             if n == 0 || n % d.multiple != 0 {
                 return Err(format!(
@@ -612,7 +627,10 @@ impl VideoRequest {
             rounds,
             fps,
             seed,
-            audio: self.audio.unwrap_or(true),
+            audio: match (self.audio, d.sound) {
+                (Some(true), false) => return Err("this model makes no sound; leave out audio, or set it to false".into()),
+                (asked, sound) => asked.unwrap_or(sound) && sound,
+            },
             loras: self.loras.clone(),
         })
     }
@@ -1875,7 +1893,7 @@ mod tests {
     }
 
     fn ltx() -> Defaults {
-        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, duration: false, guided: None, decoder: None, dfr: false, takes_loras: true }
+        Defaults { width: 768, height: 512, frames: 121, fps: 24, multiple: 64, frame_step: 8, max_frames: 121, max_volume: 1536 * 1024 * 121, image: true, sound: true, fixed: false, duration: false, guided: None, decoder: None, dfr: false, takes_loras: true }
     }
 
     /// The reference's own layouts: 121 frames are whole in segments of 24
@@ -1912,6 +1930,31 @@ mod tests {
         let t = dfr_tiles(&[48, 96, 144, 192, 240], 241, 2).unwrap();
         assert_eq!((t[0].end, t[1].start, t[1].lead), (19, 12, 7));
         assert!(dfr_tiles(&[48, 96], 105, 2).is_err());
+    }
+
+    /// A silent model makes silent files: sound left out is off, and asked
+    /// for is refused. A model with sound keeps it unless told not to.
+    #[test]
+    fn a_silent_model_makes_silent_files() {
+        let silent = Defaults { sound: false, ..ltx() };
+        assert!(!VideoRequest::new("a fox").resolved(&silent).unwrap().audio);
+        assert!(!VideoRequest { audio: Some(false), ..VideoRequest::new("a fox") }.resolved(&silent).unwrap().audio);
+        let err = VideoRequest { audio: Some(true), ..VideoRequest::new("a fox") }.resolved(&silent).unwrap_err();
+        assert!(err.to_string().contains("no sound"), "{err}");
+        assert!(VideoRequest::new("a fox").resolved(&ltx()).unwrap().audio);
+        assert!(!VideoRequest { audio: Some(false), ..VideoRequest::new("a fox") }.resolved(&ltx()).unwrap().audio);
+    }
+
+    /// A model of one shape names it, whatever else was asked for.
+    #[test]
+    fn a_model_of_one_shape_says_which() {
+        let one = Defaults { width: 32, height: 32, frames: 8, max_frames: 8, multiple: 32, frame_step: 1, max_volume: 32 * 32 * 8, fixed: true, ..ltx() };
+        assert!(VideoRequest::new("3 and 7").resolved(&one).is_ok());
+        for (w, f) in [(64, 8), (32, 4), (64, 2)] {
+            let asked = VideoRequest { width: Some(w), height: Some(w), frames: Some(f), ..VideoRequest::new("3 and 7") };
+            let err = asked.resolved(&one).unwrap_err().to_string();
+            assert!(err.contains("32×32 × 8 frames and nothing else"), "{w}x{w} x {f}: {err}");
+        }
     }
 
     fn with_dfr() -> Defaults {

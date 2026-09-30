@@ -277,12 +277,13 @@ pub type Loader = Box<
 /// CPU backends load; a GPU one is refused with the key that changes it,
 /// rather than with a type error at the other end of the program.
 ///
-/// A model trained by `nervus`'s `train_digits` is the exception to both:
-/// it is an image model, and it runs on the CPU whatever it is asked for
-/// ([`crate::dit`]).
+/// A model trained by `nervus`'s `train_digits` or `train_video` is the
+/// exception to both: it makes pictures or clips, and it runs on the CPU
+/// whatever it is asked for ([`crate::dit`]).
 pub fn cpu_loader() -> Loader {
     Box::new(|repo, backend, progress, watch| match backend {
         _ if crate::dit::is_one(repo) => Ok(Model::Image(Box::new(crate::dit::Drawer::load(repo, progress)?))),
+        _ if crate::dit::is_clips(repo) => Ok(Model::Video(Box::new(crate::dit::Filmer::load(repo, progress)?))),
         Backend::Cpu(precision) => Llm::load_watched(repo, precision, progress, watch).map(Model::from),
         Backend::Gpu(_) => {
             Err("this build has no GPU backend; pick a CPU precision instead".into())

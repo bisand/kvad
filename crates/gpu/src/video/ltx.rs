@@ -276,6 +276,8 @@ impl Ltx {
             max_frames: 121,
             max_volume: volume_for_this_machine(),
             image: true,
+            sound: true,
+            fixed: false,
             duration: head.is_some(),
             // The dev model, whose files `kvad pull … --dev` fetches.
             guided: match gguf {

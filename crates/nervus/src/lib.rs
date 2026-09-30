@@ -24,6 +24,9 @@
 //!     the conditioning steering every norm (adaLN-Zero).
 //! 13. [`flow`]  — flow matching: the loss it is trained with, and the loop
 //!     that draws with it. ([`png`] is [`json`]'s counterpart for pictures.)
+//! 14. [`moving`] — clips of two digits bouncing in a box, made up on the
+//!     spot, and what the same model needs to draw those: a time axis, and
+//!     attention that is cheaper than all of it at once ([`attention::Scope`]).
 //!
 //! Then run `cargo test -p nervus`: the gradient check in `nn` verifies the
 //! hand-derived derivatives against numerically measured ones.
@@ -40,6 +43,7 @@ pub mod json;
 pub mod matrix;
 pub mod mnist;
 pub mod model;
+pub mod moving;
 pub mod nn;
 pub mod norm;
 pub mod optim;

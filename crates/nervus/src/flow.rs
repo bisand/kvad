@@ -69,10 +69,13 @@ pub const DROP_LABEL: f32 = 0.1;
 /// and which label the model is told. Drawn before any work starts, so that
 /// the same draws happen however many threads share them.
 pub struct Example {
-    pub image: usize,
+    /// The clean picture or clip, `x₀`.
+    pub x0: Vec<f32>,
     pub t: f32,
     pub noise: Vec<f32>,
-    pub label: usize,
+    /// What the model is told it is: one label for a digit, two for a clip
+    /// of two, or the same number of "none"s when they were dropped.
+    pub labels: Vec<usize>,
 }
 
 /// `(xₜ, v)`: the point on the line, and the velocity along it.
@@ -98,21 +101,31 @@ pub fn draw(images: &[Vec<f32>], labels: &[usize], unconditional: usize, batch: 
     (0..batch)
         .map(|_| {
             let image = rng.below(images.len());
-            let t = rng.uniform();
-            let noise = (0..images[image].len()).map(|_| rng.normal()).collect();
-            let label = if rng.uniform() < DROP_LABEL { unconditional } else { labels[image] };
-            Example { image, t, noise, label }
+            noised(images[image].clone(), vec![labels[image]], unconditional, rng)
         })
         .collect()
 }
 
+/// A clean sample made into an example: a `t`, noise, and its labels, all of
+/// them dropped together one time in [`DROP_LABEL`]. A clip loses both its
+/// labels or neither, so that "none" always means "nothing was said".
+pub fn noised(x0: Vec<f32>, labels: Vec<usize>, unconditional: usize, rng: &mut Rng) -> Example {
+    let t = rng.uniform();
+    let noise = (0..x0.len()).map(|_| rng.normal()).collect();
+    let labels = match rng.uniform() < DROP_LABEL {
+        true => vec![unconditional; labels.len()],
+        false => labels,
+    };
+    Example { x0, t, noise, labels }
+}
+
 /// Forward and backward on some examples, adding into the model's gradients.
 /// Returns the sum of their losses.
-fn accumulate(model: &mut Dit, images: &[Vec<f32>], examples: &[&Example], batch: usize) -> f32 {
+fn accumulate(model: &mut Dit, examples: &[&Example], batch: usize) -> f32 {
     let mut total = 0.0;
     for e in examples {
-        let (xt, v) = noisy(&images[e.image], &e.noise, e.t);
-        let (loss, mut dv) = mse(&model.forward(&xt, e.t, e.label), &v); //    predict, score
+        let (xt, v) = noisy(&e.x0, &e.noise, e.t);
+        let (loss, mut dv) = mse(&model.forward_labels(&xt, e.t, &e.labels), &v); // predict, score
         // A mean over the whole batch, not over this thread's share of it.
         dv.iter_mut().for_each(|g| *g /= batch as f32);
         model.backward(&dv); //                                                  blame
@@ -122,10 +135,10 @@ fn accumulate(model: &mut Dit, images: &[Vec<f32>], examples: &[&Example], batch
 }
 
 /// One step of training. Returns the batch's mean loss.
-pub fn train_step(model: &mut Dit, opt: &mut AdamW, images: &[Vec<f32>], examples: &[Example]) -> f32 {
+pub fn train_step(model: &mut Dit, opt: &mut AdamW, examples: &[Example]) -> f32 {
     model.zero_grad();
     let all: Vec<&Example> = examples.iter().collect();
-    let total = accumulate(model, images, &all, examples.len());
+    let total = accumulate(model, &all, examples.len());
     opt.step(model.params()); //                                                 adjust
     total / examples.len() as f32
 }
@@ -156,7 +169,7 @@ impl Replicas {
     }
 
     /// The same step as [`train_step`], with example `i` on replica `i mod n`.
-    pub fn train_step(&mut self, model: &mut Dit, opt: &mut AdamW, images: &[Vec<f32>], examples: &[Example]) -> f32 {
+    pub fn train_step(&mut self, model: &mut Dit, opt: &mut AdamW, examples: &[Example]) -> f32 {
         self.broadcast(model);
         let n = self.models.len();
         let batch = examples.len();
@@ -169,7 +182,7 @@ impl Replicas {
                     scope.spawn(move || {
                         replica.zero_grad();
                         let mine: Vec<&Example> = examples.iter().skip(r).step_by(n).collect();
-                        accumulate(replica, images, &mine, batch)
+                        accumulate(replica, &mine, batch)
                     })
                 })
                 .collect();
@@ -186,10 +199,41 @@ impl Replicas {
         total / batch as f32
     }
 
-    /// Draw one image per request, the requests shared out across the
-    /// replicas. Request `i` is drawn from `Rng::new(seeds[i])`, so an image
-    /// does not depend on how many threads drew it or what else was drawn.
-    pub fn sample(&mut self, model: &mut Dit, requests: &[(usize, u64)], steps: usize, guidance: f32) -> Vec<Vec<f32>> {
+    /// [`validate_samples`], shared out across the replicas. The noise is
+    /// drawn here, in order, from the same generator, so each sample is asked
+    /// exactly what it would be asked on one thread; only the order the
+    /// losses are added in differs.
+    pub fn validate(&mut self, model: &mut Dit, samples: &[(&[f32], Vec<usize>)]) -> f32 {
+        self.broadcast(model);
+        let mut rng = Rng::new(VALIDATION_SEED);
+        let noises: Vec<Vec<f32>> = samples.iter().map(|(x0, _)| (0..x0.len()).map(|_| rng.normal()).collect()).collect();
+        let n = self.models.len();
+        let total: f32 = std::thread::scope(|scope| {
+            let noises = &noises;
+            let running: Vec<_> = self
+                .models
+                .iter_mut()
+                .enumerate()
+                .map(|(r, replica)| {
+                    scope.spawn(move || {
+                        let mut total = 0.0;
+                        for ((x0, labels), noise) in samples.iter().zip(noises).skip(r).step_by(n) {
+                            total += loss_at_every_time(replica, x0, labels, noise);
+                        }
+                        total
+                    })
+                })
+                .collect();
+            running.into_iter().map(|thread| thread.join().expect("a validating thread panicked")).sum()
+        });
+        total / (samples.len() * VALIDATION_TIMES) as f32
+    }
+
+    /// Draw one image or clip per request, `(labels, seed)`, the requests
+    /// shared out across the replicas. Request `i` is drawn from
+    /// `Rng::new(seed)`, so what it draws does not depend on how many threads
+    /// drew it or what else was drawn.
+    pub fn sample(&mut self, model: &mut Dit, requests: &[(Vec<usize>, u64)], steps: usize, guidance: f32) -> Vec<Vec<f32>> {
         self.broadcast(model);
         let n = self.models.len();
         let mut out = vec![Vec::new(); requests.len()];
@@ -201,8 +245,9 @@ impl Replicas {
                 .map(|(r, replica)| {
                     scope.spawn(move || {
                         let mut drawn = Vec::new();
-                        for (i, &(label, seed)) in requests.iter().enumerate().skip(r).step_by(n) {
-                            drawn.push((i, sample(replica, label, steps, guidance, &mut Rng::new(seed))));
+                        for (i, (labels, seed)) in requests.iter().enumerate().skip(r).step_by(n) {
+                            let x = sample_watched(replica, labels, steps, guidance, &mut Rng::new(*seed), &mut |_, _| true);
+                            drawn.push((i, x.expect("nothing asked it to stop")));
                         }
                         drawn
                     })
@@ -229,18 +274,32 @@ pub const VALIDATION_TIMES: usize = 8;
 /// this file). Labels are always given: this is the model that guidance
 /// starts from.
 pub fn validate(model: &mut Dit, images: &[Vec<f32>], labels: &[usize], count: usize) -> f32 {
-    let mut rng = Rng::new(VALIDATION_SEED);
     let count = count.min(images.len());
+    let samples: Vec<(&[f32], Vec<usize>)> = (0..count).map(|i| (images[i].as_slice(), vec![labels[i]])).collect();
+    validate_samples(model, &samples)
+}
+
+/// [`validate`] on any clean samples and their labels: pictures, or clips.
+/// The caller keeps the samples the same from one checkpoint to the next.
+pub fn validate_samples(model: &mut Dit, samples: &[(&[f32], Vec<usize>)]) -> f32 {
+    let mut rng = Rng::new(VALIDATION_SEED);
     let mut total = 0.0;
-    for i in 0..count {
-        let noise: Vec<f32> = (0..images[i].len()).map(|_| rng.normal()).collect();
-        for k in 0..VALIDATION_TIMES {
-            let t = (k as f32 + 0.5) / VALIDATION_TIMES as f32;
-            let (xt, v) = noisy(&images[i], &noise, t);
-            total += mse(&model.forward(&xt, t, labels[i]), &v).0;
-        }
+    for (x0, labels) in samples {
+        let noise: Vec<f32> = (0..x0.len()).map(|_| rng.normal()).collect();
+        total += loss_at_every_time(model, x0, labels, &noise);
     }
-    total / (count * VALIDATION_TIMES) as f32
+    total / (samples.len() * VALIDATION_TIMES) as f32
+}
+
+/// One sample's summed loss at each of the [`VALIDATION_TIMES`].
+fn loss_at_every_time(model: &mut Dit, x0: &[f32], labels: &[usize], noise: &[f32]) -> f32 {
+    let mut total = 0.0;
+    for k in 0..VALIDATION_TIMES {
+        let t = (k as f32 + 0.5) / VALIDATION_TIMES as f32;
+        let (xt, v) = noisy(x0, noise, t);
+        total += mse(&model.forward_labels(&xt, t, labels), &v).0;
+    }
+    total
 }
 
 const VALIDATION_SEED: u64 = 20_260_929;
@@ -252,7 +311,7 @@ const VALIDATION_SEED: u64 = 20_260_929;
 /// this file. At exactly 1 the second run could change nothing, so it is
 /// skipped.
 pub fn sample(model: &mut Dit, label: usize, steps: usize, guidance: f32, rng: &mut Rng) -> Vec<f32> {
-    sample_watched(model, label, steps, guidance, rng, &mut |_, _| true).expect("nothing asked it to stop")
+    sample_watched(model, &[label], steps, guidance, rng, &mut |_, _| true).expect("nothing asked it to stop")
 }
 
 /// [`sample`], calling `on_step(done, x)` after every step with the image as
@@ -260,7 +319,7 @@ pub fn sample(model: &mut Dit, label: usize, steps: usize, guidance: f32, rng: &
 /// rather than a half-drawn image.
 pub fn sample_watched(
     model: &mut Dit,
-    label: usize,
+    labels: &[usize],
     steps: usize,
     guidance: f32,
     rng: &mut Rng,
@@ -271,9 +330,9 @@ pub fn sample_watched(
     let dt = 1.0 / steps as f32;
     for k in 0..steps {
         let t = 1.0 - k as f32 * dt;
-        let mut v = model.forward(&x, t, label);
+        let mut v = model.forward_labels(&x, t, labels);
         if guidance != 1.0 {
-            let none = model.forward(&x, t, config.unconditional());
+            let none = model.forward_labels(&x, t, &vec![config.unconditional(); labels.len()]);
             v.iter_mut().zip(&none).for_each(|(v, n)| *v = n + guidance * (*v - n));
         }
         x.iter_mut().zip(&v).for_each(|(x, v)| *x -= dt * v);
@@ -287,9 +346,9 @@ pub fn sample_watched(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dit::DitConfig;
+    use crate::dit::{Attention, DitConfig};
 
-    const CONFIG: DitConfig = DitConfig { image: 8, channels: 1, patch: 4, classes: 2, d_model: 16, n_heads: 2, n_layers: 2 };
+    const CONFIG: DitConfig = DitConfig { image: 8, frames: 1, attention: Attention::Full, channels: 1, patch: 4, classes: 2, d_model: 16, n_heads: 2, n_layers: 2 };
 
     /// Two "images": a bright top half, and a bright left half.
     fn two_images() -> (Vec<Vec<f32>>, Vec<usize>) {
@@ -316,13 +375,13 @@ mod tests {
     #[test]
     fn it_learns_two_images_and_draws_the_one_it_is_asked_for() {
         let (images, labels) = two_images();
-        let mut rng = Rng::new(81);
+        let mut rng = Rng::new(487);
         let mut model = Dit::new(CONFIG, &mut rng);
         let mut opt = AdamW::new(3e-3);
         let before = validate(&mut model, &images, &labels, 2);
         for _ in 0..STEPS {
             let examples = draw(&images, &labels, CONFIG.unconditional(), 16, &mut rng);
-            train_step(&mut model, &mut opt, &images, &examples);
+            train_step(&mut model, &mut opt, &examples);
         }
         let after = validate(&mut model, &images, &labels, 2);
         assert!(after < 0.25 * before, "validation loss went from {before} to only {after}");
@@ -361,21 +420,76 @@ mod tests {
     /// image whichever label they were given.
     const STEPS: usize = 1500;
     const DRAWS: u64 = 6;
+    /// Measured on seeds 87 to 487: all five pass at 300 steps, and at 200 three
+    /// of the five drew fewer than two clips in three right.
+    const CLIP_STEPS: usize = 300;
+
+    /// The same check on clips: two clips of a square moving, one to the
+    /// right and one down, four frames of 8×8, told apart by their labels.
+    /// A clip is drawn right only if every frame is.
+    #[test]
+    fn it_learns_two_clips_and_draws_the_one_it_is_asked_for() {
+        use crate::dit::Attention;
+        let (n, frames) = (8usize, 4usize);
+        let square = |dx: usize, dy: usize| -> Vec<f32> {
+            let mut clip = vec![-1.0; frames * n * n];
+            for f in 0..frames {
+                let (x0, y0) = (f * dx, f * dy);
+                for y in y0..y0 + 3 {
+                    for x in x0..x0 + 3 {
+                        clip[f * n * n + y * n + x] = 1.0;
+                    }
+                }
+            }
+            clip
+        };
+        let clips = [square(1, 0), square(0, 1)];
+        for attention in [Attention::Full, Attention::Factorised] {
+            // 32 wide, where the pictures above use 16. At 16 the clips came out in
+            // the right place, moving the right way, and speckled with noise the
+            // model could not carry through its tokens: distance 55 after 4000
+            // steps, and 49 after 10000. At 32 and 64 it was 0.2 to 0.3. (A
+            // token has to carry its patch's noise through the network to
+            // predict it, and here a patch is 16 numbers.)
+            let config = DitConfig { frames, attention, d_model: 32, ..CONFIG };
+            let mut rng = Rng::new(87);
+            let mut model = Dit::new(config, &mut rng);
+            let mut opt = AdamW::new(3e-3);
+            for _ in 0..CLIP_STEPS {
+                let examples: Vec<Example> = (0..16)
+                    .map(|_| {
+                        let which = rng.below(2);
+                        noised(clips[which].clone(), vec![which], config.unconditional(), &mut rng)
+                    })
+                    .collect();
+                train_step(&mut model, &mut opt, &examples);
+            }
+            let mut right = 0;
+            for seed in 0..DRAWS {
+                for which in 0..2 {
+                    let drawn = sample(&mut model, which, 20, 1.0, &mut Rng::new(900 + seed));
+                    let distance = |i: usize| drawn.iter().zip(&clips[i]).map(|(a, b)| (a - b) * (a - b)).sum::<f32>();
+                    right += (distance(which) < 0.25 * distance(1 - which)) as u64;
+                }
+            }
+            assert!(3 * right >= 2 * (2 * DRAWS), "{attention:?}: {right} of {} clips were the one asked for", 2 * DRAWS);
+        }
+    }
 
     /// Threads must not change what is learned, only how fast.
     #[test]
     fn replicas_take_the_step_one_model_would() {
         let (images, labels) = two_images();
         let run = |threads: usize| {
-            let mut rng = Rng::new(83);
+            let mut rng = Rng::new(487);
             let mut model = Dit::new(CONFIG, &mut rng);
             let mut replicas = Replicas::new(&model, threads);
             let mut opt = AdamW::new(1e-2);
             for _ in 0..5 {
                 let examples = draw(&images, &labels, CONFIG.unconditional(), 6, &mut rng);
                 match threads {
-                    1 => train_step(&mut model, &mut opt, &images, &examples),
-                    _ => replicas.train_step(&mut model, &mut opt, &images, &examples),
+                    1 => train_step(&mut model, &mut opt, &examples),
+                    _ => replicas.train_step(&mut model, &mut opt, &examples),
                 };
             }
             model.params().into_iter().flat_map(|p| p.value.to_vec()).collect::<Vec<f32>>()
@@ -387,15 +501,29 @@ mod tests {
         }
     }
 
+    /// Validating on several threads asks the same questions as on one.
+    #[test]
+    fn validation_is_the_same_on_any_number_of_threads() {
+        let (images, labels) = two_images();
+        let mut model = Dit::new(CONFIG, &mut Rng::new(85));
+        crate::gradcheck::scramble(model.params(), &mut Rng::new(86));
+        let samples: Vec<(&[f32], Vec<usize>)> = (0..5).map(|i| (images[i % 2].as_slice(), vec![labels[i % 2]])).collect();
+        let one = validate_samples(&mut model, &samples);
+        for threads in [2, 3] {
+            let many = Replicas::new(&model, threads).validate(&mut model, &samples);
+            assert!((one - many).abs() < 1e-5 * one, "{threads} threads: {many} against {one}");
+        }
+    }
+
     /// And drawing on several threads draws the same images as drawing on one.
     #[test]
     fn an_image_depends_on_its_seed_and_not_on_the_threads() {
-        let mut rng = Rng::new(84);
+        let mut rng = Rng::new(487);
         let mut model = Dit::new(CONFIG, &mut rng);
         crate::gradcheck::scramble(model.params(), &mut rng);
-        let requests: Vec<(usize, u64)> = (0..5).map(|i| (i % 3, 100 + i as u64)).collect();
+        let requests: Vec<(Vec<usize>, u64)> = (0..5).map(|i| (vec![i % 3], 100 + i as u64)).collect();
         let alone: Vec<Vec<f32>> =
-            requests.iter().map(|&(label, seed)| sample(&mut model, label, 4, 2.0, &mut Rng::new(seed))).collect();
+            requests.iter().map(|(labels, seed)| sample(&mut model, labels[0], 4, 2.0, &mut Rng::new(*seed))).collect();
         let shared = Replicas::new(&model, 3).sample(&mut model, &requests, 4, 2.0);
         assert_eq!(alone, shared);
     }

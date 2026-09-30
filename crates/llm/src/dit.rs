@@ -114,7 +114,7 @@ impl Painter for Drawer {
         let total = resolved.steps;
         let drawn = nervus::flow::sample_watched(
             &mut self.model,
-            label,
+            &[label],
             total,
             resolved.guidance,
             &mut Rng::new(resolved.seed),
@@ -165,9 +165,9 @@ impl Painter for Drawer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nervus::dit::DitConfig;
+    use nervus::dit::{Attention, DitConfig};
 
-    const CONFIG: DitConfig = DitConfig { image: 8, channels: 1, patch: 4, classes: 3, d_model: 16, n_heads: 2, n_layers: 2 };
+    const CONFIG: DitConfig = DitConfig { image: 8, frames: 1, attention: Attention::Full, channels: 1, patch: 4, classes: 3, d_model: 16, n_heads: 2, n_layers: 2 };
 
     fn saved(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kvad-dit-{name}-{}", std::process::id()));

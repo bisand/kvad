@@ -1191,8 +1191,9 @@ pub fn entries() -> Vec<(PathBuf, String, String, u64)> {
             let (repo, precision) = stem.rsplit_once('.')?;
             let bytes = e.metadata().ok()?.len();
             // The header knows; the file name is a guess for a file whose
-            // header cannot be read.
-            let repo = repo_of(&path).unwrap_or_else(|| repo.replacen("--", "/", 1));
+            // header cannot be read. Every `--` was a slash: the Hub allows
+            // none in a name, and a pipeline's component adds a second.
+            let repo = repo_of(&path).unwrap_or_else(|| repo.replace("--", "/"));
             Some((path, repo, precision.to_string(), bytes))
         })
         .collect();
@@ -1200,13 +1201,25 @@ pub fn entries() -> Vec<(PathBuf, String, String, u64)> {
     out
 }
 
-/// Delete every cache file belonging to `repo`. Returns how many went.
+/// Whether a cache file filed under `entry` belongs to the model `repo`.
+///
+/// An image or video pipeline is one download but several caches, one per
+/// component, each filed as `REPO/COMPONENT`: Qwen-Image's transformer is
+/// `Qwen/Qwen-Image/transformer`. Those are the model's too. The match is on
+/// the slash, because `Qwen/Qwen-Image-Lightning` is another model that
+/// merely starts with the same letters.
+pub fn belongs_to(entry: &str, repo: &str) -> bool {
+    entry.strip_prefix(repo).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Delete every cache file belonging to `repo`, its components' included.
+/// Returns how many went.
 ///
 /// What a *model* going away means: `kvad rm` and the server's delete both
 /// call it, because weights derived from a checkpoint that is no longer there
 /// have nothing left to be checked against.
 pub fn forget(repo: &str) -> usize {
-    forget_where(|r, _| r == repo)
+    forget_where(|r, _| belongs_to(r, repo))
 }
 
 /// Delete one file: `repo` at one precision, by the tag [`entries`] reports.
@@ -1607,6 +1620,42 @@ mod tests {
         assert_eq!(forget(mine), 1);
         assert!(listed(mine).is_empty());
         assert_eq!(listed(other), ["gpu-q8", "q8"]);
+    }
+
+    /// Deleting a pipeline deletes its components' caches.
+    ///
+    /// `kvad rm Qwen/Qwen-Image` used to take the download and leave 29 GB of
+    /// `Qwen/Qwen-Image/transformer` and `.../text_encoder` behind, because
+    /// the match was on the repo exactly. A model whose name merely starts
+    /// the same way is not one of its components.
+    #[test]
+    fn forgetting_a_pipeline_takes_its_components() {
+        let root = Root::new("components");
+        let repo = "Qwen/Qwen-Image";
+        let mine = [
+            root.put(repo, "gpu-q8"),
+            root.put("Qwen/Qwen-Image/transformer", "gpu-q8"),
+            root.put("Qwen/Qwen-Image/text_encoder", "gpu-q8"),
+        ];
+        let theirs = [
+            root.put("Qwen/Qwen-Image-Lightning", "gpu-q8"),
+            root.put("Qwen/Qwen-Image-Lightning/transformer", "gpu-q8"),
+        ];
+
+        assert_eq!(forget(repo), 3);
+        for path in &mine {
+            assert!(!path.exists(), "{} survived", path.display());
+        }
+        for path in &theirs {
+            assert!(path.exists(), "{} went too", path.display());
+        }
+        let mut left: Vec<String> = entries().into_iter().map(|(_, r, ..)| r).collect();
+        left.sort();
+        assert_eq!(left, ["Qwen/Qwen-Image-Lightning", "Qwen/Qwen-Image-Lightning/transformer"]);
+
+        assert!(belongs_to("Qwen/Qwen-Image", "Qwen/Qwen-Image"));
+        assert!(!belongs_to("Qwen/Qwen-Image", "Qwen/Qwen-Image/transformer"));
+        assert!(!belongs_to("Qwen/Qwen-Imagery/transformer", "Qwen/Qwen-Image"));
     }
 
     #[test]

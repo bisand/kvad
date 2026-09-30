@@ -375,7 +375,11 @@ pub fn cache(remote: &Remote, args: &Args) -> Res<()> {
             return Ok(());
         }
         Some(repo) => {
-            let n = forget(entries.iter().filter(|e| e["repo"] == repo).collect())?;
+            // The same files `kvad rm` would take: a pipeline's components
+            // are filed as `REPO/COMPONENT`, and are the model's too.
+            let n = forget(
+                entries.iter().filter(|e| e["repo"].as_str().is_some_and(|r| kvad::qcache::belongs_to(r, repo))).collect(),
+            )?;
             println!("deleted {n} file(s) for {repo}");
             return Ok(());
         }

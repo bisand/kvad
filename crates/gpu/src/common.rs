@@ -54,6 +54,15 @@ pub(crate) enum Proj {
 }
 
 impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        // A matrix that is not being trained owes `backward` its input's
+        // gradient and no more: the product is made out of its sight, on
+        // whatever kernel takes it, and attached (`grad::attach`).
+        if let Proj::Dense(w) = self {
+            if x.track_op() && !w.track_op() {
+                let w = w.clone();
+                return crate::grad::attach(x, self.forward(&x.detach())?, move |x, g| crate::grad::back_through(&w, x, g));
+            }
+        }
         match self {
             // On the M5's matrix units when it is f16 or bf16 and more than
             // a few rows; `mpp::dense` says which, and declines the rest.

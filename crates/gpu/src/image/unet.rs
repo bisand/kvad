@@ -23,6 +23,7 @@
 
 use super::nn::{attention, timestep_embedding, to_grid, to_seq, Conv2d, Ctx, GroupNorm, LayerNorm, Linear};
 use crate::common::Reader;
+use crate::grad::Stretch;
 use candle_core::{Tensor, D};
 use kvad::serde_json::Value;
 
@@ -383,13 +384,9 @@ impl Unet {
         Ok(unet)
     }
 
-    /// One prediction of the noise in `x`.
-    ///
-    /// `x` is `[B, 4, h, w]` and `ctx` the prompt, `[B, 77, 2048]` for SDXL
-    /// and `[B, 77, 768]` for SD 1.5. `added` is SDXL's: the pooled prompt,
-    /// `[B, 1280]`, and the six size numbers, the same for every image in
-    /// the batch.
-    pub(crate) fn forward(&self, x: &Tensor, t: f64, ctx: &Tensor, added: Option<(&Tensor, &[f64; 6])>) -> candle_core::Result<Tensor> {
+    /// The noise level `t` as the vector every resnet reads, with SDXL's
+    /// `added` conditioning in it, for a batch like `x`.
+    pub(crate) fn embed(&self, x: &Tensor, t: f64, added: Option<(&Tensor, &[f64; 6])>) -> candle_core::Result<Tensor> {
         let b = x.dim(0)?;
         let dev = x.device();
         let dtype = x.dtype();
@@ -412,37 +409,75 @@ impl Unet {
         };
         // Every resnet applies a SiLU to this before its own projection, so
         // it is applied once here instead of forty times.
-        let temb = t_emb.silu()?;
+        t_emb.silu()
+    }
 
-        let mut h = self.conv_in.forward(x)?;
-        let mut skips = vec![h.clone()];
+    /// One prediction of the noise in `x`.
+    ///
+    /// `x` is `[B, 4, h, w]` and `ctx` the prompt, `[B, 77, 2048]` for SDXL
+    /// and `[B, 77, 768]` for SD 1.5. `added` is SDXL's: the pooled prompt,
+    /// `[B, 1280]`, and the six size numbers, the same for every image in
+    /// the batch.
+    pub(crate) fn forward(&self, x: &Tensor, t: f64, ctx: &Tensor, added: Option<(&Tensor, &[f64; 6])>) -> candle_core::Result<Tensor> {
+        let temb = self.embed(x, t, added)?;
+        let mut state = vec![x.clone()];
+        for stretch in self.stretches(&temb, ctx) {
+            state = stretch(&state)?;
+        }
+        debug_assert_eq!(state.len(), 1, "every skip taken back up");
+        Ok(state.swap_remove(0))
+    }
+
+    /// The UNet as a row of stretches, each taking the state the one before
+    /// left: the first reads `[x]` and the last leaves `[noise]`.
+    ///
+    /// The state between two is the feature map `h`, first, and after it the
+    /// skips still waiting to be taken back up, oldest first: every stage
+    /// on the way down leaves its answer there, and every stage on the way
+    /// up takes the newest. [`Unet::forward`] runs them in a row. Training
+    /// keeps only the states, and comes back through one stretch at a time
+    /// ([`crate::grad::checkpointed`]).
+    pub(crate) fn stretches<'a>(&'a self, temb: &'a Tensor, ctx: &'a Tensor) -> Vec<Stretch<'a>> {
+        // `h` replaced, the waiting skips as they were, and `h` added to
+        // them if this stretch leaves one.
+        fn state(h: Tensor, waiting: &[Tensor], leaves: bool) -> Vec<Tensor> {
+            let mut next = Vec::with_capacity(waiting.len() + 2);
+            next.push(h.clone());
+            next.extend_from_slice(waiting);
+            if leaves {
+                next.push(h);
+            }
+            next
+        }
+        let mut out: Vec<Stretch<'a>> = Vec::new();
+        out.push(Box::new(move |s| Ok(state(self.conv_in.forward(&s[0])?, &[], true))));
         for level in &self.down {
-            for s in &level.stages {
-                h = s.forward(&h, &temb, ctx)?;
-                skips.push(h.clone());
+            for stage in &level.stages {
+                out.push(Box::new(move |s| Ok(state(stage.forward(&s[0], temb, ctx)?, &s[1..], true))));
             }
             if let Some(ds) = &level.resample {
-                h = ds.forward(&h)?;
-                skips.push(h.clone());
+                out.push(Box::new(move |s| Ok(state(ds.forward(&s[0])?, &s[1..], true))));
             }
         }
-
-        h = self.mid.0.forward(&h, &temb)?;
-        h = self.mid.1.forward(&h, ctx)?;
-        h = self.mid.2.forward(&h, &temb)?;
-
+        out.push(Box::new(move |s| {
+            let h = self.mid.0.forward(&s[0], temb)?;
+            let h = self.mid.1.forward(&h, ctx)?;
+            Ok(state(self.mid.2.forward(&h, temb)?, &s[1..], false))
+        }));
         for level in &self.up {
-            for s in &level.stages {
-                let skip = skips.pop().expect("one skip per up-resnet, by construction");
-                h = s.forward(&Tensor::cat(&[&h, &skip], 1)?, &temb, ctx)?;
+            for stage in &level.stages {
+                out.push(Box::new(move |s| {
+                    let (skip, waiting) = s[1..].split_last().expect("one skip per up-resnet, by construction");
+                    Ok(state(stage.forward(&Tensor::cat(&[&s[0], skip], 1)?, temb, ctx)?, waiting, false))
+                }));
             }
             if let Some(us) = &level.resample {
-                let (_, _, hh, ww) = h.dims4()?;
-                h = us.forward(&h.upsample_nearest2d(hh * 2, ww * 2)?)?;
+                out.push(Box::new(move |s| {
+                    Ok(state(us.forward(&crate::grad::upsample_twice(&s[0])?)?, &s[1..], false))
+                }));
             }
         }
-        debug_assert!(skips.is_empty());
-
-        self.conv_out.forward(&self.norm_out.forward(&h)?.silu()?)
+        out.push(Box::new(move |s| Ok(state(self.conv_out.forward(&self.norm_out.forward(&s[0])?.silu()?)?, &s[1..], false))));
+        out
     }
 }

@@ -78,10 +78,24 @@ impl Linear {
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let y = self.plain(x)?;
+        let y = self.frozen(x)?;
         match &self.slot {
             Some(s) => s.add(x, y),
             None => Ok(y),
+        }
+    }
+
+    /// [`Linear::plain`], for an `x` that may be being differentiated: the
+    /// layer's own weights are not trained, so its answer is made out of
+    /// `backward`'s sight, bias and all, and attached with the one gradient
+    /// it owes, its input's (`crate::grad::attach`).
+    fn frozen(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match &self.w {
+            Proj::Dense(w) if x.track_op() && !w.track_op() => {
+                let w = w.clone();
+                crate::grad::attach(x, self.plain(&x.detach())?, move |x, g| crate::grad::back_through(&w, x, g))
+            }
+            _ => self.plain(x),
         }
     }
 
@@ -205,12 +219,54 @@ impl Conv2d {
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let y = x.conv2d(&self.w, self.pad, self.stride, 1, 1)?.broadcast_add(&self.b)?;
+        let plain = |x: &Tensor| x.conv2d(&self.w, self.pad, self.stride, 1, 1)?.broadcast_add(&self.b);
+        // A kernel that is not being trained owes `backward` its input's
+        // gradient and no more (`crate::grad::attach`): the transposed
+        // convolution of the answer's, as candle's own backward makes it,
+        // without the kernel's, which is a convolution again as large.
+        let y = match x.track_op() && !self.w.track_op() {
+            true => {
+                let (w, pad, stride) = (self.w.clone(), self.pad, self.stride);
+                crate::grad::attach(x, plain(&x.detach())?, move |x, g| back_through_conv(&w, pad, stride, x, g))?
+            }
+            false => plain(x)?,
+        };
         match &self.slot {
             Some(s) => s.add_conv(x, y),
             None => Ok(y),
         }
     }
+}
+
+/// `∂L/∂x` for `y = conv2d(x, w)` with `w` `[out, in, k, k]`: the transposed
+/// convolution of `∂L/∂y`, in `x`'s shape and dtype.
+///
+/// At stride 1 it is computed as an ordinary convolution, by the kernel
+/// turned half round and its two channel axes exchanged, padded `k − 1 −
+/// pad`: the same sums. candle's Metal convolution is a matrix product over
+/// gathered neighbourhoods; its transposed one is a thread for every output
+/// number, looping over every input channel and tap, and a UNet's
+/// convolutions are 1280 channels wide. A stride of 2 keeps the transposed
+/// one: there are three in SDXL.
+pub(crate) fn back_through_conv(w: &Tensor, pad: usize, stride: usize, x: &Tensor, grad: &Tensor) -> candle_core::Result<Tensor> {
+    let k = w.dim(2)?;
+    let g = grad.to_dtype(w.dtype())?;
+    let back = match stride {
+        1 => g.conv2d(&w.flip(&[2, 3])?.transpose(0, 1)?.contiguous()?, k - 1 - pad, 1, 1, 1)?,
+        _ => {
+            // What the stride's rounding left off the far edge, which need
+            // not be the same down as across: 6 rows and 7 columns at
+            // stride 2 leave one row and no column. The transposed
+            // convolution takes one number for both, so it is given the
+            // larger and the answer cut to `x`'s size. (candle's own
+            // backward gives both the rows' and fails on such a shape.)
+            let (_, _, h, wd) = x.dims4()?;
+            let left = |n: usize, gn: usize| n - ((gn - 1) * stride + k - 2 * pad);
+            let (rows, cols) = (left(h, g.dim(2)?), left(wd, g.dim(3)?));
+            g.conv_transpose2d(w, pad, rows.max(cols), stride, 1)?.narrow(2, 0, h)?.narrow(3, 0, wd)?.contiguous()?
+        }
+    };
+    back.to_dtype(x.dtype())
 }
 
 /// Group norm: split the channels into `groups` groups and normalise each

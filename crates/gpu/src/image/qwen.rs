@@ -25,6 +25,7 @@ use super::lora::{self, Adapters};
 use super::mmdit::{norm_out, Double, Names, Shape};
 use super::nn::{check_latent, latent_preview, noise, timestep_embedding, to_rgb8, Conv2d, Ctx, Linear};
 use super::schedule;
+use super::vae;
 use super::{finish, finish_gguf, local_file, open, read_json};
 use crate::common::{settle, Loader, Reader, Stored};
 use crate::gguf::Gguf;
@@ -447,7 +448,7 @@ impl WanResnet {
 struct WanDecoder {
     post_quant: Conv2d,
     conv_in: Conv2d,
-    mid: (WanResnet, (RmsChannels, Conv2d, Conv2d), WanResnet),
+    mid: WanMid,
     up: Vec<(Vec<WanResnet>, Option<Conv2d>)>,
     norm_out: RmsChannels,
     conv_out: Conv2d,
@@ -457,16 +458,7 @@ struct WanDecoder {
 
 impl WanDecoder {
     fn load(cx: &Ctx<'_>, r: &Reader<'_>, config: &Value) -> Res<Self> {
-        let n = |k: &str| config.get(k).and_then(Value::as_u64).map(|v| v as usize).ok_or(format!("VAE config has no `{k}`"));
-        let (base, z, res) = (n("base_dim")?, n("z_dim")?, n("num_res_blocks")?);
-        let mult: Vec<usize> = config["dim_mult"].as_array().ok_or("VAE config has no `dim_mult`")?.iter().filter_map(Value::as_u64).map(|v| v as usize).collect();
-        let stats = |k: &str| -> Res<Tensor> {
-            let v: Vec<f32> = config[k].as_array().ok_or(format!("VAE config has no `{k}`"))?.iter().filter_map(Value::as_f64).map(|f| f as f32).collect();
-            Ok(Tensor::from_vec(v, (1, z, 1, 1), cx.device())?.to_dtype(cx.dtype)?)
-        };
-        if !config["attn_scales"].as_array().is_some_and(|a| a.is_empty()) {
-            return Err("a Wan VAE with attention outside its middle block is not implemented".into());
-        }
+        let WanConfig { base, z, res, mult } = WanConfig::from_json(config)?;
 
         // The encoder makes latents from images, which text-to-image never
         // does; the temporal upsamplers only run from the second frame on.
@@ -475,17 +467,7 @@ impl WanDecoder {
 
         let d = r.pp("decoder");
         let top = base * mult[mult.len() - 1];
-        let m = d.pp("mid_block");
-        let a = m.pp("attentions.0");
-        let mid = (
-            WanResnet::load(cx, &m.pp("resnets.0"), top, top)?,
-            (
-                RmsChannels::load(cx, &a, "norm", top, true)?,
-                causal_2d(cx, &a, "to_qkv", (top, 3 * top))?,
-                causal_2d(cx, &a, "proj", (top, top))?,
-            ),
-            WanResnet::load(cx, &m.pp("resnets.1"), top, top)?,
-        );
+        let mid = WanMid::load(cx, &d.pp("mid_block"), top)?;
 
         // Widths top down: the widest first, then back through `dim_mult`.
         let dims: Vec<usize> = std::iter::once(mult[mult.len() - 1]).chain(mult.iter().rev().copied()).map(|u| base * u).collect();
@@ -515,8 +497,8 @@ impl WanDecoder {
             conv_out: causal(cx, &d, "conv_out", (last, 3, 3, 3))?,
             mid,
             up,
-            mean: stats("latents_mean")?,
-            std: stats("latents_std")?,
+            mean: latent_stats(cx, config, "latents_mean", z)?,
+            std: latent_stats(cx, config, "latents_std", z)?,
         })
     }
 
@@ -543,9 +525,9 @@ impl WanDecoder {
         };
         let z = z.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?;
         let mut h = done(self.conv_in.forward(&self.post_quant.forward(&z)?)?)?;
-        h = done(self.mid.0.forward(&h)?)?;
-        h = done(self.attend(&h)?)?;
-        h = done(self.mid.2.forward(&h)?)?;
+        h = done(self.mid.first.forward(&h)?)?;
+        h = done(self.mid.attend(&h)?)?;
+        h = done(self.mid.second.forward(&h)?)?;
         for (resnets, upsample) in &self.up {
             for r in resnets {
                 h = done(r.forward(&h)?)?;
@@ -564,16 +546,184 @@ impl WanDecoder {
     fn stages(&self) -> usize {
         4 + self.up.iter().map(|(r, u)| r.len() + u.is_some() as usize).sum::<usize>() + 2
     }
+}
+
+/// What a Wan VAE's config says about its shape. Its `attn_scales` must be
+/// empty: attention in the middle block only, which is all Qwen-Image's has.
+struct WanConfig {
+    base: usize,
+    /// The latent's channels.
+    z: usize,
+    res: usize,
+    mult: Vec<usize>,
+}
+
+impl WanConfig {
+    fn from_json(config: &Value) -> Res<Self> {
+        let n = |k: &str| config.get(k).and_then(Value::as_u64).map(|v| v as usize).ok_or(format!("VAE config has no `{k}`"));
+        let mult: Vec<usize> = config["dim_mult"].as_array().ok_or("VAE config has no `dim_mult`")?.iter().filter_map(Value::as_u64).map(|v| v as usize).collect();
+        if !config["attn_scales"].as_array().is_some_and(|a| a.is_empty()) {
+            return Err("a Wan VAE with attention outside its middle block is not implemented".into());
+        }
+        Ok(WanConfig { base: n("base_dim")?, z: n("z_dim")?, res: n("num_res_blocks")?, mult })
+    }
+}
+
+/// The per-channel `latents_mean` or `latents_std` as `[1, z, 1, 1]`: what
+/// puts the latent into the transformer's units and back.
+fn latent_stats(cx: &Ctx<'_>, config: &Value, k: &str, z: usize) -> Res<Tensor> {
+    let v: Vec<f32> = config[k].as_array().ok_or(format!("VAE config has no `{k}`"))?.iter().filter_map(Value::as_f64).map(|f| f as f32).collect();
+    Ok(Tensor::from_vec(v, (1, z, 1, 1), cx.device())?.to_dtype(cx.dtype)?)
+}
+
+/// The middle block, the same in the encoder and the decoder: a resnet, one
+/// attention over every position, and a resnet.
+struct WanMid {
+    first: WanResnet,
+    norm: RmsChannels,
+    qkv: Conv2d,
+    proj: Conv2d,
+    second: WanResnet,
+}
+
+impl WanMid {
+    fn load(cx: &Ctx<'_>, m: &Reader<'_>, top: usize) -> Res<Self> {
+        let a = m.pp("attentions.0");
+        Ok(WanMid {
+            first: WanResnet::load(cx, &m.pp("resnets.0"), top, top)?,
+            norm: RmsChannels::load(cx, &a, "norm", top, true)?,
+            qkv: causal_2d(cx, &a, "to_qkv", (top, 3 * top))?,
+            proj: causal_2d(cx, &a, "proj", (top, top))?,
+            second: WanResnet::load(cx, &m.pp("resnets.1"), top, top)?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        self.second.forward(&self.attend(&self.first.forward(x)?)?)
+    }
 
     /// One head as wide as the channels, over every position.
     fn attend(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let (norm, qkv, proj) = &self.mid.1;
         let (_, c, h, w) = x.dims4()?;
-        let s = qkv.forward(&norm.forward(x)?)?.reshape((1, 3 * c, h * w))?.transpose(1, 2)?.contiguous()?;
+        let s = self.qkv.forward(&self.norm.forward(x)?)?.reshape((1, 3 * c, h * w))?.transpose(1, 2)?.contiguous()?;
         let part = |i: usize| s.narrow(2, i * c, c)?.unsqueeze(1)?.contiguous();
         let a = super::nn::written_out(&part(0)?, &part(1)?, &part(2)?, 1.0 / (c as f64).sqrt())?;
         let a = a.squeeze(1)?.transpose(1, 2)?.contiguous()?.reshape((1, c, h, w))?;
-        proj.forward(&a)? + x
+        self.proj.forward(&a)? + x
+    }
+}
+
+/// The encoding half, run on one frame: a picture to the Gaussian over its
+/// latents, as [`vae::Encoder`] makes it for the other VAEs.
+///
+/// It is the decoder backwards, as theirs is: resnets, then a stride-2
+/// convolution after every level but the last, the middle block, and twice
+/// the latent's channels out, the mean's and the log-variance's. Two things
+/// are Wan's own. Every 3D convolution collapses to its last time slice, as
+/// in the decoder ([`causal`]). And two of the downsamplers also halve time,
+/// with a convolution over frames that a video's first frame never reaches:
+/// it runs on a frame and the one before it, and the first has none. So
+/// those are skipped, and a picture goes through exactly what a video's
+/// first frame does.
+///
+/// Peak footprint of one encode and one decode alone, in bf16 as the
+/// pipeline runs the VAE, on an M5 Pro:
+///
+/// | | encode | decode |
+/// |---|---|---|
+/// | 512² | 0.8 s, 1.8 GB | 1.3 s, 2.7 GB |
+/// | 1328² | 5.8 s, 14.5 GB | 9.6 s, 19.6 GB |
+///
+/// So, as for the other VAEs, a picture that can be decoded can be encoded.
+/// `tests::one_encode` measures it.
+///
+/// Nothing outside the tests calls it yet; its callers are training (#75)
+/// and editing (#43), as for [`vae::Encoder`].
+#[cfg_attr(not(test), allow(dead_code))]
+struct WanEncoder {
+    conv_in: Conv2d,
+    /// Flat, as the weights number them: each level's resnets, then its
+    /// downsampler.
+    down: Vec<(Vec<WanResnet>, Option<Conv2d>)>,
+    mid: WanMid,
+    norm_out: RmsChannels,
+    conv_out: Conv2d,
+    quant: Conv2d,
+    z: usize,
+    mean: Tensor,
+    std: Tensor,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WanEncoder {
+    fn load(cx: &Ctx<'_>, r: &Reader<'_>, config: &Value) -> Res<Self> {
+        let WanConfig { base, z, res, mult } = WanConfig::from_json(config)?;
+        r.skip_under("decoder.");
+        r.skip_under("post_quant_conv.");
+
+        let e = r.pp("encoder");
+        let dims: Vec<usize> = std::iter::once(1).chain(mult.iter().copied()).map(|u| base * u).collect();
+        let mut down = Vec::new();
+        let mut at = 0;
+        for i in 0..mult.len() {
+            let resnets = (0..res)
+                .map(|j| {
+                    let b = e.pp(format!("down_blocks.{}", at + j));
+                    WanResnet::load(cx, &b, if j == 0 { dims[i] } else { dims[i + 1] }, dims[i + 1])
+                })
+                .collect::<Res<Vec<_>>>()?;
+            at += res;
+            let downsample = match i + 1 < mult.len() {
+                true => {
+                    let b = e.pp(format!("down_blocks.{at}"));
+                    // Only from the second frame on; see above.
+                    b.skip_under("time_conv");
+                    at += 1;
+                    Some(Conv2d::load(cx, &b, "resample.1", (dims[i + 1], dims[i + 1], 3), 2)?.unpadded())
+                }
+                false => None,
+            };
+            down.push((resnets, downsample));
+        }
+        let top = dims[dims.len() - 1];
+        Ok(WanEncoder {
+            conv_in: causal(cx, &e, "conv_in", (3, base, 3, 3))?,
+            down,
+            mid: WanMid::load(cx, &e.pp("mid_block"), top)?,
+            norm_out: RmsChannels::load(cx, &e, "norm_out", top, false)?,
+            conv_out: causal(cx, &e, "conv_out", (top, 2 * z, 3, 3))?,
+            quant: causal(cx, r, "quant_conv", (2 * z, 2 * z, 1, 1))?,
+            z,
+            mean: latent_stats(cx, config, "latents_mean", z)?,
+            std: latent_stats(cx, config, "latents_std", z)?,
+        })
+    }
+
+    /// `[1, 3, H, W]` in `[−1, 1]`, `H` and `W` multiples of 8, to the
+    /// Gaussian over its `[1, 16, H/8, W/8]` latents, in the VAE's units.
+    fn encode(&self, image: &Tensor) -> candle_core::Result<vae::Posterior> {
+        let mut h = self.conv_in.forward(image)?;
+        for (resnets, downsample) in &self.down {
+            for r in resnets {
+                h = r.forward(&h)?;
+            }
+            if let Some(conv) = downsample {
+                // Right and bottom, then a stride of 2 unpadded, as in
+                // `vae::Encoder::encode`.
+                h = conv.forward(&h.pad_with_zeros(3, 0, 1)?.pad_with_zeros(2, 0, 1)?)?;
+            }
+        }
+        let h = self.mid.forward(&h)?;
+        let h = self.conv_out.forward(&self.norm_out.forward(&h)?.silu()?)?;
+        let h = self.quant.forward(&h)?;
+        Ok(vae::Posterior { mean: h.narrow(1, 0, self.z)?, logvar: h.narrow(1, self.z, self.z)?.clamp(-30.0, 20.0)? })
+    }
+
+    /// A latent in the VAE's units to the transformer's: less the
+    /// per-channel mean, over the per-channel spread, as the edit pipelines
+    /// do. The inverse of the first thing [`WanDecoder::decode`] does.
+    fn to_denoiser(&self, z: &Tensor) -> candle_core::Result<Tensor> {
+        z.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
     }
 }
 
@@ -1143,5 +1293,100 @@ mod tests {
             assert!(a > floor && h > floor, "{what}");
             assert!(d > p - size - 6.0, "{what}: the LoRA's part is further from the reference's than the model's own rounding explains");
         }
+    }
+
+    /// The VAE's config and weights, and an encoder and decoder of them on
+    /// `device` in `dtype`.
+    fn wan(device: &Device, dtype: DType) -> (WanEncoder, WanDecoder) {
+        let w = Watcher::none();
+        let config = read_json(&fetch_file("Qwen/Qwen-Image", "vae/config.json", &w).unwrap()).unwrap();
+        let paths = vec![fetch_file("Qwen/Qwen-Image", "vae/diffusion_pytorch_model.safetensors", &w).unwrap()];
+        let vault = Vault::off();
+        let cx = Ctx { ld: Loader::new(None, device.clone(), &vault), dtype };
+        let enc = WanEncoder::load(&cx, &open(&paths, dtype).unwrap(), &config).unwrap();
+        let dec = WanDecoder::load(&cx, &open(&paths, dtype).unwrap(), &config).unwrap();
+        (enc, dec)
+    }
+
+    /// kvad's Wan encoder against diffusers' `AutoencoderKLQwenImage`, on one
+    /// frame: the mean, the log-variance and the round trip, in f32 and then
+    /// in bf16 as the pipeline runs it, held to what
+    /// `vae::tests::the_encoder_agrees_with_diffusers` holds the others to.
+    /// The fixtures are `scripts/vae-fixtures.py --only qwen`'s.
+    ///
+    ///     KVAD_VAE_FIXTURES=/tmp/vae-fx cargo test --release -p kvad-gpu image::qwen::tests::the_encoder -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn the_encoder_agrees_with_diffusers() {
+        use super::super::vae::tests::{gap, psnr};
+        let dir = std::env::var("KVAD_VAE_FIXTURES").expect("KVAD_VAE_FIXTURES names the fixtures' directory");
+        let fx = candle_core::safetensors::load(format!("{dir}/qwen.safetensors"), &Device::Cpu).expect("no qwen.safetensors among the fixtures");
+        let (image, mean, logvar, decoded) = (&fx["image"], &fx["mean"], &fx["logvar"], &fx["decoded"]);
+        let theirs = psnr(decoded, image);
+        let device = Device::new_metal(0).unwrap();
+        for dtype in [DType::F32, DType::BF16] {
+            let (enc, dec) = wan(&device, dtype);
+            let x = image.unsqueeze(0).unwrap().to_device(&device).unwrap().to_dtype(dtype).unwrap();
+            let p = enc.encode(&x).unwrap();
+            let back = dec.decode(&enc.to_denoiser(&p.mean).unwrap()).unwrap();
+            let back = back.to_device(&Device::Cpu).unwrap().to_dtype(DType::F32).unwrap().squeeze(0).unwrap();
+            let (dm, dl, same, ours) = (gap(&p.mean, mean), gap(&p.logvar, logvar), psnr(&back, decoded), psnr(&back, image));
+            let own = match dtype {
+                DType::F32 => None,
+                _ => Some(gap(&fx.get("mean_half").expect("no `mean_half` in the fixtures; make them on a Mac").unsqueeze(0).unwrap(), mean)),
+            };
+            if let Some(own) = own {
+                eprintln!("qwen diffusers' own {dtype:?} mean is off by {:.2e} at most, {:.2e} rms", own.0, own.1);
+            }
+            eprintln!(
+                "qwen {dtype:?}: mean off by {:.2e} at most, {:.2e} rms; logvar {:.2e}, {:.2e}; decoded {same:.1} dB from theirs; round trip {ours:.2} dB, diffusers' {theirs:.2}",
+                dm.0, dm.1, dl.0, dl.1
+            );
+            let (close, least, db) = match own {
+                None => (1e-3, 60.0, 0.01),
+                Some(own) => (1.5 * own.1, 30.0, 0.5),
+            };
+            assert!(dm.1 < close, "qwen {dtype:?}: the mean is {:.2e} rms from diffusers'", dm.1);
+            if own.is_none() {
+                assert!(dl.1 < close, "qwen: the log-variance is {:.2e} rms from diffusers'", dl.1);
+            }
+            assert!(same > least, "qwen {dtype:?}: the decode of the mean is {same:.1} dB from diffusers'");
+            assert!((ours - theirs).abs() < db, "qwen {dtype:?}: {ours:.2} dB against diffusers' {theirs:.2}");
+        }
+    }
+
+    /// One encode of noise at `KVAD_VAE_SIDE` pixels square (1328, the
+    /// pipeline's own size, by default) in bf16, timed after a warm-up, or
+    /// one decode with `KVAD_VAE_DECODE` set; as `vae::tests::one_encode`.
+    ///
+    ///     KVAD_VAE_SIDE=1328 /usr/bin/time -l target/release/deps/kvad_gpu-… image::qwen::tests::one_encode --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn one_encode() {
+        let side: usize = std::env::var("KVAD_VAE_SIDE").map(|s| s.parse().unwrap()).unwrap_or(1328);
+        let decode = std::env::var("KVAD_VAE_DECODE").is_ok();
+        let device = Device::new_metal(0).unwrap();
+        let (enc, dec) = wan(&device, DType::BF16);
+        let (enc, dec) = match decode {
+            true => (None, Some(dec)),
+            false => (Some(enc), None),
+        };
+        let x = Tensor::randn(0f32, 0.5, (1, 3, side, side), &device).unwrap().clamp(-1.0, 1.0).unwrap().to_dtype(DType::BF16).unwrap();
+        let z = Tensor::randn(0f32, 1.0, (1, Z, side / 8, side / 8), &device).unwrap().to_dtype(DType::BF16).unwrap();
+        let run = || {
+            let out = match (&enc, &dec) {
+                (Some(enc), _) => enc.encode(&x).unwrap().mean,
+                (_, Some(dec)) => dec.decode(&z).unwrap(),
+                _ => unreachable!(),
+            };
+            device.synchronize().unwrap();
+            out.to_dtype(DType::F32).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap()
+        };
+        run();
+        let started = Instant::now();
+        let largest = run();
+        let what = if decode { "decode" } else { "encode" };
+        eprintln!("qwen BF16 {side}²: one {what} {:.2} s, largest |out| {largest:.2}", started.elapsed().as_secs_f64());
+        assert!(largest.is_finite() && largest > 0.0, "the {what} came back {largest}");
     }
 }

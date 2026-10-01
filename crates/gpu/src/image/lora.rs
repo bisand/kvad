@@ -415,6 +415,24 @@ impl Adapters {
         Ok(n)
     }
 
+    /// Put the factors `a` (`[in, r]`) and `b` (`[r, out]`) on the linear
+    /// layer `name` of `part` as its one LoRA, as they are: the layer then
+    /// answers `W·x + (x·a)·b`. Nothing is copied, scaled or cast, so that
+    /// factors that are variables stay the tensors `backward` reports on:
+    /// what training (#75) sets, where [`Adapters::set`] is for a file's.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn place(&self, part: &str, name: &str, a: &Tensor, b: &Tensor) -> Res<()> {
+        let mut r = self.0.write().expect("the adapters' lock");
+        let i = *r.index.get(&format!("{part}/{name}")).ok_or_else(|| format!("`{name}` is no layer of `{part}`"))?;
+        let Shape::Linear { inp, out } = r.layers[i].shape else { return Err(format!("`{name}` is not a linear layer").into()) };
+        let rank = a.dim(1)?;
+        if a.dims() != [inp, rank] || b.dims() != [rank, out] {
+            return Err(format!("`{name}` is {inp} to {out}, and the factors are {:?} and {:?}", a.dims(), b.dims()).into());
+        }
+        r.layers[i].set = Some(Arc::new(vec![Low { down: Down::Linear(Proj::Dense(a.clone())), b: Proj::Dense(b.clone()), dtype: a.dtype() }]));
+        Ok(())
+    }
+
     /// No LoRA on any layer.
     pub(crate) fn clear(&self) {
         for l in &mut self.0.write().expect("the adapters' lock").layers {

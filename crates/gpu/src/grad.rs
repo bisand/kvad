@@ -101,10 +101,19 @@ impl CustomOp1 for Frozen {
 // for a tensor that is being differentiated and the kernel otherwise, and
 // the crate calls these and never the kernels. (`ops::sdpa` has no twin;
 // its callers each have a written-out attention, and choose it.)
+//
+// The twin also takes f64, which the kernels were not written for: a
+// gradient is checked in it (`directional`), and nothing else runs in it.
+
+/// Whether candle's kernel will not do for `ts`: one is being
+/// differentiated, or is f64.
+fn slow(ts: &[&Tensor]) -> bool {
+    tracked(ts) || ts[0].dtype() == DType::F64
+}
 
 /// `ops::rms_norm`, with a backward where one is wanted.
 pub(crate) fn rms_norm(x: &Tensor, w: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
-    match tracked(&[x, w]) {
+    match slow(&[x, w]) {
         true => ops::rms_norm_slow(x, w, eps),
         false => ops::rms_norm(x, w, eps),
     }
@@ -112,7 +121,7 @@ pub(crate) fn rms_norm(x: &Tensor, w: &Tensor, eps: f32) -> candle_core::Result<
 
 /// `ops::layer_norm`, with a backward where one is wanted.
 pub(crate) fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
-    match tracked(&[x, w, b]) {
+    match slow(&[x, w, b]) {
         true => ops::layer_norm_slow(x, w, b, eps),
         false => ops::layer_norm(x, w, b, eps),
     }
@@ -120,7 +129,7 @@ pub(crate) fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f32) -> candle
 
 /// `ops::softmax_last_dim`, with a backward where one is wanted.
 pub(crate) fn softmax_last_dim(x: &Tensor) -> candle_core::Result<Tensor> {
-    match x.track_op() {
+    match slow(&[x]) {
         true => ops::softmax(x, candle_core::D::Minus1),
         false => ops::softmax_last_dim(x),
     }
@@ -128,7 +137,7 @@ pub(crate) fn softmax_last_dim(x: &Tensor) -> candle_core::Result<Tensor> {
 
 /// `rotary_emb::rope`, with a backward where one is wanted.
 pub(crate) fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
-    match tracked(&[x, cos, sin]) {
+    match slow(&[x, cos, sin]) {
         true => rotary_emb::rope_slow(x, cos, sin),
         false => rotary_emb::rope(x, cos, sin),
     }
@@ -136,25 +145,61 @@ pub(crate) fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Resul
 
 /// `rotary_emb::rope_i`, with a backward where one is wanted.
 pub(crate) fn rope_i(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
-    match tracked(&[x, cos, sin]) {
+    match slow(&[x, cos, sin]) {
         true => rotary_emb::rope_i_slow(x, cos, sin),
         false => rotary_emb::rope_i(x, cos, sin),
     }
 }
 
-/// The slope of `f` at `x` along a random direction, two ways:
-/// `(backward's, measured)`.
+/// The slope of a function along one direction, two ways, and how large a
+/// slope its gradient gives a direction drawn like this one.
+#[derive(Clone, Copy, Debug)]
+pub struct Slopes {
+    /// `⟨∇f, d⟩` with `backward`'s gradient; 0 if it reached none.
+    pub by_backward: f64,
+    /// `(f(x + εd) − f(x − εd)) / 2ε`.
+    pub measured: f64,
+    /// The length of `backward`'s gradient. Along a direction of standard
+    /// normals the slope is normal too, with this as its standard deviation:
+    /// the size a slope here typically is.
+    pub typical: f64,
+}
+
+impl Slopes {
+    /// How far apart the two slopes are, as a share of the typical slope or
+    /// of the measured one, whichever is larger.
+    ///
+    /// Not as a share of the slope alone: along one random direction it can
+    /// fall near zero by chance, and what is left of it is then the
+    /// measurement's rounding. FLUX's first blocks gave slopes of 350 and of
+    /// 0.59 through the same LoRA factor from two draws of the inputs, and
+    /// the second read as 19% wrong.
+    pub fn apart(&self) -> f64 {
+        (self.by_backward - self.measured).abs() / self.typical.max(self.measured.abs()).max(1e-30)
+    }
+}
+
+/// The slope of `f` at `x` along a random direction, two ways.
 ///
 /// `f` takes `x` to one number. The direction `d` is drawn from `seed`,
 /// with one standard normal for each element of `x`. Backward's slope is
 /// `⟨∇f(x), d⟩`; the measured one is `(f(x + εd) − f(x − εd)) / 2ε`. Where
 /// `backward` reaches no gradient for `x` at all, its slope is 0.
 ///
-/// In f32 the two agree to three or four digits for a smooth `f` and an
-/// `ε` near 1e-2 of `x`'s scale; in half precision the measured slope is
-/// mostly rounding, and this is not the tool.
-pub fn directional(f: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>, x: &Tensor, eps: f64, seed: u64) -> candle_core::Result<(f64, f64)> {
-    let number = |t: Tensor| -> candle_core::Result<f64> { Ok(t.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as f64) };
+/// `ε` is a trade. Too large, and the function curves between the two
+/// points; too small, and their difference is lost in the rounding of two
+/// sums of the function's own size. In f64 there is room between the two
+/// for nine digits; in f32, for three or four, with `ε` near 1e-2 of `x`'s
+/// scale; in half precision the measured slope is mostly rounding, and
+/// this is not the tool.
+pub fn directional(f: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>, x: &Tensor, eps: f64, seed: u64) -> candle_core::Result<Slopes> {
+    // In the tensors' own precision where that is f64.
+    let number = |t: Tensor| -> candle_core::Result<f64> {
+        match t.dtype() {
+            DType::F64 => t.sum_all()?.to_scalar::<f64>(),
+            _ => Ok(t.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as f64),
+        }
+    };
     // On the host and seeded, so that a failure can be run again.
     let mut state = seed | 1;
     let mut uniform = || {
@@ -168,21 +213,22 @@ pub fn directional(f: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>, x: &Tenso
 
     let var = Var::from_tensor(x)?;
     let grads = f(var.as_tensor())?.backward()?;
-    let by_backward = match grads.get(var.as_tensor()) {
-        Some(g) => number((g * &d)?)?,
-        None => 0.0,
+    let (by_backward, typical) = match grads.get(var.as_tensor()) {
+        Some(g) => (number((g * &d)?)?, number(g.sqr()?)?.sqrt()),
+        None => (0.0, 0.0),
     };
     let at = |sign: f64| -> candle_core::Result<f64> { number(f(&(x + (&d * (sign * eps))?)?)?) };
-    Ok((by_backward, (at(1.0)? - at(-1.0)?) / (2.0 * eps)))
+    Ok(Slopes { by_backward, measured: (at(1.0)? - at(-1.0)?) / (2.0 * eps), typical })
 }
 
 /// Refuse a function whose gradient `backward` does not find whole: the
-/// two slopes of [`directional`] further apart than `tolerance` of the
-/// larger. The guard to run on a model, in f32, before its first step.
+/// two slopes of [`directional`] further [`Slopes::apart`] than
+/// `tolerance`. The guard to run on a model before its first step, in f32
+/// or better.
 pub fn complete(f: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>, x: &Tensor, eps: f64, tolerance: f64) -> candle_core::Result<()> {
-    let (b, m) = directional(f, x, eps, 0x5eed)?;
-    if (b - m).abs() > tolerance * b.abs().max(m.abs()).max(1e-12) {
-        candle_core::bail!("the gradient is incomplete: backward finds a slope of {b:.6}, and the function's is {m:.6}");
+    let s = directional(f, x, eps, 0x5eed)?;
+    if s.apart() > tolerance {
+        candle_core::bail!("the gradient is incomplete: backward finds a slope of {:.6}, and the function's is {:.6}", s.by_backward, s.measured);
     }
     Ok(())
 }
@@ -219,9 +265,9 @@ mod tests {
         let x = randn(&[6, 5], &Device::Cpu);
         let whole = |x: &Tensor| x.sqr()?.sum_all();
         let cut = |x: &Tensor| (x * x.detach())?.sum_all();
-        let (b, m) = directional(&whole, &x, 1e-2, 1).unwrap();
+        let Slopes { by_backward: b, measured: m, .. } = directional(&whole, &x, 1e-2, 1).unwrap();
         assert!((b - m).abs() < 1e-3 * m.abs(), "whole: {b} against {m}");
-        let (b, m) = directional(&cut, &x, 1e-2, 1).unwrap();
+        let Slopes { by_backward: b, measured: m, .. } = directional(&cut, &x, 1e-2, 1).unwrap();
         assert!((2.0 * b - m).abs() < 1e-3 * m.abs(), "cut: {b} should be half of {m}");
         assert!(complete(&whole, &x, 1e-2, 1e-2).is_ok());
         let e = complete(&cut, &x, 1e-2, 1e-2).unwrap_err().to_string();
@@ -406,13 +452,13 @@ mod tests {
                 let slow = f(Var::from_tensor(&x).unwrap().as_tensor()).unwrap();
                 assert!(off(&slow, &fast) < 1e-4, "{name}: tracked, the numbers differ by {}", off(&slow, &fast));
                 let loss = |x: &Tensor| (f(x)? * &r)?.sum_all();
-                let (by_backward, measured) = directional(&loss, &x, 1e-2, 5).unwrap();
-                assert!((by_backward - measured).abs() < 1e-2 * measured.abs(), "{name} on {:?}: {by_backward} against {measured}", dev.location());
+                let s = directional(&loss, &x, 1e-2, 5).unwrap();
+                assert!(s.apart() < 1e-2, "{name} on {:?}: {s:?}", dev.location());
             }
             // What the wrappers are for: the kernel itself, tracked.
             let bare = |x: &Tensor| (ops::rms_norm(x, &w, 1e-6)? * &r)?.sum_all();
-            let (by_backward, measured) = directional(&bare, &x, 1e-2, 5).unwrap();
-            assert!(by_backward == 0.0 && measured.abs() > 1e-3, "candle's rms_norm now has a backward: {by_backward}, {measured}");
+            let s = directional(&bare, &x, 1e-2, 5).unwrap();
+            assert!(s.by_backward == 0.0 && s.measured.abs() > 1e-3, "candle's rms_norm now has a backward: {s:?}");
         }
     }
 

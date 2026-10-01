@@ -198,10 +198,10 @@ Zero dependencies. Read in this order:
    second one backwards *is* backpropagation.
 3. **[`bin/train_mnist.rs`](crates/nervus/src/bin/train_mnist.rs)** — the
    training loop: predict, score, blame, adjust.
-4. **[`attention.rs`](crates/nervus/src/attention.rs)** — causal
-   self-attention, forward and backward. Read it after the rest: it is three
-   `Linear` layers and two of the products from step 1, and the only new
-   derivative in it is the softmax's.
+4. **[`attention.rs`](crates/nervus/src/attention.rs)** — self-attention,
+   forward and backward, with the causal mask or without it. Read it after
+   the rest: it is three `Linear` layers and two of the products from step 1,
+   and the only new derivative in it is the softmax's.
 5. **[`norm.rs`](crates/nervus/src/norm.rs)** — LayerNorm and RMSNorm. The
    forward pass is two lines; the file is about the backward pass, and the
    argument that gets you there without the algebra: a normalised row cannot
@@ -249,6 +249,13 @@ Zero dependencies. Read in this order:
     OpenAI's. ([`json.rs`](crates/nervus/src/json.rs) is there because the
     files are JSON and the crate has no dependencies. It teaches nothing about
     networks; skip it.)
+12. **[`dit.rs`](crates/nervus/src/dit.rs)** and
+    **[`flow.rs`](crates/nervus/src/flow.rs)** — the same transformer, taught
+    to draw. Patches instead of tokens, no mask, and a timestep and a label
+    steering every norm; then flow matching, the objective FLUX and
+    Qwen-Image were trained with, which turns out to be a straight line
+    between an image and noise. See [Drawing instead of
+    writing](#drawing-instead-of-writing) below.
 
 ### The test worth running first
 
@@ -972,6 +979,124 @@ checkpoint before, so nothing had ever hit it. The identity is now the size and
 the modification time — `make`'s answer, with `make`'s flaw, that a copy which
 preserves timestamps can defeat it. Hashing would close that, and would cost
 more on a hand-placed 8 GB checkpoint than the cache saves.
+
+### Drawing instead of writing
+
+```bash
+cargo run --release -p nervus --bin train_digits
+```
+
+That trains a model that draws handwritten digits from noise, from random
+weights, in about six minutes on this machine's CPU. It is the same kind of
+model as FLUX and Qwen-Image, trained with the same objective, and about ten
+thousand times smaller than FLUX (1.28 million parameters against 12 billion):
+
+![100 digits drawn from noise, a row for each of 0 to 9](docs/digits/samples.png)
+
+*The default run (seed 1337) after 4,000 steps: each row asked for one digit,
+each column started from one fixed image of noise.*
+
+There is less new code in it than the result suggests, because the models
+people use to make pictures are transformers. [`dit.rs`](crates/nervus/src/dit.rs)
+is the GPT above with four changes. A 28×28 digit is cut into 49 patches of
+4×4, and one `Linear` turns each into a vector, where the GPT looked a token
+up. Attention loses its mask, since no patch comes "after" another. The
+output is 16 numbers per patch, put back where the patch came from. And the
+model is told two things besides the picture — how noisy it is, and which
+digit to draw — through the one idea that is new: each norm's scale and
+shift, fixed numbers in the GPT, are computed from those two things instead,
+along with a gate on each branch that starts at zero, so that every block
+begins as the identity (adaLN-Zero, from the DiT paper).
+
+The loss, in [`flow.rs`](crates/nervus/src/flow.rs), is flow matching, and
+it is simpler than anything in the GPT. Draw a straight line from a real
+digit to an image of pure noise, pick a point on it, and ask the model which
+way the line runs there. That is all training is. Drawing is the same line
+walked backwards: start from fresh noise and take 20 small steps against the
+direction the model says, and the steps end at a digit. The samplers in
+`crates/gpu` that run FLUX and LTX are this loop with better steps. The label
+is thrown away one time in ten during training, so the same model also learns
+to draw *some* digit, and at drawing time the difference between the two
+answers is exaggerated (`--guidance`, 2 by default). That is the
+`guidance_scale` of every text-to-image model.
+
+**The loss says little, so a classifier judges.** The training loss depends
+mostly on how noisy each example happened to be, so validation is measured at
+eight fixed noise levels on fixed noise, the same questions every time. Even
+that says nothing about whether the digits are any good. So the run first
+trains `train_mnist`'s network (97.2% on the test set) and, at every
+checkpoint, hands it the 100 drawings above and counts how many it reads as
+the digit asked for. It is a crude judge: a model that drew one perfect 7 a
+hundred times would score full marks on sevens. But it is a number, and
+"looks right" is not.
+
+Three seeds, the default everything else:
+
+| step | 500 | 1000 | 1500 | 2000 | 2500 | 3000 | 3500 | 4000 | validation at 4000 |
+|---|---|---|---|---|---|---|---|---|---|
+| seed 1337 | 18% | 30% | 67% | 75% | 89% | 95% | 94% | 96% | 0.189 |
+| seed 2 | 16% | 37% | 73% | 88% | 95% | 99% | 98% | 100% | 0.180 |
+| seed 3 | 16% | 27% | 65% | 83% | 88% | 95% | 96% | 94% | 0.188 |
+
+The same noise, drawn at steps 500, 1000, 2000 and 4000 of the first of them,
+shows what the numbers are counting:
+
+![The first column of the grid at four checkpoints](docs/digits/progress.png)
+
+At step 500 every row is the same smudge, whatever digit it asked for: the
+model has learned that a digit is a blob of ink in the middle before it has
+learned to listen to the label. The labels start to matter between steps 1000
+and 2000, which is where the classifier's score jumps from 30% to 75%.
+
+And the three models side by side, each drawing from the same 100 images of
+noise:
+
+![Three grids, one per seed, nearly the same digit in each cell](docs/digits/three-seeds.png)
+
+Look at any one cell across the three: the slanted 0 in the first row, the
+looped 8. Three models trained from different random weights mostly agree on
+what a given image of noise becomes. The shape of a digit is decided by the
+noise it starts from; what the model contributes is the field that carries
+the noise there, and each of them learned nearly the same one.
+
+**Threads.** The same data parallelism as the GPT, and it pays more here. Five
+interleaved runs of 150 steps each, batch 64, on an M5 Pro with 6 fast and 12
+slow cores:
+
+| threads | images a second, 5 runs | median | |
+|---|---|---|---|
+| 1 | 119–120 | 120 | 1.0x |
+| 6 | 512–537 | 532 | 4.4x |
+| 12 | 802–829 | 826 | 6.9x |
+| 18 | 966–999 | 981 | 8.2x |
+
+8.2x on 18 threads where the GPT gets 5.2x on 16. Within a sitting the runs
+agree to 3%. Between sittings they do not: the three full runs above trained
+at 762, 763 and 812 images a second, and two short runs straight afterwards
+at 909 and 1,119, with macOS recording no thermal limit throughout. So the
+table's ratios are worth more than its absolute numbers. (An earlier note
+here said only 450% of the CPU was busy. That came from `time` around a whole
+run, which counts the classifier's single-threaded training and the
+checkpoints' drawing; the training steps alone, timed apart, scale as above.)
+
+**Drawing it with `kvad`.** The model is saved as a diffusers pipeline whose
+transformer is a `DiTTransformer2DModel` — the layout of Facebook's DiT — with
+a flow-matching scheduler and no VAE, because it draws pixels rather than
+latents. `kvad` runs it on the CPU by name, like any other image model:
+
+```bash
+cp -R out/digits/model ~/.local/share/kvad/models/digits
+kvad images make 7 --model digits      # 0 to 9, or "any"
+```
+
+That it is really DiT's layout was checked against diffusers itself:
+[`scripts/dit-fixtures.py`](scripts/dit-fixtures.py) runs diffusers' own
+`DiTTransformer2DModel` on the saved model, and the two agree to 4e-6 on
+outputs of about 6. Reading diffusers' source first turned up one
+difference that no round trip through our own save and load could have:
+diffusers computes DiT's timestep frequencies by dividing by `half − 1`, where
+Facebook's code divides by `half`, a 7% difference in the slowest wave. Put
+Facebook's formula back and the check fails by 0.12.
 
 ---
 

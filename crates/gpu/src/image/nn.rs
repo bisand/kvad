@@ -252,6 +252,7 @@ pub(crate) fn back_through_conv(w: &Tensor, pad: usize, stride: usize, x: &Tenso
     let k = w.dim(2)?;
     let g = grad.to_dtype(w.dtype())?;
     let back = match stride {
+        1 if folds(w, &g) => back_folded(w, pad, &g)?,
         1 => g.conv2d(&w.flip(&[2, 3])?.transpose(0, 1)?.contiguous()?, k - 1 - pad, 1, 1, 1)?,
         _ => {
             // What the stride's rounding left off the far edge, which need
@@ -267,6 +268,55 @@ pub(crate) fn back_through_conv(w: &Tensor, pad: usize, stride: usize, x: &Tenso
         }
     };
     back.to_dtype(x.dtype())
+}
+
+/// Whether [`back_folded`] is the way back through this kernel: where it
+/// has more than a twentieth as many output channels as the grid has
+/// cells. Measured on SDXL's shapes in f16, the two are level at a
+/// twelfth (320 channels on 64×64, 9 ms each); at 5 channels a cell the
+/// fold is 2.5 ms where turning the kernel is 42, and at a fiftieth (320
+/// on 128×128) it is 40 where turning is 32, for its shares are nine times
+/// the grid.
+fn folds(w: &Tensor, g: &Tensor) -> bool {
+    let (Ok(out), Ok(cells)) = (w.dim(0), g.dims4().map(|(_, _, h, w)| h * w)) else { return false };
+    20 * out > cells
+}
+
+/// [`back_through_conv`] at stride 1 with the kernel read as it is stored.
+///
+/// The other way turns the kernel round first, and that is a copy of it:
+/// 29 MB for a 1280-channel 3×3, 38 ms where the convolution itself is 3.5
+/// on a 16×16 grid, at every step. This one takes the answer's gradient
+/// through the kernel as a matrix, `[out, in·k·k]`, the layout it has, which
+/// gives every input cell's share of each of the `k·k` taps it was read by,
+/// and then adds each tap's shares into the cell they came from: the
+/// gathering a convolution starts with, run backwards.
+pub(crate) fn back_folded(w: &Tensor, pad: usize, g: &Tensor) -> candle_core::Result<Tensor> {
+    let (o, c, k, _) = w.dims4()?;
+    let (b, _, gh, gw) = g.dims4()?;
+    let rows = g.permute((0, 2, 3, 1))?.contiguous()?.reshape((b * gh * gw, o))?;
+    let kernel = w.reshape((o, c * k * k))?;
+    #[cfg(target_os = "macos")]
+    let shares = match crate::mpp::dense(&rows, &kernel)? {
+        Some(y) => y,
+        None => rows.matmul(&kernel)?,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let shares = rows.matmul(&kernel)?;
+    let shares = shares.reshape((b, gh, gw, c, k * k))?;
+    // The input as it was padded, channels last: tap (ky, kx) of the
+    // answer's cell (y, x) read cell (y + ky, x + kx).
+    let mut sum: Option<Tensor> = None;
+    for tap in 0..k * k {
+        let (ky, kx) = (tap / k, tap % k);
+        let placed = shares.narrow(4, tap, 1)?.reshape((b, gh, gw, c))?.pad_with_zeros(1, ky, k - 1 - ky)?.pad_with_zeros(2, kx, k - 1 - kx)?;
+        sum = Some(match sum {
+            Some(s) => (s + placed)?,
+            None => placed,
+        });
+    }
+    let (h, wd) = (gh + k - 1 - 2 * pad, gw + k - 1 - 2 * pad);
+    sum.expect("a kernel has a tap").narrow(1, pad, h)?.narrow(2, pad, wd)?.permute((0, 3, 1, 2))?.contiguous()
 }
 
 /// Group norm: split the channels into `groups` groups and normalise each

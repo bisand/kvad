@@ -47,6 +47,9 @@
 //! | 512², norms attached, one AdamW, see below | 2.8 s | 7.1 GB | 0.35 s |
 //! | 768² | 5.6 s | 8.7 GB | 0.78 s |
 //! | 1024² | 10.3 s | 10.5 GB | 1.39 s |
+//! | 512², see "what took it from 10.3 s" | 2.1 s | 7.0 GB | 0.36 s |
+//! | 768² | 4.6 s | 8.2 GB | 0.80 s |
+//! | 1024² | 8.4 s | 10.3 GB | 1.43 s |
 //!
 //! Recorded whole, 512² took the machine down. 5.1 GB of every figure is
 //! the weights.
@@ -62,23 +65,48 @@
 //!   `crate::grad::attended`, 1024² was 23.4 GB and 20.7 s, 17 GB of it
 //!   one block; it now makes the scores again on the way back, a batch of
 //!   rows at a time.
-//! - **A step is seven or eight forward passes.** At 1024², of 10.3 s:
-//!   the unrecorded pass 1.7 s; each stretch run again, recorded, 1.8 s;
-//!   and `backward` the rest. In `backward`, attention's own is about
-//!   2.2 s (five products the size of the scores, in f32 on candle's
-//!   kernel; in f16 it was slower), the LoRA's side paths 0.6, the frozen
-//!   linear layers 0.4, and some 3.4 s is not arithmetic: for every
-//!   operation in the record candle makes a zeroed gradient and adds into
-//!   it, at a price whatever the tensor's size.
-//! - **What took it from 12.4 s**: attention's backward no longer copies
-//!   its scores to transpose them (1.2 s); the norms have a backward of
-//!   their own, one operation in the record where there were ten
+//! - **A step is six forward passes.** At 1024², of 10.1 s as it stood
+//!   before the last row: the unrecorded pass 1.8 s; each stretch run
+//!   again, recorded, 2.3; and `backward` 6.0. Found by leaving each out
+//!   in turn and timing the step, not by timing each in place: a clock on
+//!   one piece has to wait for the GPU before and after, a wait lets every
+//!   dropped buffer go, and the piece then pays for fresh ones, which is
+//!   most of what it measures (below). Of `backward`'s 6.0, attention's
+//!   own was 1.9, the frozen linear layers' 0.4, the norms' 0.2, the
+//!   convolutions' and the rest of the hand-written ones' 2.2, and candle's
+//!   own operations and bookkeeping 1.3.
+//! - **What took it from 12.4 s to 10.3**: attention's backward no longer
+//!   copies its scores to transpose them (1.2 s); the norms have a backward
+//!   of their own, one operation in the record where there were ten
 //!   (`crate::grad::norm_back`, 0.2 s); and the optimiser is one AdamW
 //!   over the factors end to end (`crate::adam`), 0.06 s where candle's
 //!   took 0.34 at any size.
+//! - **What took it from 10.3 s to 8.4**, and 512² from 2.8 to 2.1:
+//!   - *Attention's backward writes four tensors the size of the scores
+//!     where it wrote eight* (`crate::grad::attention_back`): 104 ms to 48
+//!     for a block at 4096 tokens, 14 to 6 at 1024. Writing 671 MB is what
+//!     costs there, not the products that read it.
+//!   - *The device is asked to let go only where the state changes shape*,
+//!     not after every stretch. A buffer candle has let go is made afresh
+//!     when next wanted, and a fresh buffer is slow to write the first
+//!     time: one product into a new 671 MB takes 107 ms, and four into
+//!     the same one 122 between them. A transformer's ten blocks want the
+//!     same buffers one after another. What is kept across them moves out
+//!     of the buffers it was born in all the same (`crate::grad::rehomed`),
+//!     or sixteen small gradients a block hold sixteen large buffers:
+//!     1.7 GB at 1024² when that was left out.
+//!   - *A wide convolution's backward reads its kernel as it is stored*
+//!     (`super::nn::back_folded`). Turning a 1280-channel kernel round was
+//!     a 29 MB copy, 38 ms where the convolution is 3.5, every step.
+//! - **What it is not.** An earlier note here put 3.4 s on candle's making
+//!   a zeroed gradient for every operation in the record. Measured, an
+//!   operation that size is 4 µs and with its zeroed gradient 10 to 18:
+//!   half a second for every operation in a step at the most.
 //!
 //! So what #75 can promise from this, on this machine: SDXL's own 1024² in
-//! 11 GB at 10 s a step, or 512² in 7 GB at under 3.
+//! 10.3 GB at 8.4 s a step, or 512² in 7 GB at 2.1. (The last three rows
+//! are the least of twelve steps, on a machine that was in use; the same
+//! runs gave 2.9, 5.8 and 10.5 s for the rows above them.)
 
 use super::lora::Adapters;
 use super::nn::{noise, Ctx};
@@ -221,12 +249,22 @@ impl Rig {
                 let stretches = self.unet.stretches(&temb, &self.ctx);
                 // After each stretch, each way: what it took and reached.
                 let (clock, at) = (Instant::now(), std::cell::Cell::new(0.0));
-                let settled = || {
-                    settle(&self.device)?;
+                // The device is asked to let go where the state changes
+                // shape, and not between stretches that leave it as it
+                // was: a transformer's blocks, whose buffers the next of
+                // them takes up as they are (see the module's notes).
+                let last = std::cell::RefCell::new(Vec::<Vec<usize>>::new());
+                let settled = |state: &[Tensor]| {
+                    let shapes: Vec<Vec<usize>> = state.iter().map(|t| t.dims().to_vec()).collect();
+                    let waits = *last.borrow() != shapes;
+                    *last.borrow_mut() = shapes;
+                    if waits {
+                        settle(&self.device)?;
+                    }
                     let now = clock.elapsed().as_secs_f64();
                     self.trace.borrow_mut().push((now - at.get(), crate::cap::peak(), crate::cap::footprint()));
                     at.set(now);
-                    Ok(())
+                    Ok(waits)
                 };
                 self.trace.borrow_mut().clear();
                 crate::cap::peak();

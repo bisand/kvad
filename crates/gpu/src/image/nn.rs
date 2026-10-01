@@ -196,6 +196,14 @@ impl Conv2d {
         Ok(Conv2d { b: b.reshape((1, cout, 1, 1))?, w, stride, pad: k / 2, slot: None })
     }
 
+    /// With no padding of its own, for a caller that pads first: the VAE
+    /// encoder's downsampler pads on one side only, which a symmetric pad
+    /// cannot say.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn unpadded(self) -> Self {
+        Conv2d { pad: 0, ..self }
+    }
+
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let y = x.conv2d(&self.w, self.pad, self.stride, 1, 1)?.broadcast_add(&self.b)?;
         match &self.slot {

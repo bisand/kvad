@@ -217,7 +217,7 @@ impl Block {
         // the other half through a GELU.
         let h = self.ff_in.forward(&self.norm3.forward(&x)?)?;
         let half = h.dim(D::Minus1)? / 2;
-        let h = (h.narrow(D::Minus1, 0, half)? * h.narrow(D::Minus1, half, half)?.gelu_erf()?)?;
+        let h = (h.narrow(D::Minus1, 0, half)? * crate::grad::gelu_erf(&h.narrow(D::Minus1, half, half)?)?)?;
         x + self.ff_out.forward(&h)?
     }
 }

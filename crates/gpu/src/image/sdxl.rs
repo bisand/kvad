@@ -350,3 +350,93 @@ impl Painter for Sdxl {
         crate::common::label(&self.device, self.dtype, None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Var;
+
+    /// SDXL's two text encoders, whole and with their real weights, as
+    /// functions of the embeddings they are given and of a LoRA on two
+    /// layers of each: the gradient `backward` finds is the function's own.
+    /// The embeddings are where a learned token goes in (textual
+    /// inversion), and the LoRA is what `lora_te1_`/`lora_te2_` train.
+    ///
+    /// ViT-L is read at its penultimate layer, and bigG there and at its
+    /// pooled, projected end-of-text row; the loss weighs every number of
+    /// both, so each layer, the final norm and the projection are on the
+    /// way. Certified in f64 on the CPU and held to that after, as
+    /// `flux::tests::a_real_block_has_a_whole_gradient` is, which has the
+    /// reasoning.
+    ///
+    ///     cargo test --release -p kvad-gpu sdxl::tests::the_text_encoders -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn the_text_encoders_have_whole_gradients() {
+        crate::cap::at(24.0);
+        let w = Watcher::none();
+        let config = |dir: &str| read_json(&fetch_file(REPO, &format!("{dir}/config.json"), &w).unwrap()).unwrap();
+        let mut runs = vec![(Device::Cpu, DType::F64, 1e-4, 0.0, "the CPU, f64"), (Device::Cpu, DType::F32, 1e-2, 1e-3, "the CPU, f32")];
+        if let Ok(metal) = Device::new_metal(0) {
+            runs.push((metal.clone(), DType::F32, 1e-2, 1e-3, "Metal, f32"));
+            // As the pipeline runs them.
+            runs.push((metal, DType::F16, 1e-2, 2e-2, "Metal, f16"));
+        }
+        // The start marker, eight tokens of a prompt, the end marker.
+        let mut ids: Vec<u32> = vec![clip::START, 320, 1125, 2368, 4919, 530, 3293, 2583, 1215, clip::END];
+        let end = ids.len() - 1;
+        for (dir, part, pooled, pad, layers) in [
+            ("text_encoder", "te1", Pooled::No, clip::END, ["text_model.encoder.layers.0.self_attn.q_proj", "text_model.encoder.layers.5.mlp.fc1"]),
+            ("text_encoder_2", "te2", Pooled::Projected, 0, ["text_model.encoder.layers.0.self_attn.v_proj", "text_model.encoder.layers.31.mlp.fc2"]),
+        ] {
+            ids.truncate(end + 1);
+            ids.resize(clip::CONTEXT, pad);
+            let cfg = ClipConfig::from_json(&config(dir)).unwrap();
+            let paths = vec![weights(REPO, dir, "model", &w).unwrap()];
+            let mut exact = crate::grad::real::Exact::default();
+            for (dev, dtype, step, tolerance, what) in &runs {
+                let (dtype, what) = (*dtype, format!("{dir}, {what}"));
+                let mut run = exact.run(&what, *tolerance);
+                let vault = Vault::off();
+                let cx = Ctx { ld: Loader::new(None, dev.clone(), &vault), dtype };
+                let adapters = Adapters::new(&PREFIXES);
+                let r = open(&paths, dtype).unwrap().with_adapters(adapters.part(part));
+                let model = Clip::load(&cx, &r, cfg, pooled).unwrap();
+
+                let seed = std::cell::Cell::new(74u64);
+                let randn = |shape: &[usize], std: f32| {
+                    seed.set(seed.get() + 1);
+                    (noise(seed.get(), shape, dev, DType::F32).unwrap() * std as f64).unwrap().to_dtype(dtype).unwrap()
+                };
+                let x = model.embed(&ids).unwrap();
+                let scale = x.to_dtype(DType::F32).unwrap().sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap().sqrt() as f64;
+                let (weigh, weigh_pooled) = (randn(&[1, clip::CONTEXT, cfg.width], 1.0), randn(&[1, cfg.width], 1.0));
+                let loss = |x: &Tensor| -> candle_core::Result<Tensor> {
+                    let (hidden, pooled) = model.read(x, end).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                    let l = (hidden * &weigh)?.sum_all()?;
+                    match pooled {
+                        Some(p) => l + (p * &weigh_pooled)?.sum_all()?,
+                        None => Ok(l),
+                    }
+                };
+
+                // Rank 4, neither factor zero, so that both get a gradient.
+                const SCALE: f32 = 0.05;
+                let factors: Vec<(Var, Var)> = layers
+                    .iter()
+                    .map(|name| {
+                        let (inp, out) = if name.ends_with("fc1") { (cfg.width, cfg.inter) } else if name.ends_with("fc2") { (cfg.inter, cfg.width) } else { (cfg.width, cfg.width) };
+                        let (a, b) = (Var::from_tensor(&randn(&[inp, 4], SCALE)).unwrap(), Var::from_tensor(&randn(&[4, out], SCALE)).unwrap());
+                        adapters.place(part, name, a.as_tensor(), b.as_tensor()).unwrap();
+                        (a, b)
+                    })
+                    .collect();
+
+                run.take("the embeddings", crate::grad::directional(&loss, &x, step * scale, 11).unwrap());
+                for (name, (a, b)) in layers.iter().zip(&factors) {
+                    run.factors(&adapters, part, name, (a, b), &|| loss(&x), step * SCALE as f64);
+                }
+            }
+        }
+    }
+}

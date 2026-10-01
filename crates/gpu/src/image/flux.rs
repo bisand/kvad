@@ -861,6 +861,83 @@ mod tests {
         }
     }
 
+    /// T5's first two layers and its final norm, with their real weights,
+    /// as a function of the embeddings they are given and of a LoRA on two
+    /// of their layers: the gradient `backward` finds is the function's
+    /// own. Two layers and not twenty-four, for the whole of it in f64 is
+    /// 38 GB; every layer is the same code, and the position bias, which
+    /// the first layer alone owns, is in.
+    ///
+    /// Certified in f64 on the CPU and held to that after, as
+    /// [`a_real_block_has_a_whole_gradient`] is. The q8 weights are read
+    /// by candle's quantised product, which has a backward
+    /// (`crate::grad::Frozen`); the M5's matrix units, which the pipeline
+    /// loads them for, refuse a tensor that is being differentiated.
+    ///
+    ///     cargo test --release -p kvad-gpu flux::tests::t5_has -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn t5_has_a_whole_gradient() {
+        crate::cap::at(24.0);
+        use candle_core::Var;
+        let (mut config, paths) = component("black-forest-labs/FLUX.1-schnell", "text_encoder_2", "model", &Watcher::none()).unwrap();
+        config["num_layers"] = json!(2);
+        let (width, ff, inner) = (4096, 10240, 4096);
+        let mut runs = vec![(Device::Cpu, None, DType::F64, 1e-5, 0.0, "the CPU, f64"), (Device::Cpu, None, DType::F32, 1e-2, 1e-3, "the CPU, f32")];
+        if let Ok(metal) = Device::new_metal(0) {
+            runs.push((metal.clone(), None, DType::F32, 1e-2, 1e-3, "Metal, f32"));
+            runs.push((metal.clone(), Some(GgmlDType::Q8_0), DType::F32, 1e-2, 1e-1, "Metal, q8 weights"));
+            runs.push((metal, None, DType::BF16, 1e-2, 0.2, "Metal, bf16"));
+        }
+        // "a red fox sitting in fresh snow", and the end marker.
+        let ids: [u32; 12] = [3, 9, 1131, 3, 20400, 3823, 16, 1434, 4170, 3, 2, 1];
+        let layers = [("encoder.block.0.layer.0.SelfAttention.q", width, inner), ("encoder.block.1.layer.1.DenseReluDense.wi_1", width, ff)];
+        let mut exact = crate::grad::real::Exact::default();
+        // The embeddings the f64 run read, for every run after it: a
+        // quantised table's rows are other numbers, and the check is of
+        // the layers.
+        let mut read: Option<Tensor> = None;
+        for (dev, quant, dtype, step, tolerance, what) in runs {
+            let mut run = exact.run(what, tolerance);
+            let vault = Vault::off();
+            let cx = Ctx { ld: Loader::new(quant, dev.clone(), &vault), dtype };
+            let adapters = Adapters::new(&PREFIXES);
+            let r = open(&paths, dtype).unwrap().with_adapters(adapters.part("te2"));
+            let t5 = T5::load(&cx, &r, &config).unwrap();
+
+            let seed = std::cell::Cell::new(74u64);
+            let randn = |shape: &[usize], std: f32| {
+                seed.set(seed.get() + 1);
+                (noise(seed.get(), shape, &dev, DType::F32).unwrap() * std as f64).unwrap().to_dtype(dtype).unwrap()
+            };
+            let x = match &read {
+                Some(x) => x.to_dtype(dtype).unwrap().to_device(&dev).unwrap(),
+                None => t5.embed(&ids, &dev, dtype).unwrap(),
+            };
+            read.get_or_insert_with(|| x.clone());
+            let scale = x.to_dtype(DType::F32).unwrap().sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap().sqrt() as f64;
+            let weigh = randn(&[1, ids.len(), width], 1.0);
+            let loss = |x: &Tensor| -> candle_core::Result<Tensor> {
+                let h = t5.read(x).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                (h * &weigh)?.sum_all()
+            };
+
+            const SCALE: f32 = 0.05;
+            let factors: Vec<(Var, Var)> = layers
+                .iter()
+                .map(|&(name, inp, out)| {
+                    let (a, b) = (Var::from_tensor(&randn(&[inp, 4], SCALE)).unwrap(), Var::from_tensor(&randn(&[4, out], SCALE)).unwrap());
+                    adapters.place("te2", name, a.as_tensor(), b.as_tensor()).unwrap();
+                    (a, b)
+                })
+                .collect();
+            run.take("the embeddings", crate::grad::directional(&loss, &x, step * scale, 11).unwrap());
+            for (&(name, ..), (a, b)) in layers.iter().zip(&factors) {
+                run.factors(&adapters, "te2", name, (a, b), &|| loss(&x), step * SCALE as f64);
+            }
+        }
+    }
+
     /// The positions diffusers' `_prepare_latent_image_ids` gives, and text at
     /// the origin: rows and columns from the top left, not centred.
     #[test]

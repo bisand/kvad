@@ -24,7 +24,7 @@
 
 use super::ltx_nn::{gelu, rms, RmsNorm, Rope};
 use crate::common::{Loader, Reader};
-use crate::image::nn::{Ctx, Linear};
+use crate::image::nn::{wide, Ctx, Linear};
 use crate::image::{finish, open};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
@@ -198,9 +198,22 @@ impl Gemma {
     /// only the real tokens at the positions they would have had gives the
     /// same numbers, because attention is causal and the padding masked out.
     pub fn hidden_states(&self, ids: &[u32], first: usize) -> candle_core::Result<Vec<Tensor>> {
-        let n = ids.len();
-        let idx = Tensor::from_vec(ids.to_vec(), n, &Device::Cpu)?;
-        let mut x = (self.embed.index_select(&idx, 0)?.to_device(&self.device)?.to_dtype(self.dtype)? * self.scale)?;
+        self.read(&self.embed(ids)?, first)
+    }
+
+    /// The tokens as the first layer takes them, `[n, width]`: each one's
+    /// row of the table, times `√width`.
+    pub(crate) fn embed(&self, ids: &[u32]) -> candle_core::Result<Tensor> {
+        let idx = Tensor::from_vec(ids.to_vec(), ids.len(), &Device::Cpu)?;
+        self.embed.index_select(&idx, 0)?.to_dtype(self.dtype)?.to_device(&self.device)? * self.scale
+    }
+
+    /// [`Gemma::hidden_states`], from the embeddings [`Gemma::embed`]
+    /// gives: what the tower is as a function of them, which is what a
+    /// gradient is taken through.
+    pub(crate) fn read(&self, x: &Tensor, first: usize) -> candle_core::Result<Vec<Tensor>> {
+        let mut x = x.clone();
+        let n = x.dim(0)?;
 
         let positions: Vec<f32> = (0..n).map(|i| (first + i) as f32).collect();
         let rope = |freq: &[f32]| Rope::standard(&positions, freq, &self.device, self.dtype).map_err(|e| candle_core::Error::Msg(e.to_string()));
@@ -208,7 +221,7 @@ impl Gemma {
         // Causal: row i sees columns 0..=i. The sliding window is 1024 and a
         // prompt never longer, so the sliding layers are causal too.
         let mask: Vec<f32> = (0..n * n).map(|k| if k % n > k / n { f32::NEG_INFINITY } else { 0.0 }).collect();
-        let mask = Tensor::from_vec(mask, (n, n), &self.device)?;
+        let mask = Tensor::from_vec(mask, (n, n), &self.device)?.to_dtype(wide(self.dtype))?;
 
         let mut states = Vec::with_capacity(self.layers.len() + 1);
         for layer in &self.layers {
@@ -248,7 +261,8 @@ impl Gemma {
         };
         let (k, v) = (share(k)?, share(v)?);
         // Scale 1: the per-head norms' weights set the temperature.
-        let scores = q.to_dtype(DType::F32)?.matmul(&k.to_dtype(DType::F32)?.t()?.contiguous()?)?.broadcast_add(mask)?;
+        let sums = wide(self.dtype);
+        let scores = q.to_dtype(sums)?.matmul(&k.to_dtype(sums)?.t()?.contiguous()?)?.broadcast_add(mask)?;
         let att = crate::grad::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
         let o = att.matmul(&v)?.transpose(0, 1)?.contiguous()?.reshape((n, h * d))?;
         let x = (x + l.post_attn_ln.forward(&self.lin(&l.o, &o)?)?)?;
@@ -256,5 +270,100 @@ impl Gemma {
         let f = l.pre_ff_ln.forward(&x)?;
         let f = self.lin(&l.down, &(gelu(&self.lin(&l.gate, &f)?)? * self.lin(&l.up, &f)?)?)?;
         (x + l.post_ff_ln.forward(&f)?)? * l.scalar
+    }
+}
+
+/// The rows every prompt is padded to ([`super::ltx_text::LENGTH`]).
+#[cfg(test)]
+const LENGTH: usize = super::ltx_text::LENGTH;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::lora::Adapters;
+    use crate::image::nn::noise;
+    use candle_core::Var;
+
+    /// Gemma's first six layers with their real weights, five sliding and
+    /// one global, as a function of the embeddings they are given and of a
+    /// LoRA on a layer of each kind: the gradient `backward` finds is the
+    /// function's own. The loss weighs all seven hidden states, for LTX
+    /// reads every one. The global layer's values are its keys, so the
+    /// LoRA on its `k_proj` is reached both ways.
+    ///
+    /// Certified in f64 on the CPU and held to that after, as
+    /// `flux::tests::a_real_block_has_a_whole_gradient` is, which has the
+    /// reasoning. The q8 weights are read by candle's quantised product,
+    /// which has a backward; the matrix units the pipeline loads them for
+    /// refuse (`ltx_dit::tests::a_real_block_has_a_whole_gradient`).
+    ///
+    ///     cargo test --release -p kvad-gpu gemma::tests::the_tower -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn the_tower_has_a_whole_gradient() {
+        crate::cap::at(24.0);
+        // Of this machine or not at all: the file is 26 GB.
+        let path = crate::image::local_file(super::super::LTX_REPO, super::super::ltx_text::TEXT_FILE).expect("LTX's text encoder is not on this machine");
+        let config = super::super::metadata(&path, "gemma_config").unwrap();
+        let c = &config["text_config"];
+        let num = |k: &str| c[k].as_u64().unwrap() as usize;
+        let width = num("hidden_size");
+        let layers = [
+            ("model.layers.0.self_attn.q_proj", width, num("num_attention_heads") * num("head_dim")),
+            ("model.layers.5.self_attn.k_proj", width, num("num_global_key_value_heads") * num("global_head_dim")),
+            ("model.layers.5.mlp.gate_proj", width, num("intermediate_size")),
+        ];
+        let mut runs = vec![(Device::Cpu, None, DType::F64, 1e-5, 0.0, "the CPU, f64"), (Device::Cpu, None, DType::F32, 1e-2, 1e-3, "the CPU, f32")];
+        if let Ok(metal) = Device::new_metal(0) {
+            runs.push((metal.clone(), None, DType::F32, 1e-2, 1e-3, "Metal, f32"));
+            runs.push((metal.clone(), Some(GgmlDType::Q8_0), DType::F32, 1e-2, 1e-1, "Metal, q8 weights"));
+            runs.push((metal, None, DType::BF16, 1e-2, 0.1, "Metal, bf16"));
+        }
+        // Twelve tokens of ordinary text, where a prompt of twelve would be.
+        let ids: [u32; 12] = [2, 818, 2604, 37423, 10396, 528, 5839, 9539, 2148, 531, 496, 15360];
+        let paths = [path.clone()];
+        let mut exact = crate::grad::real::Exact::default();
+        for (dev, quant, dtype, step, tolerance, what) in runs {
+            let mut run = exact.run(what, tolerance);
+            let vault = Vault::off();
+            let cx = Ctx { ld: Loader::new(quant, dev.clone(), &vault), dtype };
+            let adapters = Adapters::new(&[("", "gemma")]);
+            let r = open(&paths, DType::BF16).unwrap().with_adapters(adapters.part("gemma"));
+            let g = Gemma::load(&cx, &r, &config, Some(6)).unwrap();
+
+            let seed = std::cell::Cell::new(74u64);
+            let randn = |shape: &[usize], std: f32| {
+                seed.set(seed.get() + 1);
+                (noise(seed.get(), shape, &dev, DType::F32).unwrap() * std as f64).unwrap().to_dtype(dtype).unwrap()
+            };
+            let x = g.embed(&ids).unwrap();
+            let scale = x.to_dtype(DType::F32).unwrap().sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap().sqrt() as f64;
+            let weigh: Vec<Tensor> = (0..7).map(|_| randn(&[ids.len(), width], 1.0)).collect();
+            let loss = |x: &Tensor| -> candle_core::Result<Tensor> {
+                let states = g.read(x, LENGTH - ids.len())?;
+                let mut l = (&states[0] * &weigh[0])?.sum_all()?;
+                for (s, w) in states.iter().zip(&weigh).skip(1) {
+                    l = (l + (s * w)?.sum_all()?)?;
+                }
+                Ok(l)
+            };
+
+            const SCALE: f32 = 0.05;
+            let factors: Vec<(Var, Var)> = layers
+                .iter()
+                .map(|&(name, inp, out)| {
+                    let (a, b) = (Var::from_tensor(&randn(&[inp, 4], SCALE)).unwrap(), Var::from_tensor(&randn(&[4, out], SCALE)).unwrap());
+                    adapters.place("gemma", name, a.as_tensor(), b.as_tensor()).unwrap();
+                    (a, b)
+                })
+                .collect();
+            for seed in [11, 21] {
+                run.take("the embeddings", crate::grad::directional(&loss, &x, step * scale, seed).unwrap());
+            }
+            for (&(name, ..), (a, b)) in layers.iter().zip(&factors) {
+                let step = if dtype == DType::F64 { 1e-3 } else { step };
+                run.factors(&adapters, "gemma", name, (a, b), &|| loss(&x), step * SCALE as f64);
+            }
+        }
     }
 }

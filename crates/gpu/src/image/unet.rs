@@ -248,30 +248,76 @@ impl Transformer {
         })
     }
 
-    fn forward(&self, x: &Tensor, ctx: &Tensor) -> candle_core::Result<Tensor> {
-        let (_, _, h, w) = x.dims4()?;
-        let mut s = self.proj_in.forward(&to_seq(&self.norm.forward(x)?)?)?;
-        for b in &self.blocks {
-            s = b.forward(&s, ctx)?;
-        }
-        to_grid(&self.proj_out.forward(&s)?, h, w)? + x
+    /// The feature map `x` as the tokens the blocks read.
+    fn enter(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        self.proj_in.forward(&to_seq(&self.norm.forward(x)?)?)
     }
+
+    /// The blocks' tokens back as a feature map, added to the `x` they
+    /// were made from.
+    fn leave(&self, tokens: &Tensor, x: &Tensor) -> candle_core::Result<Tensor> {
+        let (_, _, h, w) = x.dims4()?;
+        to_grid(&self.proj_out.forward(tokens)?, h, w)? + x
+    }
+}
+
+/// The state after a stretch: `h`, the skips still `waiting`, and `h` again
+/// at their end if the stretch leaves one.
+fn state(h: Tensor, waiting: &[Tensor], leaves: bool) -> Vec<Tensor> {
+    let mut next = Vec::with_capacity(waiting.len() + 2);
+    next.push(h.clone());
+    next.extend_from_slice(waiting);
+    if leaves {
+        next.push(h);
+    }
+    next
+}
+
+/// The stretches of one stage, added to `out`: `before` makes the feature
+/// map from the state and says which skips still wait; then the stage's
+/// transformer, if it has one; then `after`.
+///
+/// Without a transformer that is one stretch. With one it is a stretch
+/// into the transformer, one for each of its blocks, and one out: ten
+/// blocks recorded together are ten blocks' worth of `backward`'s
+/// leavings alive at once (`crate::grad::checkpointed`). Between those the
+/// state is the tokens, then the feature map they came from, which the
+/// last adds back, then the waiting skips.
+fn staged<'a>(
+    out: &mut Vec<Stretch<'a>>,
+    before: impl Fn(&[Tensor]) -> candle_core::Result<(Tensor, Vec<Tensor>)> + 'a,
+    attn: Option<&'a Transformer>,
+    ctx: &'a Tensor,
+    after: impl Fn(Tensor) -> candle_core::Result<Tensor> + 'a,
+    leaves: bool,
+) {
+    let Some(t) = attn else {
+        out.push(Box::new(move |s| {
+            let (h, waiting) = before(s)?;
+            Ok(state(after(h)?, &waiting, leaves))
+        }));
+        return;
+    };
+    out.push(Box::new(move |s| {
+        let (h, waiting) = before(s)?;
+        let mut next = vec![t.enter(&h)?, h];
+        next.extend(waiting);
+        Ok(next)
+    }));
+    for block in &t.blocks {
+        out.push(Box::new(move |s| {
+            let mut next = s.to_vec();
+            next[0] = block.forward(&s[0], ctx)?;
+            Ok(next)
+        }));
+    }
+    out.push(Box::new(move |s| Ok(state(after(t.leave(&s[0], &s[1])?)?, &s[2..], leaves))));
 }
 
 /// A resnet, then the level's transformer if it has one.
 struct Stage {
     resnet: Resnet,
     attn: Option<Transformer>,
-}
-
-impl Stage {
-    fn forward(&self, x: &Tensor, temb: &Tensor, ctx: &Tensor) -> candle_core::Result<Tensor> {
-        let x = self.resnet.forward(x, temb)?;
-        match &self.attn {
-            Some(t) => t.forward(&x, ctx),
-            None => Ok(x),
-        }
-    }
 }
 
 struct Level {
@@ -438,43 +484,29 @@ impl Unet {
     /// keeps only the states, and comes back through one stretch at a time
     /// ([`crate::grad::checkpointed`]).
     pub(crate) fn stretches<'a>(&'a self, temb: &'a Tensor, ctx: &'a Tensor) -> Vec<Stretch<'a>> {
-        // `h` replaced, the waiting skips as they were, and `h` added to
-        // them if this stretch leaves one.
-        fn state(h: Tensor, waiting: &[Tensor], leaves: bool) -> Vec<Tensor> {
-            let mut next = Vec::with_capacity(waiting.len() + 2);
-            next.push(h.clone());
-            next.extend_from_slice(waiting);
-            if leaves {
-                next.push(h);
-            }
-            next
-        }
         let mut out: Vec<Stretch<'a>> = Vec::new();
         out.push(Box::new(move |s| Ok(state(self.conv_in.forward(&s[0])?, &[], true))));
         for level in &self.down {
             for stage in &level.stages {
-                out.push(Box::new(move |s| Ok(state(stage.forward(&s[0], temb, ctx)?, &s[1..], true))));
+                let resnet = move |s: &[Tensor]| Ok((stage.resnet.forward(&s[0], temb)?, s[1..].to_vec()));
+                staged(&mut out, resnet, stage.attn.as_ref(), ctx, Ok, true);
             }
             if let Some(ds) = &level.resample {
                 out.push(Box::new(move |s| Ok(state(ds.forward(&s[0])?, &s[1..], true))));
             }
         }
-        out.push(Box::new(move |s| {
-            let h = self.mid.0.forward(&s[0], temb)?;
-            let h = self.mid.1.forward(&h, ctx)?;
-            Ok(state(self.mid.2.forward(&h, temb)?, &s[1..], false))
-        }));
+        let first = move |s: &[Tensor]| Ok((self.mid.0.forward(&s[0], temb)?, s[1..].to_vec()));
+        staged(&mut out, first, Some(&self.mid.1), ctx, move |h| self.mid.2.forward(&h, temb), false);
         for level in &self.up {
             for stage in &level.stages {
-                out.push(Box::new(move |s| {
+                let resnet = move |s: &[Tensor]| {
                     let (skip, waiting) = s[1..].split_last().expect("one skip per up-resnet, by construction");
-                    Ok(state(stage.forward(&Tensor::cat(&[&s[0], skip], 1)?, temb, ctx)?, waiting, false))
-                }));
+                    Ok((stage.resnet.forward(&Tensor::cat(&[&s[0], skip], 1)?, temb)?, waiting.to_vec()))
+                };
+                staged(&mut out, resnet, stage.attn.as_ref(), ctx, Ok, false);
             }
             if let Some(us) = &level.resample {
-                out.push(Box::new(move |s| {
-                    Ok(state(us.forward(&crate::grad::upsample_twice(&s[0])?)?, &s[1..], false))
-                }));
+                out.push(Box::new(move |s| Ok(state(us.forward(&crate::grad::upsample_twice(&s[0])?)?, &s[1..], false))));
             }
         }
         out.push(Box::new(move |s| Ok(state(self.conv_out.forward(&self.norm_out.forward(&s[0])?.silu()?)?, &s[1..], false))));

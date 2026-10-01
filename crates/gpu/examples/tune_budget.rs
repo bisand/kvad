@@ -67,12 +67,15 @@ fn main() -> Res<()> {
     if has("--trace") && !b.trace.is_empty() {
         // n stretches forward, the loss, n stretches back, last first.
         let n = (b.trace.len() - 1) / 2;
-        eprintln!("the last step, a stretch at a time: seconds forward, seconds back, and the footprint coming back reached");
+        let gb = |bytes: u64| bytes as f64 / 1e9;
+        eprintln!("the last step, a stretch at a time: forward, then back; the footprint each reached, and left");
         for i in 0..n {
-            let (fwd, _) = b.trace[i];
-            let (back, peak) = b.trace[2 * n - i];
-            eprintln!("  stretch {i:>2}: {fwd:.3} s forward, {back:.3} s back, {:.1} GB", peak as f64 / 1e9);
+            let (fwd, fp, fl) = b.trace[i];
+            let (back, peak, left) = b.trace[2 * n - i];
+            eprintln!("  stretch {i:>2}: forward {fwd:.3} s, {:.1} then {:.1} GB; back {back:.3} s, {:.1} then {:.1} GB", gb(fp), gb(fl), gb(peak), gb(left));
         }
+        let (fwd, back): (f64, f64) = (b.trace[..n].iter().map(|t| t.0).sum(), b.trace[n + 1..].iter().map(|t| t.0).sum());
+        eprintln!("  {n} stretches: {fwd:.2} s forward, {back:.2} s back");
     }
     eprintln!("footprint at the end: {:.1} GB", kvad_gpu::cap::footprint() as f64 / 1e9);
     if b.loss.iter().any(|l| !l.is_finite()) {

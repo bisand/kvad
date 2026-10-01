@@ -39,31 +39,35 @@
 //! |---|---|---|---|
 //! | 256², the whole UNet recorded, as first written | 5.2 s | 31.8 GB | 0.10 s |
 //! | 256², the whole UNet recorded, frozen layers attached | 3.4 s | 14.4 GB | |
-//! | 256², a stretch at a time | 1.7 s | 7.7 GB | 0.14 s |
-//! | 352² | 2.5 s | 9.9 GB | 0.20 s |
-//! | 480² | 3.1 s | 13.8 GB | 0.33 s |
-//! | 512² | 3.3 s | 15.3 GB | 0.35 s |
-//! | 640² | 5.3 s | 19.8 GB | 0.55 s |
+//! | 480², 22 stretches, a stage each | 3.1 s | 13.8 GB | 0.33 s |
+//! | 480², 103 stretches, a transformer block each | 3.4 s | 7.4 GB | |
+//! | 512² | 3.7 s | 8.0 GB | 0.35 s |
+//! | 640² | 5.8 s | 9.4 GB | 0.56 s |
+//! | 768² | 9.0 s | 12.9 GB | 0.77 s |
+//! | 896² | 14.0 s | 18.2 GB | 1.09 s |
+//! | 1024² | 20.7 s | 23.4 GB | 1.39 s |
 //!
-//! (352² was measured before a convolution's backward went by the turned
-//! kernel, which took 480² from 4.1 s to 3.1.)
+//! Recorded whole, 512² took the machine down. 5.1 GB of every figure is
+//! the weights.
 //!
-//! - **Memory is 5.1 GB of weights and about 37 GB a megapixel**, a
-//!   straight line through all five sizes. By it 768² is 27 GB and 1024²
-//!   44 GB, which this machine does not have to spare, and neither was
-//!   run. Recorded whole, 512² took the machine down.
-//! - **A megabyte is not where that goes.** The activations at these sizes
-//!   are megabytes each; the stretches that reach the peak are the ten
-//!   transformer blocks at the lowest level, at 15×15 tokens, and what
-//!   they hold there is not yet found. It is not the LoRA: at rank 1 the
-//!   peak is the same.
-//! - **A step is nine times a forward pass**, most of it coming back
-//!   through the transformer blocks, and 0.35 s of it is the optimiser,
-//!   the same at any size: 1120 small tensors, each a few operations.
+//! - **What the stage-sized stretches held** was not activations, which
+//!   are megabytes. It was `backward`'s small leavings in large buffers
+//!   (`crate::grad::rehomed`), each stretch's record alive through the
+//!   next one's, and ten transformer blocks' worth of both at once. With
+//!   those three mended the 37 GB a megapixel beside the weights is about
+//!   10, up to 640².
+//! - **Past that it grows faster than the picture**, and the peak is one
+//!   transformer block at the upper attention level, where a picture of
+//!   1024² is 4096 tokens: its self-attention's scores are 671 MB in f32,
+//!   and recorded, with the steps of the softmax and their gradients, the
+//!   block reaches 17 GB beside the weights. An attention with a backward
+//!   of its own, keeping the scores once, is what would bring that down.
+//! - **A step is fifteen times a forward pass at 1024²**, nine at 512²,
+//!   nearly all of it coming back; and 0.34 s of it is the optimiser, the
+//!   same at any size: 1120 small tensors, each a few operations.
 //!
-//! So what #75 can promise from this is 512² on this machine, in about
-//! 3 s a step and 15 GB; and 1024², SDXL's own size, not before the
-//! memory above is found.
+//! So what #75 can promise from this, on this machine: SDXL's own 1024² in
+//! 23 GB at 21 s a step, or 512² in 8 GB at under 4.
 
 use super::lora::Adapters;
 use super::nn::{noise, Ctx};
@@ -100,9 +104,9 @@ pub struct Budget {
     pub drawing: f64,
     /// The last step, a stretch at a time, in the order they ran: forward
     /// through each, the loss, then back through each, last first. Each
-    /// one's seconds, and the footprint in bytes it reached, where
-    /// `crate::cap::at` is watching.
-    pub trace: Vec<(f64, u64)>,
+    /// one's seconds, the footprint in bytes it reached, where
+    /// `crate::cap::at` is watching, and the footprint it left.
+    pub trace: Vec<(f64, u64, u64)>,
 }
 
 /// Which of a UNet's linear layers a LoRA goes on: the attention
@@ -129,7 +133,7 @@ struct Rig {
     /// The last checkpointed step's stretches, in the order they ran:
     /// forward through each, the loss, then back through each, last first;
     /// the seconds each took and the footprint it reached.
-    trace: std::cell::RefCell<Vec<(f64, u64)>>,
+    trace: std::cell::RefCell<Vec<(f64, u64, u64)>>,
 }
 
 impl Rig {
@@ -209,7 +213,7 @@ impl Rig {
                 let settled = || {
                     settle(&self.device)?;
                     let now = clock.elapsed().as_secs_f64();
-                    self.trace.borrow_mut().push((now - at.get(), crate::cap::peak()));
+                    self.trace.borrow_mut().push((now - at.get(), crate::cap::peak(), crate::cap::footprint()));
                     at.set(now);
                     Ok(())
                 };

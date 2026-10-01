@@ -29,7 +29,8 @@
 //!
 //! **Padding.** LTX's decoder is not causal: the first frame is repeated once
 //! in front and the last once behind, so the output has as many frames as the
-//! input. Its latent upsampler pads time with zeros instead ([`Time`]). Space
+//! input. Its latent upsampler pads time with zeros instead, and its encoder
+//! is causal, the first frame twice in front and nothing behind ([`Time`]). Space
 //! is padded with zeros. Each chunk's window is cut from the input and padded
 //! on its own, and the 2D convolution then runs unpadded. (Padding the whole
 //! input first made two full-size copies of it: 6 GB for one convolution at
@@ -59,6 +60,19 @@ pub enum Time {
     Replicate,
     /// Nothing: the latent upsampler, a plain `Conv3d(padding=1)`.
     Zeros,
+    /// Causal: output frame `f` reads frames `f − 2 .. f`, the first frame
+    /// standing in for those before it, and none after. The VAE encoder.
+    Causal,
+}
+
+impl Time {
+    /// How many frames before an output frame and after it it reads.
+    pub fn reach(self) -> (usize, usize) {
+        match self {
+            Time::Replicate | Time::Zeros => (1, 1),
+            Time::Causal => (2, 0),
+        }
+    }
 }
 
 /// A 3×3×3 convolution with stride 1, padded in time as [`Time`] says and
@@ -118,6 +132,10 @@ impl Conv3d {
         Conv3d { time, ..self }
     }
 
+    pub(crate) fn time(&self) -> Time {
+        self.time
+    }
+
     /// `[T, C_in, H, W]` to `[T, C_out, H, W]`.
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let t = x.dim(0)?;
@@ -126,7 +144,8 @@ impl Conv3d {
 
     /// Output frames `lo .. hi` of a clip `total` frames long, from `x`,
     /// which holds the clip's frames from `start` on: at least those the
-    /// outputs read, `lo − 1 .. hi + 1` within the clip.
+    /// outputs read within the clip, `lo − 1 .. hi + 1`, or `lo − 2 .. hi`
+    /// when causal ([`Time::reach`]).
     ///
     /// For a caller that works through a clip a chunk at a time: the padding
     /// goes on at the clip's own first and last frames and nowhere else, so
@@ -144,7 +163,7 @@ impl Conv3d {
             // It gathers the neighbourhoods as it multiplies, so it needs no
             // scratch, and no chunks or bands.
             #[cfg(target_os = "macos")]
-            Kernel::Taps(k) => return crate::mpp_conv3d::conv3d(x, k, &self.b.flatten_all()?, clip, (lo, hi), self.time == Time::Zeros),
+            Kernel::Taps(k) => return crate::mpp_conv3d::conv3d(x, k, &self.b.flatten_all()?, clip, (lo, hi), self.time),
         };
 
         // Rows per band, then frames per chunk, so that neither the stacked
@@ -179,35 +198,37 @@ impl Conv3d {
     }
 
     /// What output frames `f .. f + n`, rows `r .. r + m` read: frames
-    /// `f − 1 .. f + n + 1` and rows `r − 1 .. r + m + 1`, padded where those
-    /// run off the clip. `[n + 2, C, m + 2, W + 2]`. `x` holds the clip's
-    /// frames from `start` on, of `total`.
+    /// `f − 1 .. f + n + 1` (`f − 2 .. f + n` when causal) and rows
+    /// `r − 1 .. r + m + 1`, padded where those run off the clip.
+    /// `[n + 2, C, m + 2, W + 2]`. `x` holds the clip's frames from `start`
+    /// on, of `total`.
     fn window(&self, x: &Tensor, (start, total): (usize, usize), (f, n): (usize, usize), (r, m): (usize, usize)) -> candle_core::Result<Tensor> {
         let h = x.dim(2)?;
         // Rows first, so that everything after copies only the band.
         let (top, bottom) = (r.saturating_sub(1), (r + m + 1).min(h));
         let x = x.narrow(2, top, bottom - top)?;
-        let (first, last) = (f.saturating_sub(1), (f + n + 1).min(total));
+        let (before, after) = self.time.reach();
+        let (first, last) = (f.saturating_sub(before), (f + n + after).min(total));
         let at = |g: usize| -> candle_core::Result<usize> {
             match g.checked_sub(start).filter(|&i| i < x.dim(0).unwrap_or(0)) {
                 Some(i) => Ok(i),
                 None => candle_core::bail!("conv3d: frame {g} is not in the {} given from {start}", x.dim(0)?),
             }
         };
-        let mut parts = Vec::with_capacity(3);
+        let mut parts = Vec::with_capacity(5);
         let edge = |g: usize| -> candle_core::Result<Tensor> {
             let frame = x.narrow(0, at(g)?, 1)?;
             match self.time {
-                Time::Replicate => Ok(frame),
+                Time::Replicate | Time::Causal => Ok(frame),
                 Time::Zeros => frame.zeros_like(),
             }
         };
-        if f == 0 {
+        for _ in f..before {
             parts.push(edge(0)?);
         }
         at(last - 1)?;
         parts.push(x.narrow(0, at(first)?, last - first)?);
-        if f + n == total {
+        for _ in total..f + n + after {
             parts.push(edge(total - 1)?);
         }
         let x = if parts.len() == 1 { parts.pop().unwrap() } else { Tensor::cat(&parts, 0)? };
@@ -272,7 +293,9 @@ mod tests {
     /// The definition, written out: pad, then for every output sample sum
     /// over input channels and the 3×3×3 neighbourhood.
     fn naive(x: &[f32], (t, c, h, w): (usize, usize, usize, usize), k: &[f32], bias: &[f32], cout: usize, time: Time) -> Vec<f32> {
+        let shift = (time == Time::Causal) as isize;
         let at = |f: isize, ch: usize, y: isize, xx: isize| -> f32 {
+            let f = f - shift;
             if time == Time::Zeros && (f < 0 || f >= t as isize) {
                 return 0.0;
             }
@@ -317,7 +340,7 @@ mod tests {
         let x = values(t * c * h * w, 1);
         let k = values(cout * c * 27, 2);
         let b = values(cout, 3);
-        for time in [Time::Replicate, Time::Zeros] {
+        for time in [Time::Replicate, Time::Zeros, Time::Causal] {
             let conv = Conv3d {
                 w: Kernel::Folded(fold(&Tensor::from_vec(k.clone(), (cout, c, 3, 3, 3), &dev).unwrap()).unwrap()),
                 b: Tensor::from_vec(b.clone(), (1, cout, 1, 1), &dev).unwrap(),
@@ -341,7 +364,7 @@ mod tests {
         let (t, c, h, w, cout) = (4, 3, 13, 9, 2);
         let x = values(t * c * h * w, 4);
         let k = values(cout * c * 27, 5);
-        for time in [Time::Replicate, Time::Zeros] {
+        for time in [Time::Replicate, Time::Zeros, Time::Causal] {
             let conv = Conv3d {
                 w: Kernel::Folded(fold(&Tensor::from_vec(k.clone(), (cout, c, 3, 3, 3), &dev).unwrap()).unwrap()),
                 b: Tensor::zeros((1, cout, 1, 1), DType::F32, &dev).unwrap(),
@@ -359,17 +382,18 @@ mod tests {
     #[test]
     fn frames_from_a_slice_are_the_whole_clips() {
         // A clip of five frames, taken in pieces that each come with only
-        // the one frame of halo they read: padding at the clip's ends, and
-        // none between the pieces.
+        // the frames of halo they read: padding at the clip's ends, and none
+        // between the pieces.
         let dev = Device::Cpu;
         let (t, c, h, w, cout) = (5, 3, 4, 5, 2);
         let x = Tensor::from_vec(values(t * c * h * w, 8), (t, c, h, w), &dev).unwrap();
         let k = Tensor::from_vec(values(cout * c * 27, 9), (cout, c, 3, 3, 3), &dev).unwrap();
-        for time in [Time::Replicate, Time::Zeros] {
+        for time in [Time::Replicate, Time::Zeros, Time::Causal] {
             let conv = Conv3d { w: Kernel::Folded(fold(&k).unwrap()), b: Tensor::zeros((1, cout, 1, 1), DType::F32, &dev).unwrap(), cin: c, time };
             let whole = conv.forward(&x).unwrap();
             for (lo, hi) in [(0usize, 2usize), (2, 3), (3, 5), (0, 5)] {
-                let (s, e) = (lo.saturating_sub(1), (hi + 1).min(t));
+                let (before, after) = time.reach();
+                let (s, e) = (lo.saturating_sub(before), (hi + after).min(t));
                 let got = conv.frames(&x.narrow(0, s, e - s).unwrap(), (s, t), (lo, hi)).unwrap();
                 let want = whole.narrow(0, lo, hi - lo).unwrap();
                 let worst = (got - want).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();

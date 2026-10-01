@@ -118,7 +118,7 @@ fn main() -> Res<()> {
             let t = Instant::now();
             let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"].into_iter().find(|p| std::path::Path::new(p).is_file()).ok_or("--image needs ffmpeg")?;
             let p = kvad::video::picture_from_file(ffmpeg.as_ref(), path.as_ref(), kvad::video::PICTURE_CRF)?;
-            let enc = ltx_vae::ImageEncoder::load(&fetch(ltx_vae::FILE)?, &device, dtype)?;
+            let enc = ltx_vae::VideoEncoder::load(&fetch(ltx_vae::FILE)?, &device, dtype)?;
             let at = |s: Shape| -> Res<Tensor> {
                 let z = enc.encode(&ltx_vae::picture(&p.rgb, p.width, p.height, s.width, s.height)?.to_device(&device)?)?;
                 Ok(kvad_gpu::video::ltx_dit::video_tokens(&z)?.to_dtype(dtype)?)

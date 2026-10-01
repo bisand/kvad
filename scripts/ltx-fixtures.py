@@ -11,7 +11,7 @@ Lightricks' own `ltx-core`, on the same weights and the same latents, and
 writes what it makes for the examples to compare against.
 
     python3 -m venv /tmp/ltx-venv
-    /tmp/ltx-venv/bin/pip install torch torchaudio einops safetensors av
+    /tmp/ltx-venv/bin/pip install torch torchaudio einops safetensors av colour-science
     git clone --depth 1 https://github.com/Lightricks/LTX-2 /tmp/LTX-2
 
     VIDEO=$(cargo run -q --release -p kvad-gpu --example ltx_decode -- --where)
@@ -41,6 +41,10 @@ writes what it makes for the examples to compare against.
     PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src:/tmp/LTX-2/packages/ltx-pipelines/src /tmp/ltx-venv/bin/python \\
         scripts/ltx-fixtures.py --video "$VIDEO" --picture synthetic --out /tmp/ltx-fx
     cargo run --release -p kvad-gpu --example ltx_encode -- --fixtures /tmp/ltx-fx --picture /tmp/ltx-fx/picture.png
+
+    PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
+        scripts/ltx-fixtures.py --video "$VIDEO" --clip 384x256x25 --out /tmp/ltx-fx
+    cargo run --release -p kvad-gpu --example ltx_encode -- --fixtures /tmp/ltx-fx --clip 384x256x25
 
     PYTHONPATH=/tmp/LTX-2/packages/ltx-core/src /tmp/ltx-venv/bin/python \\
         scripts/ltx-fixtures.py --dit "$DIT" --contexts random --out /tmp/ltx-fx
@@ -123,6 +127,9 @@ What to expect, as measured on 2026-09-24 on an M5 Pro:
   105.9-108.0 dB in f32 on the CPU and 37.4-41.0 in bf16 on Metal, where the
   reference's own bf16 on MPS is 37.0-40.1. kvad's H.264 round trip, by
   ffmpeg, is 48.2 dB from the reference's, by PyAV.
+- A clip through the encoder (`--clip 384x256x25`, drawn here): 108.4 dB in
+  f32 on the CPU, 107.9 on Metal, and 36.9 in bf16 on Metal, where the
+  reference's own bf16 on MPS is 35.9.
 - The DiT with its first latent frame held at sigma 0 (`--held`), on seeded
   contexts: 107-118 dB in f32 on the CPU; in bf16 on Metal video 47.1/46.0
   and velocity 42.9 dB, where the reference's own bf16 is 46.9/46.3 and 43.7.
@@ -234,6 +241,43 @@ def video(path, out):
             x = d16(z.to("mps", torch.bfloat16)).float().add(1).mul(0.5).clamp(0, 1)[0].cpu()
         print(f"video: the reference in bf16 on MPS is {psnr(x, frames):.1f} dB from its f32")
         dec.float().cpu()
+
+
+def clip(path, out, frames, height, width):
+    """A clip through the reference's video encoder, which is causal: a disc
+    moving over gradients and changing colour, above bars that scroll, so
+    that every latent frame differs from the one before. f32 on the CPU, and
+    bf16 on MPS for the drift bf16 costs the reference."""
+    from ltx_core.model.video_vae.model_configurator import VideoEncoderConfigurator
+
+    meta, tensors = read(path)
+    stats = lambda k: k if k.startswith("per_channel_statistics.") else None
+    enc = load(VideoEncoderConfigurator.from_metadata(meta), tensors, lambda k: k[len("encoder."):] if k.startswith("encoder.") else stats(k))
+    T, H, W = frames, height, width
+    yy, xx = torch.meshgrid(torch.arange(H).float(), torch.arange(W).float(), indexing="ij")
+    rgb = torch.zeros(3, T, H, W)
+    for f in range(T):
+        cx, cy = W * (0.15 + 0.7 * f / max(T - 1, 1)), H * (0.45 + 0.2 * math.sin(f / 3))
+        disc = (((xx - cx) ** 2 + (yy - cy) ** 2) < (H / 6) ** 2).float()
+        bars = (((xx + 6 * f) // (W / 16)).long() % 2).float() * (yy > 0.8 * H).float()
+        rgb[0, f] = 0.2 + 0.6 * xx / W
+        rgb[1, f] = 0.3 + 0.5 * yy / H
+        rgb[2, f] = 0.5 + 0.4 * torch.sin((xx + 8 * f) / 20)
+        for c, v in enumerate((1.0, 0.85 - 0.6 * f / T, 0.1 + 0.8 * f / T)):
+            rgb[c, f] = rgb[c, f] * (1 - disc) + v * disc
+        rgb[:, f] = rgb[:, f] * (1 - bars) + bars
+    pixels = rgb.mul(2).sub(1)
+    with torch.no_grad():
+        z = enc(pixels[None])
+    # Frames first, as kvad holds a clip: [T, 3, H, W].
+    fx = {"frames": pixels.permute(1, 0, 2, 3).contiguous(), "latent": z[0].contiguous()}
+    if torch.backends.mps.is_available():
+        e16 = enc.to("mps", torch.bfloat16)
+        with torch.no_grad():
+            fx["latent_bf16"] = e16(pixels[None].to("mps", torch.bfloat16)).float()[0].cpu().contiguous()
+        enc.float().cpu()
+    save_file(fx, f"{out}/clip_{W}x{H}x{T}.safetensors")
+    print(f"clip: {W}×{H}×{T} to latent {tuple(z.shape[1:])}")
 
 
 def media_io():
@@ -1188,6 +1232,7 @@ if __name__ == "__main__":
     p.add_argument("--diffvae", help="vae/ltx-2.5-video-vae-bf16.safetensors: the diffusion decoder, stage by stage")
     p.add_argument("--keyframes", action="store_true", help="with --diffvae: the keyframe-aware decode, writing diffvae_kf_*")
     p.add_argument("--picture", help="with --video: a picture for image-to-video, `synthetic` for one drawn here")
+    p.add_argument("--clip", help="with --video: a clip drawn here, WxHxT (T = 8k + 1), through the encoder, writing clip_WxHxT")
     p.add_argument("--upsampler", help="latent_upscale_models/ltx-2.5-latent-{spatial,temporal}-upscaler-x2-bf16-1.0.safetensors, with --vae and --latent")
     p.add_argument("--vae", help="vae/ltx-2.5-video-vae-conv-bf16.safetensors, for the upsampler's statistics")
     p.add_argument("--latent", help="a stage-1 latent to upsample: a safetensors file with `video`, [128, F, h, w], as examples/ltx.rs --latents writes")
@@ -1197,7 +1242,10 @@ if __name__ == "__main__":
 
     os.makedirs(a.out, exist_ok=True)
     started = time.time()
-    if a.video and a.picture:
+    if a.video and a.clip:
+        w, h, t = (int(v) for v in a.clip.split("x"))
+        clip(a.video, a.out, t, h, w)
+    elif a.video and a.picture:
         picture(a.video, None if a.picture == "synthetic" else a.picture, a.out)
     elif a.video:
         video(a.video, a.out)

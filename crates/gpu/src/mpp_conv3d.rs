@@ -36,7 +36,9 @@
 //!
 //! Space is padded with zeros. Time is padded as the caller says: the
 //! decoder repeats the clip's first and last frames, the latent upsampler
-//! reads zeros. As with [`crate::video::conv3d::Conv3d::frames`], the input
+//! reads zeros, and the encoder is causal: each output frame reads the two
+//! before it rather than one either side, which is the same gather one
+//! frame earlier. As with [`crate::video::conv3d::Conv3d::frames`], the input
 //! may be a slice of the clip, and only the clip's own first and last frames
 //! are padded. Pixels past the frame's end and output channels past the
 //! last are computed on zeros and not written.
@@ -45,6 +47,7 @@ use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp3, DType, Layout, MetalStorage, Shape, Tensor};
 use candle_metal_kernels::metal::ComputeCommandEncoder;
 use objc2_metal::MTLSize;
+use crate::video::conv3d::Time;
 
 const SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -61,6 +64,8 @@ struct Params {
     int lo;
     // Time padding: zeros, or the edge frame again.
     int zeros;
+    // 1 when causal: every tap one frame earlier.
+    int shift;
 };
 
 // `f(0)` to `f(N - 1)`, each index a compile-time constant, so that the
@@ -140,7 +145,7 @@ template <typename T, int BM, int BN, int NSG>
         const int tap = s / blocks;
         const int c0 = (s % blocks) * BK;
         const int kt = tap / 9, ky = (tap / 3) % 3, kx = tap % 3;
-        int g = f + kt - 1;
+        int g = f + kt - 1 - p.shift;
         bool ok = inside;
         if (g < 0) {
             ok = ok && !p.zeros;
@@ -229,6 +234,7 @@ struct Params {
     total: i32,
     lo: i32,
     zeros: i32,
+    shift: i32,
 }
 
 /// The kernels: `None` where `mpp` does not run, or where
@@ -255,25 +261,26 @@ pub(crate) fn taps(w: &Tensor) -> candle_core::Result<Tensor> {
 
 /// Output frames `lo .. hi` of a clip `total` frames long, from `x`
 /// (`[frames, in, h, w]`, the clip's frames from `start` on), with the
-/// kernel `w` laid out by [`taps`] and the bias `b` (`[out]`). `zeros` pads
-/// time with zeros instead of the edge frames. `[hi − lo, out, h, w]`.
-pub(crate) fn conv3d(x: &Tensor, w: &Tensor, b: &Tensor, (start, total): (usize, usize), (lo, hi): (usize, usize), zeros: bool)
+/// kernel `w` laid out by [`taps`] and the bias `b` (`[out]`), time padded
+/// as `time` says. `[hi − lo, out, h, w]`.
+pub(crate) fn conv3d(x: &Tensor, w: &Tensor, b: &Tensor, (start, total): (usize, usize), (lo, hi): (usize, usize), time: Time)
  -> candle_core::Result<Tensor> {
-    conv3d_with(x, w, b, (start, total), (lo, hi), zeros, TILE)
+    conv3d_with(x, w, b, (start, total), (lo, hi), time, TILE)
 }
 
 /// [`conv3d`] with a given [`Tile`]: for the tests, and for measuring.
-pub(crate) fn conv3d_with(x: &Tensor, w: &Tensor, b: &Tensor, clip: (usize, usize), (lo, hi): (usize, usize), zeros: bool, tile: Tile)
+pub(crate) fn conv3d_with(x: &Tensor, w: &Tensor, b: &Tensor, clip: (usize, usize), (lo, hi): (usize, usize), time: Time, tile: Tile)
  -> candle_core::Result<Tensor> {
     let (frames, cin, _, _) = x.dims4()?;
     let (start, total) = clip;
-    if lo >= hi || hi > total || lo.saturating_sub(1) < start || (hi + 1).min(total) > start + frames {
+    let (before, after) = time.reach();
+    if lo >= hi || hi > total || lo.saturating_sub(before) < start || (hi + after).min(total) > start + frames {
         candle_core::bail!("conv3d: output frames {lo}..{hi} of {total} need frames the {frames} from {start} do not hold");
     }
     if w.dim(1)? != 27 * cin {
         candle_core::bail!("conv3d: a [{}, {}] kernel for {cin} input channels", w.dim(0)?, w.dim(1)?);
     }
-    let op = Conv { clip, lo, n: hi - lo, zeros, tile };
+    let op = Conv { clip, lo, n: hi - lo, time, tile };
     x.contiguous()?.apply_op3_no_bwd(&w.contiguous()?, &b.contiguous()?, &op)
 }
 
@@ -281,7 +288,7 @@ struct Conv {
     clip: (usize, usize),
     lo: usize,
     n: usize,
-    zeros: bool,
+    time: Time,
     tile: Tile,
 }
 
@@ -322,7 +329,8 @@ impl CustomOp3 for Conv {
             start: self.clip.0 as i32,
             total: self.clip.1 as i32,
             lo: self.lo as i32,
-            zeros: self.zeros as i32,
+            zeros: (self.time == Time::Zeros) as i32,
+            shift: (self.time == Time::Causal) as i32,
         };
         let guard = dev.command_encoder()?;
         let enc: &ComputeCommandEncoder = guard.as_ref();
@@ -348,7 +356,6 @@ impl CustomOp3 for Conv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video::conv3d::Time;
     use candle_core::Device;
 
     /// The device, where it has matrix units. There the kernels must build.
@@ -371,7 +378,7 @@ mod tests {
 
     /// The kernel against the folded `conv2d` convolution, which agrees
     /// with Lightricks' reference to 122 dB, run in f32 on the same rounded
-    /// numbers. Both tiles, both time paddings; frames and channels that
+    /// numbers. Both tiles, all three time paddings; frames and channels that
     /// fill no tile, a frame narrower than a tile, and a slice of a clip.
     #[test]
     fn agrees_with_the_folded_convolution() {
@@ -386,24 +393,26 @@ mod tests {
                 let k = (Tensor::randn(0f32, 1.0, (cout, cin, 3, 3, 3), &dev).unwrap() / (27.0 * cin as f64).sqrt()).unwrap().to_dtype(dt).unwrap();
                 let b = Tensor::randn(0f32, 1.0, cout, &dev).unwrap().to_dtype(dt).unwrap();
                 let wt = taps(&k).unwrap();
-                for time in [Time::Replicate, Time::Zeros] {
+                for time in [Time::Replicate, Time::Zeros, Time::Causal] {
                     let f32 = |t: &Tensor| t.to_dtype(DType::F32).unwrap();
                     let folded = crate::video::conv3d::Conv3d::folded(&f32(&k), f32(&b), time).unwrap();
                     let want = folded.forward(&f32(&x)).unwrap();
                     for tile in TILES {
                         let before = crate::fused::tests_ran();
-                        let got = conv3d_with(&x, &wt, &b, (0, t), (0, t), time == Time::Zeros, tile).unwrap();
+                        let got = conv3d_with(&x, &wt, &b, (0, t), (0, t), time, tile).unwrap();
                         assert_eq!(crate::fused::tests_ran(), before + 1, "the kernel did not run");
                         assert_eq!(got.dims(), &[t, cout, h, w]);
                         let d = db(&got, &want);
                         // Rounding the output to bf16 alone costs about 50 dB.
                         let floor = if dt == DType::BF16 { 45.0 } else { 60.0 };
                         assert!(d > floor, "{dt:?} {time:?} {tile:?} [{t}, {cin}, {h}, {w}] → {cout}: {d:.1} dB");
-                        // A slice: frames 1 .. t − 1 of the clip, from the
+                        // A slice: frames 2 .. t − 1 of the clip, from the
                         // frames they read.
-                        if t >= 3 {
-                            let (lo, hi) = (1, t - 1);
-                            let got = conv3d_with(&x.narrow(0, lo - 1, hi - lo + 2).unwrap(), &wt, &b, (lo - 1, t), (lo, hi), time == Time::Zeros, tile).unwrap();
+                        if t >= 4 {
+                            let (lo, hi) = (2, t - 1);
+                            let (before, after) = time.reach();
+                            let (s, e) = (lo - before, (hi + after).min(t));
+                            let got = conv3d_with(&x.narrow(0, s, e - s).unwrap(), &wt, &b, (s, t), (lo, hi), time, tile).unwrap();
                             let d = db(&got, &want.narrow(0, lo, hi - lo).unwrap());
                             assert!(d > floor, "slice {dt:?} {time:?} {tile:?}: {d:.1} dB");
                         }
@@ -445,7 +454,7 @@ mod tests {
             let candle = || drop(folded.frames(&x, (0, t + 2), (1, t + 1)).unwrap());
             let ours: Vec<Box<dyn Fn()>> = TILES.iter().map(|&tile| -> Box<dyn Fn()> {
                 let (x, wt, b) = (x.clone(), wt.clone(), b.clone());
-                Box::new(move || drop(conv3d_with(&x, &wt, &b, (0, t + 2), (1, t + 1), false, tile).unwrap()))
+                Box::new(move || drop(conv3d_with(&x, &wt, &b, (0, t + 2), (1, t + 1), Time::Replicate, tile).unwrap()))
             }).collect();
             time(&candle);
             ours.iter().for_each(|f| {

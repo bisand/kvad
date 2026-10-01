@@ -126,6 +126,30 @@ fn path_from(motion: &Motion, (mut x, mut y): (f32, f32), angle: f32) -> Vec<(us
     out
 }
 
+/// Where digit `slot` of an [`Start::Apart`] clip has its top-left corner
+/// in each frame: slot 0 (the first label) heads up and left, slot 1 down
+/// and right, both from the middle.
+///
+/// Every clip of that kind makes the same journey, so this is known without
+/// looking, which is what lets a clip's digits be read back one at a time:
+/// see [`window`].
+pub fn apart_path(motion: &Motion, slot: usize) -> Vec<(usize, usize)> {
+    let middle = ((motion.side - motion.digit) / 2) as f32;
+    path_from(motion, (middle, middle), std::f32::consts::FRAC_PI_4 * if slot == 0 { 5.0 } else { 1.0 })
+}
+
+/// The `digit × digit` window of frame `frame` where slot `slot`'s digit is.
+///
+/// Early on the two windows overlap — in frame 0 they are the same window —
+/// so a window holds some of the other digit too. What can be read from
+/// which frames is a thing to measure, not assume.
+pub fn window(pixels: &[f32], motion: &Motion, frame: usize, slot: usize) -> Vec<f32> {
+    let (n, d) = (motion.side, motion.digit);
+    let (x0, y0) = apart_path(motion, slot)[frame];
+    let frame = &pixels[frame * n * n..(frame + 1) * n * n];
+    (0..d * d).map(|i| frame[(y0 + i / d) * n + x0 + i % d]).collect()
+}
+
 /// A clip of two digits from `images`, each `digit × digit` from 0 to 1,
 /// moving independently.
 pub fn clip(motion: &Motion, images: &[Vec<f32>], labels: &[usize], rng: &mut Rng) -> Clip {
@@ -135,12 +159,10 @@ pub fn clip(motion: &Motion, images: &[Vec<f32>], labels: &[usize], rng: &mut Rn
     let (a, b) = (rng.below(images.len()), rng.below(images.len()));
     let n = motion.side;
     let mut pixels = vec![0.0f32; motion.frames * n * n];
-    let middle = ((n - d) / 2) as f32;
     for (i, which) in [a, b].into_iter().enumerate() {
         let path = match motion.start {
             Start::Anywhere => path(motion, rng),
-            // Up and left for the first label, down and right for the second.
-            Start::Apart => path_from(motion, (middle, middle), std::f32::consts::FRAC_PI_4 * if i == 0 { 5.0 } else { 1.0 }),
+            Start::Apart => apart_path(motion, i),
         };
         for (f, (x0, y0)) in path.into_iter().enumerate() {
             let frame = &mut pixels[f * n * n..(f + 1) * n * n];
@@ -300,6 +322,23 @@ mod tests {
             }
         }
         assert!(compared > 0, "no two seeds drew the same digits");
+    }
+
+    /// Once the digits are apart, a window is exactly the digit that is in
+    /// it; before, it holds some of the other one too.
+    #[test]
+    fn a_window_is_the_digit_once_they_are_apart() {
+        let motion = Motion::apart();
+        let d = motion.digit;
+        // Two digits of different brightness, so each window says whose it is.
+        let images: Vec<Vec<f32>> = vec![vec![0.4; d * d], vec![0.8; d * d]];
+        let c = (0..20).map(|seed| clip(&motion, &images, &[0, 1], &mut Rng::new(seed))).find(|c| c.labels == [0, 1]).unwrap();
+        let last = motion.frames - 1;
+        assert_eq!(window(&c.pixels, &motion, last, 0), images[0]);
+        assert_eq!(window(&c.pixels, &motion, last, 1), images[1]);
+        // In frame 0 both windows are the same window, and the brighter wins.
+        assert_eq!(window(&c.pixels, &motion, 0, 0), window(&c.pixels, &motion, 0, 1));
+        assert!(window(&c.pixels, &motion, 0, 0).iter().all(|&v| v == 0.8));
     }
 
     #[test]

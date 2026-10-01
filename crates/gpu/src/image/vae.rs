@@ -387,7 +387,7 @@ impl Encoder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use super::super::{open, read_json};
     use crate::common::Loader;
@@ -443,7 +443,7 @@ mod tests {
 
     /// Peak signal-to-noise ratio of `a` against `b`, both in [-1, 1]: the
     /// range is 2 wide, so the peak's square is 4.
-    fn psnr(a: &Tensor, b: &Tensor) -> f64 {
+    pub(crate) fn psnr(a: &Tensor, b: &Tensor) -> f64 {
         let mse = (a - b).unwrap().sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap() as f64;
         10.0 * (4.0 / mse).log10()
     }
@@ -451,7 +451,7 @@ mod tests {
     /// How far `got` is from `want`: the largest difference as a share of
     /// the largest value, and the root-mean-square difference as a share of
     /// the root-mean-square value.
-    fn gap(got: &Tensor, want: &Tensor) -> (f32, f32) {
+    pub(crate) fn gap(got: &Tensor, want: &Tensor) -> (f32, f32) {
         let got = got.to_device(&Device::Cpu).unwrap().to_dtype(DType::F32).unwrap().squeeze(0).unwrap();
         let diff = (got - want).unwrap();
         let max = |t: &Tensor| t.abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();

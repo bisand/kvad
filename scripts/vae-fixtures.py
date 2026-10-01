@@ -2,12 +2,14 @@
 """Reference outputs of diffusers' VAE encoders, for kvad's to be compared with.
 
 `crates/gpu/src/image/vae.rs` has an encoder for the VAEs of SD 1.5, SDXL and
-FLUX, which are all diffusers' `AutoencoderKL`. A round trip through kvad's
+FLUX, which are all diffusers' `AutoencoderKL`, and `qwen.rs` one for
+Qwen-Image's, a video VAE run on one frame (`AutoencoderKLQwenImage`). A round trip through kvad's
 own encoder and decoder can look right and still be a little wrong in both
 halves, so this runs diffusers itself on the same picture, in f32 on the CPU,
 and writes, for each VAE: the picture as both sides see it, the mean and
 log-variance the encoder makes of it, and what the decoder makes of the mean.
-`vae::tests::the_encoder_agrees_with_diffusers` compares kvad's against them.
+`vae::tests::the_encoder_agrees_with_diffusers` compares kvad's against them,
+and `qwen::tests::the_encoder_agrees_with_diffusers` Qwen-Image's.
 
     python3 -m venv /tmp/vae-venv
     /tmp/vae-venv/bin/pip install torch diffusers safetensors pillow
@@ -21,17 +23,18 @@ import argparse
 import os
 
 import torch
-from diffusers import AutoencoderKL
+from diffusers import AutoencoderKL, AutoencoderKLQwenImage
 from PIL import Image
 from safetensors.torch import save_file
 
 # The VAEs kvad's pipelines load, by the name the test knows them by; the
-# variant of the weights file where the repo only has that one; and the
-# precision the pipeline runs the VAE in.
+# variant of the weights file where the repo only has that one; the
+# precision the pipeline runs the VAE in; and its class.
 VAES = {
-    "sdxl": ("madebyollin/sdxl-vae-fp16-fix", None, None, torch.float16),
-    "flux": ("black-forest-labs/FLUX.1-schnell", "vae", None, torch.bfloat16),
-    "sd15": ("stable-diffusion-v1-5/stable-diffusion-v1-5", "vae", "fp16", torch.float16),
+    "sdxl": ("madebyollin/sdxl-vae-fp16-fix", None, None, torch.float16, AutoencoderKL),
+    "flux": ("black-forest-labs/FLUX.1-schnell", "vae", None, torch.bfloat16, AutoencoderKL),
+    "sd15": ("stable-diffusion-v1-5/stable-diffusion-v1-5", "vae", "fp16", torch.float16, AutoencoderKL),
+    "qwen": ("Qwen/Qwen-Image", "vae", None, torch.bfloat16, AutoencoderKLQwenImage),
 }
 SIDE = 512
 
@@ -54,14 +57,20 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     x = picture(args.image)
 
-    for name, (repo, sub, variant, half) in VAES.items():
+    for name, (repo, sub, variant, half, cls) in VAES.items():
         if args.only and name != args.only:
             continue
-        vae = AutoencoderKL.from_pretrained(repo, subfolder=sub, variant=variant, torch_dtype=torch.float32)
+        vae = cls.from_pretrained(repo, subfolder=sub, variant=variant, torch_dtype=torch.float32)
         vae.eval()
+        # A video VAE takes `[B, C, T, H, W]`: the picture is a clip of one
+        # frame, and its frame axis is dropped again from what comes out.
+        video = cls is AutoencoderKLQwenImage
+        frame = (lambda t: t.unsqueeze(2)) if video else (lambda t: t)
+        still = (lambda t: t.squeeze(2)) if video else (lambda t: t)
         with torch.no_grad():
-            posterior = vae.encode(x).latent_dist
-            decoded = vae.decode(posterior.mean).sample
+            posterior = vae.encode(frame(x)).latent_dist
+            decoded = still(vae.decode(posterior.mean).sample)
+            posterior.mean, posterior.logvar = still(posterior.mean), still(posterior.logvar)
         tensors = {
             "image": x[0].contiguous(),
             "mean": posterior.mean[0].contiguous(),
@@ -72,7 +81,7 @@ def main():
         # half precision moves the reference, to judge kvad's by.
         if torch.backends.mps.is_available():
             with torch.no_grad():
-                h = vae.to("mps", half).encode(x.to("mps", half)).latent_dist.mean
+                h = still(vae.to("mps", half).encode(frame(x).to("mps", half)).latent_dist.mean)
             tensors["mean_half"] = h[0].float().cpu().contiguous()
         save_file(tensors, os.path.join(args.out, f"{name}.safetensors"))
         err = (decoded - x).pow(2).mean().item()

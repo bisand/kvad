@@ -28,7 +28,9 @@
 //!   ([`Frozen`]): candle's product with one has no backward, and there is
 //!   nothing to fall back to.
 //! - **It refuses** ([`refuse`]), where there is neither yet: the Q8_0
-//!   product on the M5's matrix units, and the 3D convolution there.
+//!   product on the M5's matrix units, the 3D convolution there, and a
+//!   write into a tensor that already exists ([`slice_set`]): the video
+//!   decoders' chunks and the language models' cache.
 //!   `backward is not supported` at the forward pass is the better failure.
 //!
 //! Nothing changes for inference: no tensor there is tracked.
@@ -88,6 +90,31 @@ impl CustomOp1 for Frozen {
         let w = self.0.dequantize(arg.device())?;
         Ok(Some(grad.to_dtype(DType::F32)?.broadcast_matmul(&w)?.to_dtype(arg.dtype())?))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Writing in place
+// ---------------------------------------------------------------------------
+
+/// `Tensor::slice_set`, refused for a tensor that is being differentiated.
+///
+/// Writing into a tensor that already exists is how the work that is too
+/// large to do at once is put together here: the video decoders fill a
+/// clip a few frames at a time, and the language models' cache takes each
+/// new token's keys and values. candle says of `slice_set` that it "is not
+/// compatible with back-propagation", and does not check: the numbers are
+/// written and nothing is recorded, so what `backward` then finds for the
+/// tensor written is nothing, with no error.
+///
+/// Every such write in this crate comes through here. None of them has a
+/// place in training as it stands (a clip is decoded, and a cache kept, to
+/// draw and to write, not to learn from), so this is the rule's third
+/// answer: it says so.
+pub(crate) fn slice_set(into: &Tensor, from: &Tensor, dim: usize, offset: usize) -> candle_core::Result<()> {
+    if tracked(&[into, from]) {
+        return Err(refuse("slice_set"));
+    }
+    into.slice_set(from, dim, offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,5 +1065,55 @@ mod tests {
                 assert!(off(&got, &want) < 1e-4, "{name} on {:?}: {} apart", dev.location(), off(&got, &want));
             }
         }
+    }
+
+    /// A write in place of a tensor that is being differentiated is
+    /// refused, where candle's own makes it and loses the gradient without
+    /// a word: `backward` then finds nothing for what was written. The same
+    /// write of a tensor that is not is made.
+    #[test]
+    fn a_write_in_place_refuses_a_tracked_tensor() {
+        for dev in [Some(Device::Cpu), metal()].into_iter().flatten() {
+            let part = randn(&[2, 4], &dev);
+            let whole = Tensor::zeros((5, 4), DType::F32, &dev).unwrap();
+            slice_set(&whole, &part, 0, 1).unwrap();
+            assert!(off(&whole.narrow(0, 1, 2).unwrap(), &part) == 0.0);
+
+            let var = Var::from_tensor(&part).unwrap();
+            let made = (var.as_tensor() * 2.0).unwrap();
+            let e = slice_set(&whole, &made, 0, 1).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains("backward is not supported"), "{e}");
+            let e = slice_set(var.as_tensor(), &part, 0, 0).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains("backward is not supported"), "{e}");
+
+            // What it is refused for: candle's, with the same tensors.
+            whole.slice_set(&made, 0, 1).unwrap();
+            let grads = whole.sum_all().unwrap().backward().unwrap();
+            assert!(grads.get(var.as_tensor()).is_none(), "candle's slice_set now records what it writes");
+        }
+    }
+
+    /// The three kernels that add into a buffer in place decline a tensor
+    /// that is being differentiated, whichever of their operands it is, and
+    /// take the same ones untracked.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_kernel_that_writes_in_place_declines_a_tracked_tensor() {
+        let Some(dev) = metal() else { return };
+        if !crate::mpp::available(&dev) {
+            return;
+        }
+        let half = |shape: &[usize]| randn(shape, &dev).to_dtype(DType::BF16).unwrap();
+        let var = |t: &Tensor| Var::from_tensor(t).unwrap().as_tensor().clone();
+        let (x, w, b) = (half(&[512, 64]), half(&[64, 96]), half(&[96]));
+        assert!(crate::mpp::dense_bias(&x, &w, &b).unwrap().is_some());
+        for (i, (x, w, b)) in [(var(&x), w.clone(), b.clone()), (x.clone(), var(&w), b.clone()), (x.clone(), w.clone(), var(&b))].iter().enumerate() {
+            assert!(crate::mpp::dense_bias(x, w, b).unwrap().is_none(), "dense_bias, operand {i}");
+        }
+        let answer = || half(&[512, 96]);
+        assert!(crate::mpp::dense_acc(&answer(), &x, &w).unwrap());
+        assert!(!crate::mpp::dense_acc(&var(&answer()), &x, &w).unwrap());
+        assert!(!crate::mpp::dense_acc(&answer(), &var(&x), &w).unwrap());
+        assert!(!crate::mpp::dense_acc(&answer(), &x, &var(&w)).unwrap());
     }
 }

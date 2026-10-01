@@ -125,7 +125,8 @@ pub const FREQUENCIES: usize = 256;
 /// 0..1000 of a DDPM schedule: their fastest wave has a period of 2π, so on
 /// 0..1 the slow ones barely move and the fast ones hardly complete a turn.
 /// Multiplying by 1000 puts `t` back on the scale the frequencies expect. FLUX
-/// does the same, and records it; so does `config.json` here.
+/// does the same, and so does diffusers' `FlowMatchEulerDiscreteScheduler`,
+/// whose `num_train_timesteps` of 1000 is this number written down.
 pub const TIMESTEP_SCALE: f32 = 1000.0;
 
 /// A number as a vector of waves, so that a network can read it.
@@ -135,12 +136,20 @@ pub const TIMESTEP_SCALE: f32 = 1000.0;
 /// fast to slow, it can tell nearby values apart (the fast waves differ) and
 /// see how far apart distant ones are (the slow ones do). It is the
 /// Transformer's position encoding, applied to a noise level instead.
+///
+/// The frequencies run from 1 down to 1/10000 in `half` steps — and exactly
+/// down to it, because the exponent is divided by `half - 1`. Facebook's DiT
+/// divides by `half` and stops one step short; diffusers' DiT divides by
+/// `half - 1` (`downscale_freq_shift=1`), and its layout is the one this
+/// model is saved in, so its arithmetic is the one used. The fastest wave is
+/// the same in both and the slowest differs by 7%, which a model trained
+/// with one notices when run with the other.
 pub fn timestep_features(t: f32) -> Vec<f32> {
     let half = FREQUENCIES / 2;
     let t = t * TIMESTEP_SCALE;
     let mut out = vec![0.0; FREQUENCIES];
     for k in 0..half {
-        let freq = (-(10_000f32).ln() * k as f32 / half as f32).exp();
+        let freq = (-(10_000f32).ln() * k as f32 / (half - 1) as f32).exp();
         out[k] = (t * freq).cos();
         out[half + k] = (t * freq).sin();
     }
@@ -294,6 +303,19 @@ fn gate_backward(dy: &Matrix, gate: &[f32], branch: &Matrix) -> (Matrix, Vec<f32
 // The block
 // ---------------------------------------------------------------------------
 
+/// The norm before attention, and the one before the output: diffusers
+/// writes 1e-6 into its code for both.
+pub const NORM_EPS_ATTENTION: f32 = 1e-6;
+/// The norm before the MLP, which diffusers takes from `norm_eps` in the
+/// config, where DiT's is 1e-5.
+///
+/// Matched because they are the layout's, not because they are large: on the
+/// digits model, running the attention norm at 1e-5 instead of 1e-6 moved
+/// the output by 7e-6, against outputs of about 6, and the comparison with
+/// diffusers (`agrees_with_diffusers`) cannot tell. A row whose variance is
+/// near the eps would feel it; these never are.
+pub const NORM_EPS: f32 = 1e-5;
+
 /// One DiT block: a transformer [`Block`](crate::block::Block) whose norms and
 /// residual branches are steered by the conditioning.
 ///
@@ -319,9 +341,9 @@ impl DitBlock {
     pub fn new(d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
         DitBlock {
             modulation: Linear::new(d_model, 6 * d_model, rng),
-            norm1: LayerNorm::plain(d_model),
+            norm1: LayerNorm::plain(d_model, NORM_EPS_ATTENTION),
             attn: SelfAttention::bidirectional(d_model, n_heads, rng),
-            norm2: LayerNorm::plain(d_model),
+            norm2: LayerNorm::plain(d_model, NORM_EPS),
             mlp: vec![
                 Box::new(Linear::new(d_model, 4 * d_model, rng)),
                 Box::new(Gelu::default()),
@@ -443,7 +465,7 @@ impl Dit {
             labels: Embedding::new(classes + 1, d_model, rng),
             cond_act: Silu::default(),
             blocks: (0..n_layers).map(|_| DitBlock::new(d_model, n_heads, rng)).collect(),
-            final_norm: LayerNorm::plain(d_model),
+            final_norm: LayerNorm::plain(d_model, NORM_EPS_ATTENTION),
             final_modulation: Linear::new(d_model, 2 * d_model, rng),
             out: Linear::new(d_model, config.patch_len(), rng),
             final_m: Vec::new(),
@@ -593,88 +615,262 @@ impl Dit {
 // ---------------------------------------------------------------------------
 // On disk
 // ---------------------------------------------------------------------------
+//
+// # The layout is diffusers'
+//
+// A trained model is written as a diffusers pipeline directory, so that
+// what `train_digits` makes is a `DiTTransformer2DModel` any DiT code can
+// read, and `kvad` loads it by the same rules as every other image model:
+//
+// ```text
+// model_index.json                             which pipeline, and the labels
+// transformer/config.json                      DiT's config
+// transformer/diffusion_pytorch_model.safetensors
+// scheduler/scheduler_config.json              FlowMatchEulerDiscreteScheduler
+// ```
+//
+// Two things about it are not DiT's, and both are written down rather than
+// assumed. There is no VAE: this model draws pixels in [-1, 1], not latents,
+// so there is nothing to decode and `model_index.json` names no `vae`. And
+// the scheduler is flow matching, where DiT's is DDPM. diffusers'
+// `FlowMatchEulerDiscreteScheduler` is exactly the sampler in `flow` —
+// `xₜ = (1 − σ)x₀ + σε`, the model predicting `ε − x₀`, the timestep `σ·1000`
+// — so the objective is recorded by naming it, and a loader that finds any
+// other scheduler refuses.
+//
+// # One timestep embedder, written out once per block
+//
+// diffusers gives every block its own timestep MLP and label table
+// (`transformer_blocks.N.norm1.emb`), and reads the output layer's
+// conditioning from block 0's. Facebook's DiT had one of each, and its
+// conversion copied that one into every block. So does `save`. `load` takes
+// block 0's, and refuses a checkpoint whose blocks disagree: that is a model
+// this one cannot represent, not one to be run with the difference ignored.
 
-/// What `config.json` says the numbers mean. A loader that finds anything
-/// else refuses, rather than sampling a model with another model's arithmetic.
-pub const OBJECTIVE: &str = "flow_matching";
+/// `_class_name` in `model_index.json`. Not `DiTPipeline`, because that
+/// pipeline has a VAE and a DDPM scheduler, and code that saw the name would
+/// run this model with both.
+pub const PIPELINE: &str = "NervusDiTPipeline";
+pub const TRANSFORMER: &str = "DiTTransformer2DModel";
+pub const SCHEDULER: &str = "FlowMatchEulerDiscreteScheduler";
+pub const WEIGHTS: &str = "transformer/diffusion_pytorch_model.safetensors";
 
-/// Write the model and a `config.json` into `dir`.
-///
-/// The names are this crate's own. The layout diffusers uses for DiT, which
-/// is what `kvad image` will read, is a separate job with its own tests: it
-/// keeps a timestep embedder in every block, where this model has one.
-pub fn save(dir: &Path, model: &mut Dit) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let c = model.config();
-    let config = object([
-        ("architecture", "nervus-dit".into()),
-        ("objective", OBJECTIVE.into()),
-        ("prediction", "velocity".into()),
-        ("timestep_scale", Json::Number(TIMESTEP_SCALE as f64)),
-        ("image_size", c.image.into()),
-        ("in_channels", c.channels.into()),
-        ("patch_size", c.patch.into()),
-        ("num_classes", c.classes.into()),
-        ("d_model", c.d_model.into()),
-        ("n_heads", c.n_heads.into()),
-        ("n_layers", c.n_layers.into()),
-    ]);
-    std::fs::write(dir.join(crate::checkpoint::CONFIG_FILE), format!("{config}\n"))?;
-
-    // A parameter is a flat slice, and a file wants a shape. A weight's shape
-    // is `[in, out]`, and its bias says what `out` is.
-    let params = model.params();
-    let lengths: std::collections::HashMap<String, usize> =
-        params.iter().map(|p| (p.name.clone(), p.value.len())).collect();
-    let tensors: Vec<Tensor> = params
-        .into_iter()
-        .map(|p| {
-            let shape = match p.name.strip_suffix("weight").map(|stem| lengths.get(&format!("{stem}bias"))) {
-                Some(Some(&out)) => vec![p.value.len() / out, out],
-                _ if p.name == "labels.table" => vec![c.classes + 1, c.d_model],
-                _ => vec![p.value.len()],
-            };
-            Tensor { name: p.name, shape, data: p.value.to_vec() }
-        })
-        .collect();
-    write_safetensors(&dir.join(crate::checkpoint::WEIGHTS_FILE), &tensors)
+/// Where one of this model's tensors goes in the file.
+struct Place {
+    /// Every name it is written under: one, or one per block for the
+    /// conditioning's embedders.
+    names: Vec<String>,
+    shape: Vec<usize>,
+    /// `(in, out)` for a `Linear` weight, which is stored `[in, out]` here and
+    /// `[out, in]` by PyTorch, so it is transposed on the way.
+    linear: Option<(usize, usize)>,
 }
 
-/// Read back what [`save`] wrote.
-pub fn load(dir: &Path) -> io::Result<Dit> {
-    let path = dir.join(crate::checkpoint::CONFIG_FILE);
-    let text = std::fs::read_to_string(&path)?;
-    let json = Json::parse(&text).map_err(|e| invalid(format!("{}: {e}", path.display())))?;
-    let objective = json.get("objective").and_then(Json::as_str);
-    if objective != Some(OBJECTIVE) {
-        return Err(invalid(format!("{}: objective {objective:?}, and only {OBJECTIVE} is sampled here", path.display())));
+fn place(ours: &str, c: &DitConfig) -> Place {
+    let d = c.d_model;
+    let every_block = |sub: &str| -> Vec<String> {
+        (0..c.n_layers).map(|i| format!("transformer_blocks.{i}.norm1.emb.{sub}")).collect()
+    };
+    if ours == "labels.table" {
+        return Place { names: every_block("class_embedder.embedding_table.weight"), shape: vec![c.classes + 1, d], linear: None };
     }
-    let size = |key: &str| {
-        json.get(key).and_then(Json::as_usize).ok_or_else(|| invalid(format!("{}: no `{key}`", path.display())))
+    let (stem, what) = ours.rsplit_once('.').expect("a parameter's name has a dot in it");
+    let (theirs, fan_in, fan_out) = match stem {
+        "patches" => (vec!["pos_embed.proj".to_string()], c.patch_len(), d),
+        "time.0" => (every_block("timestep_embedder.linear_1"), FREQUENCIES, d),
+        "time.2" => (every_block("timestep_embedder.linear_2"), d, d),
+        "final.modulation" => (vec!["proj_out_1".to_string()], d, 2 * d),
+        "out" => (vec!["proj_out_2".to_string()], d, c.patch_len()),
+        _ => {
+            let (i, part) = stem.strip_prefix("blocks.").and_then(|r| r.split_once('.')).unwrap_or_else(|| panic!("no place for {ours}"));
+            let (sub, fan_in, fan_out) = match part {
+                "modulation" => ("norm1.linear", d, 6 * d),
+                "attn.wq" => ("attn1.to_q", d, d),
+                "attn.wk" => ("attn1.to_k", d, d),
+                "attn.wv" => ("attn1.to_v", d, d),
+                "attn.wo" => ("attn1.to_out.0", d, d),
+                "mlp.0" => ("ff.net.0.proj", d, 4 * d),
+                "mlp.2" => ("ff.net.2", 4 * d, d),
+                _ => panic!("no place for {ours}"),
+            };
+            (vec![format!("transformer_blocks.{i}.{sub}")], fan_in, fan_out)
+        }
     };
+    let names = theirs.into_iter().map(|t| format!("{t}.{what}")).collect();
+    match what {
+        "bias" => Place { names, shape: vec![fan_out], linear: None },
+        // The patch embedding is a convolution there, `[d, C, p, p]`, whose
+        // flattened rows are in exactly the order `patchify` reads a patch.
+        _ if stem == "patches" => Place { names, shape: vec![d, c.channels, c.patch, c.patch], linear: Some((fan_in, fan_out)) },
+        _ => Place { names, shape: vec![fan_out, fan_in], linear: Some((fan_in, fan_out)) },
+    }
+}
+
+/// `[rows, cols]` to `[cols, rows]`.
+fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0; data.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
+/// Write `model` into `dir` as a diffusers pipeline. `labels` names each
+/// class, in order: the words a prompt may use to ask for one.
+pub fn save(dir: &Path, model: &mut Dit, labels: &[&str]) -> io::Result<()> {
+    let c = model.config();
+    assert_eq!(labels.len(), c.classes, "{} labels for {} classes", labels.len(), c.classes);
+    for sub in ["transformer", "scheduler"] {
+        std::fs::create_dir_all(dir.join(sub))?;
+    }
+    let write = |path: &str, json: Json| std::fs::write(dir.join(path), format!("{json}\n"));
+
+    let labels = labels.iter().enumerate().map(|(i, &l)| (i.to_string(), Json::from(l))).collect();
+    write(
+        "model_index.json",
+        object([
+            ("_class_name", PIPELINE.into()),
+            ("transformer", Json::Array(vec!["diffusers".into(), TRANSFORMER.into()])),
+            ("scheduler", Json::Array(vec!["diffusers".into(), SCHEDULER.into()])),
+            ("id2label", Json::Object(labels)),
+        ]),
+    )?;
+    write(
+        "transformer/config.json",
+        object([
+            ("_class_name", TRANSFORMER.into()),
+            ("activation_fn", "gelu-approximate".into()),
+            ("attention_bias", Json::Bool(true)),
+            ("attention_head_dim", (c.d_model / c.n_heads).into()),
+            ("dropout", Json::Number(0.0)),
+            ("in_channels", c.channels.into()),
+            ("norm_elementwise_affine", Json::Bool(false)),
+            ("norm_eps", Json::Number(NORM_EPS as f64)),
+            ("norm_num_groups", 32usize.into()),
+            ("norm_type", "ada_norm_zero".into()),
+            ("num_attention_heads", c.n_heads.into()),
+            ("num_embeds_ada_norm", c.classes.into()),
+            ("num_layers", c.n_layers.into()),
+            // One number per pixel: a velocity. DiT's is twice that, because
+            // it also learns a variance.
+            ("out_channels", c.channels.into()),
+            ("patch_size", c.patch.into()),
+            ("sample_size", c.image.into()),
+            ("upcast_attention", Json::Bool(false)),
+        ]),
+    )?;
+    write(
+        "scheduler/scheduler_config.json",
+        object([
+            ("_class_name", SCHEDULER.into()),
+            ("num_train_timesteps", (TIMESTEP_SCALE as usize).into()),
+            ("shift", Json::Number(1.0)),
+        ]),
+    )?;
+
+    let mut tensors = Vec::new();
+    for p in model.params() {
+        let place = place(&p.name, &c);
+        let data = match place.linear {
+            Some((fan_in, fan_out)) => transpose(p.value, fan_in, fan_out),
+            None => p.value.to_vec(),
+        };
+        for name in place.names {
+            tensors.push(Tensor { name, shape: place.shape.clone(), data: data.clone() });
+        }
+    }
+    write_safetensors(&dir.join(WEIGHTS), &tensors)
+}
+
+/// Read back what [`save`] wrote: the model, and its labels in class order.
+pub fn load(dir: &Path) -> io::Result<(Dit, Vec<String>)> {
+    let read = |path: &str| -> io::Result<Json> {
+        let path = dir.join(path);
+        let text = std::fs::read_to_string(&path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        Json::parse(&text).map_err(|e| invalid(format!("{}: {e}", path.display())))
+    };
+    let index = read("model_index.json")?;
+    let transformer = read("transformer/config.json")?;
+    let scheduler = read("scheduler/scheduler_config.json")?;
+    let bad = |what: String| invalid(format!("{}: {what}", dir.display()));
+
+    let class = |json: &Json| json.get("_class_name").and_then(Json::as_str).map(str::to_string);
+    for (json, wanted) in [(&index, PIPELINE), (&transformer, TRANSFORMER), (&scheduler, SCHEDULER)] {
+        if class(json).as_deref() != Some(wanted) {
+            return Err(bad(format!("{:?} where {wanted} was expected", class(json))));
+        }
+    }
+    let number = |json: &Json, key: &str| match json.get(key) {
+        Some(Json::Number(n)) => Some(*n),
+        _ => None,
+    };
+    if number(&scheduler, "num_train_timesteps") != Some(TIMESTEP_SCALE as f64) || number(&scheduler, "shift") != Some(1.0) {
+        return Err(bad("a scheduler with other timesteps or a shift; only 1000 timesteps and a shift of 1 are drawn here".into()));
+    }
+    let text = |key: &str| transformer.get(key).and_then(Json::as_str);
+    let flag = |key: &str| transformer.get(key).cloned();
+    if text("norm_type") != Some("ada_norm_zero")
+        || text("activation_fn") != Some("gelu-approximate")
+        || flag("attention_bias") != Some(Json::Bool(true))
+        || flag("norm_elementwise_affine") != Some(Json::Bool(false))
+        || number(&transformer, "norm_eps").is_none_or(|e| (e - NORM_EPS as f64).abs() > 1e-12)
+    {
+        return Err(bad("a DiT built differently from this one (its norms, activation or attention bias)".into()));
+    }
+    let size = |key: &str| transformer.get(key).and_then(Json::as_usize).ok_or_else(|| bad(format!("no `{key}` in the transformer's config")));
+    let channels = size("in_channels")?;
+    if size("out_channels")? != channels {
+        return Err(bad(format!(
+            "{} output channels for {channels} in: a DiT that also learns a variance, which this one does not",
+            size("out_channels")?
+        )));
+    }
+    let heads = size("num_attention_heads")?;
     let config = DitConfig {
-        image: size("image_size")?,
-        channels: size("in_channels")?,
+        image: size("sample_size")?,
+        channels,
         patch: size("patch_size")?,
-        classes: size("num_classes")?,
-        d_model: size("d_model")?,
-        n_heads: size("n_heads")?,
-        n_layers: size("n_layers")?,
+        classes: size("num_embeds_ada_norm")?,
+        d_model: heads * size("attention_head_dim")?,
+        n_heads: heads,
+        n_layers: size("num_layers")?,
     };
+    let labels: Vec<String> = (0..config.classes)
+        .map(|i| index.get("id2label").and_then(|l| l.get(&i.to_string())).and_then(Json::as_str).map(str::to_string))
+        .collect::<Option<_>>()
+        .ok_or_else(|| bad(format!("`id2label` does not name all {} classes", config.classes)))?;
+
     let mut model = Dit::new(config, &mut Rng::new(0));
     let mut tensors: std::collections::HashMap<String, Tensor> =
-        read_safetensors(&dir.join(crate::checkpoint::WEIGHTS_FILE))?.into_iter().map(|t| (t.name.clone(), t)).collect();
+        read_safetensors(&dir.join(WEIGHTS))?.into_iter().map(|t| (t.name.clone(), t)).collect();
     for p in model.params() {
-        let t = tensors.remove(&p.name).ok_or_else(|| invalid(format!("{}: no tensor `{}`", dir.display(), p.name)))?;
-        if t.data.len() != p.value.len() {
-            return Err(invalid(format!("`{}` has {} numbers, and the config wants {}", p.name, t.data.len(), p.value.len())));
+        let place = place(&p.name, &config);
+        let mut found = Vec::new();
+        for name in &place.names {
+            let t = tensors.remove(name).ok_or_else(|| bad(format!("no tensor `{name}`")))?;
+            if t.shape != place.shape {
+                return Err(bad(format!("`{name}` is {:?}, and the config makes it {:?}", t.shape, place.shape)));
+            }
+            found.push(t);
         }
-        p.value.copy_from_slice(&t.data);
+        if let Some(other) = found.iter().position(|t| t.data != found[0].data) {
+            return Err(bad(format!(
+                "`{}` differs from `{}`: every block has an embedder of its own, and this model shares one",
+                place.names[other], place.names[0]
+            )));
+        }
+        let data = match place.linear {
+            Some((fan_in, fan_out)) => transpose(&found[0].data, fan_out, fan_in),
+            None => found.swap_remove(0).data,
+        };
+        p.value.copy_from_slice(&data);
     }
     if let Some(name) = tensors.keys().next() {
-        return Err(invalid(format!("{}: tensor `{name}` belongs to no parameter", dir.display())));
+        return Err(bad(format!("tensor `{name}` belongs to nothing in this model")));
     }
-    Ok(model)
+    Ok((model, labels))
 }
 
 #[cfg(test)]
@@ -830,26 +1026,154 @@ mod tests {
         }
     }
 
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nervus-dit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    const LABELS: [&str; 3] = ["cat", "dog", "fish"];
+
     #[test]
     fn a_saved_model_loads_and_draws_the_same() {
-        let dir = std::env::temp_dir().join(format!("nervus-dit-{}", std::process::id()));
+        let dir = scratch("roundtrip");
         let mut rng = Rng::new(75);
         let mut model = Dit::new(CONFIG, &mut rng);
         scramble(model.params(), &mut rng);
-        save(&dir, &mut model).unwrap();
-        let mut loaded = load(&dir).unwrap();
+        save(&dir, &mut model, &LABELS).unwrap();
+        let (mut loaded, labels) = load(&dir).unwrap();
         assert_eq!(loaded.config(), CONFIG);
+        assert_eq!(labels, LABELS);
 
         let x = random(CONFIG.pixels(), &mut rng);
         assert_eq!(model.forward(&x, 0.5, 1), loaded.forward(&x, 0.5, 1));
-
-        // A model trained for another objective is refused, not misread.
-        let config = dir.join(crate::checkpoint::CONFIG_FILE);
-        let text = std::fs::read_to_string(&config).unwrap().replace(OBJECTIVE, "ddpm");
-        std::fs::write(&config, text).unwrap();
-        let err = load(&dir).err().expect("a DDPM model was loaded as flow matching");
-        assert!(err.to_string().contains("ddpm"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The contract with diffusers: every name and shape a
+    /// `DiTTransformer2DModel` with this config has, and nothing else. Written
+    /// out by hand from diffusers' modules, not derived from `place`, so that
+    /// the two can disagree.
+    #[test]
+    fn the_file_holds_what_diffusers_expects_and_nothing_else() {
+        let dir = scratch("layout");
+        let mut model = Dit::new(CONFIG, &mut Rng::new(76));
+        save(&dir, &mut model, &LABELS).unwrap();
+        let tensors = read_safetensors(&dir.join(WEIGHTS)).unwrap();
+        let found: std::collections::BTreeMap<String, Vec<usize>> = tensors.into_iter().map(|t| (t.name, t.shape)).collect();
+
+        let (d, pl, c, p) = (CONFIG.d_model, CONFIG.patch_len(), CONFIG.channels, CONFIG.patch);
+        let mut wanted = std::collections::BTreeMap::new();
+        let mut linear = |name: String, fan_in: usize, fan_out: usize| {
+            wanted.insert(format!("{name}.weight"), vec![fan_out, fan_in]);
+            wanted.insert(format!("{name}.bias"), vec![fan_out]);
+        };
+        linear("proj_out_1".into(), d, 2 * d);
+        linear("proj_out_2".into(), d, pl);
+        for i in 0..CONFIG.n_layers {
+            let b = format!("transformer_blocks.{i}");
+            linear(format!("{b}.norm1.emb.timestep_embedder.linear_1"), FREQUENCIES, d);
+            linear(format!("{b}.norm1.emb.timestep_embedder.linear_2"), d, d);
+            linear(format!("{b}.norm1.linear"), d, 6 * d);
+            for q in ["to_q", "to_k", "to_v", "to_out.0"] {
+                linear(format!("{b}.attn1.{q}"), d, d);
+            }
+            linear(format!("{b}.ff.net.0.proj"), d, 4 * d);
+            linear(format!("{b}.ff.net.2"), 4 * d, d);
+        }
+        for i in 0..CONFIG.n_layers {
+            wanted.insert(format!("transformer_blocks.{i}.norm1.emb.class_embedder.embedding_table.weight"), vec![CONFIG.classes + 1, d]);
+        }
+        wanted.insert("pos_embed.proj.weight".into(), vec![d, c, p, p]);
+        wanted.insert("pos_embed.proj.bias".into(), vec![d]);
+        assert_eq!(found, wanted);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `[in, out]` here, `[out, in]` there: element `[i][o]` of ours is
+    /// element `[o][i]` of theirs. A save and load that both forgot would
+    /// round-trip perfectly, so check one weight against the file directly.
+    #[test]
+    fn a_weight_is_stored_the_way_pytorch_stores_it() {
+        let dir = scratch("transposed");
+        let mut model = Dit::new(CONFIG, &mut Rng::new(77));
+        scramble(model.params(), &mut Rng::new(78));
+        let ours = model.params().into_iter().find(|p| p.name == "blocks.1.mlp.0.weight").unwrap().value.to_vec();
+        save(&dir, &mut model, &LABELS).unwrap();
+        let theirs = read_safetensors(&dir.join(WEIGHTS)).unwrap().into_iter().find(|t| t.name == "transformer_blocks.1.ff.net.0.proj.weight").unwrap();
+        let (fan_in, fan_out) = (CONFIG.d_model, 4 * CONFIG.d_model);
+        assert_eq!(theirs.shape, vec![fan_out, fan_in]);
+        for (i, o) in [(0, 1), (3, 17), (fan_in - 1, fan_out - 1)] {
+            assert_eq!(ours[i * fan_out + o], theirs.data[o * fan_in + i]);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What `load` refuses, each by name: another scheduler (so another
+    /// objective), a DiT that learns a variance, and blocks with embedders
+    /// of their own.
+    #[test]
+    fn a_model_this_one_cannot_be_is_refused_by_name() {
+        let dir = scratch("refused");
+        let mut model = Dit::new(CONFIG, &mut Rng::new(79));
+        let refusal = |edit: &dyn Fn(&Path)| -> String {
+            let _ = std::fs::remove_dir_all(&dir);
+            save(&dir, &mut Dit::new(CONFIG, &mut Rng::new(79)), &LABELS).unwrap();
+            edit(&dir);
+            load(&dir).err().expect("loaded a model it should have refused").to_string()
+        };
+        let rewrite = |path: &Path, from: &str, to: &str| {
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains(from), "{from} is not in {}", path.display());
+            std::fs::write(path, text.replace(from, to)).unwrap();
+        };
+
+        let err = refusal(&|d| rewrite(&d.join("scheduler/scheduler_config.json"), SCHEDULER, "DDPMScheduler"));
+        assert!(err.contains("DDPMScheduler"), "{err}");
+        let err = refusal(&|d| rewrite(&d.join("transformer/config.json"), "\"out_channels\":2", "\"out_channels\":4"));
+        assert!(err.contains("variance"), "{err}");
+
+        let err = refusal(&|d| {
+            let path = d.join(WEIGHTS);
+            let mut tensors = read_safetensors(&path).unwrap();
+            let t = tensors.iter_mut().find(|t| t.name == "transformer_blocks.1.norm1.emb.timestep_embedder.linear_1.bias").unwrap();
+            t.data[0] += 1.0;
+            write_safetensors(&path, &tensors).unwrap();
+        });
+        assert!(err.contains("embedder of its own"), "{err}");
+
+        // And the one it can: untouched, it loads.
+        save(&dir, &mut model, &LABELS).unwrap();
+        assert!(load(&dir).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// nervus's DiT against diffusers' on the same saved model: the file
+    /// layout, the timestep's frequencies, the positions, the norms' eps and
+    /// the patch orders all have to be right for these to agree. See
+    /// `scripts/dit-fixtures.py`, which writes the reference.
+    #[test]
+    #[ignore]
+    fn agrees_with_diffusers() {
+        let (Some(model), Some(fixtures)) = (std::env::var_os("KVAD_DIT_MODEL"), std::env::var_os("KVAD_DIT_FIXTURES")) else {
+            panic!("set KVAD_DIT_MODEL and KVAD_DIT_FIXTURES; see scripts/dit-fixtures.py");
+        };
+        let (mut dit, _) = load(Path::new(&model)).unwrap();
+        let fx: std::collections::HashMap<String, Vec<f32>> =
+            read_safetensors(Path::new(&fixtures)).unwrap().into_iter().map(|t| (t.name, t.data)).collect();
+        let x = &fx["x"];
+        let mut case = 0;
+        while let Some(expected) = fx.get(&format!("case.{case}.out")) {
+            let t = fx[&format!("case.{case}.t")][0];
+            let label = fx[&format!("case.{case}.label")][0] as usize;
+            let ours = dit.forward(x, t, label);
+            let worst = ours.iter().zip(expected).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            let size = expected.iter().map(|v| v.abs()).fold(0.0, f32::max);
+            println!("case {case}: t {t}, label {label}: worst difference {worst:e}, largest output {size}");
+            assert!(worst < 1e-4 * size.max(1.0), "case {case}: nervus and diffusers differ by {worst}");
+            case += 1;
+        }
+        assert!(case > 0, "no cases in {}", fixtures.to_string_lossy());
     }
 
     const NUDGE: f32 = 1e-2;

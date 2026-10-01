@@ -93,7 +93,7 @@ pub async fn models(_: Identity, St(state): St<State>) -> Result<Json<serde_json
         all.extend(
             kvad::hub::trained_models()
                 .into_iter()
-                .filter(|m| m.complete && m.arch.is_some())
+                .filter(|m| runs(m))
                 .map(listed(true)),
         );
         Ok(all)

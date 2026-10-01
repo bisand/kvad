@@ -257,9 +257,15 @@ pub(crate) fn checkpointed(
     let last = leaves(&states.pop().expect("the last state"))?;
     let value = loss(&tensors(&last))?;
     let mut total = value.backward()?;
-    let mut g = found(&last, &total)?;
+    let g = found(&last, &total)?;
+    // The loss as a number, and nothing of how it was made.
+    let value = value.detach();
+    for v in &last {
+        total.remove(v.as_tensor());
+    }
     drop(last);
     settle()?;
+    let mut g = rehomed(g)?;
 
     for stretch in stretches.iter().rev() {
         let from = leaves(&states.pop().expect("a state for each stretch"))?;
@@ -267,27 +273,65 @@ pub(crate) fn checkpointed(
         if out.len() != g.len() {
             candle_core::bail!("checkpointing: a stretch left {} tensors this time and {} the first", out.len(), g.len());
         }
-        // In f32: a sum over a whole feature map of half-precision products
-        // is past what half precision holds.
+        // A tensor the stretch handed on untouched, a UNet's waiting skip,
+        // takes its gradient as it is. The rest are weighed, in f32: a sum
+        // over a whole feature map of half-precision products is past what
+        // half precision holds.
+        let mut passed: Vec<Option<Tensor>> = vec![None; from.len()];
         let mut weighed = Tensor::zeros((), DType::F32, value.device())?;
         for (o, g) in out.iter().zip(&g) {
-            weighed = (weighed + (o.to_dtype(DType::F32)? * g.to_dtype(DType::F32)?)?.sum_all()?)?;
-        }
-        let store = weighed.backward()?;
-        for v in vars {
-            if let Some(more) = store.get(v.as_tensor()) {
-                let sum = match total.get(v.as_tensor()) {
-                    Some(have) => (have + more)?.detach(),
-                    None => more.detach(),
-                };
-                total.insert(v.as_tensor(), sum);
+            match from.iter().position(|v| v.as_tensor().id() == o.id()) {
+                Some(at) => {
+                    passed[at] = Some(match passed[at].take() {
+                        Some(p) => (p + g)?,
+                        None => g.clone(),
+                    })
+                }
+                None => weighed = (weighed + (o.to_dtype(DType::F32)? * g.to_dtype(DType::F32)?)?.sum_all()?)?,
             }
         }
-        g = found(&from, &store)?;
-        drop((store, out, from));
+        let store = weighed.backward()?;
+        let (which, mut kept): (Vec<usize>, Vec<Tensor>) = vars.iter().enumerate().filter_map(|(i, v)| store.get(v.as_tensor()).map(|g| (i, g.detach()))).unzip();
+        for (g, p) in found(&from, &store)?.into_iter().zip(passed) {
+            kept.push(match p {
+                Some(p) => (g + p)?,
+                None => g,
+            });
+        }
+        // The record goes, all of it: `weighed` is its root, and holds
+        // every tensor the stretch made for as long as it lives.
+        drop((store, weighed, out, from));
         settle()?;
+        let mut kept = rehomed(kept)?;
+        g = kept.split_off(which.len());
+        for (i, more) in which.into_iter().zip(kept) {
+            let v = vars[i].as_tensor();
+            let sum = match total.get(v) {
+                Some(have) => (have + more)?,
+                None => more,
+            };
+            total.insert(v, sum);
+        }
     }
-    Ok((value.detach(), total))
+    Ok((value, total))
+}
+
+/// `kept`, each copied into a buffer of its own size, and the originals
+/// let go. To be called straight after `settle`.
+///
+/// What `backward` leaves is small and lives long: a LoRA factor's gradient
+/// is some kilobytes, and is wanted until the optimiser has read it. But
+/// candle's Metal allocator hands a new tensor the smallest *free* buffer
+/// that will hold it, and during `backward` the free ones are the last
+/// activations', megabytes each. So each kept gradient sat in one of those
+/// and held it: SDXL's 1120 held 4 GB between them at 480×480, by the end
+/// of a step, where they are 93 MB. Straight after a `settle` nothing is
+/// free, so a copy made then is given a buffer of its own; and once every
+/// copy is made the originals go, and the buffers they held are free for
+/// the next stretch to use, and let go at its `settle`.
+fn rehomed(kept: Vec<Tensor>) -> candle_core::Result<Vec<Tensor>> {
+    // `affine(1, 0)` writes a new buffer; `copy` on Metal shares the old.
+    kept.iter().map(|t| t.affine(1.0, 0.0)).collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -44,7 +44,7 @@
 //! 576.
 
 use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{ops, rotary_emb};
+use candle_nn::ops;
 
 /// Whether this device runs the kernels here.
 pub(crate) fn available(device: &Device) -> bool {
@@ -73,7 +73,10 @@ fn type_name(dt: DType) -> Option<&'static str> {
 /// at offset zero: it goes straight into a projection, and candle's quantised
 /// matmul does not honour an offset (see `Proj::forward`).
 pub(crate) fn add_rms_norm(x: &Tensor, d: &Tensor, w: &Tensor, eps: f32) -> candle_core::Result<(Tensor, Tensor)> {
-    let fits = available(x.device())
+    // The kernels here have no backward; candle's operations below have
+    // (`grad`).
+    let fits = !crate::grad::tracked(&[x, d, w])
+        && available(x.device())
         && type_name(x.dtype()).is_some()
         && d.dtype() == x.dtype()
         && w.dtype() == x.dtype()
@@ -84,7 +87,7 @@ pub(crate) fn add_rms_norm(x: &Tensor, d: &Tensor, w: &Tensor, eps: f32) -> cand
         && w.is_contiguous();
     if !fits {
         let sum = (x + d)?;
-        return Ok((ops::rms_norm(&sum, w, eps)?, sum));
+        return Ok((crate::grad::rms_norm(&sum, w, eps)?, sum));
     }
     metal::add_rms_norm(x, d, w, eps)
 }
@@ -96,7 +99,8 @@ pub(crate) fn add_rms_norm(x: &Tensor, d: &Tensor, w: &Tensor, eps: f32) -> cand
 /// `silu(gate) * up`, where `gu` is `[.., 2n]`: the gate's `n` columns, then
 /// the up projection's, as [`crate::common::Loader::proj_cat`] merges them.
 pub(crate) fn silu_mul(gu: &Tensor, n: usize) -> candle_core::Result<Tensor> {
-    let fits = available(gu.device())
+    let fits = !gu.track_op()
+        && available(gu.device())
         && type_name(gu.dtype()).is_some()
         && gu.dim(D::Minus1)? == 2 * n
         && gu.is_contiguous();
@@ -136,7 +140,8 @@ pub(crate) fn rope_cache_fits(qkv: &Tensor, heads: &Heads, cos: &Tensor, sin: &T
         t.is_none_or(|t| t.dtype() == dt && t.is_contiguous() && t.dims() == [len])
     };
     let Ok((m, width)) = qkv.dims2() else { return false };
-    available(qkv.device())
+    !crate::grad::tracked(&[qkv, cos, sin])
+        && available(qkv.device())
         && type_name(dt).is_some()
         && type_name(cache).is_some()
         && type_name(q).is_some()
@@ -205,8 +210,8 @@ pub(crate) fn heads(
     let k = k.transpose(1, 2)?.contiguous()?;
     let v = v.transpose(1, 2)?.contiguous()?;
 
-    let q = rotary_emb::rope(&q, cos, sin)?;
-    let k = rotary_emb::rope(&k, cos, sin)?;
+    let q = crate::grad::rope(&q, cos, sin)?;
+    let k = crate::grad::rope(&k, cos, sin)?;
     Ok((q, k, v))
 }
 
@@ -221,7 +226,7 @@ pub(crate) fn heads(
 fn norm_heads(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> candle_core::Result<Tensor> {
     match weight {
         None => Ok(x.clone()),
-        Some(w) => ops::rms_norm(&x.contiguous()?, w, eps),
+        Some(w) => crate::grad::rms_norm(&x.contiguous()?, w, eps),
     }
 }
 
@@ -854,7 +859,7 @@ mod tests {
                 let (norm, sum) = add_rms_norm(&x, &d, &w, 1e-6).unwrap();
                 assert_eq!(ran(), before + 1, "the kernel did not run");
                 let want_sum = (&x + &d).unwrap();
-                let want = ops::rms_norm(&want_sum, &w, 1e-6).unwrap();
+                let want = crate::grad::rms_norm(&want_sum, &w, 1e-6).unwrap();
                 assert_eq!(off(&sum, &want_sum), 0.0, "{dt:?} [{m}, {e}]: the sum is one rounding either way");
                 let got = off(&norm, &want);
                 assert!(got < 2.0 * ulp(dt), "{dt:?} [{m}, {e}]: the norm is off by {got}");

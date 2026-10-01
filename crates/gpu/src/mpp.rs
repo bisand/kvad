@@ -670,6 +670,11 @@ impl Blocks {
     /// The bias and GELU are applied to the f32 sum as the kernel stores
     /// it, and it is rounded once, to `out`.
     pub(crate) fn linear(&self, x: &Tensor, bias: Option<&Tensor>, out: DType, gelu: bool) -> candle_core::Result<Tensor> {
+        // No backward yet, and no other reader of these blocks to hand a
+        // tensor that wants one (`grad`).
+        if x.track_op() || bias.is_some_and(|b| b.track_op()) {
+            return Err(crate::grad::refuse("mpp_q8_0"));
+        }
         let dims = x.dims().to_vec();
         let rows: usize = dims[..dims.len() - 1].iter().product();
         // The kernel reads bf16 as it is and rounds it to f16 itself.
@@ -823,6 +828,7 @@ const BIG_TILE_ROWS: usize = 1024;
 /// `x` is `[m, k]`, `w` is `[k, n]`, both f16 or both bf16. `None` means
 /// any of these, and the caller runs `x.matmul(w)` as it always has:
 /// - the device cannot run the kernel;
+/// - `x` or `w` is being differentiated: the kernel has no backward;
 /// - the dtype is f32, which `matmul2d` takes but does not accelerate;
 /// - `m` is below [`DENSE_ROWS`], a decode step above all, where a
 ///   matrix-vector kernel is the right tool and a matrix unit is not.
@@ -835,7 +841,9 @@ pub(crate) fn dense(x: &Tensor, w: &Tensor) -> candle_core::Result<Option<Tensor
 }
 
 fn dense_declines(x: &Tensor, w: &Tensor, rows: usize) -> candle_core::Result<bool> {
-    Ok(pipes(x.device()).is_none()
+    // The kernel has no backward, and candle's matmul has (`grad`).
+    Ok(crate::grad::tracked(&[x, w])
+        || pipes(x.device()).is_none()
         || x.rank() != 2
         || w.rank() != 2
         || x.dtype() != w.dtype()
@@ -862,7 +870,7 @@ fn dense_declines(x: &Tensor, w: &Tensor, rows: usize) -> candle_core::Result<bo
 /// product into it beat the product and candle's broadcast add by 1.65–7×
 /// (`dense_bias_race`).
 pub(crate) fn dense_bias(x: &Tensor, w: &Tensor, b: &Tensor) -> candle_core::Result<Option<Tensor>> {
-    if dense_declines(x, w, 1)? || b.elem_count() != w.dim(1)? {
+    if dense_declines(x, w, 1)? || b.track_op() || b.elem_count() != w.dim(1)? {
         return Ok(None);
     }
     let tile = usize::from(x.dim(0)? >= BIG_TILE_ROWS);
@@ -894,6 +902,7 @@ fn dense_bias_with(x: &Tensor, w: &Tensor, b: &Tensor, tile: usize) -> candle_co
 /// (`lora::cost`).
 pub(crate) fn dense_acc(c: &Tensor, x: &Tensor, w: &Tensor) -> candle_core::Result<bool> {
     if dense_declines(x, w, DENSE_ROWS)?
+        || c.track_op()
         || c.dims() != [x.dim(0)?, w.dim(1)?]
         || !(c.dtype() == x.dtype() || c.dtype() == DType::F32)
         || !c.is_contiguous()

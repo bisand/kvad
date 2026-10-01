@@ -32,7 +32,6 @@ use crate::gguf::Gguf;
 use crate::qcache::Vault;
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Tensor, D};
-use candle_nn::ops;
 use kvad::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use kvad::serde_json::{json, Value};
 use kvad::weights::{fetch_file, Watcher};
@@ -197,28 +196,28 @@ impl TextEncoder {
 
         let group = self.heads / self.kv_heads;
         for layer in &self.layers {
-            let h = ops::rms_norm(&x, &layer.ln1, self.eps)?;
+            let h = crate::grad::rms_norm(&x, &layer.ln1, self.eps)?;
             let split = |t: Tensor, n: usize| -> candle_core::Result<Tensor> {
                 t.reshape((1, l, n, self.head_dim))?.transpose(1, 2)?.contiguous()
             };
-            let q = candle_nn::rotary_emb::rope(&split(layer.q.forward(&h)?, self.heads)?, &cos, &sin)?;
-            let k = candle_nn::rotary_emb::rope(&split(layer.k.forward(&h)?, self.kv_heads)?, &cos, &sin)?;
+            let q = crate::grad::rope(&split(layer.q.forward(&h)?, self.heads)?, &cos, &sin)?;
+            let k = crate::grad::rope(&split(layer.k.forward(&h)?, self.kv_heads)?, &cos, &sin)?;
             let v = split(layer.v.forward(&h)?, self.kv_heads)?;
             // Grouped-query attention, the way `model.rs` does it: fold the
             // query heads that share a KV head into one batch of rows.
             let qg = q.reshape((1, self.kv_heads, group * l, self.head_dim))?;
             let att = (qg.matmul(&k.transpose(2, 3)?.contiguous()?)?.to_dtype(DType::F32)? / (self.head_dim as f64).sqrt())?;
             let att = att.reshape((1, self.heads, l, l))?.broadcast_add(&mask)?;
-            let att = ops::softmax_last_dim(&att)?.to_dtype(dtype)?.reshape((1, self.kv_heads, group * l, l))?;
+            let att = crate::grad::softmax_last_dim(&att)?.to_dtype(dtype)?.reshape((1, self.kv_heads, group * l, l))?;
             let a = att.matmul(&v)?.reshape((1, self.heads, l, self.head_dim))?;
             let a = a.transpose(1, 2)?.contiguous()?.reshape((1, l, self.heads * self.head_dim))?;
             x = (x + layer.o.forward(&a)?)?;
 
-            let h = ops::rms_norm(&x, &layer.ln2, self.eps)?;
+            let h = crate::grad::rms_norm(&x, &layer.ln2, self.eps)?;
             let g = (candle_nn::ops::silu(&layer.gate.forward(&h)?)? * layer.up.forward(&h)?)?;
             x = (x + layer.down.forward(&g)?)?;
         }
-        Ok(ops::rms_norm(&x, &self.norm, self.eps)?)
+        Ok(crate::grad::rms_norm(&x, &self.norm, self.eps)?)
     }
 }
 
@@ -317,7 +316,7 @@ impl Dit {
         let dtype = x.dtype();
         let (n_img, n_txt) = (x.dim(1)?, txt.dim(1)?);
         let mut img = self.img_in.forward(x)?;
-        let mut txt = self.txt_in.forward(&ops::rms_norm(txt, &self.txt_norm, 1e-6)?)?;
+        let mut txt = self.txt_in.forward(&crate::grad::rms_norm(txt, &self.txt_norm, 1e-6)?)?;
 
         // The model multiplies σ by 1000 before embedding it, as a timestep.
         let t = timestep_embedding(&[sigma * 1000.0], 256, true, 0.0, dev)?.to_dtype(dtype)?;

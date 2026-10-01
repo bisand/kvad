@@ -36,6 +36,16 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// kernel reads itself. It is what [`Loader::accelerated`] gives, and only
 /// the image and video pipelines ask for it; `mpp` says why a language model
 /// cannot.
+/// candle's product with a quantised matrix, which records no backward; or,
+/// for an `x` that is being differentiated, the same product with one
+/// ([`crate::grad::Frozen`]).
+fn quant(q: &QMatMul, x: &Tensor) -> candle_core::Result<Tensor> {
+    match q {
+        QMatMul::QTensor(t) if x.track_op() => x.apply_op1(crate::grad::Frozen(t.clone())),
+        _ => q.forward(x),
+    }
+}
+
 pub(crate) enum Proj {
     Dense(Tensor),
     Quant(QMatMul),
@@ -71,9 +81,9 @@ impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<T
             // LTX-2.5's DiT, so the input is widened, which also lays it out
             // afresh. The answer is f32, as a Q8_0 matrix's on the M5's
             // matrix units is.
-            Proj::Quant(q) if x.dtype() != candle_core::DType::F32 => q.forward(&x.to_dtype(candle_core::DType::F32)?),
-            Proj::Quant(q) if x.layout().start_offset() != 0 => q.forward(&x.force_contiguous()?),
-            Proj::Quant(q) => q.forward(x),
+            Proj::Quant(q) if x.dtype() != candle_core::DType::F32 => quant(q, &x.to_dtype(candle_core::DType::F32)?),
+            Proj::Quant(q) if x.layout().start_offset() != 0 => quant(q, &x.force_contiguous()?),
+            Proj::Quant(q) => quant(q, x),
             // Casts to f16 on the way in, which lays the rows out afresh:
             // the offset bug above cannot reach it.
             #[cfg(target_os = "macos")]

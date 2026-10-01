@@ -110,7 +110,7 @@ impl DurationHead {
         let split = |t: &Tensor, n: usize| t.reshape((n, self.heads, d))?.transpose(0, 1)?.contiguous();
         let (q, k, val) = (split(&q, 1)?, split(&k, n)?, split(&val, n)?);
         let scores = (q.matmul(&k.transpose(1, 2)?)? / (d as f64).sqrt())?;
-        let p = candle_nn::ops::softmax_last_dim(&scores)?;
+        let p = crate::grad::softmax_last_dim(&scores)?;
         let pooled = p.matmul(&val)?.transpose(0, 1)?.reshape((1, width))?;
         let pooled = self.out.forward(&pooled)?;
         let h = self.hidden.forward(&pooled)?.gelu()?;

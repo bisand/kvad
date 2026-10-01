@@ -249,7 +249,7 @@ impl Gemma {
         let (k, v) = (share(k)?, share(v)?);
         // Scale 1: the per-head norms' weights set the temperature.
         let scores = q.to_dtype(DType::F32)?.matmul(&k.to_dtype(DType::F32)?.t()?.contiguous()?)?.broadcast_add(mask)?;
-        let att = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
+        let att = crate::grad::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
         let o = att.matmul(&v)?.transpose(0, 1)?.contiguous()?.reshape((n, h * d))?;
         let x = (x + l.post_attn_ln.forward(&self.lin(&l.o, &o)?)?)?;
 

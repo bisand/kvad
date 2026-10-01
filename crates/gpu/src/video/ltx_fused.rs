@@ -54,13 +54,15 @@ fn type_name(dt: DType) -> Option<&'static str> {
 }
 
 /// Whether a kernel can read `t`: on a device with the kernels, in a dtype
-/// they were built for, and laid out in one run.
+/// they were built for, laid out in one run, and not being differentiated:
+/// the kernels have no backward, and the chains they stand in for have
+/// (`crate::grad`).
 fn readable(t: &Tensor) -> bool {
     #[cfg(target_os = "macos")]
     let on = kernels(t.device()).is_some();
     #[cfg(not(target_os = "macos"))]
     let on = false;
-    on && type_name(t.dtype()).is_some() && t.is_contiguous()
+    on && type_name(t.dtype()).is_some() && t.is_contiguous() && !t.track_op()
 }
 
 /// Rows of `e` numbers in `x`'s dtype: one, as `[e]` or `[1, e]`; or two,
@@ -252,6 +254,7 @@ pub(crate) fn norm_rope(x: &Tensor, w: &Tensor, rope: Option<(&Tensor, &Tensor)>
     let fits = readable(x)
         && type_name(dt).is_some()
         && w.dtype() == DType::F32
+        && !w.track_op()
         && w.is_contiguous()
         && w.elem_count() == width
         && width % (2 * heads) == 0

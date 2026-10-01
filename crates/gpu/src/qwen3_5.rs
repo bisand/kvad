@@ -28,7 +28,7 @@ use crate::ffn::{Ffn, Mlp, Moe};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{ops, rotary_emb, VarBuilder};
+use candle_nn::{ops, VarBuilder};
 use kvad::model::ffn::{Layout, Router};
 use kvad::model::qwen3_5::{Delta, Family, Kind};
 use kvad::model::{Session, Spec};
@@ -407,7 +407,7 @@ impl GpuQwen35 {
 
         // The gated norm scales by `w` itself — not by `1 + w`, which is what
         // every *other* norm in this architecture does.
-        let out = ops::rms_norm(&out.contiguous()?, &net.norm, self.spec.eps)?;
+        let out = crate::grad::rms_norm(&out.contiguous()?, &net.norm, self.spec.eps)?;
         let out = out.mul(&ops::silu(&z)?)?;
 
         let out = net.out.forward(&out.reshape((1, d.value_dim))?)?;
@@ -426,9 +426,9 @@ impl GpuQwen35 {
         let q = qg.narrow(2, 0, hd)?.contiguous()?;
         let gate = qg.narrow(2, hd, hd)?.contiguous()?.reshape((1, nh * hd))?;
 
-        let q = ops::rms_norm(&q, &attn.q_norm, spec.eps)?.reshape((1, 1, nh, hd))?;
+        let q = crate::grad::rms_norm(&q, &attn.q_norm, spec.eps)?.reshape((1, 1, nh, hd))?;
         let k = linear(h, &attn.k, None)?.reshape((1, 1, nkv, hd))?;
-        let k = ops::rms_norm(&k.contiguous()?, &attn.k_norm, spec.eps)?;
+        let k = crate::grad::rms_norm(&k.contiguous()?, &attn.k_norm, spec.eps)?;
         let v = linear(h, &attn.v, None)?.reshape((1, 1, nkv, hd))?;
 
         // Partial RoPE: the first `rope_dim` of each head rotates, the rest
@@ -438,7 +438,7 @@ impl GpuQwen35 {
         let part = |t: &Tensor| -> candle_core::Result<Tensor> {
             let t = t.transpose(1, 2)?.contiguous()?;
             let rot = t.narrow(3, 0, self.rope_dim)?.contiguous()?;
-            let rot = rotary_emb::rope(&rot, &cos, &sin)?;
+            let rot = crate::grad::rope(&rot, &cos, &sin)?;
             match self.rope_dim == hd {
                 true => Ok(rot),
                 false => {
@@ -483,7 +483,7 @@ impl GpuQwen35 {
             let mut x = self.embed.rows(&ids)?.to_dtype(self.dtype)?;
 
             for l in 0..self.blocks.len() {
-                let h = ops::rms_norm(&x, &self.blocks[l].attn_norm, spec.eps)?;
+                let h = crate::grad::rms_norm(&x, &self.blocks[l].attn_norm, spec.eps)?;
                 let mixed = match &self.blocks[l].mixer {
                     Mixer::Full(attn) => {
                         // Lent out for the step: `full_step` reads the rest
@@ -502,12 +502,12 @@ impl GpuQwen35 {
                 x = (x + mixed)?;
 
                 let b = &self.blocks[l];
-                let h = ops::rms_norm(&x, &b.mlp_norm, spec.eps)?;
+                let h = crate::grad::rms_norm(&x, &b.mlp_norm, spec.eps)?;
                 x = (x + b.mlp.forward(&h, 1, spec.n_embd)?)?;
             }
             self.pos += 1;
 
-            let h = ops::rms_norm(&x, &self.final_norm, spec.eps)?;
+            let h = crate::grad::rms_norm(&x, &self.final_norm, spec.eps)?;
             let logits = self.head.forward(&h)?.to_dtype(DType::F32)?;
             last = logits.flatten_all()?.to_vec1::<f32>()?;
         }

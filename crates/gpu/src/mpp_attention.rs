@@ -292,7 +292,11 @@ pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize, gate: 
         _ => q.dim(q.rank() - 1)? / heads.max(1),
     };
     let (qr, kr, vr) = (rows_of(q.layout(), heads, d), rows_of(k.layout(), heads, d), rows_of(v.layout(), heads, d));
-    if kernels(q.device()).is_none()
+    // No backward: a tensor being differentiated goes to the caller's own
+    // attention, which has one (`grad`).
+    if crate::grad::tracked(&[q, k, v])
+        || gate.is_some_and(|g| g.track_op())
+        || kernels(q.device()).is_none()
         || !matches!(q.dtype(), DType::F16 | DType::BF16)
         || k.dtype() != q.dtype()
         || v.dtype() != q.dtype()

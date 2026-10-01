@@ -171,8 +171,8 @@ impl Single {
         let h = modulate(x, &shift, &scale)?;
 
         let heads_of = |t: Tensor| -> candle_core::Result<Tensor> { t.reshape((1, x.dim(1)?, s.heads, s.head_dim)) };
-        let q = rotate(ops::rms_norm(&heads_of(self.q.forward(&h)?)?.contiguous()?, &self.norm_q, 1e-6)?, rope)?;
-        let k = rotate(ops::rms_norm(&heads_of(self.k.forward(&h)?)?.contiguous()?, &self.norm_k, 1e-6)?, rope)?;
+        let q = rotate(crate::grad::rms_norm(&heads_of(self.q.forward(&h)?)?.contiguous()?, &self.norm_q, 1e-6)?, rope)?;
+        let k = rotate(crate::grad::rms_norm(&heads_of(self.k.forward(&h)?)?.contiguous()?, &self.norm_k, 1e-6)?, rope)?;
         let v = heads_of(self.v.forward(&h)?)?.transpose(1, 2)?.contiguous()?;
         let a = attend(s, &q, &k, &v)?;
         let mlp = self.mlp.forward(&h)?.gelu()?;
@@ -205,8 +205,8 @@ fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> candle_core::Result<T
 fn qkv(s: Shape, st: &Stream, x: &Tensor, rope: (&Tensor, &Tensor)) -> candle_core::Result<[Tensor; 3]> {
     let n = x.dim(1)?;
     let heads_of = |t: Tensor| t.reshape((1, n, s.heads, s.head_dim));
-    let q = ops::rms_norm(&heads_of(st.q.forward(x)?)?.contiguous()?, &st.norm_q, 1e-6)?;
-    let k = ops::rms_norm(&heads_of(st.k.forward(x)?)?.contiguous()?, &st.norm_k, 1e-6)?;
+    let q = crate::grad::rms_norm(&heads_of(st.q.forward(x)?)?.contiguous()?, &st.norm_q, 1e-6)?;
+    let k = crate::grad::rms_norm(&heads_of(st.k.forward(x)?)?.contiguous()?, &st.norm_k, 1e-6)?;
     let v = heads_of(st.v.forward(x)?)?;
     Ok([rotate(q, rope)?, rotate(k, rope)?, v.transpose(1, 2)?.contiguous()?])
 }
@@ -215,14 +215,15 @@ fn qkv(s: Shape, st: &Stream, x: &Tensor, rope: (&Tensor, &Tensor)) -> candle_co
 /// pairs — `(x₀, x₁)`, `(x₂, x₃)` … — which is both models' convention and
 /// not the halves convention the Llama family uses.
 fn rotate(t: Tensor, (cos, sin): (&Tensor, &Tensor)) -> candle_core::Result<Tensor> {
-    candle_nn::rotary_emb::rope_i(&t.transpose(1, 2)?.contiguous()?, cos, sin)
+    crate::grad::rope_i(&t.transpose(1, 2)?.contiguous()?, cos, sin)
 }
 
 /// Unmasked attention over `[1, heads, tokens, d]`, back to `[1, tokens,
 /// heads·d]`.
 fn attend(s: Shape, q: &Tensor, k: &Tensor, v: &Tensor) -> candle_core::Result<Tensor> {
     let scale = 1.0 / (s.head_dim as f64).sqrt();
-    let a = match q.device().is_metal() {
+    // candle's kernel has no backward; the written-out attention has.
+    let a = match q.device().is_metal() && !crate::grad::tracked(&[q, k, v]) {
         true => ops::sdpa(q, k, v, None, false, scale as f32, 1.0)?,
         false => super::nn::written_out(q, k, v, scale)?,
     };

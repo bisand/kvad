@@ -357,7 +357,9 @@ pub(crate) fn neighbourhood(q: &Tensor, k: &Tensor, v: &Tensor, grid: [usize; 3]
     let (n, width) = q.dims2()?;
     let d = width / heads.max(1);
     let fits = (0..3).all(|a| kernel[a] >= 1 && kernel[a] <= grid[a]);
-    if kernels(q.device()).is_none()
+    // No backward: see `grad`.
+    if crate::grad::tracked(&[q, k, v])
+        || kernels(q.device()).is_none()
         || !matches!(q.dtype(), DType::F16 | DType::BF16)
         || k.dtype() != q.dtype()
         || v.dtype() != q.dtype()
@@ -392,7 +394,8 @@ pub(crate) fn neighbourhood_joint(q: &Tensor, k: &Tensor, v: &Tensor, grid: [usi
     let d = width / heads.max(1);
     let plane = grid[1] * grid[2];
     let planes = pk.dim(0)? / plane.max(1);
-    if kernels(q.device()).is_none()
+    if crate::grad::tracked(&[q, k, v, pk, pv])
+        || kernels(q.device()).is_none()
         || !matches!(q.dtype(), DType::F16 | DType::BF16)
         || [k, v, pk, pv].iter().any(|t| t.dtype() != q.dtype())
         || !matches!(d, 64 | 128)

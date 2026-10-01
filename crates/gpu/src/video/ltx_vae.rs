@@ -205,7 +205,7 @@ impl VideoDecoder {
                 let y = if fail == Some(last) { y.zeros_like()? } else { y };
                 check_stage(&y, "conv decoder", last)?;
                 let y = ((unpatchify(&y, p)?.to_dtype(DType::F32)? + 1.0)? * 0.5)?;
-                frames.slice_set(&y, 0, f)?;
+                crate::grad::slice_set(&frames, &y, 0, f)?;
             }
             Ok(())
         })?;
@@ -276,7 +276,7 @@ fn residual_in(x: &Tensor, c1: &Conv3d, c2: &Conv3d, budget: usize) -> candle_co
         let (a, b) = (f.saturating_sub(before), (f + n + after).min(t));
         let h = c1.frames(&norm_silu(&halo(x, f, n, (2 * before, 2 * after))?, EPS)?, (f.saturating_sub(2 * before), t), (a, b))?;
         let h = c2.frames(&norm_silu(&h, EPS)?, (a, t), (f, f + n))?;
-        out.slice_set(&(x.narrow(0, f, n)? + h)?, 0, f)?;
+        crate::grad::slice_set(&out, &(x.narrow(0, f, n)? + h)?, 0, f)?;
     }
     Ok(out)
 }
@@ -296,8 +296,8 @@ fn up(x: &Tensor, conv: &Conv3d, stride: [usize; 3], c: usize) -> candle_core::R
     for (f, n) in parts {
         let y = unfold(&conv.frames(&halo(x, f, n, (1, 1))?, (f.saturating_sub(1), t), (f, f + n))?, stride, c)?;
         match (f, drop) {
-            (0, 1) => out.slice_set(&y.narrow(0, 1, n * p1 - 1)?, 0, 0)?,
-            _ => out.slice_set(&y, 0, f * p1 - drop)?,
+            (0, 1) => crate::grad::slice_set(&out, &y.narrow(0, 1, n * p1 - 1)?, 0, 0)?,
+            _ => crate::grad::slice_set(&out, &y, 0, f * p1 - drop)?,
         }
     }
     Ok(out)

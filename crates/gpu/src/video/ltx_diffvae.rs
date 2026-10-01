@@ -432,7 +432,7 @@ fn by_runs(n: usize, width: usize, dtype: DType, device: &Device, spans: &[(usiz
     let out = blank(&[n, width], dtype, device)?;
     for &(t0, t1) in spans {
         let y = f(t0 * plane, (t1 - t0) * plane, t0, t1)?;
-        out.slice_set(&y.to_dtype(dtype)?.contiguous()?, 0, t0 * plane)?;
+        crate::grad::slice_set(&out, &y.to_dtype(dtype)?.contiguous()?, 0, t0 * plane)?;
     }
     Ok(out)
 }
@@ -613,7 +613,7 @@ impl Block {
                     }
                     let (cos, sin) = rope.frames(t0, t1)?;
                     for (i, part) in self.attn.project(&fused, &cos, &sin)?.into_iter().enumerate() {
-                        all.get(i)?.slice_set(&part, 0, r0)?;
+                        crate::grad::slice_set(&all.get(i)?, &part, 0, r0)?;
                     }
                 }
                 Ok(all)
@@ -684,7 +684,7 @@ impl Up {
                 .permute(&[0, 4, 1, 5, 2, 6, 3][..])?
                 .contiguous()?
                 .reshape((ft * p1 * g.h * g.w, c))?;
-            y.slice_set(&part.to_dtype(dt)?, 0, t0 * p1 * g.h * g.w)?;
+            crate::grad::slice_set(&y, &part.to_dtype(dt)?, 0, t0 * p1 * g.h * g.w)?;
         }
         match (p1 == 2 && drop_first, g.h * g.w) {
             (true, plane) => Ok((y.narrow(0, plane, y.dim(0)? - plane)?, Grid { t: g.t - 1, ..g })),

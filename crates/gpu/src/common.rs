@@ -614,8 +614,8 @@ impl KvCache {
             None => (k.clone(), v.clone()),
         };
         let (kb, vb) = self.room(k.dims(), v.dims(), k.dtype(), k.device())?;
-        kb.slice_set(&k.contiguous()?, self.axis, self.len)?;
-        vb.slice_set(&v.contiguous()?, self.axis, self.len)?;
+        crate::grad::slice_set(&kb, &k.contiguous()?, self.axis, self.len)?;
+        crate::grad::slice_set(&vb, &v.contiguous()?, self.axis, self.len)?;
         self.advance(k.dim(self.axis)?)
     }
 
@@ -638,7 +638,7 @@ impl KvCache {
                     shape[axis] = (len + m).max(2 * room).max(Self::FIRST);
                     let bigger = Tensor::zeros(shape, dtype, device)?;
                     if let Some(b) = held {
-                        bigger.slice_set(b, axis, 0)?;
+                        crate::grad::slice_set(&bigger, b, axis, 0)?;
                     }
                     Ok(bigger)
                 }

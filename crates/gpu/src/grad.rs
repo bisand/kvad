@@ -257,7 +257,7 @@ pub(crate) fn attended(
 /// The gradients of [`attended`]'s `q`, `k` and `v`, each flattened and the
 /// three end to end, from its answer's `g`.
 ///
-/// With `P = softmax(S)` and `S = scale · q·kᵀ`, the answer is `P·v`, so
+/// With `P = softmax(S)` and `S = scale · q·kᵀ`, the answer is `y = P·v`, so
 ///
 /// ```text
 /// ∂v = Pᵀ·g                       each value, by how much each query took of it
@@ -272,6 +272,23 @@ pub(crate) fn attended(
 /// taken a batch at a time: the batch's scores made, used and dropped, and
 /// `∂k` and `∂v` added to. In f32 whatever the model's dtype, as the
 /// forward pass takes its softmax: these are sums of small numbers.
+///
+/// **What it costs is the tensors the size of the scores**, a number for
+/// every pair of tokens and every head, 671 MB each for SDXL at 4096
+/// tokens: writing one is slower than any of the products, which read
+/// them and write something small. Written as the formulas stand there
+/// are eight (`S`, `S` scaled, `P`, `∂P`, `∂P ⊙ P`, `∂P` less its row's
+/// sum, `∂S`, `∂S` scaled). Here there are four:
+///
+/// - `scale` goes onto `q` before the product and onto `∂q` and `∂k`
+///   after theirs, which are small;
+/// - the row's sum `Σⱼ ∂Pᵢⱼ Pᵢⱼ` is `⟨gᵢ, yᵢ⟩`, since `Σⱼ Pᵢⱼ vⱼ` is the
+///   answer: one number a query, from `P·v`, made again here so that it is
+///   this `P`'s to the last bit and the row of `∂S` sums to nothing;
+/// - and taking it off `∂P` is part of the product that makes `∂P`: `g`
+///   is given one more column, that number, and `v` one more of −1.
+///
+/// That leaves `S`, `P`, `∂P` less the sum, and `∂S`.
 fn attention_back(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, g: &Tensor) -> candle_core::Result<Tensor> {
     attention_back_in(q, k, v, scale, g, SCORES)
 }
@@ -283,7 +300,10 @@ fn attention_back_in(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, g: &Tensor,
     let lk = k.dim(2)?;
     let wide = crate::image::nn::wide(q.dtype());
     let (kw, vw) = (k.to_dtype(wide)?, v.to_dtype(wide)?);
-    let (kt, vt) = (kw.transpose(2, 3)?.contiguous()?, vw.transpose(2, 3)?.contiguous()?);
+    let across = |t: &Tensor| t.transpose(2, 3)?.contiguous();
+    let (kt, vt) = (across(&kw)?, across(&vw)?);
+    // `vᵀ` with its row of −1 beneath.
+    let less = Tensor::cat(&[&vt, &(Tensor::ones((b, h, 1, lk), wide, q.device())? * -1.0)?], 2)?;
     let rows = (scores / (b * h * lk)).clamp(1, lq);
     let mut dq = Vec::with_capacity(lq.div_ceil(rows));
     let (mut dk, mut dv) = (kw.zeros_like()?, vw.zeros_like()?);
@@ -292,20 +312,19 @@ fn attention_back_in(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, g: &Tensor,
         let n = rows.min(lq - start);
         let qs = q.narrow(2, start, n)?.to_dtype(wide)?.contiguous()?;
         let gs = g.narrow(2, start, n)?.to_dtype(wide)?.contiguous()?;
-        let p = softmax_last_dim(&(qs.matmul(&kt)? * scale)?)?;
-        let dp = gs.matmul(&vt)?;
-        let ds = ((&p * dp.broadcast_sub(&(&dp * &p)?.sum_keepdim(D::Minus1)?)?)? * scale)?;
+        let p = softmax_last_dim(&(&qs * scale)?.matmul(&kt)?)?;
+        let sum = (p.matmul(&vw)? * &gs)?.sum_keepdim(D::Minus1)?;
+        let ds = (&p * Tensor::cat(&[&gs, &sum], 3)?.matmul(&less)?)?;
         dq.push(ds.matmul(&kw)?);
         // `∂Sᵀ·q` as `(qᵀ·∂S)ᵀ`, and `Pᵀ·g` likewise: the product wants
         // its operands laid out in rows, and this way round it is `q` and
         // `g` that are copied to be, not the scores.
-        let across = |t: &Tensor| t.transpose(2, 3)?.contiguous();
         dk = (dk + across(&across(&qs)?.matmul(&ds)?)?)?;
         dv = (dv + across(&across(&gs)?.matmul(&p)?)?)?;
         start += n;
     }
-    let dq = Tensor::cat(&dq, 2)?;
-    Tensor::cat(&[dq.flatten_all()?, dk.flatten_all()?, dv.flatten_all()?], 0)?.to_dtype(q.dtype())
+    let dq = (Tensor::cat(&dq, 2)? * scale)?;
+    Tensor::cat(&[dq.flatten_all()?, (dk * scale)?.flatten_all()?, dv.flatten_all()?], 0)?.to_dtype(q.dtype())
 }
 
 // ---------------------------------------------------------------------------
@@ -343,14 +362,15 @@ pub(crate) type Stretch<'a> = Box<dyn Fn(&[Tensor]) -> candle_core::Result<Vec<T
 /// and the price is each stretch's forward pass twice.
 ///
 /// `settle` is called after each stretch, for a device that frees what was
-/// dropped only when asked.
+/// dropped only when asked, and says whether it asked: it need not every
+/// time, and what it costs to ask is in `image::tune`.
 pub(crate) fn checkpointed(
     stretches: &[Stretch<'_>],
     input: Vec<Tensor>,
     loss: &dyn Fn(&[Tensor]) -> candle_core::Result<Tensor>,
     vars: &[Var],
     recording: &dyn Fn(bool),
-    settle: &dyn Fn() -> candle_core::Result<()>,
+    settle: &dyn Fn(&[Tensor]) -> candle_core::Result<bool>,
 ) -> candle_core::Result<(Tensor, candle_core::backprop::GradStore)> {
     recording(false);
     let mut states = vec![input];
@@ -360,8 +380,8 @@ pub(crate) fn checkpointed(
             recording(true);
             candle_core::bail!("checkpointing: a stretch's answer is being recorded with recording off; something trained is not behind the switch");
         }
+        settle(&next)?;
         states.push(next);
-        settle()?;
     }
     recording(true);
 
@@ -388,8 +408,23 @@ pub(crate) fn checkpointed(
         total.remove(v.as_tensor());
     }
     drop(last);
-    settle()?;
-    let mut g = rehomed(g)?;
+    let mut g = match settle(&g)? {
+        true => rehomed(&g)?,
+        false => g,
+    };
+    // The trained tensors' gradients found since the device last let go.
+    let mut waiting: Vec<(usize, Tensor)> = Vec::new();
+    let fold = |total: &mut candle_core::backprop::GradStore, found: Vec<(usize, Tensor)>| -> candle_core::Result<()> {
+        for (i, more) in found {
+            let v = vars[i].as_tensor();
+            let sum = match total.get(v) {
+                Some(have) => (have + more)?,
+                None => more,
+            };
+            total.insert(v, sum);
+        }
+        Ok(())
+    };
 
     for stretch in stretches.iter().rev() {
         let from = leaves(&states.pop().expect("a state for each stretch"))?;
@@ -425,18 +460,23 @@ pub(crate) fn checkpointed(
         // The record goes, all of it: `weighed` is its root, and holds
         // every tensor the stretch made for as long as it lives.
         drop((store, weighed, out, from));
-        settle()?;
-        let mut kept = rehomed(kept)?;
         g = kept.split_off(which.len());
-        for (i, more) in which.into_iter().zip(kept) {
-            let v = vars[i].as_tensor();
-            let sum = match total.get(v) {
-                Some(have) => (have + more)?,
-                None => more,
-            };
-            total.insert(v, sum);
+        // The trained tensors' gradients move out of the buffers they were
+        // born in ([`rehomed`]), and wait. Where the device has just let
+        // go, every one waiting moves again, now to a buffer of its own
+        // size, and so does the state's; every copy made before any
+        // original goes, for a buffer the first of them freed would be
+        // the next one's to take.
+        waiting.extend(which.into_iter().zip(rehomed(&kept)?));
+        drop(kept);
+        if settle(&g)? {
+            let (which, kept): (Vec<usize>, Vec<Tensor>) = std::mem::take(&mut waiting).into_iter().unzip();
+            let (kept, state) = (rehomed(&kept)?, rehomed(&g)?);
+            g = state;
+            fold(&mut total, which.into_iter().zip(kept).collect())?;
         }
     }
+    fold(&mut total, waiting)?;
     Ok((value, total))
 }
 
@@ -453,7 +493,7 @@ pub(crate) fn checkpointed(
 /// free, so a copy made then is given a buffer of its own; and once every
 /// copy is made the originals go, and the buffers they held are free for
 /// the next stretch to use, and let go at its `settle`.
-fn rehomed(kept: Vec<Tensor>) -> candle_core::Result<Vec<Tensor>> {
+fn rehomed(kept: &[Tensor]) -> candle_core::Result<Vec<Tensor>> {
     // `affine(1, 0)` writes a new buffer; `copy` on Metal shares the old.
     kept.iter().map(|t| t.affine(1.0, 0.0)).collect()
 }
@@ -1051,7 +1091,14 @@ mod tests {
         let whole_loss = loss(&state).unwrap();
         let whole = whole_loss.backward().unwrap();
 
-        let (value, grads) = checkpointed(&stretches, vec![x], &loss, &vars, &|live| on.set(live), &|| Ok(())).unwrap();
+        // The device is asked to let go after some stretches and not
+        // others, so that gradients are folded in both ways.
+        let calls = std::cell::Cell::new(0);
+        let asked = |_: &[Tensor]| {
+            calls.set(calls.get() + 1);
+            Ok(calls.get() % 3 == 0)
+        };
+        let (value, grads) = checkpointed(&stretches, vec![x], &loss, &vars, &|live| on.set(live), &asked).unwrap();
         assert!(on.get(), "recording is left on");
         assert_eq!(value.to_scalar::<f32>().unwrap(), whole_loss.to_scalar::<f32>().unwrap());
         for (i, v) in vars.iter().enumerate() {
@@ -1061,7 +1108,7 @@ mod tests {
         // A trained tensor that is not behind the switch is refused, not
         // quietly recorded through the first pass.
         let exposed: Vec<Stretch<'_>> = vec![Box::new(|s| Ok(vec![s[0].matmul(vars[0].as_tensor())?]))];
-        let e = checkpointed(&exposed, vec![randn(&[5, 8], &dev)], &loss, &vars, &|_| {}, &|| Ok(())).err().map(|e| e.to_string()).unwrap_or_default();
+        let e = checkpointed(&exposed, vec![randn(&[5, 8], &dev)], &loss, &vars, &|_| {}, &|_| Ok(true)).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(e.contains("not behind the switch"), "{e}");
     }
 
@@ -1118,6 +1165,12 @@ mod tests {
                     let var = Var::from_tensor(&x).unwrap();
                     let want = f(var.as_tensor()).unwrap().backward().unwrap().get(var.as_tensor()).unwrap().clone();
                     assert!(off(&got, &want) < 1e-5, "{what}: {} apart", off(&got, &want));
+                }
+                // The way that reads the kernel as it is stored, which a
+                // kernel this small is not sent.
+                if stride == 1 {
+                    let folded = crate::image::nn::back_folded(&w, pad, &r).unwrap();
+                    assert!(off(&folded, &got) < 1e-5, "{what}, folded: {} apart", off(&folded, &got));
                 }
             }
         }

@@ -41,11 +41,12 @@
 //! | 256², the whole UNet recorded, frozen layers attached | 3.4 s | 14.4 GB | |
 //! | 480², 22 stretches, a stage each | 3.1 s | 13.8 GB | 0.33 s |
 //! | 480², 103 stretches, a transformer block each | 3.4 s | 7.4 GB | |
-//! | 512² | 3.7 s | 8.0 GB | 0.35 s |
-//! | 640² | 5.8 s | 9.4 GB | 0.56 s |
-//! | 768² | 9.0 s | 12.9 GB | 0.77 s |
-//! | 896² | 14.0 s | 18.2 GB | 1.09 s |
-//! | 1024² | 20.7 s | 23.4 GB | 1.39 s |
+//! | 480², attention with a backward of its own | 3.2 s | 7.0 GB | |
+//! | 512² | 3.2 s | 7.2 GB | 0.35 s |
+//! | 640² | 4.6 s | 7.6 GB | 0.56 s |
+//! | 768² | 6.6 s | 8.9 GB | 0.77 s |
+//! | 896² | 9.0 s | 9.0 GB | 1.09 s |
+//! | 1024² | 12.4 s | 10.8 GB | 1.38 s |
 //!
 //! Recorded whole, 512² took the machine down. 5.1 GB of every figure is
 //! the weights.
@@ -53,21 +54,20 @@
 //! - **What the stage-sized stretches held** was not activations, which
 //!   are megabytes. It was `backward`'s small leavings in large buffers
 //!   (`crate::grad::rehomed`), each stretch's record alive through the
-//!   next one's, and ten transformer blocks' worth of both at once. With
-//!   those three mended the 37 GB a megapixel beside the weights is about
-//!   10, up to 640².
-//! - **Past that it grows faster than the picture**, and the peak is one
-//!   transformer block at the upper attention level, where a picture of
-//!   1024² is 4096 tokens: its self-attention's scores are 671 MB in f32,
-//!   and recorded, with the steps of the softmax and their gradients, the
-//!   block reaches 17 GB beside the weights. An attention with a backward
-//!   of its own, keeping the scores once, is what would bring that down.
-//! - **A step is fifteen times a forward pass at 1024²**, nine at 512²,
+//!   next one's, and ten transformer blocks' worth of both at once.
+//! - **What a block then held was its attention's scores**, a number for
+//!   every pair of tokens and every head: 671 MB in f32 at 1024², where
+//!   the upper attention level is 4096 tokens, kept at every step of the
+//!   softmax and again for each one's gradient. Before
+//!   `crate::grad::attended`, 1024² was 23.4 GB and 20.7 s, 17 GB of it
+//!   one block; it now makes the scores again on the way back, a batch of
+//!   rows at a time.
+//! - **A step is nine times a forward pass**, at 512² and at 1024² alike,
 //!   nearly all of it coming back; and 0.34 s of it is the optimiser, the
 //!   same at any size: 1120 small tensors, each a few operations.
 //!
 //! So what #75 can promise from this, on this machine: SDXL's own 1024² in
-//! 23 GB at 21 s a step, or 512² in 8 GB at under 4.
+//! 11 GB at 12 s a step, or 512² in 7 GB at 3.
 
 use super::lora::Adapters;
 use super::nn::{noise, Ctx};

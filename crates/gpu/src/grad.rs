@@ -185,6 +185,99 @@ pub(crate) fn upsample_twice(x: &Tensor) -> candle_core::Result<Tensor> {
 }
 
 // ---------------------------------------------------------------------------
+// Attention
+// ---------------------------------------------------------------------------
+
+/// The most scores [`attention_back`] holds in one tensor: 32 M, 128 MB in
+/// f32. It holds about six that size at once.
+const SCORES: usize = 1 << 25;
+
+/// Unmasked attention, `softmax(scale · q·kᵀ) · v` over `[B, heads, L, d]`,
+/// by `inner`, with a backward of its own where one is wanted.
+///
+/// Recorded step by step, attention is the most a model keeps for
+/// `backward`. Its scores are a number for every pair of tokens and every
+/// head, 671 MB in f32 for SDXL at 4096 tokens, and the record holds them
+/// at every step from the product to the softmax's answer, and `backward`
+/// then makes a gradient as large for each: 17 GB for one transformer
+/// block, the peak of a whole training step at 1024×1024.
+///
+/// Nothing of that needs keeping. The scores can be made again from `q`
+/// and `k`, which are small. So the forward pass is `inner`'s, out of
+/// `backward`'s sight on whatever kernel draws, and the way back
+/// ([`attention_back`]) makes the scores again a few rows of queries at a
+/// time and lets each batch go.
+///
+/// `backward` is told of one input, and there are three, so the three are
+/// laid end to end as one tensor for it, and their gradients come back the
+/// same way and are taken apart by the record of that laying.
+pub(crate) fn attended(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    inner: impl Fn(&Tensor, &Tensor, &Tensor) -> candle_core::Result<Tensor>,
+) -> candle_core::Result<Tensor> {
+    if !tracked(&[q, k, v]) || k.dtype() != q.dtype() || v.dtype() != q.dtype() {
+        return inner(q, k, v);
+    }
+    let (qd, kd, vd) = (q.detach(), k.detach(), v.detach());
+    let y = inner(&qd, &kd, &vd)?;
+    let all = Tensor::cat(&[q.flatten_all()?, k.flatten_all()?, v.flatten_all()?], 0)?;
+    attach(&all, y, move |_, g| attention_back(&qd, &kd, &vd, scale, g))
+}
+
+/// The gradients of [`attended`]'s `q`, `k` and `v`, each flattened and the
+/// three end to end, from its answer's `g`.
+///
+/// With `P = softmax(S)` and `S = scale · q·kᵀ`, the answer is `P·v`, so
+///
+/// ```text
+/// ∂v = Pᵀ·g                       each value, by how much each query took of it
+/// ∂P = g·vᵀ
+/// ∂S = P ⊙ (∂P − Σⱼ ∂P ⊙ P)       the softmax, a row at a time
+/// ∂q = scale · ∂S·k
+/// ∂k = scale · ∂Sᵀ·q
+/// ```
+///
+/// A row of `S` belongs to one query, and nothing in these sums crosses
+/// rows but `∂k` and `∂v`, which add up over them. So the queries are
+/// taken a batch at a time: the batch's scores made, used and dropped, and
+/// `∂k` and `∂v` added to. In f32 whatever the model's dtype, as the
+/// forward pass takes its softmax: these are sums of small numbers.
+fn attention_back(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, g: &Tensor) -> candle_core::Result<Tensor> {
+    attention_back_in(q, k, v, scale, g, SCORES)
+}
+
+/// [`attention_back`] with `scores` of them at most in one tensor.
+fn attention_back_in(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, g: &Tensor, scores: usize) -> candle_core::Result<Tensor> {
+    use candle_core::D;
+    let (b, h, lq, _) = q.dims4()?;
+    let lk = k.dim(2)?;
+    let wide = crate::image::nn::wide(q.dtype());
+    let (kw, vw) = (k.to_dtype(wide)?, v.to_dtype(wide)?);
+    let (kt, vt) = (kw.transpose(2, 3)?.contiguous()?, vw.transpose(2, 3)?.contiguous()?);
+    let rows = (scores / (b * h * lk)).clamp(1, lq);
+    let mut dq = Vec::with_capacity(lq.div_ceil(rows));
+    let (mut dk, mut dv) = (kw.zeros_like()?, vw.zeros_like()?);
+    let mut start = 0;
+    while start < lq {
+        let n = rows.min(lq - start);
+        let qs = q.narrow(2, start, n)?.to_dtype(wide)?.contiguous()?;
+        let gs = g.narrow(2, start, n)?.to_dtype(wide)?.contiguous()?;
+        let p = softmax_last_dim(&(qs.matmul(&kt)? * scale)?)?;
+        let dp = gs.matmul(&vt)?;
+        let ds = ((&p * dp.broadcast_sub(&(&dp * &p)?.sum_keepdim(D::Minus1)?)?)? * scale)?;
+        dq.push(ds.matmul(&kw)?);
+        dk = (dk + ds.transpose(2, 3)?.contiguous()?.matmul(&qs)?)?;
+        dv = (dv + p.transpose(2, 3)?.contiguous()?.matmul(&gs)?)?;
+        start += n;
+    }
+    let dq = Tensor::cat(&dq, 2)?;
+    Tensor::cat(&[dq.flatten_all()?, dk.flatten_all()?, dv.flatten_all()?], 0)?.to_dtype(q.dtype())
+}
+
+// ---------------------------------------------------------------------------
 // Checkpointing
 // ---------------------------------------------------------------------------
 
@@ -824,6 +917,39 @@ mod tests {
                     let want = f(var.as_tensor()).unwrap().backward().unwrap().get(var.as_tensor()).unwrap().clone();
                     assert!(off(&got, &want) < 1e-5, "{what}: {} apart", off(&got, &want));
                 }
+            }
+        }
+    }
+
+    /// Attention's own backward is the one candle finds through the
+    /// written-out attention: for the queries, the keys and the values,
+    /// self-attention and cross-attention (fewer keys than queries), on the
+    /// CPU and on Metal; and in batches of query rows as in one.
+    #[test]
+    fn attentions_backward_is_candles() {
+        use crate::image::nn::written_out;
+        for dev in [Some(Device::Cpu), metal()].into_iter().flatten() {
+            // (queries, keys): self-attention, cross-attention, and enough
+            // queries for three batches of rows at this test's budget.
+            for (lq, lk) in [(12, 12), (12, 5), (40, 40)] {
+                let (q, k, v) = (randn(&[1, 2, lq, 8], &dev), randn(&[1, 2, lk, 8], &dev), randn(&[1, 2, lk, 8], &dev));
+                let r = randn(&[1, 2, lq, 8], &dev);
+                let scale = 1.0 / 8f64.sqrt();
+                let vars = [Var::from_tensor(&q).unwrap(), Var::from_tensor(&k).unwrap(), Var::from_tensor(&v).unwrap()];
+                let (qv, kv, vv) = (vars[0].as_tensor(), vars[1].as_tensor(), vars[2].as_tensor());
+                let theirs = (written_out(qv, kv, vv, scale).unwrap() * &r).unwrap().sum_all().unwrap().backward().unwrap();
+                let y = attended(qv, kv, vv, scale, |q, k, v| written_out(q, k, v, scale)).unwrap();
+                assert!(off(&y, &written_out(&q, &k, &v, scale).unwrap()) < 1e-6);
+                let ours = (y * &r).unwrap().sum_all().unwrap().backward().unwrap();
+                for (name, var) in ["q", "k", "v"].iter().zip(&vars) {
+                    let (got, want) = (ours.get(var.as_tensor()).expect("a gradient for each"), theirs.get(var.as_tensor()).unwrap());
+                    assert!(off(got, want) < 1e-4, "{lq} queries, {lk} keys, {name} on {:?}: {} apart", dev.location(), off(got, want));
+                }
+                // The same in batches of 16 rows' scores, three rows at a
+                // time for the last shape.
+                let whole = attention_back(&q, &k, &v, scale, &r).unwrap();
+                let batched = attention_back_in(&q, &k, &v, scale, &r, 2 * 16 * 3).unwrap();
+                assert!(off(&batched, &whole) < 1e-5, "{lq} queries in batches: {} apart", off(&batched, &whole));
             }
         }
     }

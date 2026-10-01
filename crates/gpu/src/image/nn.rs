@@ -388,11 +388,14 @@ pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> can
     };
     let (q, k, v) = (split(q, lq)?, split(k, lk)?, split(v, lk)?);
     let scale = 1.0 / (d as f64).sqrt();
-    // candle's kernel has no backward; the written-out attention has.
-    let out = match fused(q.device(), q.dtype(), d, lq) && !crate::grad::tracked(&[&q, &k, &v]) {
-        true => ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)?,
-        false => written_out(&q, &k, &v, scale)?,
-    };
+    // With a backward of its own for tensors that want one
+    // (`grad::attended`), so that candle's kernel, which has none, only
+    // ever sees tensors that do not; if one reaches here still tracked,
+    // the written-out attention has candle's.
+    let out = crate::grad::attended(&q, &k, &v, scale, |q, k, v| match fused(q.device(), q.dtype(), d, lq) && !crate::grad::tracked(&[q, k, v]) {
+        true => ops::sdpa(q, k, v, None, false, scale as f32, 1.0),
+        false => written_out(q, k, v, scale),
+    })?;
     out.transpose(1, 2)?.contiguous()?.reshape((b, lq, width))
 }
 

@@ -222,11 +222,12 @@ fn rotate(t: Tensor, (cos, sin): (&Tensor, &Tensor)) -> candle_core::Result<Tens
 /// heads·d]`.
 fn attend(s: Shape, q: &Tensor, k: &Tensor, v: &Tensor) -> candle_core::Result<Tensor> {
     let scale = 1.0 / (s.head_dim as f64).sqrt();
-    // candle's kernel has no backward; the written-out attention has.
-    let a = match q.device().is_metal() && !crate::grad::tracked(&[q, k, v]) {
-        true => ops::sdpa(q, k, v, None, false, scale as f32, 1.0)?,
-        false => super::nn::written_out(q, k, v, scale)?,
-    };
+    // With a backward of its own for tensors that want one
+    // (`grad::attended`); candle's kernel has none.
+    let a = crate::grad::attended(q, k, v, scale, |q, k, v| match q.device().is_metal() && !crate::grad::tracked(&[q, k, v]) {
+        true => ops::sdpa(q, k, v, None, false, scale as f32, 1.0),
+        false => super::nn::written_out(q, k, v, scale),
+    })?;
     let n = q.dim(2)?;
     a.transpose(1, 2)?.contiguous()?.reshape((1, n, s.width()))
 }

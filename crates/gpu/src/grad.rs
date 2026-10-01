@@ -262,12 +262,18 @@ mod tests {
     #[test]
     fn a_quantised_projection_passes_the_gradient_to_its_input() {
         for dev in [Some(Device::Cpu), metal()].into_iter().flatten() {
-            let w = (randn(&[96, 64], &Device::Cpu) * 0.1).unwrap();
+            // Seeded, where the other tests here draw afresh each run: the
+            // staircase leaves the two slopes about 0.4% of a typical slope
+            // apart whatever the step, and they are judged as a share of
+            // the slope itself, which along one random direction now and
+            // then comes out small. A draw of 4.47 against 4.56 failed this.
+            let seeded = |seed: u64, shape: &[usize], dev: &Device| crate::image::nn::noise(seed, shape, dev, DType::F32).unwrap();
+            let w = (seeded(1, &[96, 64], &Device::Cpu) * 0.1).unwrap();
             // Quantised on the device it will run on.
             let q = Arc::new(QTensor::quantize(&w.to_device(&dev).unwrap(), GgmlDType::Q8_0).unwrap());
             let rounded = q.dequantize(&dev).unwrap();
             let proj = Proj::Quant(QMatMul::from_arc(q).unwrap());
-            let (x, r) = (randn(&[7, 64], &dev), randn(&[7, 96], &dev));
+            let (x, r) = (seeded(2, &[7, 64], &dev), seeded(3, &[7, 96], &dev));
             let f = |x: &Tensor| (proj.forward(x)? * &r)?.sum_all();
             complete(&f, &x, 1.0, 1e-2).unwrap();
 

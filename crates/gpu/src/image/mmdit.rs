@@ -120,7 +120,7 @@ impl Double {
         let txt = (txt + self.txt.out.forward(&at)?.broadcast_mul(&mt[2])?)?;
 
         let mlp = |st: &Stream, x: &Tensor, m: &[Tensor]| -> candle_core::Result<Tensor> {
-            let h = st.mlp_in.forward(&modulate(x, &m[3], &m[4])?)?.gelu()?;
+            let h = crate::grad::gelu(&st.mlp_in.forward(&modulate(x, &m[3], &m[4])?)?)?;
             x + st.mlp_out.forward(&h)?.broadcast_mul(&m[5])?
         };
         Ok((mlp(&self.img, &img, &mi)?, mlp(&self.txt, &txt, &mt)?))
@@ -175,7 +175,7 @@ impl Single {
         let k = rotate(crate::grad::rms_norm(&heads_of(self.k.forward(&h)?)?.contiguous()?, &self.norm_k, 1e-6)?, rope)?;
         let v = heads_of(self.v.forward(&h)?)?.transpose(1, 2)?.contiguous()?;
         let a = attend(s, &q, &k, &v)?;
-        let mlp = self.mlp.forward(&h)?.gelu()?;
+        let mlp = crate::grad::gelu(&self.mlp.forward(&h)?)?;
         Ok((x + self.out.forward(&Tensor::cat(&[&a, &mlp], 2)?)?.broadcast_mul(&gate)?)?)
     }
 }

@@ -171,14 +171,28 @@ impl TextEncoder {
 
     /// The last layer's hidden states after the final norm, `[1, L, width]`.
     fn forward(&self, ids: &[u32], device: &Device, dtype: DType) -> Res<Tensor> {
-        let l = ids.len();
+        self.read(&self.embed(ids, device, dtype)?)
+    }
+
+    /// The tokens as the first layer takes them, `[1, L, width]`: each
+    /// one's row of the table, for the positions are a rotation inside
+    /// every layer.
+    fn embed(&self, ids: &[u32], device: &Device, dtype: DType) -> Res<Tensor> {
         let ids_t = Tensor::new(ids, device)?;
-        let mut x = match &self.embed {
+        let x = match &self.embed {
             TextEmbed::Dense(t) => t.index_select(&ids_t, 0)?,
             TextEmbed::Quant(q) => q.embedding(&ids_t)?,
-        }
-        .to_dtype(dtype)?
-        .unsqueeze(0)?;
+        };
+        Ok(x.to_dtype(dtype)?.unsqueeze(0)?)
+    }
+
+    /// [`TextEncoder::forward`], from the embeddings [`TextEncoder::embed`]
+    /// gives: what the model is as a function of them, which is what a
+    /// gradient is taken through.
+    fn read(&self, x: &Tensor) -> Res<Tensor> {
+        let mut x = x.clone();
+        let (l, device, dtype) = (x.dim(1)?, x.device().clone(), x.dtype());
+        let (device, sums) = (&device, super::nn::wide(dtype));
 
         // Rotation angles for positions 0..l, halves convention (the first
         // half of a head pairs with the second).
@@ -192,7 +206,7 @@ impl TextEncoder {
         let angles = Tensor::from_vec(angles, (l, half), device)?;
         let (cos, sin) = (angles.cos()?.to_dtype(dtype)?, angles.sin()?.to_dtype(dtype)?);
         let mask: Vec<f32> = (0..l * l).map(|i| if i % l > i / l { f32::NEG_INFINITY } else { 0.0 }).collect();
-        let mask = Tensor::from_vec(mask, (1, 1, l, l), device)?;
+        let mask = Tensor::from_vec(mask, (1, 1, l, l), device)?.to_dtype(sums)?;
 
         let group = self.heads / self.kv_heads;
         for layer in &self.layers {
@@ -204,9 +218,13 @@ impl TextEncoder {
             let k = crate::grad::rope(&split(layer.k.forward(&h)?, self.kv_heads)?, &cos, &sin)?;
             let v = split(layer.v.forward(&h)?, self.kv_heads)?;
             // Grouped-query attention, the way `model.rs` does it: fold the
-            // query heads that share a KV head into one batch of rows.
+            // query heads that share a KV head into one batch of rows. The
+            // product is taken in f32, not rounded to bf16 and then widened:
+            // a score here is large enough that bf16's three digits move
+            // the softmax, and the gradient through it by most of its
+            // length (`tests::the_text_encoder_has_a_whole_gradient`).
             let qg = q.reshape((1, self.kv_heads, group * l, self.head_dim))?;
-            let att = (qg.matmul(&k.transpose(2, 3)?.contiguous()?)?.to_dtype(DType::F32)? / (self.head_dim as f64).sqrt())?;
+            let att = (qg.to_dtype(sums)?.matmul(&k.transpose(2, 3)?.contiguous()?.to_dtype(sums)?)? / (self.head_dim as f64).sqrt())?;
             let att = att.reshape((1, self.heads, l, l))?.broadcast_add(&mask)?;
             let att = crate::grad::softmax_last_dim(&att)?.to_dtype(dtype)?.reshape((1, self.kv_heads, group * l, l))?;
             let a = att.matmul(&v)?.reshape((1, self.heads, l, self.head_dim))?;
@@ -1387,5 +1405,91 @@ mod tests {
         let what = if decode { "decode" } else { "encode" };
         eprintln!("qwen BF16 {side}²: one {what} {:.2} s, largest |out| {largest:.2}", started.elapsed().as_secs_f64());
         assert!(largest.is_finite() && largest > 0.0, "the {what} came back {largest}");
+    }
+
+    /// The first two layers of Qwen2.5-VL's language tower and its final
+    /// norm, with their real weights, as a function of the embeddings they
+    /// are given and of a LoRA on two of their layers: the gradient
+    /// `backward` finds is the function's own. Two layers of twenty-eight,
+    /// as `flux::tests::t5_has_a_whole_gradient` takes two of T5's, and
+    /// run the same ways for the same reasons. What is here and not there:
+    /// the rotation, grouped queries and the causal mask; and the
+    /// embeddings are taken along four directions, for it was one of them
+    /// that showed what half precision did to the scores.
+    ///
+    ///     cargo test --release -p kvad-gpu qwen::tests::the_text_encoder_has -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn the_text_encoder_has_a_whole_gradient() {
+        crate::cap::at(24.0);
+        use candle_core::Var;
+        // Of this machine or not at all: the files are 16 GB, and a check
+        // is not what should fetch them. Two layers want the first shard,
+        // and the final norm is in the last.
+        let here = |f: &str| super::super::local_file("Qwen/Qwen-Image", &format!("text_encoder/{f}")).unwrap_or_else(|| panic!("Qwen/Qwen-Image's text_encoder/{f} is not on this machine"));
+        let mut config = read_json(&here("config.json")).unwrap();
+        let paths = vec![here("model-00001-of-00004.safetensors"), here("model-00004-of-00004.safetensors")];
+        let c = config.get("text_config").cloned().unwrap_or_else(|| config.clone());
+        let n = |k: &str| c[k].as_u64().unwrap() as usize;
+        let (width, inter, kv) = (n("hidden_size"), n("intermediate_size"), n("hidden_size") / n("num_attention_heads") * n("num_key_value_heads"));
+        match config.get_mut("text_config") {
+            Some(t) => t["num_hidden_layers"] = json!(2),
+            None => config["num_hidden_layers"] = json!(2),
+        }
+        let mut runs = vec![(Device::Cpu, None, DType::F64, 1e-5, 0.0, "the CPU, f64"), (Device::Cpu, None, DType::F32, 1e-2, 1e-3, "the CPU, f32")];
+        if let Ok(metal) = Device::new_metal(0) {
+            runs.push((metal.clone(), None, DType::F32, 1e-2, 1e-3, "Metal, f32"));
+            runs.push((metal.clone(), Some(GgmlDType::Q8_0), DType::F32, 1e-2, 1e-1, "Metal, q8 weights"));
+            // With the scores' product taken in bf16 this run's slopes were
+            // 10–88% of a typical slope from f64's; in f32 they are 5–9%.
+            runs.push((metal, None, DType::BF16, 1e-2, 0.2, "Metal, bf16"));
+        }
+        // Twelve tokens of ordinary text.
+        let ids: [u32; 12] = [64, 2518, 38835, 11699, 304, 7722, 11794, 1790, 311, 264, 22360, 1841];
+        let layers = [("model.layers.0.self_attn.k_proj", width, kv), ("model.layers.1.mlp.gate_proj", width, inter)];
+        let mut exact = crate::grad::real::Exact::default();
+        // The embeddings the f64 run read, for every run after it.
+        let mut read: Option<Tensor> = None;
+        for (dev, quant, dtype, step, tolerance, what) in runs {
+            let mut run = exact.run(what, tolerance);
+            let vault = Vault::off();
+            let cx = Ctx { ld: Loader::new(quant, dev.clone(), &vault), dtype };
+            let adapters = Adapters::new(&TRANSFORMER_PREFIXES);
+            let r = open(&paths, dtype).unwrap().with_adapters(adapters.part("text_encoder"));
+            let text = TextEncoder::load(&cx, &r, &config).unwrap();
+
+            let seed = std::cell::Cell::new(74u64);
+            let randn = |shape: &[usize], std: f32| {
+                seed.set(seed.get() + 1);
+                (noise(seed.get(), shape, &dev, DType::F32).unwrap() * std as f64).unwrap().to_dtype(dtype).unwrap()
+            };
+            let x = match &read {
+                Some(x) => x.to_dtype(dtype).unwrap().to_device(&dev).unwrap(),
+                None => text.embed(&ids, &dev, dtype).unwrap(),
+            };
+            read.get_or_insert_with(|| x.clone());
+            let scale = x.to_dtype(DType::F32).unwrap().sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap().sqrt() as f64;
+            let weigh = randn(&[1, ids.len(), width], 1.0);
+            let loss = |x: &Tensor| -> candle_core::Result<Tensor> {
+                let h = text.read(x).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                (h * &weigh)?.sum_all()
+            };
+
+            const SCALE: f32 = 0.05;
+            let factors: Vec<(Var, Var)> = layers
+                .iter()
+                .map(|&(name, inp, out)| {
+                    let (a, b) = (Var::from_tensor(&randn(&[inp, 4], SCALE)).unwrap(), Var::from_tensor(&randn(&[4, out], SCALE)).unwrap());
+                    adapters.place("text_encoder", name, a.as_tensor(), b.as_tensor()).unwrap();
+                    (a, b)
+                })
+                .collect();
+            for seed in [11, 21, 31, 41] {
+                run.take("the embeddings", crate::grad::directional(&loss, &x, step * scale, seed).unwrap());
+            }
+            for (&(name, ..), (a, b)) in layers.iter().zip(&factors) {
+                run.factors(&adapters, "text_encoder", name, (a, b), &|| loss(&x), step * SCALE as f64);
+            }
+        }
     }
 }

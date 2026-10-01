@@ -14,9 +14,9 @@
 //! for ViT-L the last layer is never run at all, and its weights are skipped
 //! by name rather than loaded for nothing.
 
-use super::nn::{Ctx, LayerNorm, Linear};
+use super::nn::{wide, Ctx, LayerNorm, Linear};
 use crate::common::Reader;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 use candle_nn::ops;
 use kvad::serde_json::Value;
 
@@ -164,10 +164,22 @@ impl Clip {
     /// last hidden state through the final norm instead, and no pooled
     /// vector.
     pub(crate) fn encode(&self, ids: &[u32], end: usize) -> Res<(Tensor, Option<Tensor>)> {
-        let dev = self.tokens.device();
-        let ids_t = Tensor::new(ids, dev)?;
-        let mut x = self.tokens.index_select(&ids_t, 0)?.broadcast_add(&self.positions)?.unsqueeze(0)?;
-        let mask = causal_mask(ids.len(), dev)?;
+        self.read(&self.embed(ids)?, end)
+    }
+
+    /// The tokens as the first layer takes them, `[1, 77, width]`: each
+    /// one's row of the table, and its position's added.
+    pub(crate) fn embed(&self, ids: &[u32]) -> Res<Tensor> {
+        let ids_t = Tensor::new(ids, self.tokens.device())?;
+        Ok(self.tokens.index_select(&ids_t, 0)?.broadcast_add(&self.positions)?.unsqueeze(0)?)
+    }
+
+    /// [`Clip::encode`], from the embeddings [`Clip::embed`] gives: what
+    /// the model is as a function of them, which is what a gradient is
+    /// taken through, and what a learned token (textual inversion) enters.
+    pub(crate) fn read(&self, x: &Tensor, end: usize) -> Res<(Tensor, Option<Tensor>)> {
+        let mut x = x.clone();
+        let mask = causal_mask(x.dim(1)?, x.device())?.to_dtype(wide(x.dtype()))?;
 
         let penult_at = self.cfg.layers - 1;
         let mut penultimate = None;
@@ -209,7 +221,7 @@ impl Clip {
         // Seventy-seven tokens: the score matrix is tiny and written out, and
         // the causal mask goes on explicitly. The fused kernel's causal path
         // wants a multiple of 32 queries (see `model.rs`), and 77 is not one.
-        let att = (q.matmul(&k.transpose(2, 3)?.contiguous()?)?.to_dtype(DType::F32)? * (1.0 / (d as f64).sqrt()))?;
+        let att = (q.matmul(&k.transpose(2, 3)?.contiguous()?)?.to_dtype(wide(x.dtype()))? * (1.0 / (d as f64).sqrt()))?;
         let att = crate::grad::softmax_last_dim(&att.broadcast_add(mask)?)?.to_dtype(v.dtype())?;
         let a = att.matmul(&v)?.transpose(1, 2)?.contiguous()?.reshape((b, n, w))?;
         let x = (x + l.out.forward(&a)?)?;
@@ -217,13 +229,14 @@ impl Clip {
         let h = l.fc1.forward(&l.ln2.forward(&x)?)?;
         let h = match self.cfg.act {
             Act::QuickGelu => (&h * ops::sigmoid(&(&h * 1.702)?)?)?,
-            Act::Gelu => h.gelu_erf()?,
+            Act::Gelu => crate::grad::gelu_erf(&h)?,
         };
         Ok((x + l.fc2.forward(&h)?)?)
     }
 }
 
-/// `-inf` above the diagonal, in f32 so it adds to f32 scores.
+/// `-inf` above the diagonal, in f32, which is what the scores of a model
+/// in f32 or half precision are in.
 fn causal_mask(n: usize, dev: &Device) -> Res<Tensor> {
     let data: Vec<f32> = (0..n * n).map(|i| if i % n > i / n { f32::NEG_INFINITY } else { 0.0 }).collect();
     Ok(Tensor::from_vec(data, (1, 1, n, n), dev)?)

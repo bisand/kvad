@@ -18,7 +18,7 @@
 //! - **A gated GELU MLP**, `wo(gelu(wi_0·x) · wi_1·x)`, and RMSNorm without a
 //!   bias, which T5 called a layer norm.
 
-use super::nn::{Ctx, Linear};
+use super::nn::{wide, Ctx, Linear};
 use crate::common::{Reader, Stored};
 use candle_core::quantized::QTensor;
 use candle_core::{DType, Device, Tensor};
@@ -107,14 +107,28 @@ impl T5 {
 
     /// The last layer's output after the final norm, `[1, tokens, d_model]`.
     pub(crate) fn forward(&self, ids: &[u32], device: &Device, dtype: DType) -> Res<Tensor> {
-        let l = ids.len();
+        self.read(&self.embed(ids, device, dtype)?)
+    }
+
+    /// The tokens as the first layer takes them, `[1, tokens, d_model]`:
+    /// each one's row of the table and nothing else, for T5 adds no
+    /// positions.
+    pub(crate) fn embed(&self, ids: &[u32], device: &Device, dtype: DType) -> Res<Tensor> {
         let ids_t = Tensor::new(ids, device)?;
-        let mut x = match &self.embed {
+        let x = match &self.embed {
             Embed::Dense(t) => t.index_select(&ids_t, 0)?,
             Embed::Quant(q) => q.embedding(&ids_t)?,
-        }
-        .to_dtype(dtype)?
-        .unsqueeze(0)?;
+        };
+        Ok(x.to_dtype(dtype)?.unsqueeze(0)?)
+    }
+
+    /// [`T5::forward`], from the embeddings [`T5::embed`] gives: what the
+    /// model is as a function of them, which is what a gradient is taken
+    /// through.
+    pub(crate) fn read(&self, x: &Tensor) -> Res<Tensor> {
+        let mut x = x.clone();
+        let (l, device, sums) = (x.dim(1)?, x.device().clone(), wide(x.dtype()));
+        let device = &device;
 
         // The position bias, `[1, heads, l, l]`, once for every layer.
         let index: Vec<u32> = (0..l)
@@ -126,7 +140,7 @@ impl T5 {
             .reshape((l, l, self.heads))?
             .permute((2, 0, 1))?
             .unsqueeze(0)?
-            .to_dtype(DType::F32)?
+            .to_dtype(sums)?
             .contiguous()?;
 
         let inner = self.heads * self.d_kv;
@@ -136,13 +150,13 @@ impl T5 {
                 t.reshape((1, l, self.heads, self.d_kv))?.transpose(1, 2)?.contiguous()
             };
             let (q, k, v) = (split(layer.q.forward(&h)?)?, split(layer.k.forward(&h)?)?, split(layer.v.forward(&h)?)?);
-            let scores = q.matmul(&k.transpose(2, 3)?.contiguous()?)?.to_dtype(DType::F32)?.broadcast_add(&bias)?;
+            let scores = q.matmul(&k.transpose(2, 3)?.contiguous()?)?.to_dtype(sums)?.broadcast_add(&bias)?;
             let att = crate::grad::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
             let a = att.matmul(&v)?.transpose(1, 2)?.contiguous()?.reshape((1, l, inner))?;
             x = (x + layer.o.forward(&a)?)?;
 
             let h = crate::grad::rms_norm(&x, &layer.ln2, self.eps)?;
-            let g = (layer.wi0.forward(&h)?.gelu()? * layer.wi1.forward(&h)?)?;
+            let g = (crate::grad::gelu(&layer.wi0.forward(&h)?)? * layer.wi1.forward(&h)?)?;
             x = (x + layer.wo.forward(&g)?)?;
         }
         Ok(crate::grad::rms_norm(&x, &self.norm, self.eps)?)

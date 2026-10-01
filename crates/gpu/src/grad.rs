@@ -552,6 +552,50 @@ pub(crate) fn softmax_last_dim(x: &Tensor) -> candle_core::Result<Tensor> {
     }
 }
 
+/// `Tensor::gelu_erf`, with its own backward for a tensor that is being
+/// differentiated: `x·Φ(x)` has the slope `Φ(x) + x·φ(x)`, the normal
+/// distribution's two functions.
+///
+/// candle's backward is that formula with `1/√(2π)` written as `0.398942`,
+/// six digits of it, so the gradient it gives is 7e-7 of that term out: of
+/// no account to a training step, and enough to fail the f64 check on
+/// OpenCLIP's bigG (4e-6 of a typical slope, where 1e-6 is asked), which
+/// is how it was found, and would have hidden anything smaller behind it.
+pub(crate) fn gelu_erf(x: &Tensor) -> candle_core::Result<Tensor> {
+    if !x.track_op() {
+        return x.gelu_erf();
+    }
+    attach(x, x.detach().gelu_erf()?, |x, g| {
+        let cdf = ((x / std::f64::consts::SQRT_2)?.erf()? * 0.5)? + 0.5;
+        let pdf = ((x.sqr()? * -0.5)?.exp()? * (1.0 / (2.0 * std::f64::consts::PI).sqrt()))?;
+        g * (cdf? + x * pdf)?
+    })
+}
+
+/// `Tensor::gelu`, the tanh form `x/2·(1 + tanh u)` with
+/// `u = √(2/π)·(x + 0.044715x³)`, with its own backward for a tensor that
+/// is being differentiated, for the reason [`gelu_erf`] has one: candle's
+/// writes `√(2/π)` and its products to six digits.
+///
+/// The slope is `(1 + tanh u)/2 + x/2·(1 − tanh²u)·u′`, taken in f32 for
+/// half precision: `x²` is infinite in f16 past 256, where `1 − tanh²` is
+/// 0, and their product is not a number.
+pub(crate) fn gelu(x: &Tensor) -> candle_core::Result<Tensor> {
+    if !x.track_op() {
+        return x.gelu();
+    }
+    attach(x, x.detach().gelu()?, |x, g| {
+        const CUBIC: f64 = 0.044715;
+        let c = (2.0 / std::f64::consts::PI).sqrt();
+        let (dtype, x) = (x.dtype(), x.to_dtype(crate::image::nn::wide(x.dtype()))?);
+        let sq = x.sqr()?;
+        let t = ((&x + (&x * &sq)? * CUBIC)? * c)?.tanh()?;
+        let du = ((sq * (3.0 * CUBIC))? + 1.0)? * c;
+        let slope = ((&t + 1.0)? * 0.5)? + ((x * 0.5)? * (t.sqr()?.neg()? + 1.0)?)? * du?;
+        g * slope?.to_dtype(dtype)?
+    })
+}
+
 /// `rotary_emb::rope`, with a backward where one is wanted.
 pub(crate) fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
     match slow(&[x, cos, sin]) {
@@ -631,7 +675,13 @@ pub fn directional(f: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>, x: &Tenso
     let var = Var::from_tensor(x)?;
     let grads = f(var.as_tensor())?.backward()?;
     let (by_backward, typical) = match grads.get(var.as_tensor()) {
-        Some(g) => (number((g * &d)?)?, number(g.sqr()?)?.sqrt()),
+        // Widened first: a half-precision gradient's squares overflow
+        // (f16 ends at 65504), and the length then reads as infinite.
+        Some(g) => {
+            let wide = |t: &Tensor| t.to_dtype(crate::image::nn::wide(t.dtype()));
+            let g = wide(g)?;
+            (number((&g * wide(&d)?)?)?, number(g.sqr()?)?.sqrt())
+        }
         None => (0.0, 0.0),
     };
     let at = |sign: f64| -> candle_core::Result<f64> { number(f(&(x + (&d * (sign * eps))?)?)?) };
@@ -648,6 +698,78 @@ pub fn complete(f: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>, x: &Tensor, 
         candle_core::bail!("the gradient is incomplete: backward finds a slope of {:.6}, and the function's is {:.6}", s.by_backward, s.measured);
     }
     Ok(())
+}
+
+/// What the checks of a real model's gradient share
+/// (`flux::tests::a_real_block_has_a_whole_gradient` has the reasoning).
+/// The first way a model is run is in f64 on the CPU, where a measured
+/// slope has eight digits to agree with backward's in, and must; every
+/// way after that is held to the slopes backward found there, from the
+/// same seeded tensors along the same directions, for a slope measured in
+/// f32 is 0.5–3% of a typical one out.
+#[cfg(test)]
+pub(crate) mod real {
+    use super::{directional, Slopes};
+    use crate::image::lora::Adapters;
+    use candle_core::{Tensor, Var};
+
+    /// Backward's slopes in f64, in the order they were taken.
+    #[derive(Default)]
+    pub(crate) struct Exact(Vec<f64>);
+
+    /// One way of running the model, against [`Exact`].
+    pub(crate) struct Run<'a> {
+        exact: &'a mut Vec<f64>,
+        first: bool,
+        taken: usize,
+        what: &'a str,
+        tolerance: f64,
+    }
+
+    impl Exact {
+        /// The next way: the f64 one if it is the first, and one whose
+        /// slopes may be `tolerance` of a typical slope from f64's if not.
+        pub(crate) fn run<'a>(&'a mut self, what: &'a str, tolerance: f64) -> Run<'a> {
+            let first = self.0.is_empty();
+            Run { exact: &mut self.0, first, taken: 0, what, tolerance }
+        }
+    }
+
+    impl Run<'_> {
+        pub(crate) fn take(&mut self, name: &str, s: Slopes) {
+            let what = self.what;
+            if self.first {
+                eprintln!("{what}: {name}: backward {:.6}, measured {:.6}, {:.1e} apart (a slope here is typically {:.2e})", s.by_backward, s.measured, s.apart(), s.typical);
+                assert!(s.typical > 0.0, "{what}: no gradient reached {name}");
+                assert!(s.apart() < 1e-6, "{what}: the gradient through {name} is not the function's: {s:?}");
+                self.exact.push(s.by_backward);
+            } else {
+                let exact = self.exact[self.taken];
+                let off = (s.by_backward - exact).abs() / s.typical;
+                eprintln!("{what}: {name}: backward {:.6}, {off:.1e} from f64's; measured {:.6}, {:.1e} apart", s.by_backward, s.measured, s.apart());
+                assert!(off < self.tolerance, "{what}: the gradient through {name} is not f64's: {s:?} against {exact}");
+            }
+            self.taken += 1;
+        }
+
+        /// Both factors of the LoRA on `layer` of `part`, each in turn the
+        /// variable and the other left in place. `loss` reads the adapters
+        /// as they stand; `step` is the step for a factor.
+        pub(crate) fn factors(&mut self, adapters: &Adapters, part: &str, layer: &str, (a, b): (&Var, &Var), loss: &dyn Fn() -> candle_core::Result<Tensor>, step: f64) {
+            let place = |a: &Tensor, b: &Tensor| adapters.place(part, layer, a, b).unwrap();
+            let by_a = |t: &Tensor| {
+                place(t, b.as_tensor());
+                loss()
+            };
+            self.take(&format!("{layer}'s A"), directional(&by_a, a.as_tensor(), step, 12).unwrap());
+            let by_b = |t: &Tensor| {
+                place(a.as_tensor(), t);
+                loss()
+            };
+            self.take(&format!("{layer}'s B"), directional(&by_b, b.as_tensor(), step, 13).unwrap());
+            place(a.as_tensor(), b.as_tensor());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1115,5 +1237,25 @@ mod tests {
         assert!(!crate::mpp::dense_acc(&var(&answer()), &x, &w).unwrap());
         assert!(!crate::mpp::dense_acc(&answer(), &var(&x), &w).unwrap());
         assert!(!crate::mpp::dense_acc(&answer(), &x, &var(&w)).unwrap());
+    }
+    /// Both GELUs' own backwards are the functions' slopes to nine digits
+    /// in f64, where candle's, with its constants to six, are not to eight;
+    /// and in half precision, at an `x` whose square is past f16's end, the
+    /// slope is a number.
+    #[test]
+    fn a_gelu_s_gradient_is_exact() {
+        let x = (crate::image::nn::noise(7, &[64, 33], &Device::Cpu, DType::F32).unwrap() * 2.0).unwrap().to_dtype(DType::F64).unwrap();
+        type Act = fn(&Tensor) -> candle_core::Result<Tensor>;
+        let pairs: [(&str, Act, Act); 2] = [("tanh", gelu, |x| x.gelu()), ("erf", gelu_erf, |x| x.gelu_erf())];
+        for (name, own, candles) in pairs {
+            let s = directional(&|x| own(x)?.sqr()?.sum_all(), &x, 1e-5, 3).unwrap();
+            assert!(s.apart() < 1e-9, "{name}: {s:?}");
+            let c = directional(&|x| candles(x)?.sqr()?.sum_all(), &x, 1e-5, 3).unwrap();
+            assert!(c.apart() > 1e-8, "{name}: candle's backward has become exact, and this one can go: {c:?}");
+        }
+        let far = Var::from_tensor(&Tensor::new(&[300f32, -300.0, 0.5], &Device::Cpu).unwrap().to_dtype(DType::F16).unwrap()).unwrap();
+        let grads = gelu(far.as_tensor()).unwrap().sum_all().unwrap().backward().unwrap();
+        let g = grads.get(far.as_tensor()).unwrap().to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
+        assert!(g[0] == 1.0 && g[1] == 0.0 && (g[2] - 0.8674).abs() < 2e-3, "{g:?}");
     }
 }

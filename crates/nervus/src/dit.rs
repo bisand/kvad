@@ -788,6 +788,74 @@ pub fn load_state(dir: &Path) -> io::Result<Dit> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A clip model on disk
+// ---------------------------------------------------------------------------
+
+/// `_class_name` in a clip model's `model_index.json`.
+///
+/// diffusers has no DiT for clips shaped like these (Latte's is conditioned
+/// on text), so there is no layout to be faithful to. The directory is laid
+/// out like [`save`]'s, so that `kvad` finds it by the same rule, and its
+/// transformer is [`save_state`]'s: this crate's own names, which is all a
+/// file can promise when nothing else reads it.
+pub const CLIP_PIPELINE: &str = "NervusVideoDiTPipeline";
+
+/// A clip model, with what it takes to draw with it.
+pub struct ClipModel {
+    pub model: Dit,
+    /// The labels, in class order.
+    pub labels: Vec<String>,
+    /// How many labels a clip is asked for: two for two digits.
+    pub per_clip: usize,
+    /// The frames per second its clips were made to be played at.
+    pub fps: u32,
+}
+
+/// Write a clip model into `dir`: `labels` names each class, a clip is
+/// asked for `per_clip` of them, and it plays at `fps`.
+pub fn save_clips(dir: &Path, model: &mut Dit, labels: &[&str], per_clip: usize, fps: u32) -> io::Result<()> {
+    let classes = model.config().classes;
+    assert_eq!(labels.len(), classes, "{} labels for {classes} classes", labels.len());
+    std::fs::create_dir_all(dir.join("scheduler"))?;
+    let labels = labels.iter().enumerate().map(|(i, &l)| (i.to_string(), Json::from(l))).collect();
+    let index = object([
+        ("_class_name", CLIP_PIPELINE.into()),
+        ("transformer", Json::Array(vec!["nervus".into(), "Dit".into()])),
+        ("scheduler", Json::Array(vec!["diffusers".into(), SCHEDULER.into()])),
+        ("id2label", Json::Object(labels)),
+        ("labels_per_clip", per_clip.into()),
+        ("fps", (fps as usize).into()),
+    ]);
+    std::fs::write(dir.join("model_index.json"), format!("{index}\n"))?;
+    std::fs::write(dir.join("scheduler/scheduler_config.json"), format!("{}\n", scheduler_config()))?;
+    save_state(&dir.join("transformer"), model)
+}
+
+/// Read back what [`save_clips`] wrote.
+pub fn load_clips(dir: &Path) -> io::Result<ClipModel> {
+    let bad = |what: String| invalid(format!("{}: {what}", dir.display()));
+    let read = |path: &str| -> io::Result<Json> {
+        let path = dir.join(path);
+        let text = std::fs::read_to_string(&path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        Json::parse(&text).map_err(|e| invalid(format!("{}: {e}", path.display())))
+    };
+    let index = read("model_index.json")?;
+    let class = index.get("_class_name").and_then(Json::as_str);
+    if class != Some(CLIP_PIPELINE) {
+        return Err(bad(format!("{class:?} where {CLIP_PIPELINE} was expected")));
+    }
+    check_scheduler(&read("scheduler/scheduler_config.json")?).map_err(bad)?;
+    let model = load_state(&dir.join("transformer"))?;
+    let labels = read_labels(&index, model.config().classes).map_err(bad)?;
+    let size = |key: &str| index.get(key).and_then(Json::as_usize).ok_or_else(|| bad(format!("no `{key}` in model_index.json")));
+    let (per_clip, fps) = (size("labels_per_clip")?, size("fps")?);
+    if per_clip == 0 || fps == 0 || fps > 120 {
+        return Err(bad(format!("{per_clip} labels a clip at {fps} fps")));
+    }
+    Ok(ClipModel { model, labels, per_clip, fps: fps as u32 })
+}
+
 /// `_class_name` in `model_index.json`. Not `DiTPipeline`, because that
 /// pipeline has a VAE and a DDPM scheduler, and code that saw the name would
 /// run this model with both.
@@ -907,14 +975,7 @@ pub fn save(dir: &Path, model: &mut Dit, labels: &[&str]) -> io::Result<()> {
             ("upcast_attention", Json::Bool(false)),
         ]),
     )?;
-    write(
-        "scheduler/scheduler_config.json",
-        object([
-            ("_class_name", SCHEDULER.into()),
-            ("num_train_timesteps", (TIMESTEP_SCALE as usize).into()),
-            ("shift", Json::Number(1.0)),
-        ]),
-    )?;
+    write("scheduler/scheduler_config.json", scheduler_config())?;
 
     let mut tensors = Vec::new();
     for p in model.params() {
@@ -930,6 +991,42 @@ pub fn save(dir: &Path, model: &mut Dit, labels: &[&str]) -> io::Result<()> {
     write_safetensors(&dir.join(WEIGHTS), &tensors)
 }
 
+/// The scheduler a model trained by [`crate::flow`] is sampled with,
+/// as diffusers writes one.
+fn scheduler_config() -> Json {
+    object([
+        ("_class_name", SCHEDULER.into()),
+        ("num_train_timesteps", (TIMESTEP_SCALE as usize).into()),
+        ("shift", Json::Number(1.0)),
+    ])
+}
+
+/// Refuse a scheduler config that is not [`scheduler_config`]'s: another
+/// class is another objective, and a shift or other timesteps another
+/// schedule.
+fn check_scheduler(scheduler: &Json) -> Result<(), String> {
+    let class = scheduler.get("_class_name").and_then(Json::as_str);
+    if class != Some(SCHEDULER) {
+        return Err(format!("{class:?} where {SCHEDULER} was expected"));
+    }
+    let number = |key: &str| match scheduler.get(key) {
+        Some(Json::Number(n)) => Some(*n),
+        _ => None,
+    };
+    if number("num_train_timesteps") != Some(TIMESTEP_SCALE as f64) || number("shift") != Some(1.0) {
+        return Err("a scheduler with other timesteps or a shift; only 1000 timesteps and a shift of 1 are drawn here".into());
+    }
+    Ok(())
+}
+
+/// The labels in class order, from a `model_index.json`'s `id2label`.
+fn read_labels(index: &Json, classes: usize) -> Result<Vec<String>, String> {
+    (0..classes)
+        .map(|i| index.get("id2label").and_then(|l| l.get(&i.to_string())).and_then(Json::as_str).map(str::to_string))
+        .collect::<Option<_>>()
+        .ok_or_else(|| format!("`id2label` does not name all {classes} classes"))
+}
+
 /// Read back what [`save`] wrote: the model, and its labels in class order.
 pub fn load(dir: &Path) -> io::Result<(Dit, Vec<String>)> {
     let read = |path: &str| -> io::Result<Json> {
@@ -943,7 +1040,7 @@ pub fn load(dir: &Path) -> io::Result<(Dit, Vec<String>)> {
     let bad = |what: String| invalid(format!("{}: {what}", dir.display()));
 
     let class = |json: &Json| json.get("_class_name").and_then(Json::as_str).map(str::to_string);
-    for (json, wanted) in [(&index, PIPELINE), (&transformer, TRANSFORMER), (&scheduler, SCHEDULER)] {
+    for (json, wanted) in [(&index, PIPELINE), (&transformer, TRANSFORMER)] {
         if class(json).as_deref() != Some(wanted) {
             return Err(bad(format!("{:?} where {wanted} was expected", class(json))));
         }
@@ -952,9 +1049,7 @@ pub fn load(dir: &Path) -> io::Result<(Dit, Vec<String>)> {
         Some(Json::Number(n)) => Some(*n),
         _ => None,
     };
-    if number(&scheduler, "num_train_timesteps") != Some(TIMESTEP_SCALE as f64) || number(&scheduler, "shift") != Some(1.0) {
-        return Err(bad("a scheduler with other timesteps or a shift; only 1000 timesteps and a shift of 1 are drawn here".into()));
-    }
+    check_scheduler(&scheduler).map_err(bad)?;
     let text = |key: &str| transformer.get(key).and_then(Json::as_str);
     let flag = |key: &str| transformer.get(key).cloned();
     if text("norm_type") != Some("ada_norm_zero")
@@ -985,10 +1080,7 @@ pub fn load(dir: &Path) -> io::Result<(Dit, Vec<String>)> {
         n_heads: heads,
         n_layers: size("num_layers")?,
     };
-    let labels: Vec<String> = (0..config.classes)
-        .map(|i| index.get("id2label").and_then(|l| l.get(&i.to_string())).and_then(Json::as_str).map(str::to_string))
-        .collect::<Option<_>>()
-        .ok_or_else(|| bad(format!("`id2label` does not name all {} classes", config.classes)))?;
+    let labels = read_labels(&index, config.classes).map_err(bad)?;
 
     let mut model = Dit::new(config, &mut Rng::new(0));
     let mut tensors: std::collections::HashMap<String, Tensor> =
@@ -1292,6 +1384,23 @@ mod tests {
         assert_eq!(loaded.config(), config);
         let x = random(config.pixels(), &mut Rng::new(92));
         assert_eq!(model.forward_labels(&x, 0.3, &[1, 2]), loaded.forward_labels(&x, 0.3, &[1, 2]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_clip_model_keeps_its_labels_and_its_rate() {
+        let dir = scratch("clips");
+        let config = DitConfig { frames: 3, attention: Attention::Factorised, channels: 1, ..CONFIG };
+        let mut model = Dit::new(config, &mut Rng::new(93));
+        scramble(model.params(), &mut Rng::new(94));
+        save_clips(&dir, &mut model, &LABELS, 2, 8).unwrap();
+        let mut loaded = load_clips(&dir).unwrap();
+        assert_eq!((loaded.labels.clone(), loaded.per_clip, loaded.fps), (LABELS.map(String::from).to_vec(), 2, 8));
+        let x = random(config.pixels(), &mut Rng::new(95));
+        assert_eq!(model.forward_labels(&x, 0.3, &[1, 2]), loaded.model.forward_labels(&x, 0.3, &[1, 2]));
+
+        // Not a picture pipeline, and a picture loader says so.
+        assert!(load(&dir).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -170,6 +170,12 @@ fn unit(x: &[f32]) -> Vec<f32> {
     x.iter().map(|&v| ((v + 1.0) / 2.0).clamp(0.0, 1.0)).collect()
 }
 
+/// What each class is called, which is what a prompt asks for.
+const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+/// The rate a clip is meant to be played at: eight frames, one second.
+const FPS: u32 = 8;
+
 /// The clips every checkpoint draws: two digits each, and a seed each.
 const ASKED: [[usize; 2]; 8] = [[3, 7], [0, 1], [2, 5], [4, 9], [6, 8], [1, 1], [7, 2], [8, 3]];
 
@@ -243,7 +249,11 @@ fn main() -> std::io::Result<()> {
     let mut rng = Rng::new(args.seed);
     let mut model = match &args.load {
         Some(dir) => {
-            let model = nervus::dit::load_state(dir)?;
+            // A model this binary saved, or the state of one.
+            let model = match dir.join("model_index.json").exists() {
+                true => nervus::dit::load_clips(dir)?.model,
+                false => nervus::dit::load_state(dir)?,
+            };
             if model.config() != config {
                 eprintln!("{} is {:?}, and the flags ask for {config:?}", dir.display(), model.config());
                 std::process::exit(2);
@@ -306,10 +316,12 @@ fn main() -> std::io::Result<()> {
         }
 
         if step % args.eval_every.max(1) == 0 || step == args.steps {
-            nervus::dit::save_state(&args.out.join("state"), &mut model)?;
             let val = replicas.validate(&mut model, &validation);
             let gap = replicas.validate(&mut model, &mislabelled) - val;
-            best = best.min(val);
+            if val < best {
+                best = val;
+                nervus::dit::save_clips(&args.out.join("model"), &mut model, &DIGITS, 2, FPS)?;
+            }
             let requests: Vec<(Vec<usize>, u64)> = ASKED.iter().enumerate().map(|(i, pair)| (pair.to_vec(), i as u64)).collect();
             let drawn: Vec<Vec<f32>> = replicas.sample(&mut model, &requests, args.sample_steps, args.guidance).iter().map(|x| unit(x)).collect();
             let drawn_flicker = drawn.iter().map(|c| moving::flicker(c, args.frames)).sum::<f32>() / drawn.len() as f32;
@@ -345,6 +357,12 @@ fn main() -> std::io::Result<()> {
         "trained at {rate:.1} clips/s = {:.0} frames/s ({} in training steps)",
         rate * args.frames as f64,
         human_secs(training.as_secs_f32())
+    );
+    // kvad finds a model by name in its data directory's `models`; its
+    // default is below.
+    println!(
+        "\nto draw with kvad, give it a name:\n  cp -R {} ~/.local/share/kvad/models/moving\n  kvad videos make \"3 and 7\" --model moving",
+        args.out.join("model").display()
     );
     Ok(())
 }

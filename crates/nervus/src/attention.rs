@@ -58,11 +58,50 @@ use crate::matrix::Matrix;
 use crate::nn::{prefixed, Layer, Linear, Param};
 use crate::rng::Rng;
 
+/// Which positions each position may read.
+///
+/// A video is a sequence too, `frames × patches` long, and attention over all
+/// of it costs the square of that. The cheaper option attends within groups:
+/// within one frame (every patch sees its neighbours, none of the other
+/// frames), or across frames at one place (a patch sees itself earlier and
+/// later, nothing else). Alternate the two and information still gets from
+/// anywhere to anywhere, in two hops rather than one. See `dit` for which
+/// blocks use which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Every position reads every position.
+    All,
+    /// Position `i` reads `0..=i`.
+    Causal,
+    /// The rows in runs of this many, each run reading only itself: one
+    /// frame's patches, with the frames one after another.
+    Runs(usize),
+    /// Rows `i, i + n, i + 2n, ...` reading only each other: one patch
+    /// through every frame, for a stride of one frame's patches.
+    Strided(usize),
+}
+
+impl Scope {
+    /// The groups a sequence of `rows` splits into, each a list of rows.
+    pub fn groups(self, rows: usize) -> Vec<Vec<usize>> {
+        match self {
+            Scope::All | Scope::Causal => vec![(0..rows).collect()],
+            Scope::Runs(n) => {
+                assert!(n > 0 && rows % n == 0, "{rows} rows do not split into runs of {n}");
+                (0..rows / n).map(|g| (g * n..(g + 1) * n).collect()).collect()
+            }
+            Scope::Strided(n) => {
+                assert!(n > 0 && rows % n == 0, "{rows} rows do not split with a stride of {n}");
+                (0..n).map(|g| (g..rows).step_by(n).collect()).collect()
+            }
+        }
+    }
+}
+
 /// Multi-head self-attention over one sequence: `[seq, d_model]` in,
 /// `[seq, d_model]` out.
 pub struct SelfAttention {
-    /// Whether position `i` may read only positions `0..=i`.
-    causal: bool,
+    scope: Scope,
     n_heads: usize,
     head_dim: usize,
     wq: Linear,
@@ -79,7 +118,12 @@ pub struct SelfAttention {
 /// attention, sitting right here in a struct. Inference throws it away at
 /// once; training has to keep it until backward, and avoiding exactly that is
 /// what FlashAttention is for.
+///
+/// One per head *and group*: attending within groups keeps `g` squares of
+/// `seq / g` rows rather than one of `seq`, which is the whole saving.
 struct HeadCache {
+    head: usize,
+    rows: Vec<usize>,
     q: Matrix,
     k: Matrix,
     v: Matrix,
@@ -89,18 +133,18 @@ struct HeadCache {
 impl SelfAttention {
     /// Each position reads itself and what came before it: a GPT's attention.
     pub fn causal(d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
-        Self::new(true, d_model, n_heads, rng)
+        Self::new(Scope::Causal, d_model, n_heads, rng)
     }
 
     /// Every position reads every position: a diffusion transformer's.
     pub fn bidirectional(d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
-        Self::new(false, d_model, n_heads, rng)
+        Self::new(Scope::All, d_model, n_heads, rng)
     }
 
-    fn new(causal: bool, d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
+    pub fn new(scope: Scope, d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
         assert_eq!(d_model % n_heads, 0, "d_model {d_model} does not split into {n_heads} heads");
         SelfAttention {
-            causal,
+            scope,
             n_heads,
             head_dim: d_model / n_heads,
             wq: Linear::new(d_model, d_model, rng),
@@ -133,24 +177,28 @@ impl Layer for SelfAttention {
         let scale = self.scale();
         let mut mixed = Matrix::zeros(x.rows, x.cols);
         self.heads.clear();
+        let groups = self.scope.groups(x.rows);
         for h in 0..self.n_heads {
-            // A head is nothing more than a slice of the columns. The heads
-            // never interact until Wo mixes them back together.
-            let qh = take_head(&q, h, self.head_dim);
-            let kh = take_head(&k, h, self.head_dim);
-            let vh = take_head(&v, h, self.head_dim);
+            for rows in &groups {
+                // A head is nothing more than a slice of the columns, and a
+                // group a selection of the rows. The heads never interact
+                // until Wo mixes them back together; the groups never do.
+                let qh = take_head(&q, h, self.head_dim, rows);
+                let kh = take_head(&k, h, self.head_dim, rows);
+                let vh = take_head(&v, h, self.head_dim, rows);
 
-            // scores[i][j] = q_i · k_j — how well position i's question
-            // matches position j's label.
-            let mut probs = qh.matmul_a_bt(&kh);
-            probs.data.iter_mut().for_each(|s| *s *= scale);
-            softmax_rows(&mut probs, self.causal);
+                // scores[i][j] = q_i · k_j — how well position i's question
+                // matches position j's label.
+                let mut probs = qh.matmul_a_bt(&kh);
+                probs.data.iter_mut().for_each(|s| *s *= scale);
+                softmax_rows(&mut probs, self.scope == Scope::Causal);
 
-            // Each output row is a weighted average of the value rows.
-            let out = probs.matmul(&vh);
-            put_head(&mut mixed, h, &out);
+                // Each output row is a weighted average of the value rows.
+                let out = probs.matmul(&vh);
+                put_head(&mut mixed, h, rows, &out);
 
-            self.heads.push(HeadCache { q: qh, k: kh, v: vh, probs });
+                self.heads.push(HeadCache { head: h, rows: rows.clone(), q: qh, k: kh, v: vh, probs });
+            }
         }
 
         self.wo.forward(&mixed)
@@ -164,8 +212,9 @@ impl Layer for SelfAttention {
         let mut dq = Matrix::zeros(dy.rows, dy.cols);
         let mut dk = Matrix::zeros(dy.rows, dy.cols);
         let mut dv = Matrix::zeros(dy.rows, dy.cols);
-        for (h, head) in self.heads.iter().enumerate() {
-            let dout = take_head(&dmixed, h, self.head_dim);
+        for head in &self.heads {
+            let (h, rows) = (head.head, &head.rows);
+            let dout = take_head(&dmixed, h, self.head_dim, rows);
 
             // out = P @ V. The same two rules as Linear, where P plays the
             // input and V plays the weight: dV = Pᵀ @ dout, dP = dout @ Vᵀ.
@@ -181,9 +230,9 @@ impl Layer for SelfAttention {
             let dqh = dscores.matmul(&head.k);
             let dkh = dscores.matmul_at_b(&head.q);
 
-            put_head(&mut dq, h, &dqh);
-            put_head(&mut dk, h, &dkh);
-            put_head(&mut dv, h, &dvh);
+            put_head(&mut dq, h, rows, &dqh);
+            put_head(&mut dk, h, rows, &dkh);
+            put_head(&mut dv, h, rows, &dvh);
         }
 
         // x fed three projections, so it is to blame through all three. When a
@@ -218,8 +267,8 @@ impl Layer for SelfAttention {
 
     fn describe(&self) -> String {
         format!(
-            "{}SelfAttention({} heads x {}, {} params)",
-            if self.causal { "Causal" } else { "Bidirectional" },
+            "SelfAttention({:?}, {} heads x {}, {} params)",
+            self.scope,
             self.n_heads,
             self.head_dim,
             self.param_count()
@@ -288,20 +337,20 @@ fn softmax_backward(probs: &Matrix, dprobs: &Matrix) -> Matrix {
     dscores
 }
 
-/// Copy head `h`'s columns out of a `[seq, d_model]` matrix.
-fn take_head(m: &Matrix, h: usize, head_dim: usize) -> Matrix {
-    let mut out = Matrix::zeros(m.rows, head_dim);
-    for r in 0..m.rows {
-        out.row_mut(r).copy_from_slice(&m.row(r)[h * head_dim..(h + 1) * head_dim]);
+/// Copy head `h`'s columns of the given rows out of a `[seq, d_model]` matrix.
+fn take_head(m: &Matrix, h: usize, head_dim: usize, rows: &[usize]) -> Matrix {
+    let mut out = Matrix::zeros(rows.len(), head_dim);
+    for (i, &r) in rows.iter().enumerate() {
+        out.row_mut(i).copy_from_slice(&m.row(r)[h * head_dim..(h + 1) * head_dim]);
     }
     out
 }
 
-/// The inverse of [`take_head`]: write `[seq, head_dim]` back into its columns.
-fn put_head(m: &mut Matrix, h: usize, head: &Matrix) {
+/// The inverse of [`take_head`]: write `[rows, head_dim]` back where it came from.
+fn put_head(m: &mut Matrix, h: usize, rows: &[usize], head: &Matrix) {
     let head_dim = head.cols;
-    for r in 0..m.rows {
-        m.row_mut(r)[h * head_dim..(h + 1) * head_dim].copy_from_slice(head.row(r));
+    for (i, &r) in rows.iter().enumerate() {
+        m.row_mut(r)[h * head_dim..(h + 1) * head_dim].copy_from_slice(head.row(i));
     }
 }
 
@@ -449,6 +498,90 @@ mod tests {
 
         for r in 0..SEQ {
             assert_ne!(before.row(r), after.row(r), "position {r} did not see the last one");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Attention within groups
+    // -----------------------------------------------------------------------
+
+    /// Three frames of two patches: rows 0-1, 2-3, 4-5.
+    const FRAMES: usize = 3;
+    const PATCHES: usize = 2;
+
+    fn grouped(scope: Scope, seed: u64) -> (SelfAttention, Matrix) {
+        let mut rng = Rng::new(seed);
+        let attn = SelfAttention::new(scope, D_MODEL, 2, &mut rng);
+        let rows = FRAMES * PATCHES;
+        (attn, Matrix::from_vec(rows, D_MODEL, (0..rows * D_MODEL).map(|_| rng.normal()).collect()))
+    }
+
+    #[test]
+    fn groups_are_frames_or_places() {
+        assert_eq!(Scope::Runs(2).groups(6), vec![vec![0, 1], vec![2, 3], vec![4, 5]]);
+        assert_eq!(Scope::Strided(2).groups(6), vec![vec![0, 2, 4], vec![1, 3, 5]]);
+        assert_eq!(Scope::All.groups(3), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn grouped_gradient_matches_numerical() {
+        for scope in [Scope::Runs(PATCHES), Scope::Strided(PATCHES)] {
+            let (mut attn, x) = grouped(scope, 9);
+            crate::gradcheck::scramble(attn.params(), &mut Rng::new(10));
+            for c in crate::gradcheck::check_layer(&mut attn, &x, &[3, 0, 7, 1, 4, 6], 1e-2) {
+                if c.name == "wk.bias" {
+                    continue; // zero by construction; see above
+                }
+                assert!(c.rel < 5e-3, "{scope:?} {}: analytic and numerical gradients differ (rel {:.4})", c.name, c.rel);
+            }
+        }
+    }
+
+    /// Attending within groups is exactly attending to each group alone, with
+    /// the same weights: nothing is masked, nothing leaks, and nothing else is
+    /// computed. So run every group through a plain bidirectional layer with
+    /// copied weights and compare.
+    #[test]
+    fn a_group_attends_as_if_it_were_the_whole_sequence() {
+        for scope in [Scope::Runs(PATCHES), Scope::Strided(PATCHES)] {
+            let (mut attn, x) = grouped(scope, 11);
+            crate::gradcheck::scramble(attn.params(), &mut Rng::new(12));
+            let mut alone = SelfAttention::bidirectional(D_MODEL, 2, &mut Rng::new(0));
+            for (theirs, ours) in alone.params().into_iter().zip(attn.params()) {
+                theirs.value.copy_from_slice(ours.value);
+            }
+
+            let together = attn.forward(&x);
+            for rows in scope.groups(x.rows) {
+                let mut part = Matrix::zeros(rows.len(), D_MODEL);
+                for (i, &r) in rows.iter().enumerate() {
+                    part.row_mut(i).copy_from_slice(x.row(r));
+                }
+                let out = alone.forward(&part);
+                for (i, &r) in rows.iter().enumerate() {
+                    let gap = out.row(i).iter().zip(together.row(r)).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                    assert!(gap < 1e-5, "{scope:?}: row {r} differs by {gap:e}");
+                }
+            }
+        }
+    }
+
+    /// A change in one frame reaches only that frame under `Runs`, and only
+    /// that place in every frame under `Strided`.
+    #[test]
+    fn a_change_stays_inside_its_group() {
+        for scope in [Scope::Runs(PATCHES), Scope::Strided(PATCHES)] {
+            let (mut attn, mut x) = grouped(scope, 13);
+            let before = attn.forward(&x);
+            x.row_mut(4).iter_mut().for_each(|v| *v += 1.0);
+            let after = attn.forward(&x);
+            let group: Vec<usize> = scope.groups(x.rows).into_iter().find(|g| g.contains(&4)).unwrap();
+            for r in 0..x.rows {
+                match group.contains(&r) {
+                    true => assert_ne!(before.row(r), after.row(r), "{scope:?}: row {r} did not see row 4"),
+                    false => assert_eq!(before.row(r), after.row(r), "{scope:?}: row {r} saw row 4"),
+                }
+            }
         }
     }
 

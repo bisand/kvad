@@ -66,8 +66,10 @@ fn main() -> std::io::Result<()> {
 | `mnist` | the dataset loader, for training an MLP instead |
 | `dit` | a diffusion transformer: patches, 2-D positions, adaLN-Zero conditioning |
 | `flow` | flow matching: the training loss, guidance, and the sampler |
+| `moving` | Moving MNIST: clips of two digits bouncing in a box, and a measure of flicker |
 
-Three binaries come with it: `train_mnist`, `train_text` and `train_digits`.
+Four binaries come with it: `train_mnist`, `train_text`, `train_digits` and
+`train_video`.
 
 ## Train a model that draws digits
 

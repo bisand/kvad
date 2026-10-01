@@ -64,7 +64,7 @@
 //! [`block`]: crate::block
 //! [`flow`]: crate::flow
 
-use crate::attention::SelfAttention;
+use crate::attention::{Scope, SelfAttention};
 use crate::checkpoint::{invalid, read_safetensors, write_safetensors, Tensor};
 use crate::embedding::Embedding;
 use crate::json::{object, Json};
@@ -75,10 +75,26 @@ use crate::rng::Rng;
 use std::io;
 use std::path::Path;
 
+/// Which tokens each block's attention reads. Only a video has a choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attention {
+    /// Every patch of every frame reads every other: one square of
+    /// `frames × patches` tokens per block.
+    Full,
+    /// Blocks alternate: the even ones attend within each frame, the odd ones
+    /// across frames at each place, as Latte does. `frames` squares of
+    /// `patches`, then `patches` squares of `frames`. Anything still reaches
+    /// anything, in two blocks rather than one.
+    Factorised,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DitConfig {
     /// Side of the square image, in pixels.
     pub image: usize,
+    /// Frames in a clip; 1 for a picture.
+    pub frames: usize,
+    pub attention: Attention,
     pub channels: usize,
     /// Side of a patch, in pixels. `image` has to be a multiple of it.
     pub patch: usize,
@@ -96,9 +112,15 @@ impl DitConfig {
         self.image / self.patch
     }
 
-    /// The sequence length: one token per patch.
-    pub fn tokens(&self) -> usize {
+    /// Patches in one frame.
+    pub fn patches(&self) -> usize {
         self.grid() * self.grid()
+    }
+
+    /// The sequence length: one token per patch of every frame, frame after
+    /// frame.
+    pub fn tokens(&self) -> usize {
+        self.frames * self.patches()
     }
 
     /// Numbers in one patch.
@@ -106,9 +128,24 @@ impl DitConfig {
         self.patch * self.patch * self.channels
     }
 
-    /// Numbers in one image.
-    pub fn pixels(&self) -> usize {
+    /// Numbers in one frame.
+    pub fn frame_pixels(&self) -> usize {
         self.channels * self.image * self.image
+    }
+
+    /// Numbers in one clip, `[frames, channels, image, image]`: a picture is
+    /// a clip of one frame.
+    pub fn pixels(&self) -> usize {
+        self.frames * self.frame_pixels()
+    }
+
+    /// Which tokens block `layer`'s attention reads.
+    pub fn scope(&self, layer: usize) -> Scope {
+        match (self.attention, layer % 2) {
+            (Attention::Full, _) => Scope::All,
+            (Attention::Factorised, 0) => Scope::Runs(self.patches()),
+            (Attention::Factorised, _) => Scope::Strided(self.patches()),
+        }
     }
 
     /// The label that means "no label".
@@ -163,22 +200,37 @@ pub fn timestep_features(t: f32) -> Vec<f32> {
 /// timestep. They have no parameters, so there is nothing to train and nothing
 /// to save. (Which half is which follows DiT's code, where a `meshgrid`
 /// argument order puts the column first.)
-pub fn position_table(d_model: usize, grid: usize) -> Matrix {
+///
+/// A clip's tokens get the same table in every frame, plus a third pattern of
+/// the same kind across the whole width for which frame it is, which is what
+/// Latte adds for time. A picture is frame 0 of one, and gets nothing added:
+/// DiT's table, exactly.
+pub fn position_table(d_model: usize, grid: usize, frames: usize) -> Matrix {
     assert_eq!(d_model % 4, 0, "d_model {d_model} does not split into four sinusoid bands");
-    let quarter = d_model / 4;
+    // `pos` as `width` numbers: sines at `width / 2` frequencies, then cosines.
     let wave = |pos: usize, out: &mut [f32]| {
-        for k in 0..quarter {
-            let freq = 1.0 / (10_000f32).powf(k as f32 / quarter as f32);
+        let half = out.len() / 2;
+        for k in 0..half {
+            let freq = 1.0 / (10_000f32).powf(k as f32 / half as f32);
             out[k] = (pos as f32 * freq).sin();
-            out[quarter + k] = (pos as f32 * freq).cos();
+            out[half + k] = (pos as f32 * freq).cos();
         }
     };
-    let mut table = Matrix::zeros(grid * grid, d_model);
-    for row in 0..grid {
-        for col in 0..grid {
-            let (first, second) = table.row_mut(row * grid + col).split_at_mut(d_model / 2);
-            wave(col, first);
-            wave(row, second);
+    let patches = grid * grid;
+    let mut table = Matrix::zeros(frames * patches, d_model);
+    let mut when = vec![0.0; d_model];
+    for f in 0..frames {
+        wave(f, &mut when);
+        for row in 0..grid {
+            for col in 0..grid {
+                let token = table.row_mut(f * patches + row * grid + col);
+                let (first, second) = token.split_at_mut(d_model / 2);
+                wave(col, first);
+                wave(row, second);
+                if frames > 1 {
+                    token.iter_mut().zip(&when).for_each(|(v, w)| *v += w);
+                }
+            }
         }
     }
     table
@@ -188,7 +240,8 @@ pub fn position_table(d_model: usize, grid: usize) -> Matrix {
 // Patches
 // ---------------------------------------------------------------------------
 
-/// Cut an image, `[channels, image, image]` flattened, into `[tokens, patch_len]`.
+/// Cut an image, `[channels, image, image]` flattened, into `[tokens, patch_len]`:
+/// or a clip, `[frames, channels, image, image]`, frame by frame.
 ///
 /// Within a patch the order is channel, then row, then column: the order of a
 /// `Conv2d(channels, d_model, kernel = patch, stride = patch)` weight, which
@@ -223,17 +276,19 @@ fn unpatchify_backward(config: &DitConfig, dimage: &[f32]) -> Matrix {
 }
 
 /// Call `f(token, pixel, output_at, input_at)` for every pixel: which patch
-/// it lands in, where it is in the image, and where it sits within its patch
+/// it lands in, where it is in the clip, and where it sits within its patch
 /// in the output order and in the input order.
 fn each_pixel(config: &DitConfig, mut f: impl FnMut(usize, usize, usize, usize)) {
     let (p, n, c_all) = (config.patch, config.image, config.channels);
-    for c in 0..c_all {
-        for y in 0..n {
-            for x in 0..n {
-                let token = (y / p) * config.grid() + x / p;
-                let (dy, dx) = (y % p, x % p);
-                let pixel = (c * n + y) * n + x;
-                f(token, pixel, (dy * p + dx) * c_all + c, (c * p + dy) * p + dx);
+    for frame in 0..config.frames {
+        for c in 0..c_all {
+            for y in 0..n {
+                for x in 0..n {
+                    let token = frame * config.patches() + (y / p) * config.grid() + x / p;
+                    let (dy, dx) = (y % p, x % p);
+                    let pixel = frame * config.frame_pixels() + (c * n + y) * n + x;
+                    f(token, pixel, (dy * p + dx) * c_all + c, (c * p + dy) * p + dx);
+                }
             }
         }
     }
@@ -338,11 +393,11 @@ pub struct DitBlock {
 }
 
 impl DitBlock {
-    pub fn new(d_model: usize, n_heads: usize, rng: &mut Rng) -> Self {
+    pub fn new(d_model: usize, n_heads: usize, scope: Scope, rng: &mut Rng) -> Self {
         DitBlock {
             modulation: Linear::new(d_model, 6 * d_model, rng),
             norm1: LayerNorm::plain(d_model, NORM_EPS_ATTENTION),
-            attn: SelfAttention::bidirectional(d_model, n_heads, rng),
+            attn: SelfAttention::new(scope, d_model, n_heads, rng),
             norm2: LayerNorm::plain(d_model, NORM_EPS),
             mlp: vec![
                 Box::new(Linear::new(d_model, 4 * d_model, rng)),
@@ -447,6 +502,7 @@ pub struct Dit {
     out: Linear,
     final_m: Vec<f32>,
     final_n: Matrix,
+    labels_used: usize,
 }
 
 impl Dit {
@@ -456,7 +512,7 @@ impl Dit {
         let mut model = Dit {
             config,
             patches: Linear::new(config.patch_len(), d_model, rng),
-            positions: position_table(d_model, config.grid()),
+            positions: position_table(d_model, config.grid(), config.frames),
             time: vec![
                 Box::new(Linear::new(FREQUENCIES, d_model, rng)),
                 Box::new(Silu::default()),
@@ -464,12 +520,13 @@ impl Dit {
             ],
             labels: Embedding::new(classes + 1, d_model, rng),
             cond_act: Silu::default(),
-            blocks: (0..n_layers).map(|_| DitBlock::new(d_model, n_heads, rng)).collect(),
+            blocks: (0..n_layers).map(|i| DitBlock::new(d_model, n_heads, config.scope(i), rng)).collect(),
             final_norm: LayerNorm::plain(d_model, NORM_EPS_ATTENTION),
             final_modulation: Linear::new(d_model, 2 * d_model, rng),
             out: Linear::new(d_model, config.patch_len(), rng),
             final_m: Vec::new(),
             final_n: Matrix::zeros(0, 0),
+            labels_used: 0,
         };
         model.init(rng);
         model
@@ -512,8 +569,18 @@ impl Dit {
     /// What the model says about a noisy image `x` at noise level `t`, asked
     /// to draw `label`. One number per pixel, in the image's own layout.
     pub fn forward(&mut self, x: &[f32], t: f32, label: usize) -> Vec<f32> {
-        assert_eq!(x.len(), self.config.pixels(), "an image of {} numbers, not {}", x.len(), self.config.pixels());
-        assert!(label <= self.config.classes, "label {label} of {} classes", self.config.classes);
+        self.forward_labels(x, t, &[label])
+    }
+
+    /// [`forward`](Dit::forward) told several labels at once — "a 3 and a
+    /// 7" — whose embeddings are added up. The sum does not know which came
+    /// first, and nor should it: a clip of a 3 and a 7 is one of a 7 and a 3.
+    pub fn forward_labels(&mut self, x: &[f32], t: f32, labels: &[usize]) -> Vec<f32> {
+        assert_eq!(x.len(), self.config.pixels(), "a clip of {} numbers, not {}", x.len(), self.config.pixels());
+        assert!(!labels.is_empty(), "no label; the label for none is {}", self.config.unconditional());
+        for &label in labels {
+            assert!(label <= self.config.classes, "label {label} of {} classes", self.config.classes);
+        }
 
         let mut h = self.patches.forward(&patchify(&self.config, x));
         h.add_in_place(&self.positions);
@@ -524,7 +591,11 @@ impl Dit {
         for layer in self.time.iter_mut() {
             c = layer.forward(&c);
         }
-        c.add_in_place(&self.labels.forward(&[label]));
+        self.labels_used = labels.len();
+        let looked_up = self.labels.forward(labels);
+        for r in 0..looked_up.rows {
+            c.row_mut(0).iter_mut().zip(looked_up.row(r)).for_each(|(c, e)| *c += e);
+        }
         let c = self.cond_act.forward(&c);
 
         for block in self.blocks.iter_mut() {
@@ -558,7 +629,9 @@ impl Dit {
         self.patches.backward(&dh);
 
         let mut dc = self.cond_act.backward(&dc);
-        self.labels.backward(&dc);
+        // Every label was added in whole, so every one is blamed in whole.
+        let n = self.labels_used;
+        self.labels.backward(&Matrix::from_vec(n, dc.cols, dc.data.repeat(n)));
         for layer in self.time.iter_mut().rev() {
             dc = layer.backward(&dc);
         }
@@ -596,7 +669,14 @@ impl Dit {
     }
 
     pub fn summary(&mut self) -> String {
-        let DitConfig { image, patch, d_model, n_heads, n_layers, .. } = self.config;
+        let DitConfig { image, frames, attention, patch, d_model, n_heads, n_layers, .. } = self.config;
+        if frames > 1 {
+            return format!(
+                "Dit({n_layers} layers, {n_heads} heads, d_model {d_model}, {frames} frames of {image}x{image} in {patch}x{patch} patches = {} tokens, {attention:?} attention, {} params)",
+                self.config.tokens(),
+                self.param_count()
+            );
+        }
         format!(
             "Dit({n_layers} layers, {n_heads} heads, d_model {d_model}, {image}x{image} in {patch}x{patch} patches = {} tokens, {} params)",
             self.config.tokens(),
@@ -646,6 +726,67 @@ impl Dit {
 // conversion copied that one into every block. So does `save`. `load` takes
 // block 0's, and refuses a checkpoint whose blocks disagree: that is a model
 // this one cannot represent, not one to be run with the difference ignored.
+
+/// A model of any shape, clips included, in this crate's own names: a
+/// `config.json` of every [`DitConfig`] field and one flat tensor per
+/// parameter. For keeping a training run and coming back to it; [`save`] is
+/// the layout that other code reads, and it only has one for pictures.
+pub fn save_state(dir: &Path, model: &mut Dit) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let c = model.config();
+    let config = object([
+        ("image", c.image.into()),
+        ("frames", c.frames.into()),
+        ("attention", format!("{:?}", c.attention).to_lowercase().as_str().into()),
+        ("channels", c.channels.into()),
+        ("patch", c.patch.into()),
+        ("classes", c.classes.into()),
+        ("d_model", c.d_model.into()),
+        ("n_heads", c.n_heads.into()),
+        ("n_layers", c.n_layers.into()),
+    ]);
+    std::fs::write(dir.join("config.json"), format!("{config}\n"))?;
+    let tensors: Vec<Tensor> =
+        model.params().into_iter().map(|p| Tensor { name: p.name, shape: vec![p.value.len()], data: p.value.to_vec() }).collect();
+    write_safetensors(&dir.join("state.safetensors"), &tensors)
+}
+
+/// Read back what [`save_state`] wrote.
+pub fn load_state(dir: &Path) -> io::Result<Dit> {
+    let path = dir.join("config.json");
+    let json = Json::parse(&std::fs::read_to_string(&path)?).map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+    let size = |key: &str| json.get(key).and_then(Json::as_usize).ok_or_else(|| invalid(format!("{}: no `{key}`", path.display())));
+    let attention = match json.get("attention").and_then(Json::as_str) {
+        Some("full") => Attention::Full,
+        Some("factorised") => Attention::Factorised,
+        other => return Err(invalid(format!("{}: attention {other:?}", path.display()))),
+    };
+    let config = DitConfig {
+        image: size("image")?,
+        frames: size("frames")?,
+        attention,
+        channels: size("channels")?,
+        patch: size("patch")?,
+        classes: size("classes")?,
+        d_model: size("d_model")?,
+        n_heads: size("n_heads")?,
+        n_layers: size("n_layers")?,
+    };
+    let mut model = Dit::new(config, &mut Rng::new(0));
+    let mut tensors: std::collections::HashMap<String, Tensor> =
+        read_safetensors(&dir.join("state.safetensors"))?.into_iter().map(|t| (t.name.clone(), t)).collect();
+    for p in model.params() {
+        let t = tensors.remove(&p.name).ok_or_else(|| invalid(format!("{}: no tensor `{}`", dir.display(), p.name)))?;
+        if t.data.len() != p.value.len() {
+            return Err(invalid(format!("`{}` has {} numbers where the config makes {}", p.name, t.data.len(), p.value.len())));
+        }
+        p.value.copy_from_slice(&t.data);
+    }
+    match tensors.keys().next() {
+        Some(name) => Err(invalid(format!("{}: tensor `{name}` belongs to nothing in this model", dir.display()))),
+        None => Ok(model),
+    }
+}
 
 /// `_class_name` in `model_index.json`. Not `DiTPipeline`, because that
 /// pipeline has a VAE and a DDPM scheduler, and code that saw the name would
@@ -721,6 +862,11 @@ fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// class, in order: the words a prompt may use to ask for one.
 pub fn save(dir: &Path, model: &mut Dit, labels: &[&str]) -> io::Result<()> {
     let c = model.config();
+    // diffusers has a DiT for pictures and none for clips shaped like this
+    // one, so there is no layout to be faithful to yet.
+    if c.frames != 1 {
+        return Err(invalid(format!("a model of {} frames; only a picture's DiT has a layout on disk so far", c.frames)));
+    }
     assert_eq!(labels.len(), c.classes, "{} labels for {} classes", labels.len(), c.classes);
     for sub in ["transformer", "scheduler"] {
         std::fs::create_dir_all(dir.join(sub))?;
@@ -830,6 +976,8 @@ pub fn load(dir: &Path) -> io::Result<(Dit, Vec<String>)> {
     let heads = size("num_attention_heads")?;
     let config = DitConfig {
         image: size("sample_size")?,
+        frames: 1,
+        attention: Attention::Full,
         channels,
         patch: size("patch_size")?,
         classes: size("num_embeds_ada_norm")?,
@@ -878,7 +1026,7 @@ mod tests {
     use super::*;
     use crate::gradcheck::{check_params, relative_error, scramble};
 
-    const CONFIG: DitConfig = DitConfig { image: 8, channels: 2, patch: 4, classes: 3, d_model: 8, n_heads: 2, n_layers: 2 };
+    const CONFIG: DitConfig = DitConfig { image: 8, frames: 1, attention: Attention::Full, channels: 2, patch: 4, classes: 3, d_model: 8, n_heads: 2, n_layers: 2 };
 
     fn random(n: usize, rng: &mut Rng) -> Vec<f32> {
         (0..n).map(|_| rng.normal()).collect()
@@ -947,7 +1095,7 @@ mod tests {
     #[test]
     fn block_gradient_matches_numerical() {
         let mut rng = Rng::new(73);
-        let mut block = DitBlock::new(CONFIG.d_model, CONFIG.n_heads, &mut rng);
+        let mut block = DitBlock::new(CONFIG.d_model, CONFIG.n_heads, Scope::All, &mut rng);
         // Off zero, or the gates hide everything behind them.
         scramble(block.params(), &mut rng);
         let mut x = Matrix::from_vec(CONFIG.tokens(), CONFIG.d_model, random(CONFIG.tokens() * CONFIG.d_model, &mut rng));
@@ -1026,6 +1174,89 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Clips
+    // -----------------------------------------------------------------------
+
+    /// Three frames of four patches, one channel.
+    fn clip_config(attention: Attention, n_layers: usize) -> DitConfig {
+        DitConfig { frames: 3, attention, channels: 1, n_layers, ..CONFIG }
+    }
+
+    /// Both layouts, told two labels at once, through every tensor.
+    #[test]
+    fn a_clip_model_gradient_matches_numerical() {
+        for attention in [Attention::Full, Attention::Factorised] {
+            let config = clip_config(attention, 2);
+            let mut rng = Rng::new(80);
+            let mut model = Dit::new(config, &mut rng);
+            scramble(model.params(), &mut rng);
+            let x = random(config.pixels(), &mut rng);
+            let target = random(config.pixels(), &mut rng);
+            let (t, labels) = (0.61, [2, 0]);
+
+            model.zero_grad();
+            let (_, dy) = mse(&model.forward_labels(&x, t, &labels), &target);
+            model.backward(&dy);
+
+            // Both labels' rows are to blame, and only theirs.
+            let table = model.params().into_iter().find(|p| p.name == "labels.table").unwrap();
+            let d = config.d_model;
+            for row in 0..=config.classes {
+                let size: f32 = table.grad[row * d..(row + 1) * d].iter().map(|g| g.abs()).sum();
+                assert_eq!(size > 0.0, labels.contains(&row), "{attention:?}: row {row} has gradient {size}");
+            }
+
+            let report = check_params(&mut model, Dit::params, |m| mse(&m.forward_labels(&x, t, &labels), &target).0, NUDGE);
+            for r in report {
+                if r.name.ends_with("wk.bias") {
+                    continue; // zero by construction
+                }
+                assert!(r.rel < TOLERANCE, "{attention:?} {}: analytic and numerical gradients differ (rel {:.4})", r.name, r.rel);
+            }
+        }
+    }
+
+    /// The first factorised block attends within frames, so with only that
+    /// one block, nothing in frame 2 can reach frame 0. Full attention can.
+    #[test]
+    fn a_within_frame_block_keeps_frames_apart() {
+        for (attention, apart) in [(Attention::Factorised, true), (Attention::Full, false)] {
+            let config = clip_config(attention, 1);
+            let mut model = Dit::new(config, &mut Rng::new(81));
+            scramble(model.params(), &mut Rng::new(82));
+            let mut x = random(config.pixels(), &mut Rng::new(83));
+            let before = model.forward(&x, 0.4, 1);
+            let frame = config.frame_pixels();
+            x[2 * frame + 5] += 1.0;
+            let after = model.forward(&x, 0.4, 1);
+            let moved = |f: usize| before[f * frame..(f + 1) * frame] != after[f * frame..(f + 1) * frame];
+            assert!(moved(2));
+            assert_eq!(!moved(0), apart, "{attention:?}");
+        }
+    }
+
+    /// A picture's positions are DiT's; a clip's are the same in every frame
+    /// plus a pattern for the frame, so no two tokens of a clip share one.
+    #[test]
+    fn every_token_of_a_clip_has_a_place_of_its_own() {
+        let picture = position_table(16, 3, 1);
+        let clip = position_table(16, 3, 4);
+        assert_eq!(picture.rows, 9);
+        assert_eq!(clip.rows, 36);
+        for a in 0..clip.rows {
+            for b in 0..a {
+                assert_ne!(clip.row(a), clip.row(b), "tokens {a} and {b}");
+            }
+        }
+        // The frame's pattern is the same for every patch of it.
+        let diff = |r: usize| -> Vec<f32> { clip.row(r).iter().zip(picture.row(r % 9)).map(|(c, p)| c - p).collect() };
+        // Recovered by subtracting what was added, so equal to f32 rounding.
+        let gap = |a: Vec<f32>, b: Vec<f32>| a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        assert!(gap(diff(9), diff(13)) < 1e-6);
+        assert!(gap(diff(9), diff(18)) > 0.1);
+    }
+
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("nervus-dit-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1047,6 +1278,20 @@ mod tests {
 
         let x = random(CONFIG.pixels(), &mut rng);
         assert_eq!(model.forward(&x, 0.5, 1), loaded.forward(&x, 0.5, 1));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_clip_model_keeps_its_state() {
+        let dir = scratch("state");
+        let config = DitConfig { frames: 3, attention: Attention::Factorised, channels: 1, ..CONFIG };
+        let mut model = Dit::new(config, &mut Rng::new(90));
+        scramble(model.params(), &mut Rng::new(91));
+        save_state(&dir, &mut model).unwrap();
+        let mut loaded = load_state(&dir).unwrap();
+        assert_eq!(loaded.config(), config);
+        let x = random(config.pixels(), &mut Rng::new(92));
+        assert_eq!(model.forward_labels(&x, 0.3, &[1, 2]), loaded.forward_labels(&x, 0.3, &[1, 2]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

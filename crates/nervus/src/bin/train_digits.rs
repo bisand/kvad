@@ -158,11 +158,11 @@ fn checkpoint_grid(
     columns: usize,
     name: &str,
 ) -> std::io::Result<(f32, Vec<Vec<f32>>)> {
-    let requests: Vec<(usize, u64)> = (0..10 * columns).map(|i| (i / columns, (i % columns) as u64)).collect();
+    let requests: Vec<(Vec<usize>, u64)> = (0..10 * columns).map(|i| (vec![i / columns], (i % columns) as u64)).collect();
     let drawn = replicas.sample(model, &requests, args.sample_steps, args.guidance);
 
     let data = drawn.iter().flat_map(|img| img.iter().map(|&v| to_standardised(v))).collect();
-    let labels: Vec<usize> = requests.iter().map(|&(label, _)| label).collect();
+    let labels: Vec<usize> = requests.iter().map(|(labels, _)| labels[0]).collect();
     let right = recognised(judge, &Matrix::from_vec(drawn.len(), 784, data), &labels);
 
     save_grid(&args.out.join(name), &drawn, columns)?;
@@ -224,6 +224,8 @@ fn main() -> std::io::Result<()> {
 
     let config = DitConfig {
         image: 28,
+        frames: 1,
+        attention: dit::Attention::Full,
         channels: 1,
         patch: args.patch,
         classes: 10,
@@ -261,8 +263,8 @@ fn main() -> std::io::Result<()> {
         let stepping = Instant::now();
         let examples = flow::draw(&train_images, &train.labels, config.unconditional(), args.batch, &mut rng);
         running += match threads {
-            1 => flow::train_step(&mut model, &mut opt, &train_images, &examples),
-            _ => replicas.train_step(&mut model, &mut opt, &train_images, &examples),
+            1 => flow::train_step(&mut model, &mut opt, &examples),
+            _ => replicas.train_step(&mut model, &mut opt, &examples),
         };
         training += stepping.elapsed();
         since += 1;

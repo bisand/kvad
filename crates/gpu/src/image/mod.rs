@@ -31,6 +31,7 @@ pub mod sdxl;
 pub mod lora;
 pub(crate) mod single;
 pub mod t5;
+pub mod tune;
 pub mod unet;
 pub mod vae;
 

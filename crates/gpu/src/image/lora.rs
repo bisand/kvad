@@ -195,6 +195,10 @@ struct Registry {
     /// What each part has and does not compute, by prefix, `part/prefix`: a
     /// LoRA's pairs under one are known, and change nothing.
     inert: Vec<String>,
+    /// Whether a side path's factors are read as they are, and so recorded
+    /// for `backward` where they are variables, or detached; see
+    /// [`Adapters::recording`].
+    recording: bool,
     /// Layers a checkpoint's other layout fuses, `part/name` there, each to
     /// the layers it is here and the rows of its answer each takes: FLUX's
     /// `qkv` and `linear1` in Black Forest Labs' layout. A LoRA's pair for
@@ -253,7 +257,7 @@ pub(crate) struct Slot {
 
 impl Adapters {
     pub(crate) fn new(prefixes: &[(&'static str, &'static str)]) -> Self {
-        Adapters(Arc::new(RwLock::new(Registry { prefixes: prefixes.to_vec(), index: HashMap::new(), layers: Vec::new(), inert: Vec::new(), fused: HashMap::new() })))
+        Adapters(Arc::new(RwLock::new(Registry { prefixes: prefixes.to_vec(), index: HashMap::new(), layers: Vec::new(), inert: Vec::new(), recording: true, fused: HashMap::new() })))
     }
 
     /// The registry for the layers of `part`.
@@ -279,6 +283,18 @@ impl Adapters {
             }
         };
         Slot { adapters: self.clone(), i }
+    }
+
+    /// The linear layers of `part`: each one's name, and how wide it reads
+    /// and answers.
+    pub(crate) fn linears(&self, part: &str) -> Vec<(String, usize, usize)> {
+        let r = self.0.read().expect("the adapters' lock");
+        let pre = format!("{part}/");
+        let of = |l: &Layer| match l.shape {
+            Shape::Linear { inp, out } => l.name.strip_prefix(&pre).map(|n| (n.to_string(), inp, out)),
+            Shape::Conv { .. } => None,
+        };
+        r.layers.iter().filter_map(of).collect()
     }
 
     /// The names the layers of `part` registered under.
@@ -420,7 +436,6 @@ impl Adapters {
     /// answers `W·x + (x·a)·b`. Nothing is copied, scaled or cast, so that
     /// factors that are variables stay the tensors `backward` reports on:
     /// what training (#75) sets, where [`Adapters::set`] is for a file's.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn place(&self, part: &str, name: &str, a: &Tensor, b: &Tensor) -> Res<()> {
         let mut r = self.0.write().expect("the adapters' lock");
         let i = *r.index.get(&format!("{part}/{name}")).ok_or_else(|| format!("`{name}` is no layer of `{part}`"))?;
@@ -431,6 +446,15 @@ impl Adapters {
         }
         r.layers[i].set = Some(Arc::new(vec![Low { down: Down::Linear(Proj::Dense(a.clone())), b: Proj::Dense(b.clone()), dtype: a.dtype() }]));
         Ok(())
+    }
+
+    /// Whether the factors [`Adapters::place`] put there are read as the
+    /// variables they are. Off, each side path reads a detached copy, which
+    /// shares their numbers and is no part of any record: the forward pass
+    /// is then the one that draws, with the LoRA applied, and keeps nothing
+    /// for `backward` ([`crate::grad::checkpointed`]). On unless turned off.
+    pub(crate) fn recording(&self, on: bool) {
+        self.0.write().expect("the adapters' lock").recording = on;
     }
 
     /// No LoRA on any layer.
@@ -529,8 +553,11 @@ impl Slot {
         self.adapters.0.read().expect("the adapters' lock").layers[self.i].set.is_some()
     }
 
-    fn set(&self) -> Option<Arc<Vec<Low>>> {
-        self.adapters.0.read().expect("the adapters' lock").layers[self.i].set.clone()
+    /// The LoRAs set on this layer, and whether their factors are to be
+    /// recorded ([`Adapters::recording`]).
+    fn set(&self) -> Option<(Arc<Vec<Low>>, bool)> {
+        let r = self.adapters.0.read().expect("the adapters' lock");
+        r.layers[self.i].set.clone().map(|s| (s, r.recording))
     }
 
     /// `y`, a linear layer's answer to `x`, with each LoRA's side path
@@ -542,14 +569,15 @@ impl Slot {
     /// rounds it, scales it and rounds the sum: one pass over the answer
     /// where there were four, which were most of a side path's time.
     pub(crate) fn add(&self, x: &Tensor, y: Tensor) -> candle_core::Result<Tensor> {
-        let Some(set) = self.set() else { return Ok(y) };
+        let Some((set, live)) = self.set() else { return Ok(y) };
         let (dims, inp) = (y.dims().to_vec(), x.dim(candle_core::D::Minus1)?);
         let x = x.reshape((x.elem_count() / inp, inp))?;
         let mut y = y.reshape((x.dim(0)?, dims[dims.len() - 1]))?;
         for l in set.iter() {
             let Down::Linear(a) = &l.down else { candle_core::bail!("a convolution's LoRA on a linear layer") };
-            let h = a.forward(&x.to_dtype(l.dtype)?)?;
-            y = accumulate(y, &h, &l.b)?;
+            let (down, up) = (sight(a, live), sight(&l.b, live));
+            let h = down.as_ref().unwrap_or(a).forward(&x.to_dtype(l.dtype)?)?;
+            y = accumulate(y, &h, up.as_ref().unwrap_or(&l.b))?;
         }
         y.reshape(dims)
     }
@@ -559,18 +587,28 @@ impl Slot {
     /// across them at each pixel, as a row of the same product a linear
     /// layer's takes.
     pub(crate) fn add_conv(&self, x: &Tensor, y: Tensor) -> candle_core::Result<Tensor> {
-        let Some(set) = self.set() else { return Ok(y) };
+        let Some((set, live)) = self.set() else { return Ok(y) };
         let (b, out, h, w) = y.dims4()?;
         // Pixels as rows, channels last, for the product and the sum.
         let mut rows = y.permute((0, 2, 3, 1))?.reshape((b * h * w, out))?;
         for l in set.iter() {
             let Down::Conv { w: a, stride, pad } = &l.down else { candle_core::bail!("a linear layer's LoRA on a convolution") };
-            let hid = x.to_dtype(l.dtype)?.conv2d(a, *pad, *stride, 1, 1)?;
+            let hid = x.to_dtype(l.dtype)?.conv2d(&if live { a.clone() } else { a.detach() }, *pad, *stride, 1, 1)?;
             let r = hid.dim(1)?;
             let hid = hid.permute((0, 2, 3, 1))?.reshape((b * h * w, r))?;
-            rows = accumulate(rows, &hid, &l.b)?;
+            let up = sight(&l.b, live);
+            rows = accumulate(rows, &hid, up.as_ref().unwrap_or(&l.b))?;
         }
         rows.reshape((b, h, w, out))?.permute((0, 3, 1, 2))?.contiguous()
+    }
+}
+
+/// A factor out of `backward`'s sight, where one is wanted and it is in it:
+/// the same numbers, detached. `None` for a factor to read as it is.
+fn sight(p: &Proj, live: bool) -> Option<Proj> {
+    match p {
+        Proj::Dense(t) if !live && t.track_op() => Some(Proj::Dense(t.detach())),
+        _ => None,
     }
 }
 

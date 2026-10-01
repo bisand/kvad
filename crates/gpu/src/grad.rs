@@ -91,6 +91,206 @@ impl CustomOp1 for Frozen {
 }
 
 // ---------------------------------------------------------------------------
+// Frozen layers
+// ---------------------------------------------------------------------------
+
+/// What takes a result's gradient back to its input's: `(x, ∂L/∂y)` to
+/// `∂L/∂x`.
+type Back = Box<dyn Fn(&Tensor, &Tensor) -> candle_core::Result<Tensor> + Send + Sync>;
+
+/// `y`, which was computed from `x` out of `backward`'s sight, put back in
+/// it: as far as `backward` knows, `y` came from `x` by one operation, and
+/// `back` is how its gradient returns.
+///
+/// For a layer whose weights are not being trained. candle's `backward`
+/// works out a gradient for every input of every operation, and a layer's
+/// weight is one: through `x.matmul(w)` it computes `xᵀ·∂L/∂y`, as large as
+/// `w`, whether or not anything will ever read it, and keeps it until it
+/// is done. On SDXL's UNet that was a second copy of all 2.6 B weights
+/// made and thrown away at each step: 5.2 s a step and 31.8 GB at 256×256,
+/// before any of it went on the LoRA. A frozen layer owes `backward` one
+/// thing, its input's gradient, and `back` computes only that.
+///
+/// It also gives the forward pass back its kernels. `y` is made from a
+/// detached `x`, so nothing in it is tracked, and the M5's matrix units
+/// take it as they do when drawing.
+pub(crate) fn attach(x: &Tensor, y: Tensor, back: impl Fn(&Tensor, &Tensor) -> candle_core::Result<Tensor> + Send + Sync + 'static) -> candle_core::Result<Tensor> {
+    // The storage is handed over as it is, to be read from its start.
+    let y = match y.is_contiguous() && y.layout().start_offset() == 0 {
+        true => y,
+        false => y.force_contiguous()?,
+    };
+    x.apply_op2(&y, Attached { back: Box::new(back) })
+}
+
+/// The operation [`attach`] records: of `x` and the finished `y`, whose
+/// storage is its answer.
+struct Attached {
+    back: Back,
+}
+
+impl candle_core::CustomOp2 for Attached {
+    fn name(&self) -> &'static str {
+        "attached"
+    }
+
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, y: &CpuStorage, l: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+        Ok((y.clone(), l.shape().clone()))
+    }
+
+    fn metal_fwd(&self, _: &MetalStorage, _: &Layout, y: &MetalStorage, l: &Layout) -> candle_core::Result<(MetalStorage, Shape)> {
+        // The same buffer, not a copy of it.
+        Ok((y.clone(), l.shape().clone()))
+    }
+
+    fn bwd(&self, x: &Tensor, _: &Tensor, _: &Tensor, grad: &Tensor) -> candle_core::Result<(Option<Tensor>, Option<Tensor>)> {
+        Ok((Some((self.back)(x, grad)?), None))
+    }
+}
+
+/// `∂L/∂x` for `y = x · w` over the last axis, `w` `[in, out]`: `∂L/∂y · wᵀ`,
+/// in `x`'s shape and dtype.
+///
+/// Computed as `(w · ∂L/∂yᵀ)ᵀ`. The product wants its operands laid out in
+/// rows, and a transposed one is copied to be: this way round it is the
+/// gradient that is copied, twice, and not the weight, which is the larger
+/// by far wherever there are fewer rows than the layer is wide.
+pub(crate) fn back_through(w: &Tensor, x: &Tensor, grad: &Tensor) -> candle_core::Result<Tensor> {
+    let out = w.dim(1)?;
+    let g = grad.reshape((grad.elem_count() / out, out))?.to_dtype(w.dtype())?;
+    w.matmul(&g.t()?.contiguous()?)?.t()?.contiguous()?.reshape(x.dims())?.to_dtype(x.dtype())
+}
+
+/// `[B, C, H, W]` to `[B, C, 2H, 2W]`, each value written four times, with
+/// a backward that is the sum of each four.
+///
+/// candle's own backward for a nearest-neighbour upsample is a convolution
+/// with a group for every channel, which it runs as one convolution a
+/// channel, 640 and 1280 of them for SDXL's two. This is the same sum in
+/// two reductions. (It was written on the guess that those convolutions
+/// were what a training step waited on. They were not: the step's time
+/// and memory did not move.)
+pub(crate) fn upsample_twice(x: &Tensor) -> candle_core::Result<Tensor> {
+    let (_, _, h, w) = x.dims4()?;
+    if !x.track_op() {
+        return x.upsample_nearest2d(2 * h, 2 * w);
+    }
+    attach(x, x.detach().upsample_nearest2d(2 * h, 2 * w)?, |x, g| {
+        let (b, c, h, w) = x.dims4()?;
+        // [b, c, h, 2, w, 2]: summed over the two axes of twos, one at a
+        // time and four axes at most, as Metal's reductions want.
+        let rows = g.reshape((b * c, h, 2, 2 * w))?.sum(2)?;
+        rows.reshape((b * c, h, w, 2))?.sum(3)?.reshape((b, c, h, w))?.to_dtype(x.dtype())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Checkpointing
+// ---------------------------------------------------------------------------
+
+/// One stretch of a model: from the state the stretch before it left to the
+/// state the next one reads, each a list of tensors.
+pub(crate) type Stretch<'a> = Box<dyn Fn(&[Tensor]) -> candle_core::Result<Vec<Tensor>> + 'a>;
+
+/// The loss of a model that is a row of [`Stretch`]es, and its gradient for
+/// each of `vars`, without ever holding more than one stretch's record.
+///
+/// `backward` needs every tensor the forward pass made, and a forward pass
+/// that is being recorded keeps them all until it has. For a denoiser that
+/// is every activation of every block at once, which at a useful size is
+/// more than the machine has. Checkpointing trades that memory for a second
+/// forward pass:
+///
+/// 1. **Forward, unrecorded.** `recording(false)` takes the trained tensors
+///    out of sight, so nothing is tracked and each stretch runs as it does
+///    when drawing, on the fast kernels, keeping nothing. Only the states
+///    between stretches are kept: the checkpoints.
+/// 2. **The loss**, from the last state, recorded: its gradient for that
+///    state is where the walk back starts.
+/// 3. **Back, a stretch at a time**, last first. The stretch is run again
+///    from its checkpoint, recorded this time. What `backward` is given is
+///    not the loss but `Σ⟨out, g⟩`, the stretch's outputs each weighted by
+///    the gradient already known for it, held constant: by the chain rule
+///    that sum's gradient is the loss's, for the stretch's trained tensors
+///    and for its input, which is the `g` the stretch before it needs. Then
+///    the record is dropped.
+///
+/// So the most held at once is the checkpoints and one stretch's record,
+/// and the price is each stretch's forward pass twice.
+///
+/// `settle` is called after each stretch, for a device that frees what was
+/// dropped only when asked.
+pub(crate) fn checkpointed(
+    stretches: &[Stretch<'_>],
+    input: Vec<Tensor>,
+    loss: &dyn Fn(&[Tensor]) -> candle_core::Result<Tensor>,
+    vars: &[Var],
+    recording: &dyn Fn(bool),
+    settle: &dyn Fn() -> candle_core::Result<()>,
+) -> candle_core::Result<(Tensor, candle_core::backprop::GradStore)> {
+    recording(false);
+    let mut states = vec![input];
+    for stretch in stretches {
+        let next = stretch(states.last().expect("the input"))?;
+        if next.iter().any(|t| t.track_op()) {
+            recording(true);
+            candle_core::bail!("checkpointing: a stretch's answer is being recorded with recording off; something trained is not behind the switch");
+        }
+        states.push(next);
+        settle()?;
+    }
+    recording(true);
+
+    // A state as leaves `backward` reports on, and the gradient found for
+    // each, zero for one nothing read. Detached: a gradient candle hands
+    // back still carries the record of how it was made, and that record
+    // runs through the trained tensors of the stretch it came from. Used
+    // as it is to weigh the stretch before, `backward` walked on through
+    // it and counted those tensors' gradients a second time, exactly
+    // doubling them.
+    let leaves = |state: &[Tensor]| state.iter().map(Var::from_tensor).collect::<candle_core::Result<Vec<_>>>();
+    let found = |leaves: &[Var], store: &candle_core::backprop::GradStore| -> candle_core::Result<Vec<Tensor>> {
+        leaves.iter().map(|v| store.get(v.as_tensor()).map_or_else(|| v.zeros_like(), |g| Ok(g.detach()))).collect()
+    };
+    let tensors = |leaves: &[Var]| leaves.iter().map(|v| v.as_tensor().clone()).collect::<Vec<_>>();
+
+    let last = leaves(&states.pop().expect("the last state"))?;
+    let value = loss(&tensors(&last))?;
+    let mut total = value.backward()?;
+    let mut g = found(&last, &total)?;
+    drop(last);
+    settle()?;
+
+    for stretch in stretches.iter().rev() {
+        let from = leaves(&states.pop().expect("a state for each stretch"))?;
+        let out = stretch(&tensors(&from))?;
+        if out.len() != g.len() {
+            candle_core::bail!("checkpointing: a stretch left {} tensors this time and {} the first", out.len(), g.len());
+        }
+        // In f32: a sum over a whole feature map of half-precision products
+        // is past what half precision holds.
+        let mut weighed = Tensor::zeros((), DType::F32, value.device())?;
+        for (o, g) in out.iter().zip(&g) {
+            weighed = (weighed + (o.to_dtype(DType::F32)? * g.to_dtype(DType::F32)?)?.sum_all()?)?;
+        }
+        let store = weighed.backward()?;
+        for v in vars {
+            if let Some(more) = store.get(v.as_tensor()) {
+                let sum = match total.get(v.as_tensor()) {
+                    Some(have) => (have + more)?.detach(),
+                    None => more.detach(),
+                };
+                total.insert(v.as_tensor(), sum);
+            }
+        }
+        g = found(&from, &store)?;
+        drop((store, out, from));
+        settle()?;
+    }
+    Ok((value.detach(), total))
+}
+
+// ---------------------------------------------------------------------------
 // candle's own
 // ---------------------------------------------------------------------------
 //
@@ -475,6 +675,112 @@ mod tests {
             complete(&by_q, &q, 1e-2, 2e-2).unwrap();
             complete(&by_k, &k, 1e-2, 2e-2).unwrap();
             complete(&by_v, &v, 1e-2, 2e-2).unwrap();
+        }
+    }
+
+    /// Checkpointing finds the gradients `backward` finds through the whole
+    /// model at once: a row of three stretches over a state of two tensors,
+    /// one of which a stretch passes on untouched and a later one reads,
+    /// as a UNet's skips are; each stretch with a trained matrix that the
+    /// switch takes out of sight.
+    #[test]
+    fn checkpointing_finds_the_whole_models_gradients() {
+        let dev = Device::Cpu;
+        let vars: Vec<Var> = (0..3).map(|_| Var::from_tensor(&(randn(&[8, 8], &dev) * 0.3).unwrap()).unwrap()).collect();
+        let on = std::cell::Cell::new(true);
+        // A trained matrix as a stretch reads it: itself, or out of sight.
+        let seen = |i: usize| if on.get() { vars[i].as_tensor().clone() } else { vars[i].as_tensor().detach() };
+        let stretches: Vec<Stretch<'_>> = vec![
+            // [x] to [h, skip]
+            Box::new(|s| {
+                let h = s[0].matmul(&seen(0))?.tanh()?;
+                Ok(vec![h.clone(), h])
+            }),
+            // h changes, the skip waits
+            Box::new(|s| Ok(vec![s[0].matmul(&seen(1))?.tanh()?, s[1].clone()])),
+            // the skip is taken back up
+            Box::new(|s| Ok(vec![(s[0].matmul(&seen(2))? + &s[1])?.sqr()?])),
+        ];
+        let x = randn(&[5, 8], &dev);
+        let target = randn(&[5, 8], &dev);
+        let loss = |s: &[Tensor]| (&s[0] - &target)?.sqr()?.mean_all();
+
+        let mut state = vec![x.clone()];
+        for stretch in &stretches {
+            state = stretch(&state).unwrap();
+        }
+        let whole_loss = loss(&state).unwrap();
+        let whole = whole_loss.backward().unwrap();
+
+        let (value, grads) = checkpointed(&stretches, vec![x], &loss, &vars, &|live| on.set(live), &|| Ok(())).unwrap();
+        assert!(on.get(), "recording is left on");
+        assert_eq!(value.to_scalar::<f32>().unwrap(), whole_loss.to_scalar::<f32>().unwrap());
+        for (i, v) in vars.iter().enumerate() {
+            let (got, want) = (grads.get(v.as_tensor()).expect("a gradient for each"), whole.get(v.as_tensor()).unwrap());
+            assert!(off(got, want) < 1e-5, "stretch {i}'s matrix: {} apart", off(got, want));
+        }
+        // A trained tensor that is not behind the switch is refused, not
+        // quietly recorded through the first pass.
+        let exposed: Vec<Stretch<'_>> = vec![Box::new(|s| Ok(vec![s[0].matmul(vars[0].as_tensor())?]))];
+        let e = checkpointed(&exposed, vec![randn(&[5, 8], &dev)], &loss, &vars, &|_| {}, &|| Ok(())).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("not behind the switch"), "{e}");
+    }
+
+    /// The upsample's own backward is candle's, which is a convolution a
+    /// channel: the same gradient, on the CPU and on Metal, and whole by
+    /// the slopes.
+    #[test]
+    fn the_upsamples_backward_is_candles() {
+        for dev in [Some(Device::Cpu), metal()].into_iter().flatten() {
+            let x = randn(&[2, 6, 5, 7], &dev);
+            let r = randn(&[2, 6, 10, 14], &dev);
+            let ours = |x: &Tensor| (upsample_twice(x)? * &r)?.sum_all();
+            let theirs = |x: &Tensor| (x.upsample_nearest2d(10, 14)? * &r)?.sum_all();
+            complete(&ours, &x, 1e-2, 1e-2).unwrap();
+            let grad = |f: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>| {
+                let var = Var::from_tensor(&x).unwrap();
+                f(var.as_tensor()).unwrap().backward().unwrap().get(var.as_tensor()).unwrap().clone()
+            };
+            assert!(off(&grad(&ours), &grad(&theirs)) < 1e-6);
+            assert!(off(&upsample_twice(&x).unwrap(), &x.upsample_nearest2d(10, 14).unwrap()) == 0.0);
+        }
+    }
+
+    /// A frozen convolution's backward is candle's, for a 3×3 and a 1×1 at
+    /// stride 1, which go by an ordinary convolution of the turned kernel,
+    /// and a 3×3 at stride 2, which keeps the transposed one: the same
+    /// gradient as `conv2d`'s own backward gives its input, on the CPU and
+    /// on Metal.
+    #[test]
+    fn a_convolutions_backward_is_candles() {
+        use crate::image::nn::back_through_conv;
+        for dev in [Some(Device::Cpu), metal()].into_iter().flatten() {
+            // (kernel, padding, stride, rows, columns)
+            for (k, pad, stride, h, wd) in [(3, 1, 1, 6, 7), (1, 0, 1, 6, 7), (3, 1, 2, 6, 6), (3, 1, 2, 7, 7), (3, 0, 2, 7, 7), (3, 1, 2, 6, 7), (3, 0, 2, 8, 7)] {
+                let x = randn(&[2, 5, h, wd], &dev);
+                let w = randn(&[4, 5, k, k], &dev);
+                let r = randn(x.conv2d(&w, pad, stride, 1, 1).unwrap().dims(), &dev);
+                let got = back_through_conv(&w, pad, stride, &x, &r).unwrap();
+                assert_eq!(got.dims(), x.dims());
+                let what = format!("{k}×{k}, pad {pad}, stride {stride}, {h}×{wd} on {:?}", dev.location());
+                // By the slopes, attached as a frozen convolution is.
+                let f = |x: &Tensor| (x.conv2d(&w, pad, stride, 1, 1)? * &r)?.sum_all();
+                let attached = |x: &Tensor| {
+                    let w = w.clone();
+                    let y = attach(x, x.detach().conv2d(&w, pad, stride, 1, 1)?, move |x, g| back_through_conv(&w, pad, stride, x, g))?;
+                    (y * &r)?.sum_all()
+                };
+                let s = directional(&attached, &x, 1e-2, 9).unwrap();
+                assert!(s.apart() < 1e-2, "{what}: {s:?}");
+                // And against candle's own backward, where it has one: at
+                // stride 2 it takes the rows' leftover for the columns too,
+                // and fails where they differ.
+                if stride == 1 || (h - wd) % 2 == 0 {
+                    let var = Var::from_tensor(&x).unwrap();
+                    let want = f(var.as_tensor()).unwrap().backward().unwrap().get(var.as_tensor()).unwrap().clone();
+                    assert!(off(&got, &want) < 1e-5, "{what}: {} apart", off(&got, &want));
+                }
+            }
         }
     }
 }

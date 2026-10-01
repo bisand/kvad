@@ -1974,10 +1974,18 @@ What was measured against the reference (`scripts/ltx-fixtures.py
   middle of a `[t, c, g, h, w]` tensor it was 1e38 out on Metal (mean, sum
   and max alike) and right on the CPU: −27 dB, then NaN. At four axes,
   `[t·c/g, g, h, w]`, it is exact.
-- **One picture only.** The reference's encoder is causal. For a single
-  frame every tap of every convolution reads that frame, so the decoder's
-  convolutions, which pad one copy each side, read the same three copies,
-  and serve unchanged. A clip as the input would need causal padding.
+- **The encoder is causal**, unlike the decoder: each convolution reads
+  its frame and the two before it, with the first frame standing in for
+  those before the clip (`Time::Causal`; on the M5's matrix units, the same
+  gather one frame earlier). For a picture that changes nothing: every tap
+  reads the one frame. A whole clip (#73) is encoded the same way:
+  `VideoEncoder::encode_clip` on a 384×256×25 clip from
+  `scripts/ltx-fixtures.py --clip` is 108.4 dB from the reference in f32
+  on the CPU and 107.9 on Metal; in bf16 on Metal 36.9 dB, where the
+  reference's own bf16 on MPS is 35.9. The first 9 frames alone make the
+  whole clip's first two latent frames, to 346 dB. With the decoder's
+  padding instead it is 0 dB. 121 frames at 768×512 take 10.2 s in bf16,
+  with an 11.6 GB peak footprint.
 - **The H.264 round trip is `ffmpeg`'s** (`kvad::video::picture_from_file`),
   which also reads the picture: kvad writes PNGs and has no decoder, and
   the round trip needs an encoder anyway. On a 1000×700 picture it lands

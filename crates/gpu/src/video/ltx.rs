@@ -438,7 +438,7 @@ impl Ltx {
             None => None,
             Some(p) => {
                 report("picture", 0, 1, 0.0, None)?;
-                let enc = ltx_vae::ImageEncoder::load(&self.paths[3], device, dtype)?;
+                let enc = ltx_vae::VideoEncoder::load(&self.paths[3], device, dtype)?;
                 let at = |s: Shape| -> Res<Tensor> {
                     let z = enc.encode(&ltx_vae::picture(&p.rgb, p.width, p.height, s.width, s.height)?.to_device(device)?)?;
                     Ok(video_tokens(&z)?.to_dtype(dtype)?)
@@ -723,7 +723,7 @@ impl Ltx {
             None => None,
             Some(p) => {
                 report("picture", 0, 1, 0.0, None)?;
-                let enc = ltx_vae::ImageEncoder::load(&self.paths[3], device, dtype)?;
+                let enc = ltx_vae::VideoEncoder::load(&self.paths[3], device, dtype)?;
                 let at = |s: Shape| -> Res<Tensor> {
                     let z = enc.encode(&ltx_vae::picture(&p.rgb, p.width, p.height, s.width, s.height)?.to_device(device)?)?;
                     Ok(video_tokens(&z)?.to_dtype(DType::F32)?)

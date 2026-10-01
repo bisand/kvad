@@ -20,7 +20,7 @@
 //! There is no attention, no noise and no timestep. The decoder is a pure
 //! function of the latent.
 
-use super::conv3d::{norm_silu, Conv3d};
+use super::conv3d::{norm_silu, Conv3d, Time};
 use super::metadata;
 use crate::common::{settle, Loader};
 use crate::image::nn::{check_decoded, Ctx};
@@ -201,7 +201,7 @@ impl VideoDecoder {
         let last = stage;
         span(|| at("out", &x), dev, || {
             for (f, n) in chunks(&x) {
-                let y = self.conv_out.frames(&norm_silu(&halo(&x, f, n, 1)?, EPS)?, (f.saturating_sub(1), t), (f, f + n))?;
+                let y = self.conv_out.frames(&norm_silu(&halo(&x, f, n, (1, 1))?, EPS)?, (f.saturating_sub(1), t), (f, f + n))?;
                 let y = if fail == Some(last) { y.zeros_like()? } else { y };
                 check_stage(&y, "conv decoder", last)?;
                 let y = ((unpatchify(&y, p)?.to_dtype(DType::F32)? + 1.0)? * 0.5)?;
@@ -231,15 +231,21 @@ const BUDGET: usize = 1 << 28;
 
 /// `(first frame, frames)` for each chunk of `x` a step works through.
 fn chunks(x: &Tensor) -> Vec<(usize, usize)> {
+    chunks_in(x, BUDGET)
+}
+
+/// [`chunks`] with `budget` elements a chunk at most.
+fn chunks_in(x: &Tensor, budget: usize) -> Vec<(usize, usize)> {
     let t = x.dim(0).unwrap_or(0);
-    let n = (BUDGET / (x.elem_count() / t.max(1)).max(1)).clamp(1, t.max(1));
+    let n = (budget / (x.elem_count() / t.max(1)).max(1)).clamp(1, t.max(1));
     (0..t).step_by(n).map(|f| (f, n.min(t - f))).collect()
 }
 
-/// Frames `f − k .. f + n + k` of `x`, cut off at its ends: a chunk and the
-/// `k` frames either side that `k` convolutions in a row read.
-fn halo(x: &Tensor, f: usize, n: usize, k: usize) -> candle_core::Result<Tensor> {
-    let (lo, hi) = (f.saturating_sub(k), (f + n + k).min(x.dim(0)?));
+/// Frames `f − before .. f + n + after` of `x`, cut off at its ends: a
+/// chunk and the frames either side of it that the convolutions after it
+/// read.
+fn halo(x: &Tensor, f: usize, n: usize, (before, after): (usize, usize)) -> candle_core::Result<Tensor> {
+    let (lo, hi) = (f.saturating_sub(before), (f + n + after).min(x.dim(0)?));
     x.narrow(0, lo, hi - lo)
 }
 
@@ -247,21 +253,28 @@ fn halo(x: &Tensor, f: usize, n: usize, k: usize) -> candle_core::Result<Tensor>
 /// frames at a time.
 ///
 /// A chunk's frames `f .. f + n` need the first convolution's output one
-/// frame beyond them each way, and that needs the input two frames beyond.
-/// Those halo frames are computed twice, once for each chunk that reads
-/// them: the price of never holding the steps in between at full size. A
-/// stage small enough for one chunk pays nothing.
+/// frame beyond them each way, and that needs the input two frames beyond;
+/// in the causal encoder, two and four frames before and none after. Those
+/// halo frames are computed twice, once for each chunk that reads them: the
+/// price of never holding the steps in between at full size. A stage small
+/// enough for one chunk pays nothing.
 fn residual(x: &Tensor, c1: &Conv3d, c2: &Conv3d) -> candle_core::Result<Tensor> {
+    residual_in(x, c1, c2, BUDGET)
+}
+
+/// [`residual`] in chunks of `budget` elements at most.
+fn residual_in(x: &Tensor, c1: &Conv3d, c2: &Conv3d, budget: usize) -> candle_core::Result<Tensor> {
     let t = x.dim(0)?;
-    let parts = chunks(x);
+    let parts = chunks_in(x, budget);
     if parts.len() == 1 {
         let h = c1.forward(&norm_silu(x, EPS)?)?;
         return x + c2.forward(&norm_silu(&h, EPS)?)?;
     }
+    let (before, after) = c1.time().reach();
     let out = Tensor::zeros(x.shape(), x.dtype(), x.device())?;
     for (f, n) in parts {
-        let (a, b) = (f.saturating_sub(1), (f + n + 1).min(t));
-        let h = c1.frames(&norm_silu(&halo(x, f, n, 2)?, EPS)?, (f.saturating_sub(2), t), (a, b))?;
+        let (a, b) = (f.saturating_sub(before), (f + n + after).min(t));
+        let h = c1.frames(&norm_silu(&halo(x, f, n, (2 * before, 2 * after))?, EPS)?, (f.saturating_sub(2 * before), t), (a, b))?;
         let h = c2.frames(&norm_silu(&h, EPS)?, (a, t), (f, f + n))?;
         out.slice_set(&(x.narrow(0, f, n)? + h)?, 0, f)?;
     }
@@ -281,7 +294,7 @@ fn up(x: &Tensor, conv: &Conv3d, stride: [usize; 3], c: usize) -> candle_core::R
     let drop = (p1 == 2) as usize;
     let out = Tensor::zeros((t * p1 - drop, c, h * p2, w * p3), x.dtype(), x.device())?;
     for (f, n) in parts {
-        let y = unfold(&conv.frames(&halo(x, f, n, 1)?, (f.saturating_sub(1), t), (f, f + n))?, stride, c)?;
+        let y = unfold(&conv.frames(&halo(x, f, n, (1, 1))?, (f.saturating_sub(1), t), (f, f + n))?, stride, c)?;
         match (f, drop) {
             (0, 1) => out.slice_set(&y.narrow(0, 1, n * p1 - 1)?, 0, 0)?,
             _ => out.slice_set(&y, 0, f * p1 - drop)?,
@@ -340,21 +353,26 @@ enum Down {
     Fold { conv: Conv3d, stride: [usize; 3], group: usize },
 }
 
-/// The encoder half of the same file: one picture to the latent frame the
-/// DiT holds it as, for image-to-video.
+/// The encoder half of the same file: a clip to its latents, or one
+/// picture to the latent frame the DiT holds it as, for image-to-video.
 ///
 /// The mirror of [`VideoDecoder`]: patchify 4×4 pixels into 48 channels,
-/// then residual blocks and space-to-depth steps down to `[128, 1, h, w]`,
-/// normalised by the same statistics.
+/// then residual blocks and space-to-depth steps down to `[128, F, h, w]`,
+/// normalised by the same statistics. `8(F − 1) + 1` frames make `F` latent
+/// frames, the inverse of what the decoder makes of them.
 ///
-/// **One picture only.** The reference's encoder is causal: each
-/// convolution sees two copies of the first frame before it, and a step
-/// that halves time puts one more in front. A picture is one frame, so every
-/// frame any convolution reads is that frame, and [`Conv3d`]'s own padding,
-/// one copy of the edge frame each side, reads the same three. So the
-/// decoder's convolutions serve unchanged; a clip of several frames would
-/// need the causal padding, and is refused.
-pub struct ImageEncoder {
+/// **Causal**, unlike the decoder: every convolution reads its frame and
+/// the two before it, the first frame standing in for those before the clip
+/// ([`Time::Causal`]), and a step that halves time puts one more copy of the
+/// first frame in front. So the first latent frame is the first frame's
+/// alone, whatever follows it, and each later one reads only frames up to
+/// the end of its own eight. A picture is that first frame.
+///
+/// One encode of 121 frames at 768×512 in bf16 on an M5 Pro takes 10.2 s,
+/// with a peak footprint of 11.6 GB (`examples/ltx_encode.rs --measure`).
+/// The residual steps work a chunk of frames at a time, as the decoder's
+/// do; the space-to-depth steps work on the whole clip.
+pub struct VideoEncoder {
     conv_in: Conv3d,
     blocks: Vec<Down>,
     conv_out: Conv3d,
@@ -366,7 +384,7 @@ pub struct ImageEncoder {
     params: usize,
 }
 
-impl ImageEncoder {
+impl VideoEncoder {
     /// Load the encoder half of the file at `path`, computing in `dtype` on
     /// `device`.
     pub fn load(path: &Path, device: &Device, dtype: DType) -> Res<Self> {
@@ -399,7 +417,8 @@ impl ImageEncoder {
         r.skip_under("decoder");
         let e = r.pp("encoder");
 
-        let conv_in = Conv3d::load(&cx, &e, "conv_in.conv", 3 * patch * patch, c)?;
+        let causal = |name: &str, d: &crate::common::Reader<'_>, cin: usize, cout: usize| -> Res<Conv3d> { Ok(Conv3d::load(&cx, d, name, cin, cout)?.padded(Time::Causal)) };
+        let conv_in = causal("conv_in.conv", &e, 3 * patch * patch, c)?;
         let mut blocks = Vec::new();
         for (i, b) in spec.iter().enumerate() {
             let (name, p) = (b[0].as_str().unwrap_or(""), &b[1]);
@@ -410,7 +429,7 @@ impl ImageEncoder {
                     let res = (0..n)
                         .map(|j| {
                             let rb = d.pp(format!("res_blocks.{j}"));
-                            Ok((Conv3d::load(&cx, &rb, "conv1.conv", c, c)?, Conv3d::load(&cx, &rb, "conv2.conv", c, c)?))
+                            Ok((causal("conv1.conv", &rb, c, c)?, causal("conv2.conv", &rb, c, c)?))
                         })
                         .collect::<Res<Vec<_>>>()?;
                     Down::Res(res)
@@ -423,7 +442,7 @@ impl ImageEncoder {
                     };
                     let out = c * p["multiplier"].as_u64().unwrap_or(2) as usize;
                     let n: usize = stride.iter().product();
-                    let conv = Conv3d::load(&cx, &d, "conv.conv", c, out / n)?;
+                    let conv = causal("conv.conv", &d, c, out / n)?;
                     let group = c * n / out;
                     c = out;
                     Down::Fold { conv, stride, group }
@@ -433,13 +452,13 @@ impl ImageEncoder {
             blocks.push(block);
         }
         // 128 means and the shared log-variance.
-        let conv_out = Conv3d::load(&cx, &e, "conv_out.conv", c, latent + 1)?;
+        let conv_out = causal("conv_out.conv", &e, c, latent + 1)?;
 
         let stats = r.pp("per_channel_statistics");
         let stat = |name: &str| -> Res<Tensor> { Ok(cx.get(&stats, latent, name)?.to_dtype(DType::F32)?.reshape((1, latent, 1, 1))?) };
         let (mean, std) = (stat("mean-of-means")?, stat("std-of-means")?);
         let params = finish("LTX video encoder", &paths, &r)?;
-        Ok(ImageEncoder { conv_in, blocks, conv_out, patch, latent, mean, std, dtype, params })
+        Ok(VideoEncoder { conv_in, blocks, conv_out, patch, latent, mean, std, dtype, params })
     }
 
     pub fn params(&self) -> usize {
@@ -449,12 +468,23 @@ impl ImageEncoder {
     /// A picture `[3, H, W]` in `[−1, 1]`, both sides a multiple of 32, to
     /// its normalised latent `[128, 1, H/32, W/32]`, as f32.
     pub fn encode(&self, picture: &Tensor) -> candle_core::Result<Tensor> {
-        let (_, h, w) = picture.dims3()?;
+        self.encode_clip(&picture.unsqueeze(0)?)
+    }
+
+    /// A clip `[T, 3, H, W]` in `[−1, 1]`, frames first, `T = 8k + 1` and
+    /// both sides a multiple of 32, to its normalised latents
+    /// `[128, k + 1, H/32, W/32]`, as f32.
+    pub fn encode_clip(&self, frames: &Tensor) -> candle_core::Result<Tensor> {
+        let (t, _, h, w) = frames.dims4()?;
         if h % 32 != 0 || w % 32 != 0 {
             candle_core::bail!("{w}×{h}: the encoder wants both sides a multiple of 32");
         }
-        // Frames first, as in the decoder: one frame.
-        let x = patchify(&picture.unsqueeze(0)?.to_dtype(self.dtype)?, self.patch)?;
+        // The reference cuts the last frames off a clip of any other length,
+        // and says so in a warning; a caller here is told instead.
+        if t % 8 != 1 {
+            candle_core::bail!("{t} frames: the encoder wants 8k + 1, such as {} or {}", t / 8 * 8 + 1, t / 8 * 8 + 9);
+        }
+        let x = patchify(&frames.to_dtype(self.dtype)?, self.patch)?;
         let mut x = self.conv_in.forward(&x)?;
         for block in &self.blocks {
             x = match block {
@@ -485,7 +515,7 @@ impl ImageEncoder {
         let x = self.conv_out.forward(&norm_silu(&x, EPS)?)?;
         let means = x.narrow(1, 0, self.latent)?.to_dtype(DType::F32)?;
         let z = means.broadcast_sub(&self.mean)?.broadcast_div(&self.std)?;
-        // [1, 128, h, w] → [128, 1, h, w].
+        // [F, 128, h, w] → [128, F, h, w].
         z.permute((1, 0, 2, 3))?.contiguous()
     }
 }
@@ -699,6 +729,28 @@ const MISSES: usize = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A residual step done a few frames at a time is the step done whole,
+    /// with the decoder's padding and with the encoder's causal one, whose
+    /// chunks read four frames back and none ahead.
+    #[test]
+    fn a_residual_step_in_chunks_is_the_step_whole() {
+        let dev = Device::Cpu;
+        let (t, c, h, w) = (9, 4, 3, 5);
+        let x = Tensor::randn(0f32, 1.0, (t, c, h, w), &dev).unwrap();
+        let k = || Tensor::randn(0f32, 0.3, (c, c, 3, 3, 3), &dev).unwrap();
+        let b = || Tensor::randn(0f32, 0.3, c, &dev).unwrap();
+        for time in [Time::Replicate, Time::Causal] {
+            let c1 = Conv3d::folded(&k(), b(), time).unwrap();
+            let c2 = Conv3d::folded(&k(), b(), time).unwrap();
+            let whole = residual_in(&x, &c1, &c2, usize::MAX).unwrap();
+            // Two frames a chunk: five chunks, the last of one frame.
+            let parts = residual_in(&x, &c1, &c2, 2 * c * h * w).unwrap();
+            assert_eq!(chunks_in(&x, 2 * c * h * w).len(), 5);
+            let worst = (parts - &whole).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+            assert!(worst < 1e-5, "{time:?}: the chunks differ from the whole by {worst}");
+        }
+    }
 
     #[test]
     fn depth_to_space_puts_each_channel_where_the_reference_rearrange_does() {

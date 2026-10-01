@@ -3,7 +3,8 @@
 //!
 //! - [`rms`], RMS norm with no weight of its own, which every LTX block uses
 //!   because modulation or the next projection supplies the scale;
-//! - [`gelu`], in f32 whatever its input, because candle's bf16 one is not;
+//! - [`gelu`], in f32 for a half-precision input, because candle's bf16 one
+//!   is not;
 //! - [`RmsNorm`], the weighted one, over a whole attention width at once;
 //! - [`Rope`], LTX's "split" rotary embedding: one frequency vector across
 //!   the *whole* attention width, cut into a slice per head, applied to each
@@ -12,21 +13,22 @@
 //!   `2·sigmoid(gate)`, a gate the block learns from its own input.
 
 use crate::common::Reader;
-use crate::image::nn::{Ctx, Linear};
+use crate::image::nn::{wide, Ctx, Linear};
 use crate::prof::span;
 use candle_core::{DType, Device, Tensor, D};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// `x / √(mean(x²) + eps)` over the last axis, in f32.
+/// `x / √(mean(x²) + eps)` over the last axis, in f32 for half precision
+/// ([`wide`]).
 pub(crate) fn rms(x: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
     let dtype = x.dtype();
-    let x = x.to_dtype(DType::F32)?;
+    let x = x.to_dtype(wide(dtype))?;
     let r = (x.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?;
     x.broadcast_div(&r)?.to_dtype(dtype)
 }
 
-/// Tanh-approximated GELU, computed in f32 whatever `x` is.
+/// Tanh-approximated GELU, computed in f32 where `x` is half precision.
 ///
 /// candle's Metal kernel evaluates the polynomial and the tanh in the
 /// tensor's own type, so in bf16 every intermediate is rounded to eight bits
@@ -34,7 +36,7 @@ pub(crate) fn rms(x: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
 /// feed-forward, 16 384 wide, that difference alone cost 8 dB against the
 /// reference after one block: 38.7 dB where the reference's own bf16 is 46.8.
 pub(crate) fn gelu(x: &Tensor) -> candle_core::Result<Tensor> {
-    x.to_dtype(DType::F32)?.gelu()?.to_dtype(x.dtype())
+    crate::grad::gelu(&x.to_dtype(wide(x.dtype()))?)?.to_dtype(x.dtype())
 }
 
 /// RMS norm over the last axis, times a learned weight (not `1 + weight`).
@@ -50,7 +52,8 @@ impl RmsNorm {
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let dtype = x.dtype();
-        rms(&x.to_dtype(DType::F32)?, self.eps)?.broadcast_mul(&self.w)?.to_dtype(dtype)
+        let sums = wide(dtype);
+        rms(&x.to_dtype(sums)?, self.eps)?.broadcast_mul(&self.w.to_dtype(sums)?)?.to_dtype(dtype)
     }
 
     /// The weight, `[width]` in f32.
@@ -226,8 +229,9 @@ impl GatedAttention {
         let o = match &self.gate {
             Some(g) => {
                 let (t, width) = v.dims2()?;
-                let gates = (candle_nn::ops::sigmoid(&g.forward(x)?.to_dtype(DType::F32)?)? * 2.0)?;
-                let o = v.to_dtype(DType::F32)?.reshape((t, self.heads, width / self.heads))?.broadcast_mul(&gates.unsqueeze(2)?)?;
+                let sums = wide(dtype);
+                let gates = (candle_nn::ops::sigmoid(&g.forward(x)?.to_dtype(sums)?)? * 2.0)?;
+                let o = v.to_dtype(sums)?.reshape((t, self.heads, width / self.heads))?.broadcast_mul(&gates.unsqueeze(2)?)?;
                 o.reshape((t, width))?.to_dtype(dtype)?
             }
             None => v,

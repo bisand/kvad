@@ -609,7 +609,11 @@ impl Dit {
             let cx = Ctx { ld: Loader::new(quant, device.clone(), &vault).accelerated(), dtype };
             // The tables are f32 in the file; read in f32 when computing in
             // it, so that they stay exact.
-            let read = if dtype == DType::F32 { DType::F32 } else { DType::BF16 };
+            // (And in f64 for a gradient check, `tests`.)
+            let read = match dtype {
+                DType::F32 | DType::F64 => dtype,
+                _ => DType::BF16,
+            };
             let r = match &gguf {
                 Some(file) => Reader::gguf(std::sync::Arc::clone(file), read),
                 None => open(&paths, read)?,
@@ -934,5 +938,101 @@ mod tests {
         // Token 1, column c·16 + f, is latent[c, 1, f].
         assert_eq!(t.get(1).unwrap().get(2 * 16 + 3).unwrap().to_scalar::<f32>().unwrap(), (2 * 48 + 16 + 3) as f32);
         assert_eq!(audio_latent(&t, 8).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap(), a.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+    }
+    /// The DiT's first block with its real weights, between the patchify
+    /// projections and the output heads, and a LoRA on three of its layers:
+    /// the gradient `backward` finds is the function's own, through the
+    /// video latents, through the audio latents, and through each LoRA
+    /// factor. Both streams are in, with their attention to the text and to
+    /// each other, and the first latent frame is held clean, so the tokens
+    /// read two sets of rows.
+    ///
+    /// Certified in f64 on the CPU and held to that after, as
+    /// `flux::tests::a_real_block_has_a_whole_gradient` is, which has the
+    /// reasoning. On Metal the fused steps (`ltx_fused`) and the matrix
+    /// units' attention stand aside for a tensor that is being
+    /// differentiated, and what runs is the chain they replace.
+    ///
+    /// The weights at q8 are loaded for the matrix units, as the pipeline
+    /// loads them, and those have no backward: that run must refuse, not
+    /// answer.
+    ///
+    ///     cargo test --release -p kvad-gpu ltx_dit::tests::a_real_block -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn a_real_block_has_a_whole_gradient() {
+        use crate::image::nn::noise;
+        use candle_core::Var;
+        crate::cap::at(24.0);
+        // Of this machine or not at all: the file is 42 GB.
+        let path = crate::image::local_file(super::super::LTX_REPO, super::super::ltx_text::DIT_FILE).expect("the distilled DiT is not on this machine");
+        let mut runs = vec![(Device::Cpu, None, DType::F64, 1e-5, 0.0, "the CPU, f64"), (Device::Cpu, None, DType::F32, 1e-2, 1e-3, "the CPU, f32")];
+        if let Ok(metal) = Device::new_metal(0) {
+            runs.push((metal.clone(), None, DType::F32, 1e-2, 1e-3, "Metal, f32"));
+            runs.push((metal.clone(), None, DType::BF16, 1e-2, 5e-2, "Metal, bf16"));
+            runs.push((metal, Some(GgmlDType::Q8_0), DType::BF16, 1e-2, 0.0, "Metal, q8 weights on the matrix units"));
+        }
+        // Two latent frames of 2×2, so eight video tokens of which the
+        // first four are held, nine audio latents, and twelve rows of text.
+        let shape = Shape::new(64, 64, 9, 24.0).unwrap();
+        let (held, text) = (shape.frame_tokens(), 12);
+        let mut exact = crate::grad::real::Exact::default();
+        for (dev, quant, dtype, step, tolerance, what) in runs {
+            let dit = Dit::load(&path, &dev, dtype, Some(1), quant, &mut |_| {}).unwrap();
+            let (vw, aw) = (dit.cfg.heads * dit.cfg.head_dim, dit.cfg.audio_heads * dit.cfg.audio_head_dim);
+            let grid = dit.grid(shape).unwrap();
+
+            let seed = std::cell::Cell::new(74u64);
+            let randn = |shape: &[usize], std: f32| {
+                seed.set(seed.get() + 1);
+                (noise(seed.get(), shape, &dev, DType::F32).unwrap() * std as f64).unwrap().to_dtype(dtype).unwrap()
+            };
+            let (video, audio) = (randn(&[shape.video_tokens(), dit.cfg.channels], 1.0), randn(&[shape.audio_latents(), dit.cfg.audio_channels], 1.0));
+            let ctx = Contexts { video: randn(&[text, vw], 1.0), audio: randn(&[text, aw], 1.0) };
+            let (weigh_video, weigh_audio) = (randn(&[shape.video_tokens(), dit.cfg.channels], 1.0), randn(&[shape.audio_latents(), dit.cfg.audio_channels], 1.0));
+            let loss = |video: &Tensor, audio: &Tensor| -> candle_core::Result<Tensor> {
+                let (v, a) = dit.forward(video, audio, (0.6, 0.6), held, &ctx, &grid).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                (v * &weigh_video)?.sum_all()? + (a * &weigh_audio)?.sum_all()?
+            };
+
+            // Rank 4, neither factor zero, so that both get a gradient.
+            const SCALE: f32 = 0.05;
+            let layers = [
+                ("transformer_blocks.0.attn1.to_q", vw, vw),
+                ("transformer_blocks.0.video_to_audio_attn.to_k", vw, aw),
+                ("transformer_blocks.0.audio_ff.net.0.proj", aw, 4 * aw),
+            ];
+            let factors: Vec<(Var, Var)> = layers
+                .iter()
+                .map(|&(name, inp, out)| {
+                    let (a, b) = (Var::from_tensor(&randn(&[inp, 4], SCALE)).unwrap(), Var::from_tensor(&randn(&[4, out], SCALE)).unwrap());
+                    dit.adapters.place("dit", name, a.as_tensor(), b.as_tensor()).unwrap();
+                    (a, b)
+                })
+                .collect();
+
+            if quant.is_some() {
+                let v = Var::from_tensor(&video).unwrap();
+                let refused = loss(v.as_tensor(), &audio).and_then(|l| l.backward());
+                let said = refused.err().map(|e| e.to_string()).unwrap_or_default();
+                eprintln!("{what}: {said}");
+                assert!(!said.is_empty(), "{what}: a gradient came back through kernels that have no backward");
+                continue;
+            }
+            let mut run = exact.run(what, tolerance);
+            run.take("the video latents", crate::grad::directional(&|v| loss(v, &audio), &video, step, 11).unwrap());
+            run.take("the audio latents", crate::grad::directional(&|a| loss(&video, a), &audio, step, 11).unwrap());
+            for (&(name, ..), (a, b)) in layers.iter().zip(&factors) {
+                // A wider step for a factor in f64 than for the latents:
+                // the keys of block 0's video-to-audio attention move the
+                // answer by a ten-thousandth of what the latents do, and
+                // at 1e-5 of a factor's scale that slope is mostly the
+                // rounding of the two sums. (Its audio-to-video attention
+                // moves it by a hundred-millionth, too little to measure
+                // at any step, which is why the LoRA is not there.)
+                let step = if dtype == DType::F64 { 1e-3 } else { step };
+                run.factors(&dit.adapters, "dit", name, (a, b), &|| loss(&video, &audio), step * SCALE as f64);
+            }
+        }
     }
 }

@@ -255,6 +255,45 @@ impl Layer for Gelu {
     }
 }
 
+/// `y = x * sigmoid(x)`, also called swish.
+///
+/// Another smooth ReLU, and the one a diffusion transformer passes its
+/// conditioning through (see `dit`). Its derivative comes from the product
+/// rule and `sigmoid' = s * (1 - s)`:
+///
+/// ```text
+/// dy/dx = s + x * s * (1 - s)
+/// ```
+#[derive(Default)]
+pub struct Silu {
+    x: Vec<f32>,
+    /// `sigmoid(x)`, kept for the backward pass, which needs it again.
+    s: Vec<f32>,
+}
+
+impl Layer for Silu {
+    fn forward(&mut self, x: &Matrix) -> Matrix {
+        self.x = x.data.clone();
+        self.s = x.data.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
+        let data = x.data.iter().zip(&self.s).map(|(&v, &s)| v * s).collect();
+        Matrix::from_vec(x.rows, x.cols, data)
+    }
+
+    fn backward(&mut self, dy: &Matrix) -> Matrix {
+        let data = dy
+            .data
+            .iter()
+            .zip(self.x.iter().zip(&self.s))
+            .map(|(&g, (&x, &s))| g * (s + x * s * (1.0 - s)))
+            .collect();
+        Matrix::from_vec(dy.rows, dy.cols, data)
+    }
+
+    fn describe(&self) -> String {
+        "SiLU".to_string()
+    }
+}
+
 /// Softmax followed by cross-entropy loss, fused into one function.
 ///
 /// Returns `(mean_loss, dLoss/dLogits)`.
@@ -385,6 +424,16 @@ mod tests {
         // Spread wide enough to cover the dip below zero and both flat ends.
         let x = Matrix::from_vec(4, 6, (0..24).map(|_| 2.0 * rng.normal()).collect::<Vec<f32>>());
         let report = crate::gradcheck::check_layer(&mut Gelu::default(), &x, &[2, 0, 5, 3], 1e-2);
+        for c in report {
+            assert!(c.rel < 2e-3, "{}: analytic and numerical gradients differ (rel {:.4})", c.name, c.rel);
+        }
+    }
+
+    #[test]
+    fn silu_gradient_matches_numerical() {
+        let mut rng = Rng::new(43);
+        let x = Matrix::from_vec(4, 6, (0..24).map(|_| 3.0 * rng.normal()).collect::<Vec<f32>>());
+        let report = crate::gradcheck::check_layer(&mut Silu::default(), &x, &[1, 4, 0, 5], 1e-2);
         for c in report {
             assert!(c.rel < 2e-3, "{}: analytic and numerical gradients differ (rel {:.4})", c.name, c.rel);
         }

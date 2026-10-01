@@ -64,8 +64,23 @@ fn main() -> std::io::Result<()> {
 | `text` | char tokeniser, batching, the training loop, sampling, data-parallel replicas |
 | `checkpoint` | safetensors, read and written in GPT-2 layout |
 | `mnist` | the dataset loader, for training an MLP instead |
+| `dit` | a diffusion transformer: patches, 2-D positions, adaLN-Zero conditioning |
+| `flow` | flow matching: the training loss, guidance, and the sampler |
 
-Two binaries come with it: `train_mnist` and `train_text`.
+Three binaries come with it: `train_mnist`, `train_text` and `train_digits`.
+
+## Train a model that draws digits
+
+```
+cargo run --release -p nervus --bin train_digits
+```
+
+This trains a diffusion transformer on MNIST from random weights: the same
+kind of model as FLUX and Qwen-Image, trained with the same objective, at a
+size a CPU can train in minutes. Every checkpoint draws a grid of digits, a
+row for each of 0 to 9, into `out/digits/`. Those digits are also read by a
+classifier trained on real MNIST, and the run prints how many of them it
+recognises as the digit that was asked for.
 
 ## Every derivative by hand
 

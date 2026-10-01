@@ -269,8 +269,12 @@ fn attention_back_in(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, g: &Tensor,
         let dp = gs.matmul(&vt)?;
         let ds = ((&p * dp.broadcast_sub(&(&dp * &p)?.sum_keepdim(D::Minus1)?)?)? * scale)?;
         dq.push(ds.matmul(&kw)?);
-        dk = (dk + ds.transpose(2, 3)?.contiguous()?.matmul(&qs)?)?;
-        dv = (dv + p.transpose(2, 3)?.contiguous()?.matmul(&gs)?)?;
+        // `∂Sᵀ·q` as `(qᵀ·∂S)ᵀ`, and `Pᵀ·g` likewise: the product wants
+        // its operands laid out in rows, and this way round it is `q` and
+        // `g` that are copied to be, not the scores.
+        let across = |t: &Tensor| t.transpose(2, 3)?.contiguous();
+        dk = (dk + across(&across(&qs)?.matmul(&ds)?)?)?;
+        dv = (dv + across(&across(&gs)?.matmul(&p)?)?)?;
         start += n;
     }
     let dq = Tensor::cat(&dq, 2)?;
@@ -448,20 +452,69 @@ fn slow(ts: &[&Tensor]) -> bool {
     tracked(ts) || ts[0].dtype() == DType::F64
 }
 
-/// `ops::rms_norm`, with a backward where one is wanted.
+/// `ops::rms_norm`, with a backward where one is wanted: its own
+/// ([`norm_back`]) where only `x` is being differentiated, which is every
+/// norm of a model whose weights are frozen, and candle's twin's otherwise.
 pub(crate) fn rms_norm(x: &Tensor, w: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
+    if x.track_op() && !w.track_op() {
+        let w = w.clone();
+        return attach(x, rms_norm(&x.detach(), &w, eps)?, move |x, g| norm_back(x, &g.broadcast_mul(&w.to_dtype(g.dtype())?)?, eps as f64, false)?.to_dtype(x.dtype()));
+    }
     match slow(&[x, w]) {
         true => ops::rms_norm_slow(x, w, eps),
         false => ops::rms_norm(x, w, eps),
     }
 }
 
-/// `ops::layer_norm`, with a backward where one is wanted.
+/// `ops::layer_norm`, with a backward where one is wanted, as
+/// [`rms_norm`] has.
 pub(crate) fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
+    if x.track_op() && !tracked(&[w, b]) {
+        let w = w.clone();
+        return attach(x, layer_norm(&x.detach(), &w, b, eps)?, move |x, g| norm_back(x, &g.broadcast_mul(&w.to_dtype(g.dtype())?)?, eps as f64, true)?.to_dtype(x.dtype()));
+    }
     match slow(&[x, w, b]) {
         true => ops::layer_norm_slow(x, w, b, eps),
         false => ops::layer_norm(x, w, b, eps),
     }
+}
+
+/// `∂L/∂x` for a norm over the last axis, `y = x̂ = (x − μ) / σ` with
+/// `σ = √(mean((x − μ)²) + ε)`, from `g = ∂L/∂x̂`; `μ` is the mean if
+/// `centred` (a layer norm, a group norm) and 0 if not (an RMS norm). A
+/// norm's weight is the caller's to multiply into `g` first.
+///
+/// Moving one `x` moves its own `x̂`, and through `σ` (and `μ`) every other
+/// one on the axis:
+///
+/// ```text
+/// ∂L/∂x = ( g − mean(g) − x̂ · mean(g · x̂) ) / σ        `mean(g)` only if centred
+/// ```
+///
+/// The middle term is what the centring takes back, and the last what the
+/// scaling does: a norm's answer cannot move along `x̂` itself, so that
+/// much of the gradient is removed.
+///
+/// A norm recorded step by step is ten small operations, and `backward`
+/// makes several more for each; a transformer block has three and a resnet
+/// two. This is one operation in the record, and `x̂` and `σ` are made
+/// again here from `x`, in f32 as the norm makes them.
+pub(crate) fn norm_back(x: &Tensor, g: &Tensor, eps: f64, centred: bool) -> candle_core::Result<Tensor> {
+    use candle_core::D;
+    let wide = crate::image::nn::wide(x.dtype());
+    let (x, g) = (x.detach().to_dtype(wide)?, g.to_dtype(wide)?);
+    let x = match centred {
+        true => x.broadcast_sub(&x.mean_keepdim(D::Minus1)?)?,
+        false => x,
+    };
+    let sigma = (x.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?;
+    let hat = x.broadcast_div(&sigma)?;
+    let along = hat.broadcast_mul(&(&g * &hat)?.mean_keepdim(D::Minus1)?)?;
+    let back = match centred {
+        true => g.broadcast_sub(&g.mean_keepdim(D::Minus1)?)? - along,
+        false => g - along,
+    }?;
+    back.broadcast_div(&sigma)
 }
 
 /// `ops::softmax_last_dim`, with a backward where one is wanted.
@@ -950,6 +1003,39 @@ mod tests {
                 let whole = attention_back(&q, &k, &v, scale, &r).unwrap();
                 let batched = attention_back_in(&q, &k, &v, scale, &r, 2 * 16 * 3).unwrap();
                 assert!(off(&batched, &whole) < 1e-5, "{lq} queries in batches: {} apart", off(&batched, &whole));
+            }
+        }
+    }
+
+    /// A norm's own backward is candle's through the norm written out: the
+    /// RMS norm and the layer norm, with weights, and the group norm and
+    /// the plain layer norm of the image models; on the CPU and on Metal.
+    #[test]
+    fn a_norms_backward_is_candles() {
+        use crate::image::nn::layer_norm_plain;
+        for dev in [Some(Device::Cpu), metal()].into_iter().flatten() {
+            let x = randn(&[2, 5, 24], &dev);
+            let r = randn(&[2, 5, 24], &dev);
+            let (w, b) = (randn(&[24], &dev), randn(&[24], &dev));
+            type F<'a> = &'a dyn Fn(&Tensor) -> candle_core::Result<Tensor>;
+            let grad = |f: F| {
+                let var = Var::from_tensor(&x).unwrap();
+                let y = f(var.as_tensor()).unwrap();
+                ((&y * &r).unwrap().sum_all().unwrap().backward().unwrap().get(var.as_tensor()).expect("a gradient").clone(), y)
+            };
+            let pairs: [(&str, F, F); 3] = [
+                ("rms_norm", &|x| rms_norm(x, &w, 1e-6), &|x| ops::rms_norm_slow(x, &w, 1e-6)),
+                ("layer_norm", &|x| layer_norm(x, &w, &b, 1e-5), &|x| ops::layer_norm_slow(x, &w, &b, 1e-5)),
+                // Written out as it is for an untracked tensor.
+                ("layer_norm_plain", &|x| layer_norm_plain(x, 1e-6), &|x| {
+                    let c = x.broadcast_sub(&x.mean_keepdim(candle_core::D::Minus1)?)?;
+                    c.broadcast_div(&(c.sqr()?.mean_keepdim(candle_core::D::Minus1)? + 1e-6)?.sqrt()?)
+                }),
+            ];
+            for (name, ours, theirs) in pairs {
+                let ((got, y), (want, y_want)) = (grad(ours), grad(theirs));
+                assert!(off(&y, &y_want) < 1e-5, "{name}: the answers are {} apart", off(&y, &y_want));
+                assert!(off(&got, &want) < 1e-4, "{name} on {:?}: {} apart", dev.location(), off(&got, &want));
             }
         }
     }

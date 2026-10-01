@@ -42,11 +42,11 @@
 //! | 480², 22 stretches, a stage each | 3.1 s | 13.8 GB | 0.33 s |
 //! | 480², 103 stretches, a transformer block each | 3.4 s | 7.4 GB | |
 //! | 480², attention with a backward of its own | 3.2 s | 7.0 GB | |
-//! | 512² | 3.2 s | 7.2 GB | 0.35 s |
-//! | 640² | 4.6 s | 7.6 GB | 0.56 s |
-//! | 768² | 6.6 s | 8.9 GB | 0.77 s |
-//! | 896² | 9.0 s | 9.0 GB | 1.09 s |
-//! | 1024² | 12.4 s | 10.8 GB | 1.38 s |
+//! | 512², the same | 3.2 s | 7.2 GB | 0.35 s |
+//! | 1024², the same | 12.4 s | 10.8 GB | 1.38 s |
+//! | 512², norms attached, one AdamW, see below | 2.8 s | 7.1 GB | 0.35 s |
+//! | 768² | 5.6 s | 8.7 GB | 0.78 s |
+//! | 1024² | 10.3 s | 10.5 GB | 1.39 s |
 //!
 //! Recorded whole, 512² took the machine down. 5.1 GB of every figure is
 //! the weights.
@@ -62,12 +62,23 @@
 //!   `crate::grad::attended`, 1024² was 23.4 GB and 20.7 s, 17 GB of it
 //!   one block; it now makes the scores again on the way back, a batch of
 //!   rows at a time.
-//! - **A step is nine times a forward pass**, at 512² and at 1024² alike,
-//!   nearly all of it coming back; and 0.34 s of it is the optimiser, the
-//!   same at any size: 1120 small tensors, each a few operations.
+//! - **A step is seven or eight forward passes.** At 1024², of 10.3 s:
+//!   the unrecorded pass 1.7 s; each stretch run again, recorded, 1.8 s;
+//!   and `backward` the rest. In `backward`, attention's own is about
+//!   2.2 s (five products the size of the scores, in f32 on candle's
+//!   kernel; in f16 it was slower), the LoRA's side paths 0.6, the frozen
+//!   linear layers 0.4, and some 3.4 s is not arithmetic: for every
+//!   operation in the record candle makes a zeroed gradient and adds into
+//!   it, at a price whatever the tensor's size.
+//! - **What took it from 12.4 s**: attention's backward no longer copies
+//!   its scores to transpose them (1.2 s); the norms have a backward of
+//!   their own, one operation in the record where there were ten
+//!   (`crate::grad::norm_back`, 0.2 s); and the optimiser is one AdamW
+//!   over the factors end to end (`crate::adam`), 0.06 s where candle's
+//!   took 0.34 at any size.
 //!
 //! So what #75 can promise from this, on this machine: SDXL's own 1024² in
-//! 11 GB at 12 s a step, or 512² in 7 GB at 3.
+//! 11 GB at 10 s a step, or 512² in 7 GB at under 3.
 
 use super::lora::Adapters;
 use super::nn::{noise, Ctx};
@@ -78,7 +89,7 @@ use crate::common::{settle, Loader};
 use crate::qcache::Vault;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_core::backprop::GradStore;
-use candle_nn::{AdamW, Optimizer, ParamsAdamW};
+use candle_nn::ParamsAdamW;
 use kvad::weights::{fetch_file, Watcher};
 use std::time::Instant;
 
@@ -242,7 +253,7 @@ pub fn sdxl(repo: &str, device: &Device, dtype: DType, side: usize, rank: usize,
         rig.draws(&x)?;
         drawing = t.elapsed().as_secs_f64();
     }
-    let mut opt = AdamW::new(rig.vars.clone(), ParamsAdamW { lr: 1e-4, ..Default::default() })?;
+    let mut opt = crate::adam::Adam::new(rig.vars.clone(), ParamsAdamW { lr: 1e-4, ..Default::default() })?;
     let (mut secs, mut loss, mut parts) = (Vec::new(), Vec::new(), Vec::new());
     for step in 0..steps {
         let t = Instant::now();

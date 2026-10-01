@@ -302,6 +302,18 @@ impl GroupNorm {
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (b, c, h, w) = x.dims4()?;
+        // Its own backward for a tensor that wants one, where the norm's
+        // weights are not being trained: `grad::norm_back` over each
+        // group's channels and pixels as one axis, the weight multiplied
+        // into the gradient first.
+        if x.track_op() && !crate::grad::tracked(&[&self.w, &self.b]) {
+            let (weight, eps, groups) = (self.w.clone(), self.eps, self.groups);
+            return crate::grad::attach(x, self.forward(&x.detach())?, move |x, g| {
+                let grouped = (b, groups, (c / groups) * h * w);
+                let g = g.broadcast_mul(&weight.to_dtype(g.dtype())?)?.reshape(grouped)?;
+                crate::grad::norm_back(&x.reshape(grouped)?, &g, eps, true)?.reshape((b, c, h, w))?.to_dtype(x.dtype())
+            });
+        }
         let dtype = x.dtype();
         let g = x.to_dtype(wide(dtype))?.reshape((b, self.groups, (c / self.groups) * h * w))?;
         let mean = g.mean_keepdim(D::Minus1)?;
@@ -345,6 +357,10 @@ pub(crate) fn wide(dtype: DType) -> DType {
 /// Layer norm with no weight or bias of its own, which a DiT's blocks use
 /// because the time embedding supplies scale and shift instead.
 pub(crate) fn layer_norm_plain(x: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
+    // Its own backward for a tensor that wants one (`grad::norm_back`).
+    if x.track_op() {
+        return crate::grad::attach(x, layer_norm_plain(&x.detach(), eps)?, move |x, g| crate::grad::norm_back(x, g, eps, true)?.to_dtype(x.dtype()));
+    }
     let dtype = x.dtype();
     let x = x.to_dtype(wide(dtype))?;
     let mean = x.mean_keepdim(D::Minus1)?;
@@ -855,6 +871,29 @@ mod tests {
         let var = y.sqr().unwrap().mean_keepdim(2).unwrap();
         close(&mean, &Tensor::zeros((2, 4, 1), DType::F32, &dev).unwrap(), 1e-5);
         close(&var, &Tensor::ones((2, 4, 1), DType::F32, &dev).unwrap(), 1e-3);
+    }
+
+    /// A group norm's own backward, for a tensor being differentiated
+    /// through frozen weights, is candle's through the norm written out,
+    /// which is the path it takes when its weights are variables: the same
+    /// answer and the same gradient for its input, on the CPU and on Metal.
+    #[test]
+    fn a_group_norms_backward_is_candles() {
+        use candle_core::Var;
+        for dev in [Some(Device::Cpu), Device::new_metal(0).ok()].into_iter().flatten() {
+            let (x, r) = (noise(1, &[2, 8, 5, 3], &dev, DType::F32).unwrap(), noise(2, &[2, 8, 5, 3], &dev, DType::F32).unwrap());
+            let (w, b) = (noise(3, &[1, 8, 1, 1], &dev, DType::F32).unwrap(), noise(4, &[1, 8, 1, 1], &dev, DType::F32).unwrap());
+            let frozen = GroupNorm { groups: 4, eps: 1e-5, w: w.clone(), b: b.clone() };
+            let live = GroupNorm { groups: 4, eps: 1e-5, w: Var::from_tensor(&w).unwrap().as_tensor().clone(), b: Var::from_tensor(&b).unwrap().as_tensor().clone() };
+            let grad = |gn: &GroupNorm| {
+                let var = Var::from_tensor(&x).unwrap();
+                let y = gn.forward(var.as_tensor()).unwrap();
+                ((&y * &r).unwrap().sum_all().unwrap().backward().unwrap().get(var.as_tensor()).expect("a gradient").clone(), y)
+            };
+            let ((got, y), (want, y_want)) = (grad(&frozen), grad(&live));
+            close(&y, &y_want, 1e-5);
+            close(&got, &want, 1e-4);
+        }
     }
 
     /// The fused kernel and the written-out slices are the same function on

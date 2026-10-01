@@ -32,6 +32,7 @@
 //! nothing about them is tokens in, logits out — and implement
 //! [`kvad::image::Painter`] instead.
 
+mod adam;
 pub mod cap;
 mod common;
 pub mod deepseek;

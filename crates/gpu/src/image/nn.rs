@@ -270,7 +270,7 @@ impl LayerNorm {
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        ops::layer_norm(&x.contiguous()?, &self.w, &self.b, self.eps)
+        crate::grad::layer_norm(&x.contiguous()?, &self.w, &self.b, self.eps)
     }
 }
 
@@ -320,7 +320,8 @@ pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> can
     };
     let (q, k, v) = (split(q, lq)?, split(k, lk)?, split(v, lk)?);
     let scale = 1.0 / (d as f64).sqrt();
-    let out = match fused(q.device(), q.dtype(), d, lq) {
+    // candle's kernel has no backward; the written-out attention has.
+    let out = match fused(q.device(), q.dtype(), d, lq) && !crate::grad::tracked(&[&q, &k, &v]) {
         true => ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)?,
         false => written_out(&q, &k, &v, scale)?,
     };
@@ -358,7 +359,7 @@ pub(crate) fn written_out(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> can
         // Softmax in f32: a row of 16384 f16 exponentials sums past f16's
         // largest number long before it is done.
         let att = (qs.matmul(&kt)?.to_dtype(DType::F32)? * scale)?;
-        let att = ops::softmax_last_dim(&att)?.to_dtype(v.dtype())?;
+        let att = crate::grad::softmax_last_dim(&att)?.to_dtype(v.dtype())?;
         parts.push(att.matmul(v)?);
         start += n;
     }
@@ -822,7 +823,7 @@ mod tests {
         let (q, k, v) = (mk(1, 50), mk(2, 30), mk(3, 30));
         let whole = {
             let att = (q.matmul(&k.transpose(2, 3).unwrap()).unwrap() * 0.35).unwrap();
-            ops::softmax_last_dim(&att).unwrap().matmul(&v).unwrap()
+            crate::grad::softmax_last_dim(&att).unwrap().matmul(&v).unwrap()
         };
         // Force slicing by making every row its own slice.
         let mut parts = Vec::new();

@@ -291,7 +291,7 @@ impl GpuLlama {
         let mut pending: Option<Tensor> = None;
         for (i, blk) in self.blocks.iter().enumerate() {
             let h = match pending.take() {
-                None => ops::rms_norm(&x, &blk.attn_norm, spec.eps)?,
+                None => crate::grad::rms_norm(&x, &blk.attn_norm, spec.eps)?,
                 Some(f) => {
                     let (h, sum) = fused::add_rms_norm(&x, &f, &blk.attn_norm, spec.eps)?;
                     x = sum;
@@ -488,7 +488,8 @@ pub(crate) fn attention(
     // computes its scores in the tensors' own dtype, so there the cache
     // comes up instead: that path copies what it reads anyway.
     let narrow = k.dtype() != q.dtype();
-    if fused(q.device(), hd, m) {
+    // candle's kernel has no backward; the written-out attention has.
+    if !crate::grad::tracked(&[q, k, v]) && fused(q.device(), hd, m) {
         if narrow {
             let out = ops::sdpa(&q.to_dtype(k.dtype())?, k, v, None, mask.is_some(), scale as f32, 1.0)?;
             return out.to_dtype(q.dtype());
@@ -532,7 +533,7 @@ fn written_out(
             .broadcast_add(msk)?
             .reshape((1, n_kv, group * m, seq))?;
     }
-    let att = ops::softmax_last_dim(&att)?;
+    let att = crate::grad::softmax_last_dim(&att)?;
     att.matmul(&v.contiguous()?)?.reshape((1, n_head, m, hd))
 }
 

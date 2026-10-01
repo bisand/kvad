@@ -40,7 +40,7 @@ use crate::common::{
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{ops, VarBuilder};
+use candle_nn::VarBuilder;
 use kvad::model::{Session, Spec};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -53,7 +53,7 @@ struct Norm {
 
 impl Norm {
     fn forward(&self, x: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
-        ops::layer_norm(&x.contiguous()?, &self.gain, &self.bias, eps)
+        crate::grad::layer_norm(&x.contiguous()?, &self.gain, &self.bias, eps)
     }
 
     fn params(&self) -> usize {
@@ -271,7 +271,7 @@ impl GpuGpt2 {
             if let Some(msk) = &mask {
                 att = att.broadcast_add(msk)?;
             }
-            let att = ops::softmax_last_dim(&att)?;
+            let att = crate::grad::softmax_last_dim(&att)?;
 
             let out = att.matmul(&v)?.transpose(1, 2)?.reshape((m, e))?;
             x = (x + linear(&out, &blk.o, Some(&blk.o_b))?)?;

@@ -62,7 +62,7 @@ use crate::ffn::{Ffn, Mlp, Moe};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{ops, rotary_emb, VarBuilder};
+use candle_nn::VarBuilder;
 use kvad::model::deepseek::{build_rope, Mla};
 use kvad::model::ffn::{Layout, Router};
 use kvad::model::{Session, Spec};
@@ -281,7 +281,7 @@ impl GpuDeepSeek {
     fn rotate(&self, x: &Tensor, pos0: usize, m: usize) -> candle_core::Result<Tensor> {
         let cos = self.cos.narrow(0, pos0, m)?.contiguous()?;
         let sin = self.sin.narrow(0, pos0, m)?.contiguous()?;
-        rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+        crate::grad::rope_i(&x.contiguous()?, &cos, &sin)
     }
 
     fn run(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
@@ -306,13 +306,13 @@ impl GpuDeepSeek {
         };
 
         for (l, blk) in self.blocks.iter().enumerate() {
-            let h = ops::rms_norm(&x, &blk.attn.norm, spec.eps)?;
+            let h = crate::grad::rms_norm(&x, &blk.attn.norm, spec.eps)?;
 
             // ---- Queries ---------------------------------------------------
             let q = match &blk.attn.q {
                 Query::Direct(p) => p.forward(&h)?,
                 Query::Compressed { down, norm, up } => {
-                    let mid = ops::rms_norm(&down.forward(&h)?.contiguous()?, norm, spec.eps)?;
+                    let mid = crate::grad::rms_norm(&down.forward(&h)?.contiguous()?, norm, spec.eps)?;
                     up.forward(&mid)?
                 }
             };
@@ -325,7 +325,7 @@ impl GpuDeepSeek {
             let kv = blk.attn.kv_a.forward(&h)?;
             // The norm goes on *before* the cache: what is stored is what the
             // up-projections expect to be handed.
-            let c = ops::rms_norm(
+            let c = crate::grad::rms_norm(
                 &kv.narrow(1, 0, lat)?.contiguous()?,
                 &blk.attn.kv_a_norm,
                 spec.eps,
@@ -353,7 +353,7 @@ impl GpuDeepSeek {
             if let Some(msk) = &mask {
                 scores = scores.broadcast_add(&msk.squeeze(0)?)?;
             }
-            let att = ops::softmax_last_dim(&scores)?;
+            let att = crate::grad::softmax_last_dim(&scores)?;
 
             // Average the *compressed* vectors, then decompress once.
             let acc = att.matmul(&c.broadcast_as((heads, total, lat))?)?;
@@ -363,7 +363,7 @@ impl GpuDeepSeek {
             x = (x + blk.attn.o.forward(&out)?)?;
 
             // ---- The MLP, or the mixture -----------------------------------
-            let h = ops::rms_norm(&x, &blk.mlp_norm, spec.eps)?;
+            let h = crate::grad::rms_norm(&x, &blk.mlp_norm, spec.eps)?;
             let out = blk.mlp.forward(&h, m, e)?;
             x = (x + out)?;
         }
@@ -371,7 +371,7 @@ impl GpuDeepSeek {
         self.pos += m;
 
         let last = x.i(m - 1)?.unsqueeze(0)?;
-        let last = ops::rms_norm(&last, &self.final_norm, spec.eps)?;
+        let last = crate::grad::rms_norm(&last, &self.final_norm, spec.eps)?;
         let logits = self.head.forward(&last)?.to_dtype(DType::F32)?;
         let logits = logits.flatten_all()?.to_vec1::<f32>()?;
         report_failures(last.device())?;

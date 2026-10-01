@@ -210,7 +210,7 @@ impl Clip {
         // the causal mask goes on explicitly. The fused kernel's causal path
         // wants a multiple of 32 queries (see `model.rs`), and 77 is not one.
         let att = (q.matmul(&k.transpose(2, 3)?.contiguous()?)?.to_dtype(DType::F32)? * (1.0 / (d as f64).sqrt()))?;
-        let att = ops::softmax_last_dim(&att.broadcast_add(mask)?)?.to_dtype(v.dtype())?;
+        let att = crate::grad::softmax_last_dim(&att.broadcast_add(mask)?)?.to_dtype(v.dtype())?;
         let a = att.matmul(&v)?.transpose(1, 2)?.contiguous()?.reshape((b, n, w))?;
         let x = (x + l.out.forward(&a)?)?;
 

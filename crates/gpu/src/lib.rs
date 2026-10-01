@@ -36,6 +36,7 @@ mod common;
 pub mod deepseek;
 mod ffn;
 mod fused;
+pub mod grad;
 pub mod gguf;
 pub mod gpt2;
 pub mod image;

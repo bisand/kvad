@@ -40,7 +40,7 @@ pub mod ltx_dfr;
 pub mod ltx_diffvae;
 pub mod ltx_dit;
 pub mod ltx_duration;
-mod ltx_fused;
+pub(crate) mod ltx_fused;
 pub mod ltx_sample;
 pub(crate) mod ltx_nn;
 pub mod ltx_text;

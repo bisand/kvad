@@ -277,6 +277,10 @@ pub(crate) fn conv3d_with(x: &Tensor, w: &Tensor, b: &Tensor, clip: (usize, usiz
     if lo >= hi || hi > total || lo.saturating_sub(before) < start || (hi + after).min(total) > start + frames {
         candle_core::bail!("conv3d: output frames {lo}..{hi} of {total} need frames the {frames} from {start} do not hold");
     }
+    // No backward yet, and the kernel is laid out for nothing else (`grad`).
+    if crate::grad::tracked(&[x, w, b]) {
+        return Err(crate::grad::refuse("mpp_conv3d"));
+    }
     if w.dim(1)? != 27 * cin {
         candle_core::bail!("conv3d: a [{}, {}] kernel for {cin} input channels", w.dim(0)?, w.dim(1)?);
     }

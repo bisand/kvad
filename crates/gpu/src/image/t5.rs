@@ -22,7 +22,6 @@ use super::nn::{Ctx, Linear};
 use crate::common::{Reader, Stored};
 use candle_core::quantized::QTensor;
 use candle_core::{DType, Device, Tensor};
-use candle_nn::ops;
 use kvad::serde_json::Value;
 use std::sync::Arc;
 
@@ -132,21 +131,21 @@ impl T5 {
 
         let inner = self.heads * self.d_kv;
         for layer in &self.layers {
-            let h = ops::rms_norm(&x, &layer.ln1, self.eps)?;
+            let h = crate::grad::rms_norm(&x, &layer.ln1, self.eps)?;
             let split = |t: Tensor| -> candle_core::Result<Tensor> {
                 t.reshape((1, l, self.heads, self.d_kv))?.transpose(1, 2)?.contiguous()
             };
             let (q, k, v) = (split(layer.q.forward(&h)?)?, split(layer.k.forward(&h)?)?, split(layer.v.forward(&h)?)?);
             let scores = q.matmul(&k.transpose(2, 3)?.contiguous()?)?.to_dtype(DType::F32)?.broadcast_add(&bias)?;
-            let att = ops::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
+            let att = crate::grad::softmax_last_dim(&scores)?.to_dtype(v.dtype())?;
             let a = att.matmul(&v)?.transpose(1, 2)?.contiguous()?.reshape((1, l, inner))?;
             x = (x + layer.o.forward(&a)?)?;
 
-            let h = ops::rms_norm(&x, &layer.ln2, self.eps)?;
+            let h = crate::grad::rms_norm(&x, &layer.ln2, self.eps)?;
             let g = (layer.wi0.forward(&h)?.gelu()? * layer.wi1.forward(&h)?)?;
             x = (x + layer.wo.forward(&g)?)?;
         }
-        Ok(ops::rms_norm(&x, &self.norm, self.eps)?)
+        Ok(crate::grad::rms_norm(&x, &self.norm, self.eps)?)
     }
 }
 

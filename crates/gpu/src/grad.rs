@@ -178,13 +178,19 @@ impl candle_core::CustomOp2 for Attached {
 /// `∂L/∂x` for `y = x · w` over the last axis, `w` `[in, out]`: `∂L/∂y · wᵀ`,
 /// in `x`'s shape and dtype.
 ///
-/// Computed as `(w · ∂L/∂yᵀ)ᵀ`. The product wants its operands laid out in
+/// Where the M5's matrix units do not take it, computed as `(w · ∂L/∂yᵀ)ᵀ`. The product wants its operands laid out in
 /// rows, and a transposed one is copied to be: this way round it is the
 /// gradient that is copied, twice, and not the weight, which is the larger
 /// by far wherever there are fewer rows than the layer is wide.
 pub(crate) fn back_through(w: &Tensor, x: &Tensor, grad: &Tensor) -> candle_core::Result<Tensor> {
     let out = w.dim(1)?;
     let g = grad.reshape((grad.elem_count() / out, out))?.to_dtype(w.dtype())?;
+    // On the M5's matrix units where they take it, which read the weight
+    // as it lies (`mpp::dense_turned`).
+    #[cfg(target_os = "macos")]
+    if let Some(back) = crate::mpp::dense_turned(&g, w)? {
+        return back.reshape(x.dims())?.to_dtype(x.dtype());
+    }
     w.matmul(&g.t()?.contiguous()?)?.t()?.contiguous()?.reshape(x.dims())?.to_dtype(x.dtype())
 }
 

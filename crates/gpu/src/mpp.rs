@@ -526,7 +526,11 @@ MMQ_ALL(q6_K)
 // as PyTorch's `addmm` rounds it, where adding the bias to the rounded
 // product rounds twice. `C` may be f32 where `A` and `B` are halves: a
 // LoRA's side path added into an f32 layer's answer (`dense_acc`).
-template <typename T, typename TC, int TM, int TN, int TSG, bool ACC>
+//
+// With TURNED, `B` is stored `[N, K]` and the product is `A · Bᵀ`: the way
+// back through a layer, the answer's gradient times the weight as it lies
+// (`dense_turned`).
+template <typename T, typename TC, int TM, int TN, int TSG, bool ACC, bool TURNED>
 kernel void mm_dense(device T *a [[buffer(0)]],
                      device T *b [[buffer(1)]],
                      device TC *c [[buffer(2)]],
@@ -535,25 +539,27 @@ kernel void mm_dense(device T *a [[buffer(0)]],
                      constant int &K [[buffer(5)]],
                      uint2 tg [[threadgroup_position_in_grid]]) {
     tensor<device T, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(K, M));
-    tensor<device T, dextents<int32_t, 2>, tensor_inline> tb(b, dextents<int32_t, 2>(N, K));
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> tb(b, TURNED ? dextents<int32_t, 2>(K, N) : dextents<int32_t, 2>(N, K));
     tensor<device TC, dextents<int32_t, 2>, tensor_inline> tc(c, dextents<int32_t, 2>(N, M));
-    constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), false, false, false,
+    constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), false, TURNED, false,
                                               ACC ? matmul2d_descriptor::mode::multiply_accumulate
                                                   : matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroups<TSG>> op;
     auto ma = ta.slice(0, tg.y * TM);
-    auto mb = tb.slice(tg.x * TN, 0);
+    auto mb = TURNED ? tb.slice(0, tg.x * TN) : tb.slice(tg.x * TN, 0);
     auto mc = tc.slice(tg.x * TN, tg.y * TM);
     op.run(ma, mb, mc);
 }
 
 #define DENSE(T, tn, TM, TN, TSG) \
     template [[host_name("mm_dense_" #tn "_" #TM "x" #TN)]] [[kernel]] \
-    decltype(mm_dense<T, T, TM, TN, TSG, false>) mm_dense<T, T, TM, TN, TSG, false>; \
+    decltype(mm_dense<T, T, TM, TN, TSG, false, false>) mm_dense<T, T, TM, TN, TSG, false, false>; \
     template [[host_name("mm_dense_acc_" #tn "_" #TM "x" #TN)]] [[kernel]] \
-    decltype(mm_dense<T, T, TM, TN, TSG, true>) mm_dense<T, T, TM, TN, TSG, true>; \
+    decltype(mm_dense<T, T, TM, TN, TSG, true, false>) mm_dense<T, T, TM, TN, TSG, true, false>; \
     template [[host_name("mm_dense_acc32_" #tn "_" #TM "x" #TN)]] [[kernel]] \
-    decltype(mm_dense<T, float, TM, TN, TSG, true>) mm_dense<T, float, TM, TN, TSG, true>;
+    decltype(mm_dense<T, float, TM, TN, TSG, true, false>) mm_dense<T, float, TM, TN, TSG, true, false>; \
+    template [[host_name("mm_dense_turned_" #tn "_" #TM "x" #TN)]] [[kernel]] \
+    decltype(mm_dense<T, T, TM, TN, TSG, false, true>) mm_dense<T, T, TM, TN, TSG, false, true>;
 DENSE(half, f16, 64, 64, 4)
 DENSE(half, f16, 128, 128, 8)
 DENSE(bfloat, bf16, 64, 64, 4)
@@ -574,9 +580,9 @@ pub(crate) fn available(device: &Device) -> bool {
 struct Pipes {
     /// Each of [`KINDS`], `[f16, bf16]` in, each `[f32, f16, bf16]` out.
     q: [[[ComputePipeline; 3]; 2]; 4],
-    /// `[C = A·B, C += A·B, f32 C += A·B]`, each `[f16, bf16]`, each in
-    /// [`DENSE_TILES`]' order.
-    dense: [[[ComputePipeline; 2]; 2]; 3],
+    /// `[C = A·B, C += A·B, f32 C += A·B, C = A·Bᵀ]`, each `[f16, bf16]`,
+    /// each in [`DENSE_TILES`]' order.
+    dense: [[[ComputePipeline; 2]; 2]; 4],
 }
 
 fn pipes(device: &Device) -> Option<&'static Pipes> {
@@ -610,7 +616,7 @@ fn pipes(device: &Device) -> Option<&'static Pipes> {
             };
             let q = |kind: &str| -> Result<[[ComputePipeline; 3]; 2], candle_metal_kernels::MetalKernelError> { Ok([q(kind, "f16")?, q(kind, "bf16")?]) };
             let [a, b, c, d] = KINDS.map(|(_, name, _, _)| name);
-            Ok(Pipes { q: [q(a)?, q(b)?, q(c)?, q(d)?], dense: [dense("")?, dense("acc_")?, dense("acc32_")?] })
+            Ok(Pipes { q: [q(a)?, q(b)?, q(c)?, q(d)?], dense: [dense("")?, dense("acc_")?, dense("acc32_")?, dense("turned_")?] })
         });
         match built {
             Ok(p) => Some(p),
@@ -840,6 +846,22 @@ pub(crate) fn dense(x: &Tensor, w: &Tensor) -> candle_core::Result<Option<Tensor
     Ok(Some(dense_with(x, w, tile)?))
 }
 
+/// `g · wᵀ` on the matrix units, `w` read as it is stored: the way back
+/// through `x · w`, from the answer's gradient `g` `[m, n]` and `w`
+/// `[k, n]` to `x`'s, `[m, k]`. `None` where [`dense`] would decline.
+///
+/// candle's product wants the weight's transpose laid out, or the gradient's
+/// twice (`crate::grad::back_through`), and is not on the matrix units
+/// either way: it took a layer's gradient back 5–7 times slower than the
+/// layer went forward.
+pub(crate) fn dense_turned(g: &Tensor, w: &Tensor) -> candle_core::Result<Option<Tensor>> {
+    if dense_declines(g, w, DENSE_ROWS)? || g.dim(1)? != w.dim(1)? {
+        return Ok(None);
+    }
+    let tile = usize::from(g.dim(0)? >= BIG_TILE_ROWS);
+    Ok(Some(g.contiguous()?.apply_op2_no_bwd(w, &Dense { tile, turned: true })?))
+}
+
 fn dense_declines(x: &Tensor, w: &Tensor, rows: usize) -> candle_core::Result<bool> {
     // The kernel has no backward, and candle's matmul has (`grad`).
     Ok(crate::grad::tracked(&[x, w])
@@ -886,7 +908,7 @@ fn dense_bias_with(x: &Tensor, w: &Tensor, b: &Tensor, tile: usize) -> candle_co
     // one, and is exact.
     let rows = b.to_dtype(x.dtype())?.reshape((1, n))?.broadcast_as((m, n))?;
     let c = if rows.is_contiguous() { rows.affine(1.0, 0.0)? } else { rows.contiguous()? };
-    c.inplace_op3(&x.contiguous()?, w, &Dense { tile })?;
+    c.inplace_op3(&x.contiguous()?, w, &Dense { tile, turned: false })?;
     Ok(c)
 }
 
@@ -911,19 +933,21 @@ pub(crate) fn dense_acc(c: &Tensor, x: &Tensor, w: &Tensor) -> candle_core::Resu
         return Ok(false);
     }
     let tile = usize::from(x.dim(0)? >= BIG_TILE_ROWS);
-    c.inplace_op3(&x.contiguous()?, w, &Dense { tile })?;
+    c.inplace_op3(&x.contiguous()?, w, &Dense { tile, turned: false })?;
     Ok(true)
 }
 
 /// [`dense`] in a given tile, whatever the shape: for the tests, and for
 /// measuring where the thresholds belong.
 fn dense_with(x: &Tensor, w: &Tensor, tile: usize) -> candle_core::Result<Tensor> {
-    x.contiguous()?.apply_op2_no_bwd(w, &Dense { tile })
+    x.contiguous()?.apply_op2_no_bwd(w, &Dense { tile, turned: false })
 }
 
 struct Dense {
     /// Which of [`DENSE_TILES`].
     tile: usize,
+    /// `a · bᵀ`, `b` stored `[n, k]`.
+    turned: bool,
 }
 
 impl Dense {
@@ -932,7 +956,8 @@ impl Dense {
     fn run(&self, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout, out: &candle_metal_kernels::metal::Buffer, acc: usize)
      -> candle_core::Result<()> {
         let (m, k) = la.shape().dims2()?;
-        let (_, n) = lb.shape().dims2()?;
+        let n = lb.shape().dims2().map(|(r, c)| if self.turned { r } else { c })?;
+        let acc = if self.turned { 3 } else { acc };
         let dt = a.dtype();
         let dev = a.device();
         let Some(pipes) = pipes(&Device::Metal(dev.clone())) else {
@@ -957,9 +982,9 @@ impl Dense {
     }
 
     /// `[m, n]` for `a · b`, if the two are what the kernel reads.
-    fn shape_of(a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout) -> candle_core::Result<(usize, usize)> {
+    fn shape_of(&self, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout) -> candle_core::Result<(usize, usize)> {
         let (m, k) = la.shape().dims2()?;
-        let (kb, n) = lb.shape().dims2()?;
+        let (kb, n) = lb.shape().dims2().map(|(r, c)| if self.turned { (c, r) } else { (r, c) })?;
         let dt = a.dtype();
         if !matches!(dt, DType::F16 | DType::BF16) || k != kb || b.dtype() != dt || !la.is_contiguous() || !lb.is_contiguous() {
             candle_core::bail!("mpp_dense: [{m}, {k}] x [{kb}, {n}], {dt:?} x {:?}", b.dtype());
@@ -980,7 +1005,7 @@ impl CustomOp2 for Dense {
 
     fn metal_fwd(&self, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout)
      -> candle_core::Result<(MetalStorage, Shape)> {
-        let (m, n) = Dense::shape_of(a, la, b, lb)?;
+        let (m, n) = self.shape_of(a, la, b, lb)?;
         let dt = a.dtype();
         let dev = a.device();
         let bytes = m * n * dt.size_in_bytes();
@@ -1009,7 +1034,7 @@ impl candle_core::InplaceOp3 for Dense {
 
     fn metal_fwd(&self, c: &mut MetalStorage, lc: &Layout, a: &MetalStorage, la: &Layout, b: &MetalStorage, lb: &Layout)
      -> candle_core::Result<()> {
-        let (m, n) = Dense::shape_of(a, la, b, lb)?;
+        let (m, n) = self.shape_of(a, la, b, lb)?;
         if lc.dims() != [m, n] || (c.dtype() != a.dtype() && c.dtype() != DType::F32) || !lc.is_contiguous() || lc.start_offset() != 0 {
             candle_core::bail!("mpp_dense: accumulating [{m}, {n}] {:?} into {lc:?} {:?}", a.dtype(), c.dtype());
         }
@@ -1242,6 +1267,29 @@ mod tests {
                         .max_all().unwrap().to_scalar::<f32>().unwrap();
                     assert!(most <= ulp, "{what}: {most} of its own size from the exact answer");
                 }
+            }
+        }
+    }
+
+    /// `g · wᵀ` with `w` as it is stored is the product with its transpose
+    /// laid out, to the last bit, in both dtypes and tiles and at ragged
+    /// edges.
+    #[test]
+    fn dense_turned_is_the_product_with_the_transpose() {
+        let Ok(dev) = Device::new_metal(0) else { return };
+        if !available(&dev) {
+            return;
+        }
+        for dt in [DType::F16, DType::BF16] {
+            for (m, k, n) in [(4096, 640, 320), (1024, 130, 257), (77, 64, 192), (300, 70, 16), (129, 32, 130), (8, 20, 64)] {
+                let on = |t: Tensor| t.to_dtype(dt).unwrap().to_device(&dev).unwrap();
+                let g = on(rand(m * n, 1.0).reshape((m, n)).unwrap());
+                let w = on(rand(k * n, 2.0).reshape((k, n)).unwrap());
+                let got = dense_turned(&g, &w).unwrap().expect("the kernel takes it");
+                let want = dense(&g, &w.t().unwrap().contiguous().unwrap()).unwrap().expect("the kernel takes it");
+                assert_eq!(got.dims(), [m, k]);
+                let f = |t: &Tensor| t.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert_eq!(f(&got), f(&want), "{dt:?} [{m}, {n}] x [{k}, {n}] turned");
             }
         }
     }

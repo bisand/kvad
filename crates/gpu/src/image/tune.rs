@@ -50,6 +50,9 @@
 //! | 512², see "what took it from 10.3 s" | 2.1 s | 7.0 GB | 0.36 s |
 //! | 768² | 4.6 s | 8.2 GB | 0.80 s |
 //! | 1024² | 8.4 s | 10.3 GB | 1.43 s |
+//! | 512², frozen layers' way back on the matrix units | 1.9 s | 7.0 GB | 0.36 s |
+//! | 768² | 4.2 s | 8.2 GB | 0.81 s |
+//! | 1024² | 7.7 s | 10.3 GB | 1.43 s |
 //!
 //! Recorded whole, 512² took the machine down. 5.1 GB of every figure is
 //! the weights.
@@ -98,15 +101,24 @@
 //!   - *A wide convolution's backward reads its kernel as it is stored*
 //!     (`super::nn::back_folded`). Turning a 1280-channel kernel round was
 //!     a 29 MB copy, 38 ms where the convolution is 3.5, every step.
+//! - **What took it from 8.4 s to 7.7**, and 512² from 2.1 to 1.9: a
+//!   frozen linear layer's gradient goes back on the M5's matrix units,
+//!   as its answer came forward (`crate::mpp::dense_turned`, which reads
+//!   the weight as it lies and takes its transpose). On candle's product
+//!   it was 5–7 times slower than the layer's forward pass: 11 ms where
+//!   that is 2, for a feed-forward's 1280 to 10 240 over 1024 tokens.
+//!   (At 1024² the two builds were raced on a busy machine, 9.1 s against
+//!   8.3 at best; 7.7 is a run alone.)
+//! - **The recorded pass is a forward pass and little more**: run with
+//!   nothing tracked it is 1.75 s at 1024², and recorded, 2.0.
 //! - **What it is not.** An earlier note here put 3.4 s on candle's making
 //!   a zeroed gradient for every operation in the record. Measured, an
 //!   operation that size is 4 µs and with its zeroed gradient 10 to 18:
 //!   half a second for every operation in a step at the most.
 //!
 //! So what #75 can promise from this, on this machine: SDXL's own 1024² in
-//! 10.3 GB at 8.4 s a step, or 512² in 7 GB at 2.1. (The last three rows
-//! are the least of twelve steps, on a machine that was in use; the same
-//! runs gave 2.9, 5.8 and 10.5 s for the rows above them.)
+//! 10.3 GB at under 8 s a step, or 512² in 7 GB at 1.9. (The last six
+//! rows are the least of twelve steps, on a machine that was in use.)
 
 use super::lora::Adapters;
 use super::nn::{noise, Ctx};

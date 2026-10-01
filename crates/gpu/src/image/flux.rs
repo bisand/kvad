@@ -746,6 +746,121 @@ mod tests {
         assert!(seen > 0, "no flux_ fixtures in {dir}");
     }
 
+    /// FLUX's first double block and first single block, with their real
+    /// weights and a LoRA on two of their layers: the gradient `backward`
+    /// finds is the function's own, through the latents the model is given
+    /// and through each LoRA factor.
+    ///
+    /// In two steps. In f64 on the CPU, [`crate::grad::directional`]
+    /// measures the slope with eight digits to agree in, and backward's
+    /// agrees: that gradient is whole. Then every other way the block runs
+    /// (f32 on the CPU and on Metal, and on Metal with the weights at q8 as
+    /// candle's quantised product reads them) must find the same slope as
+    /// that one did, from the same seeded tensors along the same direction.
+    /// A slope measured in f32 is not asked: it is 0.5–3% of a typical slope
+    /// out here, where backward's own is within 1e-5 of the f64 one.
+    ///
+    /// The LoRA sits on the first block's `to_q` and on the single block's
+    /// `proj_mlp`, so its gradient has the whole of both blocks to come back
+    /// through: the norms, the rotation, the attention, every frozen
+    /// projection after it, and the other LoRA's side path.
+    ///
+    ///     cargo test --release -p kvad-gpu flux::tests::a_real_block -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn a_real_block_has_a_whole_gradient() {
+        use candle_core::Var;
+        let (config, paths) = component("black-forest-labs/FLUX.1-schnell", "transformer", "diffusion_pytorch_model", &Watcher::none()).unwrap();
+        // (device, weights, the arithmetic, the step as a share of each
+        // tensor's own scale, and how far backward's slope may be from the
+        // f64 run's: f32's rounding, and at q8 the weights' own, which is a
+        // slightly different function)
+        let mut runs = vec![(Device::Cpu, None, DType::F64, DType::F64, 1e-5, 0.0, "the CPU, f64"), (Device::Cpu, None, DType::F32, DType::F32, 1e-2, 1e-3, "the CPU, f32")];
+        if let Ok(metal) = Device::new_metal(0) {
+            runs.push((metal.clone(), None, DType::F32, DType::F32, 1e-2, 1e-3, "Metal, f32"));
+            runs.push((metal.clone(), Some(GgmlDType::Q8_0), DType::F32, DType::F32, 1e-2, 1e-1, "Metal, q8 weights"));
+            // Half precision, as the pipeline runs, with the factors in it
+            // too and then in f32, as #74 means to train them. Here the
+            // measured slope is rounding and nothing else (0, or ±64000),
+            // and backward's is 0.1–7% of a typical slope from f64's.
+            runs.push((metal.clone(), None, DType::BF16, DType::BF16, 1e-2, 0.2, "Metal, bf16"));
+            runs.push((metal, None, DType::BF16, DType::F32, 1e-2, 0.2, "Metal, bf16 with f32 factors"));
+        }
+        // Backward's slopes in f64, in the order they are taken.
+        let mut exact: Vec<f64> = Vec::new();
+        for (dev, quant, dtype, factor, step, tolerance, what) in runs {
+            let first = exact.is_empty();
+            let mut taken = 0;
+            let vault = Vault::off();
+            let cx = Ctx { ld: Loader::new(quant, dev.clone(), &vault), dtype };
+            let mut cfg = Config::from_json(&config).unwrap();
+            (cfg.double, cfg.single) = (1, 1);
+            let (width, joint, pooled_width, channels) = (cfg.shape.width(), cfg.joint, cfg.pooled, cfg.in_channels);
+            let adapters = Adapters::new(&PREFIXES);
+            let r = open(&paths, dtype).unwrap().with_adapters(adapters.part("transformer"));
+            let dit = Transformer::load(&cx, &r, cfg).unwrap();
+
+            // Seeded, each tensor from its own, so that a run can be had again.
+            let seed = std::cell::Cell::new(74u64);
+            let randn_in = |shape: &[usize], std: f32, dt: DType| {
+                seed.set(seed.get() + 1);
+                (noise(seed.get(), shape, &dev, DType::F32).unwrap() * std as f64).unwrap().to_dtype(dt).unwrap()
+            };
+            let randn = |shape: &[usize], std: f32| randn_in(shape, std, dtype);
+            // 8×8 patches and 12 text tokens, at σ = 0.6.
+            let (x, txt, pooled) = (randn(&[1, 64, channels], 1.0), randn(&[1, 12, joint], 1.0), randn(&[1, pooled_width], 1.0));
+            let weigh = randn(&[1, 64, channels], 1.0);
+            let loss = |x: &Tensor| -> candle_core::Result<Tensor> {
+                let v = dit.forward(x, &txt, &pooled, 0.6, 8, 8).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                (v * &weigh)?.sum_all()
+            };
+
+            // Rank 4 on each, neither factor zero, so that both get a
+            // gradient (a LoRA starts with `B` at zero, and `A`'s is then
+            // zero too).
+            const SCALE: f32 = 0.05;
+            let layers = [("transformer_blocks.0.attn.to_q", width, width), ("single_transformer_blocks.0.proj_mlp", width, 4 * width)];
+            let factors: Vec<(Var, Var)> = layers
+                .iter()
+                .map(|&(_, inp, out)| (Var::from_tensor(&randn_in(&[inp, 4], SCALE, factor)).unwrap(), Var::from_tensor(&randn_in(&[4, out], SCALE, factor)).unwrap()))
+                .collect();
+            let place = |i: usize, a: &Tensor, b: &Tensor| adapters.place("transformer", layers[i].0, a, b).unwrap();
+            for (i, (a, b)) in factors.iter().enumerate() {
+                place(i, a.as_tensor(), b.as_tensor());
+            }
+
+            let mut report = |name: &str, s: crate::grad::Slopes| {
+                if first {
+                    eprintln!("{what}: {name}: backward {:.6}, measured {:.6}, {:.1e} apart (a slope here is typically {:.1})", s.by_backward, s.measured, s.apart(), s.typical);
+                    assert!(s.apart() < 1e-6, "{what}: the gradient through {name} is not the function's: {s:?}");
+                    exact.push(s.by_backward);
+                } else {
+                    let off = (s.by_backward - exact[taken]).abs() / s.typical;
+                    eprintln!("{what}: {name}: backward {:.6}, {off:.1e} from f64's; measured {:.6}, {:.1e} apart", s.by_backward, s.measured, s.apart());
+                    assert!(off < tolerance, "{what}: the gradient through {name} is not f64's: {s:?} against {}", exact[taken]);
+                }
+                taken += 1;
+            };
+            report("the latents", crate::grad::directional(&loss, &x, step, 11).unwrap());
+            for (i, (a, b)) in factors.iter().enumerate() {
+                // The factor under test is placed afresh for every pass, and
+                // the one beside it stays.
+                let by_a = |t: &Tensor| {
+                    place(i, t, b.as_tensor());
+                    loss(&x)
+                };
+                report(&format!("{}'s A", layers[i].0), crate::grad::directional(&by_a, a.as_tensor(), step * SCALE as f64, 12).unwrap());
+                place(i, a.as_tensor(), b.as_tensor());
+                let by_b = |t: &Tensor| {
+                    place(i, a.as_tensor(), t);
+                    loss(&x)
+                };
+                report(&format!("{}'s B", layers[i].0), crate::grad::directional(&by_b, b.as_tensor(), step * SCALE as f64, 13).unwrap());
+                place(i, a.as_tensor(), b.as_tensor());
+            }
+        }
+    }
+
     /// The positions diffusers' `_prepare_latent_image_ids` gives, and text at
     /// the origin: rows and columns from the top left, not centred.
     #[test]

@@ -247,7 +247,7 @@ impl GroupNorm {
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (b, c, h, w) = x.dims4()?;
         let dtype = x.dtype();
-        let g = x.to_dtype(DType::F32)?.reshape((b, self.groups, (c / self.groups) * h * w))?;
+        let g = x.to_dtype(wide(dtype))?.reshape((b, self.groups, (c / self.groups) * h * w))?;
         let mean = g.mean_keepdim(D::Minus1)?;
         let g = g.broadcast_sub(&mean)?;
         let var = g.sqr()?.mean_keepdim(D::Minus1)?;
@@ -274,11 +274,23 @@ impl LayerNorm {
     }
 }
 
+/// The precision a sum over many values is taken in: f32 for the half
+/// precisions, whose sums overflow or lose their small terms, and the
+/// tensor's own otherwise. Not f32 whatever comes: a gradient is checked in
+/// f64 (`crate::grad`), and a step that rounded to f32 on the way would
+/// leave the check nothing finer than f32 to measure.
+pub(crate) fn wide(dtype: DType) -> DType {
+    match dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        d => d,
+    }
+}
+
 /// Layer norm with no weight or bias of its own, which a DiT's blocks use
 /// because the time embedding supplies scale and shift instead.
 pub(crate) fn layer_norm_plain(x: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
     let dtype = x.dtype();
-    let x = x.to_dtype(DType::F32)?;
+    let x = x.to_dtype(wide(dtype))?;
     let mean = x.mean_keepdim(D::Minus1)?;
     let x = x.broadcast_sub(&mean)?;
     let var = x.sqr()?.mean_keepdim(D::Minus1)?;
@@ -358,7 +370,7 @@ pub(crate) fn written_out(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> can
         let qs = q.narrow(2, start, n)?.contiguous()?;
         // Softmax in f32: a row of 16384 f16 exponentials sums past f16's
         // largest number long before it is done.
-        let att = (qs.matmul(&kt)?.to_dtype(DType::F32)? * scale)?;
+        let att = (qs.matmul(&kt)?.to_dtype(wide(q.dtype()))? * scale)?;
         let att = crate::grad::softmax_last_dim(&att)?.to_dtype(v.dtype())?;
         parts.push(att.matmul(v)?);
         start += n;

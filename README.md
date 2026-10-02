@@ -82,7 +82,7 @@ measurement in this repo keeps pointing at.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh
+curl -fsSL https://kvad.eu/install.sh | sh
 ```
 
 Prebuilt binaries from the latest [release](https://github.com/bisand/kvad/releases),

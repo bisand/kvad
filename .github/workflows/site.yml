@@ -1,0 +1,78 @@
+# Builds site/ and publishes it to GitHub Pages, which serves it as kvad.eu.
+#
+# Why the shape is this:
+#
+# * On a push to master that touches what the site is built from. That is
+#   more than site/: the long-form pages are docs/*.md rendered as they are,
+#   the front page quotes crates/llm/src/tensor.rs, the version is the
+#   workspace's, and kvad.eu/install.sh is install.sh. A change to any of
+#   them changes the site.
+# * Linux, because nothing here needs a Mac. The screenshots are files in
+#   site/static/shots, made by site/scripts/shots.js against a running
+#   server and committed; this workflow does not make them.
+# * Pages is deployed from the workflow's artifact, not from a branch, so the
+#   repository's Pages source has to be "GitHub Actions". The domain is
+#   site/static/CNAME.
+# * One deploy at a time, and a newer one does not cancel one that is under
+#   way: a cancelled deploy can leave Pages serving neither.
+
+name: site
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "site/**"
+      - "docs/**"
+      - "install.sh"
+      - "Cargo.toml"
+      - "crates/llm/src/tensor.rs"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Build
+        working-directory: site
+        run: |
+          npm ci
+          npm run build
+
+      - name: Check there is a site
+        run: test -s site/build/index.html && test -s site/build/install.sh && test -s site/build/CNAME
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site/build
+
+  deploy:
+    name: Publish to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

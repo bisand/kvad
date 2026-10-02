@@ -1,0 +1,6 @@
+node_modules
+/build
+/.svelte-kit
+# Copied from the repository by scripts/sync.js before every build.
+/static/install.sh
+/static/internals

@@ -2,7 +2,7 @@
 #
 # Install kvad from a GitHub release.
 #
-#     curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh
+#     curl -fsSL https://kvad.eu/install.sh | sh
 #
 # Downloads the release tarball for this machine, checks it against the
 # release's SHA256SUMS, and puts the binaries in ~/.local/bin. Then it asks

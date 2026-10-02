@@ -1069,6 +1069,28 @@ pub(crate) fn settle(device: &Device) -> candle_core::Result<()> {
     report_failures(device)
 }
 
+/// `work`, with an autorelease pool of its own that is emptied when it
+/// returns. Nothing but `work` itself anywhere but on macOS.
+///
+/// Metal hands back some of what it makes, a command buffer, an encoder,
+/// *autoreleased*: not freed when the caller lets go, but when the nearest
+/// pool on the thread is emptied. An app's main thread empties one every
+/// turn of its event loop. A thread in a command-line program has no pool
+/// at all, and what is autoreleased on it is never freed: a training run
+/// grew by 5 MB a step, 6 GB over a thousand, until each step was given a
+/// pool. Anything that runs for many steps on one thread wants one a step.
+///
+/// Inference leaks less and as surely: 1.5 kB a decoded token, 160 kB an
+/// image. So every `Session::forward` has a pool, every image
+/// (`lora::painting`), and every video and each of its steps
+/// (`ltx_sample`). `examples/pool_drift` measures it.
+pub fn pooled<T>(work: impl FnOnce() -> T) -> T {
+    #[cfg(target_os = "macos")]
+    return objc2::rc::autoreleasepool(|_| work());
+    #[cfg(not(target_os = "macos"))]
+    work()
+}
+
 /// [`settle`]'s first half: waits for everything queued on `device`, on
 /// Metal by a one-byte readback, which keeps a command buffer that failed
 /// for [`report_failures`] to find. As long as a synchronise, so the

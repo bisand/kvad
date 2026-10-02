@@ -8,7 +8,7 @@ use super::clip::{self, Clip, ClipConfig, Pooled};
 use super::nn::{check_latent, latent_preview, noise, to_rgb8, Ctx};
 use super::schedule;
 use super::unet::{Unet, UnetConfig};
-use super::vae::{Decoder, VaeConfig};
+use super::vae::{Decoder, Encoder, VaeConfig};
 use super::lora::{self, Adapters};
 use super::{finish, finish_mapped, local_file, open, open_file, open_mapped, read_json, single};
 use crate::common::{settle, Loader, Reader};
@@ -229,13 +229,80 @@ impl Sdxl {
     /// The prompt as the UNet reads it: `[1, 77, 2048]` per token and
     /// `[1, 1280]` pooled.
     fn encode(&self, text: &str) -> Res<(Tensor, Tensor)> {
-        let (ids, _) = clip::tokenize(&self.tok, text, clip::END)?;
-        let (l, _) = self.clip_l.encode(&ids, 0)?;
-        // The second tokenizer pads with `!`, id 0, where the first pads with
-        // the end marker. Same vocabulary otherwise.
-        let (ids, end) = clip::tokenize(&self.tok, text, 0)?;
-        let (g, pooled) = self.clip_g.encode(&ids, end)?;
-        Ok((Tensor::cat(&[&l, &g], 2)?, pooled.expect("the second encoder is loaded pooled")))
+        read_prompt(&self.tok, &self.clip_l, &self.clip_g, text)
+    }
+}
+
+/// `text` as the two encoders read it between them: every token from both,
+/// side by side, and the second's pooled summary.
+fn read_prompt(tok: &tokenizers::Tokenizer, clip_l: &Clip, clip_g: &Clip, text: &str) -> Res<(Tensor, Tensor)> {
+    let (ids, _) = clip::tokenize(tok, text, clip::END)?;
+    let (l, _) = clip_l.encode(&ids, 0)?;
+    // The second tokenizer pads with `!`, id 0, where the first pads with
+    // the end marker. Same vocabulary otherwise.
+    let (ids, end) = clip::tokenize(tok, text, 0)?;
+    let (g, pooled) = clip_g.encode(&ids, end)?;
+    Ok((Tensor::cat(&[&l, &g], 2)?, pooled.expect("the second encoder is loaded pooled")))
+}
+
+/// What training reads a picture and its caption with (#75): both text
+/// encoders and the VAE's encoding half, and no UNet.
+///
+/// Training reads each picture and each caption once, before its first
+/// step, and lets these go: the answers do not change while a LoRA on the
+/// UNet is trained, and the UNet then has the memory to itself.
+pub(crate) struct Readers {
+    tok: tokenizers::Tokenizer,
+    clip_l: Clip,
+    clip_g: Clip,
+    vae: Encoder,
+    device: Device,
+    dtype: DType,
+}
+
+impl Readers {
+    /// From `repo`, a pipeline in diffusers' layout; the VAE is the one
+    /// drawing decodes with ([`VAE_REPO`]).
+    pub(crate) fn load(repo: &str, device: &Device, watch: &Watcher) -> Res<Self> {
+        let dtype = DType::F16;
+        let vault = Vault::off();
+        let cx = Ctx { ld: Loader::new(None, device.clone(), &vault), dtype };
+        let tok = tokenizers::Tokenizer::from_file(fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?).map_err(|e| e.to_string())?;
+        let clip = |dir: &str, what: &str, pooled: Pooled| -> Res<Clip> {
+            let paths = vec![weights(repo, dir, "model", watch)?];
+            let r = open(&paths, dtype)?;
+            let cfg = ClipConfig::from_json(&read_json(&fetch_file(repo, &format!("{dir}/config.json"), watch)?)?)?;
+            let clip = Clip::load(&cx, &r, cfg, pooled)?;
+            finish(what, &paths, &r)?;
+            Ok(clip)
+        };
+        let (clip_l, clip_g) = (clip("text_encoder", "text encoder", Pooled::No)?, clip("text_encoder_2", "second text encoder", Pooled::Projected)?);
+        let (c, paths) = (read_json(&fetch_file(VAE_REPO, "config.json", watch)?)?, vec![fetch_file(VAE_REPO, "diffusion_pytorch_model.safetensors", watch)?]);
+        let r = open(&paths, dtype)?;
+        let vae = Encoder::load(&cx, &r, VaeConfig::from_json(&c)?)?;
+        finish("VAE", &paths, &r)?;
+        settle(device)?;
+        Ok(Readers { tok, clip_l, clip_g, vae, device: device.clone(), dtype })
+    }
+
+    /// A caption as the UNet reads it: `[1, 77, 2048]` a token, and
+    /// `[1, 1280]` pooled.
+    pub(crate) fn caption(&self, text: &str) -> Res<(Tensor, Tensor)> {
+        let read = read_prompt(&self.tok, &self.clip_l, &self.clip_g, text)?;
+        settle(&self.device)?;
+        Ok(read)
+    }
+
+    /// A picture, `[1, 3, H, W]` in `[−1, 1]` on the host, as the Gaussian
+    /// over its latents the VAE says it is, in the UNet's units and in
+    /// f32: the mean, and the spread in each number.
+    pub(crate) fn picture(&self, pixels: &Tensor) -> Res<(Tensor, Tensor)> {
+        let seen = self.vae.encode(&pixels.to_dtype(self.dtype)?.to_device(&self.device)?)?;
+        let scaling = self.vae.config().scaling;
+        let mean = self.vae.to_denoiser(&seen.mean.to_dtype(DType::F32)?)?;
+        let spread = (seen.logvar.to_dtype(DType::F32)?.affine(0.5, 0.0)?.exp()? * scaling)?;
+        settle(&self.device)?;
+        Ok((mean, spread))
     }
 }
 

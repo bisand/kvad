@@ -605,7 +605,8 @@ impl Session for GpuQwen35 {
         if self.pos == 0 {
             self.reset_state()?;
         }
-        self.run(tokens)
+        // A pool a call, so a pool a token: see `pooled`.
+        crate::common::pooled(|| self.run(tokens))
     }
 
     fn cached(&self) -> usize {

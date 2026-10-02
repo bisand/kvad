@@ -35,6 +35,7 @@
 mod adam;
 pub mod cap;
 mod common;
+pub use common::pooled;
 pub mod deepseek;
 mod ffn;
 mod fused;

@@ -27,6 +27,7 @@
 
 use super::ltx_dit::{audio_latent, audio_tokens, video_latent, video_tokens, Dit, Grid, Perturb};
 use super::ltx_text::Contexts;
+use crate::common::pooled;
 use crate::image::nn::noise;
 use candle_core::{DType, Tensor};
 
@@ -121,26 +122,30 @@ pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, still: Optio
     let mut xv = hold(&noise(stream(seed, 0), &[nv, 128], dev, keep)?, still)?;
     let mut xa = noise(stream(seed, 1), &[na, 128], dev, keep)?;
     let sigmas = &STAGE_1;
+    // A pool a step, here and in the two loops below: see `pooled`.
     for i in 0..sigmas.len() - 1 {
-        let (s, next) = (sigmas[i], sigmas[i + 1]);
-        let (vv, va) = dit.forward(&xv, &xa, (s, s), n0, ctx, grid)?;
-        let f = |t: &Tensor| t.to_dtype(DType::F32);
-        // The prediction, rounded to the latent's dtype as the reference's is.
-        let x0v = hold(&(f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?, still)?;
-        let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
-        step(i, next, &x0v)?;
-        if next == 0.0 {
-            (xv, xa) = (x0v, x0a);
-        } else {
-            let k = Ancestral::new(s, next);
-            let update = |x: &Tensor, x0: &Tensor, draw: u64| -> Res<Tensor> {
-                let det = ((f(x)? * k.r as f64)? + (f(x0)? * (1.0 - k.r) as f64)?)?;
-                let eps = noise(stream(seed, draw), x.dims(), dev, keep)?;
-                Ok(((det * k.a as f64)? + (f(&eps)? * k.c as f64)?)?.to_dtype(keep)?)
-            };
-            xv = hold(&update(&xv, &x0v, 2 + 2 * i as u64)?, still)?;
-            xa = update(&xa, &x0a, 3 + 2 * i as u64)?;
-        }
+        pooled(|| -> Res<()> {
+            let (s, next) = (sigmas[i], sigmas[i + 1]);
+            let (vv, va) = dit.forward(&xv, &xa, (s, s), n0, ctx, grid)?;
+            let f = |t: &Tensor| t.to_dtype(DType::F32);
+            // The prediction, rounded to the latent's dtype as the reference's is.
+            let x0v = hold(&(f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?, still)?;
+            let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
+            step(i, next, &x0v)?;
+            if next == 0.0 {
+                (xv, xa) = (x0v, x0a);
+            } else {
+                let k = Ancestral::new(s, next);
+                let update = |x: &Tensor, x0: &Tensor, draw: u64| -> Res<Tensor> {
+                    let det = ((f(x)? * k.r as f64)? + (f(x0)? * (1.0 - k.r) as f64)?)?;
+                    let eps = noise(stream(seed, draw), x.dims(), dev, keep)?;
+                    Ok(((det * k.a as f64)? + (f(&eps)? * k.c as f64)?)?.to_dtype(keep)?)
+                };
+                xv = hold(&update(&xv, &x0v, 2 + 2 * i as u64)?, still)?;
+                xa = update(&xa, &x0a, 3 + 2 * i as u64)?;
+            }
+            Ok(())
+        })?;
     }
     Ok(Latents { video: video_latent(&xv.to_dtype(DType::F32)?, shape)?, audio: audio_latent(&xa.to_dtype(DType::F32)?, 8)? })
 }
@@ -178,14 +183,16 @@ pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u
         return Err(format!("stage 2 at {}×{} wants {} video and {} audio tokens, and was given {} and {}", shape.width, shape.height, shape.video_tokens(), shape.audio_latents(), xv.dim(0)?, xa.dim(0)?).into());
     }
     for i in 0..sigmas.len() - 1 {
-        let (s, next) = (sigmas[i], sigmas[i + 1]);
-        let (vv, va) = dit.forward(&xv, &xa, (s, s), n0, ctx, grid)?;
-        let x0v = hold(&(f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?, still)?;
-        let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
-        // The picture's velocity is (x − x₀)/σ = 0, so it stays put.
-        xv = euler(&xv, &x0v, s, next)?;
-        xa = euler(&xa, &x0a, s, next)?;
-        step(i, next, &x0v)?;
+        pooled(|| -> Res<()> {
+            let (s, next) = (sigmas[i], sigmas[i + 1]);
+            let (vv, va) = dit.forward(&xv, &xa, (s, s), n0, ctx, grid)?;
+            let x0v = hold(&(f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?, still)?;
+            let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
+            // The picture's velocity is (x − x₀)/σ = 0, so it stays put.
+            xv = euler(&xv, &x0v, s, next)?;
+            xa = euler(&xa, &x0a, s, next)?;
+            step(i, next, &x0v)
+        })?;
     }
     Ok(Latents { video: video_latent(&xv.to_dtype(DType::F32)?, shape)?, audio: audio_latent(&xa.to_dtype(DType::F32)?, 8)? })
 }
@@ -354,11 +361,13 @@ pub fn guided(
     let mut xv = hold(&noise(stream(seed, 0), &[nv, 128], dev, keep)?, still)?;
     let mut xa = noise(stream(seed, 1), &[na, 128], dev, keep)?;
     for i in 0..sigmas.len() - 1 {
-        let (s, next) = (sigmas[i], sigmas[i + 1]);
-        let (x0v, x0a) = guided_x0(dit, &xv, &xa, s, pos, neg, grid, guides, still)?;
-        xv = hold(&euler(&xv, &x0v, s, next)?, still)?;
-        xa = euler(&xa, &x0a, s, next)?;
-        step(i, next, &x0v)?;
+        pooled(|| -> Res<()> {
+            let (s, next) = (sigmas[i], sigmas[i + 1]);
+            let (x0v, x0a) = guided_x0(dit, &xv, &xa, s, pos, neg, grid, guides, still)?;
+            xv = hold(&euler(&xv, &x0v, s, next)?, still)?;
+            xa = euler(&xa, &x0a, s, next)?;
+            step(i, next, &x0v)
+        })?;
     }
     Ok(Latents { video: video_latent(&xv.to_dtype(DType::F32)?, shape)?, audio: audio_latent(&xa.to_dtype(DType::F32)?, 8)? })
 }

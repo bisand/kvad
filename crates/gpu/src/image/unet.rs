@@ -430,6 +430,11 @@ impl Unet {
         Ok(unet)
     }
 
+    /// How wide the text it attends to is.
+    pub(crate) fn context(&self) -> usize {
+        self.cfg.context
+    }
+
     /// The noise level `t` as the vector every resnet reads, with SDXL's
     /// `added` conditioning in it, for a batch like `x`.
     pub(crate) fn embed(&self, x: &Tensor, t: f64, added: Option<(&Tensor, &[f64; 6])>) -> candle_core::Result<Tensor> {

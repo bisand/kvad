@@ -456,18 +456,11 @@ pub fn use_ffmpeg(setting: &str) -> String {
 
 /// `ffmpeg` as `[videos] ffmpeg` says to find it: `off` for none, a path
 /// for that file if it is there, and `auto` for the first on `path` or in
-/// the places a package manager puts one. The last matters: a launchd
-/// service runs with `/usr/bin:/bin:/usr/sbin:/sbin` for its `PATH`, and
-/// Homebrew's `ffmpeg` is in none of them.
+/// the places a package manager puts one ([`kvad::video::ffmpeg_on`]).
 pub fn find_ffmpeg(setting: &str, path: &[PathBuf]) -> Option<PathBuf> {
     match setting.trim() {
         "off" => None,
-        "auto" | "" => path
-            .iter()
-            .cloned()
-            .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from))
-            .map(|d| d.join("ffmpeg"))
-            .find(|f| f.is_file()),
+        "auto" | "" => kvad::video::ffmpeg_on(path),
         named => Some(PathBuf::from(named)).filter(|f| f.is_file()),
     }
 }

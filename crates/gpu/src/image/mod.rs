@@ -21,6 +21,7 @@
 //! [`crate::model::session`] picks an architecture from `config.json`.
 
 pub mod clip;
+pub mod dataset;
 pub mod flux;
 pub mod mmdit;
 pub mod nn;

@@ -2,6 +2,7 @@
 //!
 //!     kvad-gpu run  [--model REPO] [--prompt TEXT] [--device metal] [--dtype bf16]
 //!     kvad-gpu chat [--model REPO] [--system TEXT]
+//!     kvad-gpu tune [MODEL] --data DIR --name NAME      (a LoRA for SDXL)
 //!
 //! Everything except the forward pass is shared with the CPU engine: the same
 //! Hub client, tokenizer, chat template, sampler and generation loop. Only the
@@ -58,7 +59,7 @@ impl Default for Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: kvad-gpu <run|chat> [options]\n\n\
+        "usage: kvad-gpu <run|chat> [options]\n       kvad-gpu tune --help\n\n\
          options:\n  \
            --model REPO        HuggingFace repo id (default: active, else {DEFAULT_MODEL})\n  \
            --device D          metal | cuda | cpu (default: best available)\n  \
@@ -166,6 +167,15 @@ fn load(args: &Args) -> Res<Llm> {
 // several lines of prose meant to be read: the unread-tensor guard names the
 // weights it found, and the quantiser names the block size that does not fit.
 fn main() {
+    // `tune` has options of its own, and reads them itself.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("tune") {
+        if let Err(e) = tune(&argv[1..]) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let args = parse_args();
     let done = match args.command.as_str() {
         "run" => run(args),
@@ -179,6 +189,146 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+const TUNE_USAGE: &str = "usage: kvad-gpu tune [MODEL] --data DIR --name NAME [options]
+
+Train a LoRA for SDXL on a folder of pictures, each with its caption in a
+.txt of the same name beside it. MODEL is SDXL's repo unless given.
+
+options:
+  --data DIR          the folder of pictures and captions
+  --name NAME         what to call the LoRA; it is written to the data
+                      directory's loras/NAME.safetensors
+  --out FILE          or the file to write it to
+  --from FILE         go on from a LoRA this wrote
+  --caption TEXT      the caption of every picture that has none
+  --size N            pixels a side, a multiple of 64 (default 1024)
+  --rank N            (default 16)
+  --alpha F           the LoRA is scaled by alpha / rank (default: the rank)
+  --steps N           (default 1000)
+  --lr F              (default 1e-4)
+  --eval-every N      steps between validation measurements (default 100)
+  --holdout N         pictures kept out of training to measure on
+                      (default: a tenth, from one to four; none of under 5)
+  --seed N            (default 1337)
+  --ffmpeg FILE       the ffmpeg that decodes the pictures (default: found)
+  --cap GB            end the run if its memory passes this (default: three
+                      quarters of the machine's)";
+
+/// `kvad-gpu tune`: [`kvad_gpu::image::tune::run`] from a command line.
+fn tune(argv: &[String]) -> Res<()> {
+    use kvad_gpu::image::tune;
+    if argv.is_empty() || argv.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        eprintln!("{TUNE_USAGE}");
+        std::process::exit(2);
+    }
+    let (mut model, mut flags) = (None, std::collections::HashMap::new());
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].strip_prefix("--") {
+            Some(flag) => {
+                let value = argv.get(i + 1).ok_or_else(|| format!("--{flag} needs a value"))?;
+                flags.insert(flag.to_string(), value.clone());
+                i += 2;
+            }
+            None if model.is_none() => {
+                model = Some(argv[i].clone());
+                i += 1;
+            }
+            None => return Err(format!("`{}` is one model too many\n\n{TUNE_USAGE}", argv[i]).into()),
+        }
+    }
+    let mut take = |flag: &str| flags.remove(flag);
+    fn number<T: std::str::FromStr>(flag: &str, value: Option<String>) -> Res<Option<T>> {
+        value.map(|v| v.parse::<T>().map_err(|_| format!("--{flag} expects a number, got `{v}`").into())).transpose()
+    }
+    let data = std::path::PathBuf::from(take("data").ok_or_else(|| format!("which pictures? --data DIR\n\n{TUNE_USAGE}"))?);
+    let out = match (take("out"), take("name")) {
+        (Some(file), _) => std::path::PathBuf::from(file),
+        (None, Some(name)) => {
+            if !kvad::weights::is_model_name(&name) {
+                return Err(format!("`{name}` is not a name: it has to be one word, with no `/` in it").into());
+            }
+            kvad::weights::data_dir().join("loras").join(format!("{name}.safetensors"))
+        }
+        (None, None) => return Err(format!("a LoRA needs a name: --name NAME\n\n{TUNE_USAGE}").into()),
+    };
+    let ffmpeg = match take("ffmpeg") {
+        Some(file) => std::path::PathBuf::from(file),
+        None => {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            kvad::video::ffmpeg_on(&std::env::split_paths(&path).collect::<Vec<_>>()).ok_or("the pictures are decoded by ffmpeg, and none was found: install it, or name one with --ffmpeg FILE")?
+        }
+    };
+    let mut opts = tune::Options::new(model.as_deref().unwrap_or(kvad_gpu::image::sdxl::REPO), &data, &out, &ffmpeg);
+    opts.from = take("from").map(std::path::PathBuf::from);
+    opts.caption = take("caption");
+    opts.alpha = number("alpha", take("alpha"))?;
+    opts.holdout = number("holdout", take("holdout"))?;
+    for (flag, into) in [("size", &mut opts.size), ("rank", &mut opts.rank), ("steps", &mut opts.steps), ("eval-every", &mut opts.eval_every)] {
+        if let Some(n) = number(flag, take(flag))? {
+            *into = n;
+        }
+    }
+    if let Some(lr) = number("lr", take("lr"))? {
+        opts.lr = lr;
+    }
+    if let Some(seed) = number("seed", take("seed"))? {
+        opts.seed = seed;
+    }
+    let cap = number::<f64>("cap", take("cap"))?.or_else(|| kvad::machine::total_memory().map(|b| b as f64 / 1e9 * 0.75));
+    if let Some(flag) = flags.keys().next() {
+        return Err(format!("unknown flag --{flag}\n\n{TUNE_USAGE}").into());
+    }
+    // A backward pass that does not fit is not refused by the system: it
+    // takes the machine down. The run ends itself first.
+    if let Some(cap) = cap {
+        kvad_gpu::cap::at(cap);
+    }
+    let device = model::pick_device(None)?;
+    if !device.is_metal() && !device.is_cuda() {
+        return Err("an image model is trained on the GPU and nowhere else, and this machine has none that candle can use".into());
+    }
+
+    // Ctrl-C ends the run after the step it is in, with its last step
+    // written beside its best. A second one ends the process.
+    static STOP: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> = std::sync::OnceLock::new();
+    extern "C" fn stop(_: libc::c_int) {
+        if let Some(flag) = STOP.get() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: `signal` is async-signal-safe, and puts back the default.
+        unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+    }
+    opts.cancel = Some(STOP.get_or_init(Default::default).clone());
+    // SAFETY: the handler stores to an atomic and calls `signal`, both of
+    // which a signal handler may.
+    unsafe { libc::signal(libc::SIGINT, stop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+
+    let s = tune::run(&opts, &device, &mut |line| eprintln!("  {line}"), &mut |_| {})?;
+    eprintln!();
+    if s.best_step == 0 {
+        eprintln!("no step was taken, and nothing was written");
+        return Ok(());
+    }
+    eprintln!(
+        "{} steps on {} pictures in {:.0} min{}",
+        s.steps,
+        s.pictures,
+        s.elapsed_secs / 60.0,
+        if s.stopped { ", stopped early" } else { "" }
+    );
+    eprintln!("validation loss {:.4} at step {}, from the model's own {:.4}", s.best_val, s.best_step, s.base_val);
+    if s.best_val >= s.base_val {
+        eprintln!("which is no better than the model without the LoRA: on pictures it did not train on, it learned nothing that carries over");
+    }
+    eprintln!("the LoRA, {:.1} M numbers on {} layers: {}", s.trained as f64 / 1e6, s.layers, s.out.display());
+    if let Some(last) = &s.last {
+        eprintln!("the last step's, validation loss {:.4}: {}", s.last_val, last.display());
+    }
+    eprintln!("\ndraw with it:  kvad images make \"...\" --model {} --lora {}", opts.repo, s.out.display());
+    Ok(())
 }
 
 fn run(args: Args) -> Res<()> {

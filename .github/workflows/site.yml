@@ -80,3 +80,24 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+      # IndexNow: tells Bing, and the engines that share its index, which
+      # addresses to read again, instead of waiting for them to come by. The
+      # key is not a secret: it is site/static/KEY.txt, served at the address
+      # below, which is how the engine knows the site sent this. Every
+      # address in the sitemap is sent, read from the site just deployed. A
+      # ping that fails does not fail the deploy.
+      - name: Tell the search engines
+        continue-on-error: true
+        env:
+          KEY: d92c88e0e98ba4eaae761394bac60438
+        run: |
+          curl -fsS --retry 5 --retry-delay 10 https://kvad.eu/sitemap.xml \
+            | grep -o '<loc>[^<]*' | sed 's/<loc>//' \
+            | jq -R . | jq -s --arg key "$KEY" \
+                '{host: "kvad.eu", key: $key, keyLocation: "https://kvad.eu/\($key).txt", urlList: .}' \
+            > ping.json
+          jq '.urlList | length' ping.json
+          curl -sS -o /dev/null -w 'IndexNow answered %{http_code}\n' \
+            -H 'content-type: application/json; charset=utf-8' \
+            --data @ping.json https://api.indexnow.org/indexnow

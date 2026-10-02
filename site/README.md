@@ -50,3 +50,14 @@ It drives the Chrome that is installed, through Playwright.
 four `A` records (185.199.108.153 to 185.199.111.153) and `www` a `CNAME` to
 `bisand.github.io`. In the repository's settings, Pages' source is "GitHub
 Actions".
+
+## Search engines
+
+After each deploy the workflow sends every address in the sitemap to
+IndexNow, which Bing and the engines that share its index read. The key is
+the 32-character file name in `static/`, and is public by design. Google does
+not read IndexNow: it finds the pages from the sitemap, submitted once in
+Search Console.
+
+`/llms.txt` lists every documentation page as Markdown, for a language
+model, and each page is served that way at `/docs/<page>.md`.

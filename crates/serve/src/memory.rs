@@ -181,6 +181,26 @@ pub fn admit(budget: &Budget, held: &[Held], id: &str, need: &Need) -> Admission
     ))
 }
 
+/// Whether `bytes` for `id`, which is not a model, fit beside what is
+/// `held`; and if not, the sentence that says what is in the way.
+pub fn reserve(budget: &Budget, held: &[Held], id: &str, bytes: u64) -> Result<(), String> {
+    let spent: u64 = held.iter().map(|h| h.commit).sum();
+    let left = budget.total.saturating_sub(spent);
+    if bytes <= left {
+        return Ok(());
+    }
+    Err(match held.is_empty() {
+        true => format!("{id} needs {}, and this server has {} for everything it holds", gb(bytes), gb(budget.total)),
+        false => format!(
+            "{id} needs {}, and {} is left of {} beside {}. Unload something first.",
+            gb(bytes),
+            gb(left),
+            gb(budget.total),
+            held.iter().map(|h| format!("{} ({})", h.id, gb(h.commit))).collect::<Vec<_>>().join(", ")
+        ),
+    })
+}
+
 /// What `repo` would take at `backend`, from what is on the disk.
 ///
 /// Blocking: it reads a directory listing and a config. The scheduler calls

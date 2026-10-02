@@ -151,6 +151,16 @@ struct Args {
     warmup: Option<usize>,
     decay_to: Option<f32>,
     clip: Option<f32>,
+    /// `tune` only: the LoRA's rank and alpha, pictures held out, the
+    /// prompts drawn at each measurement and how, and the caption of a
+    /// picture that has none.
+    rank: Option<usize>,
+    alpha: Option<f64>,
+    holdout: Option<usize>,
+    samples: Vec<String>,
+    sample_size: Option<usize>,
+    sample_steps: Option<usize>,
+    caption: Option<String>,
 }
 
 impl Default for Args {
@@ -222,6 +232,13 @@ impl Default for Args {
             warmup: None,
             decay_to: None,
             clip: None,
+            rank: None,
+            alpha: None,
+            holdout: None,
+            samples: Vec::new(),
+            sample_size: None,
+            sample_steps: None,
+            caption: None,
         }
     }
 }
@@ -234,6 +251,8 @@ fn usage() -> ! {
            pull REPO           download a model\n  \
            crawl URL           read a documentation site into a text file\n  \
            train               train a model of your own from a text file\n  \
+           tune                train a LoRA for an image model on a folder of\n  \
+           \u{20}                   captioned pictures, on a server (kvad tune --help)\n  \
            ls                  list downloaded and trained models\n  \
            use MODEL           set the default model\n  \
            rm MODEL            delete a downloaded or trained model\n  \
@@ -254,8 +273,8 @@ fn usage() -> ! {
            conversations       ls, show ID, edit ID, rm ID\n  \
            images              ls, make PROMPT [--out FILE], rm ID\n  \
            videos              ls, make PROMPT [--out FILE], show ID, watch ID, get ID, rm ID\n  \
-           jobs                ls, show ID, watch ID, cancel ID\n  \
-           datasets            ls, add FILE, crawl URL, show ID, check ID, search ID Q, rm ID\n  \
+           jobs                ls, show ID, watch ID, cancel ID, samples ID\n  \
+           datasets            ls, add FILE|DIR, crawl URL, show ID, check ID, search ID Q, rm ID\n  \
            evals               runs, show ID, suites, add FILE, edit ID FILE, rm ID,\n  \
            \u{20}                   run SUITE MODEL..., perplexity DATASET MODEL...\n  \
            bench               runs, show ID, run MODEL...\n  \
@@ -331,7 +350,7 @@ fn usage() -> ! {
 
 /// Commands that take words after them, rather than only flags.
 const POSITIONAL: &[&str] = &[
-    "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload",
+    "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "tune", "load", "unload",
     "tokenize", "service", "conversations", "jobs", "datasets", "evals", "bench", "metrics",
     "auth", "users", "sessions", "keys", "api", "images", "videos",
 ];
@@ -438,7 +457,16 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--decay-to" => a.decay_to = Some(num() as f32),
             "--clip" => a.clip = Some(num() as f32),
             "--threads" => a.threads = Some((num() as usize).max(1)),
+            // A count of characters for `train`, and for `tune` a prompt to
+            // draw, as often as it is given.
+            "--sample" if a.command == "tune" => a.samples.push(value.clone()),
             "--sample" => a.sample = Some(num() as usize),
+            "--rank" => a.rank = Some(num() as usize),
+            "--alpha" => a.alpha = Some(num()),
+            "--holdout" => a.holdout = Some(num() as usize),
+            "--sample-size" => a.sample_size = Some(num() as usize),
+            "--sample-steps" => a.sample_steps = Some(num() as usize),
+            "--caption" => a.caption = Some(value.clone()),
             "--quant" => {
                 a.quant = Precision::parse(&value).unwrap_or_else(|| {
                     eprintln!("--quant expects f32, q8 or q4, got `{value}`");

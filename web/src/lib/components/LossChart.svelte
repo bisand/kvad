@@ -12,7 +12,10 @@
   import uPlot from "uplot";
   import "uplot/dist/uPlot.min.css";
 
-  let { metrics = [], bestStep = null, steps = null } = $props();
+  // `train: false` leaves the training loss out, for a run whose training
+  // loss says mostly which noise level a step drew (a LoRA for a diffusion
+  // model): the line worth watching there is the validation loss alone.
+  let { metrics = [], bestStep = null, steps = null, train = true } = $props();
 
   let host;
   let chart = null;
@@ -22,14 +25,25 @@
     return v || fallback;
   }
 
-  /** [steps, train, val] — uPlot wants columns, not rows. */
+  /** [steps, train, val], or [steps, val] — uPlot wants columns, not rows. */
   function columns(rows) {
     const ordered = [...rows].sort((a, b) => a.step - b.step);
     return [
       ordered.map((m) => m.step),
-      ordered.map((m) => m.train_loss),
+      ...(train ? [ordered.map((m) => m.train_loss)] : []),
       ordered.map((m) => m.val_loss),
     ];
+  }
+
+  /**
+   * Tick labels with as many decimals as the ticks are apart. uPlot's own
+   * stop at three, which is right for a text run's loss, around 1, and
+   * labels every tick of a diffusion run's, around 0.007, the same.
+   */
+  function ticks(u, values) {
+    const gap = values.length > 1 ? Math.abs(values[1] - values[0]) : 1;
+    const places = Math.min(6, Math.max(0, Math.ceil(-Math.log10(gap) - 1e-9)));
+    return values.map((v) => v.toFixed(places));
   }
 
   function build() {
@@ -59,13 +73,14 @@
         },
         axes: [
           { stroke: ink, grid: { stroke: line }, ticks: { stroke: line }, label: "step" },
-          { stroke: ink, grid: { stroke: line }, ticks: { stroke: line }, label: "loss" },
+          { stroke: ink, grid: { stroke: line }, ticks: { stroke: line }, label: "loss", values: ticks, size: 64 },
         ],
         series: [
           { label: "step" },
-          { label: "train", stroke: colour("--color-primary", "#4f46e5"), width: 2 },
+          ...(train ? [{ label: "train", stroke: colour("--color-primary", "#4f46e5"), width: 2 }] : []),
           {
             label: "validation",
+            value: (u, v) => (v == null ? "--" : v.toPrecision(4)),
             stroke: colour("--color-secondary", "#0891b2"),
             width: 2,
             // The step whose model is on disk, marked where it happened.
@@ -85,7 +100,9 @@
     // Rebuilt when the theme changes, because the colours were read once.
     void metrics.length;
     void bestStep;
-    if (!chart) build();
+    // Which lines there are is decided when the chart is built.
+    if (chart && chart.series.length !== (train ? 3 : 2)) build();
+    else if (!chart) build();
     else chart.setData(columns(metrics));
   });
 

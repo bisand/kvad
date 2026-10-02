@@ -439,6 +439,12 @@ fn compress(ffmpeg: &FsPath, raw: &FsPath, to: &FsPath, id: i64) -> std::io::Res
 /// The `ffmpeg` every video is compressed with, chosen once at startup.
 static FFMPEG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
+/// The `ffmpeg` chosen at startup, for whatever else reads a picture with
+/// it: a training run, and the check of the pictures it is given.
+pub fn ffmpeg() -> Option<PathBuf> {
+    FFMPEG.get().cloned().flatten()
+}
+
 /// Choose the `ffmpeg` from `[videos] ffmpeg`, and say what was chosen, for
 /// the line the server prints as it starts.
 pub fn use_ffmpeg(setting: &str) -> String {

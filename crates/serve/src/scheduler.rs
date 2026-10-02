@@ -255,6 +255,9 @@ enum Job {
         done: Answer<Perplexity>,
     },
     Paint { on: Key, request: kvad::image::ImageRequest, out: tokio_mpsc::Sender<Stroke> },
+    /// Charge `bytes` to something that is not a resident; see
+    /// [`Scheduler::reserve`].
+    Reserve { id: String, bytes: u64, done: Answer<()> },
     Film { on: Key, request: kvad::video::VideoRequest, out: tokio_mpsc::Sender<Reel> },
 }
 
@@ -279,6 +282,9 @@ struct Shared {
     residents: Arc<Mutex<Vec<Resident>>>,
     /// The interrupt flag of whichever engine is generating.
     running: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// Memory charged to work that is not a resident: a training run in a
+    /// process of its own. Admission counts it as it counts a model.
+    reserved: Arc<Mutex<Vec<Held>>>,
 }
 
 impl Shared {
@@ -288,6 +294,31 @@ impl Shared {
 
     fn running(&self) -> std::sync::MutexGuard<'_, Option<Arc<AtomicBool>>> {
         self.running.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn reserved(&self) -> std::sync::MutexGuard<'_, Vec<Held>> {
+        self.reserved.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Everything the budget is charged for: each resident, then each
+    /// reservation.
+    fn held(&self) -> Vec<Held> {
+        let mut held: Vec<Held> = self.residents().iter().map(|r| Held { id: r.id.clone(), commit: r.commit }).collect();
+        held.extend(self.reserved().iter().cloned());
+        held
+    }
+}
+
+/// Memory held for work outside the engines, given back when this is
+/// dropped: when the run it was for has ended, however it ended.
+pub struct Reservation {
+    id: String,
+    shared: Shared,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.shared.reserved().retain(|h| h.id != self.id);
     }
 }
 
@@ -319,10 +350,28 @@ impl Scheduler {
         self.shared.residents().clone()
     }
 
-    /// Bytes of the budget no resident has been charged.
+    /// Bytes of the budget nothing has been charged: no resident, and no
+    /// reservation.
     pub fn left(&self) -> u64 {
-        let spent: u64 = self.shared.residents().iter().map(|r| r.commit).sum();
+        let spent: u64 = self.shared.held().iter().map(|h| h.commit).sum();
         self.budget.total.saturating_sub(spent)
+    }
+
+    /// Charge `bytes` of the budget to `id`, which is not a model in memory
+    /// here: a training run, which loads its own copy of a model in a
+    /// process of its own. Refused, in a sentence, if that much is not left.
+    ///
+    /// It goes through the queue, as a load does, so that it is decided
+    /// after every load ahead of it and before every load behind: asked
+    /// beside a load in progress, both could be told the same room is
+    /// theirs. Unlike a model alone, it is refused when it is over the
+    /// budget with nothing else held: what it asks for is a measured peak,
+    /// and a backward pass that does not fit takes the machine down.
+    pub async fn reserve(&self, id: String, bytes: u64) -> Result<Reservation, String> {
+        let (done, wait) = oneshot::channel();
+        self.submit(Job::Reserve { id: id.clone(), bytes, done })?;
+        wait.await.map_err(|_| "the engine stopped before it answered".to_string())??;
+        Ok(Reservation { id, shared: self.shared.clone() })
     }
 
     /// The resident a name means: `repo@backend` exactly, or the bare repo's
@@ -537,6 +586,15 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                 Box::new(move || drop(done.send(result)))
             }
 
+            Job::Reserve { id, bytes, done } => {
+                let held = shared.held();
+                let result = crate::memory::reserve(&budget, &held, &id, bytes);
+                if result.is_ok() {
+                    shared.reserved().push(Held { id, commit: bytes });
+                }
+                Box::new(move || drop(done.send(result)))
+            }
+
             Job::Unload { which, done } => {
                 let (going, staying): (Vec<Slot>, Vec<Slot>) =
                     slots.drain(..).partition(|s| which.as_ref().is_none_or(|k| &s.key == k));
@@ -668,8 +726,7 @@ fn load(
     progress: &tokio_mpsc::Sender<Progress>,
 ) -> Result<(Slot, Resident), LoadError> {
     let id = id_of(&key.repo, key.backend);
-    let held: Vec<Held> =
-        shared.residents().iter().map(|r| Held { id: r.id.clone(), commit: r.commit }).collect();
+    let held = shared.held();
     let need = crate::memory::need(&key.repo, key.backend, budget.context);
     let admission = crate::memory::admit(&budget, &held, &id, &need);
     let room = match admission {
@@ -959,6 +1016,25 @@ mod tests {
 
         // And the queue is empty again afterwards.
         assert_eq!(sched.depth(), 0);
+    }
+
+    /// A reservation is charged like a model, refused when it does not fit,
+    /// and given back when it is dropped.
+    #[tokio::test]
+    async fn a_reservation_is_charged_until_it_is_dropped() {
+        let budget = Budget { total: 20_000_000_000, context: 1024 };
+        let sched = Scheduler::spawn(|| Box::new(|_, _, _, _| Err("no backend in tests".into())), budget);
+        let first = sched.reserve("training a".into(), 12_000_000_000).await.unwrap();
+        assert_eq!(sched.left(), 8_000_000_000);
+
+        let refused = sched.reserve("training b".into(), 12_000_000_000).await.err().unwrap();
+        assert!(refused.contains("training a") && refused.contains("8.0 GB"), "{refused}");
+        assert_eq!(sched.left(), 8_000_000_000, "a refused reservation was charged");
+
+        drop(first);
+        assert_eq!(sched.left(), 20_000_000_000);
+        // Over the budget is refused even alone, which a model is not.
+        assert!(sched.reserve("training c".into(), 21_000_000_000).await.is_err());
     }
 
     /// Unloading nothing is not an error; it is nothing.

@@ -48,6 +48,7 @@ pub fn remote_only(command: &str) -> bool {
             | "unload"
             | "cancel"
             | "tokenize"
+            | "tune"
             | "conversations"
             | "images"
             | "videos"
@@ -107,6 +108,7 @@ pub fn remote(remote: &Remote, args: &Args) -> Res<()> {
         "run" => models::run(remote, args),
         "chat" => models::chat(remote, args),
         "train" => models::train(remote, args),
+        "tune" => models::tune(remote, args),
         "conversations" => api::conversations(remote, args),
         "images" => api::images(remote, args),
         "videos" => api::videos(remote, args),
@@ -131,6 +133,7 @@ pub fn remote(remote: &Remote, args: &Args) -> Res<()> {
 pub fn help(command: &str) -> ! {
     let text = match command {
         "service" => service::USAGE,
+        "tune" => models::TUNE,
         "conversations" => api::CONVERSATIONS,
         "images" => api::IMAGES,
         "videos" => api::VIDEOS,
@@ -200,7 +203,7 @@ mod tests {
         ("service.rs", include_str!("cli/service.rs")),
     ];
 
-    const METHODS: &[&str] = &["get", "post", "patch", "delete"];
+    const METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
 
     /// The client's calls that take the method as their first argument.
     const TAKES_A_METHOD: &[&str] = &["call", "call_for_cookie", "stream"];
@@ -300,7 +303,7 @@ mod tests {
     fn every_command_the_table_names_exists() {
         let known: BTreeSet<&str> = [
             "ls", "ps", "search", "info", "pull", "use", "rm", "cache", "load", "unload", "cancel",
-            "tokenize", "run", "chat", "train", "service", "conversations", "images", "videos", "jobs",
+            "tokenize", "run", "chat", "train", "tune", "service", "conversations", "images", "videos", "jobs",
             "datasets", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api",
         ]
         .into();

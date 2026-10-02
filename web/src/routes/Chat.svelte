@@ -25,7 +25,8 @@
   $effect(() => {
     models.refresh();
     api("/api/datasets")
-      .then((list) => (datasets = list.filter((d) => d.present)))
+      // A text to look things up in; a set of pictures is not one.
+      .then((list) => (datasets = list.filter((d) => d.present && d.kind !== "pictures")))
       .catch(() => {});
     // Opening the newest conversation rather than an empty pane: arriving
     // here almost always means carrying on with the last thing. Everything

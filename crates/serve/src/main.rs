@@ -69,6 +69,7 @@ mod settings;
 mod storage;
 mod watching;
 mod training;
+mod tune;
 mod users;
 mod videos;
 
@@ -147,8 +148,18 @@ fn parse_args() -> Args {
     a
 }
 
+fn main() {
+    // A training run's process is this binary, started by the server with
+    // one word; see `tune`. Decided before there is a runtime or a log:
+    // the worker has neither, and its output is the server's to read.
+    if std::env::args().nth(1).as_deref() == Some(tune::WORKER) {
+        tune::worker();
+    }
+    serve()
+}
+
 #[tokio::main]
-async fn main() {
+async fn serve() {
     // `RUST_LOG` if it is set, otherwise our own requests and warnings from
     // everything else. A default of `info` across every dependency would bury
     // the line somebody is looking for.

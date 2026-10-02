@@ -1,4 +1,4 @@
-// Runs, and the text they are trained on.
+// Runs, and the text or the pictures they are trained on.
 //
 // A run is a job on the server, so this store is mostly about *watching* one:
 // subscribe to its events, fold them into a chart, and keep working when the
@@ -15,7 +15,11 @@ class Training {
   datasets = $state([]);
   options = $state(null);
 
-  /** The run being looked at: `{ job, metrics, samples }`. */
+  /**
+   * The run being looked at: `{ job, metrics, samples, measures, pictures,
+   * stepped }`. A text run fills the first two; a LoRA run the next two,
+   * and `stepped` is the last step it said it took.
+   */
   open = $state(null);
   /** Lines of text from the run, newest last. Not persisted; the chart is. */
   log = $state([]);
@@ -52,7 +56,14 @@ class Training {
     // The metrics and samples from the request are dropped in favour of the
     // ones the stream replays, so there is one path that builds them and one
     // rule for duplicates.
-    this.open = { job: { ...job, metrics: undefined, samples: undefined }, metrics: [], samples: [] };
+    this.open = {
+      job: { ...job, metrics: undefined, samples: undefined, measures: undefined, pictures: undefined },
+      metrics: [],
+      samples: [],
+      measures: [],
+      pictures: [],
+      stepped: null,
+    };
     this.log = [];
 
     const stop = new AbortController();
@@ -100,6 +111,24 @@ class Training {
         else this.open.samples.push(u);
         break;
       }
+      case "measured": {
+        // A LoRA run's validation loss, keyed by step as a metric is. The
+        // step that was saved arrives a second time, whole, with its mark.
+        const at = this.open.measures.findIndex((m) => m.step === u.step);
+        const merged = { ...u, saved: u.saved || (at >= 0 && this.open.measures[at].saved) };
+        if (at >= 0) this.open.measures[at] = merged;
+        else this.open.measures.push(merged);
+        break;
+      }
+      case "picture": {
+        const at = this.open.pictures.findIndex((p) => p.step === u.step && p.prompt === u.prompt);
+        if (at >= 0) this.open.pictures[at] = u;
+        else this.open.pictures.push(u);
+        break;
+      }
+      case "stepped":
+        this.open.stepped = u;
+        break;
       case "status":
         this.log.push(u.message);
         if (this.log.length > 200) this.log.shift();
@@ -119,7 +148,7 @@ class Training {
         // The row now carries the result and the timings, which the stream
         // does not: read it back rather than reconstruct it here.
         api(`/api/jobs/${id}`)
-          .then(({ metrics, samples, ...job }) => {
+          .then(({ metrics, samples, measures, pictures, ...job }) => {
             if (this.open?.job.id === id) this.open.job = job;
           })
           .catch(() => {});
@@ -129,9 +158,10 @@ class Training {
     }
   }
 
-  /** The step whose model is on disk. */
+  /** The step whose model, or whose LoRA, is on disk. */
   get bestStep() {
-    const saved = this.open?.metrics.filter((m) => m.saved) ?? [];
+    const rows = this.open?.measures.length ? this.open.measures : (this.open?.metrics ?? []);
+    const saved = rows.filter((m) => m.saved);
     return saved.length ? saved[saved.length - 1].step : null;
   }
 
@@ -173,6 +203,44 @@ class Training {
     } catch (e) {
       toasts.error(e.message);
       return null;
+    }
+  }
+
+  /**
+   * Upload pictures and their captions as a dataset.
+   *
+   * A file at a time, and then one request that makes a dataset of them all
+   * or of none. What comes back is `{ dataset }` or `{ error }`: the refusal
+   * names every file that is wrong, which is a list to read and act on, not
+   * a toast that is gone in five seconds.
+   *
+   * @param {string} name
+   * @param {File[]} files
+   * @param {string} caption for every picture that has none beside it
+   * @param {(done: number, total: number) => void} [progress]
+   */
+  async uploadPictures(name, files, caption, progress) {
+    const at = `/api/datasets/pictures/${encodeURIComponent(name)}`;
+    try {
+      // Whatever an earlier try left there is not part of this one.
+      await api(at, { method: "DELETE" });
+      for (const [i, file] of files.entries()) {
+        progress?.(i, files.length);
+        await api(`${at}/${encodeURIComponent(file.name)}`, {
+          method: "PUT",
+          headers: { "content-type": "application/octet-stream" },
+          body: file,
+        });
+      }
+      progress?.(files.length, files.length);
+      const dataset = await api(`${at}?caption=${encodeURIComponent(caption ?? "")}`, { method: "POST" });
+      await this.refresh();
+      return { dataset };
+    } catch (e) {
+      api(at, { method: "DELETE" }).catch(() => {});
+      // Without the path it failed at: what is wrong is the files, and the
+      // sentence that names them is the server's own.
+      return { error: e.message.replace(/^\S+ failed: /, "") };
     }
   }
 

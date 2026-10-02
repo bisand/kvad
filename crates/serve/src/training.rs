@@ -7,11 +7,12 @@
 use crate::api::{blocking, Fail};
 use crate::auth::{Admin, Identity, State};
 use crate::datasets::{self, Dataset};
-use crate::jobs::{self, Job, TrainParams, Update};
+use crate::jobs::{self, Job, LoraParams, TrainParams, Update};
 use axum::extract::{DefaultBodyLimit, Path, Query, State as St};
+use axum::http::header;
 use axum::response::sse::Event;
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::json;
 
@@ -20,6 +21,7 @@ pub fn routes() -> Router<State> {
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}", get(job).delete(cancel_job))
         .route("/api/jobs/{id}/events", get(job_events))
+        .route("/api/jobs/{id}/samples/{step}/{prompt}", get(job_sample))
         .route("/api/train", post(start))
         .route("/api/train/options", get(options))
         .route("/api/datasets", get(list_datasets).post(upload))
@@ -27,9 +29,21 @@ pub fn routes() -> Router<State> {
         .route("/api/datasets/{id}", get(dataset).delete(remove_dataset))
         .route("/api/datasets/{id}/check", get(check))
         .route("/api/datasets/{id}/search", get(search))
+        .route("/api/datasets/{id}/pictures", get(pictures))
+        .route("/api/datasets/{id}/pictures/{file}", get(picture))
         // Uploads are text and the store has its own limit; axum's default of
         // 2 MB would refuse a corpus long before that.
         .layer(DefaultBodyLimit::max(datasets::MAX_BYTES + 1024))
+        // A picture is larger than a text may be, so these have a limit of
+        // their own, and are added after the layer above so as not to be
+        // under it.
+        .merge(
+            Router::new()
+                .route("/api/datasets/pictures/{name}", post(keep_pictures))
+                .route("/api/datasets/pictures/{name}", delete(drop_pictures))
+                .route("/api/datasets/pictures/{name}/{file}", put(stage_picture))
+                .layer(DefaultBodyLimit::max(datasets::MAX_PICTURE_BYTES + 1024)),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +68,10 @@ pub struct Whole {
     job: Job,
     metrics: Vec<jobs::Metric>,
     samples: Vec<jobs::Sample>,
+    /// A LoRA run's measurements and the pictures it drew; empty for
+    /// everything else.
+    measures: Vec<jobs::Measure>,
+    pictures: Vec<jobs::Drawn>,
 }
 
 async fn job(_: Identity, St(state): St<State>, Path(id): Path<i64>) -> Result<Json<Whole>, Fail> {
@@ -61,7 +79,13 @@ async fn job(_: Identity, St(state): St<State>, Path(id): Path<i64>) -> Result<J
     let found = blocking(move || {
         Ok(match jobs.get(id)? {
             None => None,
-            Some(job) => Some(Whole { metrics: jobs.metrics(id)?, samples: jobs.samples(id)?, job }),
+            Some(job) => Some(Whole {
+                metrics: jobs.metrics(id)?,
+                samples: jobs.samples(id)?,
+                measures: jobs.measures(id)?,
+                pictures: jobs.pictures(id)?,
+                job,
+            }),
         })
     })
     .await?;
@@ -140,6 +164,24 @@ async fn job_events(
     Ok(crate::models::stream(rx))
 }
 
+/// A picture a LoRA run drew, by the measurement it was drawn at and which
+/// prompt it is of.
+async fn job_sample(
+    _: Identity,
+    St(state): St<State>,
+    Path((id, step, prompt)): Path<(i64, i64, i64)>,
+) -> Result<Response, Fail> {
+    let jobs = state.jobs.clone();
+    let bytes = blocking(move || match jobs.picture_file(id, step, prompt)? {
+        Some(file) => Ok(std::fs::read(file).ok()),
+        None => Ok(None),
+    })
+    .await?
+    .ok_or_else(|| Fail::missing(format!("job {id} drew no such sample")))?;
+    // A sample is drawn once and never again, so it can be kept.
+    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, max-age=31536000, immutable")], bytes).into_response())
+}
+
 // ---------------------------------------------------------------------------
 // Starting a run
 // ---------------------------------------------------------------------------
@@ -155,6 +197,95 @@ pub struct Options {
     cores: usize,
     /// Whether a run is going, which is the one thing that stops another.
     training: bool,
+    /// What a LoRA run for an image model can be asked for.
+    lora: LoraOptions,
+}
+
+#[derive(serde::Serialize)]
+pub struct LoraOptions {
+    /// Why no LoRA can be trained on this server at all, if none can.
+    unavailable: Option<String>,
+    /// The models on this machine one can be trained for.
+    models: Vec<String>,
+    /// LoRAs trained here, which a run can go on from.
+    continuable: Vec<String>,
+    /// The sizes that have been measured, each with what a run at it is
+    /// charged, with samples and without.
+    sizes: Vec<LoraSize>,
+    /// Bytes of the budget nothing is charged: what a run has to fit in.
+    left: u64,
+    defaults: LoraDefaults,
+}
+
+#[derive(serde::Serialize)]
+pub struct LoraSize {
+    size: usize,
+    bytes: u64,
+    bytes_sampling: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct LoraDefaults {
+    size: usize,
+    rank: usize,
+    steps: usize,
+    lr: f64,
+    eval_every: usize,
+    sample_steps: usize,
+    seed: u64,
+}
+
+/// SDXL's pipeline, which is the one a LoRA is trained for so far.
+const TRAINABLE: &str = "StableDiffusionXLPipeline";
+
+/// The models on this machine a LoRA can be trained for: SDXL, or a
+/// fine-tune of it, as a repo in diffusers' layout. A checkpoint in one file
+/// and a GGUF are not: `kvad_gpu::image::tune` says why of each.
+fn trainable_models() -> Vec<String> {
+    let mut models: Vec<String> = kvad::hub::local_models()
+        .into_iter()
+        .filter(|m| m.complete && m.gguf.is_none() && m.single.is_none() && m.lora.is_none())
+        .filter(|m| kvad::hub::pipeline(m).as_deref() == Some(TRAINABLE))
+        .map(|m| m.id)
+        .collect();
+    // SDXL itself first, where it is here: it is what a run that names no
+    // model trains a LoRA for. A fine-tune is somebody's choice, and named.
+    if let Some(at) = models.iter().position(|m| m == BASE) {
+        models[..=at].rotate_right(1);
+    }
+    models
+}
+
+const BASE: &str = "stabilityai/stable-diffusion-xl-base-1.0";
+
+/// Where LoRAs trained here are kept, as `kvad-gpu tune --name` keeps them.
+fn loras_dir() -> std::path::PathBuf {
+    kvad::weights::data_dir().join("loras")
+}
+
+/// The LoRAs trained here, by name. A run's last step, kept beside its best
+/// as `NAME.last`, is one of them: going on from where a run stopped is
+/// what it is for.
+fn trained_loras() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(loras_dir())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|f| f.strip_suffix(".safetensors").map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Why this server trains no LoRA, if it does not.
+fn lora_unavailable() -> Option<String> {
+    if !cfg!(feature = "gpu") {
+        return Some("this kvad-serve was built without the GPU backend, and an image model is trained on the GPU".into());
+    }
+    if crate::videos::ffmpeg().is_none() {
+        return Some("the pictures are read by ffmpeg, and this server has none: install it, or name one under [videos] ffmpeg".into());
+    }
+    None
 }
 
 #[derive(serde::Serialize)]
@@ -175,10 +306,27 @@ pub struct Defaults {
 
 async fn options(_: Admin, St(state): St<State>) -> Result<Json<Options>, Fail> {
     let jobs = state.jobs.clone();
-    let (continuable, training) =
-        blocking(move || Ok((datasets::continuable_models(), jobs.training()))).await?;
+    let (continuable, training, models, loras) = blocking(move || {
+        Ok((datasets::continuable_models(), jobs.training(), trainable_models(), trained_loras()))
+    })
+    .await?;
     let d = nervus::text::Training::default();
+    let lora = LoraOptions {
+        unavailable: lora_unavailable(),
+        models,
+        continuable: loras,
+        sizes: [512, 768, 1024]
+            .into_iter()
+            .map(|size| LoraSize { size, bytes: crate::tune::need(size, false), bytes_sampling: crate::tune::need(size, true) })
+            .collect(),
+        left: state.engine.left(),
+        // `kvad-gpu tune`'s own, but for the size: 512² is a quarter of the
+        // time a step and two thirds of the memory, and the place to find
+        // out whether a set of pictures teaches anything.
+        defaults: LoraDefaults { size: 512, rank: 16, steps: 1000, lr: 1e-4, eval_every: 100, sample_steps: 20, seed: 1337 },
+    };
     Ok(Json(Options {
+        lora,
         sizes: kvad::train::SIZES.iter().map(|s| Size { name: s.name, shape: s.shape() }).collect(),
         continuable,
         defaults: Defaults {
@@ -219,11 +367,199 @@ pub struct StartRequest {
     seed: Option<u64>,
 }
 
+/// What a LoRA run is asked for; see [`LoraParams`] for what each means.
+#[derive(serde::Deserialize)]
+pub struct LoraRequest {
+    dataset: i64,
+    name: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    size: Option<usize>,
+    #[serde(default)]
+    rank: Option<usize>,
+    #[serde(default)]
+    alpha: Option<f64>,
+    #[serde(default)]
+    steps: Option<usize>,
+    #[serde(default)]
+    lr: Option<f64>,
+    #[serde(default)]
+    eval_every: Option<usize>,
+    #[serde(default)]
+    holdout: Option<usize>,
+    #[serde(default)]
+    samples: Vec<String>,
+    #[serde(default)]
+    sample_size: Option<usize>,
+    #[serde(default)]
+    sample_steps: Option<usize>,
+    #[serde(default)]
+    seed: Option<u64>,
+}
+
+/// Whether `size` is one a run or a sample may be: a multiple of 64 in
+/// what has been measured.
+fn check_size(what: &str, size: usize) -> Result<(), String> {
+    match size % 64 == 0 && crate::tune::SIZES.contains(&size) {
+        true => Ok(()),
+        false => Err(format!(
+            "{what} {size} is not a multiple of 64 from {} to {}: what a run larger than that takes has not been measured, and one that does not fit takes the machine down",
+            crate::tune::SIZES.start(),
+            crate::tune::SIZES.end()
+        )),
+    }
+}
+
+/// Work out what a LoRA request means, and refuse it for everything that
+/// can be known to be wrong before a model is loaded.
+fn plan_lora(db: &crate::db::Db, body: LoraRequest) -> Result<(crate::tune::Work, LoraParams), String> {
+    if let Some(why) = lora_unavailable() {
+        return Err(why);
+    }
+    let ffmpeg = crate::videos::ffmpeg().ok_or("no ffmpeg")?;
+    let name = body.name.trim().to_string();
+    if !kvad::weights::is_model_name(&name) || name.ends_with(".last") {
+        return Err(format!("`{name}` is not a name for a LoRA: one word, no `/`, and not ending in `.last`, which is what a run calls its last step"));
+    }
+    let models = trainable_models();
+    let model = match body.model {
+        Some(model) => model,
+        None => models.first().cloned().ok_or_else(|| format!("there is no model on this machine to train a LoRA for: pull {BASE}"))?,
+    };
+    if !models.contains(&model) {
+        return Err(format!(
+            "`{model}` is not a model on this machine that a LoRA can be trained for. That is SDXL, or a fine-tune of it, as a repo and not as one file or a GGUF{}",
+            match models.is_empty() {
+                true => "; none is here".to_string(),
+                false => format!(": {}", models.join(", ")),
+            }
+        ));
+    }
+    let from = match body.from.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        None => None,
+        Some(from) => {
+            let file = loras_dir().join(format!("{from}.safetensors"));
+            if !kvad::weights::is_model_name(from) || !file.is_file() {
+                return Err(format!("`{from}` is not a LoRA trained here"));
+            }
+            Some((from.to_string(), file))
+        }
+    };
+
+    let (dataset, data) = datasets::folder_for(db, body.dataset).map_err(|e| e.to_string())?;
+    let pictures = dataset.items.unwrap_or(0).max(0) as usize;
+    if body.holdout.is_some_and(|h| h >= pictures) {
+        return Err(format!("holding out {} leaves none of `{}`'s {pictures} pictures to train on", body.holdout.unwrap_or(0), dataset.name));
+    }
+
+    let size = body.size.unwrap_or(512);
+    check_size("a size of", size)?;
+    let samples: Vec<String> = body.samples.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if samples.len() > 4 {
+        return Err(format!("{} prompts to draw at every measurement is more than four, and each is up to a minute every time", samples.len()));
+    }
+    if let Some(sample_size) = body.sample_size {
+        check_size("a sample size of", sample_size)?;
+    }
+    let between = |what: &str, v: usize, most: usize| match (1..=most).contains(&v) {
+        true => Ok(v),
+        false => Err(format!("{what} is from 1 to {most}, and {v} was asked for")),
+    };
+    let rank = between("the rank", body.rank.unwrap_or(16), 128)?;
+    let steps = between("the number of steps", body.steps.unwrap_or(1000), 100_000)?;
+    let eval_every = between("the steps between measurements", body.eval_every.unwrap_or(100), 100_000)?;
+    let sample_steps = between("a sample's steps", body.sample_steps.unwrap_or(20), 100)?;
+    let lr = body.lr.unwrap_or(1e-4);
+    if !(lr.is_finite() && lr > 0.0 && lr <= 1.0) {
+        return Err(format!("a learning rate of {lr} is not one: more than 0, and 1e-4 unless there is a reason"));
+    }
+    if body.alpha.is_some_and(|a| !(a.is_finite() && a > 0.0)) {
+        return Err("alpha is more than 0, or left out to be the rank".into());
+    }
+
+    let charged = crate::tune::need(size, !samples.is_empty());
+    let params = LoraParams {
+        name: name.clone(),
+        from: from.as_ref().map(|f| f.0.clone()),
+        model: model.clone(),
+        dataset: dataset.id,
+        dataset_name: dataset.name,
+        size,
+        rank,
+        alpha: body.alpha,
+        steps,
+        lr,
+        eval_every,
+        holdout: body.holdout,
+        samples: samples.clone(),
+        sample_size: body.sample_size,
+        sample_steps,
+        seed: body.seed.unwrap_or(1337),
+        charged,
+    };
+    let work = crate::tune::Work {
+        repo: model,
+        data,
+        out: loras_dir().join(format!("{name}.safetensors")),
+        from: from.map(|f| f.1),
+        size,
+        rank,
+        alpha: body.alpha,
+        steps,
+        lr,
+        seed: params.seed,
+        eval_every,
+        holdout: body.holdout,
+        samples,
+        sample_size: body.sample_size,
+        sample_steps,
+        // `tune::start` names it, once the job has a number.
+        sample_dir: std::path::PathBuf::new(),
+        ffmpeg,
+        cap_gb: (charged + crate::tune::OVER) as f64 / 1e9,
+        data_dir: kvad::weights::chosen_data_dir(),
+    };
+    Ok((work, params))
+}
+
+/// Start a LoRA run: plan it, charge it, and hand it to a worker.
+async fn start_lora(who: Admin, state: State, body: LoraRequest) -> Result<Json<Job>, Fail> {
+    let db = state.db.clone();
+    let jobs = state.jobs.clone();
+    let (work, params) = blocking(move || {
+        // Before anything is charged: a second run is refused for being a
+        // second run, not for the memory the first is holding.
+        if jobs.training() {
+            return Err("a training run is already going; wait for it or stop it".into());
+        }
+        Ok(plan_lora(&db, body)?)
+    })
+    .await
+    .map_err(|e| Fail::bad(e.1))?;
+
+    let what = format!("training the LoRA {} at {}×{}", params.name, params.size, params.size);
+    let hold = state.engine.reserve(what, params.charged).await.map_err(Fail::conflict)?;
+    let jobs = state.jobs.clone();
+    let owner = who.0.id;
+    blocking(move || crate::tune::start(&jobs, hold, work, params, owner)).await.map(Json).map_err(|e| Fail::bad(e.1))
+}
+
+/// Start a run. `loop` says which: `text`, or left out, for a language model
+/// trained from scratch on a text, and `lora` for a LoRA on an image model.
 async fn start(
     who: Admin,
     St(state): St<State>,
-    Json(body): Json<StartRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<Job>, Fail> {
+    let read = |e: serde_json::Error| Fail::bad(format!("that is not a run this can start: {e}"));
+    let body: StartRequest = match body.get("loop").and_then(|l| l.as_str()) {
+        None | Some("text") => serde_json::from_value(body).map_err(read)?,
+        Some("lora") => return start_lora(who, state, serde_json::from_value(body).map_err(read)?).await,
+        Some(other) => return Err(Fail::bad(format!("`{other}` is not a training loop this server has: there are text and lora"))),
+    };
     let db = state.db.clone();
     let jobs = state.jobs.clone();
     let owner = who.0.id;
@@ -373,6 +709,83 @@ async fn start_crawl(
     .map_err(|e| Fail::bad(e.1))
 }
 
+/// One file of a set of pictures being uploaded: a picture, or the `.txt`
+/// that captions one.
+///
+/// The body is the file, as an uploaded text's is. Nothing is a dataset
+/// until [`keep_pictures`] is asked, which looks at all of them together.
+async fn stage_picture(
+    _: Admin,
+    Path((name, file)): Path<(String, String)>,
+    bytes: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, Fail> {
+    blocking(move || {
+        datasets::stage(name.trim(), &file, &bytes)?;
+        Ok(json!({ "staged": file, "bytes": bytes.len() }))
+    })
+    .await
+    .map(Json)
+    .map_err(|e| Fail::bad(e.1))
+}
+
+#[derive(serde::Deserialize)]
+pub struct Keeping {
+    /// The caption of every picture that has none beside it.
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+/// Make a dataset of the pictures uploaded under this name, if every one of
+/// them decodes and has a caption; and if not, say everything that is wrong
+/// with the lot and keep none of it.
+async fn keep_pictures(
+    who: Admin,
+    St(state): St<State>,
+    Path(name): Path<String>,
+    Query(q): Query<Keeping>,
+) -> Result<Json<Dataset>, Fail> {
+    let db = state.db.clone();
+    let owner = who.0.id;
+    blocking(move || {
+        let ffmpeg = crate::videos::ffmpeg().ok_or("the pictures are read by ffmpeg, to see that each is one, and this server has none: install it, or name one under [videos] ffmpeg")?;
+        // What the trainer will read each with, so that what passes here is
+        // what it can read.
+        // Not ffmpeg's own account of why: it is a dozen lines a picture,
+        // and what there is to do about it is the same whatever they say.
+        let decodes = |path: &std::path::Path| kvad::video::picture_from_file(&ffmpeg, path, 0).map(|_| ()).map_err(|_| "ffmpeg could not decode it".to_string());
+        datasets::keep(&db, name.trim(), q.caption.as_deref(), owner, &decodes)
+    })
+    .await
+    .map(Json)
+    .map_err(|e| Fail::bad(e.1))
+}
+
+/// Throw away an upload that was not kept.
+async fn drop_pictures(_: Admin, Path(name): Path<String>) -> Result<Json<serde_json::Value>, Fail> {
+    blocking(move || {
+        datasets::unstage(name.trim())?;
+        Ok(json!({ "dropped": name }))
+    })
+    .await
+    .map(Json)
+    .map_err(|e| Fail::bad(e.1))
+}
+
+/// The pictures of a set, each with its caption.
+async fn pictures(_: Admin, St(state): St<State>, Path(id): Path<i64>) -> Result<Json<serde_json::Value>, Fail> {
+    let db = state.db.clone();
+    let (dataset, pictures) = blocking(move || datasets::pictures(&db, id)).await.map_err(|e| Fail::missing(e.1))?;
+    Ok(Json(json!({ "dataset": dataset, "pictures": pictures })))
+}
+
+/// One picture of a set, as it was uploaded.
+async fn picture(_: Admin, St(state): St<State>, Path((id, file)): Path<(i64, String)>) -> Result<Response, Fail> {
+    let db = state.db.clone();
+    let kind = mime_guess::from_path(&file).first_or_octet_stream().to_string();
+    let bytes = blocking(move || Ok(std::fs::read(datasets::picture_file(&db, id, &file)?)?)).await.map_err(|e| Fail::missing(e.1))?;
+    Ok(([(header::CONTENT_TYPE, kind)], bytes).into_response())
+}
+
 #[derive(serde::Serialize)]
 pub struct WithText {
     #[serde(flatten)]
@@ -387,8 +800,14 @@ async fn dataset(
     Path(id): Path<i64>,
 ) -> Result<Json<WithText>, Fail> {
     let db = state.db.clone();
-    let (dataset, text) =
-        blocking(move || datasets::read(&db, id)).await.map_err(|e| Fail::missing(e.1))?;
+    let (dataset, text) = blocking(move || match datasets::get(&db, id)? {
+        // A set of pictures has no text to show the start of; its pictures
+        // and their captions are `/api/datasets/{id}/pictures`.
+        Some(d) if d.kind == datasets::Kind::Pictures => Ok((d, String::new())),
+        _ => datasets::read(&db, id),
+    })
+    .await
+    .map_err(|e| Fail::missing(e.1))?;
     Ok(Json(WithText { preview: text.chars().take(2000).collect(), dataset }))
 }
 

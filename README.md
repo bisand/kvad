@@ -129,6 +129,10 @@ The sky appears blue because of the way our eyes detect light. [...]
 
 ## Documentation
 
+[kvad.eu](https://kvad.eu) has the guide: installing, the command line, the
+web UI, the API, images, video and LoRAs, with a search over all of it. It is
+built from [`site/`](site).
+
 The long form lives in [`docs/`](docs), one file per crate, meant to be read
 in order:
 

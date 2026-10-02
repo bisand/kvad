@@ -702,6 +702,14 @@ pub(crate) fn noise(seed: u64, shape: &[usize], device: &Device, dtype: DType) -
     Ok(Tensor::from_vec(out, shape, &Device::Cpu)?.to_dtype(dtype)?.to_device(device)?)
 }
 
+/// A tensor of numbers drawn evenly from `[−bound, bound)`, in f32, from a
+/// seed, the same on every device as [`noise`] is.
+pub(crate) fn uniform(seed: u64, shape: &[usize], bound: f64, device: &Device) -> Res<Tensor> {
+    let mut rng = SplitMix(seed);
+    let out: Vec<f32> = (0..shape.iter().product()).map(|_| ((2.0 * rng.unit() - 1.0) * bound) as f32).collect();
+    Ok(Tensor::from_vec(out, shape, &Device::Cpu)?.to_device(device)?)
+}
+
 /// The block of [`noise`]'s field of `shape` that starts at `at` and is
 /// `size` long on each axis, row-major, in f32 on the host: the numbers
 /// `noise(seed, shape, …)` has there, without drawing the rest.
@@ -761,7 +769,7 @@ pub(crate) fn noise_block(seed: u64, shape: &[usize], at: &[usize], size: &[usiz
 
 /// SplitMix64: a 64-bit counter pushed through a mixing function. Tiny,
 /// fast, and good enough that nothing about an image depends on its flaws.
-struct SplitMix(u64);
+pub(crate) struct SplitMix(pub(crate) u64);
 
 impl SplitMix {
     const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -772,13 +780,13 @@ impl SplitMix {
         z ^ (z >> 31)
     }
 
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(Self::GAMMA);
         Self::mix(self.0)
     }
 
     /// Uniform in `[0, 1)`, from the top 53 bits.
-    fn unit(&mut self) -> f64 {
+    pub(crate) fn unit(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1u64 << 53) as f64
     }
 }

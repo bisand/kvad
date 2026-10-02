@@ -143,7 +143,8 @@ in order:
 | [Where to go next](docs/roadmap.md) | The roadmap, one track per job, and what to read alongside. |
 
 Design notes for individual features — GGUF, images, video, LoRA, the cluster,
-the UI — sit next to them in [`docs/`](docs) as `*-plan.md`, and
+the UI — sit next to them in [`docs/`](docs) as `*-plan.md`,
+[tune.md](docs/tune.md) covers training a LoRA for an image model, and
 [releasing.md](docs/releasing.md) covers cutting a release.
 
 ## Licence

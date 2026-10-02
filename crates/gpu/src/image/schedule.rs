@@ -73,44 +73,26 @@ impl Schedule {
 /// SD 1.5's PNDM config says neither `prediction_type` nor
 /// `timestep_spacing`, which for PNDM are `epsilon` and `leading`.
 pub(crate) fn euler(config: &Value, steps: usize) -> Res<Schedule> {
-    let f = |k: &str| config.get(k).and_then(Value::as_f64).ok_or_else(|| format!("scheduler config has no `{k}`"));
-    let class = config.get("_class_name").and_then(Value::as_str).unwrap_or("");
-    let default = |k: &str| match (k, class) {
-        ("prediction_type", _) => "epsilon",
-        ("beta_schedule", _) => "linear",
-        // diffusers' default spacing is the class's own.
-        ("timestep_spacing", "PNDMScheduler" | "DDIMScheduler" | "DDPMScheduler") => "leading",
-        ("timestep_spacing", _) => "linspace",
-        _ => "",
-    };
-    let s = |k: &str| config.get(k).and_then(Value::as_str).unwrap_or_else(|| default(k));
-    let expect = |k: &str, want: &str| -> Res<()> {
-        match s(k) == want {
-            true => Ok(()),
-            false => Err(format!("scheduler `{k}` is {:?}; only {want:?} is implemented", s(k)).into()),
-        }
-    };
-    expect("beta_schedule", "scaled_linear")?;
-    expect("prediction_type", "epsilon")?;
-    expect("timestep_spacing", "leading")?;
+    // The noise levels first: they refuse a prediction or a β schedule that
+    // is not SDXL's.
+    let noising = Noising::ddpm(config)?;
+    // diffusers' default spacing is the class's own.
+    let spacing = config.get("timestep_spacing").and_then(Value::as_str).unwrap_or(match config.get("_class_name").and_then(Value::as_str) {
+        Some("PNDMScheduler" | "DDIMScheduler" | "DDPMScheduler") => "leading",
+        _ => "linspace",
+    });
+    if spacing != "leading" {
+        return Err(format!("scheduler `timestep_spacing` is {spacing:?}; only \"leading\" is implemented").into());
+    }
     if config.get("use_karras_sigmas").and_then(Value::as_bool) == Some(true) {
         return Err("Karras sigmas are not implemented".into());
     }
     let train = config.get("num_train_timesteps").and_then(Value::as_u64).unwrap_or(1000) as usize;
     let offset = config.get("steps_offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let (b0, b1) = (f("beta_start")?.sqrt(), f("beta_end")?.sqrt());
 
-    // σ for every training timestep: `scaled_linear` spaces the *square
-    // roots* of β evenly, and σ is the noise-to-signal ratio after that
+    // σ for every training timestep: the noise-to-signal ratio after that
     // much cumulative noising.
-    let mut alpha_bar = 1.0;
-    let table: Vec<f64> = (0..train)
-        .map(|i| {
-            let beta = (b0 + (b1 - b0) * i as f64 / (train - 1) as f64).powi(2);
-            alpha_bar *= 1.0 - beta;
-            ((1.0 - alpha_bar) / alpha_bar).sqrt()
-        })
-        .collect();
+    let table: Vec<f64> = noising.kept.iter().map(|&kept| ((1.0 - kept) / kept).sqrt()).collect();
 
     // `leading`: every ⌊1000/n⌋-th timestep counted up from 0, moved up by
     // the offset, then run from the top.
@@ -128,6 +110,66 @@ pub(crate) fn euler(config: &Value, steps: usize) -> Res<Schedule> {
         init_scale: (top * top + 1.0).sqrt(),
         kind: Kind::Epsilon,
     })
+}
+
+/// What training does to a clean latent before the denoiser sees it: the
+/// other direction along the road [`euler`] comes down.
+///
+/// A noise-prediction model (SDXL) was trained on a thousand noise levels.
+/// Level `t` keeps a share `ᾱ_t` of the clean latent's variance and makes
+/// up the rest with noise:
+///
+/// ```text
+/// x_t = √ᾱ_t · x₀ + √(1 − ᾱ_t) · ε
+/// ```
+///
+/// and the model, shown `x_t` and told `t`, is asked for `ε`. Each level
+/// multiplies what the one before kept by `1 − β_t`, and `scaled_linear`
+/// spaces the *square roots* of β evenly from `beta_start` to `beta_end`.
+/// At `t = 0` nearly all of the latent is kept, 0.99915; at 999, 0.0047.
+///
+/// It is the same picture [`euler`] draws from: there the latent is
+/// `x₀ + σ·ε` and the model is shown it divided by `√(σ² + 1)`, and with
+/// `σ² = (1 − ᾱ)/ᾱ` that is this line exactly. So a LoRA trained on these
+/// inputs is trained on what drawing shows the model.
+pub(crate) struct Noising {
+    /// `ᾱ_t` for each training timestep.
+    kept: Vec<f64>,
+}
+
+impl Noising {
+    /// From a scheduler config, as [`euler`] reads it: only what SDXL
+    /// ships, and anything else refused by name.
+    pub(crate) fn ddpm(config: &Value) -> Res<Self> {
+        let f = |k: &str| config.get(k).and_then(Value::as_f64).ok_or_else(|| format!("scheduler config has no `{k}`"));
+        for (k, default, want) in [("beta_schedule", "linear", "scaled_linear"), ("prediction_type", "epsilon", "epsilon")] {
+            let is = config.get(k).and_then(Value::as_str).unwrap_or(default);
+            if is != want {
+                return Err(format!("scheduler `{k}` is {is:?}; only {want:?} is implemented").into());
+            }
+        }
+        let train = config.get("num_train_timesteps").and_then(Value::as_u64).unwrap_or(1000) as usize;
+        let (b0, b1) = (f("beta_start")?.sqrt(), f("beta_end")?.sqrt());
+        let mut alpha_bar = 1.0;
+        let kept = (0..train)
+            .map(|i| {
+                let beta = (b0 + (b1 - b0) * i as f64 / (train - 1) as f64).powi(2);
+                alpha_bar *= 1.0 - beta;
+                alpha_bar
+            })
+            .collect();
+        Ok(Noising { kept })
+    }
+
+    /// How many noise levels there are: a timestep is one of `0..levels`.
+    pub(crate) fn levels(&self) -> usize {
+        self.kept.len()
+    }
+
+    /// What level `t` multiplies the clean latent by, and the noise.
+    pub(crate) fn mix(&self, t: usize) -> (f64, f64) {
+        (self.kept[t].sqrt(), (1.0 - self.kept[t]).sqrt())
+    }
 }
 
 /// `FlowMatchEulerDiscreteScheduler` with resolution-dependent shifting, as
@@ -201,6 +243,22 @@ mod tests {
         assert!((s.sigmas[0] - 11.476_85).abs() < 1e-4, "{}", s.sigmas[0]);
         assert!((s.init_scale - (s.sigmas[0].powi(2) + 1.0).sqrt()).abs() < 1e-12);
         assert!(s.sigmas.windows(2).all(|w| w[0] > w[1]), "σ must fall every step");
+    }
+
+    /// Training's noised latent is what drawing shows the model: at every
+    /// step of a run, `x₀ + σ·ε` scaled as [`Schedule::input_scale`] scales
+    /// it is `√ᾱ·x₀ + √(1 − ᾱ)·ε`.
+    #[test]
+    fn training_noises_a_latent_as_drawing_shows_it() {
+        let (noising, s) = (Noising::ddpm(&sdxl()).unwrap(), euler(&sdxl(), 30).unwrap());
+        assert_eq!(noising.levels(), 1000);
+        for i in 0..s.steps() {
+            let (signal, noise) = noising.mix(s.timesteps[i] as usize);
+            assert!((signal - s.input_scale(i)).abs() < 1e-12 && (noise - s.sigmas[i] * s.input_scale(i)).abs() < 1e-12);
+            assert!((signal * signal + noise * noise - 1.0).abs() < 1e-12, "the variance is kept");
+        }
+        let (first, last) = (noising.mix(0).0.powi(2), noising.mix(999).0.powi(2));
+        assert!((first - 0.99915).abs() < 1e-5 && (last - 0.00466).abs() < 1e-5, "{first} {last}");
     }
 
     #[test]

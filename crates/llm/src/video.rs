@@ -813,6 +813,18 @@ fn pcm16(s: f32) -> i16 {
 // A picture to start from
 // ---------------------------------------------------------------------------
 
+/// The first `ffmpeg` in the directories of `path`, or in the places a
+/// package manager puts one. The last matters: a launchd service runs with
+/// `/usr/bin:/bin:/usr/sbin:/sbin` for its `PATH`, and Homebrew's `ffmpeg`
+/// is in none of them.
+pub fn ffmpeg_on(path: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    path.iter()
+        .cloned()
+        .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(std::path::PathBuf::from))
+        .map(|d| d.join("ffmpeg"))
+        .find(|f| f.is_file())
+}
+
 /// The CRF LTX-2.5's reference re-compresses a picture at before it is
 /// encoded: its `detect_params` gives 18 to a checkpoint of 2.4 or later,
 /// and 33 before that.

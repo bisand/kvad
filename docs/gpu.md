@@ -461,6 +461,15 @@ kvad images make "a tiny astronaut hatching from an egg on the moon" --model Qwe
     --steps 8 --lora lightx2v/Qwen-Image-Lightning:Qwen-Image-Lightning-8steps-V2.0-bf16.safetensors
 ```
 
+A LoRA for SDXL can be trained here too, on a folder of pictures with a
+caption beside each ([docs/tune.md](tune.md)): 1.9 s a step in 7 GB at 512²,
+7.3 s in 14 GB at 1024², keeping the step with the lowest loss on pictures
+it did not train on.
+
+```bash
+kvad-gpu tune --data ./my-photos --name my-style
+```
+
 Two things in it are measurements rather than code:
 
 - **The previews.** Each step can carry a picture of where it is heading,

@@ -26,7 +26,7 @@ export function slug(text) {
     .replace(/\s/g, "-");
 }
 
-function rewrite(url, source) {
+export function rewrite(url, source) {
   if (!source || /^([a-z]+:|\/|#)/i.test(url)) return url;
   const [path, frag] = url.split("#");
   const tail = frag ? `#${frag}` : "";

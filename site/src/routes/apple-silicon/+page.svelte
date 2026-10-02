@@ -1,7 +1,8 @@
 <script>
-  import { REPO, SITE } from "#lib/site.js";
+  import { REPO } from "#lib/site.js";
   import { reveal } from "#lib/reveal.js";
   import Install from "#lib/components/Install.svelte";
+  import Meta from "#lib/components/Meta.svelte";
   import Terminal from "#lib/components/Terminal.svelte";
   import { BENCH } from "#lib/captures/cli.js";
 
@@ -17,14 +18,11 @@
   ];
 </script>
 
-<svelte:head>
-  <title>Kvad on Apple silicon · kernels for the M5's GPU</title>
-  <meta
-    name="description"
-    content="What Kvad does with an M5: Metal kernels for the GPU's matrix units, what they are worth for prefill, images and video, what they are not worth for decode, and how much model fits in unified memory."
-  />
-  <link rel="canonical" href="{SITE}/apple-silicon/" />
-</svelte:head>
+<Meta
+  title="Kvad on Apple silicon · kernels for the M5's GPU"
+  description="What Kvad does with an M5: Metal kernels for the GPU's matrix units, what they are worth for prefill, images and video, what they are not worth for decode, and how much model fits in unified memory."
+  path="/apple-silicon/"
+/>
 
 <section class="wrap hero">
   <p class="label">Apple silicon</p>

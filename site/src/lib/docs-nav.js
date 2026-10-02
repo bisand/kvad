@@ -1,7 +1,9 @@
 // The documentation's table of contents, in reading order.
 //
 // A guide page is `content/docs/<slug>.md`. An internals page is one of the
-// repository's own `docs/*.md`, rendered as it is: `source` names the file.
+// repository's own `docs/*.md`, rendered as it is: `source` names the file,
+// and `summary` describes it to a search engine, since the file has no
+// description of its own.
 // The sidebar, the previous/next links and the search index are all this list.
 
 export const NAV = [
@@ -50,13 +52,27 @@ export const NAV = [
     title: "How it works",
     pages: [
       { slug: "internals", title: "Reading the engine" },
-      { slug: "internals/nervus", title: "1. nervus", source: "nervus.md" },
-      { slug: "internals/engine", title: "2. kvad", source: "engine.md" },
-      { slug: "internals/gpu", title: "3. kvad-gpu", source: "gpu.md" },
-      { slug: "internals/tui", title: "4. kvad-tui", source: "tui.md" },
-      { slug: "internals/serve", title: "5. kvad-serve", source: "serve.md" },
-      { slug: "internals/tune", title: "Training a LoRA", source: "tune.md" },
-      { slug: "internals/roadmap", title: "Roadmap", source: "roadmap.md" },
+      { slug: "internals/nervus", title: "1. nervus", source: "nervus.md",
+        summary: "A neural network and backpropagation from scratch in Rust with no dependencies, then a GPT trained on a text file: gradient checks, checkpoints, and where the time went.",
+      },
+      { slug: "internals/engine", title: "2. kvad", source: "engine.md",
+        summary: "Transformer inference written by hand: six architectures as plugins, block-wise quantisation, the integer and float kernels, batched prefill and the KV cache.",
+      },
+      { slug: "internals/gpu", title: "3. kvad-gpu", source: "gpu.md",
+        summary: "The same forward passes on Metal: numbers against the CPU, quantised weights on the GPU, and the image models, written out rather than imported.",
+      },
+      { slug: "internals/tui", title: "4. kvad-tui", source: "tui.md",
+        summary: "The terminal app: three threads, a KV cache kept across chat turns, and six backends on one key.",
+      },
+      { slug: "internals/serve", title: "5. kvad-serve", source: "serve.md",
+        summary: "The HTTP server and web UI: reasoning output, tool calls, model residency, the default backend, and benchmarks that refuse to mislead.",
+      },
+      { slug: "internals/tune", title: "Training a LoRA", source: "tune.md",
+        summary: "How Kvad trains an SDXL LoRA on a folder of pictures: what a step does, why validation loss picks the step that is kept, and what a run costs.",
+      },
+      { slug: "internals/roadmap", title: "Roadmap", source: "roadmap.md",
+        summary: "What has to be built before Kvad is a serving engine, in dependency order: a paged KV cache, continuous batching, then the hardware.",
+      },
     ],
   },
 ];

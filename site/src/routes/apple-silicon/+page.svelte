@@ -59,7 +59,8 @@
         <tr><th>Per matrix product</th><th>Against the stock kernel</th></tr>
       </thead>
       <tbody>
-        <tr><td>Dense, 96 rows or more</td><td>3.0–3.9×</td></tr>
+        <tr><td>Dense, 512 rows or more</td><td>3.0–3.9×</td></tr>
+        <tr><td>Dense, 16 to 128 rows</td><td>2.3–3.9×</td></tr>
         <tr><td>Dense, 8 rows</td><td>1.2–1.6×</td></tr>
         <tr><td>Quantised, 8-bit</td><td>2.3–2.7×</td></tr>
         <tr><td>GGUF k-quants (Q4_K, Q5_K, Q6_K)</td><td>75–90% of the 8-bit rate</td></tr>
@@ -90,7 +91,7 @@
         <tbody>
           <tr><td>Prefill, Qwen2.5-1.5B at bf16, 2,079 tokens</td><td>0.99 s</td><td>0.39 s</td><td>2.5×</td></tr>
           <tr><td>FLUX.1-schnell at q8, a step at 1024²</td><td>12.9–13.7 s</td><td>8.7–9.2 s</td><td>1.5×</td></tr>
-          <tr><td>SDXL at f16, a step at 1024²</td><td>3.94 s</td><td>3.12 s</td><td>1.26×</td></tr>
+          <tr><td>SDXL at f16, a step at 1024²</td><td>3.90–3.98 s</td><td>3.09–3.15 s</td><td>1.26×</td></tr>
           <tr><td>Qwen-Image with a LoRA applied, a step</td><td colspan="2">4.5% slower than without one</td><td></td></tr>
         </tbody>
       </table>
@@ -113,8 +114,9 @@
     <p>
       What helps decode is fewer bytes per weight and fewer trips to the GPU. Quantising to 4 bits
       does the first. Fusing a layer's small operations into three Metal kernels does the second,
-      and took a 1.5 B model's layer from 25 kernel launches to 10: 115 to 127.5 tokens a second at
-      q8.
+      and took a 1.5 B model's layer from 25 kernel launches to 10. At q8 that is 114–117 to
+      126–129 tokens a second early in a conversation, and 102–108 to 110–115 with 2,048 tokens of
+      context.
     </p>
     <p>
       The benchmark on the right is from the day this page was written. The GPU at q4 decodes 4.4

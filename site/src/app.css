@@ -1,0 +1,459 @@
+/* kvad.eu
+ *
+ * The colours are the icon's (docs/brand): ink, gold and parchment. Dark is
+ * ink with parchment text, light is paper with ink text, and gold is the one
+ * accent in both. There is no second accent and no gradient.
+ *
+ * Type is Newsreader for headings, IBM Plex Sans for reading and IBM Plex
+ * Mono for anything a terminal would print. All three are served from here.
+ */
+
+@import "@fontsource-variable/newsreader/opsz.css";
+@import "@fontsource-variable/newsreader/opsz-italic.css";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/400-italic.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+:root {
+  --bg: #12151f;
+  --surface: #1b1f2e;
+  --raised: #232838;
+  --line: rgb(239 227 200 / 0.13);
+  --line-strong: rgb(239 227 200 / 0.26);
+  --text: #ebe5d6;
+  --muted: #a8a294;
+  --faint: #77736a;
+  --accent: #f0b35a;
+  --accent-soft: rgb(240 179 90 / 0.14);
+  --on-accent: #1b1f2e;
+  --ok: #8fc79a;
+  --shadow: 0 30px 60px -30px rgb(0 0 0 / 0.7);
+
+  --serif: "Newsreader Variable", "Iowan Old Style", Georgia, serif;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --page: 1136px;
+  --gutter: clamp(20px, 4vw, 40px);
+  --header: 60px;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  color-scheme: dark;
+}
+
+/* The same block twice, because CSS has no way to say "either of these". */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f1e6;
+    --surface: #fdfaf3;
+    --raised: #efe8d8;
+    --line: rgb(27 31 46 / 0.13);
+    --line-strong: rgb(27 31 46 / 0.3);
+    --text: #1b1f2e;
+    --muted: #595750;
+    --faint: #8a857a;
+    --accent: #9c5c0b;
+    --accent-soft: rgb(224 154 53 / 0.18);
+    --on-accent: #fdfaf3;
+    --ok: #2f7a45;
+    --shadow: 0 30px 60px -34px rgb(27 31 46 / 0.35);
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f6f1e6;
+  --surface: #fdfaf3;
+  --raised: #efe8d8;
+  --line: rgb(27 31 46 / 0.13);
+  --line-strong: rgb(27 31 46 / 0.3);
+  --text: #1b1f2e;
+  --muted: #595750;
+  --faint: #8a857a;
+  --accent: #9c5c0b;
+  --accent-soft: rgb(224 154 53 / 0.18);
+  --on-accent: #fdfaf3;
+  --ok: #2f7a45;
+  --shadow: 0 30px 60px -34px rgb(27 31 46 / 0.35);
+  color-scheme: light;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-padding-top: calc(var(--header) + 20px);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 400 17px/1.6 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--serif);
+  font-weight: 500;
+  line-height: 1.12;
+  letter-spacing: -0.012em;
+  margin: 0;
+  text-wrap: balance;
+}
+
+p {
+  margin: 0;
+  text-wrap: pretty;
+}
+
+a {
+  color: inherit;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 3px;
+  transition:
+    color 0.15s,
+    text-decoration-color 0.15s;
+}
+a:hover {
+  text-decoration-color: currentColor;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--mono);
+  font-size: 0.88em;
+}
+
+img,
+svg,
+video {
+  max-width: 100%;
+  display: block;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.wrap {
+  width: 100%;
+  max-width: calc(var(--page) + 2 * var(--gutter));
+  margin-inline: auto;
+  padding-inline: var(--gutter);
+}
+
+/* A small label above a heading. Mono, because it names a thing. */
+.label {
+  font: 500 12px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  height: 44px;
+  padding: 0 18px;
+  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  font-weight: 500;
+  font-size: 15px;
+  text-decoration: none;
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    transform 0.15s var(--ease);
+}
+.btn:hover {
+  border-color: var(--text);
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.btn.primary:hover {
+  filter: brightness(1.07);
+}
+
+/* Shown to whichever theme is in force; Shot.svelte carries one of each. */
+.only-light {
+  display: none;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .only-light {
+    display: block;
+  }
+  :root:not([data-theme="dark"]) .only-dark {
+    display: none;
+  }
+}
+:root[data-theme="light"] .only-light {
+  display: block;
+}
+:root[data-theme="light"] .only-dark {
+  display: none;
+}
+
+/* Sections rise a few pixels into place the first time they are scrolled to.
+ * lib/reveal.js adds the class; without JavaScript nothing is ever hidden. */
+.reveal {
+  opacity: 0;
+  transform: translateY(14px);
+  transition:
+    opacity 0.6s var(--ease),
+    transform 0.6s var(--ease);
+}
+.reveal.seen {
+  opacity: 1;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .reveal {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---- Rendered Markdown: the documentation, and nothing else. ---- */
+
+.prose {
+  font-size: 16.5px;
+  line-height: 1.7;
+  overflow-wrap: break-word;
+}
+.prose > :first-child {
+  margin-top: 0;
+}
+.prose p,
+.prose ul,
+.prose ol,
+.prose blockquote,
+.prose .code,
+.prose .table,
+.prose img {
+  margin: 1.1em 0;
+}
+.prose h2 {
+  font-size: 1.75rem;
+  margin: 2.4em 0 0.6em;
+  padding-top: 1.2em;
+  border-top: 1px solid var(--line);
+}
+.prose h3 {
+  font-size: 1.3rem;
+  margin: 2em 0 0.5em;
+}
+.prose h4 {
+  font: 600 1rem/1.4 var(--sans);
+  letter-spacing: 0;
+  margin: 1.6em 0 0.4em;
+}
+.prose h2,
+.prose h3,
+.prose h4 {
+  position: relative;
+}
+.prose .anchor {
+  position: absolute;
+  left: -1.1em;
+  width: 1.1em;
+  color: var(--faint);
+  text-decoration: none;
+  opacity: 0;
+  font-family: var(--sans);
+  font-weight: 400;
+  transition: opacity 0.15s;
+}
+.prose :is(h2, h3, h4):hover .anchor,
+.prose .anchor:focus-visible {
+  opacity: 1;
+}
+.prose a:not(.anchor) {
+  color: var(--accent);
+  text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.prose a:not(.anchor):hover {
+  text-decoration-color: currentColor;
+}
+.prose strong {
+  font-weight: 600;
+}
+.prose ul,
+.prose ol {
+  padding-left: 1.4em;
+}
+.prose li {
+  margin: 0.35em 0;
+}
+.prose li::marker {
+  color: var(--faint);
+}
+.prose blockquote {
+  margin-inline: 0;
+  padding: 0.1em 0 0.1em 1.1em;
+  border-left: 2px solid var(--accent);
+  color: var(--muted);
+}
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 2.5em 0;
+}
+.prose :not(pre) > code {
+  padding: 0.12em 0.36em;
+  border-radius: 4px;
+  background: var(--raised);
+  white-space: nowrap;
+}
+.prose a > code {
+  color: inherit;
+}
+.prose img {
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}
+
+.prose .table {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.prose table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.93em;
+  line-height: 1.5;
+}
+.prose th,
+.prose td {
+  text-align: left;
+  padding: 0.6em 0.9em;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.prose th {
+  font-weight: 600;
+  background: var(--surface);
+  white-space: nowrap;
+}
+.prose tr:last-child td {
+  border-bottom: 0;
+}
+.prose td :not(pre) > code {
+  white-space: normal;
+}
+
+.code {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.code pre {
+  margin: 0;
+  padding: 0.95em 1.1em;
+  overflow-x: auto;
+  line-height: 1.6;
+  font-size: 13.5px;
+}
+.code pre code {
+  font-size: inherit;
+}
+.code .copy {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  height: 28px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--raised);
+  font: 500 11.5px/1 var(--mono);
+  color: var(--muted);
+  opacity: 0;
+  transition:
+    opacity 0.15s,
+    color 0.15s;
+}
+.code:hover .copy,
+.code .copy:focus-visible {
+  opacity: 1;
+}
+.code .copy:hover {
+  color: var(--text);
+}
+@media (hover: none) {
+  .code .copy {
+    opacity: 1;
+  }
+}
+
+/* highlight.js, in the page's own four colours. */
+.hljs-comment,
+.hljs-quote {
+  color: var(--faint);
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-section {
+  color: var(--accent);
+}
+.hljs-string,
+.hljs-attr,
+.hljs-addition {
+  color: var(--ok);
+}
+.hljs-number,
+.hljs-literal,
+.hljs-variable,
+.hljs-title {
+  color: color-mix(in srgb, var(--accent) 55%, var(--text));
+}
+.hljs-meta {
+  color: var(--muted);
+}

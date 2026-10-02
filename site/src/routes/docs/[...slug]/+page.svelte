@@ -1,8 +1,33 @@
 <script>
   import { codeCopy } from "#lib/copy.js";
   import { href } from "#lib/docs-nav.js";
+  import { SITE } from "#lib/site.js";
+  import Meta from "#lib/components/Meta.svelte";
 
   let { data } = $props();
+
+  // For search engines: where the page sits, and what it is.
+  const structured = $derived([
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Documentation", item: `${SITE}/docs/` },
+        { "@type": "ListItem", position: 2, name: data.group },
+        { "@type": "ListItem", position: 3, name: data.title, item: SITE + href(data.slug) },
+      ],
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "TechArticle",
+      headline: data.title,
+      description: data.description || data.summary || undefined,
+      url: SITE + href(data.slug),
+      dateModified: data.changed || undefined,
+      author: { "@type": "Person", name: "André Biseth" },
+      isPartOf: { "@type": "WebSite", name: "Kvad", url: SITE },
+    },
+  ]);
 
   // Which heading the reader is under, for the list on the right.
   let here = $state("");
@@ -26,10 +51,14 @@
   });
 </script>
 
-<svelte:head>
-  <title>{data.title} · Kvad documentation</title>
-  {#if data.description}<meta name="description" content={data.description} />{/if}
-</svelte:head>
+<Meta
+  title="{data.title} · Kvad documentation"
+  description={data.description || data.summary}
+  path={href(data.slug)}
+  type="article"
+  markdown={data.markdown}
+  data={structured}
+/>
 
 <article>
   <header>
@@ -51,7 +80,10 @@
         <a class="next" href={href(data.next.slug)}><span>Next</span>{data.next.title}</a>
       {/if}
     </div>
-    <a class="edit" href={data.edit} rel="noopener">Edit this page on GitHub</a>
+    <p class="edit">
+      <a href={data.edit} rel="noopener">Edit this page on GitHub</a>
+      <a href={data.markdown}>This page as Markdown</a>
+    </p>
   </footer>
 </article>
 
@@ -122,9 +154,11 @@
     text-align: right;
   }
   .edit {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 24px;
     font-size: 14px;
     color: var(--muted);
-    width: fit-content;
   }
 
   aside {

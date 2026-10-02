@@ -2,12 +2,34 @@
   import { REPO, SITE } from "#lib/site.js";
   import { reveal } from "#lib/reveal.js";
   import Install from "#lib/components/Install.svelte";
+  import Meta from "#lib/components/Meta.svelte";
   import Shot from "#lib/components/Shot.svelte";
   import Terminal from "#lib/components/Terminal.svelte";
   import { RUN, API } from "#lib/captures/cli.js";
   import tuiChat from "#lib/captures/tui-chat.html?raw";
 
   let { data } = $props();
+
+  const structured = $derived([
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      name: "Kvad",
+      description:
+        "A local inference engine in Rust for language, image and video models, with Metal kernels for Apple silicon, a web UI, a terminal app and an OpenAI-compatible API.",
+      url: SITE,
+      applicationCategory: "DeveloperApplication",
+      operatingSystem: "macOS, Linux",
+      softwareVersion: data.version || undefined,
+      license: "https://opensource.org/license/mit",
+      codeRepository: REPO,
+      downloadUrl: `${REPO}/releases`,
+      programmingLanguage: "Rust",
+      offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+      author: { "@type": "Person", name: "André Biseth" },
+    },
+    { "@context": "https://schema.org", "@type": "WebSite", name: "Kvad", url: SITE },
+  ]);
 
   // The four ways in. One is shown at a time, and they cross-fade.
   const WAYS = [
@@ -58,19 +80,12 @@
   ];
 </script>
 
-<svelte:head>
-  <title>Kvad · Local AI for Apple silicon, written from the arithmetic up</title>
-  <meta
-    name="description"
-    content="Kvad runs language, image and video models on your Mac from one install: a web UI, a terminal app, a command line and an OpenAI-compatible API, with its own kernels for the M5's GPU."
-  />
-  <meta property="og:title" content="Kvad" />
-  <meta property="og:description" content="Local AI for Apple silicon, written from the arithmetic up." />
-  <meta property="og:url" content={SITE} />
-  <meta property="og:image" content="{SITE}/og.png" />
-  <meta name="twitter:card" content="summary_large_image" />
-  <link rel="canonical" href="{SITE}/" />
-</svelte:head>
+<Meta
+  title="Kvad · Local AI for Apple silicon, written from the arithmetic up"
+  description="Kvad runs language, image and video models on your Mac from one install: a web UI, a terminal app, a command line and an OpenAI-compatible API, with its own kernels for the M5's GPU."
+  path="/"
+  data={structured}
+/>
 
 <section class="hero wrap">
   <div class="pitch">

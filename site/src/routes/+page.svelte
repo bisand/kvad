@@ -302,8 +302,8 @@
         <tbody>
           <tr><td>Prefill, Qwen2.5-1.5B, 2,079 tokens</td><td>0.99 s</td><td>0.39 s</td><td>2.5×</td></tr>
           <tr><td>FLUX.1-schnell, a step at 1024², q8</td><td>12.9–13.7 s</td><td>8.7–9.2 s</td><td>1.5×</td></tr>
-          <tr><td>SDXL, a step at 1024², f16</td><td>3.94 s</td><td>3.12 s</td><td>1.26×</td></tr>
-          <tr><td>Decode, Qwen2.5-1.5B, q8</td><td>115 tok/s</td><td>127.5 tok/s</td><td>1.11×</td></tr>
+          <tr><td>SDXL, a step at 1024², f16</td><td>3.90–3.98 s</td><td>3.09–3.15 s</td><td>1.26×</td></tr>
+          <tr><td>Decode, Qwen2.5-1.5B, q8, a short context</td><td>114–117 tok/s</td><td>126–129 tok/s</td><td>1.1×</td></tr>
         </tbody>
       </table>
     </div>

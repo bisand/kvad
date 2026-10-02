@@ -206,5 +206,5 @@ Match the surrounding density. `nervus` keeps zero dependencies.
 **The working tree may be shared** with another session — there was an
 untracked `docs/ui-plan.md` in it this time that belonged to someone else.
 Stage by explicit path, never `git add -A`. Do not branch or stash in the
-shared tree. Commit on `master` only when asked, ending messages with
-`Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
+shared tree. Commit on `master` only when asked, and end messages with no
+attribution line.

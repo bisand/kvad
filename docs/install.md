@@ -3,7 +3,7 @@
 # Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh
+curl -fsSL https://kvad.eu/install.sh | sh
 ```
 
 Prebuilt binaries from the latest [release](https://github.com/bisand/kvad/releases),
@@ -31,7 +31,7 @@ else; on one that already runs the service, the same service pointed at the
 new binaries. Ask for the rest explicitly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bisand/kvad/master/install.sh | sh -s -- --yes --service
+curl -fsSL https://kvad.eu/install.sh | sh -s -- --yes --service
 ```
 
 Once it is installed the service is `kvad service`'s to manage, and the

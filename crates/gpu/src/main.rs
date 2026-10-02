@@ -211,6 +211,13 @@ options:
   --eval-every N      steps between validation measurements (default 100)
   --holdout N         pictures kept out of training to measure on
                       (default: a tenth, from one to four; none of under 5)
+  --sample TEXT       a prompt to draw before the first step and at every
+                      measurement, from the same seed each time; may be
+                      given more than once
+  --sample-size N     pixels a side of a sample (default 512)
+  --sample-steps N    its denoising steps (default 20)
+  --samples DIR       where they are written (default: the LoRA's file's
+                      name, ending .samples)
   --seed N            (default 1337)
   --ffmpeg FILE       the ffmpeg that decodes the pictures (default: found)
   --cap GB            end the run if its memory passes this (default: three
@@ -223,13 +230,17 @@ fn tune(argv: &[String]) -> Res<()> {
         eprintln!("{TUNE_USAGE}");
         std::process::exit(2);
     }
-    let (mut model, mut flags) = (None, std::collections::HashMap::new());
+    let (mut model, mut flags, mut samples) = (None, std::collections::HashMap::new(), Vec::new());
     let mut i = 0;
     while i < argv.len() {
         match argv[i].strip_prefix("--") {
             Some(flag) => {
                 let value = argv.get(i + 1).ok_or_else(|| format!("--{flag} needs a value"))?;
-                flags.insert(flag.to_string(), value.clone());
+                // The one flag that may be given more than once.
+                match flag {
+                    "sample" => samples.push(value.clone()),
+                    _ => drop(flags.insert(flag.to_string(), value.clone())),
+                }
                 i += 2;
             }
             None if model.is_none() => {
@@ -266,7 +277,9 @@ fn tune(argv: &[String]) -> Res<()> {
     opts.caption = take("caption");
     opts.alpha = number("alpha", take("alpha"))?;
     opts.holdout = number("holdout", take("holdout"))?;
-    for (flag, into) in [("size", &mut opts.size), ("rank", &mut opts.rank), ("steps", &mut opts.steps), ("eval-every", &mut opts.eval_every)] {
+    opts.samples = samples;
+    opts.sample_dir = take("samples").map(std::path::PathBuf::from);
+    for (flag, into) in [("size", &mut opts.size), ("rank", &mut opts.rank), ("steps", &mut opts.steps), ("eval-every", &mut opts.eval_every), ("sample-size", &mut opts.sample_size), ("sample-steps", &mut opts.sample_steps)] {
         if let Some(n) = number(flag, take(flag))? {
             *into = n;
         }
@@ -326,6 +339,9 @@ fn tune(argv: &[String]) -> Res<()> {
     eprintln!("the LoRA, {:.1} M numbers on {} layers: {}", s.trained as f64 / 1e6, s.layers, s.out.display());
     if let Some(last) = &s.last {
         eprintln!("the last step's, validation loss {:.4}: {}", s.last_val, last.display());
+    }
+    if let Some(dir) = &s.samples {
+        eprintln!("the samples, N-STEP.png for prompt N: {}", dir.display());
     }
     eprintln!("\ndraw with it:  kvad images make \"...\" --model {} --lora {}", opts.repo, s.out.display());
     Ok(())

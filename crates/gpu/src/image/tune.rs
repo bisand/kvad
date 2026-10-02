@@ -414,8 +414,9 @@ pub struct Options {
     /// from a seed of its own that does not change: `seed`, `seed + 1` and
     /// so on. With none, nothing is drawn and no VAE is loaded.
     pub samples: Vec<String>,
-    /// Pixels a side of a sample, its denoising steps and its guidance.
-    pub sample_size: usize,
+    /// Pixels a side of a sample, the run's own `size` without one; its
+    /// denoising steps and its guidance.
+    pub sample_size: Option<usize>,
     pub sample_steps: usize,
     pub sample_guidance: f64,
     /// The folder the samples are written to; without one, the LoRA's
@@ -443,7 +444,7 @@ impl Options {
             eval_every: 100,
             holdout: None,
             samples: Vec::new(),
-            sample_size: 512,
+            sample_size: None,
             sample_steps: 20,
             sample_guidance: 5.0,
             sample_dir: None,
@@ -723,7 +724,7 @@ impl Sampler {
         let dir = opts.sample_dir.clone().unwrap_or_else(|| opts.out.with_extension("samples"));
         std::fs::create_dir_all(&dir)?;
         settle(device)?;
-        Ok(Sampler { vae, scheduler, prompts, side: opts.sample_size, steps: opts.sample_steps, guidance: opts.sample_guidance, seed: opts.seed, dir })
+        Ok(Sampler { vae, scheduler, prompts, side: opts.sample_size.unwrap_or(opts.size), steps: opts.sample_steps, guidance: opts.sample_guidance, seed: opts.seed, dir })
     }
 
     /// Where the sample of prompt `i` after `step` steps goes: named so
@@ -831,8 +832,9 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
     if opts.rank == 0 || opts.steps == 0 || opts.eval_every == 0 {
         return Err("--rank, --steps and --eval-every are each at least 1".into());
     }
-    if !opts.samples.is_empty() && (opts.sample_size % 64 != 0 || !(256..=1536).contains(&opts.sample_size) || opts.sample_steps == 0) {
-        return Err(format!("--sample-size {} is not a multiple of 64 from 256 to 1536, or --sample-steps is 0", opts.sample_size).into());
+    let sample_size = opts.sample_size.unwrap_or(opts.size);
+    if !opts.samples.is_empty() && (sample_size % 64 != 0 || !(256..=1536).contains(&sample_size) || opts.sample_steps == 0) {
+        return Err(format!("--sample-size {sample_size} is not a multiple of 64 from 256 to 1536, or --sample-steps is 0").into());
     }
     let scale = opts.alpha.map_or(1.0, |a| a / opts.rank as f64);
     let entries = super::dataset::folder(&opts.data, opts.caption.as_deref())?;
@@ -891,8 +893,8 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
         out(&format!(
             "{} sample(s) at {}×{}, {} steps each, in {sampling_secs:.0} s, and again at every measurement: {}; {:.1} GB at most so far",
             opts.samples.len(),
-            opts.sample_size,
-            opts.sample_size,
+            sample_size,
+            sample_size,
             opts.sample_steps,
             s.dir.display(),
             crate::cap::peak() as f64 / 1e9

@@ -214,7 +214,7 @@ options:
   --sample TEXT       a prompt to draw before the first step and at every
                       measurement, from the same seed each time; may be
                       given more than once
-  --sample-size N     pixels a side of a sample (default 512)
+  --sample-size N     pixels a side of a sample (default: --size)
   --sample-steps N    its denoising steps (default 20)
   --samples DIR       where they are written (default: the LoRA's file's
                       name, ending .samples)
@@ -279,7 +279,8 @@ fn tune(argv: &[String]) -> Res<()> {
     opts.holdout = number("holdout", take("holdout"))?;
     opts.samples = samples;
     opts.sample_dir = take("samples").map(std::path::PathBuf::from);
-    for (flag, into) in [("size", &mut opts.size), ("rank", &mut opts.rank), ("steps", &mut opts.steps), ("eval-every", &mut opts.eval_every), ("sample-size", &mut opts.sample_size), ("sample-steps", &mut opts.sample_steps)] {
+    opts.sample_size = number("sample-size", take("sample-size"))?;
+    for (flag, into) in [("size", &mut opts.size), ("rank", &mut opts.rank), ("steps", &mut opts.steps), ("eval-every", &mut opts.eval_every), ("sample-steps", &mut opts.sample_steps)] {
         if let Some(n) = number(flag, take(flag))? {
             *into = n;
         }

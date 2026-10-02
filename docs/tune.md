@@ -62,25 +62,26 @@ first of the row is the model's own. It is the loop `kvad images` runs, on
 the same noise: a sample is what a request with that LoRA, seed, size and
 step count draws. The prompts are read by the text encoders with the
 captions, before the UNet is loaded, and the VAE's decoder, 0.1 GB, is kept
-for the run. Samples are 512² and 20 steps unless `--sample-size` and
-`--sample-steps` say otherwise. Measured on an M5 Pro, beside a run at 512²:
-16 s a sample, and a peak of 11.3 GB where the run without them reaches
-7.1. The steps between are as fast and their losses the same to the last
+for the run. Samples are the run's own size and 20 steps unless
+`--sample-size` and `--sample-steps` say otherwise.
+
+They cost time and no memory. Measured on an M5 Pro beside a run at 1024²,
+whose own peak is 10.4 GB:
+
+| a sample | takes | reaches | the run, at most |
+|---|---|---|---|
+| 512² | 16 s | 8.0 GB | 10.4 GB |
+| 768² | 39 s | 8.4 GB | 10.4 GB |
+| 1024² | 72 s | 8.7 GB | 10.4 GB |
+
+Beside a run at 512², whose own peak is 7.1 GB, two 512² samples reach
+8.7. The steps between are as fast and their losses the same to the last
 digit, and two runs' samples are the same file.
 
-What a sample reaches is its own size's doing and not the run's, because it
-is the VAE's decoder that reaches it:
-
-| the run | samples | at most | without them |
-|---|---|---|---|
-| 512² | 512² | 11.3 GB | 7.1 GB |
-| 1024² | 512² | 11.3 GB | 10.4 GB |
-| 1024² | 768² | 18.3 GB | 10.4 GB |
-
-Over the 5.5 GB a loaded run holds, that is 5.8 GB at 512² and 12.8 at
-768²: it grows as the picture's area. By that law a 1024² sample reaches
-about 28 GB, which was not run. The run's `--cap` is what stands between a
-decode that does not fit and the machine.
+It was not so at first: a 768² sample reached 18.3 GB, nearly all of it the
+VAE's decoder, and a 1024² one would have reached about 28. The decoder now
+runs its convolutions in bands of rows and its norms a few groups at a time
+(`nn::BAND`), which gives the same picture to the bit.
 
 ## Why the training loss is not the number to watch
 
@@ -129,10 +130,12 @@ Measured on an M5 Pro with 48 GB, one picture a step:
 | size | a step | while training | at most |
 |---|---|---|---|
 | 512² | 1.9 s | 6.4 GB | 7.2 GB |
-| 1024² | 7.3 s | 7.6 GB | 13.7 GB |
+| 1024² | 7.3 s | 7.6 GB | 10.6 GB |
 
-"At most" at 1024² is the VAE's encoder reading the pictures, before the
-UNet is loaded; a run whose pictures were read before does not pay it. A
+"At most" is a step's backward pass. At 1024² it was 13.7 GB, the VAE's
+encoder reading the pictures before the UNet is loaded, until the encoder
+too ran its convolutions in bands (`nn::BAND`); reading them now reaches
+less than a step does. A
 measurement is four forward passes for each held-out picture. A thousand
 steps at 1024², SDXL's own size, is about two hours; at 512² about half an
 hour, and SDXL draws less well there.
@@ -175,9 +178,6 @@ run's own factors gave, to the bit.
 - **`kvad tune` through the service**, as a job with its loss on a chart
   (#77). `kvad-gpu tune` runs in its own process and needs the UNet's
   memory to itself.
-- **Samples at SDXL's own size.** A 1024² sample would reach about 28 GB
-  beside a run, all of it the VAE's decoder, so samples are 512² by
-  default, where SDXL draws less well, until the decode is tiled.
 - **Other models.** FLUX and Qwen-Image are refused by name: their blocks'
   gradients are checked (#74), and a step through all of them has not been
   made to fit or been measured. An SDXL checkpoint in one file is refused

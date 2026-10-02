@@ -532,6 +532,8 @@ pub(super) mod tests {
     fn one_encode() {
         let name = std::env::var("KVAD_VAE").unwrap_or_else(|_| "sdxl".into());
         let side: usize = std::env::var("KVAD_VAE_SIDE").map(|s| s.parse().unwrap()).unwrap_or(512);
+        // Under a cap, `KVAD_CAP` gigabytes or 16: see `crate::cap`.
+        crate::cap::at(std::env::var("KVAD_CAP").map(|s| s.parse().unwrap()).unwrap_or(16.0));
         let device = Device::new_metal(0).unwrap();
         let (_, _, dtype) = vae(&name);
         let (enc, _) = load(&name, &device, dtype);
@@ -554,7 +556,7 @@ pub(super) mod tests {
         let started = std::time::Instant::now();
         let largest = run();
         let what = if decode { "decode" } else { "encode" };
-        eprintln!("{name} {dtype:?} {side}²: one {what} {:.2} s, largest |out| {largest:.2}", started.elapsed().as_secs_f64());
+        eprintln!("{name} {dtype:?} {side}²: one {what} {:.2} s, largest |out| {largest:.2}; {:.1} GB at most", started.elapsed().as_secs_f64(), crate::cap::peak() as f64 / 1e9);
         assert!(largest.is_finite() && largest > 0.0, "the encode came back {largest}");
     }
 }

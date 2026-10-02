@@ -219,7 +219,7 @@ impl Conv2d {
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let plain = |x: &Tensor| x.conv2d(&self.w, self.pad, self.stride, 1, 1)?.broadcast_add(&self.b);
+        let plain = |x: &Tensor| self.banded(x, BAND);
         // A kernel that is not being trained owes `backward` its input's
         // gradient and no more (`crate::grad::attach`): the transposed
         // convolution of the answer's, as candle's own backward makes it,
@@ -235,6 +235,59 @@ impl Conv2d {
             Some(s) => s.add_conv(x, y),
             None => Ok(y),
         }
+    }
+}
+
+/// The most a convolution or a norm may gather at once, in bytes, before it
+/// is done a piece at a time ([`Conv2d::banded`], [`GroupNorm::grouped`]).
+///
+/// A VAE works at the picture's own size, and two of its operations make
+/// far more than they are given. candle's convolution on Metal is a matrix
+/// product over gathered neighbourhoods: every input number nine times
+/// over for a 3×3 kernel, 4.8 GB for 256 channels at 1024² in f16. A group
+/// norm sums in f32 and makes half a dozen tensors its input's size on the
+/// way, a gigabyte each there. And candle gives a dropped buffer back only
+/// when the device is waited for, so all of them were held at once.
+///
+/// Both are sums over a neighbourhood or a group and nothing else, so a
+/// piece at a time is the same arithmetic on the same numbers, and the
+/// answer is the same to the bit (`tests::a_piece_at_a_time_is_the_whole`).
+/// SDXL's VAE alone, by `vae::tests::one_encode`, on an M5 Pro:
+///
+/// | | whole | a piece at a time |
+/// |---|---|---|
+/// | decode, 512² | 2.1 s, 5.7 GB | 2.9 s, 2.9 GB |
+/// | decode, 768² | 5.1 s, 12.7 GB | 7.0 s, 3.3 GB |
+/// | decode, 1024² | not run alone | 12.4 s, 3.6 GB |
+/// | encode, 1024² | 5.1 s, 12.0 GB | 6.4 s, 4.7 GB |
+///
+/// What it costs in time is the waits: one a piece, and a wait lets the
+/// buffer pool go, so the next piece writes fresh ones. At 512 MB a 1024²
+/// decode was as slow, 12.4 s, and reached 6.0 GB.
+pub(crate) const BAND: usize = 256 << 20;
+
+impl Conv2d {
+    /// The convolution and its bias, in bands of rows where gathering the
+    /// whole input's neighbourhoods would pass `budget` bytes ([`BAND`]):
+    /// each band is convolved with `pad` rows of its neighbours either
+    /// side, which are then cut from its answer, and the device is waited
+    /// for before the next. A stride of 1 only, and never a tensor
+    /// `backward` is to walk: a record is not made in pieces.
+    fn banded(&self, x: &Tensor, budget: usize) -> candle_core::Result<Tensor> {
+        let (n, c, h, w) = x.dims4()?;
+        let k = self.w.dim(2)?;
+        let rows = (budget / (n * c * k * k * w * x.dtype().size_in_bytes()).max(1)).max(1);
+        if self.stride != 1 || k == 1 || rows >= h || x.track_op() {
+            return x.conv2d(&self.w, self.pad, self.stride, 1, 1)?.broadcast_add(&self.b);
+        }
+        let mut bands = Vec::with_capacity(h.div_ceil(rows));
+        for r0 in (0..h).step_by(rows) {
+            let take = rows.min(h - r0);
+            let (from, to) = (r0.saturating_sub(self.pad), (r0 + take + self.pad).min(h));
+            bands.push(x.narrow(2, from, to - from)?.conv2d(&self.w, self.pad, 1, 1, 1)?.narrow(2, r0 - from, take)?.broadcast_add(&self.b)?);
+            settle(x.device())?;
+        }
+        Tensor::cat(&bands, 2)
     }
 }
 
@@ -364,6 +417,34 @@ impl GroupNorm {
                 crate::grad::norm_back(&x.reshape(grouped)?, &g, eps, true)?.reshape((b, c, h, w))?.to_dtype(x.dtype())
             });
         }
+        self.grouped(x, BAND)
+    }
+
+    /// The norm, a few groups at a time where the whole input in the
+    /// precision it is summed in would pass `budget` bytes ([`BAND`]), with
+    /// the device waited for after each: a group's numbers are normalised
+    /// by that group's own mean and spread, so its neighbours need not be
+    /// there.
+    fn grouped(&self, x: &Tensor, budget: usize) -> candle_core::Result<Tensor> {
+        let (b, c, h, w) = x.dims4()?;
+        let per = c / self.groups;
+        let at_once = (budget / (b * per * h * w * wide(x.dtype()).size_in_bytes()).max(1)).max(1);
+        if at_once >= self.groups || x.track_op() {
+            return self.whole(x);
+        }
+        let mut parts = Vec::with_capacity(self.groups.div_ceil(at_once));
+        for g0 in (0..self.groups).step_by(at_once) {
+            let n = at_once.min(self.groups - g0);
+            let (from, len) = (g0 * per, n * per);
+            let part = GroupNorm { groups: n, eps: self.eps, w: self.w.narrow(1, from, len)?, b: self.b.narrow(1, from, len)? };
+            parts.push(part.whole(&x.narrow(1, from, len)?)?);
+            settle(x.device())?;
+        }
+        Tensor::cat(&parts, 1)
+    }
+
+    fn whole(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let (b, c, h, w) = x.dims4()?;
         let dtype = x.dtype();
         let g = x.to_dtype(wide(dtype))?.reshape((b, self.groups, (c / self.groups) * h * w))?;
         let mean = g.mean_keepdim(D::Minus1)?;
@@ -794,6 +875,42 @@ impl SplitMix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A convolution in bands of rows and a group norm a few groups at a
+    /// time are the whole of each, to the bit: on the CPU and on Metal, in
+    /// f32 and in f16, with budgets that cut at one row or group, at a few,
+    /// and unevenly, and a batch of two.
+    #[test]
+    fn a_piece_at_a_time_is_the_whole() {
+        let mut devices = vec![Device::Cpu];
+        if let Ok(metal) = Device::new_metal(0) {
+            devices.push(metal);
+        }
+        for dev in devices {
+            for dtype in [DType::F32, DType::F16] {
+                let draw = |seed: u64, shape: &[usize]| noise(seed, shape, &dev, DType::F32).unwrap().to_dtype(dtype).unwrap();
+                let (n, c, out, h, w) = (2, 12, 5, 23, 17);
+                let x = draw(1, &[n, c, h, w]);
+                let same = |a: &Tensor, b: &Tensor, what: &str| {
+                    let apart = (a.to_dtype(DType::F32).unwrap() - b.to_dtype(DType::F32).unwrap()).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+                    assert_eq!(a.dims(), b.dims(), "{what}");
+                    assert!(apart == 0.0, "{what}, {dtype:?} on {:?}: {apart} apart", dev.location());
+                };
+                let row = n * c * 9 * w * dtype.size_in_bytes();
+                let conv = Conv2d::from_parts(draw(2, &[out, c, 3, 3]), draw(3, &[out]), 1).unwrap();
+                let whole = conv.banded(&x, usize::MAX).unwrap();
+                for rows in [1, 4, 22] {
+                    same(&conv.banded(&x, rows * row).unwrap(), &whole, &format!("a convolution {rows} rows at a time"));
+                }
+                let norm = GroupNorm { groups: 6, eps: 1e-6, w: draw(4, &[1, c, 1, 1]), b: draw(5, &[1, c, 1, 1]) };
+                let whole = norm.grouped(&x, usize::MAX).unwrap();
+                let group = n * (c / 6) * h * w * wide(dtype).size_in_bytes();
+                for groups in [1, 4, 5] {
+                    same(&norm.grouped(&x, groups * group).unwrap(), &whole, &format!("a norm {groups} groups at a time"));
+                }
+            }
+        }
+    }
 
     fn close(a: &Tensor, b: &Tensor, tol: f32) -> f32 {
         let d = (a.to_dtype(DType::F32).unwrap() - b.to_dtype(DType::F32).unwrap()).unwrap();

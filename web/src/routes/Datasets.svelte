@@ -1,6 +1,8 @@
 <script>
-  // The text runs are trained on, and the one question worth asking about it
-  // before a run starts: which characters a model has no token for.
+  // What runs are trained on: a text, and the one question worth asking about
+  // it before a run starts, which characters a model has no token for; or a
+  // set of pictures with their captions, and the question worth asking about
+  // those, whether every one has a caption and is a picture.
   import { training } from "../lib/training.svelte.js";
   import { toasts } from "../lib/toasts.svelte.js";
   import { humanBytes } from "../lib/models.svelte.js";
@@ -17,6 +19,68 @@
   let confirming = $state(null);
   let against = $state("");
   let checks = $state({});
+
+  // A set of pictures: the files chosen, what to call it, and the caption
+  // of any picture that has none beside it.
+  const PICTURES = ["jpg", "jpeg", "png", "webp", "bmp"];
+  let chosen = $state([]);
+  let setName = $state("");
+  let caption = $state("");
+  /** `{ done, total }` while the files go up. */
+  let sending = $state(null);
+  /** The server's refusal, whole: it names every file that is wrong. */
+  let refused = $state("");
+  /** The dataset whose pictures are shown, and those pictures. */
+  let showingSet = $state(null);
+
+  const ending = (file) => file.name.split(".").pop().toLowerCase();
+  const pictureCount = $derived(chosen.filter((f) => PICTURES.includes(ending(f))).length);
+  const captionCount = $derived(chosen.filter((f) => ending(f) === "txt").length);
+
+  /** Pictures and captions out of whatever was picked: a folder's worth of
+   *  files usually has a `.DS_Store` or a `notes.md` in it. */
+  function pickPictures(event) {
+    const all = [...(event.currentTarget.files ?? [])];
+    chosen = all.filter((f) => !f.name.startsWith(".") && [...PICTURES, "txt"].includes(ending(f)));
+    refused = "";
+    // A folder's own name, when a folder was picked, is the better default.
+    const folder = all[0]?.webkitRelativePath?.split("/")[0];
+    if (!setName.trim() && folder) setName = folder;
+  }
+
+  async function uploadPictures(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (!pictureCount) return toasts.warning("Choose some pictures.");
+    refused = "";
+    sending = { done: 0, total: chosen.length };
+    const { dataset, error } = await training.uploadPictures(setName.trim(), chosen, caption.trim(), (done, total) => {
+      sending = { done, total };
+    });
+    sending = null;
+    if (error) {
+      refused = error;
+      return;
+    }
+    toasts.success(`Uploaded ${dataset.name}: ${dataset.items} pictures.`);
+    chosen = [];
+    setName = "";
+    caption = "";
+    form.reset();
+  }
+
+  async function togglePictures(d) {
+    if (showingSet?.id === d.id) {
+      showingSet = null;
+      return;
+    }
+    try {
+      const { pictures } = await api(`/api/datasets/${d.id}/pictures`);
+      showingSet = { id: d.id, pictures };
+    } catch (e) {
+      toasts.error(e.message);
+    }
+  }
 
   // Reading a website.
   let url = $state("");
@@ -131,7 +195,7 @@
   async function checkAll(model) {
     checks = {};
     if (!model) return;
-    for (const d of training.datasets) {
+    for (const d of training.datasets.filter((d) => d.kind !== "pictures")) {
       try {
         checks[d.id] = await training.check(d.id, model);
       } catch {
@@ -214,6 +278,56 @@
     </form>
   </section>
 
+
+  <!-- What an image model's LoRA is trained on. The files go up one at a
+       time and are then made into a dataset together, or not at all: the
+       server decodes every picture and looks for every caption first, and
+       says everything that is wrong in one answer. -->
+  <section class="card bg-base-100 border-base-300 border">
+    <form class="card-body gap-3 p-4" onsubmit={uploadPictures}>
+      <h2 class="text-sm font-medium opacity-60">Add pictures</h2>
+      <div class="flex flex-wrap items-end gap-2">
+        <fieldset class="fieldset">
+          <legend class="fieldset-legend">Pictures and captions</legend>
+          <input
+            type="file"
+            class="file-input file-input-sm"
+            multiple
+            accept=".jpg,.jpeg,.png,.webp,.bmp,.txt"
+            onchange={pickPictures}
+          />
+        </fieldset>
+        <fieldset class="fieldset grow">
+          <legend class="fieldset-legend">Name</legend>
+          <input class="input input-sm w-full" bind:value={setName} placeholder="my-photos" required />
+        </fieldset>
+        <button class="btn btn-sm" disabled={!!sending || !pictureCount || !setName.trim()}>
+          {#if sending}<span class="loading loading-spinner loading-xs"></span>{/if}
+          Upload
+        </button>
+      </div>
+      <fieldset class="fieldset">
+        <legend class="fieldset-legend">Caption for pictures that have none</legend>
+        <input class="input input-sm w-full" bind:value={caption} placeholder="a photo of sks dog" />
+      </fieldset>
+      {#if sending}
+        <progress class="progress w-full" value={sending.done} max={Math.max(sending.total, 1)}></progress>
+      {:else if chosen.length}
+        <p class="text-xs opacity-60">
+          {pictureCount} picture{pictureCount === 1 ? "" : "s"} and {captionCount} caption{captionCount === 1 ? "" : "s"} chosen.
+        </p>
+      {/if}
+      {#if refused}
+        <div role="alert" class="alert alert-error text-sm whitespace-pre-wrap">{refused}</div>
+      {/if}
+      <p class="text-xs opacity-60">
+        Choose the pictures (<code>jpg</code>, <code>png</code>, <code>webp</code>, <code>bmp</code>)
+        and, beside each, a <code>.txt</code> of the same name holding its caption:
+        <code>one.jpg</code> and <code>one.txt</code>. Every picture is decoded and must have a
+        caption, or nothing is kept and every file that is wrong is named.
+      </p>
+    </form>
+  </section>
 
   <!-- The other way to get a corpus: point it at a documentation site and
        let it read. A job, because it is minutes and hundreds of requests. -->
@@ -370,8 +484,7 @@
         <thead>
           <tr>
             <th class="w-full">Name</th>
-            <th class="whitespace-nowrap">Characters</th>
-            <th class="whitespace-nowrap">Distinct</th>
+            <th class="whitespace-nowrap">Holds</th>
             <th class="whitespace-nowrap">Size</th>
             <th></th>
           </tr>
@@ -380,14 +493,22 @@
           {#each training.datasets as d (d.id)}
             <tr class="hover:bg-base-200/50">
               <td class="max-w-0">
-                <div class="truncate font-medium">{d.name}</div>
+                {#if d.kind === "pictures"}
+                  <button class="link link-hover truncate font-medium" onclick={() => togglePictures(d)}>
+                    {d.name}
+                  </button>
+                {:else}
+                  <div class="truncate font-medium">{d.name}</div>
+                {/if}
                 {#if d.source}
                   <div class="truncate text-xs opacity-50">
                     {d.source}{d.manifest ? " · manifest kept beside it" : ""}
                   </div>
                 {/if}
                 {#if !d.present}
-                  <div class="text-error text-xs">the file is gone from disk</div>
+                  <div class="text-error text-xs">
+                    {d.kind === "pictures" ? "the folder" : "the file"} is gone from disk
+                  </div>
                 {:else if checks[d.id]}
                   {#if checks[d.id].unseen_count === 0}
                     <div class="text-xs opacity-60">
@@ -404,8 +525,13 @@
                   {/if}
                 {/if}
               </td>
-              <td class="text-sm whitespace-nowrap opacity-70">{d.characters.toLocaleString()}</td>
-              <td class="text-sm whitespace-nowrap opacity-70">{d.distinct}</td>
+              <td class="text-sm whitespace-nowrap opacity-70">
+                {#if d.kind === "pictures"}
+                  {d.items} pictures
+                {:else}
+                  {d.characters.toLocaleString()} characters, {d.distinct} distinct
+                {/if}
+              </td>
               <td class="text-sm whitespace-nowrap opacity-70">{humanBytes(d.bytes)}</td>
               <td class="text-right">
                 <button
@@ -417,6 +543,25 @@
                 </button>
               </td>
             </tr>
+            {#if showingSet?.id === d.id}
+              <tr>
+                <td colspan="4">
+                  <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    {#each showingSet.pictures as p (p.file)}
+                      <figure>
+                        <img
+                          class="rounded-box bg-base-200 aspect-square w-full object-cover"
+                          src={`/api/datasets/${d.id}/pictures/${encodeURIComponent(p.file)}`}
+                          alt={p.caption}
+                          loading="lazy"
+                        />
+                        <figcaption class="mt-1 text-xs opacity-70">{p.caption}</figcaption>
+                      </figure>
+                    {/each}
+                  </div>
+                </td>
+              </tr>
+            {/if}
           {/each}
         </tbody>
       </table>
@@ -427,7 +572,7 @@
 <!-- Retrieval, on its own. Whether the right passage comes back and whether
      a model then reads it properly are different questions that fail for
      different reasons, and only the first one has an answer you can look at. -->
-{#if training.datasets.length}
+{#if training.datasets.some((d) => d.kind !== "pictures")}
   <div class="mx-auto mt-6 flex max-w-4xl flex-col gap-6">
     <section class="card bg-base-100 border-base-300 border">
       <form class="card-body gap-3 p-4" onsubmit={ask}>
@@ -437,7 +582,7 @@
             <legend class="fieldset-legend">In</legend>
             <select class="select select-sm w-56" bind:value={searchIn}>
               <option value={null} disabled>choose one</option>
-              {#each training.datasets as d (d.id)}
+              {#each training.datasets.filter((d) => d.kind !== "pictures") as d (d.id)}
                 <option value={d.id}>{d.name}</option>
               {/each}
             </select>
@@ -503,8 +648,13 @@
     <div class="modal-box">
       <h3 class="text-lg font-medium">Delete {confirming.name}?</h3>
       <p class="py-3 text-sm opacity-70">
-        The text file goes. Models already trained on it are untouched — a model carries
-        the tokeniser it was trained with and does not read this file again.
+        {#if confirming.kind === "pictures"}
+          The pictures and their captions go. A LoRA already trained on them is untouched: it
+          does not read them again.
+        {:else}
+          The text file goes. Models already trained on it are untouched — a model carries
+          the tokeniser it was trained with and does not read this file again.
+        {/if}
       </p>
       <div class="modal-action">
         <button class="btn btn-sm" onclick={() => (confirming = null)}>Cancel</button>

@@ -20,6 +20,34 @@ use std::io::{BufRead, Write};
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// The commands with a local twin, which run here when no server answers.
+pub const TUNE: &str = "usage: kvad tune [MODEL] --data DIR --name NAME [options]
+       kvad tune [MODEL] --dataset ID|NAME --name NAME [options]
+
+Train a LoRA for SDXL on pictures, as a job on the server. MODEL is the
+server's first SDXL unless given; `kvad train options` lists what it can
+train. --data uploads a folder as a dataset first: pictures, each with its
+caption in a .txt of the same name beside it.
+
+  --name NAME         what to call the LoRA
+  --from NAME         go on from a LoRA trained there
+  --caption TEXT      with --data: the caption of every picture that has none
+  --size N            pixels a side, a multiple of 64 up to 1024 (default 512)
+  --rank N            (default 16)
+  --alpha F           the LoRA is scaled by alpha / rank (default: the rank)
+  --steps N           (default 1000)
+  --lr F              (default 1e-4)
+  --eval-every N      steps between validation measurements (default 100)
+  --holdout N         pictures kept out of training to measure on
+  --sample TEXT       a prompt to draw before the first step and at every
+                      measurement; up to four
+  --sample-size N     pixels a side of a sample (default: --size)
+  --sample-steps N    its denoising steps (default 20)
+  --seed N            (default 1337)
+
+The run is charged to the server's memory as a model is, and refused if it
+does not fit beside the models in memory. `kvad jobs samples ID` fetches
+what it drew. In this process, with no server: kvad-gpu tune.";
+
 pub const LOCAL_TOO: &[&str] = &["ls", "search", "info", "pull", "use", "rm", "cache", "run", "chat", "train"];
 
 /// `kvad ls`.
@@ -912,6 +940,125 @@ pub fn train(remote: &Remote, args: &Args) -> Res<()> {
     Ok(())
 }
 
+/// `kvad tune`: a LoRA for an image model, as a job on the server.
+///
+/// The pictures have to be a dataset the server has, as a text has to be
+/// for `kvad train`: `--dataset` names one, and `--data DIR` uploads the
+/// folder as one first.
+pub fn tune(remote: &Remote, args: &Args) -> Res<()> {
+    let dataset = match (&args.dataset, &args.data) {
+        (Some(d), _) => super::api::dataset_id(remote, d)?,
+        (None, Some(dir)) => {
+            let made = upload_pictures(remote, dir, None, args.caption.as_deref())?;
+            made["id"].as_i64().ok_or("the server made a dataset and did not say which")?
+        }
+        (None, None) => {
+            eprintln!("{TUNE}");
+            std::process::exit(2);
+        }
+    };
+    let Some(name) = &args.name else {
+        eprintln!("a LoRA needs a name:  kvad tune ... --name NAME");
+        std::process::exit(2);
+    };
+    let size = match &args.size {
+        None => None,
+        Some(s) => Some(s.parse::<usize>().map_err(|_| format!("--size expects pixels a side, such as 512, and got `{s}`"))?),
+    };
+
+    let mut body = json!({ "loop": "lora", "dataset": dataset, "name": name });
+    for (key, value) in [
+        ("model", args.words.first().cloned().or_else(|| args.model.clone()).map(Value::from)),
+        ("from", args.from.clone().map(Value::from)),
+        ("size", size.map(Value::from)),
+        ("rank", args.rank.map(Value::from)),
+        ("alpha", args.alpha.map(Value::from)),
+        ("steps", args.steps.map(Value::from)),
+        ("lr", args.lr.map(|lr| Value::from(lr as f64))),
+        ("eval_every", args.eval_every.map(Value::from)),
+        ("holdout", args.holdout.map(Value::from)),
+        ("samples", (!args.samples.is_empty()).then(|| Value::from(args.samples.clone()))),
+        ("sample_size", args.sample_size.map(Value::from)),
+        ("sample_steps", args.sample_steps.map(Value::from)),
+        // `--seed` has a default of its own for sampling text, which is not
+        // this run's; the server's is used unless one was given.
+        ("seed", args.seed_given.then(|| Value::from(args.seed))),
+    ] {
+        if let Some(v) = value {
+            body[key] = v;
+        }
+    }
+    let job = remote.post("/api/train", &body)?;
+    let id = job["id"].as_i64().unwrap_or(0);
+    super::api::follow(remote, &job, args)?;
+    if !args.json {
+        let made = remote.get(&format!("/api/jobs/{id}"))?;
+        if let Some(file) = made["result"]["handle"].as_str().filter(|_| made["result"]["measured"] == true) {
+            println!("\ndraw with it:  kvad images make \"...\" --model {} --lora {file}", super::out::s(&made["params"]["model"]));
+        }
+        if !args.samples.is_empty() {
+            println!("what it drew:  kvad jobs samples {id}");
+        }
+    }
+    Ok(())
+}
+
+/// A name as one segment of a path: every byte that is not a letter, a
+/// digit or one of `-._~` as `%XX`.
+fn segment(name: &str) -> String {
+    name.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+/// Upload a folder of pictures and their captions as a dataset, named after
+/// the folder unless `named`.
+///
+/// A file at a time, and then one request that makes a dataset of them or
+/// refuses them all, saying everything that is wrong at once. Refused, what
+/// was uploaded is thrown away: the next try sends the whole folder again.
+pub fn upload_pictures(remote: &Remote, dir: &str, named: Option<&str>, caption: Option<&str>) -> Res<Value> {
+    const KINDS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "bmp", "txt"];
+    let folder = std::path::Path::new(dir);
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(folder)
+        .map_err(|e| format!("could not read {dir}: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
+        .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| KINDS.contains(&e.to_ascii_lowercase().as_str())))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("{dir} holds no pictures: none of its files end in {}", KINDS[..5].join(", ")).into());
+    }
+    let shown = match named {
+        Some(name) => name.to_string(),
+        None => std::fs::canonicalize(folder)
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "pictures".into()),
+    };
+    let name = segment(&shown);
+    eprintln!("uploading {} files from {dir} as dataset `{shown}`", files.len());
+    // Whatever an earlier try left there is not part of this one.
+    remote.delete(&format!("/api/datasets/pictures/{name}"))?;
+    let mut progress = super::out::Progress::new();
+    for (i, path) in files.iter().enumerate() {
+        let shown = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let file = segment(&shown);
+        let bytes = std::fs::read(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        progress.show(format!("  {} of {}  {shown}", i + 1, files.len()));
+        remote.call("put", &format!("/api/datasets/pictures/{name}/{file}"), Some(Body::Bytes(bytes)))?;
+    }
+    progress.done();
+    let caption = super::enc(caption.unwrap_or(""));
+    remote.call("post", &format!("/api/datasets/pictures/{name}?caption={caption}"), None).inspect_err(|_| {
+        let _ = remote.delete(&format!("/api/datasets/pictures/{name}"));
+    })
+}
+
 /// Upload a file as a dataset, named after the file.
 fn upload(remote: &Remote, file: &str) -> Res<i64> {
     let text = std::fs::read_to_string(file).map_err(|e| format!("could not read {file}: {e}"))?;
@@ -949,6 +1096,28 @@ fn options(remote: &Remote, args: &Args) -> Res<()> {
         println!("can be trained further (--from): {}", continuable.join(", "));
     }
     println!("{} cores", out::s(&o["cores"]));
+    let lora = &o["lora"];
+    println!("\na LoRA for an image model (kvad tune):");
+    match lora["unavailable"].as_str() {
+        Some(why) => println!("  not on this server: {why}"),
+        None => {
+            let models: Vec<String> = out::items(&lora["models"]).iter().map(out::s).collect();
+            match models.is_empty() {
+                true => println!("  no model here to train one for: kvad pull stabilityai/stable-diffusion-xl-base-1.0"),
+                false => println!("  for: {}", models.join(", ")),
+            }
+            let rows: Vec<Vec<String>> = out::items(&lora["sizes"])
+                .iter()
+                .map(|s| vec![out::s(&s["size"]), out::bytes(&s["bytes"]), out::bytes(&s["bytes_sampling"])])
+                .collect();
+            out::table(&["SIZE", "CHARGED", "WITH SAMPLES"], &rows);
+            println!("  {} is left beside the models in memory", out::bytes(&lora["left"]));
+            let loras: Vec<String> = out::items(&lora["continuable"]).iter().map(out::s).collect();
+            if !loras.is_empty() {
+                println!("  can be gone on from (--from): {}", loras.join(", "));
+            }
+        }
+    }
     if o["training"] == true {
         println!("a run is going now, and a second would be refused until it ends");
     }

@@ -363,6 +363,8 @@ enum Probe {
 pub enum Body<'a> {
     Json(&'a Value),
     Text(String),
+    /// A file as it is: a picture of a dataset.
+    Bytes(Vec<u8>),
 }
 
 impl Remote {
@@ -493,6 +495,7 @@ impl Remote {
             Some(Body::Text(text)) => self
                 .agent
                 .run(req.header("content-type", "text/plain; charset=utf-8").body(text.into_bytes())?),
+            Some(Body::Bytes(bytes)) => self.agent.run(req.header("content-type", "application/octet-stream").body(bytes)?),
         };
         sent.map_err(|e| match e {
             ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -804,14 +807,19 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("post", "/api/conversations/{id}/messages", "kvad chat"),
     ("post", "/api/playground/complete", "kvad run"),
     ("post", "/api/playground/tokenize", "kvad tokenize"),
-    ("post", "/api/train", "kvad train"),
+    ("post", "/api/train", "kvad train, kvad tune"),
     ("get", "/api/train/options", "kvad train options"),
     ("get", "/api/jobs", "kvad jobs"),
     ("get", "/api/jobs/{id}", "kvad jobs show"),
     ("delete", "/api/jobs/{id}", "kvad jobs cancel"),
     ("get", "/api/jobs/{id}/events", "kvad jobs watch"),
+    ("get", "/api/jobs/{id}/samples/{step}/{prompt}", "kvad jobs samples"),
     ("get", "/api/datasets", "kvad datasets"),
     ("post", "/api/datasets", "kvad datasets add"),
+    ("put", "/api/datasets/pictures/{name}/{file}", "kvad datasets add, kvad tune"),
+    ("post", "/api/datasets/pictures/{name}", "kvad datasets add, kvad tune"),
+    ("delete", "/api/datasets/pictures/{name}", "kvad datasets add, kvad tune"),
+    ("get", "/api/datasets/{id}/pictures", "kvad datasets show"),
     ("post", "/api/datasets/crawl", "kvad datasets crawl"),
     ("get", "/api/datasets/{id}", "kvad datasets show"),
     ("delete", "/api/datasets/{id}", "kvad datasets rm"),
@@ -865,6 +873,12 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
          there, make a key on the Account page, and give it to `kvad auth login --key`",
     ),
     ("get", "/api/auth/oidc/callback", "where the identity provider sends the browser back"),
+    (
+        "get",
+        "/api/datasets/{id}/pictures/{file}",
+        "one picture of a set as it was uploaded, for the web UI's <img>. The command \
+         line's copy is the file it sent; `kvad datasets show` lists them with their captions",
+    ),
     (
         "get",
         "/api/images/{id}",

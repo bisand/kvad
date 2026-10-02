@@ -608,18 +608,35 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       same cores and each take twice as long. Every check that can be \
                       made before an hour is committed — the dataset exists, the model \
                       to continue from has a token for every character in it — is made \
-                      here rather than at step one.",
+                      here rather than at step one. `loop` says which kind of run: \
+                      `text`, or nothing, trains a language model on a text; `lora` \
+                      trains a LoRA for SDXL on a set of pictures, in a process of its \
+                      own, charged to the memory budget as a model is and refused with \
+                      409 if it does not fit beside the models in memory.",
         query: &[],
-        body: json_body("`{ dataset, name?, from?, size?, steps?, lr?, eval_every?, \
-                         threads?, sample?, seed? }`."),
+        body: json_body("For text: `{ dataset, name?, from?, size?, steps?, lr?, eval_every?, \
+                         threads?, sample?, seed? }`. For a LoRA: `{ loop: \"lora\", dataset, \
+                         name, model?, from?, size?, rank?, alpha?, steps?, lr?, eval_every?, \
+                         holdout?, samples?, sample_size?, sample_steps?, seed? }`, where \
+                         `samples` is up to four prompts drawn at every measurement."),
         produces: JSON, events: &[],
     },
     Endpoint {
         method: "get", path: "/api/train/options", tag: "Training", access: Access::Admin,
         summary: "What a run can be asked for",
         description: "Model sizes, models that can be continued, defaults, the core \
-                      count, and whether a run is already going.",
+                      count, and whether a run is already going. Under `lora`: the \
+                      models a LoRA can be trained for, the sizes with what a run at \
+                      each is charged, and what is left of the memory budget.",
         query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/jobs/{id}/samples/{step}/{prompt}", tag: "Jobs", access: Access::SignedIn,
+        summary: "A picture a LoRA run drew",
+        description: "The sample of one prompt, counted from 0, at one measurement. A \
+                      prompt's seed never changes, so its samples differ by what the \
+                      LoRA learned between them; step 0 is the model without it.",
+        query: &[], body: None, produces: "image/png", events: &[],
     },
     Endpoint {
         method: "get", path: "/api/jobs", tag: "Jobs", access: Access::SignedIn,
@@ -631,7 +648,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         method: "get", path: "/api/jobs/{id}", tag: "Jobs", access: Access::SignedIn,
         summary: "One job, with its chart",
-        description: "The row, plus the training metrics and samples belonging to it.",
+        description: "The row, plus the training metrics and samples belonging to it; \
+                      for a LoRA run, its measurements and the pictures it drew.",
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
@@ -650,14 +668,15 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       landing between the two is seen rather than lost — and may \
                       therefore be seen twice, which is why every update is keyed.",
         query: &[], body: None, produces: SSE,
-        events: &[("update", "One of `status`, `download`, `metric`, `sample`, `pace`, \
-                              `progress`, `case`, `scored`, `timing`, or `ended`.")],
+        events: &[("update", "One of `status`, `download`, `metric`, `sample`, `stepped`, \
+                              `measured`, `picture`, `pace`, `progress`, `case`, `scored`, \
+                              `timing`, or `ended`.")],
     },
 
     // -- Datasets -----------------------------------------------------------
     Endpoint {
         method: "get", path: "/api/datasets", tag: "Datasets", access: Access::Admin,
-        summary: "The text files runs are trained on",
+        summary: "The texts and sets of pictures runs are trained on",
         description: "", query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
@@ -694,6 +713,44 @@ pub const ENDPOINTS: &[Endpoint] = &[
         method: "delete", path: "/api/datasets/{id}", tag: "Datasets", access: Access::Admin,
         summary: "Delete a dataset",
         description: "", query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "put", path: "/api/datasets/pictures/{name}/{file}", tag: "Datasets", access: Access::Admin,
+        summary: "Upload one file of a set of pictures",
+        description: "A picture (`jpg`, `jpeg`, `png`, `webp`, `bmp`) or the `.txt` of \
+                      the same name that captions one; the body is the file. It waits \
+                      beside the others sent under this name, and is not a dataset \
+                      until `POST /api/datasets/pictures/{name}` makes one of them.",
+        query: &[],
+        body: Some(Body { content_type: "application/octet-stream", description: "The file." }),
+        produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "post", path: "/api/datasets/pictures/{name}", tag: "Datasets", access: Access::Admin,
+        summary: "Make a dataset of the pictures uploaded",
+        description: "Every picture is decoded, as the trainer will decode it, and \
+                      must have a caption. If anything is wrong nothing is kept, and \
+                      the answer names all of it at once: each picture with no caption \
+                      or an empty one, each caption with no picture, each file that is \
+                      not a picture. The upload stays, so the fix is the files that \
+                      were missing and this again.",
+        query: &[("caption", false, "The caption of every picture that has none beside it.")],
+        body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "delete", path: "/api/datasets/pictures/{name}", tag: "Datasets", access: Access::Admin,
+        summary: "Throw away an upload that was not kept",
+        description: "", query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/datasets/{id}/pictures", tag: "Datasets", access: Access::Admin,
+        summary: "The pictures of a set, each with its caption",
+        description: "", query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/datasets/{id}/pictures/{file}", tag: "Datasets", access: Access::Admin,
+        summary: "One picture of a set",
+        description: "", query: &[], body: None, produces: "image/*", events: &[],
     },
     Endpoint {
         method: "get", path: "/api/datasets/{id}/check", tag: "Datasets", access: Access::Admin,

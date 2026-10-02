@@ -75,11 +75,18 @@ pub const JOBS: &str = "usage: kvad jobs [ls] [--limit N]
        kvad jobs show ID
        kvad jobs watch ID      follow it until it ends
        kvad jobs cancel ID     ask it to stop
+       kvad jobs samples ID [--out DIR]
+                               the pictures a LoRA run drew, as N-STEP.png
+                               for prompt N (default DIR: job-ID-samples)
 
 Downloads, training runs, evals and benchmarks, in one history.";
 
 pub const DATASETS: &str = "usage: kvad datasets [ls]
        kvad datasets add FILE [--name NAME]
+       kvad datasets add DIR [--name NAME] [--caption TEXT]
+                               a folder of pictures, each with its caption in
+                               a .txt of the same name; --caption is the
+                               caption of every picture that has none
        kvad datasets crawl URL --name NAME [--pages N] [--mb F] [--pause MS]
                                            [--drop-rare N] [--same-host]
        kvad datasets show ID
@@ -181,6 +188,52 @@ pub fn jobs(remote: &Remote, args: &Args) -> Res<()> {
             if let Some(last) = out::items(&job["samples"]).last() {
                 println!("\nsample at step {}:\n{}", out::s(&last["step"]), out::s(&last["text"]));
             }
+            // A LoRA run's chart: the validation loss, step 0 being the
+            // model without the LoRA.
+            let measures = out::items(&job["measures"]);
+            if !measures.is_empty() {
+                println!();
+                let number = |v: &Value, places: usize| v.as_f64().map_or(String::new(), |f| format!("{f:.places$}"));
+                let rows: Vec<Vec<String>> = measures
+                    .iter()
+                    .map(|m| {
+                        vec![
+                            out::s(&m["step"]),
+                            number(&m["val_loss"], 4),
+                            number(&m["train_loss"], 4),
+                            number(&m["secs_per_step"], 1),
+                            if m["saved"] == true { "saved".into() } else { String::new() },
+                        ]
+                    })
+                    .collect();
+                out::table(&["STEP", "VALIDATION", "TRAIN", "S/STEP", "KEPT"], &rows);
+            }
+            if let Some(file) = job["result"]["handle"].as_str().filter(|_| job["result"]["measured"] == true) {
+                println!("\nthe LoRA: {file}");
+            }
+            let drawn = out::items(&job["pictures"]).len();
+            if drawn > 0 {
+                println!("{drawn} samples drawn:  kvad jobs samples {id}");
+            }
+            Ok(())
+        }
+        "samples" => {
+            let id = super::id(needs(words, "a job's id", JOBS))?;
+            let job = remote.get(&format!("/api/jobs/{id}"))?;
+            let pictures = out::items(&job["pictures"]);
+            if pictures.is_empty() {
+                println!("job {id} drew no samples");
+                return Ok(());
+            }
+            let dir = std::path::PathBuf::from(args.out.clone().unwrap_or_else(|| format!("job-{id}-samples")));
+            std::fs::create_dir_all(&dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+            for p in pictures {
+                let (step, prompt) = (p["step"].as_i64().unwrap_or(0), p["prompt"].as_i64().unwrap_or(0));
+                // Named as `kvad-gpu tune` names them: a prompt's samples in
+                // a row, in the order they were drawn.
+                remote.download(&format!("/api/jobs/{id}/samples/{step}/{prompt}"), &dir.join(format!("{}-{step:05}.png", prompt + 1)))?;
+            }
+            println!("{} samples in {}", pictures.len(), dir.display());
             Ok(())
         }
         "watch" => {
@@ -330,6 +383,20 @@ pub fn watch(remote: &Remote, id: i64, raw: bool) -> Res<()> {
             // train` prints in this process. The words are printed; the chart
             // is `kvad jobs show`.
             "metric" | "sample" => {}
+            // A LoRA run's steps are seconds each, so each is shown as it
+            // lands, on one line. Its measurements are said in its own
+            // words, as a text run's are, and the chart is `kvad jobs show`.
+            "stepped" => progress.show(format!(
+                "  step {} of {} · {:.1} s",
+                out::s(&u["step"]),
+                out::s(&u["steps"]),
+                u["secs"].as_f64().unwrap_or(0.0)
+            )),
+            "measured" => {}
+            "picture" => {
+                progress.done();
+                println!("  drew sample {} at step {}", u["prompt"].as_i64().unwrap_or(0) + 1, out::s(&u["step"]));
+            }
             "case" => {
                 progress.done();
                 println!(
@@ -423,8 +490,11 @@ pub fn datasets(remote: &Remote, args: &Args) -> Res<()> {
                         out::s(&d["id"]),
                         out::s(&d["name"]),
                         out::bytes(&d["bytes"]),
-                        out::s(&d["characters"]),
-                        out::s(&d["distinct"]),
+                        // What it holds: characters of text, or pictures.
+                        match d["kind"] == "pictures" {
+                            true => format!("{} pictures", out::s(&d["items"])),
+                            false => format!("{} characters, {} distinct", out::s(&d["characters"]), out::s(&d["distinct"])),
+                        },
                         match d["present"] == false {
                             true => "its file is gone".into(),
                             false => out::s(&d["source"]),
@@ -432,11 +502,20 @@ pub fn datasets(remote: &Remote, args: &Args) -> Res<()> {
                     ]
                 })
                 .collect();
-            out::table(&["ID", "NAME", "SIZE", "CHARACTERS", "DISTINCT", "FROM"], &rows);
+            out::table(&["ID", "NAME", "SIZE", "HOLDS", "FROM"], &rows);
             Ok(())
         }
         "add" => {
             let file = needs(words, "a file", DATASETS);
+            // A folder is pictures and their captions.
+            if std::path::Path::new(file).is_dir() {
+                let made = super::models::upload_pictures(remote, file, args.name.as_deref(), args.caption.as_deref())?;
+                match args.json {
+                    true => out::json(&made),
+                    false => println!("dataset {} `{}`: {} pictures, {}", out::s(&made["id"]), out::s(&made["name"]), out::s(&made["items"]), out::bytes(&made["bytes"])),
+                }
+                return Ok(());
+            }
             let text = std::fs::read_to_string(file).map_err(|e| format!("could not read {file}: {e}"))?;
             let name = args.name.clone().unwrap_or_else(|| {
                 std::path::Path::new(file).file_stem().map_or("corpus".into(), |s| s.to_string_lossy().into_owned())
@@ -484,6 +563,14 @@ pub fn datasets(remote: &Remote, args: &Args) -> Res<()> {
                 return Ok(());
             }
             println!("dataset {} `{}`", out::s(&d["id"]), out::s(&d["name"]));
+            if d["kind"] == "pictures" {
+                println!("  {} · {} pictures · added {}\n", out::bytes(&d["bytes"]), out::s(&d["items"]), out::s(&d["created_at"]));
+                let set = remote.get(&format!("/api/datasets/{id}/pictures"))?;
+                let rows: Vec<Vec<String>> =
+                    out::items(&set["pictures"]).iter().map(|p| vec![out::s(&p["file"]), out::s(&p["caption"])]).collect();
+                out::table(&["PICTURE", "CAPTION"], &rows);
+                return Ok(());
+            }
             println!(
                 "  {} · {} characters, {} distinct · added {}",
                 out::bytes(&d["bytes"]),

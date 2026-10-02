@@ -740,7 +740,11 @@ impl Rig {
     /// `Sdxl::draw` runs, on the same noise, schedule and guidance, so
     /// that a sample is what a request with this LoRA, seed, size and
     /// step count draws. Nothing is recorded.
-    fn sample(&self, s: &Sampler, i: usize) -> Res<kvad::image::Image> {
+    ///
+    /// `stop` is asked before each denoising step, and a sample it ends is
+    /// `None`: a picture is over a minute at 1024², which is too long for
+    /// a run that was told to stop to go on drawing one.
+    fn sample(&self, s: &Sampler, i: usize, stop: &dyn Fn() -> bool) -> Res<Option<kvad::image::Image>> {
         let (ctx, summary) = &s.prompts[i];
         let guided = s.guidance > 1.0;
         // An empty negative prompt is zeros, as SDXL's pipeline has it.
@@ -756,6 +760,9 @@ impl Rig {
         self.adapters.recording(false);
         let drawn = (|| -> Res<()> {
             for k in 0..sched.steps() {
+                if stop() {
+                    return Ok(());
+                }
                 // A pool a step: see `pooled`.
                 x = pooled(|| -> Res<Tensor> {
                     let xin = (&x * sched.input_scale(k))?.to_dtype(self.dtype)?;
@@ -777,19 +784,26 @@ impl Rig {
         })();
         self.adapters.recording(true);
         drawn?;
+        if stop() {
+            settle(&self.device)?;
+            return Ok(None);
+        }
         check_latent(&x)?;
         let image = to_rgb8(&s.vae.decode(&x.to_dtype(self.dtype)?)?)?;
         // The decoder's activations are the largest buffers of a run, and
         // a dropped buffer is the device's until it is next waited for.
         settle(&self.device)?;
-        Ok(image)
+        Ok(Some(image))
     }
 
-    /// Every prompt drawn and written, as the LoRA is after `step` steps.
-    fn samples(&self, s: &Sampler, step: usize, watch: &mut dyn FnMut(Event)) -> Res<()> {
+    /// Every prompt drawn and written, as the LoRA is after `step` steps;
+    /// or as many as were drawn before `stop` said to.
+    fn samples(&self, s: &Sampler, step: usize, stop: &dyn Fn() -> bool, watch: &mut dyn FnMut(Event)) -> Res<()> {
         for i in 0..s.prompts.len() {
             let path = s.path(step, i);
-            let image = pooled(|| self.sample(s, i)).map_err(|e| format!("sample {} after step {step}: {e}", i + 1))?;
+            let Some(image) = pooled(|| self.sample(s, i, stop)).map_err(|e| format!("sample {} after step {step}: {e}", i + 1))? else {
+                return Ok(());
+            };
             std::fs::write(&path, image.png())?;
             watch(Event::Sampled { step, prompt: i, path });
         }
@@ -875,6 +889,7 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
         rig.trained as f64 / 1e6
     ));
 
+    let stopping = || opts.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
     let base_val = rig.measure(&measured, &noising)?;
     watch(Event::Measured { step: 0, val_loss: base_val });
     out(&format!("before the first step: validation loss {base_val:.4}"));
@@ -888,8 +903,11 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
     let mut sampling_secs = 0.0;
     if let Some(s) = &sampler {
         let t = Instant::now();
-        rig.samples(s, 0, watch)?;
+        rig.samples(s, 0, &stopping, watch)?;
         sampling_secs = t.elapsed().as_secs_f64();
+    }
+    // Said of samples that were drawn, not of ones a stop cut short.
+    if let Some(s) = sampler.as_ref().filter(|_| !stopping()) {
         out(&format!(
             "{} sample(s) at {}×{}, {} steps each, in {sampling_secs:.0} s, and again at every measurement: {}; {:.1} GB at most so far",
             opts.samples.len(),
@@ -908,7 +926,7 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
     let (mut pass, mut stopped, mut taken) = (Vec::new(), false, 0);
     let (mut since, mut since_secs, mut said_pace) = (Vec::new(), 0.0, false);
     for step in 1..=opts.steps {
-        if opts.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+        if stopping() {
             stopped = true;
             break;
         }
@@ -969,7 +987,7 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
                 watch(Event::Saved { step, val_loss: last_val });
             }
             if let Some(s) = &sampler {
-                rig.samples(s, step, watch)?;
+                rig.samples(s, step, &stopping, watch)?;
             }
         }
     }

@@ -29,6 +29,11 @@
 //! long, so the second is refused rather than queued — an hour of waiting
 //! with no way to see why is worse than being told now. Downloads have no
 //! such limit; they are waiting on a network.
+//!
+//! A LoRA run for an image model is a training run too, and the one of them
+//! that is not on `nervus`'s threads: it is on the GPU, in a process of its
+//! own, and charged to the memory the models are. [`crate::tune`] has it.
+//! Which loop a run was is in its parameters ([`Params`]).
 
 use crate::db::Db;
 use crate::scheduler::Progress;
@@ -75,6 +80,33 @@ pub struct Metric {
 pub struct Sample {
     pub step: i64,
     pub text: String,
+}
+
+/// One measurement of a LoRA run: the validation loss after `step` steps.
+///
+/// Not a [`Metric`], because a diffusion run does not have a `Metric`'s
+/// numbers. Step 0 is the model before it has taken a step, with no training
+/// loss at all; and the training loss there is, the mean since the last
+/// measurement, says mostly which noise levels those steps drew. The chart is
+/// of `val_loss`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Measure {
+    pub step: i64,
+    pub val_loss: f64,
+    pub train_loss: Option<f64>,
+    pub secs_per_step: Option<f64>,
+    pub elapsed_secs: f64,
+    pub saved: bool,
+}
+
+/// A picture a LoRA run drew at a measurement: of the prompt numbered
+/// `prompt` from 0, after `step` steps. `url` is where the file is served;
+/// the picture itself is never in the stream.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Drawn {
+    pub step: i64,
+    pub prompt: i64,
+    pub url: String,
 }
 
 /// One case of a prompt suite, run against one variant.
@@ -127,6 +159,10 @@ pub enum Update {
     Download { file: String, bytes: u64, total: u64 },
     Metric(Metric),
     Sample(Sample),
+    /// One step of a run that says so: a LoRA's, which are seconds each.
+    Stepped { step: usize, steps: usize, loss: f64, secs: f64 },
+    Measured(Measure),
+    Picture(Drawn),
     /// Work done out of work to do, in whatever units the job counts in.
     Progress { done: usize, total: usize },
     Case(Case),
@@ -228,6 +264,53 @@ impl Jobs {
             let rows =
                 q.query_map([id], |r| Ok(Sample { step: r.get(0)?, text: r.get(1)? }))?.collect();
             rows
+        })
+    }
+
+    pub fn measures(&self, id: i64) -> Res<Vec<Measure>> {
+        self.db.with(|c| {
+            let mut q = c.prepare(
+                "SELECT step, val_loss, train_loss, secs_per_step, elapsed_secs, saved
+                 FROM tune_metrics WHERE job = ?1 ORDER BY step",
+            )?;
+            let rows = q
+                .query_map([id], |r| {
+                    Ok(Measure {
+                        step: r.get(0)?,
+                        val_loss: r.get(1)?,
+                        train_loss: r.get(2)?,
+                        secs_per_step: r.get(3)?,
+                        elapsed_secs: r.get(4)?,
+                        saved: r.get::<_, i64>(5)? != 0,
+                    })
+                })?
+                .collect();
+            rows
+        })
+    }
+
+    pub fn pictures(&self, id: i64) -> Res<Vec<Drawn>> {
+        self.db.with(|c| {
+            let mut q = c.prepare("SELECT step, prompt FROM tune_samples WHERE job = ?1 ORDER BY step, prompt")?;
+            let rows = q
+                .query_map([id], |r| {
+                    let (step, prompt) = (r.get(0)?, r.get(1)?);
+                    Ok(Drawn { step, prompt, url: sample_url(id, step, prompt) })
+                })?
+                .collect();
+            rows
+        })
+    }
+
+    /// The file a run's sample is in, for serving it.
+    pub fn picture_file(&self, id: i64, step: i64, prompt: i64) -> Res<Option<String>> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT file FROM tune_samples WHERE job = ?1 AND step = ?2 AND prompt = ?3",
+                params![id, step, prompt],
+                |r| r.get(0),
+            )
+            .optional()
         })
     }
 
@@ -374,14 +457,29 @@ impl Jobs {
     }
 }
 
+/// Where a run's sample is served from.
+pub fn sample_url(job: i64, step: i64, prompt: i64) -> String {
+    format!("/api/jobs/{job}/samples/{step}/{prompt}")
+}
+
 pub fn row(r: &rusqlite::Row) -> rusqlite::Result<Job> {
     let json = |s: Option<String>| s.and_then(|s| serde_json::from_str(&s).ok());
+    let kind: String = r.get("kind")?;
+    let params: serde_json::Value = json(r.get("params")?).unwrap_or(serde_json::Value::Null);
+    // A training run says which loop it was, whenever it was written: a row
+    // from before there were two is read as the text run it was, and
+    // answered with `loop` beside its fields like any other. What cannot be
+    // read as either is passed on as it is stored.
+    let params = match kind.as_str() {
+        "train" => Params::read(&params).ok().and_then(|p| serde_json::to_value(p).ok()).unwrap_or(params),
+        _ => params,
+    };
     Ok(Job {
         id: r.get("id")?,
-        kind: r.get("kind")?,
+        kind,
         state: r.get("state")?,
         label: r.get("label")?,
-        params: json(r.get("params")?).unwrap_or(serde_json::Value::Null),
+        params,
         result: json(r.get("result")?),
         error: r.get("error")?,
         created_at: r.get("created_at")?,
@@ -584,6 +682,62 @@ pub struct TrainParams {
     pub seed: u64,
 }
 
+/// What a LoRA run for an image model was asked for.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LoraParams {
+    /// What the LoRA is called: `loras/NAME.safetensors` in the data
+    /// directory.
+    pub name: String,
+    /// A LoRA trained here, by name, that this run goes on from.
+    pub from: Option<String>,
+    /// The model it is a LoRA for.
+    pub model: String,
+    pub dataset: i64,
+    pub dataset_name: String,
+    /// Pixels a side.
+    pub size: usize,
+    pub rank: usize,
+    pub alpha: Option<f64>,
+    pub steps: usize,
+    pub lr: f64,
+    pub eval_every: usize,
+    pub holdout: Option<usize>,
+    /// The prompts drawn at every measurement.
+    pub samples: Vec<String>,
+    pub sample_size: Option<usize>,
+    pub sample_steps: usize,
+    pub seed: u64,
+    /// What admission charged the run, in bytes.
+    pub charged: u64,
+}
+
+/// What a training run was asked for, whichever loop it is.
+///
+/// One variant a loop, and not one struct with fields only some loops read:
+/// a text run's `size` is the name of a shape and its `sample` a count of
+/// characters, and a LoRA's `size` is pixels and its samples are prompts.
+/// `loop` says which, in the stored JSON, beside the variant's own fields.
+///
+/// A row written before there was more than one loop has no `loop`, and is
+/// a text run: [`Params::read`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "loop", rename_all = "snake_case")]
+pub enum Params {
+    Text(TrainParams),
+    Lora(LoraParams),
+}
+
+impl Params {
+    /// A training job's `params`, as whichever loop wrote them.
+    pub fn read(stored: &serde_json::Value) -> Res<Params> {
+        Ok(match stored.get("loop").and_then(|l| l.as_str()) {
+            None | Some("text") => Params::Text(serde_json::from_value(stored.clone())?),
+            Some("lora") => Params::Lora(serde_json::from_value(stored.clone())?),
+            Some(other) => return Err(format!("`{other}` is not a training loop this server has").into()),
+        })
+    }
+}
+
 /// Train a model in the background.
 ///
 /// `opts` is built by the caller, because working out what a request means —
@@ -603,7 +757,7 @@ pub fn train(
         .clone()
         .or_else(|| params.from.clone())
         .unwrap_or_else(|| "training".into());
-    let id = jobs.create("train", &label, &serde_json::to_value(&params)?, owner)?;
+    let id = jobs.create("train", &label, &serde_json::to_value(Params::Text(params))?, owner)?;
     let (cancel, events) = jobs.register(id);
     // The flag Phase 0 put on `Training::stop`, read once a step.
     opts.cancel = Some(Arc::clone(&cancel));
@@ -746,6 +900,8 @@ fn from_fetch(f: kvad::weights::Fetch) -> Option<Update> {
 pub fn history(jobs: &Jobs, id: i64) -> Res<Vec<Update>> {
     let mut updates: Vec<Update> = jobs.metrics(id)?.into_iter().map(Update::Metric).collect();
     updates.extend(jobs.samples(id)?.into_iter().map(Update::Sample));
+    updates.extend(jobs.measures(id)?.into_iter().map(Update::Measured));
+    updates.extend(jobs.pictures(id)?.into_iter().map(Update::Picture));
     updates.extend(jobs.cases(id)?.into_iter().map(Update::Case));
     updates.extend(jobs.timings(id)?.into_iter().map(Update::Timing));
     Ok(updates)
@@ -873,6 +1029,49 @@ mod tests {
             Update::Sample(s) => assert_eq!(s.text, "abc"),
             other => panic!("expected a sample, got {other:?}"),
         }
+    }
+
+    /// The check #77 asks for: a text run's row from before the parameters
+    /// were an enum still reads, as the text run it was; and each loop's
+    /// row says which loop it is and reads back as it was written.
+    #[test]
+    fn a_run_from_before_there_were_two_loops_reads_as_a_text_run() {
+        // As `jobs::train` stored it before this change, key for key.
+        let old = serde_json::json!({
+            "name": "shakespeare", "from": null, "dataset": 3, "dataset_name": "tiny",
+            "size": "small", "steps": 2000, "lr": 0.001, "eval_every": 100, "threads": 8,
+            "sample": 160, "seed": 1337
+        });
+        match Params::read(&old).unwrap() {
+            Params::Text(t) => assert_eq!((t.size.as_str(), t.steps, t.sample, t.dataset), ("small", 2000, 160, 3)),
+            other => panic!("an old row read as {other:?}"),
+        }
+
+        let text: TrainParams = serde_json::from_value(old.clone()).unwrap();
+        let stored = serde_json::to_value(Params::Text(text)).unwrap();
+        assert_eq!(stored["loop"], "text");
+        // The fields stay where a page that reads `params.size` finds them.
+        assert_eq!((&stored["size"], &stored["dataset_name"]), (&old["size"], &old["dataset_name"]));
+
+        let lora = LoraParams {
+            name: "my-style".into(), from: None, model: "stabilityai/stable-diffusion-xl-base-1.0".into(),
+            dataset: 4, dataset_name: "photos".into(), size: 1024, rank: 16, alpha: None, steps: 1000, lr: 1e-4,
+            eval_every: 100, holdout: None, samples: vec!["a lighthouse".into()], sample_size: Some(512),
+            sample_steps: 20, seed: 1337, charged: 12_100_000_000,
+        };
+        let stored = serde_json::to_value(Params::Lora(lora.clone())).unwrap();
+        assert_eq!((&stored["loop"], &stored["size"]), (&serde_json::json!("lora"), &serde_json::json!(1024)));
+        match Params::read(&stored).unwrap() {
+            Params::Lora(back) => assert_eq!(back, lora),
+            other => panic!("a LoRA's row read as {other:?}"),
+        }
+        assert!(Params::read(&serde_json::json!({ "loop": "video" })).is_err());
+
+        // And the row itself, read back, says which loop it was.
+        let jobs = jobs();
+        let id = jobs.create("train", "shakespeare", &old, None).unwrap();
+        let job = jobs.get(id).unwrap().unwrap();
+        assert_eq!((&job.params["loop"], &job.params["size"]), (&serde_json::json!("text"), &serde_json::json!("small")));
     }
 
     /// Deleting a job takes its chart with it, which needs foreign keys on.

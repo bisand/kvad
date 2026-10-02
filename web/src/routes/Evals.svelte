@@ -169,7 +169,7 @@
           <span class="opacity-70">Held-out text</span>
           <select class="select select-sm min-w-56" bind:value={dataset}>
             <option value={null}>Pick a dataset…</option>
-            {#each training.datasets as d (d.id)}
+            {#each training.datasets.filter((d) => d.kind !== "pictures") as d (d.id)}
               <option value={d.id}>{d.name} ({d.characters.toLocaleString()} characters)</option>
             {/each}
           </select>

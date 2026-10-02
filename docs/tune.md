@@ -1,8 +1,9 @@
 # Training a LoRA for an image model
 
-Written 2026-10-01 for [#75](https://github.com/bisand/kvad/issues/75). The
-first part of it: the training loop itself, for SDXL, run in the process
-that asks for it. What is not here yet is at the end.
+Written 2026-10-01 for [#75](https://github.com/bisand/kvad/issues/75): the
+training loop itself, for SDXL, run in the process that asks for it. The
+same loop as a job on the server, [#77](https://github.com/bisand/kvad/issues/77),
+is under "Through the service". What is not here yet is at the end.
 
 ```bash
 kvad-gpu tune --data ./my-photos --name my-style
@@ -173,11 +174,83 @@ runs the four checks that need SDXL's weights; the last is that the file a
 run writes, set on the UNet as a request sets a LoRA, gives the answer the
 run's own factors gave, to the bit.
 
+## Through the service
+
+```bash
+kvad tune --data ./my-photos --name my-style --sample "a lighthouse, my-style"
+kvad jobs show 12          # the validation loss at each measurement
+kvad jobs samples 12       # what it drew, as N-STEP.png for prompt N
+```
+
+`kvad tune` uploads the folder as a dataset and starts the run as a job, as
+`kvad train` does with a text; `--dataset NAME` trains on pictures the
+server already has. The job is followed like any other, and outlives the
+command that started it.
+
+In the web UI it is the same two pages a text run uses. **Datasets** takes
+the pictures and their captions and shows a set's pictures; **Training**
+has "A LoRA for images" beside "A language model", says what the run will
+be charged before it starts, and shows the run as it goes: the validation
+loss alone on the chart, for the reason given above, with step 0 the model
+without the LoRA; and the samples as a grid, a row a prompt and a column a
+measurement, so that a row reads as what was learned.
+
+**The pictures are checked before there is a dataset.** They go up a file
+at a time and are then made into a dataset together, or not at all. Every
+picture is decoded with `ffmpeg`, as the trainer will decode it, and must
+have a caption. A picture with no caption, an empty caption, a caption with
+no picture and a file that is not a picture are each named, all of them in
+one answer, where a run would find them one at a time after loading two
+text encoders. `--caption TEXT` is the caption of every picture that has
+none, and is written beside each as its `.txt`.
+
+**The run is a process of its own.** The server starts itself again as
+`kvad-serve tune-worker`, hands it the run, and reads what it does a line at
+a time (`crates/serve/src/tune.rs`). A run that does not fit has to end
+itself, and the trainer's guard does that by ending the process at a
+ceiling on its footprint; in the server that would be the server and every
+model it holds. And a process that has held 10 GB of GPU buffers does not
+give all of it back while it lives, which a server up for weeks would keep.
+What it costs is that the worker loads the UNet itself: one the server
+holds for drawing is not shared with it.
+
+**It is charged to the memory budget, as a model is.** A run asks for what
+was measured above and 1.5 GB over, and is refused, saying what is in the
+way, if that much is not left beside the models in memory:
+
+| size | charged | drawing samples |
+|---|---|---|
+| 512² | 8.6 GB | 10.2 GB |
+| 768² | 10.0 GB | 10.2 GB |
+| 1024² | 12.1 GB | 12.1 GB |
+
+The worker ends itself 2 GB past that. Sizes over 1024² are refused: what
+they take has not been measured. One run at a time, a text run or this.
+
+One run through it, on the M5 Pro: six pictures at 512², one 512² sample of
+8 steps at each measurement. A step is 1.9 s, as it is in `kvad-gpu tune`,
+and the worker reached 8.5 GB, under the 10.2 it was charged. The server
+itself was 18 MB afterwards.
+
+**Stopping** a job ends the run after the step it is in, or the denoising
+step if it is drawing a sample, which is seconds: 3 s, asked in the middle
+of a 1024² sample. It then measures where it
+is and writes its last step beside its best, as Ctrl-C does to `kvad-gpu
+tune`.
+
+**What is kept**: the LoRA in the data directory's `loras/NAME.safetensors`
+(and `NAME.last.safetensors`); each measurement, in the database, which is
+the chart; and each sample as a file under `tune-samples/JOB/`, which the
+job's events name and `GET /api/jobs/{id}/samples/{step}/{prompt}` serves.
+
 ## Not here yet
 
-- **`kvad tune` through the service**, as a job with its loss on a chart
-  (#77). `kvad-gpu tune` runs in its own process and needs the UNet's
-  memory to itself.
+- **A zip** of a dataset. Pictures are uploaded a file at a time.
+- **A trained LoRA in the Images page's list.** That list is of LoRAs
+  pulled from the Hub. One trained here is named by its file, which the run
+  reports: `kvad images make ... --lora FILE`.
+- **Training videos**, and an image model from scratch, from the same
+  pages: the rest of #77.
 - **Other models.** FLUX and Qwen-Image are refused by name: their blocks'
   gradients are checked (#74), and a step through all of them has not been
   made to fit or been measured. An SDXL checkpoint in one file is refused

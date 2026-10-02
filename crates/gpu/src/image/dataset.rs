@@ -250,7 +250,11 @@ fn key(parts: &[&str]) -> String {
 ///
 /// A picture is read again if its file, its caption, the model or the size
 /// has changed: all of them are in the name its reading is kept under.
-pub(crate) fn read_all(entries: &[Entry], repo: &str, side: usize, ffmpeg: &Path, device: &Device, cache: &Path, said: &mut dyn FnMut(&str)) -> Res<Vec<Seen>> {
+///
+/// `prompts` are read with them, each as the two text encoders read it,
+/// `[1, 77, 2048]` a token and `[1, 1280]` pooled, on the host: what a run
+/// draws its samples from, which it cannot read once the encoders are gone.
+pub(crate) fn read_all(entries: &[Entry], prompts: &[String], repo: &str, side: usize, ffmpeg: &Path, device: &Device, cache: &Path, said: &mut dyn FnMut(&str)) -> Res<(Vec<Seen>, Vec<(Tensor, Tensor)>)> {
     let mut readers: Option<Readers> = None;
     let mut seen = Vec::with_capacity(entries.len());
     let (mut fresh, mut enlarged) = (0, Vec::new());
@@ -298,9 +302,32 @@ pub(crate) fn read_all(entries: &[Entry], repo: &str, side: usize, ffmpeg: &Path
     if !enlarged.is_empty() {
         said(&format!("{} picture(s) are smaller than {side} pixels on their short side and were enlarged, which teaches blur: {}", enlarged.len(), enlarged.iter().take(6).cloned().collect::<Vec<_>>().join(", ")));
     }
+    let mut read = Vec::with_capacity(prompts.len());
+    for text in prompts {
+        let file = cache.join(format!("{}.safetensors", key(&["prompt 1", repo, text])));
+        let kept = candle_core::safetensors::load(&file, &Device::Cpu).ok().and_then(|mut t| Some((t.remove("ctx")?, t.remove("pooled")?)));
+        if let Some(pair) = kept {
+            read.push(pair);
+            continue;
+        }
+        if readers.is_none() {
+            said("loading the text encoders and the VAE's encoder");
+            readers = Some(Readers::load(repo, device, &Watcher::none())?);
+        }
+        let readers = readers.as_ref().expect("just loaded");
+        let (ctx, pooled) = crate::common::pooled(|| -> Res<(Tensor, Tensor)> {
+            let (ctx, pooled) = readers.caption(text)?;
+            Ok((ctx.to_device(&Device::Cpu)?, pooled.to_device(&Device::Cpu)?))
+        })?;
+        std::fs::create_dir_all(cache)?;
+        let aside = file.with_extension(format!("{}.part", std::process::id()));
+        candle_core::safetensors::save(&HashMap::from([("ctx", ctx.clone()), ("pooled", pooled.clone())]), &aside)?;
+        std::fs::rename(&aside, &file)?;
+        read.push((ctx, pooled));
+    }
     drop(readers);
     crate::common::settle(device)?;
-    Ok(seen)
+    Ok((seen, read))
 }
 
 #[cfg(test)]

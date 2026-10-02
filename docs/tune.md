@@ -54,6 +54,34 @@ validation loss is taken, and the LoRA is written if it is the lowest yet.
 The last step's is written beside it as `NAME.last.safetensors` where that
 is another.
 
+**4. Draws samples, if asked.** Each `--sample "a prompt"` is drawn before
+the first step and at every measurement, into `NAME.samples/` as
+`N-STEP.png` for the Nth prompt. A prompt's seed never changes, so a row of
+its samples differs by what the LoRA learned and by nothing else, and the
+first of the row is the model's own. It is the loop `kvad images` runs, on
+the same noise: a sample is what a request with that LoRA, seed, size and
+step count draws. The prompts are read by the text encoders with the
+captions, before the UNet is loaded, and the VAE's decoder, 0.1 GB, is kept
+for the run. Samples are 512² and 20 steps unless `--sample-size` and
+`--sample-steps` say otherwise. Measured on an M5 Pro, beside a run at 512²:
+16 s a sample, and a peak of 11.3 GB where the run without them reaches
+7.1. The steps between are as fast and their losses the same to the last
+digit, and two runs' samples are the same file.
+
+What a sample reaches is its own size's doing and not the run's, because it
+is the VAE's decoder that reaches it:
+
+| the run | samples | at most | without them |
+|---|---|---|---|
+| 512² | 512² | 11.3 GB | 7.1 GB |
+| 1024² | 512² | 11.3 GB | 10.4 GB |
+| 1024² | 768² | 18.3 GB | 10.4 GB |
+
+Over the 5.5 GB a loaded run holds, that is 5.8 GB at 512² and 12.8 at
+768²: it grows as the picture's area. By that law a 1024² sample reaches
+about 28 GB, which was not run. The run's `--cap` is what stands between a
+decode that does not fit and the machine.
+
 ## Why the training loss is not the number to watch
 
 How much noise there is to find decides most of a step's loss. At level 900
@@ -147,8 +175,9 @@ run's own factors gave, to the bit.
 - **`kvad tune` through the service**, as a job with its loss on a chart
   (#77). `kvad-gpu tune` runs in its own process and needs the UNet's
   memory to itself.
-- **Samples at checkpoints**: a few fixed prompts and seeds drawn at each
-  measurement. They need the VAE's decoder, whose peak at 1024² is 21 GB.
+- **Samples at SDXL's own size.** A 1024² sample would reach about 28 GB
+  beside a run, all of it the VAE's decoder, so samples are 512² by
+  default, where SDXL draws less well, until the decode is tiled.
 - **Other models.** FLUX and Qwen-Image are refused by name: their blocks'
   gradients are checked (#74), and a step through all of them has not been
   made to fit or been measured. An SDXL checkpoint in one file is refused

@@ -122,10 +122,11 @@
 
 use super::dataset::Seen;
 use super::lora::Adapters;
-use super::nn::{noise, uniform, Ctx, SplitMix};
-use super::schedule::Noising;
-use super::sdxl::{weights, PREFIXES};
+use super::nn::{check_latent, noise, to_rgb8, uniform, Ctx, SplitMix};
+use super::schedule::{self, Noising, Schedule};
+use super::sdxl::{weights, PREFIXES, VAE_REPO};
 use super::unet::{Unet, UnetConfig};
+use super::vae::{Decoder, VaeConfig};
 use super::{finish, open, read_json};
 use crate::common::{pooled, settle, Loader};
 use crate::qcache::Vault;
@@ -409,6 +410,17 @@ pub struct Options {
     /// Pictures held out of training to measure it on; without a number,
     /// see [`held_out`].
     pub holdout: Option<usize>,
+    /// Prompts drawn at every measurement, and before the first step, each
+    /// from a seed of its own that does not change: `seed`, `seed + 1` and
+    /// so on. With none, nothing is drawn and no VAE is loaded.
+    pub samples: Vec<String>,
+    /// Pixels a side of a sample, its denoising steps and its guidance.
+    pub sample_size: usize,
+    pub sample_steps: usize,
+    pub sample_guidance: f64,
+    /// The folder the samples are written to; without one, the LoRA's
+    /// file's name with `.samples` for its ending.
+    pub sample_dir: Option<PathBuf>,
     pub ffmpeg: PathBuf,
     /// Raised from another thread to end the run early.
     pub cancel: Option<Arc<AtomicBool>>,
@@ -430,6 +442,11 @@ impl Options {
             seed: 1337,
             eval_every: 100,
             holdout: None,
+            samples: Vec::new(),
+            sample_size: 512,
+            sample_steps: 20,
+            sample_guidance: 5.0,
+            sample_dir: None,
             ffmpeg: ffmpeg.to_path_buf(),
             cancel: None,
         }
@@ -448,6 +465,9 @@ pub enum Event {
     Measured { step: usize, val_loss: f32 },
     /// The LoRA was written, because this step is the best so far.
     Saved { step: usize, val_loss: f32 },
+    /// A sample was drawn after `step` steps, of the prompt numbered
+    /// `prompt` from 0, and written to `path`.
+    Sampled { step: usize, prompt: usize, path: PathBuf },
 }
 
 #[derive(Debug)]
@@ -465,6 +485,8 @@ pub struct Summary {
     pub best_val: f32,
     pub best_step: usize,
     pub last_val: f32,
+    /// The folder the samples are in, where any were asked for.
+    pub samples: Option<PathBuf>,
     pub steps: usize,
     pub elapsed_secs: f64,
     /// Whether [`Options::cancel`] ended it early.
@@ -670,6 +692,110 @@ impl Rig {
     }
 }
 
+/// What a run draws its samples with: the VAE's decoding half, which
+/// training has no other use for, and each prompt as the text encoders
+/// read it before they were let go.
+struct Sampler {
+    vae: Decoder,
+    scheduler: kvad::serde_json::Value,
+    /// Each prompt's `[1, 77, 2048]` and `[1, 1280]`, on the device.
+    prompts: Vec<(Tensor, Tensor)>,
+    side: usize,
+    steps: usize,
+    guidance: f64,
+    seed: u64,
+    dir: PathBuf,
+}
+
+impl Sampler {
+    fn load(opts: &Options, read: &[(Tensor, Tensor)], device: &Device, dtype: DType) -> Res<Self> {
+        let w = Watcher::none();
+        let vault = Vault::off();
+        let cx = Ctx { ld: Loader::new(None, device.clone(), &vault), dtype };
+        let (c, paths) = (read_json(&fetch_file(VAE_REPO, "config.json", &w)?)?, vec![fetch_file(VAE_REPO, "diffusion_pytorch_model.safetensors", &w)?]);
+        let r = open(&paths, dtype)?;
+        let vae = Decoder::load(&cx, &r, VaeConfig::from_json(&c)?)?;
+        finish("VAE", &paths, &r)?;
+        let scheduler = read_json(&fetch_file(&opts.repo, "scheduler/scheduler_config.json", &w)?)?;
+        // Checked now, not at the first measurement.
+        schedule::euler(&scheduler, opts.sample_steps)?;
+        let prompts = read.iter().map(|(ctx, pooled)| Ok((ctx.to_dtype(dtype)?.to_device(device)?, pooled.to_dtype(dtype)?.to_device(device)?))).collect::<Res<Vec<_>>>()?;
+        let dir = opts.sample_dir.clone().unwrap_or_else(|| opts.out.with_extension("samples"));
+        std::fs::create_dir_all(&dir)?;
+        settle(device)?;
+        Ok(Sampler { vae, scheduler, prompts, side: opts.sample_size, steps: opts.sample_steps, guidance: opts.sample_guidance, seed: opts.seed, dir })
+    }
+
+    /// Where the sample of prompt `i` after `step` steps goes: named so
+    /// that a folder's listing has one prompt's samples in a row, in the
+    /// order they were drawn.
+    fn path(&self, step: usize, i: usize) -> PathBuf {
+        self.dir.join(format!("{}-{step:05}.png", i + 1))
+    }
+}
+
+impl Rig {
+    /// One picture of prompt `i`, with the LoRA as it now is: the loop
+    /// `Sdxl::draw` runs, on the same noise, schedule and guidance, so
+    /// that a sample is what a request with this LoRA, seed, size and
+    /// step count draws. Nothing is recorded.
+    fn sample(&self, s: &Sampler, i: usize) -> Res<kvad::image::Image> {
+        let (ctx, summary) = &s.prompts[i];
+        let guided = s.guidance > 1.0;
+        // An empty negative prompt is zeros, as SDXL's pipeline has it.
+        let (ctx, summary) = match guided {
+            true => (Tensor::cat(&[&ctx.zeros_like()?, ctx], 0)?, Tensor::cat(&[&summary.zeros_like()?, summary], 0)?),
+            false => (ctx.clone(), summary.clone()),
+        };
+        let side = s.side as f64;
+        let ids = [side, side, 0.0, 0.0, side, side];
+        let sched: Schedule = schedule::euler(&s.scheduler, s.steps)?;
+        let f = s.vae.config().factor();
+        let mut x = (noise(s.seed + i as u64, &[1, 4, s.side / f, s.side / f], &self.device, DType::F32)? * sched.init_scale)?;
+        self.adapters.recording(false);
+        let drawn = (|| -> Res<()> {
+            for k in 0..sched.steps() {
+                // A pool a step: see `pooled`.
+                x = pooled(|| -> Res<Tensor> {
+                    let xin = (&x * sched.input_scale(k))?.to_dtype(self.dtype)?;
+                    let xin = if guided { Tensor::cat(&[&xin, &xin], 0)? } else { xin };
+                    let eps = self.unet.forward(&xin, sched.timesteps[k], &ctx, Some((&summary, &ids)))?.to_dtype(DType::F32)?;
+                    let eps = match guided {
+                        true => {
+                            let (u, c) = (eps.narrow(0, 0, 1)?, eps.narrow(0, 1, 1)?);
+                            (&u + ((c - &u)? * s.guidance)?)?
+                        }
+                        false => eps,
+                    };
+                    let next = (&x + (eps * sched.dt(k))?)?;
+                    settle(&self.device)?;
+                    Ok(next)
+                })?;
+            }
+            Ok(())
+        })();
+        self.adapters.recording(true);
+        drawn?;
+        check_latent(&x)?;
+        let image = to_rgb8(&s.vae.decode(&x.to_dtype(self.dtype)?)?)?;
+        // The decoder's activations are the largest buffers of a run, and
+        // a dropped buffer is the device's until it is next waited for.
+        settle(&self.device)?;
+        Ok(image)
+    }
+
+    /// Every prompt drawn and written, as the LoRA is after `step` steps.
+    fn samples(&self, s: &Sampler, step: usize, watch: &mut dyn FnMut(Event)) -> Res<()> {
+        for i in 0..s.prompts.len() {
+            let path = s.path(step, i);
+            let image = pooled(|| self.sample(s, i)).map_err(|e| format!("sample {} after step {step}: {e}", i + 1))?;
+            std::fs::write(&path, image.png())?;
+            watch(Event::Sampled { step, prompt: i, path });
+        }
+        Ok(())
+    }
+}
+
 /// Train a LoRA for SDXL on a folder of captioned pictures, saving the
 /// best as it goes, and say what happened.
 ///
@@ -683,7 +809,10 @@ impl Rig {
 ///    the mean square of what it got wrong; `backward`, a stretch at a
 ///    time; AdamW on the factors.
 /// 3. **Every `eval_every` steps** the validation loss is measured
-///    ([`Rig::measure`]) and the LoRA is written if it is the best yet.
+///    ([`Rig::measure`]) and the LoRA is written if it is the best yet;
+///    and each of [`Options::samples`] is drawn ([`Rig::sample`]), from
+///    the seed it was drawn from before the first step and at every
+///    measurement since, so that a row of them differs by what was learned.
 ///
 /// **The training loss says almost nothing.** How much noise there is to
 /// find decides most of it: at level 900 the picture is nearly all noise
@@ -702,10 +831,13 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
     if opts.rank == 0 || opts.steps == 0 || opts.eval_every == 0 {
         return Err("--rank, --steps and --eval-every are each at least 1".into());
     }
+    if !opts.samples.is_empty() && (opts.sample_size % 64 != 0 || !(256..=1536).contains(&opts.sample_size) || opts.sample_steps == 0) {
+        return Err(format!("--sample-size {} is not a multiple of 64 from 256 to 1536, or --sample-steps is 0", opts.sample_size).into());
+    }
     let scale = opts.alpha.map_or(1.0, |a| a / opts.rank as f64);
     let entries = super::dataset::folder(&opts.data, opts.caption.as_deref())?;
     out(&format!("{} pictures in {}, each to {}×{}", entries.len(), opts.data.display(), opts.size, opts.size));
-    let seen = super::dataset::read_all(&entries, &opts.repo, opts.size, &opts.ffmpeg, device, &super::dataset::cache_dir(), out)?;
+    let (seen, prompts) = super::dataset::read_all(&entries, &opts.samples, &opts.repo, opts.size, &opts.ffmpeg, device, &super::dataset::cache_dir(), out)?;
 
     // Which pictures are held out is drawn from the seed, and so is the
     // same for two runs to be compared.
@@ -744,6 +876,28 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
     let base_val = rig.measure(&measured, &noising)?;
     watch(Event::Measured { step: 0, val_loss: base_val });
     out(&format!("before the first step: validation loss {base_val:.4}"));
+
+    // The samples before the first step are the model's own, or those of
+    // the LoRA the run goes on from: what the later ones are held against.
+    let sampler = match opts.samples.is_empty() {
+        true => None,
+        false => Some(Sampler::load(opts, &prompts, device, DType::F16)?),
+    };
+    let mut sampling_secs = 0.0;
+    if let Some(s) = &sampler {
+        let t = Instant::now();
+        rig.samples(s, 0, watch)?;
+        sampling_secs = t.elapsed().as_secs_f64();
+        out(&format!(
+            "{} sample(s) at {}×{}, {} steps each, in {sampling_secs:.0} s, and again at every measurement: {}; {:.1} GB at most so far",
+            opts.samples.len(),
+            opts.sample_size,
+            opts.sample_size,
+            opts.sample_steps,
+            s.dir.display(),
+            crate::cap::peak() as f64 / 1e9
+        ));
+    }
 
     let mut opt = crate::adam::Adam::new(rig.vars.clone(), ParamsAdamW { lr: opts.lr, ..Default::default() })?;
     let numbers = seen[0].mean.elem_count();
@@ -788,8 +942,8 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
         // The second step on is the pace: the first compiles the kernels.
         if step == 3 && !said_pace {
             said_pace = true;
-            let left = (opts.steps - step) as f64 * secs + (opts.steps / opts.eval_every) as f64 * (measured.len() * MEASURED_AT.len()) as f64 * secs / 5.0;
-            out(&format!("{secs:.1} s a step: about {} for the {} steps left and their measurements", human(left), opts.steps - step));
+            let left = (opts.steps - step) as f64 * secs + (opts.steps / opts.eval_every) as f64 * ((measured.len() * MEASURED_AT.len()) as f64 * secs / 5.0 + sampling_secs);
+            out(&format!("{secs:.1} s a step: about {} for the {} steps left, their measurements{}", human(left), opts.steps - step, if sampler.is_some() { " and samples" } else { "" }));
         }
 
         if step % opts.eval_every == 0 || step == opts.steps {
@@ -812,6 +966,9 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
                 rig.save(scale, &opts.out)?;
                 watch(Event::Saved { step, val_loss: last_val });
             }
+            if let Some(s) = &sampler {
+                rig.samples(s, step, watch)?;
+            }
         }
     }
     // A run that was stopped, or whose last measurement was not its best,
@@ -833,7 +990,7 @@ pub fn run(opts: &Options, device: &Device, out: &mut dyn FnMut(&str), watch: &m
         }
         false => None,
     };
-    Ok(Summary { out: opts.out.clone(), last, layers: rig.layers, trained: rig.trained, pictures: train.len(), held_out: held.len(), base_val, best_val, best_step, last_val, steps: taken, elapsed_secs: started.elapsed().as_secs_f64(), stopped })
+    Ok(Summary { out: opts.out.clone(), last, layers: rig.layers, trained: rig.trained, pictures: train.len(), held_out: held.len(), base_val, best_val, best_step, last_val, samples: sampler.map(|s| s.dir), steps: taken, elapsed_secs: started.elapsed().as_secs_f64(), stopped })
 }
 
 /// Seconds, as a person says them.

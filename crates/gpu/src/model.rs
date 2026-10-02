@@ -595,7 +595,8 @@ impl Session for GpuLlama {
         let (ragged, whole) = tokens.split_at(tokens.len() % PREFILL_CHUNK);
         for part in std::iter::once(ragged).chain(whole.chunks(PREFILL_CHUNK)) {
             if !part.is_empty() {
-                logits = self.run(part)?;
+                // A pool a call, so a pool a token: see `pooled`.
+                logits = crate::common::pooled(|| self.run(part))?;
             }
         }
         Ok(logits)

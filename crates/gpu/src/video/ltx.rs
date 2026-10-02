@@ -32,7 +32,7 @@ use super::ltx_dit::{video_tokens, Dit, Shape};
 use super::ltx_sample::{dev_sigmas, guided, one_stage, refine, Guide, Latents, AUDIO_GUIDE, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
 use super::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
 use super::{ltx_audio, ltx_dfr, ltx_diffvae, ltx_duration, ltx_upsample, ltx_vae};
-use crate::common::settle;
+use crate::common::{pooled, settle};
 use crate::image::lora;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
@@ -892,7 +892,8 @@ impl Director for Ltx {
             })
             .collect::<Res<Vec<_>>>()
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(kvad::image::Refused(e.to_string())) })?;
-        let filmed = self.run(req, on_step);
+        // A pool a video, around the ones each step has: see `pooled`.
+        let filmed = pooled(|| self.run(req, on_step));
         self.loras.clear();
         // Whatever `run` held is dropped by now, and candle's Metal pool
         // lets it go only here. A generation that was cancelled, or failed,

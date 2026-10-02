@@ -1079,6 +1079,11 @@ pub(crate) fn settle(device: &Device) -> candle_core::Result<()> {
 /// at all, and what is autoreleased on it is never freed: a training run
 /// grew by 5 MB a step, 6 GB over a thousand, until each step was given a
 /// pool. Anything that runs for many steps on one thread wants one a step.
+///
+/// Inference leaks less and as surely: 1.5 kB a decoded token, 160 kB an
+/// image. So every `Session::forward` has a pool, every image
+/// (`lora::painting`), and every video and each of its steps
+/// (`ltx_sample`). `examples/pool_drift` measures it.
 pub fn pooled<T>(work: impl FnOnce() -> T) -> T {
     #[cfg(target_os = "macos")]
     return objc2::rc::autoreleasepool(|_| work());

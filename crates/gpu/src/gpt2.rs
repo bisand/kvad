@@ -363,7 +363,8 @@ impl Session for GpuGpt2 {
     fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
         let mut last = Vec::new();
         for chunk in tokens.chunks(PREFILL_CHUNK) {
-            last = self.run(chunk)?;
+            // A pool a call, so a pool a token: see `pooled`.
+            last = crate::common::pooled(|| self.run(chunk))?;
         }
         Ok(last)
     }

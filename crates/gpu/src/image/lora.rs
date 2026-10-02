@@ -28,7 +28,7 @@
 
 use super::Uncached;
 use kvad::lora::SPELLINGS;
-use crate::common::Proj;
+use crate::common::{pooled, Proj};
 use candle_core::{DType, Device, Tensor};
 use kvad::image::ImageRequest;
 use std::collections::HashMap;
@@ -472,7 +472,11 @@ impl Adapters {
 /// as [`kvad::image::Refused`], the asker's to change.
 ///
 /// Without LoRAs it only draws, and leaves the adapters as they stand.
+///
+/// The drawing has an autorelease pool of its own, as every image must on a
+/// thread that serves one after another: see [`pooled`].
 pub(crate) fn painting<T>(adapters: &Adapters, req: &ImageRequest, device: &Device, dtype: DType, draw: impl FnOnce() -> Res<T>) -> Res<T> {
+    let draw = || pooled(draw);
     if req.loras.is_empty() {
         return draw();
     }

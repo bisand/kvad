@@ -31,6 +31,9 @@ pub const USAGE: &str = "usage: kvad service <command>
 
 `stop` is for now: it starts again at the next login. `uninstall` is for good.
 
+`start` and `install` wait for the server to answer. When it does not, they
+print what it wrote as it stopped and exit 1.
+
 `status` exits 0 when the server answers, 1 when the service manager says it
 is running and nothing answers, and 3 when it is not running.";
 
@@ -261,38 +264,88 @@ fn uptime(secs: u64) -> String {
     }
 }
 
+/// What became of a service that was just started.
+enum Arrival {
+    Answering,
+    /// It ran and is gone, with how the manager says it ended. A server that
+    /// refuses its database or its address does this within a moment, and
+    /// launchd starts it again every ten seconds for as long as it is asked.
+    Exited(String),
+    /// Still there, and nothing at its address.
+    Quiet,
+}
+
 /// Wait for a server to answer, for up to `budget`.
 ///
 /// The socket opens early — before migrations have a chance to be slow, and
 /// long before the autoloaded model is in memory — so this is seconds, not
 /// the minute a load takes.
-fn await_answer(remote: &Remote, budget: Duration) -> bool {
+///
+/// It stops early for a service that has exited: waiting out the budget on a
+/// process that is not there is fifteen seconds of looking hopeful.
+fn await_answer(remote: &Remote, budget: Duration) -> Arrival {
     let until = Instant::now() + budget;
     loop {
         if !matches!(health(remote), Health::Silent(_)) {
-            return true;
+            return Arrival::Answering;
+        }
+        let state = daemon::state();
+        if let (false, Some(exit)) = (state.running, &state.last_exit) {
+            return Arrival::Exited(exit.clone());
         }
         if Instant::now() >= until {
-            return false;
+            // systemd calls a unit it is about to restart "activating", so a
+            // loop there gets this far with an exit status to show for it.
+            return match state.last_exit {
+                Some(exit) => Arrival::Exited(exit),
+                None => Arrival::Quiet,
+            };
         }
         std::thread::sleep(Duration::from_millis(250));
     }
 }
 
+/// See that a service just started answers, or fail with what it said.
+///
+/// A failure, not a remark. "Running, and not answering yet" with a zero
+/// exit was what an install printed over a server that could not open its
+/// database, and the installer above it went on to say kvad was installed.
+fn arrived(remote: &Remote, since: &daemon::Mark) -> Res<()> {
+    let what = match await_answer(remote, Duration::from_secs(15)) {
+        Arrival::Answering => {
+            println!("  answering at {}", remote.base);
+            return Ok(());
+        }
+        Arrival::Exited(exit) => format!(
+            "kvad-serve started and exited with {exit}; nothing answers at {}.",
+            remote.base
+        ),
+        Arrival::Quiet => format!("kvad-serve is running, and nothing answers at {}.", remote.base),
+    };
+    Err(with_its_words(what, since).into())
+}
+
+/// A failure to start, with what the server wrote on its way down.
+fn with_its_words(what: String, since: &daemon::Mark) -> String {
+    // `daemon`'s own failures end with where the log is; ours do not yet.
+    let log = daemon::where_the_log_is();
+    let what = what.strip_suffix(log.as_str()).unwrap_or(&what).trim_end();
+    let said = daemon::said_since(since);
+    if said.is_empty() {
+        return format!("{what}\n{log}");
+    }
+    let said: Vec<String> = said.iter().map(|l| format!("    {l}")).collect();
+    format!("{what}\nIt said:\n\n{}\n\n{log}", said.join("\n"))
+}
+
 fn start(_args: &Args) -> Res<()> {
     let (remote, _) = this_machine()?;
-    match daemon::start()? {
+    let since = daemon::mark();
+    match daemon::start().map_err(|e| with_its_words(e.to_string(), &since))? {
         false => println!("{} is already running", daemon::LABEL),
         true => println!("started {}", daemon::LABEL),
     }
-    match await_answer(&remote, Duration::from_secs(15)) {
-        true => println!("  answering at {}", remote.base),
-        false => {
-            println!("  not answering at {} yet.", remote.base);
-            println!("  {}", daemon::where_the_log_is());
-        }
-    }
-    Ok(())
+    arrived(&remote, &since)
 }
 
 fn stop() -> Res<()> {
@@ -379,14 +432,12 @@ fn install(args: &Args) -> Res<()> {
 
     println!("installing {} ({})", daemon::LABEL, daemon::manager_name());
     println!("  {} --bind {bind}", program.display());
-    daemon::install(&program, &bind)?;
+    let since = daemon::mark();
+    daemon::install(&program, &bind).map_err(|e| with_its_words(e.to_string(), &since))?;
     println!("  written to {}", daemon::unit_path().display());
 
     let remote = Remote::new(&reachable(addr), Why::Service)?;
-    match await_answer(&remote, Duration::from_secs(15)) {
-        true => println!("  answering at {}", remote.base),
-        false => println!("  running, and not answering at {} yet", remote.base),
-    }
+    arrived(&remote, &since)?;
     println!("  {}", daemon::where_the_log_is());
     println!("  stop it with: kvad service stop · remove it with: kvad service uninstall");
     // A user service dies with the last session unless lingering is on,

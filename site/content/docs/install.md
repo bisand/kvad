@@ -84,6 +84,11 @@ Run the install command again. An upgrade keeps the address the service is
 already installed with, stops the service before replacing the binaries
 underneath it, and starts it again afterwards.
 
+The installer then checks that the server answers at its address. If it does
+not within fifteen seconds, the installer says so and prints what `kvad-serve`
+wrote as it stopped. `kvad service install` and `kvad service start` do the
+same, and exit non-zero.
+
 ## Uninstall
 
 ```bash

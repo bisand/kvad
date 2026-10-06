@@ -80,6 +80,38 @@ pub const LTX_GGUF_FILES: [&str; 6] = [
     "model_patches/ltx-2.5-duration-head-bf16.safetensors",
 ];
 
+/// Whether `repo` is LTX-2.5, asking the disk and never the Hub.
+///
+/// Lightricks' own repo is LTX-2.5 whether it is here yet or not, so that a
+/// load of it can fetch the files it needs, and only those: the repo is
+/// 71 GB, and a generation reads about 66 GB of it.
+pub fn is_ltx(repo: &str) -> bool {
+    if repo.eq_ignore_ascii_case(LTX_REPO) {
+        return true;
+    }
+    // A GGUF of its DiT, here, whose card names it.
+    if crate::gguf::split(repo).is_some() {
+        return crate::gguf::local(repo).and_then(|l| l.base).is_some_and(|b| b.eq_ignore_ascii_case(LTX_REPO));
+    }
+    // By the file `crate::hub::pipeline` knows it by, asked directly: the
+    // listing would size every model in the cache to answer.
+    crate::weights::local_file(repo, LTX_DENOISER).is_some()
+}
+
+/// Fetch LTX-2.5's dev model and distilled LoRA ([`LTX_DEV_FILES`]) from
+/// `repo`, and nothing else: what `kvad pull REPO --dev` means. LTX's repo
+/// has no model index for a pull to read, and a load fetches the files the
+/// distilled model reads.
+pub fn pull_dev(repo: &str, progress: &mut dyn FnMut(&str), watch: &crate::weights::Watcher) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_ltx(repo) {
+        return Err(format!("--dev is for LTX-2.5's repo, and {repo} is not one").into());
+    }
+    LTX_DEV_FILES.iter().try_for_each(|f| {
+        progress(&format!("fetching {f}"));
+        crate::weights::fetch_file(repo, f, watch).map(|_| ())
+    })
+}
+
 /// Whether a pipeline, by name, makes videos rather than images.
 pub fn is_video_pipeline(name: &str) -> bool {
     name == LTX_PIPELINE || name == crate::dit::CLIP_PIPELINE

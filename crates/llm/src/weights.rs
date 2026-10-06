@@ -443,6 +443,16 @@ pub fn cached(repo_id: &str, filename: &str) -> Cached {
     }
 }
 
+/// `file` from `repo` if it is already on this machine: in a directory
+/// standing in for the repo, or in the Hub cache, at any revision it holds.
+pub fn local_file(repo: &str, file: &str) -> Option<PathBuf> {
+    if let Some(dir) = local_dir(repo) {
+        return Some(dir.join(file)).filter(|p| p.is_file());
+    }
+    let snapshots = crate::hub::cache_dir().join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
+    std::fs::read_dir(snapshots).ok()?.flatten().map(|e| e.path().join(file)).find(|p| p.is_file())
+}
+
 fn look(repo: &hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>, filename: &str) -> Cached {
     match repo.download_file().filename(filename.to_string()).local_files_only(true).send() {
         Ok(path) => Cached::Here(path),

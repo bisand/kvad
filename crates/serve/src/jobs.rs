@@ -466,10 +466,7 @@ pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>, dev: bool) -> Re
                 }),
             }),
             true if !crate::engine::is_ltx(&repo) => Err(format!("--dev is for LTX-2.5's repo, and {repo} is not one").into()),
-            true => kvad::video::LTX_DEV_FILES.iter().try_for_each(|f| {
-                progress(&format!("fetching {f}"));
-                kvad::weights::fetch_file(&repo, f, &watch).map(|_| ())
-            }),
+            true => kvad::video::pull_dev(&repo, &mut progress, &watch),
         };
 
         // `hf-hub` has no way to be interrupted, so a cancelled download is

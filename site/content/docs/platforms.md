@@ -58,6 +58,7 @@ with the conversation.
 | Stable Diffusion 1.5 | f16 | 1.9 GB |
 | SDXL | f16 | 6.4 GB |
 | FLUX.1-schnell | q8 | 18.3 GB |
+| FLUX.1-dev | q8 | 17 GB |
 | Qwen-Image | q8 | about 29 GB |
 
 The server will not load a model that does not fit beside the ones already in

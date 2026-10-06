@@ -134,9 +134,12 @@ class Images {
       preview: true,
       response_format: "url",
     };
-    // A model that takes no guidance refuses both, so neither is sent.
+    // A model refuses what it does not take, so that is not sent: guidance
+    // by one that draws without, a negative prompt by one that draws without
+    // or reads its guidance as a number (FLUX.1-dev).
     const guided = this.defaults?.takes_guidance ?? true;
-    if (guided && this.negative.trim()) body.negative_prompt = this.negative;
+    const negated = this.defaults?.takes_negative ?? guided;
+    if (negated && this.negative.trim()) body.negative_prompt = this.negative;
     if (this.width && this.height) body.size = `${this.width}x${this.height}`;
     if (this.steps) body.steps = this.steps;
     if (guided && this.guidance != null && this.guidance !== "") body.guidance_scale = Number(this.guidance);

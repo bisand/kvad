@@ -389,8 +389,11 @@ schnell's four steps need no guidance, so each is one forward pass:
 | denoise, per step | 7.3 s | 13.1 s |
 | VAE decode | 5.3 s | 9.6 s |
 
-(Single runs again. FLUX.1-dev takes guidance as an input and is refused by
-name until it has an implementation of its own.)
+(Single runs again.) FLUX.1-dev is the same transformer with the guidance
+scale as one more input, embedded as the timestep is, so it is guided in
+one pass a step and takes no negative prompt: 28 steps at guidance 3.5,
+3.7 s a step at 768² and 7.2 s at 1024²
+([docs/image-plan.md](image-plan.md)).
 
 The community's GGUFs of Qwen-Image's and FLUX.1-schnell's transformers load
 too, and of LTX-2.5's distilled DiT for its fast pipeline, by the repo and

@@ -132,7 +132,7 @@ pub struct Sdxl {
 /// SDXL's own answers. 30 steps and guidance 5: the middle of what
 /// Stability's own examples use. The model was trained at 1024², and the
 /// VAE needs multiples of 8.
-const DEFAULTS: Defaults = Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: true, edits: true };
+const DEFAULTS: Defaults = Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_negative: true, takes_loras: true, edits: true };
 
 /// The checkpoints distilled to a few steps, by the repo that holds them,
 /// and what each is made to be run at: `(repo, side, steps)`, and always

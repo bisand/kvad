@@ -243,7 +243,7 @@ impl Painter for Sd15 {
     fn defaults(&self) -> Defaults {
         // The model was trained at 512²; 25 steps and guidance 7.5 are what
         // its examples use.
-        Defaults { width: 512, height: 512, steps: 25, guidance: 7.5, multiple: 8, takes_guidance: true, takes_loras: true, edits: true }
+        Defaults { width: 512, height: 512, steps: 25, guidance: 7.5, multiple: 8, takes_guidance: true, takes_negative: true, takes_loras: true, edits: true }
     }
 
     fn summary(&self) -> String {

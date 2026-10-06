@@ -140,7 +140,7 @@ impl Painter for Drawer {
     fn defaults(&self) -> Defaults {
         let side = self.model.config().image;
         // `train_digits` draws its checkpoints at 20 steps and guidance 2.
-        Defaults { width: side, height: side, steps: 20, guidance: 2.0, multiple: side, takes_guidance: true, takes_loras: false, edits: false }
+        Defaults { width: side, height: side, steps: 20, guidance: 2.0, multiple: side, takes_guidance: true, takes_negative: true, takes_loras: false, edits: false }
     }
 
     fn summary(&self) -> String {

@@ -266,3 +266,63 @@ fn every_pipeline_has_a_pull() {
         assert!(!said.contains("implemented here"), "{class}: {said}");
     }
 }
+
+/// A GGUF in the cache as `repo`, `file` of it, with a card naming `base`.
+fn cache_gguf(repo: &str, file: &str, base: &str) {
+    cache_repo(repo, &[("README.md", &format!("---\nbase_model: {base}\n---\n")), (file, "")], &[]);
+}
+
+/// A pull of a GGUF fetches the file and what its base holds beside its
+/// denoiser, and not the base's own: the transformer's weights are not in
+/// the cache here, and the Hub is not asked for them. The backend is asked
+/// whether it runs the base before that, and a pull with none asks nothing.
+#[test]
+fn a_pull_of_a_gguf_fetches_its_base_but_the_denoiser() {
+    let _alone = alone();
+    cache_borrowed();
+    let shards = r#"{"weight_map": {"a": "w-00001-of-00002.safetensors", "b": "w-00002-of-00002.safetensors"}}"#;
+    let files = [
+        ("model_index.json", r#"{"_class_name": "FluxPipeline"}"#),
+        ("tokenizer_2/tokenizer.json", "{}"),
+        ("scheduler/scheduler_config.json", "{}"),
+        ("transformer/config.json", "{}"),
+        ("vae/config.json", "{}"),
+        ("vae/diffusion_pytorch_model.safetensors", ""),
+        ("text_encoder/config.json", "{}"),
+        ("text_encoder/model.safetensors", ""),
+        ("text_encoder_2/config.json", "{}"),
+        ("text_encoder_2/model.safetensors.index.json", shards),
+        ("text_encoder_2/w-00001-of-00002.safetensors", ""),
+        ("text_encoder_2/w-00002-of-00002.safetensors", ""),
+    ];
+    cache_repo("kvad-test/gguf-base", &files, &["text_encoder/model.safetensors.index.json"]);
+    cache_gguf("kvad-test/flux-gguf", "flux1-Q4_K_S.gguf", "kvad-test/gguf-base");
+
+    let before = ASKED.load(Ordering::SeqCst);
+    let asked = std::cell::RefCell::new(Vec::new());
+    let runs = |pipeline: &str, base: &str| -> Result<(), Box<dyn std::error::Error>> {
+        asked.borrow_mut().push(format!("{pipeline} {base}"));
+        Ok(())
+    };
+    kvad::pipeline::pull_gguf("kvad-test/flux-gguf:Q4_K_S", &runs, &mut |_| {}, &Watcher::none()).unwrap();
+    assert_eq!(*asked.borrow(), ["FluxPipeline kvad-test/gguf-base"]);
+
+    // A base the backend does not run is refused, in the backend's words.
+    let refused = kvad::pipeline::pull_gguf("kvad-test/flux-gguf:Q4_K_S", &|_, _| Err("patch size 2".into()), &mut |_| {}, &Watcher::none()).unwrap_err().to_string();
+    assert!(refused.contains("is a GGUF of kvad-test/gguf-base") && refused.contains("patch size 2"), "{refused}");
+
+    // A base whose denoiser is not read from a GGUF, by its model index.
+    cache_repo("kvad-test/gguf-xl", &[("model_index.json", r#"{"_class_name": "StableDiffusionXLPipeline"}"#)], &[]);
+    cache_gguf("kvad-test/xl-gguf", "xl-Q8_0.gguf", "kvad-test/gguf-xl");
+    let refused = kvad::pipeline::pull_gguf("kvad-test/xl-gguf:Q8_0", &|_, _| panic!("asked of a base no GGUF is read for"), &mut |_| {}, &Watcher::none()).unwrap_err().to_string();
+    assert!(refused.contains("a StableDiffusionXLPipeline"), "{refused}");
+
+    // LTX-2.5 has no model index, and is known by its name: its files but
+    // the DiT, and no question for the backend.
+    let files: Vec<(&str, &str)> = kvad::video::LTX_GGUF_FILES.iter().map(|f| (*f, "")).collect();
+    cache_repo(kvad::video::LTX_REPO, &files, &[]);
+    cache_gguf("kvad-test/ltx-gguf", "ltx-2.5-Q4_K_M.gguf", kvad::video::LTX_REPO);
+    kvad::pipeline::pull_gguf("kvad-test/ltx-gguf:Q4_K_M", &|_, _| panic!("LTX-2.5 is not asked about"), &mut |_| {}, &Watcher::none()).unwrap();
+
+    assert_eq!(ASKED.load(Ordering::SeqCst), before, "a GGUF's pull asked the Hub for a file the cache does not hold");
+}

@@ -951,15 +951,6 @@ impl QwenImage {
     }
 }
 
-/// Every file of `repo` this pipeline reads but its transformer's weights:
-/// what the pull of a GGUF of its transformer brings of the base. The same
-/// files [`QwenImage::load_with`] fetches for itself, and one of them the
-/// transformer's config, which a GGUF does not carry.
-pub(crate) fn fetch_base(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
-    progress(&format!("fetching what {repo} holds beside its transformer"));
-    kvad::pipeline::qwen::beside(repo, watch).map(|_| ())
-}
-
 /// Bytes for `params` weights at a quantisation, the way candle stores them.
 fn weight_bytes_at(params: usize, quant: Option<GgmlDType>) -> u64 {
     let per_block = |bytes: u64, block: u64| params as u64 * bytes / block;

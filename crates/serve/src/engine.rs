@@ -248,7 +248,7 @@ pub fn pull_pipeline(repo: &str, progress: &mut dyn FnMut(&str), watch: &kvad::w
 /// LoRA, named the same ways.
 pub fn pull_single(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weights::Watcher) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "gpu")]
-    return kvad_gpu::image::pull_single(name, progress, watch);
+    return kvad::pipeline::pull_single(name, progress, watch);
     #[cfg(not(feature = "gpu"))]
     {
         let _ = (progress, watch);

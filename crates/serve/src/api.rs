@@ -65,6 +65,7 @@ pub fn routes() -> Router<State> {
         .route("/api/keys", get(crate::accounts::list_keys).post(crate::accounts::create_key))
         .route("/api/keys/{id}", delete(crate::accounts::revoke_key))
         .merge(crate::training::routes())
+        .merge(crate::tuning::routes())
         .merge(crate::monitoring::routes())
         .merge(crate::playground::routes())
         .merge(crate::evals::routes())

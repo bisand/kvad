@@ -991,9 +991,15 @@ fn list_local() -> Res<()> {
     let mut row = |m: &hub::LocalModel, note: &str| {
         total += m.bytes;
         let marker = if active.as_deref() == Some(m.id.as_str()) { " *" } else { "" };
+        // A LoRA trained here is named by its path, and the end of a path
+        // is the part that tells one from another.
+        let name = match (&m.lora, m.id.chars().count()) {
+            (Some(_), n) if n > 46 => format!("…{}", m.id.chars().skip(n - 45).collect::<String>()),
+            _ => truncate(&m.id, 46),
+        };
         println!(
             "{:<46} {:<11} {:>9}{}{}",
-            truncate(&m.id, 46),
+            name,
             m.arch.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
             hub::human_bytes(m.bytes),
             marker,
@@ -1013,7 +1019,11 @@ fn list_local() -> Res<()> {
         }
         println!("{:<46} {:<11} {:>9}", "TRAINED HERE", "ARCH", "SIZE");
         for m in &trained {
-            row(m, if m.complete { "" } else { "  (unfinished — no weights)" });
+            row(m, match (m.complete, &m.lora) {
+                (_, Some(_)) => "  (a LoRA)",
+                (true, None) => "",
+                (false, None) => "  (unfinished — no weights)",
+            });
         }
     }
 

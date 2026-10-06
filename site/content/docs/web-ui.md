@@ -22,8 +22,8 @@ With the background service installed it is already there.
 | **Playground** | Raw completion, two models side by side, the tokeniser, and the probability of every token the model considered. |
 | **Images** | A prompt, the denoiser's settings, each step as it happens, and a gallery. |
 | **Videos** | Text or a picture to video, with sound: the generation as it goes, and a gallery. |
-| **Training** | Train a small model on a dataset, with its loss curve drawn as it falls. |
-| **Datasets** | Upload text, or crawl a documentation site into a corpus. |
+| **Training** | Train a small language model on a text, or a LoRA for SDXL on captioned pictures, with the loss drawn as it falls. |
+| **Datasets** | Upload text, crawl a documentation site into a corpus, or upload pictures and write their captions. |
 | **Evals** | Prompt suites across models, and perplexity on held-out text. |
 | **Benchmarks** | Variants measured against each other: interleaved rounds, medians and ranges. |
 | **Monitoring** | The machine, recent requests and what each route costs, and the log. |

@@ -886,6 +886,19 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
          server's machine, `kvad service restart` restarts the service through launchd \
          or systemd",
     ),
+    (
+        "post",
+        "/api/tune",
+        "no command yet: `kvad-gpu tune --data DIR --name NAME` trains the same LoRA from a \
+         folder, in the terminal that asks, without the server",
+    ),
+    ("get", "/api/tune/options", "what the Training page offers for a LoRA run; `kvad-gpu tune --help` says the same"),
+    ("get", "/api/jobs/{id}/pictures/{file}", "a PNG a LoRA run drew, for the Training page's <img>; `kvad-gpu tune --sample` writes them to a folder"),
+    ("post", "/api/datasets/pictures", "the Datasets page starting a folder of pictures; `kvad-gpu tune --data` reads any folder there is"),
+    ("get", "/api/datasets/{id}/pictures", "the Datasets page's view of that folder"),
+    ("put", "/api/datasets/{id}/files/{file}", "the Datasets page uploading one picture or caption into it"),
+    ("get", "/api/datasets/{id}/files/{file}", "a picture, for the Datasets page's <img>"),
+    ("delete", "/api/datasets/{id}/files/{file}", "the Datasets page taking one out"),
     ("get", "/api/data", "the Settings page's view of the data directory; on the server's machine, `du` sees it"),
     ("get", "/api/data/plan", "the Settings page asking before it moves the data"),
     (

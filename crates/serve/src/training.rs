@@ -54,6 +54,8 @@ pub struct Whole {
     job: Job,
     metrics: Vec<jobs::Metric>,
     samples: Vec<jobs::Sample>,
+    /// What a LoRA run drew; empty for every other kind of job.
+    pictures: Vec<jobs::Picture>,
 }
 
 async fn job(_: Identity, St(state): St<State>, Path(id): Path<i64>) -> Result<Json<Whole>, Fail> {
@@ -61,7 +63,7 @@ async fn job(_: Identity, St(state): St<State>, Path(id): Path<i64>) -> Result<J
     let found = blocking(move || {
         Ok(match jobs.get(id)? {
             None => None,
-            Some(job) => Some(Whole { metrics: jobs.metrics(id)?, samples: jobs.samples(id)?, job }),
+            Some(job) => Some(Whole { metrics: jobs.metrics(id)?, samples: jobs.samples(id)?, pictures: jobs.pictures(id)?, job }),
         })
     })
     .await?;

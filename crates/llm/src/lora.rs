@@ -117,6 +117,31 @@ pub fn locals(dir: &Path, repo: &str) -> Vec<Local> {
     tops(dir).into_iter().filter_map(|(f, file)| Some(Local { name: name_in(dir, ONLY, repo, &f), adapts: read(&file)?, file })).collect()
 }
 
+/// Where LoRAs trained on this machine are written: `kvad-gpu tune --name`
+/// and the server's training runs both write `NAME.safetensors` here.
+pub fn trained_dir() -> PathBuf {
+    crate::weights::data_dir().join("loras")
+}
+
+/// The LoRAs trained on this machine, each known by its file's path, which
+/// is a name a request can apply it by.
+///
+/// `NAME.last.safetensors` is left out: a run's last step, kept beside its
+/// best for going on from, and not the one to draw with.
+pub fn trained() -> Vec<Local> {
+    let Ok(entries) = std::fs::read_dir(trained_dir()) else { return Vec::new() };
+    let mut found: Vec<Local> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
+            p.is_file() && name.ends_with(".safetensors") && !name.ends_with(".last.safetensors") && !name.starts_with('.')
+        })
+        .filter_map(|file| Some(Local { name: file.to_string_lossy().into_owned(), adapts: read(&file)?, file }))
+        .collect();
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+
 /// The LoRA `name` means, if it is on this machine. Never asks the Hub.
 pub fn local(name: &str) -> Option<Local> {
     if is_path(name) {

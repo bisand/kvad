@@ -221,7 +221,11 @@ options:
   --seed N            (default 1337)
   --ffmpeg FILE       the ffmpeg that decodes the pictures (default: found)
   --cap GB            end the run if its memory passes this (default: three
-                      quarters of the machine's)";
+                      quarters of the machine's)
+  --progress json     also say what the run does on standard output, one
+                      JSON object a line, for a program that follows it;
+                      the run then ends when the program that started it
+                      does";
 
 /// `kvad-gpu tune`: [`kvad_gpu::image::tune::run`] from a command line.
 fn tune(argv: &[String]) -> Res<()> {
@@ -292,6 +296,11 @@ fn tune(argv: &[String]) -> Res<()> {
         opts.seed = seed;
     }
     let cap = number::<f64>("cap", take("cap"))?.or_else(|| kvad::machine::total_memory().map(|b| b as f64 / 1e9 * 0.75));
+    let followed = match take("progress").as_deref() {
+        None => false,
+        Some("json") => true,
+        Some(other) => return Err(format!("--progress json is the one there is, not `{other}`").into()),
+    };
     if let Some(flag) = flags.keys().next() {
         return Err(format!("unknown flag --{flag}\n\n{TUNE_USAGE}").into());
     }
@@ -320,7 +329,76 @@ fn tune(argv: &[String]) -> Res<()> {
     // which a signal handler may.
     unsafe { libc::signal(libc::SIGINT, stop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
 
-    let s = tune::run(&opts, &device, &mut |line| eprintln!("  {line}"), &mut |_| {})?;
+    // A run somebody else started and follows (`kvad-serve`, which keeps a
+    // run in a process of its own: the memory a run takes is then given
+    // back whole when it ends, and `--cap` ends the run and not the server).
+    // It reads these lines, and the run must not outlive it: a server that
+    // is stopped or dies leaves a child with nobody to stop it, hours of the
+    // GPU, and a parent of 1.
+    if followed {
+        let flag = STOP.get_or_init(Default::default).clone();
+        // SAFETY: `getppid` only reads.
+        let parent = unsafe { libc::getppid() };
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            // SAFETY: as above.
+            if unsafe { libc::getppid() } != parent {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        });
+    }
+    let tell = |v: kvad::serde_json::Value| {
+        if followed {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{v}");
+            let _ = out.flush();
+        }
+    };
+    use kvad::serde_json::json;
+    let ran = tune::run(
+        &opts,
+        &device,
+        &mut |line| {
+            eprintln!("  {line}");
+            tell(json!({ "kind": "say", "line": line }));
+        },
+        &mut |e| {
+            tell(match e {
+                tune::Event::Step { step, steps, loss, secs } => json!({ "kind": "step", "step": step, "steps": steps, "loss": loss, "secs": secs }),
+                tune::Event::Measured { step, val_loss } => json!({ "kind": "measured", "step": step, "val_loss": val_loss }),
+                tune::Event::Saved { step, val_loss } => json!({ "kind": "saved", "step": step, "val_loss": val_loss }),
+                tune::Event::Sampled { step, prompt, path } => json!({ "kind": "sampled", "step": step, "prompt": prompt, "path": path }),
+            })
+        },
+    );
+    let s = match ran {
+        Ok(s) => s,
+        Err(e) => {
+            tell(json!({ "kind": "failed", "error": e.to_string() }));
+            return Err(e);
+        }
+    };
+    // serde_json writes a number that is not finite as null, which is what
+    // a loss nothing measured is.
+    tell(json!({
+        "kind": "done",
+        "out": s.out,
+        "last": s.last,
+        "layers": s.layers,
+        "trained": s.trained,
+        "pictures": s.pictures,
+        "held_out": s.held_out,
+        "base_val": s.base_val,
+        "best_val": s.best_val,
+        "best_step": s.best_step,
+        "last_val": s.last_val,
+        "samples": s.samples,
+        "steps": s.steps,
+        "elapsed_secs": s.elapsed_secs,
+        "stopped": s.stopped,
+    }));
     eprintln!();
     if s.best_step == 0 {
         eprintln!("no step was taken, and nothing was written");

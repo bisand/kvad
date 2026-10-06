@@ -622,6 +622,30 @@ pub const ENDPOINTS: &[Endpoint] = &[
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
+        method: "post", path: "/api/tune", tag: "Training", access: Access::Admin,
+        summary: "Train a LoRA for an image model",
+        description: "On a dataset of captioned pictures, for SDXL or a fine-tune of it. \
+                      The run is `kvad-gpu tune` in a process of its own, followed as any \
+                      job is; its validation loss is a `metric`, and what it draws of \
+                      each sample prompt at each measurement a `picture`. Refused before \
+                      it starts for a picture with no caption, naming every one, and when \
+                      the memory a run at that size was measured to take is not left: that \
+                      memory is set aside for the run, and no model is loaded into it. The \
+                      LoRA is written to the data directory's `loras/NAME.safetensors`.",
+        query: &[],
+        body: json_body("`{ dataset, name, model?, size?, rank?, steps?, lr?, eval_every?, \
+                         seed?, caption?, samples?, sample_size?, sample_steps? }`."),
+        produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/tune/options", tag: "Training", access: Access::Admin,
+        summary: "What a LoRA run can be asked for",
+        description: "The models on this machine one can be trained for, the sizes and \
+                      what each is set aside in memory, the defaults, what is left of the \
+                      budget, and why not if this machine cannot train one.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
         method: "get", path: "/api/jobs", tag: "Jobs", access: Access::SignedIn,
         summary: "Everything long-running, newest first",
         description: "Downloads, training runs, evals and benchmarks in one history.",
@@ -650,14 +674,22 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       landing between the two is seen rather than lost — and may \
                       therefore be seen twice, which is why every update is keyed.",
         query: &[], body: None, produces: SSE,
-        events: &[("update", "One of `status`, `download`, `metric`, `sample`, `pace`, \
-                              `progress`, `case`, `scored`, `timing`, or `ended`.")],
+        events: &[("update", "One of `status`, `download`, `metric`, `sample`, `picture`, \
+                              `pace`, `progress`, `case`, `scored`, `timing`, or `ended`.")],
+    },
+    Endpoint {
+        method: "get", path: "/api/jobs/{id}/pictures/{file}", tag: "Jobs", access: Access::SignedIn,
+        summary: "A picture a LoRA run drew",
+        description: "By the `file` a `picture` update names, which is the one the run \
+                      wrote it to. Its `prompt` counts the run's sample prompts from 0, and \
+                      step 0 is the model without the LoRA.",
+        query: &[], body: None, produces: "image/png", events: &[],
     },
 
     // -- Datasets -----------------------------------------------------------
     Endpoint {
         method: "get", path: "/api/datasets", tag: "Datasets", access: Access::Admin,
-        summary: "The text files runs are trained on",
+        summary: "The texts and the pictures runs are trained on",
         description: "", query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
@@ -694,6 +726,40 @@ pub const ENDPOINTS: &[Endpoint] = &[
         method: "delete", path: "/api/datasets/{id}", tag: "Datasets", access: Access::Admin,
         summary: "Delete a dataset",
         description: "", query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "post", path: "/api/datasets/pictures", tag: "Datasets", access: Access::Admin,
+        summary: "Start a dataset of pictures",
+        description: "Empty, or the one of that name if there is one: pictures and \
+                      their captions are then put into it a file at a time.",
+        query: &[("name", true, "What to call it.")],
+        body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/datasets/{id}/pictures", tag: "Datasets", access: Access::Admin,
+        summary: "The pictures in a dataset, each with its caption",
+        description: "", query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "put", path: "/api/datasets/{id}/files/{file}", tag: "Datasets", access: Access::Admin,
+        summary: "Put a picture, or a caption, into a dataset",
+        description: "The body is the file. A picture is a JPEG, PNG, WebP or BMP of at \
+                      most 32 MB, named as one; its caption is the `.txt` of the same \
+                      name. Either replaces one of the same name.",
+        query: &[],
+        body: Some(Body { content_type: "application/octet-stream", description: "The file." }),
+        produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/datasets/{id}/files/{file}", tag: "Datasets", access: Access::Admin,
+        summary: "One file of a dataset of pictures",
+        description: "", query: &[], body: None, produces: "image/*", events: &[],
+    },
+    Endpoint {
+        method: "delete", path: "/api/datasets/{id}/files/{file}", tag: "Datasets", access: Access::Admin,
+        summary: "Take a file out of a dataset",
+        description: "A picture goes with its caption; a caption goes alone.",
+        query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
         method: "get", path: "/api/datasets/{id}/check", tag: "Datasets", access: Access::Admin,
@@ -1128,6 +1194,7 @@ mod tests {
     const SOURCES: &[(&str, &str)] = &[
         ("api.rs", include_str!("api.rs")),
         ("training.rs", include_str!("training.rs")),
+        ("tuning.rs", include_str!("tuning.rs")),
         ("monitoring.rs", include_str!("monitoring.rs")),
         ("playground.rs", include_str!("playground.rs")),
         ("evals.rs", include_str!("evals.rs")),

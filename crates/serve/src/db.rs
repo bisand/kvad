@@ -57,6 +57,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("015-video-pipelines", include_str!("migrations/015-video-pipelines.sql")),
     ("016-image-loras", include_str!("migrations/016-image-loras.sql")),
     ("017-video-loras", include_str!("migrations/017-video-loras.sql")),
+    ("018-picture-training", include_str!("migrations/018-picture-training.sql")),
 ];
 
 #[derive(Clone)]
@@ -181,7 +182,7 @@ fn migrate(conn: &Connection) -> Res<()> {
 mod tests {
     use super::*;
 
-    /// Migrations 006 and 007 rebuild the jobs table to widen its `kind`
+    /// Migrations 006, 007 and 018 rebuild the jobs table to widen its `kind`
     /// check, and a rebuild is a `DROP TABLE` — which, with foreign keys
     /// enforced, would take every training metric and sample on the machine
     /// with it. This is the upgrade an existing installation makes, run
@@ -199,7 +200,7 @@ mod tests {
             .filter(|(_, sql)| sql.contains("CREATE TABLE jobs_new"))
             .map(|(name, _)| *name)
             .collect();
-        assert_eq!(rebuilds, ["006-evals", "007-crawl"], "a migration rebuilds `jobs` unwatched");
+        assert_eq!(rebuilds, ["006-evals", "007-crawl", "018-picture-training"], "a migration rebuilds `jobs` unwatched");
 
         // Everything up to the first of them; `migrate` then runs the rest.
         let before: Vec<_> = MIGRATIONS.iter().take_while(|(n, _)| *n != rebuilds[0]).collect();
@@ -242,7 +243,7 @@ mod tests {
         assert_eq!((metrics, samples), (1, 1), "the rebuild cascaded through the chart");
 
         // The point of the rebuilds: kinds the old checks refused.
-        for kind in ["bench", "crawl"] {
+        for kind in ["bench", "crawl", "tune"] {
             conn.execute(
                 "INSERT INTO jobs (kind, state, label, params) VALUES (?1, 'running', 'b', '{}')",
                 [kind],

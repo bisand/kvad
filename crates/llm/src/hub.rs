@@ -865,9 +865,7 @@ pub fn find_local(id: &str) -> Option<LocalModel> {
 /// "retraining" rather than "re-download" when asked to delete one.
 pub fn trained_models() -> Vec<LocalModel> {
     let root = crate::weights::models_dir();
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
+    let entries = std::fs::read_dir(&root).into_iter().flatten();
 
     let mut out: Vec<LocalModel> = entries
         .filter_map(|e| e.ok())
@@ -908,6 +906,22 @@ pub fn trained_models() -> Vec<LocalModel> {
         })
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
+    // And the LoRAs trained here, after the models: each one file, named
+    // by its path, which is what a request applies it by.
+    out.extend(crate::lora::trained().into_iter().map(|l| LocalModel {
+        id: l.name.clone(),
+        path: l.file.clone(),
+        bytes: std::fs::metadata(&l.file).map(|m| m.len()).unwrap_or(0),
+        arch: None,
+        model_type: None,
+        complete: true,
+        params: None,
+        unreadable_as: None,
+        reads: Reads::Everything,
+        gguf: None,
+        single: None,
+        lora: Some(l),
+    }));
     out
 }
 

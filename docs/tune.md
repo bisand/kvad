@@ -173,11 +173,56 @@ runs the four checks that need SDXL's weights; the last is that the file a
 run writes, set on the UNet as a request sets a LoRA, gives the answer the
 run's own factors gave, to the bit.
 
+## From the web UI
+
+The Training page starts the same run and follows it (#77). The pictures are
+a dataset: the Datasets page uploads them with their `.txt` captions into a
+folder under the data directory's `datasets/`, shows each beside its
+caption, and lets one be written there. A run is refused before it starts
+for a picture with no caption, naming every one, unless it is given a
+caption for those.
+
+The server does not train in its own process. It starts `kvad-gpu tune
+--progress json` beside it and reads what that writes, one JSON object a
+line: every step, every measurement, every sample drawn. Three reasons:
+
+- **The memory comes back.** What a run takes is the system's again the
+  moment the process ends. In the server it would stay in candle's buffer
+  pool and the allocator for as long as the server ran.
+- **The ceiling ends the run, not the server.** `--cap` kills the process
+  that passes it.
+- **A failed backward pass costs one job**, and not everybody's models.
+
+The run's memory is set aside in the server's budget before it starts, so
+no model is loaded into it meanwhile, and a run that does not fit beside
+what is loaded is refused with what holds the rest. What is set aside is
+the measured peak and a fifth: 8.6 GB at 512², 10.3 at 768² and 12.7 at
+1024², and at least 10.4 where samples are drawn. The sizes offered are
+those three, the ones measured.
+
+The page draws the validation loss alone, for the reason above, against the
+model's own before the first step, and a row of pictures for each sample
+prompt: the model's own first, then one for each measurement. Stopping a
+run sends it the interrupt Ctrl-C would; it finishes its step, measures,
+and keeps what it has. A run started by a server ends when that server
+does.
+
+The LoRA is written to the data directory's `loras/NAME.safetensors`. LoRAs
+there are listed with the models, `kvad ls` among "trained here", and the
+Images page offers them for the models they fit.
+
+Checked on an M5 Pro with six made-up pictures at 512²: a 6-step run to its
+end (validation loss 0.0054 to 0.0051, three samples), and a 40-step run
+stopped from the page at step 10, which kept that step. The second LoRA was
+then applied by a request, 768² in 12 steps, by the path it is listed
+under. No long run has been made through the page.
+
 ## Not here yet
 
-- **`kvad tune` through the service**, as a job with its loss on a chart
-  (#77). `kvad-gpu tune` runs in its own process and needs the UNet's
-  memory to itself.
+- **A `kvad` command for it.** The routes are the web UI's so far;
+  `kvad-gpu tune` is the command line, without the server.
+- **Going on from a LoRA** (`--from`), `--alpha` and `--holdout` from the
+  page. `kvad-gpu tune` has them.
 - **Other models.** FLUX and Qwen-Image are refused by name: their blocks'
   gradients are checked (#74), and a step through all of them has not been
   made to fit or been measured. An SDXL checkpoint in one file is refused

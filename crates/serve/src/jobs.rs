@@ -77,6 +77,15 @@ pub struct Sample {
     pub text: String,
 }
 
+/// A picture a LoRA run drew at a measurement: the prompt numbered `prompt`
+/// from 0, after `step` steps, in the file `file` of the job's samples.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Picture {
+    pub step: i64,
+    pub prompt: i64,
+    pub file: String,
+}
+
 /// One case of a prompt suite, run against one variant.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Case {
@@ -127,6 +136,7 @@ pub enum Update {
     Download { file: String, bytes: u64, total: u64 },
     Metric(Metric),
     Sample(Sample),
+    Picture(Picture),
     /// Work done out of work to do, in whatever units the job counts in.
     Progress { done: usize, total: usize },
     Case(Case),
@@ -231,6 +241,14 @@ impl Jobs {
         })
     }
 
+    pub fn pictures(&self, id: i64) -> Res<Vec<Picture>> {
+        self.db.with(|c| {
+            let mut q = c.prepare("SELECT step, prompt, file FROM train_pictures WHERE job = ?1 ORDER BY step, prompt")?;
+            let rows = q.query_map([id], |r| Ok(Picture { step: r.get(0)?, prompt: r.get(1)?, file: r.get(2)? }))?.collect();
+            rows
+        })
+    }
+
     /// The verdicts an eval run has reached so far.
     pub fn cases(&self, id: i64) -> Res<Vec<Case>> {
         self.db.with(|c| {
@@ -282,9 +300,10 @@ impl Jobs {
         })
     }
 
-    /// Is a training run going? The one thing that is not allowed twice.
+    /// Is a training run going, of text or of a LoRA? The one thing that is
+    /// not allowed twice.
     pub fn training(&self) -> bool {
-        self.live_kind(&["train"]).is_some()
+        self.live_kind(&["train", "tune"]).is_some()
     }
 
     /// A live job of one of these kinds, named, or `None`.
@@ -739,6 +758,322 @@ fn from_fetch(f: kvad::weights::Fetch) -> Option<Update> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A LoRA for an image model
+// ---------------------------------------------------------------------------
+
+/// What a LoRA run was asked for. Stored as the job's `params`, as
+/// [`TrainParams`] is for a `train`: the job's kind says which of the two a
+/// row holds, so a row written before there were LoRA runs reads as it did.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TuneParams {
+    pub name: String,
+    /// The model the LoRA is for.
+    pub model: String,
+    pub dataset: i64,
+    pub dataset_name: String,
+    pub pictures: usize,
+    pub size: usize,
+    pub rank: usize,
+    pub steps: usize,
+    pub lr: f64,
+    pub eval_every: usize,
+    pub seed: u64,
+    /// The caption of every picture that has none beside it.
+    pub caption: Option<String>,
+    /// Prompts drawn before the first step and at every measurement.
+    pub samples: Vec<String>,
+    pub sample_size: usize,
+    pub sample_steps: usize,
+}
+
+/// What a LoRA run needs that is not the request's to say.
+pub struct TuneRun {
+    /// `kvad-gpu`, which trains.
+    pub program: std::path::PathBuf,
+    /// The dataset's folder, and the file the LoRA is written to.
+    pub data: std::path::PathBuf,
+    pub out: std::path::PathBuf,
+    pub ffmpeg: std::path::PathBuf,
+    /// The run ends itself past this many gigabytes.
+    pub cap_gb: f64,
+    /// The memory set aside for it, given back when the run is over.
+    pub hold: Box<dyn std::any::Any + Send>,
+}
+
+/// Where a job's sample pictures are kept.
+pub fn samples_dir(id: i64) -> std::path::PathBuf {
+    kvad::weights::data_dir().join("tune-samples").join(id.to_string())
+}
+
+/// What `kvad-gpu tune --progress json` said on one line of its output.
+#[derive(Debug, Clone, PartialEq)]
+enum Told {
+    Say(String),
+    Step { step: usize, steps: usize, loss: f64 },
+    Measured { step: usize, val_loss: f64 },
+    Saved { step: usize, val_loss: f64 },
+    Sampled { step: usize, prompt: usize, file: String },
+    Done(serde_json::Value),
+    Failed(String),
+}
+
+/// Read one line of a run's output. `None` for a line that is not one of
+/// these: a newer `kvad-gpu` may say things this does not know, and a run
+/// is not failed for it.
+fn told(line: &str) -> Option<Told> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let n = |key: &str| v[key].as_u64().map(|n| n as usize);
+    // A loss that is not a number is written as null.
+    let f = |key: &str| v[key].as_f64().unwrap_or(f64::NAN);
+    Some(match v["kind"].as_str()? {
+        "say" => Told::Say(v["line"].as_str()?.to_string()),
+        "step" => Told::Step { step: n("step")?, steps: n("steps")?, loss: f("loss") },
+        "measured" => Told::Measured { step: n("step")?, val_loss: f("val_loss") },
+        "saved" => Told::Saved { step: n("step")?, val_loss: f("val_loss") },
+        "sampled" => Told::Sampled {
+            step: n("step")?,
+            prompt: n("prompt")?,
+            file: std::path::Path::new(v["path"].as_str()?).file_name()?.to_str()?.to_string(),
+        },
+        "done" => Told::Done(v),
+        "failed" => Told::Failed(v["error"].as_str()?.to_string()),
+        _ => return None,
+    })
+}
+
+/// Train a LoRA in the background, in a process of its own.
+///
+/// `kvad-gpu tune` and not a thread here, for three reasons. What a run
+/// takes, 7 to 11 GB of the GPU's memory, is the system's again the moment
+/// the process ends, where a thread's would stay in this server's pools and
+/// its allocator. The ceiling a run sets on itself (`--cap`) ends the run
+/// and not the server. And a backward pass that fails takes one job with
+/// it, not everybody's models.
+///
+/// It is followed by what it writes on its standard output, a JSON object
+/// a line, and stopped with the interrupt Ctrl-C would send it: it finishes
+/// the step it is on and writes that step beside its best.
+pub fn tune(jobs: &Arc<Jobs>, params: TuneParams, run: TuneRun, owner: Option<i64>) -> Res<Job> {
+    if let Some(other) = jobs.live_kind(&["train", "tune"]) {
+        return Err(format!("a training run is already going, {other}; wait for it or stop it").into());
+    }
+    let id = jobs.create("tune", &params.name, &serde_json::to_value(&params)?, owner)?;
+    let (cancel, events) = jobs.register(id);
+    let samples = samples_dir(id);
+
+    let mut command = std::process::Command::new(&run.program);
+    command
+        .arg("tune")
+        .arg(&params.model)
+        .arg("--data").arg(&run.data)
+        .arg("--out").arg(&run.out)
+        .arg("--ffmpeg").arg(&run.ffmpeg)
+        .arg("--samples").arg(&samples)
+        .args(["--progress", "json"])
+        .args(["--size", &params.size.to_string()])
+        .args(["--rank", &params.rank.to_string()])
+        .args(["--steps", &params.steps.to_string()])
+        .args(["--lr", &params.lr.to_string()])
+        .args(["--eval-every", &params.eval_every.to_string()])
+        .args(["--seed", &params.seed.to_string()])
+        .args(["--sample-size", &params.sample_size.to_string()])
+        .args(["--sample-steps", &params.sample_steps.to_string()])
+        .args(["--cap", &format!("{:.1}", run.cap_gb)]);
+    if let Some(caption) = &params.caption {
+        command.arg("--caption").arg(caption);
+    }
+    for prompt in &params.samples {
+        command.arg("--sample").arg(prompt);
+    }
+    command
+        // The run keeps what it reads of the pictures under the data
+        // directory, and this server may have been told its own in a config
+        // file the run would not read.
+        .env("KVAD_DATA_DIR", kvad::weights::data_dir())
+        .env("HF_HUB_CACHE", kvad::hub::cache_dir())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let why = format!("could not start {}: {e}", run.program.display());
+            jobs.finish(id, "failed", Some(why.clone()), None);
+            return Err(why.into());
+        }
+    };
+
+    let worker = Arc::clone(jobs);
+    let db = jobs.db.clone();
+    let hold = run.hold;
+    std::thread::Builder::new().name(format!("kvad-tune-{id}")).spawn(move || {
+        let started = std::time::Instant::now();
+        let pid = child.id();
+        let over = Arc::new(AtomicBool::new(false));
+
+        // The interrupt, once, when somebody asks; the run does the rest.
+        let stopper = {
+            let (cancel, over, events) = (Arc::clone(&cancel), Arc::clone(&over), events.clone());
+            std::thread::spawn(move || {
+                while !over.load(Ordering::Relaxed) {
+                    if cancel.load(Ordering::Relaxed) {
+                        // SAFETY: `kill` with a pid this thread's parent is
+                        // still waiting on, so it names that child and no
+                        // other process.
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
+                        let _ = events.send(Update::Status { message: "asked to stop: it finishes the step it is on, and a measurement or a sample if it is in one".into() });
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })
+        };
+
+        // What it says to a person goes to its standard error, and the last
+        // of that is why it ended when it did not say so itself: the
+        // ceiling on its memory, a panic, a signal.
+        let stderr = child.stderr.take();
+        let last_words = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut tail: std::collections::VecDeque<String> = Default::default();
+            for line in stderr.into_iter().flat_map(|e| std::io::BufReader::new(e).lines().map_while(Result::ok)) {
+                // Indented lines are the ones also sent as `say`.
+                if line.trim().is_empty() || line.starts_with("  ") {
+                    continue;
+                }
+                tail.push_back(line);
+                if tail.len() > 8 {
+                    tail.pop_front();
+                }
+            }
+            tail.into_iter().collect::<Vec<_>>().join("\n")
+        });
+
+        let (mut done, mut failed) = (None, None);
+        // The mean of the steps' losses since the last measurement: what
+        // the training loss is worth showing as (`docs/tune.md`).
+        let (mut sum, mut count) = (0.0f64, 0usize);
+        if let Some(stdout) = child.stdout.take() {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                let update = match told(&line) {
+                    None => continue,
+                    Some(Told::Say(message)) => Update::Status { message },
+                    Some(Told::Step { step, steps, loss }) => {
+                        if loss.is_finite() {
+                            sum += loss;
+                            count += 1;
+                        }
+                        Update::Progress { done: step, total: steps }
+                    }
+                    Some(Told::Measured { step, val_loss }) => {
+                        // Before the first step there is no training loss,
+                        // and the column wants a number: the model's own
+                        // loss on the measured pictures stands in for it.
+                        let train_loss = if count > 0 { sum / count as f64 } else { val_loss };
+                        (sum, count) = (0.0, 0);
+                        let metric = Metric {
+                            step: step as i64,
+                            train_loss,
+                            val_loss,
+                            chars_per_sec: 0.0,
+                            elapsed_secs: started.elapsed().as_secs_f64(),
+                            saved: false,
+                        };
+                        if val_loss.is_finite() && train_loss.is_finite() {
+                            let _ = db.with(|c| {
+                                c.execute(
+                                    "INSERT OR REPLACE INTO train_metrics
+                                     (job, step, train_loss, val_loss, chars_per_sec, elapsed_secs)
+                                     VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                                    params![id, metric.step, metric.train_loss, metric.val_loss, metric.elapsed_secs],
+                                )
+                            });
+                        }
+                        Update::Metric(metric)
+                    }
+                    Some(Told::Saved { step, val_loss }) => {
+                        let _ = db.with(|c| {
+                            c.execute("UPDATE train_metrics SET saved = 1 WHERE job = ?1 AND step = ?2", params![id, step as i64])
+                        });
+                        Update::Metric(Metric { step: step as i64, train_loss: f64::NAN, val_loss, chars_per_sec: 0.0, elapsed_secs: 0.0, saved: true })
+                    }
+                    Some(Told::Sampled { step, prompt, file }) => {
+                        let picture = Picture { step: step as i64, prompt: prompt as i64, file };
+                        let _ = db.with(|c| {
+                            c.execute(
+                                "INSERT OR REPLACE INTO train_pictures (job, step, prompt, file) VALUES (?1, ?2, ?3, ?4)",
+                                params![id, picture.step, picture.prompt, picture.file],
+                            )
+                        });
+                        Update::Picture(picture)
+                    }
+                    Some(Told::Done(summary)) => {
+                        done = Some(summary);
+                        continue;
+                    }
+                    Some(Told::Failed(why)) => {
+                        failed = Some(why);
+                        continue;
+                    }
+                };
+                let _ = events.send(update);
+            }
+        }
+        let status = child.wait();
+        over.store(true, Ordering::Relaxed);
+        let _ = stopper.join();
+        let said = last_words.join().unwrap_or_default();
+        drop(hold);
+
+        match (done, failed) {
+            (Some(s), _) => {
+                // No step taken and nothing written: stopped before the
+                // first measurement was beaten.
+                let measured = s["best_step"].as_u64().unwrap_or(0) > 0;
+                let (best, base) = (s["best_val"].as_f64(), s["base_val"].as_f64());
+                let stopped = s["stopped"].as_bool().unwrap_or(false);
+                let result = serde_json::json!({
+                    "lora": measured.then(|| s["out"].clone()),
+                    "last": s["last"],
+                    "model": params.model,
+                    "measured": measured,
+                    "base_val": base,
+                    "best_val": best.filter(|_| measured),
+                    "best_step": s["best_step"],
+                    "last_val": s["last_val"],
+                    // Whether it beat the model without it, on pictures it
+                    // did not train on: the one thing a LoRA is for.
+                    "improved": measured && best.zip(base).is_some_and(|(best, base)| best < base),
+                    "pictures": s["pictures"],
+                    "held_out": s["held_out"],
+                    "layers": s["layers"],
+                    "trained": s["trained"],
+                    "steps": s["steps"],
+                    "elapsed_secs": s["elapsed_secs"],
+                    "stopped": stopped,
+                });
+                worker.finish(id, if stopped { "cancelled" } else { "done" }, None, Some(result));
+            }
+            (None, Some(why)) => worker.finish(id, "failed", Some(why), None),
+            (None, None) => {
+                let how = match status {
+                    Ok(s) => s.to_string(),
+                    Err(e) => e.to_string(),
+                };
+                let why = match said.is_empty() {
+                    true => format!("the run ended without saying why ({how})"),
+                    false => format!("the run ended without finishing ({how}). The last it said:\n{said}"),
+                };
+                worker.finish(id, "failed", Some(why), None);
+            }
+        }
+    })?;
+
+    jobs.get(id)?.ok_or_else(|| "the job vanished as it started".into())
+}
+
 /// The same events a watcher would see, out of the database.
 ///
 /// What a browser arriving late is sent before it starts following the live
@@ -746,6 +1081,7 @@ fn from_fetch(f: kvad::weights::Fetch) -> Option<Update> {
 pub fn history(jobs: &Jobs, id: i64) -> Res<Vec<Update>> {
     let mut updates: Vec<Update> = jobs.metrics(id)?.into_iter().map(Update::Metric).collect();
     updates.extend(jobs.samples(id)?.into_iter().map(Update::Sample));
+    updates.extend(jobs.pictures(id)?.into_iter().map(Update::Picture));
     updates.extend(jobs.cases(id)?.into_iter().map(Update::Case));
     updates.extend(jobs.timings(id)?.into_iter().map(Update::Timing));
     Ok(updates)
@@ -769,6 +1105,50 @@ mod tests {
 
     fn jobs() -> Arc<Jobs> {
         Arc::new(Jobs::new(Db::in_memory().unwrap()))
+    }
+
+    /// What `kvad-gpu tune --progress json` writes, read back; and a line
+    /// that is something else is passed over, not a failure.
+    #[test]
+    fn a_run_is_followed_by_its_lines() {
+        assert_eq!(told(r#"{"kind":"say","line":"loading the UNet"}"#), Some(Told::Say("loading the UNet".into())));
+        assert_eq!(told(r#"{"kind":"step","step":3,"steps":300,"loss":0.25,"secs":1.9}"#), Some(Told::Step { step: 3, steps: 300, loss: 0.25 }));
+        assert_eq!(told(r#"{"kind":"measured","step":0,"val_loss":0.0147}"#), Some(Told::Measured { step: 0, val_loss: 0.0147 }));
+        assert_eq!(told(r#"{"kind":"saved","step":100,"val_loss":0.0126}"#), Some(Told::Saved { step: 100, val_loss: 0.0126 }));
+        assert_eq!(
+            told(r#"{"kind":"sampled","step":100,"prompt":1,"path":"/data/tune-samples/7/1-100.png"}"#),
+            Some(Told::Sampled { step: 100, prompt: 1, file: "1-100.png".into() })
+        );
+        assert_eq!(told(r#"{"kind":"failed","error":"no pictures"}"#), Some(Told::Failed("no pictures".into())));
+        assert!(matches!(told(r#"{"kind":"done","best_step":200,"stopped":false}"#), Some(Told::Done(_))));
+        // A loss that is not a number arrives as null.
+        assert!(matches!(told(r#"{"kind":"step","step":1,"steps":2,"loss":null}"#), Some(Told::Step { loss, .. }) if loss.is_nan()));
+        for other in ["", "not json", r#"{"kind":"something new"}"#, r#"{"step":1}"#] {
+            assert_eq!(told(other), None, "{other}");
+        }
+    }
+
+    /// A run that cannot start is a failed job with the reason, and the
+    /// next one is not refused for it.
+    #[test]
+    fn a_run_that_cannot_start_says_so_and_is_over() {
+        let jobs = jobs();
+        let params = TuneParams {
+            name: "style".into(), model: "a/b".into(), dataset: 1, dataset_name: "pictures".into(), pictures: 5,
+            size: 512, rank: 16, steps: 10, lr: 1e-4, eval_every: 5, seed: 1, caption: None, samples: Vec::new(),
+            sample_size: 512, sample_steps: 20,
+        };
+        let run = || TuneRun {
+            program: "/no/such/kvad-gpu".into(), data: "/tmp".into(), out: "/tmp/style.safetensors".into(),
+            ffmpeg: "/no/ffmpeg".into(), cap_gb: 8.0, hold: Box::new(()),
+        };
+        let said = tune(&jobs, params.clone(), run(), None).unwrap_err().to_string();
+        assert!(said.contains("/no/such/kvad-gpu"), "{said}");
+        let job = &jobs.list(10).unwrap()[0];
+        assert_eq!((job.kind.as_str(), job.state.as_str()), ("tune", "failed"));
+        assert_eq!(job.params["samples"], serde_json::json!([]));
+        assert!(!jobs.training());
+        assert!(tune(&jobs, params, run(), None).unwrap_err().to_string().contains("could not start"));
     }
 
     #[test]

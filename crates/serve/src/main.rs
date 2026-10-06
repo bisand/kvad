@@ -69,6 +69,7 @@ mod settings;
 mod storage;
 mod watching;
 mod training;
+mod tuning;
 mod users;
 mod videos;
 

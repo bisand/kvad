@@ -454,6 +454,11 @@ pub fn use_ffmpeg(setting: &str) -> String {
     said
 }
 
+/// The `ffmpeg` this server uses, if it has one.
+pub fn ffmpeg() -> Option<PathBuf> {
+    FFMPEG.get().cloned().flatten()
+}
+
 /// `ffmpeg` as `[videos] ffmpeg` says to find it: `off` for none, a path
 /// for that file if it is there, and `auto` for the first on `path` or in
 /// the places a package manager puts one ([`kvad::video::ffmpeg_on`]).

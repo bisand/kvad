@@ -12,7 +12,9 @@
   import uPlot from "uplot";
   import "uplot/dist/uPlot.min.css";
 
-  let { metrics = [], bestStep = null, steps = null } = $props();
+  /** `validationOnly`: draw no training loss. A diffusion model's says
+   *  which noise levels the last steps drew and little else (docs/tune.md). */
+  let { metrics = [], bestStep = null, steps = null, validationOnly = false } = $props();
 
   let host;
   let chart = null;
@@ -22,14 +24,25 @@
     return v || fallback;
   }
 
-  /** [steps, train, val] — uPlot wants columns, not rows. */
+  /** [steps, train, val] — uPlot wants columns, not rows. Without the
+   *  training loss, [steps, val]. */
   function columns(rows) {
     const ordered = [...rows].sort((a, b) => a.step - b.step);
-    return [
-      ordered.map((m) => m.step),
-      ordered.map((m) => m.train_loss),
-      ordered.map((m) => m.val_loss),
-    ];
+    const steps = ordered.map((m) => m.step);
+    const val = ordered.map((m) => m.val_loss);
+    return validationOnly ? [steps, val] : [steps, ordered.map((m) => m.train_loss), val];
+  }
+
+  /**
+   * A loss axis's labels, with as many decimals as tell two ticks apart.
+   * A language model's loss falls from 4 to 1 and one decimal does; a
+   * diffusion model's moves in its third and fourth, and one decimal wrote
+   * the same number beside every line.
+   */
+  function ticks(u, values) {
+    const gap = values.length > 1 ? Math.abs(values[1] - values[0]) : 1;
+    const decimals = Math.min(6, Math.max(0, Math.ceil(-Math.log10(gap))));
+    return values.map((v) => v.toFixed(decimals));
   }
 
   function build() {
@@ -59,13 +72,15 @@
         },
         axes: [
           { stroke: ink, grid: { stroke: line }, ticks: { stroke: line }, label: "step" },
-          { stroke: ink, grid: { stroke: line }, ticks: { stroke: line }, label: "loss" },
+          { stroke: ink, grid: { stroke: line }, ticks: { stroke: line }, label: "loss", values: ticks, size: 60 },
         ],
         series: [
           { label: "step" },
-          { label: "train", stroke: colour("--color-primary", "#4f46e5"), width: 2 },
+          ...(validationOnly ? [] : [{ label: "train", stroke: colour("--color-primary", "#4f46e5"), width: 2 }]),
           {
             label: "validation",
+            // A loss in its fourth decimal reads as 0.01 at uPlot's two.
+            value: (u, v) => (v == null ? "--" : v.toFixed(Math.abs(v) < 0.1 ? 4 : 3)),
             stroke: colour("--color-secondary", "#0891b2"),
             width: 2,
             // The step whose model is on disk, marked where it happened.

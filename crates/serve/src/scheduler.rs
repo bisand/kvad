@@ -279,6 +279,21 @@ struct Shared {
     residents: Arc<Mutex<Vec<Resident>>>,
     /// The interrupt flag of whichever engine is generating.
     running: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// Memory set aside for work that is not a resident; see [`Reserved`].
+    reserved: Arc<Mutex<Option<Held>>>,
+}
+
+/// Memory of the budget held for something that is no model in this
+/// process: a LoRA training run, which is a process of its own on the same
+/// machine and the same GPU. Admission counts it as it counts a resident,
+/// so a model is not loaded into the memory a backward pass is about to
+/// take. Given back when this is dropped.
+pub struct Reserved(Arc<Mutex<Option<Held>>>);
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 impl Shared {
@@ -288,6 +303,17 @@ impl Shared {
 
     fn running(&self) -> std::sync::MutexGuard<'_, Option<Arc<AtomicBool>>> {
         self.running.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn reserved(&self) -> std::sync::MutexGuard<'_, Option<Held>> {
+        self.reserved.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Everything admission counts: the residents, and what is reserved.
+    fn held(&self) -> Vec<Held> {
+        let mut held: Vec<Held> = self.residents().iter().map(|r| Held { id: r.id.clone(), commit: r.commit }).collect();
+        held.extend(self.reserved().clone());
+        held
     }
 }
 
@@ -319,10 +345,41 @@ impl Scheduler {
         self.shared.residents().clone()
     }
 
-    /// Bytes of the budget no resident has been charged.
+    /// Bytes of the budget no resident has been charged, and nothing has
+    /// reserved.
     pub fn left(&self) -> u64 {
-        let spent: u64 = self.shared.residents().iter().map(|r| r.commit).sum();
+        let spent: u64 = self.shared.held().iter().map(|h| h.commit).sum();
         self.budget.total.saturating_sub(spent)
+    }
+
+    /// Set `bytes` of the budget aside for `what`, or say why not: what is
+    /// left, and who holds the rest. One at a time.
+    ///
+    /// Unlike a model, never admitted "alone, whatever it takes": what asks
+    /// is a training run, whose memory is a figure measured beforehand and
+    /// whose overrun takes the machine down.
+    pub fn reserve(&self, what: &str, bytes: u64) -> Result<Reserved, String> {
+        let gb = |b: u64| format!("{:.1} GB", b as f64 / 1e9);
+        let mut reserved = self.shared.reserved();
+        if let Some(other) = reserved.as_ref() {
+            return Err(format!("{} already has {} set aside for it", other.id, gb(other.commit)));
+        }
+        let residents = self.shared.residents();
+        let spent: u64 = residents.iter().map(|r| r.commit).sum();
+        let left = self.budget.total.saturating_sub(spent);
+        if bytes > left {
+            let holding = match residents.is_empty() {
+                true => String::new(),
+                false => format!(
+                    ": {} in memory. Unload {} first",
+                    residents.iter().map(|r| format!("{} ({})", r.id, gb(r.commit))).collect::<Vec<_>>().join(", "),
+                    if residents.len() == 1 { "it" } else { "one" }
+                ),
+            };
+            return Err(format!("{what} takes about {}, and {} is left of {}{holding}", gb(bytes), gb(left), gb(self.budget.total)));
+        }
+        *reserved = Some(Held { id: what.to_string(), commit: bytes });
+        Ok(Reserved(Arc::clone(&self.shared.reserved)))
     }
 
     /// The resident a name means: `repo@backend` exactly, or the bare repo's
@@ -668,8 +725,7 @@ fn load(
     progress: &tokio_mpsc::Sender<Progress>,
 ) -> Result<(Slot, Resident), LoadError> {
     let id = id_of(&key.repo, key.backend);
-    let held: Vec<Held> =
-        shared.residents().iter().map(|r| Held { id: r.id.clone(), commit: r.commit }).collect();
+    let held = shared.held();
     let need = crate::memory::need(&key.repo, key.backend, budget.context);
     let admission = crate::memory::admit(&budget, &held, &id, &need);
     let room = match admission {

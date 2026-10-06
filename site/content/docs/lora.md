@@ -50,8 +50,6 @@ my-photos/
 kvad-gpu tune --data ./my-photos --name my-style
 ```
 
-Training arrived after v0.11.0. Until the next release it needs a build from
-source.
 
 The result is `~/.local/share/kvad/loras/my-style.safetensors`, which
 `kvad images --lora` applies and so does diffusers.
@@ -62,6 +60,17 @@ kvad images make "a lighthouse, my-style" \
     --lora ~/.local/share/kvad/loras/my-style.safetensors
 ```
 
+### From the web UI
+
+The Training page runs the same training as a job on the server. Upload the
+pictures and their captions on the Datasets page, choose them and a name on
+the Training page, and add a prompt or two to draw as it learns. The page
+shows the validation loss and a row of pictures for each prompt, one at
+every measurement. The finished LoRA is then a choice on the Images page.
+
+This arrived after v0.12.0. Until the next release it needs a build from
+source.
+
 ### What a run takes
 
 Measured on an M5 Pro with 48 GB, one picture a step:
@@ -69,7 +78,7 @@ Measured on an M5 Pro with 48 GB, one picture a step:
 | Size | A step | While training | At most |
 |---|---|---|---|
 | 512² | 1.9 s | 6.4 GB | 7.2 GB |
-| 1024² | 7.3 s | 7.6 GB | 13.7 GB |
+| 1024² | 7.3 s | 7.6 GB | 10.6 GB |
 
 A thousand steps at 1024², SDXL's own size, is about two hours. At 512² it is
 about half an hour, and SDXL draws less well there.

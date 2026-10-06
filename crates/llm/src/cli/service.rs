@@ -222,7 +222,7 @@ fn print_health(answer: &Health) {
                 );
             }
             if let Some(depth) = h["queue_depth"].as_u64().filter(|&d| d > 0) {
-                println!("queue     {depth} waiting");
+                println!("queue     {}", out::queue(depth));
             }
         }
         Health::Refused(why) => {

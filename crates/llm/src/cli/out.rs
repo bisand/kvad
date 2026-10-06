@@ -27,6 +27,16 @@ pub fn bytes(value: &Value) -> String {
 }
 
 /// The elements of an array field, or none.
+/// A queue depth in words. The server's count has the running request in
+/// it (`Scheduler::depth`), so one is one running and nothing behind it,
+/// which "1 waiting" said wrongly.
+pub fn queue(depth: u64) -> String {
+    match depth.saturating_sub(1) {
+        0 => "1 running".to_string(),
+        behind => format!("1 running, {behind} waiting"),
+    }
+}
+
 pub fn items(value: &Value) -> &[Value] {
     value.as_array().map(Vec::as_slice).unwrap_or(&[])
 }
@@ -177,6 +187,14 @@ pub fn tty() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The running request is in the count, and is not said to be waiting.
+    #[test]
+    fn a_queue_depth_says_the_running_request_apart() {
+        assert_eq!(queue(1), "1 running");
+        assert_eq!(queue(2), "1 running, 1 waiting");
+        assert_eq!(queue(5), "1 running, 4 waiting");
+    }
 
     #[test]
     fn cut_counts_characters_and_says_when_it_cut() {

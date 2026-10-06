@@ -156,7 +156,7 @@ pub struct Health {
     /// and thinks the server is broken can be pointed here.
     ui_embedded: bool,
     /// The model in memory used most recently, every model in memory, and
-    /// how much is waiting for them.
+    /// how many requests are waiting for them, the running one included.
     loaded: Option<crate::scheduler::Loaded>,
     residents: Vec<crate::scheduler::Resident>,
     queue_depth: usize,

@@ -98,9 +98,13 @@
           <p class="text-xs opacity-60">Queue</p>
           <p class="text-lg font-medium">{m.queue_depth}</p>
           <p class="text-xs opacity-70">
+            <!-- The count has the running request in it, so one is one
+                 running and nothing behind it. -->
             {m.queue_depth === 0
               ? "idle"
-              : `${m.queue_depth} waiting for the engine`}
+              : m.queue_depth === 1
+                ? "1 running"
+                : `1 running, ${m.queue_depth - 1} waiting for the engine`}
           </p>
           <p class="mt-1 text-xs opacity-60">
             One generation at a time, whichever model it is for. Requests queue in the order they arrive.

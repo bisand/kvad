@@ -16,10 +16,11 @@
 
 use super::clip::{self, Clip, ClipConfig, Pooled};
 use super::nn::{check_latent, latent_preview, noise, to_rgb8, Ctx};
+use super::edit::Edited;
 use super::schedule;
 use super::sdxl::{weights, TOKENIZER_REPO};
 use super::unet::{Unet, UnetConfig};
-use super::vae::{Decoder, VaeConfig};
+use super::vae::{Decoder, Encoder, VaeConfig};
 use super::sdxl::local_weights;
 use super::lora::{self, Adapters};
 use super::{finish, finish_mapped, open, open_file, open_mapped, read_json, single};
@@ -41,6 +42,8 @@ pub struct Sd15 {
     clip: Clip,
     unet: Unet,
     vae: Decoder,
+    /// The VAE's other half, for an image made from a picture ([`edit`]).
+    encoder: Encoder,
     scheduler: Value,
     device: Device,
     dtype: DType,
@@ -126,6 +129,7 @@ impl Sd15 {
         progress("loading the VAE");
         let (r_v, paths) = reader("vae", "diffusion_pytorch_model", maps.as_ref().map(|m| &m.vae))?;
         let vae = Decoder::load(&cx, &r_v, VaeConfig::from_json(&config("vae")?)?)?;
+        let encoder = Encoder::load(&cx, &r_v, VaeConfig::from_json(&config("vae")?)?)?;
         match (&file, &maps) {
             (Some(f), Some(m)) => {
                 let parts = [(&m.clip, &r_t), (&m.unet, &r_u), (&m.vae, &r_v)];
@@ -137,7 +141,7 @@ impl Sd15 {
 
         settle(&device)?;
         progress(&format!("loaded SD 1.5: {:.2} B parameters in f16", params as f64 / 1e9));
-        Ok(Sd15 { tok, clip, unet, vae, scheduler, device, dtype, adapters, params })
+        Ok(Sd15 { tok, clip, unet, vae, encoder, scheduler, device, dtype, adapters, params })
     }
 
     /// The prompt as the UNet reads it: `[1, 77, 768]`.
@@ -149,8 +153,8 @@ impl Sd15 {
 
 impl Sd15 {
     /// One image, with whatever LoRAs the adapters hold.
-    fn draw(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
-        let req = req.resolved(&self.defaults())?;
+    fn draw(&mut self, asked: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+        let req = asked.resolved(&self.defaults())?;
         let t0 = Instant::now();
 
         // The prompt, and what guidance steers away from: the negative
@@ -169,10 +173,23 @@ impl Sd15 {
         let f = self.vae.config().factor();
         let shape = [1, 4, req.height / f, req.width / f];
         // In f32 between steps, as SDXL's.
-        let mut x = (noise(req.seed, &shape, &self.device, DType::F32)? * sched.init_scale)?;
+        let eps = noise(req.seed, &shape, &self.device, DType::F32)?;
+        // From noise; or from a picture, noised part of the way ([`edit`]).
+        let (edited, mut x) = match &asked.edit {
+            None => (None, (eps * sched.init_scale)?),
+            Some(e) => {
+                let (edited, x) = Edited::begin(e, &req, &sched, f, eps, |pixels| {
+                    let seen = self.encoder.encode(&pixels.to_dtype(self.dtype)?.to_device(&self.device)?)?;
+                    Ok(self.encoder.to_denoiser(&seen.mean.to_dtype(DType::F32)?)?)
+                })?;
+                settle(&self.device)?;
+                (Some(edited), x)
+            }
+        };
+        let first = edited.as_ref().map_or(0, |e| e.first);
 
         let t1 = Instant::now();
-        for i in 0..sched.steps() {
+        for i in first..sched.steps() {
             let xin = (&x * sched.input_scale(i))?.to_dtype(self.dtype)?;
             let xin = if guided { Tensor::cat(&[&xin, &xin], 0)? } else { xin };
             let eps = self.unet.forward(&xin, sched.timesteps[i], &ctx, None)?.to_dtype(DType::F32)?;
@@ -194,7 +211,10 @@ impl Sd15 {
                 }
             };
             x = (&x + (eps * sched.dt(i))?)?;
-            if !on_step(Step { done: i + 1, total: sched.steps(), preview }) {
+            if let Some(e) = &edited {
+                x = e.hold(x, &sched, i)?;
+            }
+            if !on_step(Step { done: i + 1 - first, total: sched.steps() - first, preview }) {
                 return Err("cancelled".into());
             }
         }
@@ -204,6 +224,10 @@ impl Sd15 {
         let t2 = Instant::now();
         let pixels = self.vae.decode(&x.to_dtype(self.dtype)?)?;
         let image = to_rgb8(&pixels)?;
+        let image = match &edited {
+            Some(e) => e.paste(image),
+            None => image,
+        };
         let decode_secs = t2.elapsed().as_secs_f64();
         Ok(Painted { image, request: req, encode_secs, denoise_secs, decode_secs })
     }
@@ -219,7 +243,7 @@ impl Painter for Sd15 {
     fn defaults(&self) -> Defaults {
         // The model was trained at 512²; 25 steps and guidance 7.5 are what
         // its examples use.
-        Defaults { width: 512, height: 512, steps: 25, guidance: 7.5, multiple: 8, takes_guidance: true, takes_loras: true }
+        Defaults { width: 512, height: 512, steps: 25, guidance: 7.5, multiple: 8, takes_guidance: true, takes_loras: true, edits: true }
     }
 
     fn summary(&self) -> String {

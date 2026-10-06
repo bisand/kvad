@@ -133,6 +133,21 @@ settings and the time each stage took.
 When streaming, the events are `image_generation.step`,
 `image_generation.partial_image` and `image_generation.completed`.
 
+`POST /v1/images/edits`
+
+OpenAI's edits endpoint, as a multipart form or as JSON with each file a
+`data:` URL. It takes everything above, and:
+
+| Field | |
+|---|---|
+| `image` | The picture to start from. One a request. |
+| `mask` | Optional. Where the picture may change: transparent there, or white on black. The picture's size. |
+| `strength` | Above 0, at most 1. 0.75 without a mask, 1 with one. |
+
+It runs image-to-image on SDXL and SD 1.5: the prompt describes the result,
+not the change. The `kvad` object adds `strength`, `input_url` and `mask_url`.
+See [Images](/docs/images/#from-a-picture).
+
 ## Videos
 
 `POST /v1/videos` starts a job and answers at once.

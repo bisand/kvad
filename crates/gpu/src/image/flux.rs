@@ -603,7 +603,7 @@ impl Painter for Flux {
     fn defaults(&self) -> Defaults {
         // Black Forest Labs' own settings for schnell: four steps, no
         // guidance, a megapixel.
-        Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_loras: true }
+        Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_loras: true, edits: false }
     }
 
     fn summary(&self) -> String {

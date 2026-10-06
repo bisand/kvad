@@ -129,7 +129,7 @@ fn taps(from: usize, to: usize) -> Vec<Vec<(usize, f32)>> {
 
 /// `image` at `width` × `height`: along each row, then down each column
 /// ([`taps`]).
-fn resized(image: &Image, width: usize, height: usize) -> Image {
+pub(crate) fn resized(image: &Image, width: usize, height: usize) -> Image {
     if (image.width, image.height) == (width, height) {
         return image.clone();
     }
@@ -176,7 +176,7 @@ pub(crate) fn fitted(image: &Image, side: usize) -> (Image, [f64; 6]) {
 }
 
 /// A picture as a VAE reads one: `[1, 3, H, W]` in `[−1, 1]`, on the host.
-fn pixels(image: &Image) -> Res<Tensor> {
+pub(crate) fn pixels(image: &Image) -> Res<Tensor> {
     let n = image.width * image.height;
     let mut planes = vec![0f32; n * 3];
     for (i, &v) in image.rgb.iter().enumerate() {

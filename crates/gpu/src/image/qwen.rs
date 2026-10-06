@@ -1107,7 +1107,7 @@ impl Painter for QwenImage {
     fn defaults(&self) -> Defaults {
         // The reference's own: 1328² (its 1:1 size), 50 steps, and a true-CFG
         // scale of 4, which applies only when a negative prompt is given.
-        Defaults { width: 1328, height: 1328, steps: 50, guidance: 4.0, multiple: 16, takes_guidance: true, takes_loras: true }
+        Defaults { width: 1328, height: 1328, steps: 50, guidance: 4.0, multiple: 16, takes_guidance: true, takes_loras: true, edits: false }
     }
 
     fn summary(&self) -> String {

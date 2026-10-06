@@ -846,6 +846,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("post", "/api/keys", "kvad keys add, kvad auth login"),
     ("delete", "/api/keys/{id}", "kvad keys rm, kvad auth logout"),
     ("post", "/v1/images/generations", "kvad images make"),
+    ("post", "/v1/images/edits", "kvad images edit"),
     ("get", "/api/images", "kvad images"),
     ("delete", "/api/images/{id}", "kvad images rm"),
     ("post", "/v1/videos", "kvad videos make"),
@@ -871,6 +872,8 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
         "the PNG itself, for the web UI's <img>. `kvad images make` writes each picture \
          to a file from the same bytes as it arrives",
     ),
+    ("get", "/api/images/{id}/input", "the picture an edit was made from, for the web UI's <img>; whoever ran `kvad images edit` has the file"),
+    ("get", "/api/images/{id}/mask", "an edit's mask, likewise"),
     (
         "get",
         "/api/settings",

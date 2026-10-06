@@ -1,15 +1,18 @@
 <script>
-  // Text to image: a prompt, the knobs a denoiser has, and every picture kept.
+  // Text to image, and a picture to an image: a prompt, the knobs a denoiser
+  // has, the picture to start from if there is one, and every picture kept.
   import { images, SIZES } from "../lib/images.svelte.js";
   import { models } from "../lib/models.svelte.js";
   import { navigate } from "../lib/router.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
   import Loras from "../lib/components/Loras.svelte";
+  import EditSource from "../lib/components/EditSource.svelte";
 
   const WARN = "M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z";
   const TRASH = "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6";
   const REUSE = "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5";
   const DOWNLOAD = "M12 3v12M7 10l5 5 5-5M5 21h14";
+  const EDIT = "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z";
 
   $effect(() => {
     models.refresh();
@@ -72,6 +75,8 @@
 
       <Loras form={im} takes={d ? d.takes_loras : null} busy={im.running} />
 
+      <EditSource form={im} edits={d ? d.edits : null} busy={im.running} />
+
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <label class="flex flex-col gap-1">
           <span class="text-sm opacity-70">Width</span>
@@ -114,7 +119,7 @@
       <div class="flex items-center gap-2">
         <button class="btn btn-primary" onclick={() => im.make()} disabled={im.running || !im.chosen || !im.prompt.trim()}>
           {#if im.running}<span class="loading loading-spinner loading-xs"></span>{/if}
-          Generate
+          {im.source ? "Edit" : "Generate"}
         </button>
         {#if im.running}
           <button class="btn" onclick={() => im.stop()}>Stop</button>
@@ -176,11 +181,14 @@
             <figcaption class="flex flex-col gap-1 p-3">
               <p class="line-clamp-2 text-sm" title={g.prompt}>{g.prompt}</p>
               <p class="text-xs opacity-60">
-                {g.width}×{g.height} · {g.steps} steps · seed {g.seed}{#if g.loras?.length} · {g.loras.length === 1 ? "a LoRA" : `${g.loras.length} LoRAs`}{/if}
+                {g.width}×{g.height} · {g.steps} steps · seed {g.seed}{#if g.loras?.length}{" · "}{g.loras.length === 1 ? "a LoRA" : `${g.loras.length} LoRAs`}{/if}{#if g.strength != null}{" · "}{g.mask_url ? "a masked edit" : "an edit"} at {g.strength}{/if}
               </p>
               <div class="flex gap-1">
                 <button class="btn btn-ghost btn-xs" onclick={() => im.reuse(g)} title="Put these settings back in the form">
                   <Icon path={REUSE} size={14} /> Reuse
+                </button>
+                <button class="btn btn-ghost btn-xs" onclick={() => im.startFromKept(g)} title="Start a new image from this picture">
+                  <Icon path={EDIT} size={14} /> Edit
                 </button>
                 <a class="btn btn-ghost btn-xs" href={g.url} download={`kvad-${g.id}.png`} title="Download the PNG">
                   <Icon path={DOWNLOAD} size={14} />
@@ -212,6 +220,17 @@
         <p class="text-xs opacity-60">
           LoRAs: {open.loras.map((l) => (l.scale === 1 ? l.name : `${l.name} at ${l.scale}`)).join(", ")}
         </p>
+      {/if}
+      {#if open.input_url}
+        <div class="mt-3 flex items-start gap-3">
+          <img src={open.input_url} alt="What it was made from" class="w-40 rounded" />
+          {#if open.mask_url}<img src={open.mask_url} alt="Its mask" class="w-40 rounded" />{/if}
+          <p class="text-xs opacity-60">
+            An edit at strength {open.strength} of the picture beside this{#if open.mask_url}, where
+              its mask let it change{/if}. It ran the last {Math.max(1, Math.round(open.steps * open.strength))}
+            of its {open.steps} steps.
+          </p>
+        </div>
       {/if}
     </div>
     <form method="dialog" class="modal-backdrop">

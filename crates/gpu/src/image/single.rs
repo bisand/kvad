@@ -352,26 +352,32 @@ fn clip_g(k: &str, full: &str) -> Option<Vec<(String, Src)>> {
 /// The VAE's levels in SD 1.5, which `ldm` numbers from the bottom.
 const VAE_LEVELS: usize = 4;
 
-/// A VAE name of `ldm`'s, as the diffusers name it becomes: empty for the
-/// encoder's, which decoding does not read, and `None` for what the VAE does
-/// not have.
+/// A VAE name of `ldm`'s, as the diffusers name it becomes, and `None` for
+/// what the VAE does not have.
+///
+/// Both halves are read: the decoder draws, and the encoder reads the
+/// picture an image is made from. They are named alike but for their
+/// levels: the decoder's `up.N` counts from the bottom, diffusers'
+/// `up_blocks.{3 − N}`, and the encoder's `down.N` from the top, as
+/// diffusers' `down_blocks.N` does.
 fn vae(k: &str, full: &str) -> Option<Vec<(String, Src)>> {
     let one = |to: String, matrix: bool| Some(vec![(to, Src { matrix, ..Src::whole(full) })]);
-    if k.starts_with("encoder.") || k.starts_with("quant_conv.") {
-        return Some(Vec::new());
-    }
-    if k.starts_with("post_quant_conv.") {
+    if k.starts_with("post_quant_conv.") || k.starts_with("quant_conv.") {
         return one(k.to_string(), false);
     }
-    let d = k.strip_prefix("decoder.")?;
+    let (half, d) = match (k.strip_prefix("decoder."), k.strip_prefix("encoder.")) {
+        (Some(d), _) => ("decoder", d),
+        (None, Some(d)) => ("encoder", d),
+        (None, None) => return None,
+    };
     for (from, to) in [("conv_in.", "conv_in."), ("conv_out.", "conv_out."), ("norm_out.", "conv_norm_out.")] {
         if let Some(r) = d.strip_prefix(from) {
-            return one(format!("decoder.{to}{r}"), false);
+            return one(format!("{half}.{to}{r}"), false);
         }
     }
     for (from, to) in [("mid.block_1.", "resnets.0."), ("mid.block_2.", "resnets.1.")] {
         if let Some(r) = d.strip_prefix(from) {
-            return one(format!("decoder.mid_block.{to}{}", vae_resnet(r)?), false);
+            return one(format!("{half}.mid_block.{to}{}", vae_resnet(r)?), false);
         }
     }
     // Single-head attention, its projections 1×1 convolutions.
@@ -385,16 +391,24 @@ fn vae(k: &str, full: &str) -> Option<Vec<(String, Src)>> {
             "proj_out" => "to_out.0",
             _ => return None,
         };
-        return one(format!("decoder.mid_block.attentions.0.{to}.{p}"), layer != "norm" && p == "weight");
+        return one(format!("{half}.mid_block.attentions.0.{to}.{p}"), layer != "norm" && p == "weight");
     }
-    // `up.N`, counted from the bottom: diffusers' `up_blocks.{3 - N}`.
-    let (n, r) = d.strip_prefix("up.")?.split_once('.')?;
-    let level = VAE_LEVELS.checked_sub(n.parse::<usize>().ok()? + 1)?;
-    if let Some(p) = r.strip_prefix("upsample.conv.") {
-        return one(format!("decoder.up_blocks.{level}.upsamplers.0.conv.{p}"), false);
+    let (blocks, sampler, n, r) = match half {
+        "decoder" => {
+            let (n, r) = d.strip_prefix("up.")?.split_once('.')?;
+            ("up_blocks", "upsample.conv.", VAE_LEVELS.checked_sub(n.parse::<usize>().ok()? + 1)?, r)
+        }
+        _ => {
+            let (n, r) = d.strip_prefix("down.")?.split_once('.')?;
+            ("down_blocks", "downsample.conv.", n.parse::<usize>().ok().filter(|&n| n < VAE_LEVELS)?, r)
+        }
+    };
+    if let Some(p) = r.strip_prefix(sampler) {
+        let to = if half == "decoder" { "upsamplers" } else { "downsamplers" };
+        return one(format!("{half}.{blocks}.{n}.{to}.0.conv.{p}"), false);
     }
     let (j, r) = r.strip_prefix("block.")?.split_once('.')?;
-    one(format!("decoder.up_blocks.{level}.resnets.{j}.{}", vae_resnet(r)?), false)
+    one(format!("{half}.{blocks}.{n}.resnets.{j}.{}", vae_resnet(r)?), false)
 }
 
 /// Inside the VAE's resnets, `ldm`'s names are diffusers' but for the
@@ -539,7 +553,7 @@ mod tests {
     }
 
     /// The same for SD 1.5: the base's own `v1-5-pruned-emaonly.safetensors`,
-    /// in f32, against its diffusers files in f16, the VAE's decoder among
+    /// in f32, against its diffusers files in f16, both halves of the VAE among
     /// them. Needs both on this machine:
     ///
     ///     cargo test --release -p kvad-gpu single::tests::sd15_s -- --ignored --nocapture
@@ -554,9 +568,8 @@ mod tests {
             (&maps.unet, "unet/diffusion_pytorch_model.fp16.safetensors"),
             (&maps.vae, "vae/diffusion_pytorch_model.fp16.safetensors"),
         ];
-        // What the loaders skip: the VAE's encoder, and CLIP's buffer of
-        // positions.
-        let unused = |n: &str| n.starts_with("encoder.") || n.starts_with("quant_conv.") || n.ends_with("position_ids");
+        // What the loaders skip: CLIP's buffer of positions.
+        let unused = |n: &str| n.ends_with("position_ids");
         let (same, total) = against_folders(&path, REPO, &parts, &unused);
         eprintln!("{same} of {total} tensors bit for bit; {} of the file's left unread", maps.unread.len());
         assert_eq!(same, total);
@@ -582,8 +595,22 @@ mod tests {
             let got = vae(from, from).unwrap_or_else(|| panic!("{from}"));
             assert_eq!((got[0].0.as_str(), got[0].1.matrix), (to, matrix), "{from}");
         }
-        assert_eq!(vae("encoder.down.0.block.0.conv1.weight", "x"), Some(Vec::new()));
-        assert_eq!(vae("quant_conv.bias", "x"), Some(Vec::new()));
+        // The encoder's, whose levels count from the top as diffusers' do.
+        let encoder = [
+            ("encoder.conv_in.weight", "encoder.conv_in.weight", false),
+            ("encoder.norm_out.bias", "encoder.conv_norm_out.bias", false),
+            ("encoder.down.0.block.0.conv1.weight", "encoder.down_blocks.0.resnets.0.conv1.weight", false),
+            ("encoder.down.1.block.0.nin_shortcut.weight", "encoder.down_blocks.1.resnets.0.conv_shortcut.weight", false),
+            ("encoder.down.2.downsample.conv.bias", "encoder.down_blocks.2.downsamplers.0.conv.bias", false),
+            ("encoder.mid.block_2.conv2.weight", "encoder.mid_block.resnets.1.conv2.weight", false),
+            ("encoder.mid.attn_1.q.weight", "encoder.mid_block.attentions.0.to_q.weight", true),
+            ("quant_conv.bias", "quant_conv.bias", false),
+        ];
+        for (from, to, matrix) in encoder {
+            let got = vae(from, from).unwrap_or_else(|| panic!("{from}"));
+            assert_eq!((got[0].0.as_str(), got[0].1.matrix), (to, matrix), "{from}");
+        }
+        assert_eq!(vae("encoder.down.4.block.0.conv1.weight", "x"), None, "SD 1.5's VAE has four levels");
         assert_eq!(vae("decoder.up.4.block.0.conv1.weight", "x"), None, "SD 1.5's VAE has four levels");
         assert_eq!(vae("decoder.up.0.block.0.conv3.weight", "x"), None);
     }
@@ -616,7 +643,8 @@ mod tests {
             "model_ema.diffusion_modelinput_blocks00weight",
         ];
         let m = sd15(names).unwrap();
-        assert_eq!((m.unet.len(), m.clip.len(), m.vae.len(), m.unread.len()), (1, 1, 1, 5));
+        // Both halves of the VAE are read: the encoder for an edit.
+        assert_eq!((m.unet.len(), m.clip.len(), m.vae.len(), m.unread.len()), (1, 1, 2, 4));
         let e = sd15(["model.diffusion_model.input_blocks.0.0.weight", "conditioner.embedders.1.model.ln_final.weight"]).err().unwrap().to_string();
         assert!(e.contains("SD 1.5") && e.contains("ln_final"), "SDXL's bigG: {e}");
     }

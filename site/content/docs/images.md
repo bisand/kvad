@@ -75,6 +75,39 @@ kvad images            # the gallery, as a list
 kvad images rm 12
 ```
 
+## From a picture
+
+`kvad images edit` makes a picture from one you give it. The picture is noised
+part of the way and drawn over from there, so the prompt says what the result
+should be, not what to change: "a green apple on a wooden table", not "make
+the apple green". SDXL and Stable Diffusion 1.5 do this, and their fine-tunes.
+
+```bash
+kvad images edit "a green apple on a wooden table" --image apples.jpg --strength 0.5
+kvad images edit "a blue ceramic bowl" --image apples.jpg --mask right-half.png
+```
+
+`--strength` is how far the picture is taken towards noise, above 0 and at
+most 1, and 0.75 unless said. Near 0 it comes back as it was; at 1 nothing of
+it is left. An edit runs that share of its steps.
+
+With `--mask` only part of the picture is drawn anew, at strength 1 unless
+said, and the rest comes back exactly as it went in. The mask is a picture the
+same size: transparent where the model should draw, as OpenAI's masks are, or
+white on black if it has no transparency. The web UI's Images page lets you
+paint one on the picture.
+
+Without `--size`, the result has the picture's own shape, at about as many
+pixels as the model's own size. The server reads the picture with `ffmpeg`,
+so it needs one installed.
+
+These models were not trained to inpaint, so a mask's edge can show where what
+is drawn does not meet what was kept. Models trained to follow an editing
+instruction (FLUX.1 Kontext, Qwen-Image-Edit) are not here yet.
+
+This arrived after v0.12.0. Until the next release it needs a build from
+source.
+
 ## From the API
 
 `POST /v1/images/generations` is OpenAI's images endpoint, with the settings
@@ -97,6 +130,18 @@ curl http://127.0.0.1:5823/v1/images/generations \
 With `"stream": true` the server sends an event per denoising step, a rough
 preview beside each when `partial_images` asks for one, and a completed event
 per image. See [OpenAI-compatible API](/docs/api/#images).
+
+`POST /v1/images/edits` is OpenAI's edits endpoint: the same fields, with an
+`image`, an optional `mask` and `strength`, as a multipart form or as JSON
+with each file a `data:` URL.
+
+```bash
+curl http://127.0.0.1:5823/v1/images/edits \
+  -F image=@apples.jpg \
+  -F prompt="a green apple on a wooden table" \
+  -F strength=0.5 \
+  -F response_format=url
+```
 
 ## Memory
 

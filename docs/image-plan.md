@@ -428,10 +428,58 @@ is not read.
   `decode(latent / 0.3611 + 0.1159)`.
 - **Schnell takes no guidance.** It was distilled to make an image in one to
   four steps without it, so a guidance scale or a negative prompt is refused
-  rather than ignored. FLUX.1-dev, which takes guidance as an input to the time
-  embedding, is refused by name until it has an implementation and a test.
+  rather than ignored.
 
 At q8 the transformer is about 12.6 GB and T5 about 5 GB.
+
+### FLUX.1-dev (#37)
+
+Added 2026-10-06. Dev is the same transformer with one more input, and it
+was refused by name until now. The repo is gated and its licence is
+non-commercial.
+
+- **The guidance scale is read, not applied.** Dev was distilled from a
+  model guided by running it twice. The scale is now a number the model is
+  given: the same 256 sinusoids as the timestep, of the scale ×1000,
+  through two layers of its own (`time_text_embed.guidance_embedder`,
+  Black Forest Labs' `guidance_in`), added to the time embedding before
+  CLIP's vector is. One pass a step at any scale.
+- **So guidance without a negative prompt**, which no model here had.
+  `Defaults` says the two apart now, `takes_guidance` and
+  `takes_negative`; a negative prompt to dev is a 400 that says why, and
+  the Images page greys the field with the reason.
+- **Which model a transformer is, its config says**: `guidance_embeds`.
+  Everything else is schnell's code, and the checkpoint's weights are all
+  read, the two new layers among them, or the load fails.
+- **The scheduler** shifts with the picture's size (`use_dynamic_shifting`,
+  0.5 at 256 patches to 1.15 at 4096), which Qwen-Image's already did.
+- **Defaults** are diffusers': 28 steps at guidance 3.5, 1024². The issue
+  said about 50, which is Black Forest Labs' own example; 28 is 3.4
+  minutes at 1024² here, and 50 would be six.
+- **The preview matrix is schnell's.** Same VAE, and the previews at steps
+  14 and 28 of a 1024² run were the finished picture's colours.
+
+Measured on an M5 Pro at q8, 28 steps, "a red fox sitting in fresh snow
+next to a wooden sign that says "FLUX", photograph", seed 3:
+
+| | a step | denoise | decode |
+|---|---|---|---|
+| 768² | 3.7 s | 102 to 107 s (three runs) | 7 s |
+| 1024² | 7.2 s | 201 s (one run) | 12.9 s |
+
+It is charged 17.0 GB, as schnell is, and the server's footprint with it
+loaded and idle was 17 GB, 21 GB at the most over a session of both sizes.
+The first image was right: the fox,
+the snow, and a sign that reads FLUX. At guidance 1 the same seed gives a
+flatter, greyer picture with the fox turned away, and at 3.5 a saturated
+one facing the camera, so the input is live. schnell draws as before and
+still refuses a guidance scale.
+
+Not checked: a picture against one diffusers drew (not installed here), a
+LoRA made for dev, or a GGUF of dev's transformer. Both of those go through
+schnell's code with the two layers added to the name map, and neither file
+was fetched. diffusers can also guide dev the old way, twice a step with a
+negative prompt (`true_cfg_scale`); that is not here.
 
 ## Where the code goes
 

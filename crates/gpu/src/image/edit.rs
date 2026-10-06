@@ -211,7 +211,7 @@ mod tests {
         (0..8).for_each(|y| (8..16).for_each(|x| repaint[y * 16 + x] = 255));
         let edit = Edit { image: image.clone(), mask: Some(Mask { width: 16, height: 8, repaint }), strength: Some(0.5) };
         let req = kvad::image::ImageRequest { edit: Some(edit.clone()), width: Some(16), height: Some(8), ..kvad::image::ImageRequest::new("x") }
-            .resolved(&kvad::image::Defaults { width: 16, height: 8, steps: 20, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: false, edits: true })
+            .resolved(&kvad::image::Defaults { width: 16, height: 8, steps: 20, guidance: 5.0, multiple: 8, takes_guidance: true, takes_negative: true, takes_loras: false, edits: true })
             .unwrap();
         let eps = Tensor::from_vec(vec![1f32, -1.0], (1, 1, 1, 2), &Device::Cpu).unwrap();
         // An "encoder" that says 3 everywhere.

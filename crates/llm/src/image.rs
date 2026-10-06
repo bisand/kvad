@@ -184,6 +184,11 @@ pub struct Defaults {
     /// model — FLUX.1-schnell — was trained to make an image without it, and
     /// has no use for a guidance scale or a negative prompt either.
     pub takes_guidance: bool,
+    /// Whether it has a use for a negative prompt: only a model that is
+    /// guided by running it twice, with the prompt and with what to steer
+    /// away from. FLUX.1-dev takes guidance and no negative prompt: its
+    /// guidance is a number the model reads, in one pass.
+    pub takes_negative: bool,
     /// Whether a request may apply LoRAs to it ([`Lora`]).
     pub takes_loras: bool,
     /// Whether it makes an image from a picture ([`Edit`]).
@@ -287,9 +292,13 @@ impl ImageRequest {
             if self.guidance.is_some_and(|g| g != 0.0) {
                 return Err("this model makes images without guidance; leave guidance_scale out, or set it to 0".into());
             }
-            if self.negative_prompt.as_deref().is_some_and(|n| !n.is_empty()) {
-                return Err("this model makes images without guidance, so it has no use for a negative prompt".into());
+        }
+        if !d.takes_negative && self.negative_prompt.as_deref().is_some_and(|n| !n.is_empty()) {
+            return Err(match d.takes_guidance {
+                false => "this model makes images without guidance, so it has no use for a negative prompt",
+                true => "this model reads its guidance as a number and is run once a step, so it has no use for a negative prompt",
             }
+            .into());
         }
         // Kept below 2³² so that it survives a round trip through a browser,
         // where every number is a double and a 64-bit seed would come back
@@ -606,7 +615,7 @@ mod tests {
     }
 
     fn sdxl() -> Defaults {
-        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: false, edits: true }
+        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_negative: true, takes_loras: false, edits: true }
     }
 
     /// An edit with no size is its picture's shape at the model's own
@@ -706,7 +715,7 @@ mod tests {
 
     #[test]
     fn a_model_without_guidance_refuses_a_guidance_scale_and_a_negative_prompt() {
-        let schnell = Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_loras: false, edits: false };
+        let schnell = Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_negative: false, takes_loras: false, edits: false };
         let ask = |g: Option<f32>, n: Option<&str>| {
             ImageRequest { guidance: g, negative_prompt: n.map(str::to_string), ..ImageRequest::new("a cat") }.resolved(&schnell)
         };
@@ -714,6 +723,20 @@ mod tests {
         assert!(ask(Some(0.0), Some("")).is_ok(), "zero and empty are the same as leaving them out");
         assert!(ask(Some(3.5), None).unwrap_err().to_string().contains("guidance_scale"));
         assert!(ask(None, Some("blurry")).unwrap_err().to_string().contains("negative prompt"));
+    }
+
+    /// FLUX.1-dev: guided by a number it reads, in one pass, so with
+    /// nothing for a negative prompt to do.
+    #[test]
+    fn a_model_that_reads_its_guidance_takes_a_scale_and_refuses_a_negative_prompt() {
+        let dev = Defaults { width: 1024, height: 1024, steps: 28, guidance: 3.5, multiple: 16, takes_guidance: true, takes_negative: false, takes_loras: true, edits: false };
+        let ask = |g: Option<f32>, n: Option<&str>| {
+            ImageRequest { guidance: g, negative_prompt: n.map(str::to_string), ..ImageRequest::new("a cat") }.resolved(&dev)
+        };
+        assert_eq!(ask(None, None).unwrap().guidance, 3.5);
+        assert_eq!(ask(Some(1.0), Some("")).unwrap().guidance, 1.0);
+        let why = ask(Some(2.0), Some("blurry")).unwrap_err().to_string();
+        assert!(why.contains("negative prompt") && !why.contains("without guidance"), "{why}");
     }
 
     #[test]

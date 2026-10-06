@@ -1,5 +1,5 @@
-//! FLUX.1-schnell: an MMDiT like Qwen-Image's, with two text encoders and a
-//! second kind of block.
+//! FLUX.1, schnell and dev: an MMDiT like Qwen-Image's, with two text
+//! encoders and a second kind of block.
 //!
 //! - **Two text encoders, for two jobs.** T5-XXL reads the prompt as a
 //!   sentence, 256 tokens of it, and its hidden states are the text stream
@@ -14,10 +14,13 @@
 //!   column counted from the top left, and every text token is at the origin.
 //!   Qwen-Image centred its image and put its text on the diagonal after it;
 //!   FLUX, the older model, did neither.
-//! - **No guidance.** Schnell is distilled to make an image in one to four
-//!   steps without it, so each step is one forward pass. (FLUX.1-dev instead
-//!   takes the guidance scale as an input to the time embedding; that variant
-//!   is refused here rather than run without its input.)
+//! - **One pass a step, in both.** Schnell is distilled to make an image in
+//!   one to four steps with no guidance at all. Dev is distilled another
+//!   way, from a model guided by running it twice: the guidance scale is
+//!   now a number it *reads*, embedded as the timestep is and added to it,
+//!   so guidance 3.5 costs what guidance 1 does and there is nothing for a
+//!   negative prompt to do. Which of the two a transformer is, its config
+//!   says: `guidance_embeds`.
 
 use super::clip::{self, Clip, ClipConfig, Pooled};
 use super::lora::{self, Adapters};
@@ -57,6 +60,8 @@ struct Config {
     joint: usize,
     pooled: usize,
     axes: [usize; 3],
+    /// Whether the guidance scale is an input: dev's, and not schnell's.
+    guided: bool,
 }
 
 impl Config {
@@ -64,13 +69,6 @@ impl Config {
         let n = |k: &str| -> Res<usize> {
             v.get(k).and_then(Value::as_u64).map(|n| n as usize).ok_or_else(|| format!("transformer config has no `{k}`").into())
         };
-        if v.get("guidance_embeds").and_then(Value::as_bool) == Some(true) {
-            return Err(concat!(
-                "this is a guidance-distilled FLUX (FLUX.1-dev), which takes the guidance scale as an input; ",
-                "only FLUX.1-schnell is implemented"
-            )
-            .into());
-        }
         if n("patch_size")? != 1 {
             return Err("FLUX with a transformer patch size other than 1 is not implemented".into());
         }
@@ -87,6 +85,7 @@ impl Config {
             joint: n("joint_attention_dim")?,
             pooled: n("pooled_projection_dim")?,
             axes: axes.try_into().map_err(|_| "`axes_dims_rope` should have three entries")?,
+            guided: v.get("guidance_embeds").and_then(Value::as_bool) == Some(true),
         })
     }
 }
@@ -143,6 +142,10 @@ fn gguf_map(cfg: &Config) -> Vec<(String, Vec<Part>)> {
     lin(&format!("{t}.timestep_embedder.linear_2"), &[("time_in.out_layer", 0..w)]);
     lin(&format!("{t}.text_embedder.linear_1"), &[("vector_in.in_layer", 0..w)]);
     lin(&format!("{t}.text_embedder.linear_2"), &[("vector_in.out_layer", 0..w)]);
+    if cfg.guided {
+        lin(&format!("{t}.guidance_embedder.linear_1"), &[("guidance_in.in_layer", 0..w)]);
+        lin(&format!("{t}.guidance_embedder.linear_2"), &[("guidance_in.out_layer", 0..w)]);
+    }
     lin("norm_out.linear", &[("final_layer.adaLN_modulation.1", w..2 * w), ("final_layer.adaLN_modulation.1", 0..w)]);
     lin("proj_out", &[("final_layer.linear", 0..cfg.in_channels)]);
     // The per-head norms have one name each way.
@@ -203,8 +206,8 @@ fn open_gguf(path: &Path, cfg: &Config) -> Res<Gguf> {
 }
 
 /// Whether `repo`'s transformer is one this pipeline runs, from its config
-/// alone: FLUX.1-dev's is refused here for its guidance input, before a
-/// GGUF of it is downloaded, rather than after, at its load.
+/// alone: asked before a GGUF of it is downloaded, rather than after, at
+/// its load.
 pub(crate) fn runs(repo: &str, watch: &Watcher) -> Res<()> {
     Config::from_json(&read_json(&fetch_file(repo, "transformer/config.json", watch)?)?).map(|_| ())
 }
@@ -222,6 +225,8 @@ struct Transformer {
     time2: Linear,
     text1: Linear,
     text2: Linear,
+    /// The guidance scale's own two layers, in a model that reads one.
+    guidance: Option<(Linear, Linear)>,
     double: Vec<Double>,
     single: Vec<Single>,
     norm_out: Linear,
@@ -247,6 +252,10 @@ impl Transformer {
             time2: Linear::load(cx, &t, "timestep_embedder.linear_2", w, w, true)?,
             text1: Linear::load(cx, &t, "text_embedder.linear_1", cfg.pooled, w, true)?,
             text2: Linear::load(cx, &t, "text_embedder.linear_2", w, w, true)?,
+            guidance: match cfg.guided {
+                true => Some((Linear::load(cx, &t, "guidance_embedder.linear_1", 256, w, true)?, Linear::load(cx, &t, "guidance_embedder.linear_2", w, w, true)?)),
+                false => None,
+            },
             norm_out: Linear::load(cx, r, "norm_out.linear", w, 2 * w, true)?,
             proj_out: Linear::load(cx, r, "proj_out", w, cfg.in_channels, true)?,
             double,
@@ -256,8 +265,10 @@ impl Transformer {
     }
 
     /// The velocity at noise level `sigma` for packed latents `x`
-    /// (`[1, rows·cols, 64]`), T5's hidden states `txt` and CLIP's `pooled`.
-    fn forward(&self, x: &Tensor, txt: &Tensor, pooled: &Tensor, sigma: f64, rows: usize, cols: usize) -> Res<Tensor> {
+    /// (`[1, rows·cols, 64]`), T5's hidden states `txt` and CLIP's `pooled`,
+    /// at the guidance scale `guidance`, which only a model that reads one
+    /// (dev) does anything with.
+    fn forward(&self, x: &Tensor, txt: &Tensor, pooled: &Tensor, sigma: f64, guidance: f64, rows: usize, cols: usize) -> Res<Tensor> {
         let dev = x.device();
         let dtype = x.dtype();
         let (n_img, n_txt) = (x.dim(1)?, txt.dim(1)?);
@@ -266,9 +277,14 @@ impl Transformer {
 
         // The time embedding (σ as a timestep, ×1000) plus CLIP's summary of
         // the prompt, each through its own two-layer MLP.
-        let t = timestep_embedding(&[sigma * 1000.0], 256, true, 0.0, dev)?.to_dtype(dtype)?;
-        let temb = (self.time2.forward(&self.time1.forward(&t)?.silu()?)?
-            + self.text2.forward(&self.text1.forward(pooled)?.silu()?)?)?;
+        let embedded = |n: f64| -> Res<Tensor> { Ok(timestep_embedding(&[n * 1000.0], 256, true, 0.0, dev)?.to_dtype(dtype)?) };
+        let mut temb = self.time2.forward(&self.time1.forward(&embedded(sigma)?)?.silu()?)?;
+        // The guidance scale the same way: the same sinusoids of it, ×1000
+        // as σ is, through two layers of its own, added to the time's.
+        if let Some((one, two)) = &self.guidance {
+            temb = (temb + two.forward(&one.forward(&embedded(guidance)?)?.silu()?)?)?;
+        }
+        let temb = (temb + self.text2.forward(&self.text1.forward(pooled)?.silu()?)?)?;
         let temb = temb.silu()?;
 
         let half = self.cfg.shape.head_dim / 2;
@@ -330,6 +346,14 @@ pub struct Flux {
     adapters: Adapters,
     params: usize,
     bytes: usize,
+}
+
+/// What a transformer of this shape is called.
+fn name_of(cfg: &Config) -> &'static str {
+    match cfg.guided {
+        true => "FLUX.1-dev",
+        false => "FLUX.1-schnell",
+    }
 }
 
 /// A component's config and weights: a shard index's worth, or one file.
@@ -476,7 +500,7 @@ impl Flux {
 
         settle(&device)?;
         let from = made.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
-        progress(&format!("loaded FLUX.1-schnell: {:.1} B parameters at {label}{from}", params as f64 / 1e9));
+        progress(&format!("loaded {}: {:.1} B parameters at {label}{from}", name_of(&dit.cfg), params as f64 / 1e9));
         Ok(Flux { clip_tok, t5_tok, clip, t5, dit, vae, scheduler, device, dtype, quant, gguf: made, adapters, params, bytes: bytes as usize })
     }
 
@@ -548,8 +572,8 @@ pub(crate) fn weight_bytes(repo: &str, quant: Option<GgmlDType>, size: &dyn Fn(&
 impl Flux {
     /// One image, with whatever LoRAs the adapters hold.
     fn draw(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
-        // A guidance scale or a negative prompt is refused here, because the
-        // defaults say this model takes neither.
+        // What the defaults say this model does not take is refused here:
+        // a guidance scale by schnell, a negative prompt by both.
         let req = req.resolved(&self.defaults())?;
 
         let t0 = Instant::now();
@@ -564,7 +588,7 @@ impl Flux {
         let t1 = Instant::now();
         for i in 0..sched.steps() {
             let sigma = sched.timesteps[i];
-            let v = self.dit.forward(&x.to_dtype(self.dtype)?, &txt, &pooled, sigma, rows, cols)?.to_dtype(DType::F32)?;
+            let v = self.dit.forward(&x.to_dtype(self.dtype)?, &txt, &pooled, sigma, req.guidance as f64, rows, cols)?.to_dtype(DType::F32)?;
             let preview = match req.preview {
                 true => {
                     let clean = (&x - (&v * sigma)?)?;
@@ -603,12 +627,17 @@ impl Painter for Flux {
     fn defaults(&self) -> Defaults {
         // Black Forest Labs' own settings for schnell: four steps, no
         // guidance, a megapixel.
-        Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_loras: true, edits: false }
+        let schnell = Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_negative: false, takes_loras: true, edits: false };
+        match self.dit.cfg.guided {
+            false => schnell,
+            // And diffusers' for dev: 28 steps at guidance 3.5.
+            true => Defaults { steps: 28, guidance: 3.5, takes_guidance: true, ..schnell },
+        }
     }
 
     fn summary(&self) -> String {
         let from = self.gguf.as_ref().map(|(name, _)| format!(", the transformer from {name}")).unwrap_or_default();
-        format!("FLUX.1-schnell, {:.1} B parameters{from}", self.params as f64 / 1e9)
+        format!("{}, {:.1} B parameters{from}", name_of(&self.dit.cfg), self.params as f64 / 1e9)
     }
 
     fn params(&self) -> usize {
@@ -727,7 +756,7 @@ mod tests {
                 let dit = Transformer::load(&cx, &r, cfg).unwrap();
                 bfl_loras(&adapters, &map);
                 let on = |k: &str| fx[k].to_device(&dev).unwrap();
-                let run = || dit.forward(&on("x"), &on("txt"), &on("pooled"), sigma, 8, 8).unwrap().to_device(&Device::Cpu).unwrap();
+                let run = || dit.forward(&on("x"), &on("txt"), &on("pooled"), sigma, 0.0, 8, 8).unwrap().to_device(&Device::Cpu).unwrap();
                 let plain = run();
                 let n = adapters.set(&[(&file, 1.0)], &dev, factors).unwrap();
                 let adapted = run();
@@ -811,7 +840,7 @@ mod tests {
             let (x, txt, pooled) = (randn(&[1, 64, channels], 1.0), randn(&[1, 12, joint], 1.0), randn(&[1, pooled_width], 1.0));
             let weigh = randn(&[1, 64, channels], 1.0);
             let loss = |x: &Tensor| -> candle_core::Result<Tensor> {
-                let v = dit.forward(x, &txt, &pooled, 0.6, 8, 8).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                let v = dit.forward(x, &txt, &pooled, 0.6, 0.0, 8, 8).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
                 (v * &weigh)?.sum_all()
             };
 
@@ -940,6 +969,40 @@ mod tests {
 
     /// The positions diffusers' `_prepare_latent_image_ids` gives, and text at
     /// the origin: rows and columns from the top left, not centred.
+    /// Dev's config and schnell's differ in one line, and so do the
+    /// layers each is read with: the guidance scale's two, under Black
+    /// Forest Labs' name for them in a GGUF.
+    #[test]
+    fn only_a_guided_transformer_has_the_guidance_layers() {
+        let config = |guided: bool| {
+            json!({
+                "patch_size": 1, "num_layers": 1, "num_single_layers": 1, "num_attention_heads": 24, "attention_head_dim": 128,
+                "in_channels": 64, "joint_attention_dim": 4096, "pooled_projection_dim": 768, "guidance_embeds": guided
+            })
+        };
+        let (dev, schnell) = (Config::from_json(&config(true)).unwrap(), Config::from_json(&config(false)).unwrap());
+        assert!(dev.guided && !schnell.guided);
+        assert_eq!((name_of(&dev), name_of(&schnell)), ("FLUX.1-dev", "FLUX.1-schnell"));
+        let guidance = |cfg: &Config| -> Vec<(String, String)> {
+            gguf_map(cfg).into_iter().filter(|(to, _)| to.contains("guidance")).map(|(to, parts)| (to, parts[0].name.clone())).collect()
+        };
+        assert!(guidance(&schnell).is_empty());
+        assert_eq!(
+            guidance(&dev),
+            [
+                ("time_text_embed.guidance_embedder.linear_1.weight", "guidance_in.in_layer.weight"),
+                ("time_text_embed.guidance_embedder.linear_1.bias", "guidance_in.in_layer.bias"),
+                ("time_text_embed.guidance_embedder.linear_2.weight", "guidance_in.out_layer.weight"),
+                ("time_text_embed.guidance_embedder.linear_2.bias", "guidance_in.out_layer.bias"),
+            ]
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+        );
+        // A config that does not say is schnell's.
+        let mut bare = config(false);
+        bare.as_object_mut().unwrap().remove("guidance_embeds");
+        assert!(!Config::from_json(&bare).unwrap().guided);
+    }
+
     #[test]
     fn text_is_at_the_origin_and_patches_count_from_the_corner() {
         let cfg = Config {
@@ -950,6 +1013,7 @@ mod tests {
             joint: 4096,
             pooled: 768,
             axes: [16, 56, 56],
+            guided: false,
         };
         let (rows, cols, text) = (3, 5, 2);
         let a = angles(&cfg, rows, cols, text);

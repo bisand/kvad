@@ -21,6 +21,9 @@
 
   const im = $derived(images);
   const d = $derived(images.defaults);
+  // Whether the model has a use for a negative prompt; a server from before
+  // it said so separately means what guidance meant.
+  const negated = $derived(d ? (d.takes_negative ?? d.takes_guidance) : true);
   const p = $derived(images.progress);
   const elapsed = $derived(p && p.step ? (Date.now() - p.started) / 1000 : 0);
 
@@ -68,8 +71,12 @@
         <input
           class="input w-full"
           bind:value={im.negative}
-          disabled={d && !d.takes_guidance}
-          placeholder={d && !d.takes_guidance ? "This model makes images without guidance" : "What to steer away from (optional)"}
+          disabled={d && !negated}
+          placeholder={!d || negated
+            ? "What to steer away from (optional)"
+            : d.takes_guidance
+              ? "This model takes guidance as a number, with no negative prompt"
+              : "This model makes images without guidance"}
         />
       </label>
 

@@ -1,6 +1,6 @@
 ---
 title: Images
-description: Text to image with Stable Diffusion 1.5, SDXL, FLUX.1-schnell and Qwen-Image, on the Mac's GPU.
+description: Text to image with Stable Diffusion 1.5, SDXL, FLUX.1 and Qwen-Image, on the Mac's GPU.
 ---
 
 Image generation runs on the GPU engine, so it needs a Mac. The models are
@@ -24,12 +24,16 @@ and `kvad images` list it.
 |---|---|---|---|
 | Stable Diffusion 1.5 | 1.9 GB | 0.75 s at 512² | 25 |
 | SDXL | 6.4 GB | 3.1 s at 1024² | 30 |
-| FLUX.1-schnell, q8 | 18.3 GB | about 9 s at 1024² | 4 |
+| FLUX.1-schnell, q8 | 18.3 GB | about 7 s at 1024² | 4 |
+| FLUX.1-dev, q8 | 17 GB | about 7 s at 1024² | 28 |
 | Qwen-Image, q8 | about 29 GB | 28 s at 1024² | 20 |
 
 SDXL and Qwen-Image run the denoiser twice per step while guidance is on, and
-those figures include both passes. FLUX.1-schnell needs no guidance. FLUX.1-dev
-is not supported.
+those figures include both passes. FLUX.1-schnell needs no guidance.
+FLUX.1-dev takes a guidance scale, 3.5 unless said, as a number the model
+reads: one pass a step, and no negative prompt. Its repository is gated and
+its licence non-commercial, so it needs a Hugging Face token for an account
+that has accepted the licence.
 
 ### Fine-tunes
 

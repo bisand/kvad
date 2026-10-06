@@ -28,7 +28,7 @@ pub const IMAGES: &str = "usage: kvad images [ls]
                                [and what `make` takes]
        kvad images rm ID
 
-Pictures made by an image model on the server — SDXL, SD 1.5, Qwen-Image.
+Pictures made by an image model on the server — SDXL, SD 1.5, FLUX, Qwen-Image.
 Every one is kept there, with the settings that made it; `make` also writes it
 here, to --out or to image-ID.png. Anything left out is the model's own
 default. --lora applies a LoRA fetched with `kvad pull`, at the strength after

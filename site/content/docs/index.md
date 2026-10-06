@@ -32,7 +32,7 @@ macOS on Apple silicon gets all four. Linux gets `kvad` and a CPU-only
   Mistral, Qwen2/2.5/3, SmolLM2), DeepSeek V2 and V3, Qwen3.5/3.8 and
   Qwen3-Next. Weights come straight from Hugging Face as safetensors.
 - **Image models**: Stable Diffusion 1.5 and SDXL with their fine-tunes,
-  FLUX.1-schnell and Qwen-Image, with LoRAs applied per request.
+  FLUX.1-schnell, FLUX.1-dev and Qwen-Image, with LoRAs applied per request.
 - **Video**: LTX-2.5, with sound, from a prompt or from a picture.
 
 ## Where to start

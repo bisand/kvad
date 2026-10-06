@@ -768,7 +768,7 @@ impl Rig {
                         }
                         false => eps,
                     };
-                    let next = (&x + (eps * sched.dt(k))?)?;
+                    let next = sched.stepped(&x, &eps, k, s.seed + i as u64)?;
                     settle(&self.device)?;
                     Ok(next)
                 })?;

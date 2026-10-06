@@ -182,6 +182,67 @@ steps, `timestep_spacing: leading` with `steps_offset: 1`.
 - The latent is decoded as `vae(x / 0.13025)` — `scaling_factor` from the VAE
   config — and pixels come back in `[−1, 1]`.
 
+#### Other spacings, and one other class (#33)
+
+Written 2026-10-06. Two of the most-downloaded SDXL repos were refused at
+load for `timestep_spacing: trailing`: `stabilityai/sdxl-turbo` and
+`RunDiffusion/Juggernaut-XL-v9`. Neither is a new architecture.
+
+- **`trailing`** counts down from the last timestep in strides of `1000/n`:
+  `round(1000 − i·1000/n) − 1`, rounded as numpy rounds, a half to the even
+  side. Four steps are `999, 749, 499, 249`; one step is `999`. `leading`
+  at one step is timestep 1, which removes no noise, so a model distilled
+  to one step cannot be run with it at all.
+- **`linspace`** is `n` timesteps evenly from 999 to 0, between whole ones,
+  with σ read off the line between its neighbours'. It is diffusers'
+  default for a `EulerDiscreteScheduler` config that names none, which was
+  refused too.
+- Both start at `x = noise · σ_max`, not `√(σ_max² + 1)`, as diffusers
+  starts them.
+- `use_karras_sigmas`, `use_exponential_sigmas`, `use_beta_sigmas` and
+  `rescale_betas_zero_snr` are refused by name when set.
+
+**The scheduler class in the config is not run, with one exception.** A
+DDIM, DDPM or PNDM config runs as Euler over its own noise levels, which
+is what RealVisXL (DDIM) and SD 1.5 (PNDM) already did, and now Juggernaut
+(DDPM). `EulerAncestralDiscreteScheduler` is kept, because sdxl-turbo does
+not work without it past one step: an ancestral step comes down further
+than the next σ and puts fresh noise back, `σ_up = √(σ_next²·(σ² −
+σ_next²)/σ²)`, `σ_down = √(σ_next² − σ_up²)`, and the last step, to 0, adds
+none. The fresh noise is drawn from the request's seed and the step, so a
+request still draws the same picture twice.
+
+That was not the plan. The issue guessed plain Euler would do for one to
+four steps, and at one step it does, being the same arithmetic. At two and
+four the picture came out noisier at each step (grain over the whole fox),
+and with ancestral steps it comes out cleaner at each, as the model card
+says it should.
+
+**sdxl-turbo's defaults** are 512², one step and guidance 0, where SDXL's
+are 1024², 30 and 5. Nothing in the repo says it is distilled: the pipeline
+and the UNet's config are SDXL's, and `trailing` is Juggernaut's too, which
+wants 30 steps. So the repos known to be distilled are a table in
+`sdxl.rs`, matched whole; a fine-tune of turbo under another name gets
+SDXL's defaults and has to be told `--steps` and `--guidance 0`.
+
+Checked on an M5 Pro, "a red fox sitting in fresh snow, photograph", seed 3:
+
+| | | denoise | decode |
+|---|---|---|---|
+| sdxl-turbo | 512², 1 step, no guidance | 0.3 s | 3.0 s |
+| sdxl-turbo | 512², 4 steps | 1.3 s | 2.9 s |
+| Juggernaut-XL v9 | 1024², 30 steps, guidance 5 | 92.7 s | 14.1 s |
+
+All three are a fox in snow, and an edit of turbo's at strength 0.6 in
+four steps made the fox a wolf under the same branch. The σ tables are tested against diffusers'
+formulas recomputed in double precision; no picture was compared with one
+diffusers drew, which is not installed here. The ancestral noise is this
+generator's and not torch's, so a seed's picture is not diffusers' for the
+same seed.
+
+Not done: a turbo checkpoint in one file (`sd_xl_turbo_1.0_fp16.safetensors`)
+is read with SDXL base's scheduler config, `leading`, and so not as turbo.
+
 ### VAE decoder
 
 `AutoencoderKL`, `latent_channels 4`, `block_out_channels [128, 256, 512, 512]`,

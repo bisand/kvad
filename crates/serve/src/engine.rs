@@ -227,6 +227,22 @@ pub fn pull_gguf(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weigh
     }
 }
 
+/// Pull an image pipeline in diffusers' layout, every file its load reads.
+/// Whether `repo` was one: a repo with no `model_index.json` is not, and
+/// nothing of it has been fetched.
+pub fn pull_pipeline(repo: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weights::Watcher) -> Result<bool, Box<dyn std::error::Error>> {
+    #[cfg(feature = "gpu")]
+    return kvad_gpu::image::pull_pipeline(repo, progress, watch).map(|files| files.is_some());
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = progress;
+        match kvad::weights::fetch_file(repo, "model_index.json", watch) {
+            Ok(_) => Err(format!("{repo} is an image pipeline, and this build has no GPU backend to run one").into()),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
 /// Pull an SDXL or SD 1.5 checkpoint in one file, `repo`,
 /// `repo:file.safetensors` or a path, and what it reads beside it; or a
 /// LoRA, named the same ways.

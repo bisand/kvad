@@ -977,12 +977,29 @@ impl QwenImage {
 /// transformer's config, which a GGUF does not carry.
 pub(crate) fn fetch_base(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
     progress(&format!("fetching what {repo} holds beside its transformer"));
-    fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?;
-    for f in ["model_index.json", "scheduler/scheduler_config.json", "transformer/config.json", "vae/config.json", "vae/diffusion_pytorch_model.safetensors"] {
-        fetch_file(repo, f, watch)?;
+    beside(repo, watch).map(|_| ())
+}
+
+/// [`fetch_base`]'s files. A component's shard index is read and not
+/// listed: which shards there are is all it says.
+fn beside(repo: &str, watch: &Watcher) -> Res<Vec<PathBuf>> {
+    let mut files = vec![fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?];
+    for f in ["model_index.json", "scheduler/scheduler_config.json", "transformer/config.json", "vae/config.json", "vae/diffusion_pytorch_model.safetensors", "text_encoder/config.json"] {
+        files.push(fetch_file(repo, f, watch)?);
     }
-    component(repo, "text_encoder", "model", watch)?;
-    Ok(())
+    files.extend(component(repo, "text_encoder", "model", watch)?.1);
+    Ok(files)
+}
+
+/// Every file [`QwenImage::load`] reads for `repo`, fetched and not loaded:
+/// what its pull brings. The transformer in the repo's own bf16, whatever
+/// quantisation a load then makes of it.
+pub(crate) fn fetch(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Vec<PathBuf>> {
+    progress(&format!("fetching {repo}'s text encoder and VAE"));
+    let mut files = beside(repo, watch)?;
+    progress("fetching the transformer — twenty billion parameters, in bf16");
+    files.extend(component(repo, "transformer", "diffusion_pytorch_model", watch)?.1);
+    Ok(files)
 }
 
 /// Bytes for `params` weights at a quantisation, the way candle stores them.

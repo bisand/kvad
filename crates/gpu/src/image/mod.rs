@@ -313,6 +313,30 @@ pub fn pull_single(name: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) 
     }
 }
 
+/// Fetch every file the load of `repo` reads, a pipeline in diffusers'
+/// layout, a directory to a model, and load none of it: a pull. The files,
+/// its own and the ones its pipeline borrows from other repos; or `None`
+/// for a repo with no `model_index.json`, which is not one, and has been
+/// asked nothing else.
+///
+/// A language model's pull asks such a repo for a `config.json` it does not
+/// have, which is why this is asked first. For a language model the
+/// question is one small request, and none once the cache holds the answer.
+pub fn pull_pipeline(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Option<Vec<PathBuf>>> {
+    let Ok(index) = fetch_file(repo, "model_index.json", watch) else { return Ok(None) };
+    let v = read_json(&index)?;
+    // The same four arms as [`load_with`]'s, and the same refusal: a
+    // pipeline with no implementation here is not worth its gigabytes.
+    let files = match v.get("_class_name").and_then(Value::as_str).unwrap_or("?") {
+        "StableDiffusionXLPipeline" => sdxl::fetch(repo, progress, watch)?,
+        "StableDiffusionPipeline" => sd15::fetch(repo, progress, watch)?,
+        "QwenImagePipeline" => qwen::fetch(repo, progress, watch)?,
+        "FluxPipeline" => flux::fetch(repo, progress, watch)?,
+        other => return Err(format!("`{repo}` is a {other}; the pipelines implemented here are {}", PIPELINES.join(" and ")).into()),
+    };
+    Ok(Some(files))
+}
+
 /// Fetch a GGUF, `repo:QUANT`, and everything else its model reads from
 /// its base, without loading any of it: a pull.
 ///

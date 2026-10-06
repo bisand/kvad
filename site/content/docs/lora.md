@@ -68,6 +68,20 @@ the Training page, and add a prompt or two to draw as it learns. The page
 shows the validation loss and a row of pictures for each prompt, one at
 every measurement. The finished LoRA is then a choice on the Images page.
 
+### Through the server, from the command line
+
+`kvad tune` asks the server for the same job, from this machine or another.
+It sends the folder as a dataset, follows the run, and the LoRA is then
+applied by its name:
+
+```bash
+kvad tune --data ./my-photos --name my-style --sample "a lighthouse, my-style"
+kvad images make "a lighthouse, my-style" --lora my-style
+```
+
+`kvad jobs pictures ID --out DIR` fetches the pictures a run drew, and
+`kvad tune options` says what a run can be asked for.
+
 ### What a run takes
 
 Measured on an M5 Pro with 48 GB, one picture a step:

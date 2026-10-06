@@ -151,6 +151,13 @@ struct Args {
     eval_every: Option<usize>,
     threads: Option<usize>,
     sample: Option<usize>,
+    /// `tune` only: `--sample` as it was written, a prompt to draw, as often
+    /// as it is given. `train`'s is a number, kept above.
+    samples: Vec<String>,
+    rank: Option<usize>,
+    caption: Option<String>,
+    sample_size: Option<usize>,
+    sample_steps: Option<usize>,
     warmup: Option<usize>,
     decay_to: Option<f32>,
     clip: Option<f32>,
@@ -224,6 +231,11 @@ impl Default for Args {
             eval_every: None,
             threads: None,
             sample: None,
+            samples: Vec::new(),
+            rank: None,
+            caption: None,
+            sample_size: None,
+            sample_steps: None,
             warmup: None,
             decay_to: None,
             clip: None,
@@ -259,8 +271,10 @@ fn usage() -> ! {
            conversations       ls, show ID, edit ID, rm ID\n  \
            images              ls, make PROMPT [--out FILE], rm ID\n  \
            videos              ls, make PROMPT [--out FILE], show ID, watch ID, get ID, rm ID\n  \
-           jobs                ls, show ID, watch ID, cancel ID\n  \
-           datasets            ls, add FILE, crawl URL, show ID, check ID, search ID Q, rm ID\n  \
+           jobs                ls, show ID, watch ID, cancel ID, pictures ID\n  \
+           datasets            ls, add FILE|DIR, crawl URL, show ID, check ID, search ID Q,\n  \
+           \u{20}                   put ID FILE..., get ID FILE, rm ID [FILE...]\n  \
+           tune                train a LoRA for SDXL: --data DIR --name NAME; options\n  \
            evals               runs, show ID, suites, add FILE, edit ID FILE, rm ID,\n  \
            \u{20}                   run SUITE MODEL..., perplexity DATASET MODEL...\n  \
            bench               runs, show ID, run MODEL...\n  \
@@ -337,7 +351,7 @@ fn usage() -> ! {
 /// Commands that take words after them, rather than only flags.
 const POSITIONAL: &[&str] = &[
     "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload",
-    "tokenize", "service", "conversations", "jobs", "datasets", "evals", "bench", "metrics",
+    "tokenize", "service", "conversations", "jobs", "datasets", "tune", "evals", "bench", "metrics",
     "auth", "users", "sessions", "keys", "api", "images", "videos",
 ];
 
@@ -445,7 +459,16 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--decay-to" => a.decay_to = Some(num() as f32),
             "--clip" => a.clip = Some(num() as f32),
             "--threads" => a.threads = Some((num() as usize).max(1)),
-            "--sample" => a.sample = Some(num() as usize),
+            // A number of characters for `train`, a prompt for `tune`: each
+            // reads its own, and `train` refuses a prompt.
+            "--sample" => {
+                a.sample = value.parse().ok();
+                a.samples.push(value.clone());
+            }
+            "--rank" => a.rank = Some(num() as usize),
+            "--caption" => a.caption = Some(value.clone()),
+            "--sample-size" => a.sample_size = Some(num() as usize),
+            "--sample-steps" => a.sample_steps = Some(num() as usize),
             "--quant" => {
                 a.quant = Precision::parse(&value).unwrap_or_else(|| {
                     eprintln!("--quant expects f32, q8 or q4, got `{value}`");
@@ -480,6 +503,10 @@ fn parse_from(argv: Vec<String>) -> Args {
     }
     if !a.words.is_empty() {
         a.target = Some(a.words.join(" "));
+    }
+    if let (true, None, Some(given)) = (a.command == "train", a.sample, a.samples.first()) {
+        eprintln!("--sample expects a number, got `{given}`");
+        std::process::exit(2);
     }
     a
 }

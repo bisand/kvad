@@ -363,6 +363,8 @@ enum Probe {
 pub enum Body<'a> {
     Json(&'a Value),
     Text(String),
+    /// A file as it is: a picture going into a dataset.
+    Bytes(Vec<u8>),
 }
 
 impl Remote {
@@ -493,6 +495,7 @@ impl Remote {
             Some(Body::Text(text)) => self
                 .agent
                 .run(req.header("content-type", "text/plain; charset=utf-8").body(text.into_bytes())?),
+            Some(Body::Bytes(bytes)) => self.agent.run(req.header("content-type", "application/octet-stream").body(bytes)?),
         };
         sent.map_err(|e| match e {
             ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -806,10 +809,13 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("post", "/api/playground/tokenize", "kvad tokenize"),
     ("post", "/api/train", "kvad train"),
     ("get", "/api/train/options", "kvad train options"),
+    ("post", "/api/tune", "kvad tune"),
+    ("get", "/api/tune/options", "kvad tune options"),
     ("get", "/api/jobs", "kvad jobs"),
     ("get", "/api/jobs/{id}", "kvad jobs show"),
     ("delete", "/api/jobs/{id}", "kvad jobs cancel"),
     ("get", "/api/jobs/{id}/events", "kvad jobs watch"),
+    ("get", "/api/jobs/{id}/pictures/{file}", "kvad jobs pictures"),
     ("get", "/api/datasets", "kvad datasets"),
     ("post", "/api/datasets", "kvad datasets add"),
     ("post", "/api/datasets/crawl", "kvad datasets crawl"),
@@ -817,6 +823,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("delete", "/api/datasets/{id}", "kvad datasets rm"),
     ("get", "/api/datasets/{id}/check", "kvad datasets check"),
     ("get", "/api/datasets/{id}/search", "kvad datasets search"),
+    ("post", "/api/datasets/pictures", "kvad datasets add, kvad tune"),
+    ("get", "/api/datasets/{id}/pictures", "kvad datasets show"),
+    ("put", "/api/datasets/{id}/files/{file}", "kvad datasets add, kvad datasets put, kvad tune"),
+    ("get", "/api/datasets/{id}/files/{file}", "kvad datasets get"),
+    ("delete", "/api/datasets/{id}/files/{file}", "kvad datasets rm"),
     ("get", "/api/evals/suites", "kvad evals suites"),
     ("post", "/api/evals/suites", "kvad evals add"),
     ("patch", "/api/evals/suites/{id}", "kvad evals edit"),
@@ -889,19 +900,6 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
          server's machine, `kvad service restart` restarts the service through launchd \
          or systemd",
     ),
-    (
-        "post",
-        "/api/tune",
-        "no command yet: `kvad-gpu tune --data DIR --name NAME` trains the same LoRA from a \
-         folder, in the terminal that asks, without the server",
-    ),
-    ("get", "/api/tune/options", "what the Training page offers for a LoRA run; `kvad-gpu tune --help` says the same"),
-    ("get", "/api/jobs/{id}/pictures/{file}", "a PNG a LoRA run drew, for the Training page's <img>; `kvad-gpu tune --sample` writes them to a folder"),
-    ("post", "/api/datasets/pictures", "the Datasets page starting a folder of pictures; `kvad-gpu tune --data` reads any folder there is"),
-    ("get", "/api/datasets/{id}/pictures", "the Datasets page's view of that folder"),
-    ("put", "/api/datasets/{id}/files/{file}", "the Datasets page uploading one picture or caption into it"),
-    ("get", "/api/datasets/{id}/files/{file}", "a picture, for the Datasets page's <img>"),
-    ("delete", "/api/datasets/{id}/files/{file}", "the Datasets page taking one out"),
     ("get", "/api/data", "the Settings page's view of the data directory; on the server's machine, `du` sees it"),
     ("get", "/api/data/plan", "the Settings page asking before it moves the data"),
     (

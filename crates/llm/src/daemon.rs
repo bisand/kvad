@@ -374,6 +374,61 @@ pub fn where_the_log_is() -> String {
     }
 }
 
+/// A place in the service's log: taken before a start, so that what the
+/// server wrote *because of* that start can be told from what was there.
+///
+/// launchd appends to one file across every run, and a server that fails the
+/// same way each time writes the same line each time; the last line of the
+/// file says nothing about when.
+pub struct Mark {
+    len: u64,
+    at: std::time::SystemTime,
+}
+
+/// Where the log is now.
+pub fn mark() -> Mark {
+    let len = log_paths().get(1).and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+    Mark { len, at: std::time::SystemTime::now() }
+}
+
+/// What the server has written to standard error since `mark`: its last few
+/// lines, a line it repeated given once.
+///
+/// A server that cannot start says why here and nowhere else — a database
+/// newer than the build, an address it may not bind — and "see the log" is
+/// one step more than somebody at the end of an installer takes.
+pub fn said_since(mark: &Mark) -> Vec<String> {
+    let text = match Manager::here() {
+        Manager::Launchd => {
+            let Some(bytes) = log_paths().get(1).and_then(|p| std::fs::read(p).ok()) else {
+                return Vec::new();
+            };
+            // A log that shrank was rotated or removed; all of it is new.
+            let from = if bytes.len() as u64 >= mark.len { mark.len as usize } else { 0 };
+            String::from_utf8_lossy(&bytes[from..]).into_owned()
+        }
+        Manager::Systemd => {
+            let secs = mark.at.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let since = format!("@{secs}");
+            output("journalctl", &["--user", "-u", UNIT, "--since", &since, "--no-pager", "-o", "cat"])
+                .unwrap_or_default()
+        }
+    };
+    last_lines(&text, 6)
+}
+
+/// The last `keep` lines of `text` that say something, without the repeats a
+/// restart loop makes.
+fn last_lines(text: &str, keep: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()) {
+        if lines.last().map(String::as_str) != Some(line) {
+            lines.push(line.to_string());
+        }
+    }
+    lines.split_off(lines.len().saturating_sub(keep))
+}
+
 /// The manager's own name, for sentences.
 pub fn manager_name() -> &'static str {
     match Manager::here() {
@@ -640,6 +695,14 @@ mod tests {
     }
 
     /// A plist reformatted onto one line is still the plist launchd runs.
+    #[test]
+    fn a_restart_loop_is_said_once() {
+        let log = "listening\nschema 17, this build knows 15\n\nschema 17, this build knows 15\nschema 17, this build knows 15\n";
+        assert_eq!(last_lines(log, 6), ["listening", "schema 17, this build knows 15"]);
+        assert_eq!(last_lines("a\nb\nc\n", 2), ["b", "c"]);
+        assert!(last_lines("", 6).is_empty());
+    }
+
     #[test]
     fn a_plist_on_one_line_still_has_its_address() {
         let one_line = "<plist><dict><key>Label</key><string>net.kvad.serve</string>\

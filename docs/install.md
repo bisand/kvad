@@ -25,6 +25,15 @@ default — it says what that address is and offers to keep it. It also stops
 the service before replacing the binaries underneath it, and starts it again
 afterwards, whether or not the unit file itself was rewritten.
 
+Starting the service ends with a question put to the server itself: does
+anything answer at its address. If nothing does within fifteen seconds the
+installer says so, prints what `kvad-serve` wrote on its way down, and does
+not finish on "installed" in green. The case it was written for is a database
+newer than the release being installed — a build from a checkout has migrated
+it — which the server refuses to open, as it should, and which the service
+manager reports as a job it has. `kvad service install` and `kvad service
+start` ask the same question and exit non-zero on the same answer.
+
 For a machine with nobody watching, `--yes` never opens a terminal and takes
 the quiet answer to every question: on a fresh machine, binaries and nothing
 else; on one that already runs the service, the same service pointed at the

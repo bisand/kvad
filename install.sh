@@ -735,6 +735,94 @@ resume_service() {
     service_loaded
 }
 
+# Whether the service answers, which is not what any of the above asks.
+#
+# launchd having the job is not the server listening. A kvad-serve that
+# refuses its database — one written by a newer build than the release being
+# installed — exits as it starts, launchd starts it again every ten seconds,
+# and every question put to launchd in between comes back "loaded". This
+# script said "loaded" and then "kvad is installed" over exactly that.
+#
+# Any HTTP reply counts, a 401 included: a server that wants a credential is
+# a server. wget calls those failures, with 6 and 8.
+SERVICE_FAILED=0
+answers() {
+    case $SERVICE_HOST in
+        0.0.0.0) host=127.0.0.1 ;;
+        ::)      host=::1 ;;
+        *)       host=$SERVICE_HOST ;;
+    esac
+    url="http://$(join_bind "$host" "$SERVICE_PORT")/api/health"
+    if have curl; then
+        curl -s -o /dev/null --max-time 2 "$url"
+    else
+        wget -q -O /dev/null --timeout=2 --tries=1 "$url"
+        case $? in 0|6|8) return 0 ;; *) return 1 ;; esac
+    fi
+}
+
+# Fifteen seconds, which is what `kvad service install` gives it. The socket
+# opens before a model is loaded, so a healthy server is there in one or two.
+await_answer() {
+    waited=0
+    until answers; do
+        waited=$((waited + 1))
+        [ "$waited" -ge 30 ] && return 1
+        sleep 0.5
+    done
+    return 0
+}
+
+# How long the server's error log is, taken before a start so that what the
+# start wrote can be told from what a month of other starts left there.
+# Linux keeps it in the journal, which is asked by time instead.
+log_mark() {
+    LOG_BYTES=0
+    LOG_SINCE=$(date +%s)
+    if [ "$PLATFORM" = macos ] && [ -f "$HOME/Library/Logs/kvad/kvad-serve.err" ]; then
+        LOG_BYTES=$(wc -c < "$HOME/Library/Logs/kvad/kvad-serve.err" | tr -d ' ')
+    fi
+}
+
+# What the server has said since log_mark, a repeated line once.
+said_since() {
+    if [ "$PLATFORM" = macos ]; then
+        [ -f "$HOME/Library/Logs/kvad/kvad-serve.err" ] || return 0
+        tail -c "+$((LOG_BYTES + 1))" "$HOME/Library/Logs/kvad/kvad-serve.err" 2>/dev/null
+    else
+        have journalctl || return 0
+        journalctl --user -u kvad-serve --since "@$LOG_SINCE" --no-pager -o cat 2>/dev/null
+    fi | grep -v '^[[:space:]]*$' | uniq | tail -n 6
+}
+
+# For the starts this script makes itself. `kvad service install` does its
+# own asking, and says the same things, where the kvad just installed has it.
+check_answering() {
+    if await_answer; then
+        say "  answering at http://$(bind_addr)"
+        return 0
+    fi
+    SERVICE_FAILED=1
+    said=$(said_since | sed 's/^/    /')
+    if [ "$PLATFORM" = macos ]; then
+        log="$HOME/Library/Logs/kvad/kvad-serve.err"
+    else
+        log="journalctl --user -u kvad-serve"
+    fi
+    if [ -n "$said" ]; then
+        warn "$SERVICE_LABEL was started, and nothing answers at http://$(bind_addr).
+  kvad-serve said:
+
+$said
+
+  Its log: $log"
+    else
+        warn "$SERVICE_LABEL was started, and nothing answers at http://$(bind_addr).
+  Its log: $log"
+    fi
+    return 1
+}
+
 # The address a service that is already installed was given. An upgrade that
 # quietly moved the server back to 127.0.0.1:5823 is a server that stopped
 # answering where the rest of the machine expects it — so what is on disk is
@@ -1219,22 +1307,33 @@ if [ -f "$SRC/kvad-serve" ]; then
         # --force because the objections it would raise — an address that is
         # not loopback, an address that is taken — have been put to the
         # person already, above, and answered.
+        log_mark
         if cli_has_service "$PREFIX/kvad"; then
-            "$PREFIX/kvad" service install --host "$SERVICE_HOST" --port "$SERVICE_PORT" --force >&2 ||
+            if "$PREFIX/kvad" service install --host "$SERVICE_HOST" --port "$SERVICE_PORT" --force >&2; then
+                # A kvad from before 0.12 exits 0 over a server that never
+                # answered, with "not answering yet" in what it printed.
+                answers || check_answering || true
+            else
+                SERVICE_FAILED=1
                 warn "kvad service install did not finish; see above. Retry it with:
     $PREFIX/kvad service install --host $SERVICE_HOST --port $SERVICE_PORT"
+            fi
         elif [ "$PLATFORM" = macos ]; then
             write_launchd
+            check_answering || true
         else
             write_systemd
+            check_answering || true
         fi
     elif [ "$SERVICE_WAS_LOADED" -eq 1 ]; then
         # Stopped a few steps up so its binaries could be replaced. Whatever
         # was just declined, it was not "turn my server off".
         step "Starting the service again on the new binaries"
+        log_mark
         if resume_service; then
-            say "  $SERVICE_LABEL is listening on $(bind_addr)"
+            check_answering || true
         else
+            SERVICE_FAILED=1
             if [ "$PLATFORM" = macos ]; then
                 how="launchctl bootstrap gui/$(id -u) $(service_paths)"
             else
@@ -1255,7 +1354,14 @@ fi
 # ------------------------------------------------------------------ done --
 
 say ""
-say "${GRN}kvad $VERSION is installed.${R}"
+if [ "$SERVICE_FAILED" -eq 1 ]; then
+    # Not green, and not the last word: the binaries are where they should
+    # be and the thing most people installed them for is not there.
+    say "${YEL}kvad $VERSION is installed, and its background service is not answering.${R}"
+    say "What it said is above; ${B}kvad service status${R} asks again."
+else
+    say "${GRN}kvad $VERSION is installed.${R}"
+fi
 say ""
 say "  ${B}kvad pull${R} Qwen/Qwen2.5-0.5B-Instruct   download a model"
 say "  ${B}kvad chat${R}                              talk to it"

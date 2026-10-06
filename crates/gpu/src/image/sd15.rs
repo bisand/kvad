@@ -35,7 +35,7 @@ use std::time::Instant;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-pub const REPO: &str = "stable-diffusion-v1-5/stable-diffusion-v1-5";
+pub use kvad::pipeline::sd15::REPO;
 
 pub struct Sd15 {
     tok: tokenizers::Tokenizer,
@@ -267,30 +267,7 @@ impl Painter for Sd15 {
 /// the base's configs and scheduler. What its pull fetches.
 pub(crate) fn fetch_base(progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
     progress(&format!("fetching {REPO}'s configs"));
-    beside(REPO, watch).map(|_| ())
-}
-
-/// What [`Sd15::load_with`] reads that is not a model: the tokenizer, and
-/// `repo`'s configs and scheduler.
-fn beside(repo: &str, watch: &Watcher) -> Res<Vec<PathBuf>> {
-    let mut files = vec![fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?];
-    for f in ["model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json", "unet/config.json", "vae/config.json"] {
-        files.push(fetch_file(repo, f, watch)?);
-    }
-    Ok(files)
-}
-
-/// Every file [`Sd15::load`] reads for `repo`, a pipeline in diffusers'
-/// layout, fetched and not loaded: what its pull brings. The `.fp16` weights
-/// where the repo ships them, as [`weights`] chooses.
-pub(crate) fn fetch(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Vec<PathBuf>> {
-    progress(&format!("fetching {repo}'s configs"));
-    let mut files = beside(repo, watch)?;
-    for (dir, stem, what) in [("text_encoder", "model", "text encoder"), ("unet", "diffusion_pytorch_model", "UNet"), ("vae", "diffusion_pytorch_model", "VAE")] {
-        progress(&format!("fetching the {what}"));
-        files.push(weights(repo, dir, stem, watch)?);
-    }
-    Ok(files)
+    kvad::pipeline::sd15::beside(REPO, watch).map(|_| ())
 }
 
 /// [`weight_bytes`] for a checkpoint in one file: what the three loaders

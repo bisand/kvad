@@ -108,7 +108,7 @@ fn cache_repo(repo: &str, files: &[(&str, &str)], missing: &[&str]) -> PathBuf {
 /// wants is in the cache, so a request is a file the test did not expect.
 fn pulled(repo: &str) -> Vec<String> {
     let before = ASKED.load(Ordering::SeqCst);
-    let files = kvad_gpu::image::pull_pipeline(repo, &mut |_| {}, &Watcher::none()).unwrap().expect("a pipeline");
+    let files = kvad::pipeline::pull(repo, &mut |_| {}, &Watcher::none()).unwrap().expect("a pipeline");
     assert_eq!(ASKED.load(Ordering::SeqCst), before, "the pull of {repo} asked the Hub for a file the cache does not hold");
     let mut names: Vec<String> = files
         .iter()
@@ -240,10 +240,10 @@ fn a_pull_knows_what_is_not_its_pipeline() {
     let _alone = alone();
     let language = cache_language_model("pulled", &["model_index.json"]);
     let before = ASKED.load(Ordering::SeqCst);
-    assert!(kvad_gpu::image::pull_pipeline(&language, &mut |_| {}, &Watcher::none()).unwrap().is_none());
+    assert!(kvad::pipeline::pull(&language, &mut |_| {}, &Watcher::none()).unwrap().is_none());
 
     cache_repo("kvad-test/three", &[("model_index.json", r#"{"_class_name": "StableDiffusion3Pipeline"}"#)], &[]);
-    let refused = kvad_gpu::image::pull_pipeline("kvad-test/three", &mut |_| {}, &Watcher::none()).unwrap_err().to_string();
+    let refused = kvad::pipeline::pull("kvad-test/three", &mut |_| {}, &Watcher::none()).unwrap_err().to_string();
     assert!(refused.contains("StableDiffusion3Pipeline"), "{refused}");
     assert_eq!(ASKED.load(Ordering::SeqCst), before, "the Hub was asked");
 }
@@ -262,7 +262,7 @@ fn every_pipeline_has_a_pull() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("model_index.json"), format!(r#"{{"_class_name": "{class}"}}"#)).unwrap();
         cache_borrowed();
-        let said = kvad_gpu::image::pull_pipeline(&dir.to_string_lossy(), &mut |_| {}, &Watcher::none()).unwrap_err().to_string();
+        let said = kvad::pipeline::pull(&dir.to_string_lossy(), &mut |_| {}, &Watcher::none()).unwrap_err().to_string();
         assert!(!said.contains("implemented here"), "{class}: {said}");
     }
 }

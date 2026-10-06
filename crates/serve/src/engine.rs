@@ -232,7 +232,7 @@ pub fn pull_gguf(name: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weigh
 /// nothing of it has been fetched.
 pub fn pull_pipeline(repo: &str, progress: &mut dyn FnMut(&str), watch: &kvad::weights::Watcher) -> Result<bool, Box<dyn std::error::Error>> {
     #[cfg(feature = "gpu")]
-    return kvad_gpu::image::pull_pipeline(repo, progress, watch).map(|files| files.is_some());
+    return kvad::pipeline::pull(repo, progress, watch).map(|files| files.is_some());
     #[cfg(not(feature = "gpu"))]
     {
         let _ = progress;

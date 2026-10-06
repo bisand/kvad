@@ -979,9 +979,22 @@ fn pull(args: Args) -> Res<()> {
         std::process::exit(2);
     };
 
+    eprintln!("pulling {repo}");
+    // An image pipeline in diffusers' layout first, as the server's pull
+    // asks: a language model's pull finds no config in one. Fetched here,
+    // and drawn with by a server, which is where the GPU backend is.
+    let watch = weights::Watcher::none();
+    if let Some(files) = kvad::pipeline::pull(&repo, &mut |msg| eprintln!("  {msg}"), &watch)? {
+        println!("  an image pipeline, {} files", files.len());
+        if let Some(local) = hub::find_local(&repo) {
+            println!("  {} on disk", hub::human_bytes(local.bytes));
+        }
+        println!("\nmake a picture with:  kvad images make \"…\" --model {repo}   (with kvad-serve running)");
+        return Ok(());
+    }
+
     // Read the config first: no point downloading gigabytes for an
     // architecture we cannot run.
-    eprintln!("pulling {repo}");
     let files = weights::pull(&repo)?;
     let spec = Spec::from_json(&files.config)?;
     println!("  {}", spec.summary());

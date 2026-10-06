@@ -217,12 +217,32 @@ stopped from the page at step 10, which kept that step. The second LoRA was
 then applied by a request, 768² in 12 steps, by the path it is listed
 under. No long run has been made through the page.
 
+## From `kvad`, through the server
+
+`kvad tune` asks a running server for the same job, from this machine or
+another:
+
+```bash
+kvad tune --data ./my-photos --name my-style --sample "a lighthouse, my-style"
+kvad images make "a lighthouse, my-style" --lora my-style
+kvad jobs pictures 12 --out ./samples      # what job 12 drew as it learned
+```
+
+`--data` sends the folder to the server as a dataset first, a request a
+file; `--dataset` names one it has. `kvad datasets add DIR`, `put`, `get`
+and `rm ID FILE...` are the Datasets page's upload, and `kvad tune options`
+says what a run there can be asked for and what memory each size is set
+aside. A LoRA trained on the server is applied by the one word it was
+named, as above: the path it has there means nothing on another machine.
+
+Checked against a server with the six made-up pictures at 512²: the folder
+sent, a 6-step run followed to its end, its three samples fetched, and an
+image drawn with `--lora` and the LoRA's name.
+
 ## Not here yet
 
-- **A `kvad` command for it.** The routes are the web UI's so far;
-  `kvad-gpu tune` is the command line, without the server.
 - **Going on from a LoRA** (`--from`), `--alpha` and `--holdout` from the
-  page. `kvad-gpu tune` has them.
+  page or `kvad tune`. `kvad-gpu tune` has them.
 - **Other models.** FLUX and Qwen-Image are refused by name: their blocks'
   gradients are checked (#74), and a step through all of them has not been
   made to fit or been measured. An SDXL checkpoint in one file is refused

@@ -85,19 +85,56 @@ pub const JOBS: &str = "usage: kvad jobs [ls] [--limit N]
        kvad jobs show ID
        kvad jobs watch ID      follow it until it ends
        kvad jobs cancel ID     ask it to stop
+       kvad jobs pictures ID [--out DIR]
+                               fetch what a LoRA run drew: the samples of
+                               `kvad tune --sample`, into DIR (default: here)
 
 Downloads, training runs, evals and benchmarks, in one history.";
 
 pub const DATASETS: &str = "usage: kvad datasets [ls]
-       kvad datasets add FILE [--name NAME]
+       kvad datasets add FILE [--name NAME]   a text, to train a language model on
+       kvad datasets add DIR [--name NAME]    a folder of pictures, for `kvad tune`
        kvad datasets crawl URL --name NAME [--pages N] [--mb F] [--pause MS]
                                            [--drop-rare N] [--same-host]
        kvad datasets show ID
        kvad datasets check ID --model MODEL   would it fit that model's vocabulary
        kvad datasets search ID QUESTION [--k N]
+       kvad datasets put ID FILE...           pictures and captions into a folder of them
+       kvad datasets get ID FILE [--out PATH] one of them back
+       kvad datasets rm ID FILE...            take those out of it
        kvad datasets rm ID
 
-An ID can also be a dataset's name.";
+An ID can also be a dataset's name. A picture's caption is the .txt of the same
+name: `dog.jpg` and `dog.txt`. A file's name may hold letters, digits, spaces
+and `-`, `_` or `.`; anything else in it is sent as `_`. Adding a folder under
+the name of one already there adds to it.";
+
+pub const TUNE: &str = "usage: kvad tune --data DIR --name NAME [options]
+       kvad tune --dataset ID|NAME --name NAME [options]
+       kvad tune options                      what a run can be asked for there
+
+Train a LoRA for SDXL on the server, from a folder of pictures, each with its
+caption in a .txt of the same name. --data uploads the folder as a dataset
+first; --dataset names one the server has. The LoRA is the server's when it is
+done: `kvad images make PROMPT --lora NAME` draws with it.
+
+  --model MODEL       the model it is for (default: SDXL's base)
+  --caption TEXT      the caption of every picture that has none
+  --size N            pixels a side: 512, 768 or 1024 (default 1024)
+  --rank N            (default 16)
+  --steps N           (default 1000)
+  --lr F              (default 1e-4)
+  --eval-every N      steps between measurements (default 100)
+  --seed N            (default 1337)
+  --sample TEXT       a prompt to draw before the first step and at every
+                      measurement; up to four. `kvad jobs pictures ID`
+                      fetches them
+  --sample-size N     pixels a side of a sample (default 512)
+  --sample-steps N    its denoising steps (default 20)
+
+The run is a job: Ctrl-C stops the watching, `kvad jobs cancel ID` the run.
+`kvad-gpu tune` trains the same LoRA in the terminal that asks, with no
+server, and has --from, --alpha and --holdout, which this does not.";
 
 pub const EVALS: &str = "usage: kvad evals [runs]
        kvad evals show ID
@@ -205,6 +242,33 @@ pub fn jobs(remote: &Remote, args: &Args) -> Res<()> {
                 (false, true) => println!("asked job {id} to stop; it stops at its next step or file"),
                 (false, false) => println!("job {id} is not running"),
             }
+            Ok(())
+        }
+        "pictures" => {
+            let id = super::id(needs(words, "a job's id", JOBS))?;
+            let job = remote.get(&format!("/api/jobs/{id}"))?;
+            let drawn = out::items(&job["pictures"]);
+            if args.json {
+                out::json(&job["pictures"]);
+                return Ok(());
+            }
+            if drawn.is_empty() {
+                println!("job {id} drew no pictures; a LoRA run draws them when it is given `--sample`");
+                return Ok(());
+            }
+            let dir = std::path::PathBuf::from(args.out.as_deref().unwrap_or("."));
+            std::fs::create_dir_all(&dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+            for p in drawn {
+                let file = out::s(&p["file"]);
+                // The name is the server's, and it becomes a path here.
+                if file.contains(['/', '\\']) || file.starts_with('.') {
+                    return Err(format!("the server named a picture `{file}`, which is not a file's name").into());
+                }
+                let to = dir.join(&file);
+                let file = segment(&file);
+                remote.download(&format!("/api/jobs/{id}/pictures/{file}"), &to)?;
+            }
+            println!("wrote {} pictures to {}", drawn.len(), dir.display());
             Ok(())
         }
         other => unknown("jobs", other, JOBS),
@@ -340,6 +404,10 @@ pub fn watch(remote: &Remote, id: i64, raw: bool) -> Res<()> {
             // train` prints in this process. The words are printed; the chart
             // is `kvad jobs show`.
             "metric" | "sample" => {}
+            "picture" => {
+                progress.done();
+                println!("  drew {}", out::s(&u["file"]));
+            }
             "case" => {
                 progress.done();
                 println!(
@@ -393,6 +461,232 @@ fn duration(secs: f64) -> String {
 // Datasets
 // ---------------------------------------------------------------------------
 
+/// Whether a dataset is a folder of pictures, not a text.
+fn pictures(dataset: &Value) -> bool {
+    dataset["kind"] == "pictures"
+}
+
+/// A dataset of pictures in a line.
+fn pictures_line(d: &Value) -> String {
+    let bare = match d["uncaptioned"].as_u64().unwrap_or(0) {
+        0 => String::new(),
+        n => format!(", {n} with no caption"),
+    };
+    format!("dataset {} `{}`: {} pictures{bare}, {}", out::s(&d["id"]), out::s(&d["name"]), out::s(&d["pictures"]), out::bytes(&d["bytes"]))
+}
+
+/// A file's name as one segment of a path. The server takes letters, digits,
+/// spaces and `-`, `_` or `.` in one, so a space is all there is to escape.
+fn segment(file: &str) -> String {
+    file.replace(' ', "%20")
+}
+
+/// What a file is sent as: its own name, with anything the server would
+/// refuse in one as `_`, which is what the web UI's upload does too.
+fn sent_as(path: &std::path::Path) -> String {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ') { c } else { '_' }).collect();
+    match name.strip_prefix('.') {
+        Some(rest) => format!("_{rest}"),
+        None => name,
+    }
+}
+
+/// What a folder's dataset is called when nothing says: the folder's name,
+/// in the characters a dataset's name may have.
+fn folder_name(dir: &std::path::Path) -> String {
+    let name = dir.canonicalize().ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
+    let name: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect();
+    match name.trim_matches(['-', '.']) {
+        "" => "pictures".into(),
+        n => n.to_string(),
+    }
+}
+
+/// The pictures and captions straight inside `dir`, by name.
+fn picture_files(dir: &std::path::Path) -> Res<Vec<std::path::PathBuf>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("could not read {}: {e}", dir.display()))? {
+        let path = entry?.path();
+        let ending = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        let hidden = path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if path.is_file() && !hidden && matches!(ending.as_str(), "jpg" | "jpeg" | "png" | "webp" | "bmp" | "txt") {
+            found.push(path);
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Send files into a dataset of pictures, one request each, and fail at the
+/// end with every refusal if any was refused: the rest have arrived.
+fn put_files(remote: &Remote, id: i64, files: &[std::path::PathBuf], quiet: bool) -> Res<()> {
+    let mut progress = out::Progress::new();
+    let mut refused = Vec::new();
+    for (i, path) in files.iter().enumerate() {
+        let name = sent_as(path);
+        if !quiet {
+            progress.show(format!("  {} of {}  {name}", i + 1, files.len()));
+        }
+        let sent = std::fs::read(path)
+            .map_err(|e| format!("could not read {}: {e}", path.display()).into())
+            .and_then(|bytes| {
+                let file = segment(&name);
+                remote.call("put", &format!("/api/datasets/{id}/files/{file}"), Some(Body::Bytes(bytes)))
+            });
+        if let Err(why) = sent {
+            refused.push(format!("  {}: {why}", path.display()));
+        }
+    }
+    progress.done();
+    match refused.len() {
+        0 => Ok(()),
+        n => Err(format!("{n} of {} files did not go in:\n{}", files.len(), refused.join("\n")).into()),
+    }
+}
+
+/// Make the dataset of pictures called `name`, or find it, and send it the
+/// pictures and captions in `dir`. The dataset as it then is comes back.
+pub fn add_pictures(remote: &Remote, dir: &std::path::Path, name: &str, quiet: bool) -> Res<Value> {
+    let files = picture_files(dir)?;
+    if files.is_empty() {
+        return Err(format!("{} holds no pictures: files ending in jpg, jpeg, png, webp or bmp, each with its caption in a .txt of the same name", dir.display()).into());
+    }
+    let made = remote.call("post", &format!("/api/datasets/pictures?name={}", super::enc(name)), None)?;
+    let id = made["id"].as_i64().ok_or("the server made a dataset and did not say which")?;
+    if !quiet {
+        eprintln!("sending {} files from {} to dataset `{name}`", files.len(), dir.display());
+    }
+    put_files(remote, id, &files, quiet)?;
+    Ok(remote.get(&format!("/api/datasets/{id}/pictures"))?["dataset"].take())
+}
+
+// ---------------------------------------------------------------------------
+// A LoRA for an image model
+// ---------------------------------------------------------------------------
+
+pub fn tune(remote: &Remote, args: &Args) -> Res<()> {
+    if args.words.first().map(String::as_str) == Some("options") {
+        return tune_options(remote, args);
+    }
+    if let Some(word) = args.words.first() {
+        unknown("tune", word, TUNE);
+    }
+    let Some(name) = &args.name else {
+        eprintln!("a LoRA needs a name.\n\n{TUNE}");
+        std::process::exit(2);
+    };
+    let size = match args.size.as_deref().map(str::parse::<usize>) {
+        None => None,
+        Some(Ok(n)) => Some(n),
+        Some(Err(_)) => return Err(format!("--size is pixels a side, 512, 768 or 1024, not `{}`", args.size.as_deref().unwrap_or("")).into()),
+    };
+    let dataset = match (&args.dataset, &args.data) {
+        (Some(d), _) => dataset_id(remote, d)?,
+        (None, Some(dir)) => {
+            let dir = std::path::Path::new(dir);
+            if !dir.is_dir() {
+                return Err(format!("{} is not a folder; --data is a folder of pictures and their captions", dir.display()).into());
+            }
+            let made = add_pictures(remote, dir, &folder_name(dir), args.json)?;
+            made["id"].as_i64().ok_or("the server made a dataset and did not say which")?
+        }
+        (None, None) => {
+            eprintln!("train it on what?\n\n{TUNE}");
+            std::process::exit(2);
+        }
+    };
+
+    let mut body = json!({ "dataset": dataset, "name": name });
+    for (key, value) in [
+        ("model", args.model.clone().map(Value::from)),
+        ("size", size.map(Value::from)),
+        ("rank", args.rank.map(Value::from)),
+        ("steps", args.steps.map(Value::from)),
+        // Through its text, so that 1e-4 arrives as 0.0001 and not as the
+        // nearest f32 to it written out as an f64.
+        ("lr", args.lr.and_then(|lr| lr.to_string().parse::<f64>().ok()).map(Value::from)),
+        ("eval_every", args.eval_every.map(Value::from)),
+        ("seed", args.seed_given.then_some(args.seed).map(Value::from)),
+        ("caption", args.caption.clone().map(Value::from)),
+        ("sample_size", args.sample_size.map(Value::from)),
+        ("sample_steps", args.sample_steps.map(Value::from)),
+    ] {
+        if let Some(v) = value {
+            body[key] = v;
+        }
+    }
+    if !args.samples.is_empty() {
+        body["samples"] = json!(args.samples);
+    }
+    let job = remote.post("/api/tune", &body)?;
+    let id = job["id"].as_i64().unwrap_or(0);
+    follow(remote, &job, args)?;
+    if args.json {
+        return Ok(());
+    }
+    let done = remote.get(&format!("/api/jobs/{id}"))?;
+    let r = &done["result"];
+    match (r["lora"].is_string(), r["improved"] == true) {
+        (false, _) => println!("\nno LoRA was written: the run ended before it measured one"),
+        (true, improved) => {
+            println!(
+                "\n{name}: validation {:.4} at step {}, {:.4} without it{}",
+                r["best_val"].as_f64().unwrap_or(f64::NAN),
+                out::s(&r["best_step"]),
+                r["base_val"].as_f64().unwrap_or(f64::NAN),
+                if improved { "" } else { ". It did not beat the model without it" },
+            );
+            println!("draw with it:  kvad images make \"...\" --lora {name}");
+        }
+    }
+    if !args.samples.is_empty() {
+        println!("its samples:   kvad jobs pictures {id} --out DIR");
+    }
+    Ok(())
+}
+
+/// `kvad tune options`: what a LoRA run can be asked for there.
+fn tune_options(remote: &Remote, args: &Args) -> Res<()> {
+    let o = remote.get("/api/tune/options")?;
+    if args.json {
+        out::json(&o);
+        return Ok(());
+    }
+    if let Some(why) = o["unavailable"].as_str() {
+        println!("no LoRA can be trained there: {why}\n");
+    }
+    let models = out::items(&o["models"]);
+    match models.is_empty() {
+        true => println!("models: none on that machine yet. kvad pull {}", out::s(&o["base"])),
+        false => println!("models: {}", models.iter().map(out::s).collect::<Vec<_>>().join(", ")),
+    }
+    let gb = |v: &Value| v.as_f64().unwrap_or(0.0) / 1e9;
+    println!("\nmemory set aside for a run, of {:.1} GB nothing holds:", gb(&o["left"]));
+    let rows: Vec<Vec<String>> = out::items(&o["sides"])
+        .iter()
+        .map(|s| vec![format!("{}²", out::s(&s["side"])), format!("{:.1} GB", gb(&s["takes"])), format!("{:.1} GB", gb(&s["takes_sampling"]))])
+        .collect();
+    out::table(&["SIZE", "RUN", "WITH SAMPLES"], &rows);
+    let d = &o["defaults"];
+    println!(
+        "\ndefaults: --size {} --rank {} --steps {} --lr {} --eval-every {} --seed {} --sample-size {} --sample-steps {}",
+        out::s(&d["size"]),
+        out::s(&d["rank"]),
+        out::s(&d["steps"]),
+        out::s(&d["lr"]),
+        out::s(&d["eval_every"]),
+        out::s(&d["seed"]),
+        out::s(&d["sample_size"]),
+        out::s(&d["sample_steps"]),
+    );
+    println!("at most {} --sample prompts a run", out::s(&o["max_samples"]));
+    if o["training"] == true {
+        println!("a training run is going there now; a second waits for it or is refused");
+    }
+    Ok(())
+}
+
 /// A dataset by id, or by name.
 pub fn dataset_id(remote: &Remote, word: &str) -> Res<i64> {
     if let Ok(id) = word.parse() {
@@ -433,8 +727,15 @@ pub fn datasets(remote: &Remote, args: &Args) -> Res<()> {
                         out::s(&d["id"]),
                         out::s(&d["name"]),
                         out::bytes(&d["bytes"]),
-                        out::s(&d["characters"]),
-                        out::s(&d["distinct"]),
+                        match pictures(d) {
+                            true => format!("{} pictures", out::s(&d["pictures"])),
+                            false => out::s(&d["characters"]),
+                        },
+                        match (pictures(d), d["uncaptioned"].as_u64().unwrap_or(0)) {
+                            (true, 0) => String::new(),
+                            (true, n) => format!("{n} with no caption"),
+                            (false, _) => out::s(&d["distinct"]),
+                        },
                         match d["present"] == false {
                             true => "its file is gone".into(),
                             false => out::s(&d["source"]),
@@ -443,6 +744,60 @@ pub fn datasets(remote: &Remote, args: &Args) -> Res<()> {
                 })
                 .collect();
             out::table(&["ID", "NAME", "SIZE", "CHARACTERS", "DISTINCT", "FROM"], &rows);
+            Ok(())
+        }
+        "add" if std::path::Path::new(needs(words, "a file, or a folder of pictures", DATASETS)).is_dir() => {
+            let dir = std::path::Path::new(&words[0]);
+            let name = args.name.clone().unwrap_or_else(|| folder_name(dir));
+            let made = add_pictures(remote, dir, &name, args.json)?;
+            match args.json {
+                true => out::json(&made),
+                false => println!("{}", pictures_line(&made)),
+            }
+            Ok(())
+        }
+        "put" => {
+            let id = dataset_id(remote, needs(words, "a dataset", DATASETS))?;
+            if words.len() < 2 {
+                eprintln!("put which files into it?  kvad datasets put {id} FILE...");
+                std::process::exit(2);
+            }
+            let files: Vec<std::path::PathBuf> = words[1..].iter().map(std::path::PathBuf::from).collect();
+            put_files(remote, id, &files, args.json)?;
+            let held = remote.get(&format!("/api/datasets/{id}/pictures"))?;
+            match args.json {
+                true => out::json(&held["dataset"]),
+                false => println!("{}", pictures_line(&held["dataset"])),
+            }
+            Ok(())
+        }
+        "get" => {
+            let id = dataset_id(remote, needs(words, "a dataset", DATASETS))?;
+            let Some(file) = words.get(1) else {
+                eprintln!("get which file from it?  kvad datasets get {id} FILE");
+                std::process::exit(2);
+            };
+            let to = args.out.clone().unwrap_or_else(|| file.clone());
+            let file = segment(file);
+            let bytes = remote.download(&format!("/api/datasets/{id}/files/{file}"), std::path::Path::new(&to))?;
+            println!("wrote {to} ({})", kvad::hub::human_bytes(bytes));
+            Ok(())
+        }
+        "rm" if words.len() > 1 => {
+            let id = dataset_id(remote, &words[0])?;
+            let files = &words[1..];
+            if !out::confirm(&format!("take {} out of dataset {id}?", files.join(", ")), args.yes)? {
+                println!("cancelled");
+                return Ok(());
+            }
+            for name in files {
+                let file = segment(name);
+                let gone = remote.delete(&format!("/api/datasets/{id}/files/{file}"))?;
+                match args.json {
+                    true => out::json(&gone),
+                    false => println!("took out {name}"),
+                }
+            }
             Ok(())
         }
         "add" => {
@@ -488,6 +843,24 @@ pub fn datasets(remote: &Remote, args: &Args) -> Res<()> {
         }
         "show" => {
             let id = dataset_id(remote, needs(words, "a dataset", DATASETS))?;
+            // A folder of pictures is shown by its own route; the text
+            // one refuses it.
+            let listed = remote.get("/api/datasets")?;
+            if out::items(&listed).iter().any(|d| d["id"] == id && pictures(d)) {
+                let held = remote.get(&format!("/api/datasets/{id}/pictures"))?;
+                if args.json {
+                    out::json(&held);
+                    return Ok(());
+                }
+                let d = &held["dataset"];
+                println!("{}, added {}\n", pictures_line(d), out::s(&d["created_at"]));
+                let rows: Vec<Vec<String>> = out::items(&held["pictures"])
+                    .iter()
+                    .map(|p| vec![out::s(&p["file"]), out::bytes(&p["bytes"]), p["caption"].as_str().map_or("(no caption)".into(), |c| out::cut(c, 80))])
+                    .collect();
+                out::table(&["FILE", "SIZE", "CAPTION"], &rows);
+                return Ok(());
+            }
             let d = remote.get(&format!("/api/datasets/{id}"))?;
             if args.json {
                 out::json(&d);

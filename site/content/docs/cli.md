@@ -41,8 +41,9 @@ their own usage with `--help`.
 |---|---|
 | `kvad train --data FILE --name NAME` | Train a model from a text file. |
 | `kvad crawl URL` | Read a documentation site into a text file. |
-| `kvad datasets` | `ls`, `add FILE`, `crawl URL`, `show`, `check`, `search`, `rm`. |
-| `kvad-gpu tune --data DIR --name NAME` | Train an SDXL LoRA on a folder of pictures. |
+| `kvad datasets` | `ls`, `add FILE` or `add DIR` (a folder of pictures), `crawl URL`, `show`, `check`, `search`, `put ID FILE...`, `get ID FILE`, `rm`. |
+| `kvad tune --data DIR --name NAME` | Train an SDXL LoRA on a folder of pictures, as a job on the server. `kvad tune options` says what it takes. |
+| `kvad-gpu tune --data DIR --name NAME` | The same training in this terminal, with no server. |
 
 ## The server
 
@@ -54,7 +55,7 @@ their own usage with `--help`.
 | `kvad load MODEL [--backend ID]` | Put a model in memory. |
 | `kvad unload [ID]` | Take one out, or all of them. |
 | `kvad conversations` | `ls`, `show ID`, `edit ID`, `rm ID`. |
-| `kvad jobs` | `ls`, `show ID`, `watch ID`, `cancel ID`. |
+| `kvad jobs` | `ls`, `show ID`, `watch ID`, `cancel ID`, `pictures ID` (the samples a LoRA run drew). |
 | `kvad evals` | Prompt suites and perplexity. See [Benchmarks and evals](/docs/benchmarks/). |
 | `kvad bench` | Benchmarks. |
 | `kvad metrics` | The machine, recent requests, and the log. |

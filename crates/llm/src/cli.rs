@@ -53,6 +53,7 @@ pub fn remote_only(command: &str) -> bool {
             | "videos"
             | "jobs"
             | "datasets"
+            | "tune"
             | "evals"
             | "bench"
             | "metrics"
@@ -76,6 +77,10 @@ pub fn no_server(command: &str) -> ! {
         "ps" | "load" | "unload" => {
             "\nIn this process a model is loaded by the command that uses it, and let go\n\
              when that command ends, so there is nothing to keep in memory between them."
+        }
+        "tune" => {
+            "\nWith no server, `kvad-gpu tune --data DIR --name NAME` trains the same LoRA\n\
+             in the terminal that asks."
         }
         _ => "",
     };
@@ -112,6 +117,7 @@ pub fn remote(remote: &Remote, args: &Args) -> Res<()> {
         "videos" => api::videos(remote, args),
         "jobs" => api::jobs(remote, args),
         "datasets" => api::datasets(remote, args),
+        "tune" => api::tune(remote, args),
         "evals" => api::evals(remote, args),
         "bench" => api::bench(remote, args),
         "metrics" => api::metrics(remote, args),
@@ -136,6 +142,7 @@ pub fn help(command: &str) -> ! {
         "videos" => api::VIDEOS,
         "jobs" => api::JOBS,
         "datasets" => api::DATASETS,
+        "tune" => api::TUNE,
         "evals" => api::EVALS,
         "bench" => api::BENCH,
         "metrics" => api::METRICS,
@@ -200,7 +207,7 @@ mod tests {
         ("service.rs", include_str!("cli/service.rs")),
     ];
 
-    const METHODS: &[&str] = &["get", "post", "patch", "delete"];
+    const METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
 
     /// The client's calls that take the method as their first argument.
     const TAKES_A_METHOD: &[&str] = &["call", "call_for_cookie", "stream"];
@@ -301,7 +308,7 @@ mod tests {
         let known: BTreeSet<&str> = [
             "ls", "ps", "search", "info", "pull", "use", "rm", "cache", "load", "unload", "cancel",
             "tokenize", "run", "chat", "train", "service", "conversations", "images", "videos", "jobs",
-            "datasets", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api",
+            "datasets", "tune", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api",
         ]
         .into();
         for (method, path, commands) in client::COMMANDS {

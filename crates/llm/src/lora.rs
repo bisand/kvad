@@ -142,6 +142,14 @@ pub fn trained() -> Vec<Local> {
     found
 }
 
+/// The LoRA trained into `dir` under `name`, if there is one: its best, and
+/// never `NAME.last`, which is for going on from.
+fn trained_as(dir: &Path, name: &str) -> Option<Local> {
+    let file = dir.join(format!("{name}.safetensors"));
+    let named = crate::weights::is_model_name(name) && !name.ends_with(".last") && file.is_file();
+    named.then(|| read(&file)).flatten().map(|adapts| Local { name: name.to_string(), adapts, file })
+}
+
 /// The LoRA `name` means, if it is on this machine. Never asks the Hub.
 pub fn local(name: &str) -> Option<Local> {
     if is_path(name) {
@@ -149,7 +157,12 @@ pub fn local(name: &str) -> Option<Local> {
         return Some(Local { name: name.to_string(), adapts: read(&file)?, file });
     }
     let repo = split(name).map_or(name, |(r, _)| r);
-    if !repo.contains('/') || crate::gguf::split(name).is_some() {
+    // One word is a LoRA trained here, by the name it was given: a request
+    // from another machine has no path to name it by.
+    if !repo.contains('/') {
+        return trained_as(&trained_dir(), name);
+    }
+    if crate::gguf::split(name).is_some() {
         return None;
     }
     let dir = crate::hub::cache_dir().join(format!("models--{}", repo.replace('/', "--")));
@@ -265,6 +278,15 @@ mod tests {
         std::fs::write(dir.join(ONLY), "style.safetensors").unwrap();
         assert_eq!(names(locals(&dir, "o/style")), ["o/style"]);
         assert_eq!(device_bytes(&snap.join("style.safetensors")), Some((4 * 16 + 8 * 4) * 2));
+
+        // One trained here is named by the word it was given.
+        file(&root.join("mine.safetensors"), pair);
+        file(&root.join("mine.last.safetensors"), pair);
+        file(&root.join("other.safetensors"), &[("model.diffusion_model.out.2.weight", &[1])]);
+        assert_eq!(trained_as(&root, "mine").map(|l| l.file), Some(root.join("mine.safetensors")));
+        assert!(trained_as(&root, "mine.last").is_none(), "a run's last step is not the one to draw with");
+        assert!(trained_as(&root, "other").is_none(), "not a LoRA");
+        assert!(trained_as(&root, "../mine").is_none() && trained_as(&root, "absent").is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

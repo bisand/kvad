@@ -450,14 +450,20 @@ pub fn pull(jobs: &Arc<Jobs>, repo: String, owner: Option<i64>, dev: bool) -> Re
                 "`{repo}`: what follows the colon is a GGUF's quantisation, such as Q4_K_S, or a checkpoint's file, such as model.safetensors"
             )
             .into()),
-            // A repo by its name alone: a language model, or one whose only
-            // model is a checkpoint file, which a language model's pull
-            // finds no config in. Asked of the Hub only then.
-            false => kvad::weights::pull_watched(&repo, &mut progress, &watch).map(|_| ()).or_else(|e| match kvad::checkpoint::candidates(&repo) {
-                // Checkpoint files and nothing else: the checkpoint's pull
-                // says which, or why none is one.
-                Ok(Some(files)) if !files.is_empty() => crate::engine::pull_single(&repo, &mut progress, &watch),
-                _ => Err(e),
+            // A repo by its name alone. An image pipeline in diffusers'
+            // layout first, a directory to a model: its model index says
+            // which, and its pull fetches what that pipeline's load reads.
+            // Then a language model, or a repo whose only model is a
+            // checkpoint file, which a language model's pull finds no
+            // config in. Asked of the Hub only then.
+            false => crate::engine::pull_pipeline(&repo, &mut progress, &watch).and_then(|pipeline| match pipeline {
+                true => Ok(()),
+                false => kvad::weights::pull_watched(&repo, &mut progress, &watch).map(|_| ()).or_else(|e| match kvad::checkpoint::candidates(&repo) {
+                    // Checkpoint files and nothing else: the checkpoint's pull
+                    // says which, or why none is one.
+                    Ok(Some(files)) if !files.is_empty() => crate::engine::pull_single(&repo, &mut progress, &watch),
+                    _ => Err(e),
+                }),
             }),
             true if !crate::engine::is_ltx(&repo) => Err(format!("--dev is for LTX-2.5's repo, and {repo} is not one").into()),
             true => kvad::video::LTX_DEV_FILES.iter().try_for_each(|f| {

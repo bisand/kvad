@@ -91,14 +91,34 @@ pub(crate) fn weight_bytes(repo: &str, size: &dyn Fn(&str, &str) -> Option<u64>)
 /// base's configs and scheduler, and the VAE. What its pull fetches.
 pub(crate) fn fetch_base(progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
     progress(&format!("fetching {REPO}'s configs and {VAE_REPO}'s VAE"));
-    fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?;
+    beside(REPO, watch).map(|_| ())
+}
+
+/// What [`Sdxl::load_with`] reads that is not a model of `repo`'s own: the
+/// tokenizer, `repo`'s configs and scheduler, and the VAE.
+fn beside(repo: &str, watch: &Watcher) -> Res<Vec<PathBuf>> {
+    let mut files = vec![fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?];
     for f in ["model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json", "text_encoder_2/config.json", "unet/config.json"] {
-        fetch_file(REPO, f, watch)?;
+        files.push(fetch_file(repo, f, watch)?);
     }
     for f in ["config.json", "diffusion_pytorch_model.safetensors"] {
-        fetch_file(VAE_REPO, f, watch)?;
+        files.push(fetch_file(VAE_REPO, f, watch)?);
     }
-    Ok(())
+    Ok(files)
+}
+
+/// Every file [`Sdxl::load`] reads for `repo`, a pipeline in diffusers'
+/// layout, fetched and not loaded: what its pull brings. The `.fp16` weights
+/// where the repo ships them, as [`weights`] chooses, and never the repo's
+/// own VAE, which the load does not read.
+pub(crate) fn fetch(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Vec<PathBuf>> {
+    progress(&format!("fetching {repo}'s configs and {VAE_REPO}'s VAE"));
+    let mut files = beside(repo, watch)?;
+    for (dir, stem, what) in [("text_encoder", "model", "text encoder"), ("text_encoder_2", "model", "second text encoder"), ("unet", "diffusion_pytorch_model", "UNet")] {
+        progress(&format!("fetching the {what}"));
+        files.push(weights(repo, dir, stem, watch)?);
+    }
+    Ok(files)
 }
 
 /// [`weight_bytes`] for a checkpoint in one file: everything in it but its

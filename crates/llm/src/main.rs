@@ -980,22 +980,48 @@ fn pull(args: Args) -> Res<()> {
     };
 
     eprintln!("pulling {repo}");
-    // An image pipeline in diffusers' layout first, as the server's pull
-    // asks: a language model's pull finds no config in one. Fetched here,
-    // and drawn with by a server, which is where the GPU backend is.
+    // What is not a language model first, by the same arms as the server's
+    // pull (`jobs::pull`): fetched here, and drawn with by a server, which
+    // is where the GPU backend is.
     let watch = weights::Watcher::none();
-    if let Some(files) = kvad::pipeline::pull(&repo, &mut |msg| eprintln!("  {msg}"), &watch)? {
+    let mut say = |msg: &str| eprintln!("  {msg}");
+    // A GGUF, `repo:QUANT`: one file of its repo, and what its base holds
+    // beside its denoiser. No backend here to ask whether it runs the base.
+    if kvad::gguf::split(&repo).is_some() {
+        kvad::pipeline::pull_gguf(&repo, &|_, _| Ok(()), &mut say, &watch)?;
+        return pulled_for_a_server(&repo);
+    }
+    // A checkpoint in one file, or a LoRA, named by the file or a path.
+    if kvad::checkpoint::split(&repo).is_some() || kvad::checkpoint::is_path(&repo) {
+        kvad::pipeline::pull_single(&repo, &mut say, &watch)?;
+        return pulled_for_a_server(&repo);
+    }
+    if repo.contains(':') {
+        return Err(format!(
+            "`{repo}`: what follows the colon is a GGUF's quantisation, such as Q4_K_S, or a checkpoint's file, such as model.safetensors"
+        )
+        .into());
+    }
+    // An image pipeline in diffusers' layout: a language model's pull finds
+    // no config in one.
+    if let Some(files) = kvad::pipeline::pull(&repo, &mut say, &watch)? {
         println!("  an image pipeline, {} files", files.len());
-        if let Some(local) = hub::find_local(&repo) {
-            println!("  {} on disk", hub::human_bytes(local.bytes));
-        }
-        println!("\nmake a picture with:  kvad images make \"…\" --model {repo}   (with kvad-serve running)");
-        return Ok(());
+        return pulled_for_a_server(&repo);
     }
 
     // Read the config first: no point downloading gigabytes for an
-    // architecture we cannot run.
-    let files = weights::pull(&repo)?;
+    // architecture we cannot run. A repo with no config, whose only model
+    // is a checkpoint file, is asked of the Hub only then.
+    let files = match weights::pull(&repo) {
+        Ok(files) => files,
+        Err(e) => match kvad::checkpoint::candidates(&repo) {
+            Ok(Some(files)) if !files.is_empty() => {
+                kvad::pipeline::pull_single(&repo, &mut say, &watch)?;
+                return pulled_for_a_server(&repo);
+            }
+            _ => return Err(e),
+        },
+    };
     let spec = Spec::from_json(&files.config)?;
     println!("  {}", spec.summary());
 
@@ -1016,6 +1042,21 @@ fn pull(args: Args) -> Res<()> {
         println!("  {} on disk", hub::human_bytes(local.bytes));
     }
     println!("\nrun it with:  kvad run --model {repo}");
+    Ok(())
+}
+
+/// What `kvad pull` says of a model this process cannot run and has
+/// fetched: its size, and what a server makes with it.
+fn pulled_for_a_server(name: &str) -> Res<()> {
+    if let Some(local) = hub::find_local(name) {
+        println!("  {} on disk", hub::human_bytes(local.bytes));
+    }
+    let video = kvad::gguf::local(name).and_then(|g| g.base).is_some_and(|b| b.eq_ignore_ascii_case(kvad::video::LTX_REPO));
+    match (kvad::lora::local(name).is_some() && kvad::checkpoint::local(name).is_none(), video) {
+        (true, _) => println!("\napply it with:  kvad images make \"…\" --model MODEL --lora {name}   (with kvad-serve running)"),
+        (false, true) => println!("\nmake a video with:  kvad videos make \"…\" --model {name}   (with kvad-serve running)"),
+        (false, false) => println!("\nmake a picture with:  kvad images make \"…\" --model {name}   (with kvad-serve running)"),
+    }
     Ok(())
 }
 

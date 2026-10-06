@@ -508,13 +508,6 @@ impl Flux {
     }
 }
 
-/// Every file of `repo` this pipeline reads but its transformer's weights:
-/// what the pull of a GGUF of its transformer brings of the base.
-pub(crate) fn fetch_base(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
-    progress(&format!("fetching what {repo} holds beside its transformer"));
-    kvad::pipeline::flux::beside(repo, watch).map(|_| ())
-}
-
 /// What the pipeline will hold at `quant`, from the checkpoint headers on the
 /// disk. `None` until every shard is here.
 ///

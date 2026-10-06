@@ -63,13 +63,6 @@ pub(crate) fn weight_bytes(repo: &str, size: &dyn Fn(&str, &str) -> Option<u64>)
     Some(own + vae)
 }
 
-/// What a checkpoint in one file reads besides the file: the tokenizer, the
-/// base's configs and scheduler, and the VAE. What its pull fetches.
-pub(crate) fn fetch_base(progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
-    progress(&format!("fetching {REPO}'s configs and {VAE_REPO}'s VAE"));
-    kvad::pipeline::sdxl::beside(REPO, watch).map(|_| ())
-}
-
 /// [`weight_bytes`] for a checkpoint in one file: everything in it but its
 /// VAE, in f16, and the fp16-fix VAE.
 pub(crate) fn single_weight_bytes(file: &Path, size: &dyn Fn(&str, &str) -> Option<u64>) -> Option<u64> {

@@ -263,13 +263,6 @@ impl Painter for Sd15 {
     }
 }
 
-/// What a checkpoint in one file reads besides the file: the tokenizer, and
-/// the base's configs and scheduler. What its pull fetches.
-pub(crate) fn fetch_base(progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
-    progress(&format!("fetching {REPO}'s configs"));
-    kvad::pipeline::sd15::beside(REPO, watch).map(|_| ())
-}
-
 /// [`weight_bytes`] for a checkpoint in one file: what the three loaders
 /// read of it, in f16. Not the VAE's encoder, `ldm`'s training state or an
 /// EMA's copy of the UNet, which in a file that kept it doubles the UNet.

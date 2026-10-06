@@ -108,16 +108,6 @@ pub fn is_gguf_of_ltx(name: &str, watch: &Watcher) -> bool {
     kvad::gguf::split(name).is_some() && (is_pipeline(name) || kvad::gguf::find(name, watch).is_ok_and(|f| f.base.eq_ignore_ascii_case(super::LTX_REPO)))
 }
 
-/// Every file of LTX-2.5 a GGUF of its DiT reads beside it: all a load
-/// reads but the DiT, and the duration head. What its pull fetches.
-pub fn fetch_base(progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
-    for f in FILES.iter().filter(|f| **f != DIT_FILE).chain([&ltx_duration::FILE]) {
-        progress(&format!("fetching {f}"));
-        fetch_file(super::LTX_REPO, f, watch)?;
-    }
-    Ok(())
-}
-
 /// Whether `repo`'s guided pipeline can run: its dev DiT and distilled LoRA
 /// on this machine, asked of the disk. `Err` says how to fetch them.
 pub fn guided_ready(repo: &str) -> Result<(), String> {
@@ -1099,6 +1089,15 @@ fn preview(clean: &Tensor, shape: Shape) -> Res<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A GGUF's pull is written where there is no backend, with the files
+    /// it fetches of the base listed there: every file a load reads but
+    /// the DiT, and the duration head.
+    #[test]
+    fn a_gguf_pull_fetches_what_a_load_reads_beside_the_dit() {
+        let read: Vec<&str> = FILES.iter().copied().filter(|f| *f != DIT_FILE).chain([ltx_duration::FILE]).collect();
+        assert_eq!(kvad::video::LTX_GGUF_FILES.to_vec(), read);
+    }
 
     /// The middle latent frame, one pixel a token, row by row: here the
     /// only frame of three with nothing in it, so every pixel is the bias.

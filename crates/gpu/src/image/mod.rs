@@ -59,7 +59,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 pub use kvad::pipeline::PIPELINES;
 
 /// The pipelines whose denoiser can be read from a community GGUF.
-pub const GGUF_PIPELINES: [&str; 2] = ["QwenImagePipeline", "FluxPipeline"];
+pub use kvad::pipeline::GGUF_PIPELINES;
 
 /// What kind of model `repo` is, from its `model_index.json`, if it has one on
 /// this machine. `None` for a language model, a missing repo, or a pipeline
@@ -277,62 +277,11 @@ fn load_single(file: &Path, kind: Kind, progress: &mut dyn FnMut(&str), watch: &
     })
 }
 
-/// What a checkpoint of `kind` reads besides its file.
-fn fetch_base(kind: Kind, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
-    match kind {
-        Kind::Sdxl => sdxl::fetch_base(progress, watch),
-        Kind::Sd15 => sd15::fetch_base(progress, watch),
-    }
-}
-
-/// Fetch a checkpoint in one file, and what it reads beside it, or a LoRA,
-/// without loading either: a pull. The header is read on the Hub first, so
-/// a file that is neither costs a few small requests.
-pub fn pull_single(name: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
-    // Here already, or a file on this machine: only what goes beside it.
-    if let Some(c) = kvad::checkpoint::local(name) {
-        return fetch_base(c.kind, progress, watch);
-    }
-    if kvad::lora::local(name).is_some() {
-        progress("a LoRA, on this machine already; nothing to fetch");
-        return Ok(());
-    }
-    if kvad::checkpoint::is_path(name) {
-        return Err(format!("{name} is neither an SDXL or SD 1.5 checkpoint in Stability's layout nor a LoRA").into());
-    }
-    // A checkpoint, and if its header says it is none, a LoRA: which needs
-    // nothing beside it, the model it is applied to having its own.
-    match kvad::checkpoint::find(name) {
-        Ok(found) => {
-            kvad::checkpoint::fetch(&found, progress, watch)?;
-            fetch_base(found.kind, progress, watch)
-        }
-        Err(not_checkpoint) => match kvad::lora::find(name) {
-            Ok(found) => kvad::lora::fetch(&found, progress, watch).map(|_| ()),
-            Err(not_lora) => Err(format!("{not_checkpoint}; and as a LoRA: {not_lora}").into()),
-        },
-    }
-}
-
 /// Fetch a GGUF, `repo:QUANT`, and everything else its model reads from
-/// its base, without loading any of it: a pull.
-///
-/// The base is asked what it is before anything large is fetched, so a GGUF
-/// of a model not implemented here costs a model card, not gigabytes.
+/// its base, without loading any of it: a pull ([`kvad::pipeline::pull_gguf`]),
+/// of a base this backend runs ([`gguf_runs`]).
 pub fn pull(name: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
-    let found = kvad::gguf::find(name, watch)?;
-    // LTX-2.5 is no diffusers pipeline, and is known by its name.
-    if found.base.eq_ignore_ascii_case(crate::video::LTX_REPO) {
-        kvad::gguf::fetch(&found, progress, watch)?;
-        return crate::video::ltx::fetch_base(progress, watch);
-    }
-    let pipeline = gguf_pipeline(name, &found.base, watch)?;
-    kvad::gguf::fetch(&found, progress, watch)?;
-    match pipeline {
-        "QwenImagePipeline" => qwen::fetch_base(&found.base, progress, watch),
-        "FluxPipeline" => flux::fetch_base(&found.base, progress, watch),
-        other => Err(format!("no pull is written for a GGUF of a {other}").into()),
-    }
+    kvad::pipeline::pull_gguf(name, &|pipeline, base| gguf_runs(pipeline, base, watch), progress, watch)
 }
 
 /// A GGUF of `base`'s denoiser, under the names `base`'s loader asks for:
@@ -347,19 +296,22 @@ pub fn open_gguf(path: &Path, base: &str, watch: &Watcher) -> Res<Gguf> {
     }
 }
 
+/// Whether this backend runs `base`, a `pipeline`, with its denoiser read
+/// from a GGUF: FLUX's transformer is asked of its config, before a GGUF
+/// of it is downloaded.
+fn gguf_runs(pipeline: &str, base: &str, watch: &Watcher) -> Res<()> {
+    match pipeline {
+        "FluxPipeline" => flux::runs(base, watch),
+        _ => Ok(()),
+    }
+}
+
 /// The pipeline a GGUF's base is, if it is one whose denoiser can be read
 /// from a GGUF here.
 fn gguf_pipeline(name: &str, base: &str, watch: &Watcher) -> Res<&'static str> {
-    let index = fetch_file(base, "model_index.json", watch).map_err(|e| format!("{name} is a GGUF of {base}, and {base} is not an image pipeline: {e}"))?;
-    let class = read_json(&index)?.get("_class_name").and_then(Value::as_str).map(str::to_string).unwrap_or_default();
-    match GGUF_PIPELINES.iter().find(|p| **p == class) {
-        Some(&"FluxPipeline") => {
-            flux::runs(base, watch).map_err(|e| format!("{name} is a GGUF of {base}: {e}"))?;
-            Ok("FluxPipeline")
-        }
-        Some(p) => Ok(p),
-        None => Err(format!("{name} is a GGUF of {base}, a {class}, and a GGUF's denoiser is read for {} only, so far", GGUF_PIPELINES.join(" and ")).into()),
-    }
+    let pipeline = kvad::pipeline::gguf_pipeline(name, base, watch)?;
+    gguf_runs(pipeline, base, watch).map_err(|e| format!("{name} is a GGUF of {base}: {e}"))?;
+    Ok(pipeline)
 }
 
 pub(crate) fn read_json(path: &Path) -> Res<Value> {

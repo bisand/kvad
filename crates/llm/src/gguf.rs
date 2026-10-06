@@ -9,8 +9,8 @@
 //! The file is only the denoiser. The text encoder, the VAE and the
 //! scheduler come from the repo it was made from, which its model card
 //! names as `base_model`. So a GGUF model is two repos: this module finds
-//! the file and the base, and the GPU crate, which knows what each pipeline
-//! reads, fetches the rest of the base and loads the two together.
+//! the file and the base, [`crate::pipeline`] fetches what the base holds
+//! beside its denoiser, and the GPU crate loads the two together.
 //!
 //! Nothing here parses a GGUF. The name, the file and the base are all this
 //! crate needs to list, pull and delete one.

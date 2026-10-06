@@ -170,14 +170,7 @@ pub fn weight_bytes(repo: &str, quant: Option<candle_core::quantized::GgmlDType>
 
 /// `file` from `repo` if it is already on this machine: in a directory
 /// standing in for the repo, or in the Hub cache.
-pub(crate) fn local_file(repo: &str, file: &str) -> Option<PathBuf> {
-    if let Some(dir) = kvad::weights::local_dir(repo) {
-        return Some(dir.join(file)).filter(|p| p.is_file());
-    }
-    let hub = kvad::hub::cache_dir();
-    let snapshots = hub.join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
-    std::fs::read_dir(snapshots).ok()?.flatten().map(|e| e.path().join(file)).find(|p| p.is_file())
-}
+pub(crate) use kvad::weights::local_file;
 
 /// Load whichever pipeline `repo` is.
 ///

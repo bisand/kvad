@@ -90,16 +90,7 @@ fn max_volume(memory: u64) -> usize {
 /// load of it can fetch the files it needs, and only those: the repo is
 /// 71 GB, and a generation reads about 66 GB of it.
 pub fn is_pipeline(repo: &str) -> bool {
-    if repo.eq_ignore_ascii_case(super::LTX_REPO) {
-        return true;
-    }
-    // A GGUF of its DiT, here, whose card names it.
-    if kvad::gguf::split(repo).is_some() {
-        return kvad::gguf::local(repo).and_then(|l| l.base).is_some_and(|b| b.eq_ignore_ascii_case(super::LTX_REPO));
-    }
-    // By the file `kvad::hub::pipeline` knows it by, asked directly: the
-    // listing would size every model in the cache to answer.
-    crate::image::local_file(repo, kvad::video::LTX_DENOISER).is_some()
+    kvad::video::is_ltx(repo)
 }
 
 /// Whether `name` is a GGUF of LTX-2.5's DiT, asking the Hub for its card

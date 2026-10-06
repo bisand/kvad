@@ -975,7 +975,7 @@ fn search(args: Args) -> Res<()> {
 fn pull(args: Args) -> Res<()> {
     let Some(repo) = args.target.as_deref().map(str::to_string).or_else(|| args.model.clone())
     else {
-        eprintln!("usage: kvad pull REPO");
+        eprintln!("usage: kvad pull REPO [--dev]");
         std::process::exit(2);
     };
 
@@ -985,6 +985,12 @@ fn pull(args: Args) -> Res<()> {
     // is where the GPU backend is.
     let watch = weights::Watcher::none();
     let mut say = |msg: &str| eprintln!("  {msg}");
+    // `--dev`: LTX-2.5's dev model and distilled LoRA, and nothing else.
+    if args.dev {
+        kvad::video::pull_dev(&repo, &mut say, &watch)?;
+        println!("\nguided videos, 30 steps unless --steps says:  kvad videos make \"…\" --guidance 3   (with kvad-serve running)");
+        return Ok(());
+    }
     // A GGUF, `repo:QUANT`: one file of its repo, and what its base holds
     // beside its denoiser. No backend here to ask whether it runs the base.
     if kvad::gguf::split(&repo).is_some() {

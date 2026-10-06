@@ -326,3 +326,28 @@ fn a_pull_of_a_gguf_fetches_its_base_but_the_denoiser() {
 
     assert_eq!(ASKED.load(Ordering::SeqCst), before, "a GGUF's pull asked the Hub for a file the cache does not hold");
 }
+
+/// `--dev` fetches LTX-2.5's dev model and distilled LoRA and nothing else,
+/// from a repo that is LTX-2.5 by its name or by the DiT it holds, and is
+/// refused for any other before the Hub is asked.
+#[test]
+fn a_dev_pull_is_ltxs_two_files_and_is_for_ltx_only() {
+    let _alone = alone();
+    let dev: Vec<(&str, &str)> = kvad::video::LTX_DEV_FILES.iter().map(|f| (*f, "")).collect();
+    cache_repo(kvad::video::LTX_REPO, &dev, &[]);
+    // A copy of the repo under another name: known by its distilled DiT.
+    let mut copy = dev.clone();
+    copy.push((kvad::video::LTX_DENOISER, ""));
+    cache_repo("kvad-test/ltx-copy", &copy, &[]);
+    let language = cache_language_model("not-ltx", &[]);
+
+    let before = ASKED.load(Ordering::SeqCst);
+    for repo in [kvad::video::LTX_REPO, "kvad-test/ltx-copy"] {
+        let mut said = Vec::new();
+        kvad::video::pull_dev(repo, &mut |m| said.push(m.to_string()), &Watcher::none()).unwrap();
+        assert_eq!(said, kvad::video::LTX_DEV_FILES.map(|f| format!("fetching {f}")), "{repo}");
+    }
+    let refused = kvad::video::pull_dev(&language, &mut |_| {}, &Watcher::none()).unwrap_err().to_string();
+    assert!(refused.contains("--dev is for LTX-2.5's repo"), "{refused}");
+    assert_eq!(ASKED.load(Ordering::SeqCst), before, "the Hub was asked");
+}

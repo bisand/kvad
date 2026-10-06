@@ -1,12 +1,15 @@
 <script>
-  // The text runs are trained on, and the one question worth asking about it
-  // before a run starts: which characters a model has no token for.
+  // What runs are trained on: text, and the one question worth asking about
+  // it before a run starts, which characters a model has no token for; and
+  // pictures with their captions, for a LoRA.
   import { training } from "../lib/training.svelte.js";
   import { toasts } from "../lib/toasts.svelte.js";
   import { humanBytes } from "../lib/models.svelte.js";
   import { watchJob } from "../lib/jobwatch.js";
   import { api } from "../lib/api.js";
   import Icon from "../lib/components/Icon.svelte";
+  import AddPictures from "../lib/components/AddPictures.svelte";
+  import PictureSet from "../lib/components/PictureSet.svelte";
 
   const TRASH =
     "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6";
@@ -15,6 +18,8 @@
   let text = $state("");
   let uploading = $state(false);
   let confirming = $state(null);
+  /** The dataset of pictures whose pictures are shown, by id. */
+  let viewing = $state(null);
   let against = $state("");
   let checks = $state({});
 
@@ -131,7 +136,7 @@
   async function checkAll(model) {
     checks = {};
     if (!model) return;
-    for (const d of training.datasets) {
+    for (const d of training.datasetsOf("text")) {
       try {
         checks[d.id] = await training.check(d.id, model);
       } catch {
@@ -214,6 +219,7 @@
     </form>
   </section>
 
+  <AddPictures onadded={(d) => (viewing = d.id)} />
 
   <!-- The other way to get a corpus: point it at a documentation site and
        let it read. A job, because it is minutes and hundreds of requests. -->
@@ -363,14 +369,14 @@
     {#if training.datasets.length === 0}
       <div class="bg-base-200 rounded-box p-6 text-center text-sm opacity-70">
         Nothing yet. <code>scripts/get-text.sh</code> in this repository fetches a corpus to
-        start with.
+        start with, and a folder of captioned pictures is a dataset for a LoRA.
       </div>
     {:else}
       <table class="table">
         <thead>
           <tr>
             <th class="w-full">Name</th>
-            <th class="whitespace-nowrap">Characters</th>
+            <th class="whitespace-nowrap">Holds</th>
             <th class="whitespace-nowrap">Distinct</th>
             <th class="whitespace-nowrap">Size</th>
             <th></th>
@@ -380,14 +386,31 @@
           {#each training.datasets as d (d.id)}
             <tr class="hover:bg-base-200/50">
               <td class="max-w-0">
-                <div class="truncate font-medium">{d.name}</div>
+                {#if d.kind === "pictures"}
+                  <button
+                    class="link link-hover block max-w-full truncate text-left font-medium"
+                    aria-expanded={viewing === d.id}
+                    onclick={() => (viewing = viewing === d.id ? null : d.id)}
+                  >
+                    {d.name}
+                  </button>
+                  {#if d.present && d.uncaptioned}
+                    <div class="text-warning text-xs">
+                      {d.uncaptioned} of them {d.uncaptioned === 1 ? "has" : "have"} no caption yet
+                    </div>
+                  {/if}
+                {:else}
+                  <div class="truncate font-medium">{d.name}</div>
+                {/if}
                 {#if d.source}
                   <div class="truncate text-xs opacity-50">
                     {d.source}{d.manifest ? " · manifest kept beside it" : ""}
                   </div>
                 {/if}
                 {#if !d.present}
-                  <div class="text-error text-xs">the file is gone from disk</div>
+                  <div class="text-error text-xs">
+                    the {d.kind === "pictures" ? "folder" : "file"} is gone from disk
+                  </div>
                 {:else if checks[d.id]}
                   {#if checks[d.id].unseen_count === 0}
                     <div class="text-xs opacity-60">
@@ -404,8 +427,17 @@
                   {/if}
                 {/if}
               </td>
-              <td class="text-sm whitespace-nowrap opacity-70">{d.characters.toLocaleString()}</td>
-              <td class="text-sm whitespace-nowrap opacity-70">{d.distinct}</td>
+              {#if d.kind === "pictures"}
+                <td class="text-sm whitespace-nowrap opacity-70">
+                  {d.pictures.toLocaleString()} picture{d.pictures === 1 ? "" : "s"}
+                </td>
+                <td class="text-sm whitespace-nowrap opacity-40">—</td>
+              {:else}
+                <td class="text-sm whitespace-nowrap opacity-70">
+                  {d.characters.toLocaleString()} characters
+                </td>
+                <td class="text-sm whitespace-nowrap opacity-70">{d.distinct}</td>
+              {/if}
               <td class="text-sm whitespace-nowrap opacity-70">{humanBytes(d.bytes)}</td>
               <td class="text-right">
                 <button
@@ -417,6 +449,13 @@
                 </button>
               </td>
             </tr>
+            {#if d.kind === "pictures" && viewing === d.id}
+              <tr>
+                <td colspan="5" class="bg-base-200/20">
+                  <PictureSet dataset={d} />
+                </td>
+              </tr>
+            {/if}
           {/each}
         </tbody>
       </table>
@@ -427,7 +466,7 @@
 <!-- Retrieval, on its own. Whether the right passage comes back and whether
      a model then reads it properly are different questions that fail for
      different reasons, and only the first one has an answer you can look at. -->
-{#if training.datasets.length}
+{#if training.datasetsOf("text").length}
   <div class="mx-auto mt-6 flex max-w-4xl flex-col gap-6">
     <section class="card bg-base-100 border-base-300 border">
       <form class="card-body gap-3 p-4" onsubmit={ask}>
@@ -437,7 +476,7 @@
             <legend class="fieldset-legend">In</legend>
             <select class="select select-sm w-56" bind:value={searchIn}>
               <option value={null} disabled>choose one</option>
-              {#each training.datasets as d (d.id)}
+              {#each training.datasetsOf("text") as d (d.id)}
                 <option value={d.id}>{d.name}</option>
               {/each}
             </select>
@@ -503,8 +542,13 @@
     <div class="modal-box">
       <h3 class="text-lg font-medium">Delete {confirming.name}?</h3>
       <p class="py-3 text-sm opacity-70">
-        The text file goes. Models already trained on it are untouched — a model carries
-        the tokeniser it was trained with and does not read this file again.
+        {#if confirming.kind === "pictures"}
+          The pictures and their captions go. A LoRA already trained on them is untouched:
+          it is a file of its own and does not read these again.
+        {:else}
+          The text file goes. Models already trained on it are untouched — a model carries
+          the tokeniser it was trained with and does not read this file again.
+        {/if}
       </p>
       <div class="modal-action">
         <button class="btn btn-sm" onclick={() => (confirming = null)}>Cancel</button>

@@ -4,6 +4,12 @@
   import { router, navigate } from "../lib/router.svelte.js";
   import { toasts } from "../lib/toasts.svelte.js";
   import LossChart from "../lib/components/LossChart.svelte";
+  import TuneForm from "../lib/components/TuneForm.svelte";
+  import TuneRun from "../lib/components/TuneRun.svelte";
+
+  /** Which kind of run the form on the left asks for: `text`, a language
+   *  model from a corpus, or `lora`, a LoRA for an image model. */
+  let making = $state("text");
 
   let form = $state({
     dataset: null,
@@ -31,8 +37,9 @@
     if (o && form.steps === null) {
       form = { ...form, steps: o.defaults.steps, lr: o.defaults.lr, eval_every: o.defaults.eval_every, threads: o.defaults.threads };
     }
-    if (o && form.dataset === null && training.datasets.length) {
-      form.dataset = training.datasets[0].id;
+    const texts = training.datasetsOf("text");
+    if (o && form.dataset === null && texts.length) {
+      form.dataset = texts[0].id;
     }
   });
 
@@ -102,23 +109,43 @@
          machine left chat at 45–52% of idle speed; capped to 8, 67%. So the
          honest thing to say is "slower", not "queued". -->
     <div role="alert" class="alert alert-info">
-      <span>
-        A training run is using the cores. Replies stay possible and come at roughly half
-        speed while it runs — capping the run's threads gets some of that back.
-      </span>
+      {#if training.running.kind === "tune"}
+        <span>
+          A LoRA run is using the GPU, and has memory set aside that models cannot be loaded
+          into until it ends. Images, videos and replies from the GPU stay possible and come
+          slower while it runs.
+        </span>
+      {:else}
+        <span>
+          A training run is using the cores. Replies stay possible and come at roughly half
+          speed while it runs — capping the run's threads gets some of that back.
+        </span>
+      {/if}
     </div>
   {/if}
 
   <div class="grid gap-6 lg:grid-cols-[22rem_1fr]">
     <!-- What to run. -->
-    <form class="card bg-base-100 border-base-300 h-fit border" onsubmit={start}>
+    <div class="card bg-base-100 border-base-300 h-fit border">
       <div class="card-body gap-3 p-4">
         <h2 class="text-sm font-medium opacity-60">New run</h2>
+        <div role="tablist" class="tabs tabs-border tabs-sm">
+          <button role="tab" class="tab {making === 'text' ? 'tab-active' : ''}" aria-selected={making === "text"} onclick={() => (making = "text")}>
+            Language model
+          </button>
+          <button role="tab" class="tab {making === 'lora' ? 'tab-active' : ''}" aria-selected={making === "lora"} onclick={() => (making = "lora")}>
+            Image LoRA
+          </button>
+        </div>
+        {#if making === "lora"}
+          <TuneForm {busy} />
+        {:else}
+        <form class="flex flex-col gap-3" onsubmit={start}>
 
         <fieldset class="fieldset">
           <legend class="fieldset-legend">Dataset</legend>
           <select class="select select-sm w-full" bind:value={form.dataset}>
-            {#each training.datasets as d (d.id)}
+            {#each training.datasetsOf("text") as d (d.id)}
               <option value={d.id} disabled={!d.present}>
                 {d.name} — {d.characters.toLocaleString()} chars, {d.distinct} distinct
               </option>
@@ -126,7 +153,7 @@
               <option value={null}>nothing uploaded yet</option>
             {/each}
           </select>
-          {#if training.datasets.length === 0}
+          {#if training.datasetsOf("text").length === 0}
             <p class="mt-1 text-xs opacity-60">
               <a href="/datasets" onclick={(e) => navigate(e, "/datasets")} class="link">
                 Upload a text file
@@ -223,12 +250,16 @@
           {#if starting}<span class="loading loading-spinner loading-xs"></span>{/if}
           {busy ? "A run is already going" : "Start"}
         </button>
+        </form>
+        {/if}
       </div>
-    </form>
+    </div>
 
     <!-- What it is doing. -->
     <div class="flex min-w-0 flex-col gap-4">
-      {#if open}
+      {#if open?.job.kind === "tune"}
+        <TuneRun {open} {stateBadge} />
+      {:else if open}
         <section class="card bg-base-100 border-base-300 border">
           <div class="card-body gap-3 p-4">
             <div class="flex flex-wrap items-center gap-2">
@@ -335,22 +366,23 @@
       <!-- Everything that has run. -->
       <section>
         <h2 class="mb-2 text-sm font-medium opacity-60">Runs</h2>
-        {#if training.jobs.filter((j) => j.kind === "train").length === 0}
+        {#if training.runs.length === 0}
           <p class="text-sm opacity-60">Nothing yet.</p>
         {:else}
           <table class="table table-sm">
             <tbody>
-              {#each training.jobs.filter((j) => j.kind === "train") as j (j.id)}
+              {#each training.runs as j (j.id)}
                 <tr class="hover:bg-base-200/50 cursor-pointer" onclick={() => training.watch(j.id)}>
                   <td class="w-full">
                     <span class="font-medium">{j.label}</span>
+                    {#if j.kind === "tune"}<span class="badge badge-xs badge-soft ml-1">LoRA</span>{/if}
                     <span class="ml-2 text-xs opacity-60">{j.params.dataset_name}</span>
                   </td>
                   <td class="whitespace-nowrap">
                     <span class="badge badge-sm {stateBadge(j.state)}">{j.state}</span>
                   </td>
                   <td class="text-xs whitespace-nowrap opacity-60">
-                    {measured(j.result) ? j.result.best_val.toFixed(3) : "—"}
+                    {measured(j.result) ? j.result.best_val.toFixed(j.kind === "tune" ? 4 : 3) : "—"}
                   </td>
                   <td class="text-xs whitespace-nowrap opacity-60">{j.created_at}</td>
                 </tr>

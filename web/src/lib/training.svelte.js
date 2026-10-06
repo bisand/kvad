@@ -7,6 +7,10 @@
 import { api, sse } from "./api.js";
 import { toasts } from "./toasts.svelte.js";
 
+/** The kinds of job that are a training run: of a language model from
+ *  text, and of a LoRA for an image model from pictures. */
+const RUNS = ["train", "tune"];
+
 /** States a job does not come back from. */
 const FINISHED = ["done", "failed", "cancelled"];
 
@@ -14,8 +18,11 @@ class Training {
   jobs = $state([]);
   datasets = $state([]);
   options = $state(null);
+  /** What a LoRA run can be asked for, or null before the server has said
+   *  (and on a server from before there were any). */
+  tune = $state(null);
 
-  /** The run being looked at: `{ job, metrics, samples }`. */
+  /** The run being looked at: `{ job, metrics, samples, pictures, progress }`. */
   open = $state(null);
   /** Lines of text from the run, newest last. Not persisted; the chart is. */
   log = $state([]);
@@ -23,18 +30,31 @@ class Training {
 
   async refresh() {
     try {
-      [this.jobs, this.datasets, this.options] = await Promise.all([
+      [this.jobs, this.datasets, this.options, this.tune] = await Promise.all([
         api("/api/jobs"),
         api("/api/datasets"),
         api("/api/train/options"),
+        // Its own failure is not the page's: the text half works without it.
+        api("/api/tune/options").catch(() => null),
       ]);
     } catch (e) {
       toasts.error(e.message);
     }
   }
 
+  /** A run that is going, of text or of a LoRA: there is one at a time. */
   get running() {
-    return this.jobs.find((j) => j.kind === "train" && (j.state === "running" || j.state === "queued"));
+    return this.jobs.find((j) => RUNS.includes(j.kind) && (j.state === "running" || j.state === "queued"));
+  }
+
+  /** Every run there has been, newest first. */
+  get runs() {
+    return this.jobs.filter((j) => RUNS.includes(j.kind));
+  }
+
+  /** The datasets of one kind: `text`, or `pictures`. */
+  datasetsOf(kind) {
+    return this.datasets.filter((d) => (d.kind ?? "text") === kind);
   }
 
   /** Watch a job: its history first, then whatever happens next. */
@@ -52,7 +72,13 @@ class Training {
     // The metrics and samples from the request are dropped in favour of the
     // ones the stream replays, so there is one path that builds them and one
     // rule for duplicates.
-    this.open = { job: { ...job, metrics: undefined, samples: undefined }, metrics: [], samples: [] };
+    this.open = {
+      job: { ...job, metrics: undefined, samples: undefined, pictures: undefined },
+      metrics: [],
+      samples: [],
+      pictures: [],
+      progress: null,
+    };
     this.log = [];
 
     const stop = new AbortController();
@@ -100,6 +126,16 @@ class Training {
         else this.open.samples.push(u);
         break;
       }
+      case "picture": {
+        // Keyed by step and prompt, for the reason a metric is by step.
+        const at = this.open.pictures.findIndex((p) => p.step === u.step && p.prompt === u.prompt);
+        if (at >= 0) this.open.pictures[at] = u;
+        else this.open.pictures.push(u);
+        break;
+      }
+      case "progress":
+        this.open.progress = { done: u.done, total: u.total };
+        break;
       case "status":
         this.log.push(u.message);
         if (this.log.length > 200) this.log.shift();
@@ -119,7 +155,7 @@ class Training {
         // The row now carries the result and the timings, which the stream
         // does not: read it back rather than reconstruct it here.
         api(`/api/jobs/${id}`)
-          .then(({ metrics, samples, ...job }) => {
+          .then(({ metrics, samples, pictures, ...job }) => {
             if (this.open?.job.id === id) this.open.job = job;
           })
           .catch(() => {});
@@ -138,6 +174,23 @@ class Training {
   async start(request) {
     try {
       const job = await api("/api/train", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      await this.refresh();
+      await this.watch(job.id);
+      return job;
+    } catch (e) {
+      toasts.error(e.message);
+      return null;
+    }
+  }
+
+  /** Start a LoRA run; as `start`, on `/api/tune`. */
+  async startTune(request) {
+    try {
+      const job = await api("/api/tune", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(request),
@@ -174,6 +227,60 @@ class Training {
       toasts.error(e.message);
       return null;
     }
+  }
+
+  /**
+   * Put pictures and captions into the dataset of pictures called `name`,
+   * making it if it is not there. One request a file, so that one bad
+   * picture is one refusal with its name in it and the rest still arrive.
+   *
+   * `files` are `{ name, body }`, already named as the server will take
+   * them. `onProgress(done, total)` after each. Returns the dataset and
+   * the refusals, each a sentence.
+   */
+  async uploadPictures(name, files, onProgress) {
+    let dataset;
+    try {
+      dataset = await api(`/api/datasets/pictures?name=${encodeURIComponent(name)}`, { method: "POST" });
+    } catch (e) {
+      toasts.error(e.message);
+      return null;
+    }
+    const refused = [];
+    let done = 0;
+    for (const f of files) {
+      try {
+        await api(`/api/datasets/${dataset.id}/files/${encodeURIComponent(f.name)}`, {
+          method: "PUT",
+          headers: { "content-type": "application/octet-stream" },
+          body: f.body,
+        });
+      } catch (e) {
+        refused.push(e.message);
+      }
+      onProgress?.(++done, files.length);
+    }
+    await this.refresh();
+    return { dataset, refused };
+  }
+
+  /** The pictures of a dataset, each with its caption or null. */
+  async pictures(id) {
+    return (await api(`/api/datasets/${id}/pictures`)).pictures;
+  }
+
+  /** Write the caption of the picture `file`: the `.txt` of its name. */
+  async caption(id, file, text) {
+    const txt = file.replace(/\.[^.]+$/, ".txt");
+    await api(`/api/datasets/${id}/files/${encodeURIComponent(txt)}`, {
+      method: "PUT",
+      headers: { "content-type": "text/plain" },
+      body: text,
+    });
+  }
+
+  async removePicture(id, file) {
+    await api(`/api/datasets/${id}/files/${encodeURIComponent(file)}`, { method: "DELETE" });
   }
 
   /**

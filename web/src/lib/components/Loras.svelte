@@ -16,6 +16,8 @@
   // A LoRA by its file first, which is what tells a repo's several apart,
   // and its repo after: `Qwen-Image-Lightning-8steps-V2.0-bf16 · lightx2v/…`.
   function label(name) {
+    // One trained on this machine is known by its file's path.
+    if (name.startsWith("/")) return `${name.slice(name.lastIndexOf("/") + 1).replace(/\.safetensors$/i, "")} · trained here`;
     const at = name.lastIndexOf(":");
     if (at < 0 || !name.slice(0, at).includes("/")) return name;
     return `${name.slice(at + 1).replace(/\.safetensors$/i, "")} · ${name.slice(0, at)}`;

@@ -18,6 +18,8 @@
 //! different meaning for σ and for what the model predicts. A straight path is
 //! why these models get away with fewer steps.
 
+use super::nn::{noise, SplitMix};
+use candle_core::Tensor;
 use kvad::serde_json::Value;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -33,6 +35,9 @@ pub(crate) struct Schedule {
     /// The latent starts as unit noise times this.
     pub(crate) init_scale: f64,
     pub(crate) kind: Kind,
+    /// Whether each step but the last puts some fresh noise back
+    /// ([`Schedule::down_up`]): Euler ancestral, for a config that names it.
+    pub(crate) ancestral: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,18 +65,76 @@ impl Schedule {
     pub(crate) fn steps(&self) -> usize {
         self.timesteps.len()
     }
+
+    /// Where step `i` comes down to, and how much fresh noise it then adds.
+    ///
+    /// Plain Euler comes down to the next σ and adds none. An ancestral
+    /// step comes down further, to `down`, and adds `up` of new noise, with
+    /// `down² + up² = σ_next²`: the latent is at the next level either way,
+    /// but part of its noise has been drawn again rather than carried. `up`
+    /// is the largest it can be without the total passing what the step
+    /// started with (Karras et al., as k-diffusion's `get_ancestral_step`).
+    /// The last step comes down to 0, where there is nothing to add.
+    pub(crate) fn down_up(&self, i: usize) -> (f64, f64) {
+        let (from, to) = (self.sigmas[i], self.sigmas[i + 1]);
+        if !self.ancestral || to == 0.0 {
+            return (to, 0.0);
+        }
+        let up = (to * to * (from * from - to * to) / (from * from)).sqrt();
+        ((to * to - up * up).sqrt(), up)
+    }
+
+    /// The latent after step `i`, from `x` and what the denoiser predicted
+    /// there: Euler's step, and an ancestral one's fresh noise, which is
+    /// the request's `seed`'s and the step's, so the same request draws the
+    /// same picture.
+    pub(crate) fn stepped(&self, x: &Tensor, predicted: &Tensor, i: usize, seed: u64) -> Res<Tensor> {
+        let (down, up) = self.down_up(i);
+        let x = (x + (predicted * (down - self.sigmas[i]))?)?;
+        if up == 0.0 {
+            return Ok(x);
+        }
+        // A stream of its own for each step, and none of them the one the
+        // first latent was drawn from.
+        let stream = SplitMix(seed.rotate_left(32) ^ (i as u64 + 1)).next();
+        let fresh = noise(stream, x.dims(), x.device(), x.dtype())?;
+        Ok((x + (fresh * up)?)?)
+    }
 }
 
 /// `EulerDiscreteScheduler` as SDXL configures it.
 ///
-/// Only the settings SDXL ships are implemented, and anything else in the
-/// config is refused rather than ignored: a scheduler that silently runs the
-/// wrong schedule draws a worse picture and says nothing.
+/// Only the settings SDXL and its fine-tunes ship are implemented, and
+/// anything else in the config is refused rather than ignored: a scheduler
+/// that silently runs the wrong schedule draws a worse picture and says
+/// nothing.
+///
+/// **The class in the config is mostly not run.** Whether `_class_name`
+/// says DDIM, DDPM or PNDM, the steps are Euler's over that config's noise
+/// levels. A diffusers pipeline's scheduler is swappable in just this way,
+/// and Euler is what people swap these to. The one class that is kept is
+/// `EulerAncestralDiscreteScheduler`, whose steps put fresh noise back
+/// ([`Schedule::down_up`]): sdxl-turbo was distilled expecting that, and
+/// with plain Euler its second, third and fourth steps each leave the
+/// picture noisier than the one before.
 ///
 /// A setting the config leaves out means what diffusers' class for it
-/// defaults to, and the class is the config's own even though Euler runs:
-/// SD 1.5's PNDM config says neither `prediction_type` nor
-/// `timestep_spacing`, which for PNDM are `epsilon` and `leading`.
+/// defaults to, and there the class is the config's own: SD 1.5's PNDM
+/// config says neither `prediction_type` nor `timestep_spacing`, which for
+/// PNDM are `epsilon` and `leading`.
+///
+/// **Spacing** is which of the thousand training timesteps a run of `n`
+/// visits, and it matters most when `n` is small:
+///
+/// - `leading` counts up from 0 in whole strides of `⌊1000/n⌋`, so its top
+///   step is short of the last timestep: 967 of 999 at 30 steps, and 1 at
+///   one step, which is no denoising at all.
+/// - `trailing` counts down from the last timestep in strides of `1000/n`,
+///   so the first step always starts from full noise. It is what a model
+///   distilled to one or four steps (sdxl-turbo) has to be run with.
+/// - `linspace` spreads `n` evenly from the last timestep to 0, landing
+///   between whole timesteps, where σ is read off the line between its
+///   neighbours.
 pub(crate) fn euler(config: &Value, steps: usize) -> Res<Schedule> {
     // The noise levels first: they refuse a prediction or a β schedule that
     // is not SDXL's.
@@ -81,34 +144,63 @@ pub(crate) fn euler(config: &Value, steps: usize) -> Res<Schedule> {
         Some("PNDMScheduler" | "DDIMScheduler" | "DDPMScheduler") => "leading",
         _ => "linspace",
     });
-    if spacing != "leading" {
-        return Err(format!("scheduler `timestep_spacing` is {spacing:?}; only \"leading\" is implemented").into());
+    for unset in ["use_karras_sigmas", "use_exponential_sigmas", "use_beta_sigmas", "rescale_betas_zero_snr"] {
+        if config.get(unset).and_then(Value::as_bool) == Some(true) {
+            return Err(format!("scheduler `{unset}` is set, and is not implemented").into());
+        }
     }
-    if config.get("use_karras_sigmas").and_then(Value::as_bool) == Some(true) {
-        return Err("Karras sigmas are not implemented".into());
+    if steps == 0 {
+        return Err("a run takes at least one step".into());
     }
-    let train = config.get("num_train_timesteps").and_then(Value::as_u64).unwrap_or(1000) as usize;
+    let train = noising.levels();
     let offset = config.get("steps_offset").and_then(Value::as_u64).unwrap_or(0) as usize;
 
-    // σ for every training timestep: the noise-to-signal ratio after that
-    // much cumulative noising.
-    let table: Vec<f64> = noising.kept.iter().map(|&kept| ((1.0 - kept) / kept).sqrt()).collect();
+    let timesteps: Vec<f64> = match spacing {
+        // Every ⌊1000/n⌋-th timestep counted up from 0, moved up by the
+        // offset, then run from the top.
+        "leading" => {
+            let ratio = train / steps;
+            (0..steps).rev().map(|i| ((i * ratio + offset) as f64).min((train - 1) as f64)).collect()
+        }
+        // Down from the last in strides of 1000/n, each rounded as numpy
+        // rounds, a half to the even side. The offset is not used.
+        "trailing" => {
+            let ratio = train as f64 / steps as f64;
+            (0..steps).map(|i| (train as f64 - i as f64 * ratio).round_ties_even() - 1.0).collect()
+        }
+        "linspace" => {
+            let last = (train - 1) as f64;
+            (0..steps).map(|i| last * (steps - 1 - i) as f64 / (steps - 1).max(1) as f64).collect()
+        }
+        other => return Err(format!("scheduler `timestep_spacing` is {other:?}; \"leading\", \"trailing\" and \"linspace\" are implemented").into()),
+    };
 
-    // `leading`: every ⌊1000/n⌋-th timestep counted up from 0, moved up by
-    // the offset, then run from the top.
-    let ratio = train / steps;
-    let timesteps: Vec<f64> = (0..steps).rev().map(|i| (i * ratio + offset) as f64).collect();
-    // Timesteps are whole here, so "interpolating" the table is reading it.
-    let mut sigmas: Vec<f64> = timesteps.iter().map(|&t| table[t as usize]).collect();
+    // σ for every training timestep: the noise-to-signal ratio after that
+    // much cumulative noising. A timestep between two is on the line
+    // between theirs; a whole one reads the table.
+    let table: Vec<f64> = noising.kept.iter().map(|&kept| ((1.0 - kept) / kept).sqrt()).collect();
+    let sigma = |t: f64| {
+        let low = t.floor() as usize;
+        let part = t - low as f64;
+        table[low] * (1.0 - part) + table[(low + 1).min(train - 1)] * part
+    };
+    let mut sigmas: Vec<f64> = timesteps.iter().map(|&t| sigma(t)).collect();
     let top = sigmas[0];
     sigmas.push(0.0);
     Ok(Schedule {
         sigmas,
         timesteps,
-        // `leading` spacing starts from the top σ of the run, with the unit
-        // variance of the clean latent added in quadrature.
-        init_scale: (top * top + 1.0).sqrt(),
+        // What unit noise is scaled by to start. `leading` stops short of
+        // the last timestep, where some of the picture would still be
+        // there, so the clean latent's unit variance is added in
+        // quadrature. The other two start where there is none left to
+        // speak of, and diffusers starts them at σ itself.
+        init_scale: match spacing {
+            "leading" => (top * top + 1.0).sqrt(),
+            _ => top,
+        },
         kind: Kind::Epsilon,
+        ancestral: config.get("_class_name").and_then(Value::as_str) == Some("EulerAncestralDiscreteScheduler"),
     })
 }
 
@@ -211,7 +303,7 @@ pub(crate) fn flow(config: &Value, steps: usize, patches: usize) -> Res<Schedule
     }
     let timesteps = sigmas.clone();
     sigmas.push(0.0);
-    Ok(Schedule { sigmas, timesteps, init_scale: 1.0, kind: Kind::Flow })
+    Ok(Schedule { sigmas, timesteps, init_scale: 1.0, kind: Kind::Flow, ancestral: false })
 }
 
 #[cfg(test)]
@@ -269,18 +361,113 @@ mod tests {
 
         // Left out, a setting is the class's default: SD 1.5's PNDM config
         // runs as SDXL's Euler does, and an Euler config without a spacing
-        // is `linspace`, which is refused.
+        // is `linspace`.
         let pndm = json!({
             "_class_name": "PNDMScheduler", "beta_end": 0.012, "beta_schedule": "scaled_linear", "beta_start": 0.00085,
             "num_train_timesteps": 1000, "set_alpha_to_one": false, "skip_prk_steps": true, "steps_offset": 1,
         });
-        let mut sdxl = pndm.clone();
-        sdxl["prediction_type"] = json!("epsilon");
-        sdxl["timestep_spacing"] = json!("leading");
-        assert_eq!(euler(&pndm, 25).unwrap().sigmas, euler(&sdxl, 25).unwrap().sigmas);
+        let mut said = pndm.clone();
+        said["prediction_type"] = json!("epsilon");
+        said["timestep_spacing"] = json!("leading");
+        assert_eq!(euler(&pndm, 25).unwrap().sigmas, euler(&said, 25).unwrap().sigmas);
         let mut plain = pndm.clone();
         plain["_class_name"] = json!("EulerDiscreteScheduler");
-        assert!(euler(&plain, 25).unwrap_err().to_string().contains("linspace"));
+        assert_eq!(euler(&plain, 25).unwrap().timesteps[0], 999.0);
+
+        let mut c = sdxl();
+        c["timestep_spacing"] = json!("sideways");
+        assert!(euler(&c, 30).unwrap_err().to_string().contains("sideways"));
+        let mut c = sdxl();
+        c["rescale_betas_zero_snr"] = json!(true);
+        assert!(euler(&c, 30).unwrap_err().to_string().contains("rescale_betas_zero_snr"));
+        assert!(euler(&sdxl(), 0).is_err());
+    }
+
+    /// sdxl-turbo's scheduler config, and Juggernaut-XL's: another class
+    /// each, and `trailing`.
+    fn trailing(class: &str) -> Value {
+        json!({
+            "_class_name": class, "beta_end": 0.012, "beta_schedule": "scaled_linear", "beta_start": 0.00085,
+            "num_train_timesteps": 1000, "prediction_type": "epsilon", "steps_offset": 1, "timestep_spacing": "trailing"
+        })
+    }
+
+    /// `trailing` as diffusers' `EulerDiscreteScheduler.set_timesteps`
+    /// picks it: the timesteps by its formula, numpy's rounding included,
+    /// and σ from the β table (recomputed independently, in double
+    /// precision, from the same formulas).
+    #[test]
+    fn trailing_starts_every_run_from_the_last_timestep() {
+        let near = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-5 * b.max(1.0));
+        let one = euler(&trailing("EulerAncestralDiscreteScheduler"), 1).unwrap();
+        assert_eq!(one.timesteps, [999.0]);
+        assert!(near(&one.sigmas, &[14.614_641, 0.0]), "{:?}", one.sigmas);
+        // Full noise, with nothing of a picture added to it.
+        assert_eq!(one.init_scale, one.sigmas[0]);
+
+        let four = euler(&trailing("EulerAncestralDiscreteScheduler"), 4).unwrap();
+        assert_eq!(four.timesteps, [999.0, 749.0, 499.0, 249.0]);
+        assert!(near(&four.sigmas, &[14.614_641, 4.081_729, 1.612_886, 0.693_205, 0.0]), "{:?}", four.sigmas);
+
+        // 937.5, 812.5, 687.5 and 562.5 go to the even side: 938, 812, 688, 562.
+        let sixteen = euler(&trailing("DDPMScheduler"), 16).unwrap();
+        assert_eq!(&sixteen.timesteps[..8], &[999.0, 937.0, 874.0, 811.0, 749.0, 687.0, 624.0, 561.0]);
+        assert_eq!(sixteen.timesteps[15], 61.0);
+        assert_eq!(euler(&trailing("DDPMScheduler"), 3).unwrap().timesteps, [999.0, 666.0, 332.0]);
+
+        // The class changes no noise level.
+        assert_eq!(euler(&trailing("DDPMScheduler"), 4).unwrap().sigmas, four.sigmas);
+        // `leading` at one step would be timestep 1: no noise to remove.
+        assert_eq!(euler(&sdxl(), 1).unwrap().timesteps, [1.0]);
+    }
+
+    /// An ancestral step's two parts make up the level it comes down to,
+    /// the last adds nothing, and no other class adds anything at all.
+    #[test]
+    fn an_ancestral_step_puts_noise_back_and_lands_where_euler_does() {
+        let s = euler(&trailing("EulerAncestralDiscreteScheduler"), 4).unwrap();
+        assert!(s.ancestral);
+        for i in 0..3 {
+            let (down, up) = s.down_up(i);
+            assert!(up > 0.0 && down < s.sigmas[i + 1], "step {i}: {down} {up}");
+            assert!((down * down + up * up - s.sigmas[i + 1].powi(2)).abs() < 1e-9);
+        }
+        // σ 14.6146 to 4.0817, as diffusers' `EulerAncestralDiscreteScheduler.step`
+        // splits it: up = √(to²·(from² − to²)/from²).
+        let (down, up) = s.down_up(0);
+        assert!((up - 3.919_303).abs() < 1e-5 && (down - 1.139_988).abs() < 1e-5, "{down} {up}");
+        assert_eq!(s.down_up(3), (0.0, 0.0));
+
+        let plain = euler(&trailing("DDPMScheduler"), 4).unwrap();
+        assert!(!plain.ancestral && !euler(&sdxl(), 30).unwrap().ancestral);
+        assert_eq!(plain.down_up(0), (plain.sigmas[1], 0.0));
+
+        // The fresh noise is the seed's and the step's: the same again for
+        // the same, another for another.
+        let dev = candle_core::Device::Cpu;
+        let x = Tensor::zeros((1, 4, 8, 8), candle_core::DType::F32, &dev).unwrap();
+        let after = |sched: &Schedule, i: usize, seed: u64| sched.stepped(&x, &x, i, seed).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(after(&s, 0, 7), after(&s, 0, 7));
+        assert_ne!(after(&s, 0, 7), after(&s, 1, 7));
+        assert_ne!(after(&s, 0, 7), after(&s, 0, 8));
+        assert!(after(&plain, 0, 7).iter().all(|&v| v == 0.0), "plain Euler adds none");
+        let spread = (after(&s, 0, 7).iter().map(|v| v * v).sum::<f32>() / 256.0).sqrt() as f64;
+        assert!((spread / up - 1.0).abs() < 0.15, "unit noise times up: {spread} against {up}");
+    }
+
+    /// `linspace`, the same way: timesteps between whole ones, and σ on
+    /// the line between their neighbours'.
+    #[test]
+    fn linspace_lands_between_timesteps() {
+        let mut c = sdxl();
+        c["timestep_spacing"] = json!("linspace");
+        let s = euler(&c, 5).unwrap();
+        assert_eq!(s.timesteps, [999.0, 749.25, 499.5, 249.75, 0.0]);
+        let want = [14.614_641, 4.086_088, 1.615_583, 0.695_15, 0.029_167, 0.0];
+        assert!(s.sigmas.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5 * b.max(1.0)), "{:?}", s.sigmas);
+        assert_eq!(s.init_scale, s.sigmas[0]);
+        // One step of it is numpy's `linspace(0, 999, 1)`: timestep 0.
+        assert_eq!(euler(&c, 1).unwrap().timesteps, [0.0]);
     }
 
     fn qwen() -> Value {

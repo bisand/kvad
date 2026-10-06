@@ -210,7 +210,7 @@ impl Sd15 {
                     None
                 }
             };
-            x = (&x + (eps * sched.dt(i))?)?;
+            x = sched.stepped(&x, &eps, i, req.seed)?;
             if let Some(e) = &edited {
                 x = e.hold(x, &sched, i)?;
             }

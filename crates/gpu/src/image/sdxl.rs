@@ -125,6 +125,33 @@ pub struct Sdxl {
     /// The text encoders' and the UNet's layers, for LoRAs ([`lora`]).
     adapters: Adapters,
     params: usize,
+    /// What a request that does not say is given ([`defaults_of`]).
+    defaults: Defaults,
+}
+
+/// SDXL's own answers. 30 steps and guidance 5: the middle of what
+/// Stability's own examples use. The model was trained at 1024², and the
+/// VAE needs multiples of 8.
+const DEFAULTS: Defaults = Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: true, edits: true };
+
+/// The checkpoints distilled to a few steps, by the repo that holds them,
+/// and what each is made to be run at: `(repo, side, steps)`, and always
+/// without guidance, which distilling took away the need for.
+///
+/// Nothing in such a repo says so. Its pipeline is SDXL's, its UNet's config
+/// is SDXL's, and `trailing` spacing in its scheduler is shared with
+/// fine-tunes that want thirty steps (Juggernaut-XL). So the ones known are
+/// named here, whole, and a name is never guessed from: a fine-tune of one
+/// under another name gets SDXL's defaults and has to be told its steps and
+/// guidance, as any request may.
+const FEW_STEPS: [(&str, usize, usize); 1] = [("stabilityai/sdxl-turbo", 512, 1)];
+
+/// What a request to `repo` that does not say is given.
+fn defaults_of(repo: &str) -> Defaults {
+    match FEW_STEPS.iter().find(|(r, ..)| *r == repo) {
+        Some(&(_, side, steps)) => Defaults { width: side, height: side, steps, guidance: 0.0, ..DEFAULTS },
+        None => DEFAULTS,
+    }
 }
 
 /// What a LoRA's names for SDXL may start with, and the part each is in:
@@ -159,7 +186,7 @@ impl Sdxl {
         let tok = tokenizers::Tokenizer::from_file(get(TOKENIZER_REPO, "tokenizer.json")?).map_err(|e| e.to_string())?;
         let scheduler = read_json(&get(repo, "scheduler/scheduler_config.json")?)?;
         // Checked now rather than at the first request.
-        schedule::euler(&scheduler, 30)?;
+        schedule::euler(&scheduler, defaults_of(repo).steps)?;
 
         let mut params = 0;
         let config = |dir: &str| -> Res<Value> { read_json(&get(repo, &format!("{dir}/config.json"))?) };
@@ -227,7 +254,7 @@ impl Sdxl {
 
         settle(&device)?;
         progress(&format!("loaded SDXL: {:.2} B parameters in f16", params as f64 / 1e9));
-        Ok(Sdxl { tok, clip_l, clip_g, unet, vae, encoder, scheduler, device, dtype, adapters, params })
+        Ok(Sdxl { tok, clip_l, clip_g, unet, vae, encoder, scheduler, device, dtype, adapters, params, defaults: defaults_of(repo) })
     }
 
     /// The prompt as the UNet reads it: `[1, 77, 2048]` per token and
@@ -384,7 +411,7 @@ impl Sdxl {
                     None
                 }
             };
-            x = (&x + (eps * sched.dt(i))?)?;
+            x = sched.stepped(&x, &eps, i, req.seed)?;
             if let Some(e) = &edited {
                 x = e.hold(x, &sched, i)?;
             }
@@ -419,10 +446,7 @@ impl Painter for Sdxl {
     }
 
     fn defaults(&self) -> Defaults {
-        // 30 steps and guidance 5: the middle of what Stability's own
-        // examples use. The model was trained at 1024², and the VAE needs
-        // multiples of 8.
-        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: true, edits: true }
+        self.defaults
     }
 
     fn summary(&self) -> String {

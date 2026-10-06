@@ -45,6 +45,14 @@ kvad images make "a lighthouse at dusk" --model ~/Downloads/some-sdxl-finetune.s
 
 A repository with several checkpoints is named as `repo:file.safetensors`.
 
+`stabilityai/sdxl-turbo` draws in one step with no guidance, at 512², and
+those are what it is given when a request does not say: about 0.3 s of
+denoising on an M5 Pro, and 3 s to decode. Four steps are a little sharper.
+
+```bash
+kvad images make "a red fox in fresh snow" --model stabilityai/sdxl-turbo
+```
+
 ### GGUF
 
 Community GGUF files of Qwen-Image's and FLUX.1-schnell's transformers load by

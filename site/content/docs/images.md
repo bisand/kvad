@@ -105,9 +105,6 @@ These models were not trained to inpaint, so a mask's edge can show where what
 is drawn does not meet what was kept. Models trained to follow an editing
 instruction (FLUX.1 Kontext, Qwen-Image-Edit) are not here yet.
 
-This arrived after v0.12.0. Until the next release it needs a build from
-source.
-
 ## From the API
 
 `POST /v1/images/generations` is OpenAI's images endpoint, with the settings

@@ -147,7 +147,7 @@ pub fn ps(remote: &Remote, args: &Args) -> Res<()> {
         out::s(&m["context"]),
     );
     if let Some(depth) = listing["queue_depth"].as_u64().filter(|&d| d > 0) {
-        println!("queue: {depth} waiting");
+        println!("queue: {}", out::queue(depth));
     }
     Ok(())
 }

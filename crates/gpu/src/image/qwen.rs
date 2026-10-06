@@ -34,6 +34,7 @@ use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Tensor, D};
 use kvad::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use kvad::serde_json::{json, Value};
+use kvad::pipeline::component;
 use kvad::weights::{fetch_file, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,9 +42,7 @@ use std::time::Instant;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// The repo ships the tokenizer as `vocab.json` and `merges.txt`; this one
-/// has the same vocabulary as a `tokenizer.json`.
-pub const TOKENIZER_REPO: &str = "Qwen/Qwen2.5-VL-7B-Instruct";
+pub use kvad::pipeline::qwen::TOKENIZER_REPO;
 
 /// The system prompt every prompt is wrapped in, and how many tokens of it to
 /// throw away afterwards. Both from diffusers' `QwenImagePipeline`.
@@ -775,25 +774,6 @@ pub struct QwenImage {
     bytes: usize,
 }
 
-/// The files of one component: its config and its weights, a shard index's
-/// worth or one file.
-fn component(repo: &str, dir: &str, weights: &str, watch: &Watcher) -> Res<(Value, Vec<PathBuf>)> {
-    let config = read_json(&fetch_file(repo, &format!("{dir}/config.json"), watch)?)?;
-    let index = format!("{dir}/{weights}.safetensors.index.json");
-    let paths = match fetch_file(repo, &index, watch) {
-        Ok(index) => {
-            let map = read_json(&index)?;
-            let mut shards: Vec<String> =
-                map["weight_map"].as_object().ok_or("a shard index with no weight_map")?.values().filter_map(Value::as_str).map(str::to_string).collect();
-            shards.sort();
-            shards.dedup();
-            shards.iter().map(|s| fetch_file(repo, &format!("{dir}/{s}"), watch)).collect::<Res<Vec<_>>>()?
-        }
-        Err(_) => vec![fetch_file(repo, &format!("{dir}/{weights}.safetensors"), watch)?],
-    };
-    Ok((config, paths))
-}
-
 impl QwenImage {
     pub fn load(
         repo: &str,
@@ -977,29 +957,7 @@ impl QwenImage {
 /// transformer's config, which a GGUF does not carry.
 pub(crate) fn fetch_base(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
     progress(&format!("fetching what {repo} holds beside its transformer"));
-    beside(repo, watch).map(|_| ())
-}
-
-/// [`fetch_base`]'s files. A component's shard index is read and not
-/// listed: which shards there are is all it says.
-fn beside(repo: &str, watch: &Watcher) -> Res<Vec<PathBuf>> {
-    let mut files = vec![fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?];
-    for f in ["model_index.json", "scheduler/scheduler_config.json", "transformer/config.json", "vae/config.json", "vae/diffusion_pytorch_model.safetensors", "text_encoder/config.json"] {
-        files.push(fetch_file(repo, f, watch)?);
-    }
-    files.extend(component(repo, "text_encoder", "model", watch)?.1);
-    Ok(files)
-}
-
-/// Every file [`QwenImage::load`] reads for `repo`, fetched and not loaded:
-/// what its pull brings. The transformer in the repo's own bf16, whatever
-/// quantisation a load then makes of it.
-pub(crate) fn fetch(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Vec<PathBuf>> {
-    progress(&format!("fetching {repo}'s text encoder and VAE"));
-    let mut files = beside(repo, watch)?;
-    progress("fetching the transformer — twenty billion parameters, in bf16");
-    files.extend(component(repo, "transformer", "diffusion_pytorch_model", watch)?.1);
-    Ok(files)
+    kvad::pipeline::qwen::beside(repo, watch).map(|_| ())
 }
 
 /// Bytes for `params` weights at a quantisation, the way candle stores them.

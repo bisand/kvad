@@ -52,6 +52,7 @@ pub mod image;
 pub mod lora;
 pub mod machine;
 pub mod model;
+pub mod pipeline;
 pub mod qcache;
 pub mod quant;
 pub mod residency;

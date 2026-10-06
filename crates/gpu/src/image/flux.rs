@@ -37,6 +37,7 @@ use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use kvad::serde_json::{json, Value};
+use kvad::pipeline::component;
 use kvad::weights::{fetch_file, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -356,23 +357,6 @@ fn name_of(cfg: &Config) -> &'static str {
     }
 }
 
-/// A component's config and weights: a shard index's worth, or one file.
-fn component(repo: &str, dir: &str, weights: &str, watch: &Watcher) -> Res<(Value, Vec<PathBuf>)> {
-    let config = read_json(&fetch_file(repo, &format!("{dir}/config.json"), watch)?)?;
-    let paths = match fetch_file(repo, &format!("{dir}/{weights}.safetensors.index.json"), watch) {
-        Ok(index) => {
-            let map = read_json(&index)?;
-            let mut shards: Vec<String> =
-                map["weight_map"].as_object().ok_or("a shard index with no weight_map")?.values().filter_map(Value::as_str).map(str::to_string).collect();
-            shards.sort();
-            shards.dedup();
-            shards.iter().map(|s| fetch_file(repo, &format!("{dir}/{s}"), watch)).collect::<Res<Vec<_>>>()?
-        }
-        Err(_) => vec![fetch_file(repo, &format!("{dir}/{weights}.safetensors"), watch)?],
-    };
-    Ok((config, paths))
-}
-
 /// Bytes for `params` weights at a quantisation, as candle stores them.
 fn at(params: usize, quant: Option<GgmlDType>) -> u64 {
     match quant {
@@ -528,32 +512,7 @@ impl Flux {
 /// what the pull of a GGUF of its transformer brings of the base.
 pub(crate) fn fetch_base(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
     progress(&format!("fetching what {repo} holds beside its transformer"));
-    beside(repo, watch).map(|_| ())
-}
-
-/// [`fetch_base`]'s files. A component's shard index is read and not
-/// listed: which shards there are is all it says.
-fn beside(repo: &str, watch: &Watcher) -> Res<Vec<PathBuf>> {
-    let mut files = vec![fetch_file(super::sdxl::TOKENIZER_REPO, "tokenizer.json", watch)?];
-    for f in ["model_index.json", "tokenizer_2/tokenizer.json", "scheduler/scheduler_config.json", "transformer/config.json", "vae/config.json", "vae/diffusion_pytorch_model.safetensors"] {
-        files.push(fetch_file(repo, f, watch)?);
-    }
-    for dir in ["text_encoder", "text_encoder_2"] {
-        files.push(fetch_file(repo, &format!("{dir}/config.json"), watch)?);
-        files.extend(component(repo, dir, "model", watch)?.1);
-    }
-    Ok(files)
-}
-
-/// Every file [`Flux::load`] reads for `repo`, fetched and not loaded: what
-/// its pull brings. The transformer in the repo's own bf16, whatever
-/// quantisation a load then makes of it.
-pub(crate) fn fetch(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Vec<PathBuf>> {
-    progress(&format!("fetching {repo}'s text encoders and VAE"));
-    let mut files = beside(repo, watch)?;
-    progress("fetching the transformer");
-    files.extend(component(repo, "transformer", "diffusion_pytorch_model", watch)?.1);
-    Ok(files)
+    kvad::pipeline::flux::beside(repo, watch).map(|_| ())
 }
 
 /// What the pipeline will hold at `quant`, from the checkpoint headers on the

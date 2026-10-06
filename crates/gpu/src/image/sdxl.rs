@@ -17,22 +17,16 @@ use crate::qcache::Vault;
 use candle_core::{DType, Device, Tensor};
 use kvad::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use kvad::serde_json::Value;
-use kvad::weights::{fetch_file, Cached, Watcher};
+use kvad::weights::{fetch_file, Watcher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-pub const REPO: &str = "stabilityai/stable-diffusion-xl-base-1.0";
-
-/// SDXL's own VAE overflows f16 in its decoder, which is why its config says
-/// `force_upcast`. This is the same decoder retrained to stay in range, so
-/// the whole pipeline can run in one dtype. See the plan.
-pub const VAE_REPO: &str = "madebyollin/sdxl-vae-fp16-fix";
-
-/// The base repo ships CLIP's vocabulary as `vocab.json` and `merges.txt`
-/// only; this repo has the same vocabulary as a `tokenizer.json`.
-pub const TOKENIZER_REPO: &str = "openai/clip-vit-large-patch14";
+pub use kvad::pipeline::sdxl::{REPO, VAE_REPO};
+pub use kvad::pipeline::CLIP_TOKENIZER_REPO as TOKENIZER_REPO;
+/// A component's weights, the `.fp16` variant where the repo ships one.
+pub(crate) use kvad::pipeline::weights;
 
 /// How SDXL's four latent channels look, roughly, as colour: rows are
 /// channels (of the latent divided by the VAE's scaling factor), columns R, G,
@@ -47,24 +41,6 @@ pub const TOKENIZER_REPO: &str = "openai/clip-vit-large-patch14";
 pub(crate) const PREVIEW: [[f32; 3]; 4] =
     [[0.0550, 0.0538, 0.0513], [-0.0319, -0.0023, 0.0079], [0.0157, 0.0059, -0.0009], [-0.0416, -0.0268, -0.0241]];
 pub(crate) const PREVIEW_BIAS: [f32; 3] = [0.0897, -0.1454, -0.1718];
-
-/// A component's weights, `dir/stem`: the `.fp16` variant where the repo
-/// ships one, as Stability's does beside its f32 files, and the plain file
-/// otherwise, as nearly every fine-tune does, in f16 already. Either is read
-/// in f16, whatever it is stored in.
-///
-/// The cache is asked first, so a repo that is here asks the Hub nothing;
-/// then the Hub, `.fp16` first, so that a repo with both never downloads its
-/// f32 file.
-pub(crate) fn weights(repo: &str, dir: &str, stem: &str, watch: &Watcher) -> Res<PathBuf> {
-    let (fp16, plain) = (format!("{dir}/{stem}.fp16.safetensors"), format!("{dir}/{stem}.safetensors"));
-    for f in [&fp16, &plain] {
-        if let Cached::Here(p) = kvad::weights::cached(repo, f) {
-            return Ok(p);
-        }
-    }
-    fetch_file(repo, &fp16, watch).or_else(|_| fetch_file(repo, &plain, watch)).map_err(|e| format!("{repo} has neither {fp16} nor {plain}: {e}").into())
-}
 
 /// [`weights`], asked of this machine only.
 pub(crate) fn local_weights(repo: &str, dir: &str, stem: &str) -> Option<PathBuf> {
@@ -91,34 +67,7 @@ pub(crate) fn weight_bytes(repo: &str, size: &dyn Fn(&str, &str) -> Option<u64>)
 /// base's configs and scheduler, and the VAE. What its pull fetches.
 pub(crate) fn fetch_base(progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<()> {
     progress(&format!("fetching {REPO}'s configs and {VAE_REPO}'s VAE"));
-    beside(REPO, watch).map(|_| ())
-}
-
-/// What [`Sdxl::load_with`] reads that is not a model of `repo`'s own: the
-/// tokenizer, `repo`'s configs and scheduler, and the VAE.
-fn beside(repo: &str, watch: &Watcher) -> Res<Vec<PathBuf>> {
-    let mut files = vec![fetch_file(TOKENIZER_REPO, "tokenizer.json", watch)?];
-    for f in ["model_index.json", "scheduler/scheduler_config.json", "text_encoder/config.json", "text_encoder_2/config.json", "unet/config.json"] {
-        files.push(fetch_file(repo, f, watch)?);
-    }
-    for f in ["config.json", "diffusion_pytorch_model.safetensors"] {
-        files.push(fetch_file(VAE_REPO, f, watch)?);
-    }
-    Ok(files)
-}
-
-/// Every file [`Sdxl::load`] reads for `repo`, a pipeline in diffusers'
-/// layout, fetched and not loaded: what its pull brings. The `.fp16` weights
-/// where the repo ships them, as [`weights`] chooses, and never the repo's
-/// own VAE, which the load does not read.
-pub(crate) fn fetch(repo: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Vec<PathBuf>> {
-    progress(&format!("fetching {repo}'s configs and {VAE_REPO}'s VAE"));
-    let mut files = beside(repo, watch)?;
-    for (dir, stem, what) in [("text_encoder", "model", "text encoder"), ("text_encoder_2", "model", "second text encoder"), ("unet", "diffusion_pytorch_model", "UNet")] {
-        progress(&format!("fetching the {what}"));
-        files.push(weights(repo, dir, stem, watch)?);
-    }
-    Ok(files)
+    kvad::pipeline::sdxl::beside(REPO, watch).map(|_| ())
 }
 
 /// [`weight_bytes`] for a checkpoint in one file: everything in it but its

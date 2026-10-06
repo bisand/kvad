@@ -68,9 +68,6 @@ the Training page, and add a prompt or two to draw as it learns. The page
 shows the validation loss and a row of pictures for each prompt, one at
 every measurement. The finished LoRA is then a choice on the Images page.
 
-This arrived after v0.12.0. Until the next release it needs a build from
-source.
-
 ### What a run takes
 
 Measured on an M5 Pro with 48 GB, one picture a step:

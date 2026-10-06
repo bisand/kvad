@@ -440,6 +440,27 @@ kvad pull ckpt/anything-v5.0
 kvad images make "1girl, reading in a library" --model ckpt/anything-v5.0
 ```
 
+SDXL and SD 1.5 also make an image from a picture
+(`crates/gpu/src/image/edit.rs`, `/v1/images/edits`, #43). The picture is
+encoded by the VAE's other half, noised to the level a `strength` names, and
+the walk down the schedule goes on from there with the prompt: SDEdit, which
+diffusers calls image-to-image. The prompt says what the picture should be,
+not what to change in it; these are not models trained to follow an
+instruction. With a mask it is inpainting as diffusers does it for a UNet
+that was not trained to: the kept part is put back after every step, noised
+to the level the step came down to, and once more as pixels at the end, so
+it comes back to the byte. On SD 1.5 at 512², the model's own drawing edited
+with another prompt comes back 10 levels of 255 from itself, on average, at
+strength 0.2, and 41 at strength 1; under a mask of its right half, the left
+half is the same bytes
+(`edit::tests::sd15_edits_a_picture_and_keeps_what_a_mask_keeps`). A mask's
+edge can show: nothing here was trained to meet one.
+
+```bash
+kvad images edit "a green apple on a wooden table" --image apples.jpg --strength 0.5
+kvad images edit "a blue ceramic bowl" --image apples.jpg --mask right-half.png
+```
+
 LoRAs apply to Qwen-Image, FLUX, SDXL, SD 1.5 and LTX-2.5, at run time, per
 request: the model stays as it was loaded, q8 or a GGUF, and each request
 chooses its own LoRAs and strengths ([docs/lora-plan.md](lora-plan.md)).

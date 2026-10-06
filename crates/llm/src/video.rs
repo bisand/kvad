@@ -853,35 +853,7 @@ pub const PICTURE_CRF: u32 = 18;
 /// `ffmpeg` turns a JPEG by its EXIF orientation, as the reference does. It
 /// does not convert an ICC profile to sRGB, which the reference does.
 pub fn picture_from_file(ffmpeg: &std::path::Path, path: &std::path::Path, crf: u32) -> Res<crate::image::Image> {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-    let run = |args: &[&str], input: Option<Vec<u8>>| -> Res<Vec<u8>> {
-        let mut child = Command::new(ffmpeg)
-            .args(["-nostdin", "-v", "error"])
-            .args(args)
-            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("could not run {}: {e}", ffmpeg.display()))?;
-        // Fed from a thread, so that a picture larger than a pipe's buffer
-        // cannot leave both sides waiting on each other.
-        let feed = input.map(|bytes| {
-            let mut stdin = child.stdin.take();
-            std::thread::spawn(move || stdin.as_mut().map(|s| s.write_all(&bytes)))
-        });
-        let mut out = Vec::new();
-        child.stdout.take().ok_or("no stdout")?.read_to_end(&mut out)?;
-        let mut err = String::new();
-        child.stderr.take().ok_or("no stderr")?.read_to_string(&mut err)?;
-        if let Some(f) = feed {
-            let _ = f.join();
-        }
-        match child.wait()? {
-            s if s.success() => Ok(out),
-            s => Err(format!("{} {s}: {}", ffmpeg.display(), err.trim()).into()),
-        }
-    };
+    let run = |args: &[&str], input: Option<Vec<u8>>| ffmpeg_out(ffmpeg, args, input);
     let path = path.to_str().ok_or("a picture's path that is not UTF-8")?;
     // PPM out: a header that gives the size, then the RGB as it is.
     let ppm = ["-frames:v", "1", "-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "pipe:1"];
@@ -902,8 +874,70 @@ pub fn picture_from_file(ffmpeg: &std::path::Path, path: &std::path::Path, crf: 
     ppm_rgb(&bytes)
 }
 
+/// What `ffmpeg` writes to its standard output when run with `args`, fed
+/// `input` on its standard input if there is any.
+fn ffmpeg_out(ffmpeg: &std::path::Path, args: &[&str], input: Option<Vec<u8>>) -> Res<Vec<u8>> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(ffmpeg)
+        .args(["-nostdin", "-v", "error"])
+        .args(args)
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {}: {e}", ffmpeg.display()))?;
+    // Fed from a thread, so that a picture larger than a pipe's buffer
+    // cannot leave both sides waiting on each other.
+    let feed = input.map(|bytes| {
+        let mut stdin = child.stdin.take();
+        std::thread::spawn(move || stdin.as_mut().map(|s| s.write_all(&bytes)))
+    });
+    let mut out = Vec::new();
+    child.stdout.take().ok_or("no stdout")?.read_to_end(&mut out)?;
+    let mut err = String::new();
+    child.stderr.take().ok_or("no stderr")?.read_to_string(&mut err)?;
+    if let Some(f) = feed {
+        let _ = f.join();
+    }
+    match child.wait()? {
+        s if s.success() => Ok(out),
+        s => Err(format!("{} {s}: {}", ffmpeg.display(), err.trim()).into()),
+    }
+}
+
+/// The mask in the file at `path`: where an edit may change its picture.
+///
+/// Two conventions are read, because both are in use. OpenAI's is the
+/// picture's own alpha: where the mask is transparent, the picture is
+/// drawn anew. The other, Stable Diffusion's tools', is white on black:
+/// white is drawn anew. So a file with any transparency in it is read by
+/// its alpha, and one with none, or no alpha channel at all, by how light
+/// it is.
+pub fn mask_from_file(ffmpeg: &std::path::Path, path: &std::path::Path) -> Res<crate::image::Mask> {
+    let path = path.to_str().ok_or("a mask's path that is not UTF-8")?;
+    let pgm = ["-frames:v", "1", "-f", "image2pipe", "-c:v", "pgm", "-pix_fmt", "gray", "pipe:1"];
+    // A file with no alpha has no plane for `alphaextract` to take, and
+    // ffmpeg says so by failing.
+    let alpha = ffmpeg_out(ffmpeg, &[&["-i", path, "-vf", "alphaextract"][..], &pgm[..]].concat(), None).ok().and_then(|b| pnm(&b, "P5", 1).ok());
+    if let Some((width, height, alpha)) = alpha {
+        if alpha.iter().any(|&a| a != 255) {
+            return Ok(crate::image::Mask { width, height, repaint: alpha.iter().map(|&a| 255 - a).collect() });
+        }
+    }
+    let (width, height, repaint) = pnm(&ffmpeg_out(ffmpeg, &[&["-i", path][..], &pgm[..]].concat(), None)?, "P5", 1)?;
+    Ok(crate::image::Mask { width, height, repaint })
+}
+
 /// A binary PPM (`P6`, 8 bits) as an image.
 fn ppm_rgb(bytes: &[u8]) -> Res<crate::image::Image> {
+    let (width, height, rgb) = pnm(bytes, "P6", 3)?;
+    Ok(crate::image::Image { width, height, rgb })
+}
+
+/// A binary PNM of 8 bits, `kind` (`P6` colour, `P5` grey) with `samples`
+/// bytes a pixel: its width, its height and its samples.
+fn pnm(bytes: &[u8], kind: &str, samples: usize) -> Res<(usize, usize, Vec<u8>)> {
     // `P6`, width, height and the largest value, each after white space,
     // then one byte of white space and the samples.
     let mut fields = Vec::new();
@@ -923,11 +957,11 @@ fn ppm_rgb(bytes: &[u8]) -> Res<crate::image::Image> {
     }
     let n = |i: usize| fields[i].parse::<usize>().map_err(|_| format!("a PPM header field {:?}", fields[i]));
     let (width, height, max) = (n(1)?, n(2)?, n(3)?);
-    if fields[0] != "P6" || max != 255 {
-        return Err(format!("a PPM that is {} with samples to {max}, not P6 to 255", fields[0]).into());
+    if fields[0] != kind || max != 255 {
+        return Err(format!("a PPM that is {} with samples to {max}, not {kind} to 255", fields[0]).into());
     }
-    let rgb = bytes.get(at + 1..at + 1 + width * height * 3).ok_or("ffmpeg's PPM is shorter than its header says")?.to_vec();
-    Ok(crate::image::Image { width, height, rgb })
+    let data = bytes.get(at + 1..at + 1 + width * height * samples).ok_or("ffmpeg's PPM is shorter than its header says")?.to_vec();
+    Ok((width, height, data))
 }
 
 // ---------------------------------------------------------------------------

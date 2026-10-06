@@ -428,6 +428,47 @@ pub const ENDPOINTS: &[Endpoint] = &[
         ],
     },
     Endpoint {
+        method: "post", path: "/v1/images/edits", tag: "Images", access: Access::SignedIn,
+        summary: "Make an image from a picture",
+        description: "OpenAI's route, run as image-to-image on the model that draws: the \
+                      picture is noised part of the way, by `strength` (above 0, at most 1; \
+                      0.75 unless said), and drawn over from there. The prompt says what the \
+                      picture should be, not what to change in it; this is not a model \
+                      trained to follow an instruction. With a `mask` only part is drawn \
+                      anew, at strength 1 unless said, and the rest comes back as it was \
+                      sent: where the mask is transparent, as OpenAI's are, or white if it \
+                      has no transparency. Without a `size` the result is the picture's own \
+                      shape at about the model's own number of pixels. SDXL and SD 1.5 \
+                      edit. The picture and the mask are kept with the image. Streams as \
+                      `/v1/images/generations` does; `step` counts the steps an edit runs.",
+        query: &[],
+        body: Some(Body {
+            content_type: "multipart/form-data",
+            description: "`image` (a file) and `prompt`, with `mask?` (a file), `strength?`, and \
+                          whatever `/v1/images/generations` takes; or the same as JSON, `image` \
+                          and `mask` each a `data:` URL.",
+        }),
+        produces: "application/json or text/event-stream",
+        events: &[
+            ("image_generation.step", "`{index, step, total}` after each denoising step."),
+            ("image_generation.partial_image", "A preview, when previews were asked for."),
+            ("image_generation.completed", "The image, as `/v1/images/generations` gives one."),
+            ("error", "`{error}`; the stream ends."),
+        ],
+    },
+    Endpoint {
+        method: "get", path: "/api/images/{id}/input", tag: "Images", access: Access::SignedIn,
+        summary: "The picture an edit was made from",
+        description: "As it was sent. 404 for an image made from a prompt alone.",
+        query: &[], body: None, produces: "image/*", events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/images/{id}/mask", tag: "Images", access: Access::SignedIn,
+        summary: "An edit's mask",
+        description: "As it was sent. 404 for an image made without one.",
+        query: &[], body: None, produces: "image/*", events: &[],
+    },
+    Endpoint {
         method: "get", path: "/api/images", tag: "Images", access: Access::SignedIn,
         summary: "Your images",
         description: "Newest first, each with the settings that made it — the seed \

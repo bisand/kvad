@@ -22,6 +22,7 @@
 
 pub mod clip;
 pub mod dataset;
+pub(crate) mod edit;
 pub mod flux;
 pub mod mmdit;
 pub mod nn;

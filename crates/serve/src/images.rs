@@ -23,6 +23,21 @@
 //! follows a link without its key would otherwise get a 401 where it
 //! expected a picture.
 //!
+//! # Edits
+//!
+//! `/v1/images/edits` is OpenAI's too: a picture, a prompt, and a mask if
+//! only part of the picture is to change. What it runs is image-to-image on
+//! the model that draws (`kvad_gpu::image::edit`): the picture is noised
+//! part of the way, by `strength`, and drawn over from there, so the prompt
+//! says what the picture should be and not what to change in it. A model
+//! trained to follow an instruction, as OpenAI's own and FLUX Kontext are,
+//! is a different thing this endpoint will also serve when one is here.
+//!
+//! The picture arrives as a file in a form, which is what OpenAI's SDK
+//! sends, or as a `data:` URL in JSON. It is kept beside the image it made,
+//! `<id>.input`, and the mask as `<id>.mask`, as they were sent: an edit is
+//! looked at beside what it was made from, and made again from it.
+//!
 //! # Streaming
 //!
 //! With `stream: true` the answer is server-sent events: one
@@ -37,14 +52,16 @@ use crate::auth::{Identity, State};
 use crate::db::Db;
 use crate::models::{sse, stream};
 use crate::scheduler::{Kind, Resident, Stroke};
-use axum::extract::{Path, State as St};
+use crate::videos::Fields;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, State as St};
 use axum::http::{header, HeaderMap};
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use kvad::image::{ImageRequest, Painted};
+use kvad::image::{Edit, ImageRequest, Painted};
 use rusqlite::{params, Row};
 use serde_json::json;
 use std::path::{Path as FsPath, PathBuf};
@@ -54,9 +71,19 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 pub fn routes() -> Router<State> {
     Router::new()
         .route("/v1/images/generations", post(generations))
+        .route("/v1/images/edits", post(edits))
         .route("/api/images", get(gallery))
         .route("/api/images/{id}", get(file).delete(remove))
+        .route("/api/images/{id}/input", get(input))
+        .route("/api/images/{id}/mask", get(mask))
+        // A picture and its mask, each sent as base64 at its largest;
+        // axum's default of 2 MB would refuse a photograph.
+        .layer(DefaultBodyLimit::max(2 * (MAX_PICTURE / 3 * 4) + (1 << 16)))
 }
+
+/// The largest picture an edit may start from, and the largest mask: 20 MiB,
+/// OpenAI's limit on a picture sent to it and the one a video's is held to.
+const MAX_PICTURE: usize = 20 << 20;
 
 /// Where the PNGs are: `images` in the data directory.
 pub fn dir() -> PathBuf {
@@ -91,15 +118,34 @@ pub struct Stored {
     pub url: String,
     /// The LoRAs that made it, each at its strength; none for most.
     pub loras: Vec<kvad::image::Lora>,
+    /// For an edit: how far its picture was noised, where that picture is,
+    /// and where its mask is if it had one. All `None` for an image made
+    /// from a prompt alone.
+    pub strength: Option<f64>,
+    pub input_url: Option<String>,
+    pub mask_url: Option<String>,
 }
 
 const COLUMNS: &str = "id, model, backend, prompt, negative_prompt, width, height, steps, guidance, \
-                       seed, bytes, secs, created_at, loras";
+                       seed, bytes, secs, created_at, loras, strength, masked";
+
+/// What an edit was made from, as it was sent: the picture's file, and the
+/// mask's if there was one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sources {
+    pub image: Vec<u8>,
+    pub mask: Option<Vec<u8>>,
+}
 
 fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
     let id: i64 = r.get(0)?;
+    let strength: Option<f64> = r.get(14)?;
+    let masked = r.get::<_, i64>(15)? != 0;
     Ok(Stored {
         id,
+        input_url: strength.map(|_| format!("/api/images/{id}/input")),
+        mask_url: strength.filter(|_| masked).map(|_| format!("/api/images/{id}/mask")),
+        strength,
         model: r.get(1)?,
         backend: r.get(2)?,
         prompt: r.get(3)?,
@@ -129,8 +175,8 @@ fn url_of(id: i64, created_at: &str) -> String {
 }
 
 /// Keep an image: its row, then its file, and neither if the file cannot be
-/// written.
-pub fn save(db: &Db, dir: &FsPath, owner: Option<i64>, model: &str, backend: &str, p: &Painted) -> Res<Stored> {
+/// written. An edit's picture and mask are kept beside it.
+pub fn save(db: &Db, dir: &FsPath, owner: Option<i64>, model: &str, backend: &str, p: &Painted, sources: Option<&Sources>) -> Res<Stored> {
     let png = p.image.png();
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     let r = &p.request;
@@ -138,7 +184,8 @@ pub fn save(db: &Db, dir: &FsPath, owner: Option<i64>, model: &str, backend: &st
     let id = db.with(|c| {
         c.execute(
             "INSERT INTO images (owner, model, backend, prompt, negative_prompt, width, height, steps, \
-             guidance, seed, bytes, secs, loras) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             guidance, seed, bytes, secs, loras, strength, masked) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 owner,
                 model,
@@ -152,7 +199,9 @@ pub fn save(db: &Db, dir: &FsPath, owner: Option<i64>, model: &str, backend: &st
                 r.seed as i64,
                 png.len() as i64,
                 secs,
-                (!r.loras.is_empty()).then(|| serde_json::to_string(&r.loras).unwrap_or_default())
+                (!r.loras.is_empty()).then(|| serde_json::to_string(&r.loras).unwrap_or_default()),
+                r.strength.map(|s| s as f64),
+                r.masked as i64
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -162,9 +211,17 @@ pub fn save(db: &Db, dir: &FsPath, owner: Option<i64>, model: &str, backend: &st
     // half a picture.
     let path = dir.join(format!("{id}.png"));
     let aside = dir.join(format!("{id}.png.part"));
-    let written = std::fs::write(&aside, &png).and_then(|()| std::fs::rename(&aside, &path));
+    let written = std::fs::write(&aside, &png).and_then(|()| std::fs::rename(&aside, &path)).and_then(|()| {
+        let Some(sources) = sources else { return Ok(()) };
+        std::fs::write(dir.join(format!("{id}.input")), &sources.image)?;
+        match &sources.mask {
+            Some(mask) => std::fs::write(dir.join(format!("{id}.mask")), mask),
+            None => Ok(()),
+        }
+    });
     if let Err(e) = written {
         let _ = std::fs::remove_file(&aside);
+        remove_files(dir, id);
         let _ = db.with(|c| c.execute("DELETE FROM images WHERE id = ?1", [id]));
         return Err(format!("could not write {}: {e}", path.display()).into());
     }
@@ -200,9 +257,18 @@ pub fn delete(db: &Db, dir: &FsPath, id: i64, owner: Option<i64>) -> Res<bool> {
     if gone == 0 {
         return Ok(false);
     }
+    let _ = std::fs::remove_file(dir.join(format!("{id}.input")));
+    let _ = std::fs::remove_file(dir.join(format!("{id}.mask")));
     match std::fs::remove_file(dir.join(format!("{id}.png"))) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(true),
+    }
+}
+
+/// Every file an image has, gone: for a save that failed part of the way.
+fn remove_files(dir: &FsPath, id: i64) {
+    for ending in ["png", "input", "mask"] {
+        let _ = std::fs::remove_file(dir.join(format!("{id}.{ending}")));
     }
 }
 
@@ -239,6 +305,28 @@ async fn file(who: Identity, St(state): St<State>, Path(name): Path<String>) -> 
         bytes,
     )
         .into_response())
+}
+
+/// What an edit was made from: its picture, or its mask, as it was sent.
+async fn source(who: Identity, state: State, name: String, ending: &'static str) -> Result<Response, Fail> {
+    let id = id_in(&name)?;
+    let db = state.db.clone();
+    let bytes = blocking(move || match get_one(&db, id, who.id)? {
+        Some(_) => Ok(std::fs::read(dir().join(format!("{id}.{ending}"))).ok()),
+        None => Ok(None),
+    })
+    .await?
+    .ok_or_else(|| Fail::missing(format!("image {id} has no {ending}")))?;
+    // Written once, with the image, and never again.
+    Ok(([(header::CONTENT_TYPE, crate::videos::sniff(&bytes)), (header::CACHE_CONTROL, "private, max-age=31536000, immutable")], bytes).into_response())
+}
+
+async fn input(who: Identity, St(state): St<State>, Path(name): Path<String>) -> Result<Response, Fail> {
+    source(who, state, name, "input").await
+}
+
+async fn mask(who: Identity, St(state): St<State>, Path(name): Path<String>) -> Result<Response, Fail> {
+    source(who, state, name, "mask").await
 }
 
 async fn remove(who: Identity, St(state): St<State>, Path(name): Path<String>) -> Result<Json<serde_json::Value>, Fail> {
@@ -296,18 +384,31 @@ enum Format {
     Url,
 }
 
+/// `1024x1024` as a width and a height; `auto`, or nothing, as neither.
+fn size_of(size: Option<&str>) -> Result<(Option<usize>, Option<usize>), Fail> {
+    match size.map(str::trim) {
+        None | Some("") | Some("auto") => Ok((None, None)),
+        Some(s) => {
+            let (w, h) = s
+                .split_once(['x', 'X', '×'])
+                .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+                .ok_or_else(|| Fail::bad(format!("size is WIDTHxHEIGHT, like 1024x1024, not {s:?}")))?;
+            Ok((Some(w), Some(h)))
+        }
+    }
+}
+
+fn format_of(response_format: Option<&str>) -> Result<Format, Fail> {
+    match response_format {
+        None | Some("b64_json") => Ok(Format::B64),
+        Some("url") => Ok(Format::Url),
+        Some(other) => Err(Fail::bad(format!("response_format is b64_json or url, not {other:?}"))),
+    }
+}
+
 impl Generations {
     fn request(&self) -> Result<ImageRequest, Fail> {
-        let (width, height) = match self.size.as_deref().map(str::trim) {
-            None | Some("") | Some("auto") => (None, None),
-            Some(s) => {
-                let (w, h) = s
-                    .split_once(['x', 'X', '×'])
-                    .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
-                    .ok_or_else(|| Fail::bad(format!("size is WIDTHxHEIGHT, like 1024x1024, not {s:?}")))?;
-                (Some(w), Some(h))
-            }
-        };
+        let (width, height) = size_of(self.size.as_deref())?;
         Ok(ImageRequest {
             prompt: self.prompt.clone(),
             negative_prompt: self.negative_prompt.clone(),
@@ -318,15 +419,12 @@ impl Generations {
             seed: self.seed,
             preview: self.preview.unwrap_or(false) || self.partial_images.unwrap_or(0) > 0,
             loras: self.loras.clone(),
+            edit: None,
         })
     }
 
     fn format(&self) -> Result<Format, Fail> {
-        match self.response_format.as_deref() {
-            None | Some("b64_json") => Ok(Format::B64),
-            Some("url") => Ok(Format::Url),
-            Some(other) => Err(Fail::bad(format!("response_format is b64_json or url, not {other:?}"))),
-        }
+        format_of(self.response_format.as_deref())
     }
 }
 
@@ -336,14 +434,30 @@ pub async fn generations(
     St(state): St<State>,
     Json(body): Json<Generations>,
 ) -> Result<Response, Fail> {
-    let mut request = body.request()?;
-    let format = body.format()?;
-    let n = body.n.unwrap_or(1);
+    let request = body.request()?;
+    let asked = Asked { model: body.model.clone(), request, n: body.n.unwrap_or(1), format: body.format()?, stream: body.stream, sources: None };
+    make(who, headers, state, asked).await
+}
+
+/// A request for images once it has been read, whichever route read it.
+struct Asked {
+    model: Option<String>,
+    request: ImageRequest,
+    n: usize,
+    format: Format,
+    stream: bool,
+    /// An edit's picture and mask as they were sent, to keep.
+    sources: Option<Sources>,
+}
+
+/// Check a request against the model it names and make its images.
+async fn make(who: Identity, headers: HeaderMap, state: State, asked: Asked) -> Result<Response, Fail> {
+    let Asked { model, mut request, n, format, stream, sources } = asked;
     if n == 0 || n > MAX_N {
         return Err(Fail::bad(format!("n is between 1 and {MAX_N}, not {n}")));
     }
 
-    let resident = crate::openai::resident_for(&state, body.model.as_deref(), Kind::Image).await?;
+    let resident = crate::openai::resident_for(&state, model.as_deref(), Kind::Image).await?;
     let defaults = resident
         .model
         .image
@@ -356,11 +470,126 @@ pub async fn generations(
     request.seed = Some(resolved.seed);
     loras_fit(&state, &request.loras)?;
 
-    let job = Job { state, owner: who.id, resident, request, n, format, base: base_url(&headers) };
-    Ok(match body.stream {
+    let job = Job { state, owner: who.id, resident, request, n, format, base: base_url(&headers), sources: sources.map(std::sync::Arc::new) };
+    Ok(match stream {
         true => streamed(job).into_response(),
         false => whole(job).await?.into_response(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// /v1/images/edits
+// ---------------------------------------------------------------------------
+
+/// A picture a request sent under `name`: a file in a form, or in JSON a
+/// `data:` URL, bare or as OpenAI's `{"image_url": …}`. `None` where it
+/// sent none.
+fn sent(f: &Fields, name: &str) -> Result<Option<Vec<u8>>, Fail> {
+    // OpenAI's SDK names a form's file `image`, or `image[]` for several.
+    let array = format!("{name}[]");
+    let mut files = f.files.iter().filter(|(n, _)| *n == name || *n == array);
+    let bytes = match (files.next(), f.get(&[name])) {
+        (Some((_, bytes)), _) => {
+            if files.next().is_some() {
+                return Err(Fail::bad(format!("{name}: one picture is edited at a time here, and several were sent")));
+            }
+            bytes.clone()
+        }
+        (None, None) => return Ok(None),
+        (None, Some((_, v))) => {
+            let url = match v {
+                serde_json::Value::String(u) => u.clone(),
+                serde_json::Value::Object(o) if o.contains_key("file_id") => {
+                    return Err(Fail::bad(format!("{name}.file_id: there is no Files API here; send the picture itself, as a file or a data: URL")))
+                }
+                serde_json::Value::Object(o) => o
+                    .get("image_url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| Fail::bad(format!("{name} wants an image_url")))?,
+                _ => return Err(Fail::bad(format!("{name} is a file, or a data: URL"))),
+            };
+            crate::videos::data_url(url.trim(), name)?
+        }
+    };
+    if bytes.is_empty() {
+        return Err(Fail::bad(format!("{name} is empty")));
+    }
+    if bytes.len() > MAX_PICTURE {
+        return Err(Fail::bad(format!("{name} is {} MB, and the most a picture may be is {} MB", bytes.len() >> 20, MAX_PICTURE >> 20)));
+    }
+    Ok(Some(bytes))
+}
+
+/// What an edit asked for, but for its picture and mask, which are files
+/// still to be read.
+fn edit_request(f: &Fields) -> Result<(ImageRequest, Option<f32>), Fail> {
+    let prompt = f.text(&["prompt"]).ok_or_else(|| Fail::bad("an edit needs a prompt: what the picture should be"))?;
+    let (width, height) = size_of(f.text(&["size"]).as_deref())?;
+    let request = ImageRequest {
+        prompt,
+        negative_prompt: f.text(&["negative_prompt"]),
+        width,
+        height,
+        steps: f.number(&["steps", "num_inference_steps"])?,
+        guidance: f.number(&["guidance_scale"])?,
+        seed: f.number(&["seed"])?,
+        preview: f.flag("preview")?.unwrap_or(false) || f.number::<usize>(&["partial_images"])?.unwrap_or(0) > 0,
+        loras: f.loras()?,
+        edit: None,
+    };
+    Ok((request, f.number(&["strength"])?))
+}
+
+/// Read a picture and its mask with `ffmpeg`, which reads files: each is
+/// written aside, read, and removed.
+fn read_sources(ffmpeg: &FsPath, sources: &Sources, strength: Option<f32>) -> Res<Edit> {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let aside = |what: &str| std::env::temp_dir().join(format!("kvad-edit-{}-{n}.{what}", std::process::id()));
+    let read = |what: &str, bytes: &[u8]| -> Res<PathBuf> {
+        let path = aside(what);
+        std::fs::write(&path, bytes).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        Ok(path)
+    };
+    let picture = read("image", &sources.image)?;
+    let image = kvad::video::picture_from_file(ffmpeg, &picture, 0);
+    let _ = std::fs::remove_file(&picture);
+    let image = image.map_err(|e| format!("image is not a picture ffmpeg can read: {e}"))?;
+    let mask = match &sources.mask {
+        None => None,
+        Some(bytes) => {
+            let path = read("mask", bytes)?;
+            let mask = kvad::video::mask_from_file(ffmpeg, &path);
+            let _ = std::fs::remove_file(&path);
+            Some(mask.map_err(|e| format!("mask is not a picture ffmpeg can read: {e}"))?)
+        }
+    };
+    Ok(Edit { image, mask, strength })
+}
+
+pub async fn edits(who: Identity, headers: HeaderMap, St(state): St<State>, body: Bytes) -> Result<Response, Fail> {
+    let f = Fields::read(&headers, &body)?;
+    let (mut request, strength) = edit_request(&f)?;
+    let image = sent(&f, "image")?.ok_or_else(|| Fail::bad("an edit needs an image: the picture to start from, as a file in a form or a data: URL"))?;
+    let sources = Sources { image, mask: sent(&f, "mask")? };
+
+    // Read now, so that a file that is not a picture is a 400 and not a
+    // failure after a wait in the queue.
+    let ffmpeg = crate::videos::ffmpeg().ok_or_else(|| Fail::bad("editing a picture needs ffmpeg on the server, to read it; `[videos] ffmpeg` in kvad.toml"))?;
+    let read = sources.clone();
+    let edit = blocking(move || read_sources(&ffmpeg, &read, strength)).await.map_err(|e| Fail::bad(e.1))?;
+    request.edit = Some(edit);
+
+    let asked = Asked {
+        model: f.text(&["model"]),
+        request,
+        n: f.number(&["n"])?.unwrap_or(1),
+        format: format_of(f.text(&["response_format"]).as_deref())?,
+        stream: f.flag("stream")?.unwrap_or(false),
+        sources: Some(sources),
+    };
+    make(who, headers, state, asked).await
 }
 
 /// Each LoRA on this machine, and all of them together in what no resident
@@ -398,6 +627,8 @@ struct Job {
     format: Format,
     /// `http://host:port` as the client reached us, for absolute links.
     base: Option<String>,
+    /// An edit's picture and mask as they were sent, kept with each image.
+    sources: Option<std::sync::Arc<Sources>>,
 }
 
 impl Job {
@@ -409,8 +640,8 @@ impl Job {
     async fn keep(&self, painted: &Painted) -> Result<Stored, Fail> {
         let (db, owner, model) = (self.state.db.clone(), self.owner, self.resident.model.repo.clone());
         let backend = self.resident.model.backend.clone();
-        let painted = painted.clone();
-        blocking(move || save(&db, &dir(), owner, &model, &backend, &painted)).await
+        let (painted, sources) = (painted.clone(), self.sources.clone());
+        blocking(move || save(&db, &dir(), owner, &model, &backend, &painted, sources.as_deref())).await
     }
 
     /// One image in OpenAI's shape, with how it was made in `kvad`.
@@ -432,6 +663,9 @@ impl Job {
             "steps": stored.steps,
             "guidance": stored.guidance,
             "loras": stored.loras,
+            "strength": stored.strength,
+            "input_url": stored.input_url,
+            "mask_url": stored.mask_url,
             "encode_secs": painted.encode_secs,
             "denoise_secs": painted.denoise_secs,
             "decode_secs": painted.decode_secs,
@@ -563,6 +797,8 @@ mod tests {
                 seed,
                 preview: false,
                 loras: Vec::new(),
+                strength: None,
+                masked: false,
             },
             encode_secs: 0.1,
             denoise_secs: 1.0,
@@ -583,7 +819,7 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let dir = scratch("kept");
         let seed = u64::MAX - 7;
-        let s = save(&db, &dir, None, "stabilityai/sdxl", "metal f16", &painted(seed)).unwrap();
+        let s = save(&db, &dir, None, "stabilityai/sdxl", "metal f16", &painted(seed), None).unwrap();
         assert_eq!(s.seed, seed);
         assert_eq!((s.width, s.height, s.steps), (2, 1, 3));
         assert!(s.url.starts_with(&format!("/api/images/{}.png?v=", s.id)), "{}", s.url);
@@ -608,12 +844,95 @@ mod tests {
         let mut p = painted(1);
         let loras = vec![kvad::image::Lora { name: "lightx2v/Qwen-Image-Lightning:8steps.safetensors".into(), scale: 0.8 }];
         p.request.loras = loras.clone();
-        assert_eq!(save(&db, &dir, None, "Qwen/Qwen-Image", "metal q8", &p).unwrap().loras, loras);
-        let plain = save(&db, &dir, None, "Qwen/Qwen-Image", "metal q8", &painted(2)).unwrap();
+        assert_eq!(save(&db, &dir, None, "Qwen/Qwen-Image", "metal q8", &p, None).unwrap().loras, loras);
+        let plain = save(&db, &dir, None, "Qwen/Qwen-Image", "metal q8", &painted(2), None).unwrap();
         assert!(plain.loras.is_empty());
         let stored: Option<String> = db.with(|c| c.query_row("SELECT loras FROM images WHERE id = ?1", [plain.id], |r| r.get(0))).unwrap();
         assert_eq!(stored, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An edit is kept with what it was made from, as it was sent, and the
+    /// row says where; an image that is no edit has neither.
+    #[test]
+    fn an_edit_keeps_its_picture_and_its_mask() {
+        let db = Db::in_memory().unwrap();
+        let dir = scratch("edits");
+        let mut p = painted(1);
+        p.request.strength = Some(0.5);
+        p.request.masked = true;
+        let sources = Sources { image: b"\x89PNG the picture".to_vec(), mask: Some(b"\x89PNG the mask".to_vec()) };
+        let s = save(&db, &dir, None, "m", "b", &p, Some(&sources)).unwrap();
+        assert_eq!(s.strength, Some(0.5));
+        assert_eq!((s.input_url.as_deref(), s.mask_url.as_deref()), (Some(format!("/api/images/{}/input", s.id).as_str()), Some(format!("/api/images/{}/mask", s.id).as_str())));
+        assert_eq!(std::fs::read(dir.join(format!("{}.input", s.id))).unwrap(), sources.image);
+        assert_eq!(std::fs::read(dir.join(format!("{}.mask", s.id))).unwrap(), sources.mask.clone().unwrap());
+
+        // Without a mask there is no link to one.
+        p.request.masked = false;
+        let plain = save(&db, &dir, None, "m", "b", &p, Some(&Sources { mask: None, ..sources })).unwrap();
+        assert!(plain.input_url.is_some() && plain.mask_url.is_none());
+        assert!(!dir.join(format!("{}.mask", plain.id)).exists());
+
+        let drawn = save(&db, &dir, None, "m", "b", &painted(2), None).unwrap();
+        assert_eq!((drawn.strength, drawn.input_url, drawn.mask_url), (None, None, None));
+
+        assert!(delete(&db, &dir, s.id, None).unwrap());
+        assert!(!dir.join(format!("{}.input", s.id)).exists() && !dir.join(format!("{}.mask", s.id)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fields(v: serde_json::Value) -> Fields {
+        match v {
+            serde_json::Value::Object(map) => Fields { map, files: Vec::new() },
+            _ => unreachable!(),
+        }
+    }
+
+    /// An edit's fields under OpenAI's names and diffusers', from JSON or
+    /// from a form, where every value is text.
+    #[test]
+    fn an_edit_is_read_from_json_or_a_form() {
+        let (r, strength) = edit_request(&fields(json!({ "prompt": "a green apple", "size": "768x512", "steps": 20, "guidance_scale": 6.5, "seed": 7, "strength": 0.4, "negative_prompt": "blurry", "partial_images": 1 }))).unwrap();
+        assert_eq!((r.prompt.as_str(), r.width, r.height, r.steps, r.guidance, r.seed, r.preview), ("a green apple", Some(768), Some(512), Some(20), Some(6.5), Some(7), true));
+        assert_eq!((r.negative_prompt.as_deref(), strength), (Some("blurry"), Some(0.4)));
+
+        let form = fields(json!({ "prompt": "a green apple", "num_inference_steps": "12", "strength": "0.6", "loras": "[{\"name\":\"a/b\",\"scale\":0.5}]" }));
+        let (r, strength) = edit_request(&form).unwrap();
+        assert_eq!((r.steps, strength, r.width, r.loras.len()), (Some(12), Some(0.6), None, 1));
+
+        assert!(edit_request(&fields(json!({ "size": "512x512" }))).unwrap_err().1.contains("prompt"));
+        assert!(edit_request(&fields(json!({ "prompt": "x", "strength": "a lot" }))).unwrap_err().1.contains("strength"));
+    }
+
+    /// The picture, however it was sent; and what cannot be had is refused
+    /// by name.
+    #[test]
+    fn an_edit_s_picture_is_a_file_or_a_data_url() {
+        let mut form = fields(json!({ "prompt": "x" }));
+        form.files.push(("image".into(), b"picture".to_vec()));
+        form.files.push(("mask".into(), b"mask".to_vec()));
+        assert_eq!(sent(&form, "image").unwrap().as_deref(), Some(&b"picture"[..]));
+        assert_eq!(sent(&form, "mask").unwrap().as_deref(), Some(&b"mask"[..]));
+        assert_eq!(sent(&fields(json!({})), "mask").unwrap(), None);
+
+        // OpenAI's SDK sends a list of pictures as `image[]`.
+        let mut list = fields(json!({}));
+        list.files.push(("image[]".into(), b"one".to_vec()));
+        assert_eq!(sent(&list, "image").unwrap().as_deref(), Some(&b"one"[..]));
+        list.files.push(("image[]".into(), b"two".to_vec()));
+        assert!(sent(&list, "image").unwrap_err().1.contains("one picture"));
+
+        let url = json!({ "image": "data:image/png;base64,cGljdHVyZQ==" });
+        assert_eq!(sent(&fields(url), "image").unwrap().as_deref(), Some(&b"picture"[..]));
+        for (body, wrong) in [
+            (json!({ "image": "https://example.com/a.png" }), "fetches nothing"),
+            (json!({ "image": { "file_id": "file-1" } }), "no Files API"),
+            (json!({ "image": 3 }), "a data: URL"),
+        ] {
+            let said = sent(&fields(body), "image").unwrap_err().1;
+            assert!(said.contains(wrong), "{said}");
+        }
     }
 
     /// Deleting the newest image and making another must not give the new
@@ -623,9 +942,9 @@ mod tests {
     fn a_deleted_images_id_is_not_handed_out_again() {
         let db = Db::in_memory().unwrap();
         let dir = scratch("reused");
-        let first = save(&db, &dir, None, "m", "b", &painted(1)).unwrap();
+        let first = save(&db, &dir, None, "m", "b", &painted(1), None).unwrap();
         assert!(delete(&db, &dir, first.id, None).unwrap());
-        let second = save(&db, &dir, None, "m", "b", &painted(2)).unwrap();
+        let second = save(&db, &dir, None, "m", "b", &painted(2), None).unwrap();
         assert!(second.id > first.id, "id {} was handed out again", first.id);
         assert_ne!(second.url, first.url);
         let _ = std::fs::remove_dir_all(&dir);
@@ -649,7 +968,7 @@ mod tests {
         })
         .unwrap();
         let dir = scratch("owned");
-        let mine = save(&db, &dir, Some(1), "m", "b", &painted(1)).unwrap();
+        let mine = save(&db, &dir, Some(1), "m", "b", &painted(1), None).unwrap();
         assert!(get_one(&db, mine.id, Some(2)).unwrap().is_none());
         assert!(list(&db, Some(2)).unwrap().is_empty());
         assert!(!delete(&db, &dir, mine.id, Some(2)).unwrap());

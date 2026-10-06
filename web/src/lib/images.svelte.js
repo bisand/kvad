@@ -34,6 +34,15 @@ class Images {
   fixSeed = $state(false);
   /** LoRAs to apply, `{ name, scale }`, each as it was pulled. */
   loras = $state([]);
+  /** A picture to start from, `{ name, url }` with `url` a `data:` URL, or
+   *  null to draw from the prompt alone. */
+  source = $state(null);
+  /** Where the picture may change: a `data:` URL of a mask, white where it
+   *  is drawn anew, or null for all of it. */
+  mask = $state(null);
+  /** How far the picture is noised, 0 to 1; null for the default, which is
+   *  0.75, or 1 where there is a mask. */
+  strength = $state(null);
 
   running = $state(false);
   /** `{ step, total, started, preview }` while a picture is being made. */
@@ -138,10 +147,18 @@ class Images {
       body.loras = this.loras.map((l) => ({ name: l.name, scale: Number(l.scale) }));
     }
 
+    // From a picture, it is an edit: the same request and the picture,
+    // each file a `data:` URL, to the route that reads one.
+    if (this.source) {
+      body.image = this.source.url;
+      if (this.mask) body.mask = this.mask;
+      if (this.strength != null && this.strength !== "") body.strength = Number(this.strength);
+    }
+
     this.progress = { ...this.progress, loading: false, started: Date.now() };
     try {
       await sse(
-        "/v1/images/generations",
+        this.source ? "/v1/images/edits" : "/v1/images/generations",
         body,
         {
           "image_generation.step": (data) => {
@@ -180,8 +197,38 @@ class Images {
     this.#stop?.abort();
   }
 
-  /** Put an old picture's settings back in the form. */
-  reuse(image) {
+  /** Start from a picture: a `File`, or a `Blob` with a name. */
+  async startFrom(file, name = file.name) {
+    try {
+      this.source = { name, url: await dataUrl(file) };
+      this.mask = null;
+    } catch (e) {
+      toasts.error(`Could not read ${name}: ${e.message}.`);
+    }
+  }
+
+  /** Start from a picture in the gallery: an edit of what was made. */
+  async startFromKept(image) {
+    try {
+      await this.startFrom(await blob(image.url), `image ${image.id}`);
+      this.prompt = image.prompt;
+      const resident = models.imageResidents.find((r) => r.repo === image.model);
+      this.model = resident?.id ?? image.model;
+    } catch (e) {
+      toasts.error(e.message);
+    }
+  }
+
+  /** Draw from the prompt alone again. */
+  clearSource() {
+    this.source = null;
+    this.mask = null;
+    this.strength = null;
+  }
+
+  /** Put an old picture's settings back in the form: for an edit, the
+   *  picture it was made from and its mask too. */
+  async reuse(image) {
     this.prompt = image.prompt;
     this.negative = image.negative_prompt ?? "";
     this.width = image.width;
@@ -193,6 +240,14 @@ class Images {
     this.loras = (image.loras ?? []).map((l) => ({ name: l.name, scale: l.scale }));
     const resident = models.imageResidents.find((r) => r.repo === image.model);
     this.model = resident?.id ?? image.model;
+    if (!image.input_url) return this.clearSource();
+    try {
+      this.source = { name: `what image ${image.id} was made from`, url: await dataUrl(await blob(image.input_url)) };
+      this.mask = image.mask_url ? await dataUrl(await blob(image.mask_url)) : null;
+      this.strength = image.strength;
+    } catch (e) {
+      toasts.error(e.message);
+    }
   }
 
   async remove(id) {
@@ -207,3 +262,20 @@ class Images {
 }
 
 export const images = new Images();
+
+/** A file from this server, as a `Blob`. */
+async function blob(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} failed: ${response.status} ${response.statusText}.`);
+  return await response.blob();
+}
+
+/** A file's bytes as a `data:` URL. */
+function dataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error ?? new Error("the file could not be read"));
+    reader.readAsDataURL(file);
+  });
+}

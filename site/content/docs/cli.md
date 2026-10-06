@@ -30,6 +30,7 @@ their own usage with `--help`.
 | `kvad run --prompt TEXT` | One answer. |
 | `kvad chat` | A conversation. |
 | `kvad images make PROMPT` | A picture. Also `ls` and `rm ID`. |
+| `kvad images edit PROMPT --image PICTURE` | A picture made from one, with `--strength` and `--mask`. |
 | `kvad videos make PROMPT` | A clip. Also `ls`, `show`, `watch`, `get`, `rm`. |
 | `kvad tokenize TEXT` | How the model splits a text. |
 | `kvad cancel` | Stop whatever is generating. |

@@ -595,7 +595,7 @@ fn remove_files(dir: &FsPath, id: i64) {
 
 /// One part of a `multipart/form-data` body.
 #[derive(Debug, PartialEq)]
-struct Part {
+pub(crate) struct Part {
     name: String,
     /// Present when the part is a file.
     filename: Option<String>,
@@ -608,7 +608,7 @@ struct Part {
 /// blank line, the bytes, and the next boundary, which is always preceded by
 /// CRLF. A part's own headers other than its name are not needed here, and
 /// neither is anything before the first boundary or after the last.
-fn form(body: &[u8], content_type: &str) -> Result<Vec<Part>, Fail> {
+pub(crate) fn form(body: &[u8], content_type: &str) -> Result<Vec<Part>, Fail> {
     let boundary = content_type
         .split(';')
         .filter_map(|p| p.trim().strip_prefix("boundary="))
@@ -653,13 +653,13 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 /// A request's fields, whichever way it was sent: JSON's own values, or a
 /// form's as strings. A form's files are in `files`, by field name.
-struct Fields {
-    map: Map<String, Value>,
-    files: Vec<(String, Vec<u8>)>,
+pub(crate) struct Fields {
+    pub(crate) map: Map<String, Value>,
+    pub(crate) files: Vec<(String, Vec<u8>)>,
 }
 
 impl Fields {
-    fn read(headers: &HeaderMap, body: &[u8]) -> Result<Fields, Fail> {
+    pub(crate) fn read(headers: &HeaderMap, body: &[u8]) -> Result<Fields, Fail> {
         let kind = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
         if kind.to_ascii_lowercase().starts_with("multipart/form-data") {
             let mut map = Map::new();
@@ -684,7 +684,7 @@ impl Fields {
     }
 
     /// The first of `names` that is present and not empty.
-    fn get<'a>(&self, names: &[&'a str]) -> Option<(&'a str, &Value)> {
+    pub(crate) fn get<'a>(&self, names: &[&'a str]) -> Option<(&'a str, &Value)> {
         names.iter().find_map(|n| {
             let v = self.map.get(*n)?;
             let blank = v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty());
@@ -692,7 +692,7 @@ impl Fields {
         })
     }
 
-    fn text(&self, names: &[&str]) -> Option<String> {
+    pub(crate) fn text(&self, names: &[&str]) -> Option<String> {
         self.get(names).map(|(_, v)| match v {
             Value::String(s) => s.clone(),
             other => other.to_string(),
@@ -700,7 +700,7 @@ impl Fields {
     }
 
     /// A number, whether JSON sent it as one or a form as text.
-    fn number<T: std::str::FromStr>(&self, names: &[&str]) -> Result<Option<T>, Fail> {
+    pub(crate) fn number<T: std::str::FromStr>(&self, names: &[&str]) -> Result<Option<T>, Fail> {
         let Some((name, v)) = self.get(names) else { return Ok(None) };
         let text = match v {
             Value::String(s) => s.trim().to_string(),
@@ -711,7 +711,7 @@ impl Fields {
 
     /// `loras`, `[{name, scale}]`: JSON's list, or a form's field holding
     /// the same list as JSON text.
-    fn loras(&self) -> Result<Vec<kvad::image::Lora>, Fail> {
+    pub(crate) fn loras(&self) -> Result<Vec<kvad::image::Lora>, Fail> {
         let Some((_, v)) = self.get(&["loras"]) else { return Ok(Vec::new()) };
         let v = match v {
             Value::String(s) => serde_json::from_str(s).map_err(|e| Fail::bad(format!("loras is not JSON: {e}")))?,
@@ -720,7 +720,7 @@ impl Fields {
         serde_json::from_value(v).map_err(|e| Fail::bad(format!("loras is a list of {{name, scale}}: {e}")))
     }
 
-    fn flag(&self, name: &str) -> Result<Option<bool>, Fail> {
+    pub(crate) fn flag(&self, name: &str) -> Result<Option<bool>, Fail> {
         match self.get(&[name]) {
             None => Ok(None),
             Some((_, Value::Bool(b))) => Ok(Some(*b)),
@@ -770,7 +770,7 @@ fn picture(f: &Fields) -> Result<Option<Vec<u8>>, Fail> {
                 Value::Object(o) => o.get("image_url").and_then(Value::as_str).map(str::to_string).ok_or_else(|| Fail::bad("input_reference wants an image_url"))?,
                 _ => return Err(Fail::bad("input_reference is a file, or {\"image_url\": \"data:…\"}")),
             };
-            data_url(url.trim())?
+            data_url(url.trim(), "input_reference.image_url")?
         }
     };
     if bytes.is_empty() {
@@ -782,20 +782,21 @@ fn picture(f: &Fields) -> Result<Option<Vec<u8>>, Fail> {
     Ok(Some(bytes))
 }
 
-/// The bytes a `data:` URL holds, base64 or not.
-fn data_url(url: &str) -> Result<Vec<u8>, Fail> {
+/// The bytes a `data:` URL holds, base64 or not. `what` is the field it
+/// came in, for the refusals.
+pub(crate) fn data_url(url: &str, what: &str) -> Result<Vec<u8>, Fail> {
     use base64::Engine;
     let Some(rest) = url.strip_prefix("data:") else {
         return Err(Fail::bad(match url.starts_with("http:") || url.starts_with("https:") {
-            true => "input_reference.image_url: this server fetches nothing on a client's behalf; send the picture itself, as a file or a data: URL",
-            false => "input_reference.image_url is not a data: URL",
+            true => format!("{what}: this server fetches nothing on a client's behalf; send the picture itself, as a file or a data: URL"),
+            false => format!("{what} is not a data: URL"),
         }));
     };
     let (head, body) = rest.split_once(',').ok_or_else(|| Fail::bad("a data: URL with no comma"))?;
     match head.ends_with(";base64") {
         true => base64::engine::general_purpose::STANDARD
             .decode(body.trim())
-            .map_err(|e| Fail::bad(format!("input_reference.image_url is not base64: {e}"))),
+            .map_err(|e| Fail::bad(format!("{what} is not base64: {e}"))),
         false => Ok(body.as_bytes().to_vec()),
     }
 }
@@ -1046,7 +1047,7 @@ async fn run(state: State, id: i64, key: Key, request: VideoRequest, _herald: He
 
 /// A picture's media type, by its first bytes: what a browser needs told
 /// to show one kept without its name.
-fn sniff(b: &[u8]) -> &'static str {
+pub(crate) fn sniff(b: &[u8]) -> &'static str {
     match b {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",

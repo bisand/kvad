@@ -53,7 +53,50 @@ pub struct ImageRequest {
     pub preview: bool,
     /// LoRAs to apply for this image, each at its strength.
     pub loras: Vec<Lora>,
+    /// A picture to start from, where the image is an edit of one.
+    pub edit: Option<Edit>,
 }
+
+/// A picture an image is made *from*, where it is not made from noise alone.
+///
+/// The picture is noised part of the way and denoised from there with the
+/// prompt, which is SDEdit, and what diffusers calls image-to-image: the
+/// prompt describes the picture wanted, not the change to make. `strength`
+/// says how far up the noise the picture is taken, and so how much of it is
+/// left: near 0 it comes back as it was, at 1 nothing of it remains but
+/// where a mask kept it.
+///
+/// With a mask it is inpainting. Outside the mask the picture is put back
+/// after every step, at that step's noise, so the model draws the masked
+/// part in the knowledge of the rest and the rest comes out as it went in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Edit {
+    pub image: Image,
+    pub mask: Option<Mask>,
+    /// 0 to 1. Without one, [`STRENGTH`], or 1 where there is a mask.
+    pub strength: Option<f32>,
+}
+
+/// Where an [`Edit`] may change its picture: a byte a pixel, row by row,
+/// 255 where the model draws anew and 0 where the picture is kept, and
+/// between them a mix. The picture's own size.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Mask {
+    pub width: usize,
+    pub height: usize,
+    pub repaint: Vec<u8>,
+}
+
+impl std::fmt::Debug for Mask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Mask({}×{})", self.width, self.height)
+    }
+}
+
+/// How far an edit noises its picture when the request does not say:
+/// three quarters of the way, where the picture's layout and colours
+/// survive and its detail is the prompt's. diffusers' default is 0.8.
+pub const STRENGTH: f32 = 0.75;
 
 /// A LoRA a request applies: its name, as a checkpoint's is (`repo`,
 /// `repo:file.safetensors` or a path; [`crate::lora`]), and how strongly.
@@ -143,6 +186,8 @@ pub struct Defaults {
     pub takes_guidance: bool,
     /// Whether a request may apply LoRAs to it ([`Lora`]).
     pub takes_loras: bool,
+    /// Whether it makes an image from a picture ([`Edit`]).
+    pub edits: bool,
 }
 
 /// An [`ImageRequest`] with every blank filled and checked.
@@ -157,6 +202,28 @@ pub struct Resolved {
     pub seed: u64,
     pub preview: bool,
     pub loras: Vec<Lora>,
+    /// How far an edit noised its picture; `None` for an image that is not
+    /// an edit. `steps` is still what was asked for: an edit runs the last
+    /// `strength` of them ([`edit_steps`]).
+    pub strength: Option<f32>,
+    /// Whether an edit kept the picture outside a mask.
+    pub masked: bool,
+}
+
+/// The steps an edit of `strength` runs out of `steps`: the bottom of the
+/// schedule, from where the picture was noised to. At least one.
+pub fn edit_steps(steps: usize, strength: f32) -> usize {
+    ((steps as f32 * strength).round() as usize).clamp(1, steps)
+}
+
+/// The size an edit is made at when the request names none: the picture's
+/// own shape, at about as many pixels as the model's own size has, each
+/// side a multiple of what the model needs.
+pub fn edit_size(picture: (usize, usize), d: &Defaults) -> (usize, usize) {
+    let (w, h) = (picture.0.max(1) as f64, picture.1.max(1) as f64);
+    let scale = ((d.width * d.height) as f64 / (w * h)).sqrt();
+    let side = |n: f64| (((n * scale / d.multiple as f64).round() as usize).max(1) * d.multiple).min(MAX_SIDE / d.multiple * d.multiple);
+    (side(w), side(h))
 }
 
 /// The largest side a request may ask for. Past this the VAE decode alone
@@ -179,8 +246,17 @@ impl ImageRequest {
     /// report which seed made it. An image that cannot be made again is a
     /// worse answer than one that can.
     pub fn resolved(&self, d: &Defaults) -> Res<Resolved> {
-        let width = self.width.unwrap_or(d.width);
-        let height = self.height.unwrap_or(d.height);
+        if self.edit.is_some() && !d.edits {
+            return Err("this model makes images from a prompt alone, not from a picture; SDXL and SD 1.5 edit one".into());
+        }
+        // An edit with no size is its picture's shape, and with one side
+        // only, that side and the model's own for the other, as an image is.
+        let fitted = match (&self.edit, self.width, self.height) {
+            (Some(e), None, None) => Some(edit_size((e.image.width, e.image.height), d)),
+            _ => None,
+        };
+        let width = self.width.or(fitted.map(|f| f.0)).unwrap_or(d.width);
+        let height = self.height.or(fitted.map(|f| f.1)).unwrap_or(d.height);
         let steps = self.steps.unwrap_or(d.steps);
         let guidance = self.guidance.unwrap_or(d.guidance);
         for (what, n) in [("width", width), ("height", height)] {
@@ -225,6 +301,33 @@ impl ImageRequest {
                 .unwrap_or(0)
         });
         check_loras(&self.loras, d.takes_loras)?;
+        let strength = match &self.edit {
+            None => None,
+            Some(e) => {
+                if e.image.width == 0 || e.image.height == 0 || e.image.rgb.len() != e.image.width * e.image.height * 3 {
+                    return Err("the picture to edit is empty".into());
+                }
+                if let Some(m) = &e.mask {
+                    if (m.width, m.height) != (e.image.width, e.image.height) || m.repaint.len() != m.width * m.height {
+                        return Err(format!(
+                            "the mask is {}×{} and the picture {}×{}; a mask is its picture's size",
+                            m.width, m.height, e.image.width, e.image.height
+                        )
+                        .into());
+                    }
+                    if m.repaint.iter().all(|&b| b == 0) {
+                        return Err("the mask keeps the whole picture, so there is nothing to draw".into());
+                    }
+                }
+                // Inside a mask the usual wish is something new; without
+                // one, the picture changed and still itself.
+                let strength = e.strength.unwrap_or(if e.mask.is_some() { 1.0 } else { STRENGTH });
+                if !(strength.is_finite() && strength > 0.0 && strength <= 1.0) {
+                    return Err(format!("strength is above 0 and at most 1, not {strength}").into());
+                }
+                Some(strength)
+            }
+        };
         let negative_prompt = self.negative_prompt.clone().filter(|n| !n.is_empty());
         Ok(Resolved {
             prompt: self.prompt.clone(),
@@ -236,6 +339,8 @@ impl ImageRequest {
             seed,
             preview: self.preview,
             loras: self.loras.clone(),
+            strength,
+            masked: self.edit.as_ref().is_some_and(|e| e.mask.is_some()),
         })
     }
 }
@@ -501,7 +606,53 @@ mod tests {
     }
 
     fn sdxl() -> Defaults {
-        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: false }
+        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: false, edits: true }
+    }
+
+    /// An edit with no size is its picture's shape at the model's own
+    /// number of pixels, and runs the last `strength` of its steps.
+    #[test]
+    fn an_edit_is_sized_from_its_picture_and_runs_part_of_its_steps() {
+        assert_eq!(edit_size((512, 512), &sdxl()), (1024, 1024));
+        assert_eq!(edit_size((1000, 500), &sdxl()), (1448, 728));
+        assert_eq!(edit_size((3000, 4000), &sdxl()), (888, 1184));
+        assert_eq!(edit_size((10_000, 10), &sdxl()).0, MAX_SIDE, "held to the largest side there is");
+
+        assert_eq!((edit_steps(20, 0.2), edit_steps(30, 0.75), edit_steps(30, 1.0), edit_steps(4, 0.01)), (4, 23, 30, 1));
+    }
+
+    #[test]
+    fn an_edit_is_checked_before_it_is_run() {
+        let picture = |w: usize, h: usize| Image { width: w, height: h, rgb: vec![0; w * h * 3] };
+        let edit = |mask: Option<Mask>, strength: Option<f32>| ImageRequest {
+            edit: Some(Edit { image: picture(640, 480), mask, strength }),
+            ..ImageRequest::new("a cat")
+        };
+        let whole = |w: usize, h: usize, v: u8| Mask { width: w, height: h, repaint: vec![v; w * h] };
+
+        // Three quarters of the way without a mask, and all of it with one.
+        let r = edit(None, None).resolved(&sdxl()).unwrap();
+        assert_eq!((r.width, r.height, r.strength, r.masked), (1184, 888, Some(STRENGTH), false));
+        let r = edit(Some(whole(640, 480, 255)), None).resolved(&sdxl()).unwrap();
+        assert_eq!((r.strength, r.masked), (Some(1.0), true));
+        // A size that was asked for is the size.
+        let sized = ImageRequest { width: Some(512), height: Some(512), ..edit(None, Some(0.3)) }.resolved(&sdxl()).unwrap();
+        assert_eq!((sized.width, sized.height, sized.strength), (512, 512, Some(0.3)));
+        // An image that is not an edit says so by having no strength.
+        assert_eq!(ImageRequest::new("a cat").resolved(&sdxl()).unwrap().strength, None);
+
+        for (request, wrong) in [
+            (edit(None, Some(0.0)), "strength"),
+            (edit(None, Some(1.5)), "strength"),
+            (edit(Some(whole(64, 64, 255)), None), "a mask is its picture's size"),
+            (edit(Some(whole(640, 480, 0)), None), "nothing to draw"),
+            (ImageRequest { edit: Some(Edit { image: picture(0, 0), mask: None, strength: None }), width: Some(512), height: Some(512), ..ImageRequest::new("a cat") }, "empty"),
+        ] {
+            let said = request.resolved(&sdxl()).unwrap_err().to_string();
+            assert!(said.contains(wrong), "{said}");
+        }
+        let cannot = Defaults { edits: false, ..sdxl() };
+        assert!(edit(None, None).resolved(&cannot).unwrap_err().to_string().contains("not from a picture"));
     }
 
     /// A LoRA is refused by a model that takes none, and checked by one that
@@ -555,7 +706,7 @@ mod tests {
 
     #[test]
     fn a_model_without_guidance_refuses_a_guidance_scale_and_a_negative_prompt() {
-        let schnell = Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_loras: false };
+        let schnell = Defaults { width: 1024, height: 1024, steps: 4, guidance: 0.0, multiple: 16, takes_guidance: false, takes_loras: false, edits: false };
         let ask = |g: Option<f32>, n: Option<&str>| {
             ImageRequest { guidance: g, negative_prompt: n.map(str::to_string), ..ImageRequest::new("a cat") }.resolved(&schnell)
         };

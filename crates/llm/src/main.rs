@@ -121,8 +121,11 @@ struct Args {
     silent: bool,
     /// `pull` only: LTX-2.5's dev model too, for guided videos.
     dev: bool,
-    /// The picture a video starts from.
+    /// The picture a video starts from, or `images edit` edits.
     image: Option<String>,
+    /// `images edit`: the mask's file, and how far the picture is noised.
+    mask: Option<String>,
+    strength: Option<f32>,
     /// `videos make` only: which of LTX-2.5's decoders, `diffusion` or
     /// `conv`.
     decoder: Option<String>,
@@ -200,6 +203,8 @@ impl Default for Args {
             silent: false,
             dev: false,
             image: None,
+            mask: None,
+            strength: None,
             decoder: None,
             pipeline: None,
             quant: Precision::F32,
@@ -419,6 +424,8 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--frames" => a.frames = Some(num() as usize),
             "--fps" => a.fps = Some(num() as u32),
             "--image" => a.image = Some(value.clone()),
+            "--mask" => a.mask = Some(value.clone()),
+            "--strength" => a.strength = Some(num() as f32),
             "--decoder" => a.decoder = Some(value.clone()),
             "--pipeline" => a.pipeline = Some(value.clone()),
             "--out" => a.out = Some(value.clone()),

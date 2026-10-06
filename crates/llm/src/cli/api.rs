@@ -24,13 +24,23 @@ pub const IMAGES: &str = "usage: kvad images [ls]
        kvad images make PROMPT [--out FILE] [--model MODEL] [--size WxH] [--steps N]
                                [--guidance F] [--negative TEXT] [--seed N]
                                [--lora NAME[:SCALE]]...
+       kvad images edit PROMPT --image PICTURE [--mask FILE] [--strength F]
+                               [and what `make` takes]
        kvad images rm ID
 
 Pictures made by an image model on the server — SDXL, SD 1.5, Qwen-Image.
 Every one is kept there, with the settings that made it; `make` also writes it
 here, to --out or to image-ID.png. Anything left out is the model's own
 default. --lora applies a LoRA fetched with `kvad pull`, at the strength after
-a colon (1 if none), to Qwen-Image, FLUX, SDXL or SD 1.5.";
+a colon (1 if none), to Qwen-Image, FLUX, SDXL or SD 1.5.
+
+`edit` makes a picture from PICTURE: it is noised part of the way and drawn
+over from there, so PROMPT says what the result should be, not what to change.
+--strength is how far, above 0 and at most 1 (0.75 unless said): near 0 the
+picture comes back as it was, and at 1 nothing of it is left. With --mask only
+part of it is drawn anew, at strength 1 unless said: where the mask is
+transparent, or white if it has no transparency. Without --size the result is
+the picture's own shape. SDXL and SD 1.5 edit.";
 
 pub const VIDEOS: &str = "usage: kvad videos [ls]
        kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]
@@ -1053,16 +1063,37 @@ pub fn images(remote: &Remote, args: &Args) -> Res<()> {
             }
             Ok(())
         }
-        "make" => {
+        "make" | "edit" => {
             let prompt = match (&args.prompt, words.is_empty()) {
                 (Some(p), _) => p.clone(),
                 (None, false) => words.join(" "),
                 (None, true) => {
-                    eprintln!("make what?\n\n{IMAGES}");
+                    eprintln!("{sub} what?\n\n{IMAGES}");
                     std::process::exit(2);
                 }
             };
             let mut body = json!({ "prompt": prompt, "stream": true, "response_format": "b64_json" });
+            // A file as a `data:` URL: the server reads a picture by its
+            // bytes, not its name, so the media type is only a label.
+            let file = |path: &String| -> Res<Value> {
+                let bytes = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;
+                Ok(json!(format!("data:application/octet-stream;base64,{}", client::encode_base64(&bytes))))
+            };
+            let editing = match (sub, &args.image) {
+                ("edit", Some(picture)) => {
+                    body["image"] = file(picture)?;
+                    if let Some(mask) = &args.mask {
+                        body["mask"] = file(mask)?;
+                    }
+                    if let Some(s) = args.strength {
+                        body["strength"] = json!(s);
+                    }
+                    true
+                }
+                ("edit", None) => return Err(format!("edit which picture? --image PICTURE\n\n{IMAGES}").into()),
+                (_, None) if args.mask.is_none() && args.strength.is_none() => false,
+                _ => return Err("--image, --mask and --strength are `kvad images edit`'s; `make` draws from a prompt alone".into()),
+            };
             if let Some(m) = &args.model {
                 body["model"] = json!(m);
             }
@@ -1087,7 +1118,12 @@ pub fn images(remote: &Remote, args: &Args) -> Res<()> {
 
             let mut progress = out::Progress::new();
             let started = std::time::Instant::now();
-            for event in remote.stream("post", "/v1/images/generations", Some(Body::Json(&body)))? {
+            // The same events from either route.
+            let events = match editing {
+                true => remote.stream("post", "/v1/images/edits", Some(Body::Json(&body)))?,
+                false => remote.stream("post", "/v1/images/generations", Some(Body::Json(&body)))?,
+            };
+            for event in events {
                 let event = event?;
                 let data = event.json()?;
                 match event.name.as_str() {
@@ -1106,10 +1142,12 @@ pub fn images(remote: &Remote, args: &Args) -> Res<()> {
                         match args.json {
                             true => out::json(k),
                             false => eprintln!(
-                                "{path}: {}×{}, {} steps, guidance {}, seed {} — image {} on the server\n  \
+                                "{path}: {}×{}, {}{} steps, guidance {}, seed {} — image {} on the server\n  \
                                  denoise {:.1} s, decode {:.1} s",
                                 out::s(&k["width"]),
                                 out::s(&k["height"]),
+                                // An edit runs the last `strength` of them.
+                                k["strength"].as_f64().map(|s| format!("strength {s:.2} of ")).unwrap_or_default(),
                                 out::s(&k["steps"]),
                                 out::s(&k["guidance"]),
                                 out::s(&k["seed"]),

@@ -6,6 +6,7 @@
 
 use super::clip::{self, Clip, ClipConfig, Pooled};
 use super::nn::{check_latent, latent_preview, noise, to_rgb8, Ctx};
+use super::edit::Edited;
 use super::schedule;
 use super::unet::{Unet, UnetConfig};
 use super::vae::{Decoder, Encoder, VaeConfig};
@@ -116,6 +117,8 @@ pub struct Sdxl {
     clip_g: Clip,
     unet: Unet,
     vae: Decoder,
+    /// The VAE's other half, for an image made from a picture ([`edit`]).
+    encoder: Encoder,
     scheduler: Value,
     device: Device,
     dtype: DType,
@@ -219,11 +222,12 @@ impl Sdxl {
         let (c, paths) = (read_json(&get(VAE_REPO, "config.json")?)?, vec![get(VAE_REPO, "diffusion_pytorch_model.safetensors")?]);
         let r = open(&paths, dtype)?;
         let vae = Decoder::load(&cx, &r, VaeConfig::from_json(&c)?)?;
+        let encoder = Encoder::load(&cx, &r, VaeConfig::from_json(&c)?)?;
         params += finish("VAE", &paths, &r)?;
 
         settle(&device)?;
         progress(&format!("loaded SDXL: {:.2} B parameters in f16", params as f64 / 1e9));
-        Ok(Sdxl { tok, clip_l, clip_g, unet, vae, scheduler, device, dtype, adapters, params })
+        Ok(Sdxl { tok, clip_l, clip_g, unet, vae, encoder, scheduler, device, dtype, adapters, params })
     }
 
     /// The prompt as the UNet reads it: `[1, 77, 2048]` per token and
@@ -308,8 +312,8 @@ impl Readers {
 
 impl Sdxl {
     /// One image, with whatever LoRAs the adapters hold.
-    fn draw(&mut self, req: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
-        let req = req.resolved(&self.defaults())?;
+    fn draw(&mut self, asked: &ImageRequest, on_step: &mut dyn FnMut(Step) -> bool) -> Res<Painted> {
+        let req = asked.resolved(&self.defaults())?;
         let t0 = Instant::now();
 
         // The prompt, and what guidance steers away from. SDXL's pipeline
@@ -338,10 +342,23 @@ impl Sdxl {
         let shape = [1, 4, req.height / f, req.width / f];
         // The latent is kept in f32 between steps: the UNet's answer is f16,
         // but thirty small updates accumulated in f16 lose the last of them.
-        let mut x = (noise(req.seed, &shape, &self.device, DType::F32)? * sched.init_scale)?;
+        let eps = noise(req.seed, &shape, &self.device, DType::F32)?;
+        // From noise; or from a picture, noised part of the way ([`edit`]).
+        let (edited, mut x) = match &asked.edit {
+            None => (None, (eps * sched.init_scale)?),
+            Some(e) => {
+                let (edited, x) = Edited::begin(e, &req, &sched, f, eps, |pixels| {
+                    let seen = self.encoder.encode(&pixels.to_dtype(self.dtype)?.to_device(&self.device)?)?;
+                    Ok(self.encoder.to_denoiser(&seen.mean.to_dtype(DType::F32)?)?)
+                })?;
+                settle(&self.device)?;
+                (Some(edited), x)
+            }
+        };
+        let first = edited.as_ref().map_or(0, |e| e.first);
 
         let t1 = Instant::now();
-        for i in 0..sched.steps() {
+        for i in first..sched.steps() {
             let xin = (&x * sched.input_scale(i))?.to_dtype(self.dtype)?;
             let xin = if guided { Tensor::cat(&[&xin, &xin], 0)? } else { xin };
             let eps = self.unet.forward(&xin, sched.timesteps[i], &ctx, Some((&pooled, &time_ids)))?.to_dtype(DType::F32)?;
@@ -368,7 +385,10 @@ impl Sdxl {
                 }
             };
             x = (&x + (eps * sched.dt(i))?)?;
-            if !on_step(Step { done: i + 1, total: sched.steps(), preview }) {
+            if let Some(e) = &edited {
+                x = e.hold(x, &sched, i)?;
+            }
+            if !on_step(Step { done: i + 1 - first, total: sched.steps() - first, preview }) {
                 return Err("cancelled".into());
             }
         }
@@ -382,6 +402,10 @@ impl Sdxl {
         let t2 = Instant::now();
         let pixels = self.vae.decode(&x.to_dtype(self.dtype)?)?;
         let image = to_rgb8(&pixels)?;
+        let image = match &edited {
+            Some(e) => e.paste(image),
+            None => image,
+        };
         let decode_secs = t2.elapsed().as_secs_f64();
         Ok(Painted { image, request: req, encode_secs, denoise_secs, decode_secs })
     }
@@ -398,7 +422,7 @@ impl Painter for Sdxl {
         // 30 steps and guidance 5: the middle of what Stability's own
         // examples use. The model was trained at 1024², and the VAE needs
         // multiples of 8.
-        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: true }
+        Defaults { width: 1024, height: 1024, steps: 30, guidance: 5.0, multiple: 8, takes_guidance: true, takes_loras: true, edits: true }
     }
 
     fn summary(&self) -> String {

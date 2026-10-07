@@ -5,7 +5,10 @@
 //!
 //! 1. [`one_stage`]: eight *ancestral* steps from pure noise, at half the
 //!    requested width and height. Each takes a deterministic step to below
-//!    the next noise level and adds fresh noise back up to it.
+//!    the next noise level and adds fresh noise back up to it: to the video
+//!    and to the sound alike, as the reference's
+//!    `euler_ancestral_denoising_loop` does, drawing the video's and then
+//!    the sound's at every step.
 //! 2. The video latent is upsampled ×2 (`ltx_upsample`), and [`refine`]
 //!    re-noises both latents to σ = 0.909375 and takes three plain Euler
 //!    steps at the full size. The sound is refined too, not frozen.
@@ -24,11 +27,17 @@
 //! the reference's `x − σ·v` with their own σ, 0, is `x`. The noise is drawn
 //! for every token all the same, so a seed makes the same noise with a
 //! picture as without.
+//!
+//! **The noise** is kvad's own (`image::nn::noise`), not torch's, so a seed
+//! makes the same clip here every time and not the reference's clip. Every
+//! draw of a generation has a stream of its own (`image::nn::stream`), and
+//! fresh noise has to be: until #167 a step's noise was the noise the latent
+//! began as, moved a few elements along, and the sound was a train of clicks.
 
 use super::ltx_dit::{audio_latent, audio_tokens, video_latent, video_tokens, Dit, Grid, Perturb};
 use super::ltx_text::Contexts;
 use crate::common::pooled;
-use crate::image::nn::noise;
+use crate::image::nn::{noise, stream};
 use candle_core::{DType, Tensor};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -72,14 +81,6 @@ impl Ancestral {
         let c = (next * next - (down * down) * (alpha_next * alpha_next) / (alpha_down * alpha_down)).max(0.0).sqrt();
         Ancestral { a: alpha_next / alpha_down, r, c }
     }
-}
-
-/// Where each draw of noise comes from: the seed, moved along so that no
-/// two draws in one generation share a stream. kvad's noise is its own
-/// (`image::nn::noise`), not torch's, so a seed makes the same clip here
-/// every time and not the reference's clip.
-fn stream(seed: u64, draw: u64) -> u64 {
-    seed.wrapping_add(draw.wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
 /// A clip's latents: video `[128, F, h, w]` and audio `[8, T, 16]`, in f32.
@@ -375,6 +376,44 @@ pub fn guided(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The check #167 lacked: the sound of a small clip, by the distilled
+    /// model's ancestral stage 1 alone, is not a train of clicks. A click
+    /// train is near silence with impulses at full scale, so its crest
+    /// factor, peak over RMS, is high: 27 for the track that shipped against
+    /// 4.3 for the same clip's steady one, and at this size 11.1, peaking at
+    /// full scale, against 5.8. Of a quiet scene, which is what tells them
+    /// apart: a dog's barks are loud bursts too, and measured 6 either way.
+    ///
+    /// Of this machine or not at all: the text path and the DiT are 60 GB.
+    ///
+    ///     cargo test --release -p kvad-gpu ltx_sample::tests::the_sound -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn the_sound_of_a_fast_clip_is_not_a_train_of_clicks() {
+        use super::super::ltx_dit::Shape;
+        use super::super::ltx_text::{TextEncoder, DIT_FILE, TEXT_FILE};
+        use super::super::{ltx_audio, LTX_REPO};
+        use candle_core::quantized::GgmlDType;
+        use candle_core::Device;
+        crate::cap::at(28.0);
+        let find = |f: &str| crate::image::local_file(LTX_REPO, f).unwrap_or_else(|| panic!("{f} is not on this machine"));
+        let (text, dit, audio) = (find(TEXT_FILE), find(DIT_FILE), find(ltx_audio::FILE));
+        let dev = Device::new_metal(0).unwrap();
+        let (dtype, quant) = (DType::BF16, Some(GgmlDType::Q8_0));
+        let ctx = TextEncoder::load(&text, &dit, &dev, dtype, quant, &mut |_| {}).unwrap().encode("a fox sitting in fresh snow, snow falling, photograph").unwrap();
+        dev.synchronize().unwrap();
+        let dit = Dit::load(&dit, &dev, dtype, None, quant, &mut |_| {}).unwrap();
+        let shape = Shape::new(384, 256, 49, 24.0).unwrap();
+        let l = one_stage(&dit, &ctx, &dit.grid(shape).unwrap(), 3, None, &mut |_, _, _| Ok(())).unwrap();
+        drop(dit);
+        dev.synchronize().unwrap();
+        let sound = ltx_audio::AudioPath::load(&audio, &dev).unwrap().decode(&l.audio).unwrap();
+        let peak = sound.samples.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let rms = (sound.samples.iter().map(|x| (x * x) as f64).sum::<f64>() / sound.samples.len() as f64).sqrt() as f32;
+        eprintln!("peak {peak:.4}, RMS {rms:.5}, crest factor {:.1}", peak / rms);
+        assert!(peak / rms < 8.0, "a crest factor of {:.1}: clicks", peak / rms);
+    }
 
     #[test]
     fn the_negative_prompt_is_one_line_with_single_spaces() {

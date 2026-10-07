@@ -58,6 +58,9 @@ class Videos {
   /** Which unguided pipeline, `fast` or `dfr`; null is the model's own
    *  choice, which is DFR above 30 fps. */
   pipeline = $state(null);
+  /** DFR's spatial epilogue: the clip made at half the size and then
+   *  detailed in tiles at the size asked for. It makes the video DFR's. */
+  epilogue = $state(false);
   /** The picture to start from, a `File`, and a link to show it by. */
   picture = $state(null);
   /** LoRAs to apply to every DiT the video's pipeline runs, `{ name, scale }`. */
@@ -125,10 +128,23 @@ class Videos {
     return f > 30 ? 0 : r;
   }
 
-  /** Whether DFR makes the video: asked for, or above 30 fps. */
+  /** Whether the video ends with DFR's epilogue: ticked, on a model with
+   *  DFR, and nothing in the form asking for another pipeline. */
+  get withEpilogue() {
+    return this.epilogue && !!this.defaults?.dfr && !this.guided && this.pipeline !== "fast";
+  }
+
+  /** Whether DFR makes the video: asked for, above 30 fps, or for its
+   *  epilogue. */
   get dfr() {
     const d = this.defaults;
-    return !!d?.dfr && !this.guided && (this.pipeline === "dfr" || this.rounds(d) > 0);
+    return !!d?.dfr && !this.guided && (this.pipeline === "dfr" || this.rounds(d) > 0 || this.withEpilogue);
+  }
+
+  /** What the width and height must be multiples of: the model's own, or
+   *  128 with the epilogue, whose first stage is a quarter of the size. */
+  get multiple() {
+    return this.withEpilogue ? 128 : (this.defaults?.multiple ?? 64);
   }
 
   /** The frames a length in seconds makes: the nearest the model can, which
@@ -141,10 +157,16 @@ class Videos {
   }
 
   /** The fast pipeline's frames that `b` first-stage frames cost: their
-   *  own, or on DFR what its DiT holds at its most (`dfrFrames`). */
+   *  own, or on DFR what its DiT holds at its most (`dfrFrames`). With the
+   *  epilogue the stages are at half the size, a quarter of the tokens, and
+   *  the epilogue's largest tile may be more (`dfrEpilogueFrames`). */
   cost(b, d = this.defaults) {
     if (!this.dfr) return b;
-    const l = dfrFrames(b, this.rounds(d));
+    let l = dfrFrames(b, this.rounds(d));
+    if (l != null && this.withEpilogue) {
+      const tile = dfrEpilogueFrames(b, this.rounds(d), Number(this.width || d.width), Number(this.height || d.height));
+      l = tile == null ? null : Math.max(Math.ceil(l / 4), tile);
+    }
     return l == null ? Infinity : 8 * (l - 1) + 1;
   }
 
@@ -175,7 +197,11 @@ class Videos {
     const h = Number(this.height || d.height);
     const fps = Number(this.fps || d.fps);
     const scale = 1 << this.rounds(d);
-    const f = this.frames() ?? (d.duration ? fps : (d.frames - 1) * scale + 1);
+    // A length left to the model: it chooses up to the longest that fits,
+    // and that has to be a second. (Not a clip of `fps` frames, which is
+    // off the grid of 8k + 1 that DFR's canvas is counted on.)
+    if (this.frames() == null && d.duration) return this.longest < fps;
+    const f = this.frames() ?? (d.frames - 1) * scale + 1;
     const base = Math.floor((f - 1) / scale) + 1;
     return w * h * this.cost(base, d) > d.max_volume || base > d.max_frames;
   }
@@ -290,6 +316,7 @@ class Videos {
       if (this.negative.trim()) body.negative_prompt = this.negative.trim();
       if (this.decoder) body.decoder = this.decoder;
       if (this.pipeline && !this.guided) body.pipeline = this.pipeline;
+      if (this.withEpilogue) body.epilogue = true;
       if (this.loras.length) body.loras = this.loras.map((l) => ({ name: l.name, scale: Number(l.scale) }));
       let request;
       if (this.picture) {
@@ -334,6 +361,7 @@ class Videos {
     this.decoder = k.decoder ?? null;
     // DFR above 30 fps is the model's own choice; below, it was asked.
     this.pipeline = k.pipeline === "dfr" && k.fps <= 30 ? "dfr" : null;
+    this.epilogue = !!k.epilogue;
     this.loras = (k.loras ?? []).map((l) => ({ name: l.name, scale: l.scale }));
     const resident = models.videoResidents.find((r) => r.repo === v.model);
     this.model = resident?.id ?? v.model;
@@ -398,7 +426,7 @@ function dfrTiles(seams, frames, count) {
       const planes = [...seams, ...out.flatMap((o) => o.slots)].filter((p) => p < seam);
       pinned = 1 + (seam - Math.max(...planes)) / 8;
     }
-    out.push({ cells: pinned + end - start, anchors: seams.filter(within), slots: middles.filter(within) });
+    out.push({ cells: pinned + end - start, from: ps, to: pe, anchors: seams.filter(within), slots: middles.filter(within) });
   }
   return out;
 }
@@ -420,4 +448,26 @@ function dfrFrames(frames, rounds) {
     seams = [...new Set([...doubled, ...tiles.flatMap((t) => t.slots)])].sort((a, b) => a - b);
   }
   return most;
+}
+
+/** The most latent frames of tokens, at the clip's full size, that DFR's
+ *  spatial epilogue holds in one call: its first step's, in 2 × 2 tiles
+ *  overlapping by 10 cells, of the window with the most frames and
+ *  keyframes; null where there is no canvas.
+ *  `kvad::video::dfr_epilogue_frames`. */
+function dfrEpilogueFrames(frames, rounds, width, height) {
+  const c = dfrCanvas(frames);
+  if (!c) return null;
+  let [seams, keys, f] = [[], c.keyframes, c.frames];
+  for (let r = 1; r <= rounds; r++) {
+    f = 2 * (f - 1) + 1;
+    seams = keys.map((p) => 2 * p);
+    keys = [...new Set([...seams, ...dfrTiles(seams, f, 1 << r).flatMap((t) => t.slots)])].sort((a, b) => a - b);
+  }
+  const windows = rounds === 0 ? [{ cells: Math.floor((f - 1) / 8) + 1, from: 0, to: f - 1 }] : dfrTiles(seams, f, 1 << rounds);
+  const side = (cells) => Math.min(cells, Math.ceil((cells + Math.min(10, Math.max(0, cells - 2))) / 2));
+  const [rows, cols] = [Math.floor(height / 32), Math.floor(width / 32)];
+  if (!rows || !cols) return null;
+  const share = (side(rows) * side(cols)) / (rows * cols);
+  return Math.max(...windows.map((w) => Math.ceil(share * (1.25 * w.cells + keys.filter((p) => w.from <= p && p <= w.to).length + 1))));
 }

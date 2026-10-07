@@ -2177,6 +2177,9 @@ mod tests {
         // 6 keyframes in it and the opening frame.
         assert_eq!(dfr_epilogue_frames(121, 1, 768, 512).unwrap(), ((13.0 * 17.0 / 384.0) * (1.25 * 19.0 + 7.0) as f64).ceil() as usize);
         assert!(dfr_epilogue_frames(121, 1, 768, 512).unwrap() < dfr_frames(121, 1).unwrap());
+        // As the web form counts them (`dfrEpilogueFrames`): 15, 18, and at
+        // 96 fps and 1536×1024, 14.
+        assert_eq!((dfr_epilogue_frames(121, 0, 768, 512).unwrap(), dfr_epilogue_frames(121, 1, 768, 512).unwrap(), dfr_epilogue_frames(121, 2, 1536, 1024).unwrap()), (15, 18, 14));
     }
 
     /// DFR's largest call: stage 2 for a clip at its own rate and at twice

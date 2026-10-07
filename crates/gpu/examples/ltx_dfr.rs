@@ -159,6 +159,7 @@ fn main() -> Res<()> {
             frames: canvas.frames,
             fps,
         };
+        let mut after_one = None;
         for r in 1..=rounds {
             let t = Instant::now();
             let seams: Vec<usize> = clip.positions.iter().map(|p| 2 * p).collect();
@@ -178,6 +179,21 @@ fn main() -> Res<()> {
             let k = w("keyframes")?;
             eprintln!("   round {r}: video {:5.1} dB, new keyframes {:5.1} dB, carried {:5.1} dB", db(&clip.video, &w("video")?)?, db(&pick(&clip.keyframes, true)?, &pick(&k, true)?)?,
                       db(&pick(&clip.keyframes, false)?, &pick(&k, false)?)?);
+            if r == 1 {
+                after_one = Some((ltx_dfr::Clip { video: clip.video.clone(), keyframes: clip.keyframes.clone(), positions: clip.positions.clone(), frames: clip.frames, fps: clip.fps }, seams.clone()));
+            }
+        }
+        // The spatial epilogue, on the first round's clip, with the
+        // keyframes and the opening frame the reference was given, and the
+        // tiles' weights as it sums them.
+        if let (Some((clip, seams)), Ok(theirs)) = (&after_one, get(&want, "epilogue_video")) {
+            let t = Instant::now();
+            let spatial = ltx_upsample::Upsampler::load(&up_path, &vae, device, DType::F32)?;
+            let (keyframes, opening) = (get(&want, "epilogue_keyframes")?, get(&want, "epilogue_opening")?);
+            let with = ltx_dfr::Epilogue { keyframes: &keyframes, opening: Some(&opening), seams, windows: 2, normalised: false };
+            let got = ltx_dfr::epilogue(second, &ctx, &spatial, clip, &with, downscale, &one.audio, canvas.frames as f64 / fps, None, &mut replay, &mut |_, _, _, _, _| Ok(()))?;
+            device.synchronize()?;
+            eprintln!("   epilogue in {:.2} s: {:?}, video {:5.1} dB", t.elapsed().as_secs_f64(), got.dims(), db(&got, &theirs)?);
         }
         if drawn != want.keys().filter(|k| k.starts_with("noise_")).count() {
             return Err(format!("{drawn} draws used of the reference's {}", want.keys().filter(|k| k.starts_with("noise_")).count()).into());
@@ -199,6 +215,39 @@ fn main() -> Res<()> {
                 eprintln!("   round {r}: video {:5.1} dB, keyframes {:5.1} dB", d(&format!("round_{r}_video"))?, d(&format!("round_{r}_keyframes"))?);
             }
         }
+    }
+    // 4. Only when asked for, the epilogue alone in f32: from the
+    // reference's own first round, so that one DiT is loaded and nothing
+    // before the epilogue is run. Half step 2's memory, for a busy machine.
+    if only == Some(4) {
+        let lora = detailing.as_ref().ok_or("--only 4 wants --detailing, the DiT the epilogue runs")?;
+        let (device, dtype) = (Device::Cpu, DType::F32);
+        let w = |k: &str| get(&want, k);
+        let ctx = Contexts { video: contexts[0].clone(), audio: contexts[1].clone() };
+        let t = Instant::now();
+        let dit = Dit::load_as(&path, Some((lora, ltx_dfr::DETAILING_STRENGTH as f64)), "transformer-check", &device, dtype, Some(blocks), None, &mut |_| {})?;
+        eprintln!("4. the epilogue alone, f32 on the CPU: {:.2} B parameters in {:.1} s", dit.params() as f64 / 1e9, t.elapsed().as_secs_f64());
+        // Its draws are the last sixteen: two windows of two phases, each
+        // noised and stepped once with noise.
+        let total = want.keys().filter(|k| k.starts_with("noise_")).count();
+        let mut drawn = total - 16;
+        let mut replay = |dims: &[usize]| -> Res<Vec<f32>> {
+            let n = w(&format!("noise_{drawn}"))?.flatten_all()?.to_vec1::<f32>()?;
+            drawn += 1;
+            match n.len() == dims.iter().product::<usize>() {
+                true => Ok(n),
+                false => Err(format!("draw {} is {} numbers, where {dims:?} were asked", drawn - 1, n.len()).into()),
+            }
+        };
+        let positions: Vec<usize> = w("round_1_positions")?.to_vec1::<f32>()?.iter().map(|&p| p as usize).collect();
+        let clip = ltx_dfr::Clip { video: w("round_1_video")?, keyframes: w("round_1_keyframes")?, positions, frames: 2 * (canvas.frames - 1) + 1, fps: 2.0 * fps };
+        let seams: Vec<usize> = canvas.keyframes.iter().map(|p| 2 * p).collect();
+        let spatial = ltx_upsample::Upsampler::load(&up_path, &vae, &device, DType::F32)?;
+        let (keyframes, opening) = (w("epilogue_keyframes")?, w("epilogue_opening")?);
+        let with = ltx_dfr::Epilogue { keyframes: &keyframes, opening: Some(&opening), seams: &seams, windows: 2, normalised: false };
+        let t = Instant::now();
+        let got = ltx_dfr::epilogue(&dit, &ctx, &spatial, &clip, &with, downscale, &w("stage_1_audio")?, canvas.frames as f64 / fps, None, &mut replay, &mut |_, _, _, _, _| Ok(()))?;
+        eprintln!("   epilogue in {:.2} s: {:?}, video {:5.1} dB; {} of {total} draws used", t.elapsed().as_secs_f64(), got.dims(), db(&got, &w("epilogue_video")?)?, drawn);
     }
     Ok(())
 }

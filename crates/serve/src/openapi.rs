@@ -527,6 +527,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       LoRA is gated on Hugging Face: its first request fetches it, and \
                       is a 400 naming the page whose terms to accept when the server's \
                       token may not. `kvad.pipeline` says which made a video.\n\n\
+                      `epilogue: true` ends DFR with its spatial epilogue, for sizes \
+                      its second stage could not hold whole: the clip is made at half \
+                      the width and height, the first stage at a quarter, and then \
+                      upsampled once more and detailed in overlapping spatial tiles at \
+                      the size asked for. It makes the request DFR's, wants the width \
+                      and height to be multiples of 128, and takes several times as \
+                      long. `kvad.epilogue` says whether a video had it.\n\n\
                       `loras`, kvad's own, is `[{name, scale}]`, in a form as that list \
                       in JSON text: LoRAs to apply to every DiT the video's pipeline \
                       runs, at most 4, each by the name it was pulled by and a `scale` of \
@@ -545,7 +552,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       engine that makes it answers nothing else meanwhile.",
         query: &[], body: json_body("`{ prompt, model?, size?, seconds?, frames?, fps?, seed?, \
                                      audio?, input_reference?, steps?, guidance_scale?, \
-                                     negative_prompt?, decoder?, pipeline?, loras? }`, or the same fields as \
+                                     negative_prompt?, decoder?, pipeline?, epilogue?, loras? }`, or the same fields as \
                                      `multipart/form-data`, with `input_reference` a file."),
         produces: JSON, events: &[],
     },

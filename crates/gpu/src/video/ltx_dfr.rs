@@ -1,6 +1,6 @@
 //! DFR, LTX-2.5's "Diffusion Fidelity Rendering" (the reference's
-//! `dfr_pipeline.py`): its canvas, its first two stages, and its temporal
-//! rounds.
+//! `dfr_pipeline.py`): its canvas, its first two stages, its temporal
+//! rounds, and its spatial epilogue ([`epilogue`], which has its own notes).
 //!
 //! DFR is the reference's two stages with keyframes in them. The clip is
 //! padded to a whole number of *segments*, 24 or 32 pixel frames, whichever
@@ -43,8 +43,8 @@
 //!
 //! Stages 1 and 2 were plain Euler until the reference's 1.4.0 made them
 //! ancestral on LTX-2.5's checkpoints, with the distilled pipeline's stage
-//! 2. Its spatial epilogue, ancestral as well, is not made here. The
-//! temporal rounds stay at η 0.5.
+//! 2, and its spatial epilogue, which is ancestral here too. The temporal
+//! rounds stay at η 0.5.
 //!
 //! **The temporal rounds.** Each doubles the frames, `F` latent frames to
 //! `2F − 1` and `N` pixel frames to `2(N − 1) + 1`, and the frame rate with
@@ -83,7 +83,8 @@
 use super::ltx_cond::{bf16, lerp, State};
 pub use kvad::video::{dfr_canvas as canvas, dfr_tiles as tiles, DfrCanvas as Canvas, DfrTile as Tile, DFR_SEGMENTS as SEGMENTS};
 use super::ltx_dit::{audio_latent, audio_tokens, video_latent, video_tokens, Dit, Shape};
-use super::ltx_sample::{euler, Ancestral, OnStep, STAGE_1, STAGE_2};
+use super::ltx_sample::{euler, Ancestral, OnStep, ETA, STAGE_1, STAGE_2};
+use super::ltx_tile::Tiling;
 use super::ltx_upsample::Upsampler;
 use super::ltx_text::Contexts;
 use candle_core::{DType, Device, Tensor};
@@ -160,7 +161,14 @@ pub struct Sound<'a> {
 /// `sound`: the reference's `euler_denoising_loop`, or its
 /// `euler_ancestral_denoising_loop`, as `steps` says. See the module notes;
 /// `step` hears each step with the prediction of the video's own tokens.
-pub fn stage(dit: &Dit, ctx: &Contexts, state: &State, sound: &Sound<'_>, sigmas: &[f32], mut steps: Steps<'_>, step: OnStep<'_>) -> Res<Staged> {
+///
+/// With `tiling`, each step's prediction is made over spatial tiles and
+/// blended (`ltx_tile`): the reference's `TiledDiffusionModel` about its
+/// `X0Model`, as DFR's spatial epilogue runs. The latent is still one, and
+/// stepped once.
+#[allow(clippy::too_many_arguments)]
+pub fn stage(dit: &Dit, ctx: &Contexts, state: &State, sound: &Sound<'_>, sigmas: &[f32], mut steps: Steps<'_>, tiling: Option<Tiling>, step: OnStep<'_>)
+ -> Res<Staged> {
     let (dev, keep) = (dit.device(), dit.dtype());
     let (n, na) = (state.len(), sound.shape.audio_latents());
     if sound.tokens.len() != na * C {
@@ -176,17 +184,61 @@ pub fn stage(dit: &Dit, ctx: &Contexts, state: &State, sound: &Sound<'_>, sigmas
     let mask = column(state.mask.clone())?;
     let rest = column(state.mask.iter().map(|m| 1.0 - m).collect())?;
     let blend = |x: &Tensor| -> candle_core::Result<Tensor> { x.broadcast_mul(&mask)? + clean.broadcast_mul(&rest)? };
-    let grid = dit.grid_at(state.shape, state.positions.clone(), &state.marks, sound.shape.audio_positions())?;
+    // One grid for the whole state, or each tile's tokens: which, where,
+    // and their weights. A tile's grid is built at each call and dropped,
+    // sixteen of them being several GB of rotary tables.
+    let whole = match tiling {
+        None => Some(dit.grid_at(state.shape, state.positions.clone(), &state.marks, sound.shape.audio_positions())?),
+        Some(_) => None,
+    };
+    let pieces = match tiling {
+        None => Vec::new(),
+        Some(t) => {
+            let (rows, cols) = state.shape.grid();
+            t.pieces(state.shape.latent_frames(), rows, cols, &state.positions, &state.reach)?
+        }
+    };
     for i in 0..sigmas.len() - 1 {
         let (s, next) = (sigmas[i], sigmas[i + 1]);
         let audio_sigma = if sound.frozen { 0.0 } else { s };
-        let (vv, va) = dit.forward_masked(&xv, &xa, (s, audio_sigma), &state.mask, ctx, &grid)?;
-        // Each token's σ, `m · σ` in f32 as the reference's timesteps; the
-        // prediction rounded, as its `X0Model` rounds it, then blended in f32.
-        let sigma = column(state.mask.iter().map(|m| m * s).collect())?;
-        let x0 = blend(&f(&(f(&xv)? - f(&vv)?.broadcast_mul(&sigma)?)?.to_dtype(keep)?)?)?;
-        // The sound's mask is 1, or 0 when frozen, when it stays as it is.
-        let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
+        // The predictions of the clean latents, in the latents' dtype as
+        // the reference's `X0Model` rounds them. Each token's σ is `m · σ`
+        // in f32, as the reference's timesteps.
+        let (x0, x0a) = match &whole {
+            Some(grid) => {
+                let (vv, va) = dit.forward_masked(&xv, &xa, (s, audio_sigma), &state.mask, ctx, grid)?;
+                let sigma = column(state.mask.iter().map(|m| m * s).collect())?;
+                ((f(&xv)? - f(&vv)?.broadcast_mul(&sigma)?)?.to_dtype(keep)?, (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?)
+            }
+            None => {
+                // Summed on the host, a tile's tokens being scattered
+                // through the state: each tile's prediction times its
+                // weights, and the sound's averaged, every tile having
+                // heard all of it.
+                let (mut sum, mut sum_a) = (vec![0f32; n * C], vec![0f32; na * C]);
+                for p in &pieces {
+                    let k = p.tokens.len();
+                    let at = Tensor::from_slice(&p.tokens, k, dev)?;
+                    let x = xv.index_select(&at, 0)?;
+                    let masks: Vec<f32> = p.tokens.iter().map(|&t| state.mask[t as usize]).collect();
+                    let marks: Vec<bool> = p.tokens.iter().map(|&t| state.marks[t as usize]).collect();
+                    let grid = dit.grid_at(state.shape, p.positions.clone(), &marks, sound.shape.audio_positions())?;
+                    let (vv, va) = dit.forward_masked(&x, &xa, (s, audio_sigma), &masks, ctx, &grid)?;
+                    let sigma = Tensor::from_vec(masks.iter().map(|m| m * s).collect::<Vec<f32>>(), (k, 1), dev)?;
+                    let part = host(&(f(&x)? - f(&vv)?.broadcast_mul(&sigma)?)?.to_dtype(keep)?)?;
+                    for (j, &t) in p.tokens.iter().enumerate() {
+                        let (to, w) = (t as usize * C, p.weights[j]);
+                        sum[to..to + C].iter_mut().zip(&part[j * C..(j + 1) * C]).for_each(|(a, b)| *a += w * b);
+                    }
+                    let part = host(&(f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?)?;
+                    sum_a.iter_mut().zip(&part).for_each(|(a, b)| *a += b / pieces.len() as f32);
+                }
+                (upload(&sum, n)?, upload(&sum_a, na)?)
+            }
+        };
+        // Blended towards the clean latents in f32. The sound's mask is 1,
+        // or 0 when frozen, when it stays as it is.
+        let x0 = blend(&f(&x0)?)?;
         let look = x0.to_dtype(keep)?;
         match &mut steps {
             Steps::Euler => {
@@ -279,7 +331,7 @@ pub fn first(dit: &Dit, ctx: &Contexts, shape: Shape, sound: Shape, keyframes: &
     let state = state.noised(&drawn(noise(&[len, C])?, dt), STAGE_1[0])?;
     let na = sound.audio_latents();
     let audio = noised(&vec![0.0; na * C], &drawn(noise(&[na, C])?, dt), STAGE_1[0])?;
-    stage(dit, ctx, &state, &Sound { tokens: &audio, shape: sound, frozen: false }, &STAGE_1, Steps::at(eta, noise), step)
+    stage(dit, ctx, &state, &Sound { tokens: &audio, shape: sound, frozen: false }, &STAGE_1, Steps::at(eta, noise), None, step)
 }
 
 /// What DFR's stage 2 starts from: stage 1's video, upsampled and as it
@@ -309,7 +361,7 @@ pub fn second(dit: &Dit, ctx: &Contexts, shape: Shape, sound: Shape, keyframes: 
     let state = state.noised(&drawn(noise(&[len, C])?, dt), STAGE_2[0])?;
     let tokens = host(&audio_tokens(&kept(from.audio, dt)?)?)?;
     let audio = noised(&tokens, &drawn(noise(&[tokens.len() / C, C])?, dt), STAGE_2[0])?;
-    stage(dit, ctx, &state, &Sound { tokens: &audio, shape: sound, frozen: false }, &STAGE_2, Steps::at(eta, noise), step)
+    stage(dit, ctx, &state, &Sound { tokens: &audio, shape: sound, frozen: false }, &STAGE_2, Steps::at(eta, noise), None, step)
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +518,7 @@ pub fn round(
         noise(&[sound_shape.audio_latents(), C])?;
         let steps = Steps::Ancestral { eta: TEMPORAL_ETA, noise: &mut *noise };
         let n = plan.len();
-        let got = stage(dit, ctx, &state, &Sound { tokens: &tokens, shape: sound_shape, frozen: true }, TEMPORAL, steps, &mut |i, s, x| step(t, n, i, s, x))?;
+        let got = stage(dit, ctx, &state, &Sound { tokens: &tokens, shape: sound_shape, frozen: true }, TEMPORAL, steps, None, &mut |i, s, x| step(t, n, i, s, x))?;
         kept_video.push(got.video.narrow(1, tile.pinned, got.video.dim(1)? - tile.pinned)?);
         if let Some(k) = got.keyframes {
             for (j, &p) in tile.slots.iter().enumerate() {
@@ -486,6 +538,173 @@ pub fn round(
         frames,
         fps,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The spatial epilogue
+// ---------------------------------------------------------------------------
+
+/// How strongly the epilogue holds its keyframes: `EPILOGUE_KEYFRAME_STRENGTH`.
+pub const EPILOGUE_STRENGTH: f32 = 1.0;
+/// Its tiles each way, for the first step and for the rest, and their
+/// overlap in latent cells: `EPILOGUE_SPATIAL_COARSE_TILES`, `_TILES` and
+/// `_OVERLAP`.
+pub const EPILOGUE_TILES: (usize, usize) = (2, 4);
+pub const EPILOGUE_OVERLAP: usize = 10;
+
+/// What the epilogue is given beside the clip it details.
+pub struct Epilogue<'a> {
+    /// The clip's keyframes at the epilogue's size, `[128, K, H, W]`, at
+    /// the clip's `positions`: each decoded, stretched ×2 and encoded
+    /// again, the reference's `_rebuild_epilogue_keyframes`.
+    pub keyframes: &'a Tensor,
+    /// The clip's first frame made the same way, `[128, 1, H, W]`, for a
+    /// clip that starts from no picture.
+    pub opening: Option<&'a Tensor>,
+    /// The last temporal round's seams, in the clip's pixel frames, and how
+    /// many windows to cut the clip into at them, `2^rounds`. No seams, a
+    /// clip that had no round, is one window: the reference's own plan
+    /// fails there, on a canvas of no segments.
+    pub seams: &'a [usize],
+    pub windows: usize,
+    /// Whether the tiles' weights are divided by their sum; see `ltx_tile`.
+    pub normalised: bool,
+}
+
+/// DFR's spatial epilogue, the reference's `run_spatial_epilogue` after its
+/// keyframes are rebuilt: `clip` is a finished clip at half the size
+/// wanted, and what comes back is its latent at the full size, `[128, F,
+/// 2h, 2w]`.
+///
+/// The video is upsampled ×2 by `up`, the spatial upsampler, and detailed
+/// by stage 2's three steps with `dit`, the one with the detailing LoRA
+/// fused in: the first step's prediction in 2 × 2 spatial tiles and the
+/// other two's in 4 × 4 (`ltx_tile`), so that the DiT never sees a frame
+/// larger than it knows. The clip as it came is beside it as a reference
+/// latent `downscale` times smaller, and every keyframe is held at strength
+/// 1, with the opening frame when there is no picture.
+///
+/// In time it goes in windows cut at the last round's seams, as that
+/// round's tiles were (see the module notes): a window after the first
+/// starts on the last keyframe before its seam and is given the frames from
+/// there to the seam as the window before left them. A window's two phases
+/// are two stages: the first noises it to stage 2's first level, and the
+/// second starts from the first's answer with no noise added, though noise
+/// is drawn for it as the reference draws it.
+///
+/// `sound`, `duration`, `still`, `noise` and `step` are as for [`round`]:
+/// the sound is stage 1's, frozen; `still` is the picture at the full size.
+#[allow(clippy::too_many_arguments)]
+pub fn epilogue(
+    dit: &Dit,
+    ctx: &Contexts,
+    up: &Upsampler,
+    clip: &Clip,
+    with: &Epilogue<'_>,
+    downscale: usize,
+    sound: &Tensor,
+    duration: f64,
+    still: Option<&Tensor>,
+    noise: Noise<'_>,
+    step: OnTile<'_>,
+) -> Res<Tensor> {
+    if up.temporal() {
+        return Err("the spatial epilogue wants the spatial upsampler".into());
+    }
+    let (dev, dt) = (dit.device(), dit.dtype());
+    let guide = clip.video.to_device(dev)?.to_dtype(DType::F32)?;
+    let video = up.forward(&guide)?;
+    let (_, cells, rows, cols) = video.dims4()?;
+    if with.keyframes.dims() != [C, clip.positions.len(), rows, cols] || with.opening.is_some_and(|o| o.dims() != [C, 1, rows, cols]) {
+        return Err(format!("keyframes {:?} for {} at {rows}×{cols} latents", with.keyframes.dims(), clip.positions.len()).into());
+    }
+    let cond = conditioning_fps(clip.fps);
+    let plan = match with.seams {
+        [] => vec![Tile { start: 0, end: cells, pinned: 0, pixel_start: 0, pixel_end: clip.frames - 1, anchors: Vec::new(), slots: Vec::new() }],
+        seams => tiles(seams, clip.frames, with.windows)?,
+    };
+    let plane = |p: usize| -> Res<Tensor> {
+        let k = clip.positions.iter().position(|&q| q == p).ok_or("a window that starts on no keyframe")?;
+        Ok(with.keyframes.narrow(1, k, 1)?)
+    };
+    let mut kept_video = Vec::with_capacity(plan.len());
+    let mut before: Option<(usize, Tensor)> = None;
+    for (t, tile) in plan.iter().enumerate() {
+        // Where the window starts: the last keyframe before its seam, of
+        // all the clip has, and the frame after the seam is its own first.
+        let (origin, resume, pinned) = match tile.start {
+            0 => (0, 0, 0),
+            start => {
+                let seam = (start - 1) * 8;
+                let key = clip.positions.iter().copied().filter(|&p| p < seam && p % 8 == 0).max().ok_or_else(|| format!("no keyframe before the seam at {seam}"))?;
+                (key, seam + 1, 1 + (seam - key) / 8)
+            }
+        };
+        let first = if pinned > 0 { origin / 8 + 1 } else { tile.start };
+        let run = video.narrow(1, first, tile.end - first)?.to_device(&Device::Cpu)?;
+        let part = match pinned {
+            0 => kept(&run, dt)?,
+            _ => kept(&Tensor::cat(&[&plane(origin)?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?, &run], 1)?, dt)?,
+        };
+        let local = part.dim(1)?;
+        // The clip as it came, over the same frames: under the plane, the
+        // frame the keyframe is at.
+        let reference = kept(&guide.narrow(1, if pinned > 0 { first - 1 } else { first }, local)?, dt)?;
+        let shape = Shape::new(32 * cols, 32 * rows, 8 * (local - 1) + 1, cond)?;
+        let given = match (pinned, &before) {
+            (0, _) => None,
+            (_, None) => return Err("a window with frames to be given and none before it".into()),
+            (_, Some((base, made))) => {
+                let at = first.checked_sub(*base).filter(|at| at + pinned - 1 <= made.dim(1).unwrap_or(0)).ok_or("a window's pinned frames fall outside the window before")?;
+                Some(video_tokens(&Tensor::cat(&[&part.narrow(1, 0, 1)?, &kept(&made.narrow(1, at, pinned - 1)?, dt)?], 1)?)?)
+            }
+        };
+        // The window's state about a latent: the reference's conditionings
+        // in its order, the same for both phases.
+        let build = |latent: &Tensor| -> Res<State> {
+            let mut state = State::video(latent, shape)?;
+            if let (Some(s), 0) = (still, pinned) {
+                state = state.held(&kept(s, dt)?)?;
+            }
+            for (k, &p) in clip.positions.iter().enumerate() {
+                if origin <= p && p <= tile.pixel_end && p >= resume {
+                    state = state.anchor(&with.keyframes.narrow(1, k, 1)?, p - origin, EPILOGUE_STRENGTH)?;
+                }
+            }
+            if let (Some(o), 0) = (with.opening, pinned) {
+                state = state.anchor(o, 0, EPILOGUE_STRENGTH)?;
+            }
+            state = state.reference(&reference, downscale, 1.0)?;
+            match &given {
+                Some(g) => state.held(g),
+                None => Ok(state),
+            }
+        };
+        let sound_shape = shape;
+        let tokens = host(&audio_tokens(&tile_sound(sound, origin, shape.frames, clip.fps, duration, cond, dt)?)?)?;
+        let frozen = Sound { tokens: &tokens, shape: sound_shape, frozen: true };
+        let n = plan.len();
+        let tiling = |count: usize| Some(Tiling { count, overlap: EPILOGUE_OVERLAP, normalised: with.normalised });
+        // The first step, noised to stage 2's first level; then the rest
+        // from its answer, the noise drawn and not added.
+        let mut phase = |latent: &Tensor, scale: f32, sigmas: &[f32], count: usize, from: usize| -> Res<Staged> {
+            let state = build(latent)?;
+            let len = state.len();
+            let state = state.noised(&drawn(noise(&[len, C])?, dt), scale)?;
+            noise(&[sound_shape.audio_latents(), C])?;
+            let steps = Steps::Ancestral { eta: ETA, noise: &mut *noise };
+            stage(dit, ctx, &state, &frozen, sigmas, steps, tiling(count), &mut |i, s, x| step(t, n, from + i, s, x))
+        };
+        let coarse = phase(&part, STAGE_2[0], &STAGE_2[..2], EPILOGUE_TILES.0, 0)?;
+        let fine = phase(&kept(&coarse.video, dt)?, 0.0, &STAGE_2[1..], EPILOGUE_TILES.1, 1)?;
+        kept_video.push(fine.video.narrow(1, pinned, local - pinned)?);
+        before = Some((if pinned > 0 { first - 1 } else { tile.start }, fine.video));
+    }
+    let video = Tensor::cat(&kept_video, 1)?;
+    if video.dim(1)? != cells {
+        return Err(format!("the epilogue's windows stitched to {} latent frames, not {cells}", video.dim(1)?).into());
+    }
+    Ok(video)
 }
 
 #[cfg(test)]

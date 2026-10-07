@@ -171,6 +171,8 @@ pub struct Stored {
     /// The pipeline that made it, `fast` or `dfr`, where the model has a
     /// choice and the request was not guided.
     pub pipeline: Option<String>,
+    /// Whether DFR ended with its spatial epilogue.
+    pub epilogue: bool,
     /// The LoRAs that made it, each at its strength; none for most.
     pub loras: Vec<kvad::image::Lora>,
 }
@@ -179,7 +181,7 @@ const COLUMNS: &str = "id, model, backend, prompt, width, height, frames, fps, s
                        phase, error, bytes, encode_secs, denoise_secs, decode_secs, created_at, \
                        CAST(strftime('%s', created_at) AS INTEGER), \
                        CAST(strftime('%s', started_at) AS INTEGER), CAST(strftime('%s', completed_at) AS INTEGER), \
-                       picture, chosen, steps, guidance, negative_prompt, decoder, pipeline, loras";
+                       picture, chosen, steps, guidance, negative_prompt, decoder, pipeline, loras, epilogue";
 
 fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
     Ok(Stored {
@@ -214,6 +216,7 @@ fn stored_from(r: &Row<'_>) -> rusqlite::Result<Stored> {
         pipeline: r.get(28)?,
         // Written by `queue` only, so JSON it can read.
         loras: r.get::<_, Option<String>>(29)?.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
+        epilogue: r.get::<_, i64>(30)? != 0,
     })
 }
 
@@ -277,6 +280,9 @@ impl Stored {
                 // Which pipeline made it: `fast`, or `dfr`, which also makes
                 // more than 30 fps; null for a guided video, or a model with one.
                 "pipeline": self.pipeline,
+                // Whether DFR made it at half the size and ended with its
+                // spatial epilogue.
+                "epilogue": self.epilogue,
                 "loras": self.loras,
                 "fps": self.fps,
                 "seed": self.seed,
@@ -323,8 +329,8 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
     let id = db.with(|c| {
         c.execute(
             "INSERT INTO videos (owner, model, backend, prompt, width, height, frames, fps, seed, audio, picture, chosen, \
-             steps, guidance, negative_prompt, decoder, pipeline, loras) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             steps, guidance, negative_prompt, decoder, pipeline, loras, epilogue) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 owner,
                 model,
@@ -343,7 +349,8 @@ pub fn queue(db: &Db, owner: Option<i64>, model: &str, backend: &str, r: &kvad::
                 r.guided.as_ref().and_then(|g| g.negative_prompt.clone()),
                 r.decoder.map(|d| d.as_str()),
                 r.pipeline.map(|p| p.as_str()),
-                (!r.loras.is_empty()).then(|| serde_json::to_string(&r.loras).unwrap_or_default())
+                (!r.loras.is_empty()).then(|| serde_json::to_string(&r.loras).unwrap_or_default()),
+                r.epilogue as i64
             ],
         )?;
         Ok(c.last_insert_rowid())
@@ -846,6 +853,8 @@ impl Asked {
                 // Above 30 fps a model with DFR runs it without being asked;
                 // one without refuses this by name.
                 pipeline: f.text(&["pipeline"]).map(|p| kvad::video::Pipeline::parse(&p)).transpose().map_err(|e| Fail::bad(e.to_string()))?,
+                // DFR's spatial epilogue, which makes the request DFR's.
+                epilogue: f.flag("epilogue")?,
                 loras: f.loras()?,
             },
             seconds,
@@ -1318,7 +1327,7 @@ mod tests {
     use kvad::video::{Audio, Resolved, Video};
 
     fn resolved(seed: u64) -> Resolved {
-        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, guided: None, decoder: None, pipeline: None, rounds: 0, fps: 24, seed, audio: true, loras: Vec::new() }
+        Resolved { prompt: "a red and a blue pixel".into(), width: 2, height: 2, frames: 3, chosen: false, guided: None, decoder: None, pipeline: None, rounds: 0, epilogue: false, fps: 24, seed, audio: true, loras: Vec::new() }
     }
 
     /// The LoRAs that made a video are kept with it, and one made without

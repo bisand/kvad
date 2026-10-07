@@ -959,9 +959,10 @@ def transformer(path, out, contexts, blocks, lora=None, guided=False, conditione
         the temporal upsampler, then two of its `run_one_temporal_round` on
         stage 2's answer: 97 frames at 96 fps in two tiles, then 193 at 192
         in four, each tile four ancestral steps at η 0.5 with its seams held
-        and the sound frozen. The noise every stage and step draws is saved
-        in the order it was drawn, and replayed in `replay`'s place when
-        given.
+        and the sound frozen; and then the spatial epilogue on the first
+        round's clip, for which see below. The noise every stage and step
+        draws is saved in the order it was drawn, and replayed in `replay`'s
+        place when given.
 
         Two departures. The ancestral loops keep their latents in the run's
         dtype, where DFR leaves them in its default bf16, so that the f32
@@ -970,7 +971,6 @@ def transformer(path, out, contexts, blocks, lora=None, guided=False, conditione
         import contextlib
         import sys
         import types
-        from functools import partial
         from types import SimpleNamespace
 
         # The pipelines' media reader, which nothing here reads with.
@@ -983,12 +983,9 @@ def transformer(path, out, contexts, blocks, lora=None, guided=False, conditione
         from ltx_core.types import VIDEO_SCALE_FACTORS
         from ltx_pipelines import dfr_stages
         from ltx_pipelines.dfr_helpers.layout import resolve_canvas
-        from ltx_pipelines.distilled import (
-            ANCESTRAL_ETA,
-            ANCESTRAL_NOISE_SEED_OFFSET,
-            ANCESTRAL_S_NOISE,
-            ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
-        )
+        from ltx_pipelines import distilled
+        from ltx_pipelines.distilled import ANCESTRAL_NOISE_SEED_OFFSET, ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET, ancestral_sampler_kwargs
+        from ltx_pipelines.dfr_pipeline import _EPILOGUE_ANCESTRAL_NOISE_SEED_OFFSET
         from ltx_pipelines.utils.blocks import DiffusionStage
         from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, STAGE_2_DISTILLED_SIGMAS
         from ltx_pipelines.utils.samplers import euler_ancestral_denoising_loop
@@ -1030,25 +1027,28 @@ def transformer(path, out, contexts, blocks, lora=None, guided=False, conditione
         pictures = lambda make: make(None)
 
         drawn = []
-        noiser = GaussianNoiser(torch.Generator(device).manual_seed(5))
-        own = noiser._sample_noise
-        def sample(state):
-            n = own(state) if replay is None else replay[len(drawn)].to(state.latent.device, state.latent.dtype)[None]
-            drawn.append(n[0].float().cpu().contiguous())
-            return n
-        noiser._sample_noise = sample
+        class Noiser(GaussianNoiser):
+            """The reference's noiser, its noise drawn or replayed, and saved."""
+            def _sample_noise(self, state):
+                n = super()._sample_noise(state) if replay is None else replay[len(drawn)].to(state.latent.device, state.latent.dtype)[None]
+                drawn.append(n[0].float().cpu().contiguous())
+                return n
+        noiser = Noiser(torch.Generator(device).manual_seed(5))
+        # The epilogue makes a noiser of its own for every pass.
+        dfr_stages.GaussianNoiser = Noiser
         def draw(x, generator):
             """An ancestral loop's noise, drawn or replayed, and saved."""
             n = torch.randn(x.shape, generator=generator, dtype=x.dtype, device=x.device) if replay is None else replay[len(drawn)].to(x.device, x.dtype).reshape(x.shape)
             drawn.append(n[0].float().cpu().contiguous())
             return n
-        # The loop every pass here runs, the rounds' too, which name it
-        # themselves: with the noise above, and in the run's dtype.
+        # The loop every pass here runs, with the noise above and in the
+        # run's dtype: the rounds name it themselves, and the stages and the
+        # epilogue have it of the pipeline's `ancestral_sampler_kwargs`.
         ancestral = lambda *a, **k: euler_ancestral_denoising_loop(*a, **{**k, "new_noise_fn": draw, "model_dtype": dtype})
         dfr_stages.euler_ancestral_denoising_loop = ancestral
-        # `ancestral_sampler_kwargs`' loop, for a stage's one call.
+        distilled.euler_ancestral_denoising_loop = ancestral
         seed = 10
-        loop = lambda offset: partial(ancestral, noise_seed=seed + offset, eta=ANCESTRAL_ETA, s_noise=ANCESTRAL_S_NOISE)
+        loop = lambda offset: ancestral_sampler_kwargs(seed, dtype, offset)["loop"]
         vc, ac = ctx["video"].to(device, dtype)[None], ctx["audio"].to(device, dtype)[None]
         shape = lambda w, h, n, rate: VideoPixelShape(batch=1, frames=n, height=h, width=w, fps=rate)
         common = dict(image_conditioner=pictures, images=[], video_context=vc, audio_context=ac, noiser=noiser, device=dev, dtype=dtype)
@@ -1094,6 +1094,37 @@ def transformer(path, out, contexts, blocks, lora=None, guided=False, conditione
                     rounds[f"round_{round_idx}_positions"] = torch.tensor(list(keyframes), dtype=torch.float32)
                     keyframes = {p: k.to(torch.bfloat16) for p, k in keyframes.items()}
                     print(f"dit: DFR round {round_idx}, {2**round_idx} tiles, {canvas.frames} frames at {canvas.fps} fps, in {dtype} on {device}, {time.time() - t:.1f} s")
+                    if round_idx == 1:
+                        after_one = (video_state, dict(keyframes), list(seams), canvas)
+                # The spatial epilogue, on the first round's clip so that it
+                # is two windows and not four: `run_spatial_epilogue` after
+                # its keyframes are rebuilt, by its own window plan and
+                # `_run_epilogue_windows`, to 1024×640 in 2 × 2 tiles and
+                # then 4 × 4. The rebuilt keyframes and the opening frame,
+                # which the pipeline decodes, stretches and encodes, are the
+                # upsampler's here: any latents of the size serve, and they
+                # are saved. Rows of 20 cells in four tiles is a case where
+                # the reference's weights do not sum to 1 (to 1.09 here).
+                t = time.time()
+                video_state, keyframes, seams, canvas = after_one
+                guide = video_state.latent[:1]
+                wide = upsample_video(guide, enc, up)
+                planes = {p: upsample_video(k.to(dtype), enc, up).to(torch.bfloat16) for p, k in keyframes.items()}
+                opening = upsample_video(guide[:, :, :1], enc, up).to(torch.bfloat16)
+                windows, prefixes = dfr_stages._plan_epilogue_windows(
+                    n_latent_frames=wide.shape[2], last_window_seams=seams, keyframe_positions=keyframes, temporal_upscalings=1, temporal_scale=VIDEO_SCALE_FACTORS.time,
+                )
+                detailed = dfr_stages._run_epilogue_windows(
+                    stage=stage(sd2), latent=wide, guide=guide, windows=windows, prefixes=prefixes, window_images=[[] for _ in windows], keyframes=planes,
+                    opening_plane=opening, sigmas=STAGE_2_DISTILLED_SIGMAS, video_context=vc, audio_context=ac, audio_latent=audio_latent,
+                    source_duration=frames / fps, canvas=shape(2 * width, 2 * height, canvas.frames, canvas.fps), seed=seed, device=dev, dtype=dtype,
+                    downscale_factor=downscale, temporal_scale=VIDEO_SCALE_FACTORS.time, loop=loop(_EPILOGUE_ANCESTRAL_NOISE_SEED_OFFSET),
+                )
+                rounds["epilogue_upsampled"] = c(wide)
+                rounds["epilogue_keyframes"] = c(torch.cat([k.float() for k in planes.values()], dim=2))
+                rounds["epilogue_opening"] = c(opening.float())
+                rounds["epilogue_video"] = c(detailed)
+                print(f"dit: DFR's spatial epilogue, {len(windows)} windows at {2 * width}×{2 * height}, in {dtype} on {device}, {time.time() - t:.1f} s")
         return {
             "shape": torch.tensor([width, height, frames, fps]),
             "positions": torch.tensor(positions, dtype=torch.float32),

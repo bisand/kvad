@@ -1529,8 +1529,9 @@ every 10 dB is ten times less error power.
   `ltx_sample::ETA`, 1, for the distilled model, and 0 for the dev model's
   stage 2. Three steps are two that add noise and the prediction. Each
   draw has a stream of its own: 102 to 105 in `refine`, after the two that
-  re-noise, and the next of the request's counter in DFR. There is no
-  spatial epilogue here to change.
+  re-noise, and the next of the request's counter in DFR. There was no
+  spatial epilogue here to change; there is one now, below, and it is
+  ancestral.
 
   Before and after, on an M5 Pro at q8, 768×512 × 121 at 24 fps, same
   prompt and seed, from `ffmpeg -af astats`, a `showspectrumpic`
@@ -1637,6 +1638,75 @@ every 10 dB is ten times less error power.
   quicker to denoise, its second round's tiles having a segment less to
   carry; the two were made hours apart on a machine doing other things, so
   that is a rough figure. One prompt and seed, and none from a picture.
+- **The spatial epilogue**, the last of the reference's DFR that Kvad
+  lacked (`ltx_dfr::epilogue`, `ltx_tile`). A request's `epilogue: true`
+  has the clip made at half its width and height, stage 1 at a quarter,
+  rounds and all; then, as the reference's `run_spatial_epilogue`:
+  1. every keyframe, and the clip's first frame when it starts from no
+     picture, is decoded alone, stretched ×2 in RGB by Lanczos
+     (`ltx_vae::lanczos_x2`, Pillow's 8-bit resize to the bit) and encoded
+     again;
+  2. the video latent is upsampled ×2 by the spatial upsampler;
+  3. the DiT with the detailing LoRA takes stage 2's three ancestral steps
+     on it, the clip as it came beside it as a reference latent and the
+     keyframes held at strength 1. Each call is made over spatial tiles
+     that overlap by 10 latent cells and blended by trapezoidal ramps: the
+     first step in 2 × 2, the other two in 4 × 4. The DiT never sees a
+     frame larger than a tile, which is the point: sizes stage 2 could not
+     hold, or was not trained at.
+
+  In time it goes in windows cut at the last round's seams and chained as
+  the rounds' tiles are, a window starting on a keyframe and given the
+  frames before its seam.
+
+  Against the reference's `_plan_epilogue_windows` and
+  `_run_epilogue_windows` (1.4.2), on its own first round's clip, two
+  windows to 1024×640, the keyframes and the opening frame given to both
+  (the upsampler's, standing in for the rebuilt ones), every draw replayed,
+  the DiT cut to two blocks: **108.4 dB in f32** on the CPU, and 38.0 dB in
+  bf16 on Metal where the reference's own bf16 is 36.9
+  (`examples/ltx_dfr.rs`, and `--only 4` for the f32 epilogue alone).
+
+  Two things the reference does that Kvad does not:
+  - **Its tiles' weights do not always sum to 1**, and it does not divide
+    by them. A span shorter than twice the overlap is ramped from both
+    sides at once and reached by a third tile: with four tiles and an
+    overlap of 10, any side under 50 latent cells, 1600 pixels. Its own
+    `split_by_count` gives sums up to 1.074 at 32 cells and 1.008 at 48,
+    so a prediction up to 7% too large in bands (9% where rows and
+    columns both do it). Its VAE decoders check for this and divide; its
+    `VideoModalityTilingHelper.blend` does not. Kvad divides
+    (`Tiling::normalised`), which is the same wherever the sum is 1, and
+    keeps the reference's sums for the comparison above, whose rows of 20
+    cells are such a case.
+  - **Its epilogue fails on a clip with no temporal round**: the window
+    plan is made from the last round's seams, and none is a canvas of no
+    segments (`ValueError` from `split_at_seams`). So it runs at 48 fps
+    and above only. Kvad makes such a clip one window. Nothing checks
+    that case against a reference, there being none.
+
+  Admission counts the stages' and rounds' calls at a quarter of their
+  tokens and the epilogue's largest tile (`dfr_epilogue_frames`), which
+  for 121 frames at 768×512 is 15 latent frames of tokens at 24 fps and
+  18 at 48, under stage 2's 25 without it.
+
+  Through the service on an M5 Pro, q8, "a fox trots through fresh snow
+  towards the camera", seed 3, 768×512, 3 s, with the epilogue (stage 1 at
+  192×128, stage 2 at 384×256):
+
+  | | Denoise | Decode | Peak (`top`) |
+  |---|---|---|---|
+  | 145 frames at 48 fps, two windows | 486.7 s | 26.5 s | 25 GB |
+  | 73 frames at 24 fps, one window | 209.4 s | 12.5 s | 25 GB |
+
+  Both are coherent clips of a fox trotting, with no grid where the tiles
+  meet and, at 48 fps, no jump where the windows do (frame 96 to 97, 0.96×
+  the median change). **That is all that was run.** 768×512 is not what
+  the epilogue is for, and is a worse clip than DFR without it makes
+  there, its first stage being 192×128; the sizes it is for, 1536×1024 and
+  above, were not run, the machine having no memory free for their decode
+  that day. No clip from a picture was made. The web form has no switch
+  for it: it is the API's `epilogue` field.
 - **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
   6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
   profiling before two stages quadruple the tokens.

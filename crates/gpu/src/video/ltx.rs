@@ -582,11 +582,14 @@ struct DfrPlan {
     /// Each round's tiles' steps, and loading the plain DiT again for them.
     rounds: Vec<f64>,
     load_3: f64,
+    /// The spatial epilogue, its keyframes' rebuilding and its DiT's
+    /// loading with it; 0 without one.
+    epilogue: f64,
     decode: f64,
 }
 
 impl DfrPlan {
-    fn new(half: Shape, full: Shape, canvas: &ltx_dfr::Canvas, rounds: u32, picture: bool, decoder: Option<Decoder>) -> Self {
+    fn new(half: Shape, full: Shape, canvas: &ltx_dfr::Canvas, rounds: u32, epilogue: bool, picture: bool, decoder: Option<Decoder>) -> Self {
         let step = |tokens: usize| tokens as f64 * (1.386e-3 + 2.86e-8 * tokens as f64);
         let at_768 = (768 * 512 * 121) as f64;
         let keys = canvas.keyframes.len();
@@ -595,9 +598,11 @@ impl DfrPlan {
         let mut seams = canvas.keyframes.clone();
         let mut frames = canvas.frames;
         let mut round_secs = Vec::new();
+        let mut last = Vec::new();
         for r in 1..=rounds {
             frames = 2 * (frames - 1) + 1;
             let doubled: Vec<usize> = seams.iter().map(|p| 2 * p).collect();
+            last = doubled.clone();
             let tiles = ltx_dfr::tiles(&doubled, frames, 1 << r).unwrap_or_default();
             round_secs.push(tiles.iter().map(|t| step((t.cells() + t.anchors.len() + t.slots.len()) * full.frame_tokens()) * 4.0).sum());
             let mut next: Vec<usize> = doubled.iter().copied().chain(tiles.iter().flat_map(|t| t.slots.iter().copied())).collect();
@@ -605,7 +610,27 @@ impl DfrPlan {
             next.dedup();
             seams = next;
         }
-        let out = (full.width * full.height * frames) as f64;
+        // The epilogue, roughly: each window's first step in four calls of
+        // about 0.4 of its tokens and its other two in sixteen of about
+        // 0.16, at four times the stages' tokens a frame, the half-size clip
+        // and the keyframes beside; and a keyframe's rebuilding, 2 s.
+        let epilogue_secs = match epilogue {
+            false => 0.0,
+            true => {
+                let windows: Vec<usize> = match last.is_empty() {
+                    true => vec![(frames - 1) / 8 + 1],
+                    false => ltx_dfr::tiles(&last, frames, 1 << rounds).unwrap_or_default().iter().map(|t| t.cells()).collect(),
+                };
+                let per = |cells: usize| {
+                    let n = (1.25 * cells as f64 + cells as f64 / 3.0 + 1.0) * 4.0 * full.frame_tokens() as f64;
+                    4.0 * step((0.4 * n) as usize) + 32.0 * step((0.16 * n) as usize)
+                };
+                20.0 + 2.0 * (seams.len() + 1) as f64 + windows.iter().map(|&c| per(c)).sum::<f64>()
+            }
+        };
+        // The frames decoded are the clip's own, four times the stages'
+        // pixels after an epilogue.
+        let out = (full.width * full.height * frames) as f64 * if epilogue { 4.0 } else { 1.0 };
         DfrPlan {
             picture: if picture { 1.0 } else { 0.0 },
             text: 9.4,
@@ -616,6 +641,7 @@ impl DfrPlan {
             stage_2: step(full.video_tokens() + keys * full.frame_tokens() + half.video_tokens()),
             rounds: round_secs,
             load_3: if rounds > 0 { 5.0 } else { 0.0 },
+            epilogue: epilogue_secs,
             // As the fast decode's, and the keyframes' 8–21% more.
             decode: match decoder {
                 Some(Decoder::Diffusion) => 1.15 * 22.0 * out / at_768,
@@ -627,7 +653,7 @@ impl DfrPlan {
     fn total(&self) -> f64 {
         let s1 = (STAGE_1.len() - 1) as f64;
         let s2 = (STAGE_2.len() - 1) as f64;
-        self.picture + self.text + self.load + self.stage_1 * s1 + self.upsample + self.load_2 + self.stage_2 * s2 + self.load_3 + self.rounds.iter().sum::<f64>() + self.decode
+        self.picture + self.text + self.load + self.stage_1 * s1 + self.upsample + self.load_2 + self.stage_2 * s2 + self.load_3 + self.rounds.iter().sum::<f64>() + self.epilogue + self.decode
     }
 }
 
@@ -671,17 +697,23 @@ impl Ltx {
         let (mut base, base_fps) = r.base();
         let fps = base_fps as f64;
         let cond = ltx_dfr::conditioning_fps(fps);
+        // The size the stages and the rounds make: the clip's, or half of it
+        // each way when the epilogue is to make the rest.
+        let (sw, sh) = match r.epilogue {
+            true => (r.width / 2, r.height / 2),
+            false => (r.width, r.height),
+        };
         // Until the head has chosen, the canvas and plan are the longest.
         let shapes = |frames: usize| -> Res<(ltx_dfr::Canvas, Shape, Shape, Shape)> {
             let canvas = ltx_dfr::canvas(frames)?;
-            let half = Shape::new(r.width / 2, r.height / 2, canvas.frames, cond)?;
-            let full = Shape::new(r.width, r.height, canvas.frames, cond)?;
+            let half = Shape::new(sw / 2, sh / 2, canvas.frames, cond)?;
+            let full = Shape::new(sw, sh, canvas.frames, cond)?;
             // The sound as long as the canvas plays, at the rate it plays.
             let sound = Shape::new(r.width, r.height, canvas.frames, fps)?;
             Ok((canvas, half, full, sound))
         };
         let (mut canvas, mut half, mut full, mut sound) = shapes(base)?;
-        let mut plan = DfrPlan::new(half, full, &canvas, rounds, req.image.is_some(), r.decoder);
+        let mut plan = DfrPlan::new(half, full, &canvas, rounds, r.epilogue, req.image.is_some(), r.decoder);
         let total = std::cell::Cell::new(plan.total());
         let chosen = std::cell::Cell::new(None);
         let started = Instant::now();
@@ -713,15 +745,20 @@ impl Ltx {
                     let z = enc.encode(&ltx_vae::picture(&p.rgb, p.width, p.height, s.width, s.height)?.to_device(device)?)?;
                     Ok(video_tokens(&z)?.to_dtype(DType::F32)?)
                 };
-                let stills = (at(half)?, at(full)?);
+                // And at the clip's own size, for the epilogue.
+                let wide = match r.epilogue {
+                    true => Some(at(Shape::new(r.width, r.height, canvas.frames, cond)?)?),
+                    false => None,
+                };
+                let stills = (at(half)?, at(full)?, wide);
                 drop(enc);
                 settle(device)?;
                 Some(stills)
             }
         };
-        let (still_1, still_2) = match &stills {
-            Some((a, b)) => (Some(a), Some(b)),
-            None => (None, None),
+        let (still_1, still_2, still_3) = match &stills {
+            Some((a, b, c)) => (Some(a), Some(b), c.as_ref()),
+            None => (None, None, None),
         };
 
         // 1. The prompt, and the length the head chooses, at the first
@@ -734,7 +771,7 @@ impl Ltx {
             base = ltx_duration::frames_for(seconds, fps, (ltx_duration::MIN_SECONDS * fps).round() as usize, most);
             r.frames = (base - 1) * (1 << rounds) + 1;
             (canvas, half, full, sound) = shapes(base)?;
-            plan = DfrPlan::new(half, full, &canvas, rounds, req.image.is_some(), r.decoder);
+            plan = DfrPlan::new(half, full, &canvas, rounds, r.epilogue, req.image.is_some(), r.decoder);
             total.set(plan.total());
             chosen.set(Some(r.frames));
         }
@@ -793,6 +830,8 @@ impl Ltx {
             frames: canvas.frames,
             fps,
         };
+        // The last round's seams, which the epilogue cuts its windows at.
+        let mut last_seams: Vec<usize> = Vec::new();
         if let Some(temporal) = &temporal {
             let dit = self.adapted(Dit::load(&self.paths[1], device, dtype, None, quant, &mut quiet)?)?;
             let up = ltx_upsample::Upsampler::load(temporal, &self.paths[3], device, DType::F32)?;
@@ -801,7 +840,7 @@ impl Ltx {
             for round in 1..=rounds {
                 let phase = if round == 1 { "round 1" } else { "round 2" };
                 let secs = plan.rounds[round as usize - 1];
-                let (w, h) = (r.width, r.height);
+                let (w, h) = (sw, sh);
                 let mut step = |tile: usize, tiles: usize, i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
                     let steps = ltx_dfr::TEMPORAL.len() - 1;
                     let at = tile * steps + i + 1;
@@ -809,10 +848,77 @@ impl Ltx {
                     let look = preview(clean, Shape::new(w, h, 8 * (frames - 1) + 1, cond)?)?;
                     report(phase, at, tiles * steps, done + secs * at as f64 / (tiles * steps) as f64, Some(look))
                 };
+                last_seams = clip.positions.iter().map(|p| 2 * p).collect();
                 clip = ltx_dfr::round(&dit, &ctx, &up, &clip, round, &one.audio, duration, still_2, &mut noise, &mut step)?;
                 done += secs;
                 settle(device)?;
             }
+        }
+        // 5b. The spatial epilogue: the clip so far is half the size asked
+        // for, and this makes the rest.
+        if r.epilogue {
+            settle(device)?;
+            report("epilogue", 0, 1, done, None)?;
+            // The keyframes at the clip's own size: each decoded alone,
+            // stretched ×2 and encoded again, as the reference rebuilds
+            // them; and the opening frame the same way, when the clip
+            // starts from no picture.
+            let mut planes: Vec<Tensor> = (0..clip.positions.len()).map(|k| clip.keyframes.narrow(1, k, 1)).collect::<candle_core::Result<_>>()?;
+            if still_3.is_none() {
+                planes.push(clip.video.narrow(1, 0, 1)?);
+            }
+            let pictures: Vec<Tensor> = {
+                let own = |k: usize| crate::image::nn::stream(r.seed.wrapping_add(0xD0F0_0000_0000), 4000 + k as u64);
+                let decoded: Vec<Tensor> = match r.decoder {
+                    Some(Decoder::Diffusion) => {
+                        let dec = ltx_diffvae::DiffDecoder::load(&self.paths[5], device, dtype)?;
+                        planes.iter().enumerate().map(|(k, p)| Ok(dec.decode(&p.to_device(device)?, own(k), ltx_diffvae::BUDGET, &mut |_, _| Ok(()))?.0)).collect::<Res<_>>()?
+                    }
+                    _ => {
+                        let dec = ltx_vae::VideoDecoder::load(&self.paths[3], device, dtype)?;
+                        planes.iter().map(|p| Ok(dec.decode(&p.to_device(device)?)?.to_device(&Device::Cpu)?)).collect::<Res<_>>()?
+                    }
+                };
+                // To 8 bits, rounding half to even as numpy does; twice the
+                // size; and to `[−1, 1]` for the encoder.
+                decoded
+                    .iter()
+                    .map(|frame| -> Res<Tensor> {
+                        let x = frame.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.narrow(0, 0, 1)?.permute((0, 2, 3, 1))?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                        let rgb: Vec<u8> = x.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8).collect();
+                        let wide: Vec<f32> = ltx_vae::lanczos_x2(&rgb, sw, sh)?.iter().map(|&v| v as f32 / 255.0 * 2.0 - 1.0).collect();
+                        Ok(Tensor::from_vec(wide, (r.height, r.width, 3), &Device::Cpu)?.permute((2, 0, 1))?.contiguous()?)
+                    })
+                    .collect::<Res<_>>()?
+            };
+            settle(device)?;
+            let mut encoded: Vec<Tensor> = {
+                let enc = ltx_vae::VideoEncoder::load(&self.paths[3], device, dtype)?;
+                pictures.iter().map(|p| Ok(enc.encode(&p.to_device(device)?)?.to_device(&Device::Cpu)?)).collect::<Res<_>>()?
+            };
+            settle(device)?;
+            let opening = match still_3 {
+                None => encoded.pop(),
+                Some(_) => None,
+            };
+            let keyframes = Tensor::cat(&encoded, 1)?;
+            // The detailing DiT again, and the spatial upsampler.
+            let detailing = self.adapted(Dit::load_as(&self.paths[1], Some((&lora, ltx_dfr::DETAILING_STRENGTH as f64)), "transformer-detailing", device, dtype, None, quant, &mut quiet)?)?;
+            let up = ltx_upsample::Upsampler::load(&self.paths[2], &self.paths[3], device, DType::F32)?;
+            let with = ltx_dfr::Epilogue { keyframes: &keyframes, opening: opening.as_ref(), seams: &last_seams, windows: 1 << rounds, normalised: true };
+            let (wide, secs) = (Shape::new(r.width, r.height, 9, cond)?, plan.epilogue);
+            let play = ltx_dfr::conditioning_fps(clip.fps);
+            let mut step = |window: usize, windows: usize, i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
+                let steps = STAGE_2.len() - 1;
+                let at = window * steps + i + 1;
+                let frames = clean.dim(0)? / wide.frame_tokens();
+                let look = preview(clean, Shape::new(r.width, r.height, 8 * (frames - 1) + 1, play)?)?;
+                report("epilogue", at, windows * steps, done + secs * at as f64 / (windows * steps) as f64, Some(look))
+            };
+            let video = ltx_dfr::epilogue(&detailing, &ctx, &up, &clip, &with, downscale, &one.audio, canvas.frames as f64 / fps, still_3, &mut noise, &mut step)?;
+            clip = ltx_dfr::Clip { video, keyframes, positions: clip.positions.clone(), frames: clip.frames, fps: clip.fps };
+            drop((detailing, up));
+            settle(device)?;
         }
         drop(ctx);
         settle(device)?;

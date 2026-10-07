@@ -161,6 +161,12 @@ pub struct VideoRequest {
     /// ([`Defaults::dfr`]): the fast one unless `fps` is above 30, which
     /// only DFR's temporal rounds make.
     pub pipeline: Option<Pipeline>,
+    /// DFR's spatial epilogue: the clip is made at half its width and
+    /// height, its first stage at a quarter, and then upsampled once more
+    /// and detailed in spatial tiles at the size asked for. For sizes DFR's
+    /// stage 2 could not hold whole. It makes the request DFR's, and wants
+    /// the width and height to be multiples of 128.
+    pub epilogue: Option<bool>,
     /// LoRAs to apply for this video, each at its strength, to every DiT
     /// its pipeline runs ([`crate::image::Lora`]).
     pub loras: Vec<crate::image::Lora>,
@@ -396,6 +402,49 @@ pub fn dfr_frames(frames: usize, rounds: u32) -> Res<usize> {
     Ok(most)
 }
 
+/// The most tokens DFR's spatial epilogue holds in one DiT call, in latent
+/// frames of the clip's full size, for a clip of `frames` first-stage frames
+/// doubled `rounds` times at `width × height`.
+///
+/// The epilogue goes through the clip in windows, the last round's tiles
+/// (one window where there was no round), and its first step's call is the
+/// largest: one of 2 × 2 spatial tiles that overlap by 10 latent cells. A
+/// tile holds its share of the window's frames, of every keyframe in the
+/// window and of the opening frame, and of the half-size clip beside them,
+/// a quarter of a frame's tokens a frame.
+pub fn dfr_epilogue_frames(frames: usize, rounds: u32, width: usize, height: usize) -> Res<usize> {
+    let c = dfr_canvas(frames)?;
+    // The rounds' seams and keyframes, as `dfr_frames` follows them.
+    let (mut seams, mut keys, mut f) = (Vec::new(), c.keyframes.clone(), c.frames);
+    for r in 1..=rounds {
+        f = 2 * (f - 1) + 1;
+        seams = keys.iter().map(|p| 2 * p).collect();
+        let mut next: Vec<usize> = seams.iter().copied().chain(dfr_tiles(&seams, f, 1 << r)?.iter().flat_map(|t| t.slots.clone())).collect();
+        next.sort_unstable();
+        next.dedup();
+        keys = next;
+    }
+    // A window's latent frames, pinned ones included, and where its own
+    // frames begin and end.
+    let windows: Vec<(usize, usize, usize)> = match rounds {
+        0 => vec![((f - 1) / 8 + 1, 0, f - 1)],
+        _ => dfr_tiles(&seams, f, 1 << rounds)?.iter().map(|t| (t.cells(), t.start * 8, t.pixel_end)).collect(),
+    };
+    // A tile's share of a frame: half of each side and half the overlap.
+    let side = |cells: usize| (cells + 10.min(cells.saturating_sub(2))).div_ceil(2).min(cells);
+    let (rows, cols) = (height / 32, width / 32);
+    let share = (side(rows) * side(cols)) as f64 / (rows * cols) as f64;
+    let most = windows
+        .iter()
+        .map(|&(cells, from, to)| {
+            let held = keys.iter().filter(|&&p| from <= p && p <= to).count() + 1;
+            (share * (1.25 * cells as f64 + held as f64)).ceil() as usize
+        })
+        .max()
+        .unwrap_or(1);
+    Ok(most)
+}
+
 /// A model's own answers for what a [`VideoRequest`] leaves out, and its
 /// limits.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -493,6 +542,9 @@ pub struct Resolved {
     /// [`BASE_FPS`]. `frames` and `fps` are the clip's as it is delivered;
     /// its first stages make `(frames − 1) / 2^rounds + 1` at `fps / 2^rounds`.
     pub rounds: u32,
+    /// Whether DFR ends with its spatial epilogue, its stages before it at
+    /// half and a quarter of the size.
+    pub epilogue: bool,
     pub fps: u32,
     pub seed: u64,
     pub audio: bool,
@@ -552,6 +604,21 @@ impl VideoRequest {
                 }
             }
         };
+        // The epilogue is DFR's, and makes a request DFR's that named no
+        // pipeline.
+        let epilogue = self.epilogue.unwrap_or(false);
+        let pipeline = match (epilogue, pipeline, self.pipeline) {
+            (false, p, _) | (true, p @ Some(Pipeline::Dfr), _) => p,
+            (true, Some(Pipeline::Fast), None) => Some(Pipeline::Dfr),
+            (true, _, _) => return Err("the epilogue is DFR's, which runs without guidance; leave out epilogue, or ask for dfr and leave out steps, guidance and the negative prompt".into()),
+        };
+        if epilogue {
+            for (what, n) in [("width", width), ("height", height)] {
+                if n == 0 || n % 128 != 0 {
+                    return Err(format!("with the epilogue {what} must be a multiple of 128, and {n} is not; try {}", ((n + 64) / 128).max(1) * 128).into());
+                }
+            }
+        }
         // DFR's rounds double the frames, `F` to `2(F − 1) + 1`, so the
         // clip's frames are the first stages' so doubled: a step of 8 is 16
         // after one round, and the defaults and limits go the same way.
@@ -564,9 +631,12 @@ impl VideoRequest {
         // The fast pipeline's frames a clip of `b` first-stage frames costs
         // as much as: its own, or what DFR's DiT holds at its most.
         let cost = |b: usize| -> usize {
-            match dfr {
-                true => dfr_frames(b, rounds).map_or(usize::MAX, |l| 8 * (l - 1) + 1),
-                false => b,
+            match (dfr, epilogue) {
+                // Its stages and rounds at half the size, a quarter of the
+                // tokens, and then the epilogue's largest tile.
+                (true, true) => dfr_frames(b, rounds).and_then(|l| Ok(l.div_ceil(4).max(dfr_epilogue_frames(b, rounds, width, height)?))).map_or(usize::MAX, |l| 8 * (l - 1) + 1),
+                (true, false) => dfr_frames(b, rounds).map_or(usize::MAX, |l| 8 * (l - 1) + 1),
+                (false, _) => b,
             }
         };
         let fits = |b: usize| (width * height).saturating_mul(cost(b)) <= d.max_volume;
@@ -696,6 +766,7 @@ impl VideoRequest {
             decoder,
             pipeline,
             rounds,
+            epilogue,
             fps,
             seed,
             audio: match (self.audio, d.sound) {
@@ -2083,6 +2154,29 @@ mod tests {
 
     fn with_dfr() -> Defaults {
         Defaults { dfr: true, ..ltx() }
+    }
+
+    /// The epilogue makes a request DFR's, wants sides of 128, and is held
+    /// to its largest tile's call, which is less than the whole clip's.
+    #[test]
+    fn the_epilogue_is_dfr_s_and_counted_by_its_tiles() {
+        let d = with_dfr();
+        let ask = |w: usize, h: usize| VideoRequest { width: Some(w), height: Some(h), frames: Some(121), epilogue: Some(true), ..VideoRequest::new("a dog") };
+        let r = ask(768, 512).resolved(&d).unwrap();
+        assert_eq!((r.pipeline, r.epilogue, r.rounds), (Some(Pipeline::Dfr), true, 0));
+        assert!(!VideoRequest { frames: Some(121), ..VideoRequest::new("a dog") }.resolved(&d).unwrap().epilogue);
+        assert!(ask(704, 512).resolved(&d).unwrap_err().to_string().contains("multiple of 128"));
+        let fast = VideoRequest { pipeline: Some(Pipeline::Fast), ..ask(768, 512) };
+        assert!(fast.resolved(&d).unwrap_err().to_string().contains("the epilogue is DFR's"));
+        let guided = VideoRequest { steps: Some(20), ..ask(768, 512) };
+        assert!(guided.resolved(&d).unwrap_err().to_string().contains("the epilogue is DFR's"));
+        // 121 frames at 768×512, 16 × 24 cells: one window of 16 latent
+        // frames and 5 keyframes and the opening frame, in tiles of 13 × 17.
+        assert_eq!(dfr_epilogue_frames(121, 0, 768, 512).unwrap(), ((13.0 * 17.0 / 384.0) * (1.25 * 16.0 + 6.0) as f64).ceil() as usize);
+        // At 48 fps two windows, the first of three segments: 19 frames,
+        // 6 keyframes in it and the opening frame.
+        assert_eq!(dfr_epilogue_frames(121, 1, 768, 512).unwrap(), ((13.0 * 17.0 / 384.0) * (1.25 * 19.0 + 7.0) as f64).ceil() as usize);
+        assert!(dfr_epilogue_frames(121, 1, 768, 512).unwrap() < dfr_frames(121, 1).unwrap());
     }
 
     /// DFR's largest call: stage 2 for a clip at its own rate and at twice

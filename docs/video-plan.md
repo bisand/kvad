@@ -408,6 +408,12 @@ LTX-2.5 branches.
   reference would mean reproducing torch's Philox RNG. **We do not**: a kvad
   seed gives a repeatable kvad video, not the reference's video. Parity tests
   inject the reference's noise instead.
+- Every draw of a generation has a stream of its own, `image::nn::stream`:
+  the seed plus the draw's number *mixed*. Until #167 it was the seed plus
+  the draw's number times γ, and γ is the step of SplitMix's own counter, so
+  each draw was the first one started a few numbers late, and its noise the
+  first draw's moved that many elements along. See "The sound was a train of
+  clicks" below.
 
 ### Stage 1: 8 steps, ancestral
 
@@ -421,8 +427,10 @@ x      = ((1 − σₙ)/(1 − σ_down)) · (r·x + (1 − r)·x₀)
          + ε · √max(σₙ² − σ_down²(1 − σₙ)²/(1 − σ_down)², 0)
 ```
 
-The last step, to σ = 0, returns x₀. The coefficients are constants of the
-schedule. Written as `x = A·(r·x + (1 − r)·x₀) + c·ε`, they are:
+The last step, to σ = 0, returns x₀. The video and the sound are stepped
+alike, each with noise of its own at every step: the reference's
+`euler_ancestral_denoising_loop` draws the video's and then the sound's. The
+coefficients are constants of the schedule. Written as `x = A·(r·x + (1 − r)·x₀) + c·ε`, they are:
 
 | step | σ → σₙ | A | r | c |
 |---|---|---|---|---|
@@ -1452,11 +1460,46 @@ every 10 dB is ten times less error power.
 
   The first step of a run after a build or a new cache is slower (50 s at
   512×320): shaders compile and the cache pages in.
-- **The pictures are right and the sound is plausible.** The dog runs from
-  the waterline to the camera over the whole five seconds. The short clip's
-  sound has two broadband bursts half a second apart. Both clips peak at
-  full scale, and the reference's own decoder and vocoder give the same
-  peak and loudness from the same latents.
+- **The pictures are right. The sound was not, and this called it
+  plausible.** The dog runs from the waterline to the camera over the whole
+  five seconds. The short clip's sound has two broadband bursts half a
+  second apart. Both clips peak at full scale, and the reference's own
+  decoder and vocoder give the same peak and loudness from the same latents.
+  That checked the decoders and nothing before them, and nobody listened:
+  the bursts were clicks, and every clip from this sampler had them until
+  #167.
+- **The sound was a train of clicks** (#167): broadband impulses about ten
+  a second with near silence between, from the first clip made here until
+  0.14.0. The stepping was the reference's, which steps the sound
+  ancestrally as it does the video. The noise was not fresh. A draw's seed
+  was `seed + draw·γ`, and SplitMix's `j`th number is a function of
+  `seed + j·γ`, so draw `d` was draw 0 started `d` numbers late: an even
+  `d` gives draw 0's noise moved `d` elements along. The sound began as
+  draw 1 and step `i` added draw `3 + 2i`, the noise it began as moved
+  `2 + 2i` elements along, and an audio token is 8 channels of 16 mel bins,
+  so that is the same noise two more bins up at every step. (The video had
+  the same fault along its 128 channels, which are not an axis of anything,
+  and showed no harm that was noticed.) With the draw's number mixed before
+  it is added, on an M5 Pro at q8, 768×512, two stages, from
+  `ffmpeg -af astats` and a spectrogram:
+
+  | Clip | | Peak | RMS | Crest factor | Spectrogram |
+  |---|---|---|---|---|---|
+  | A fox in falling snow, seed 3, 113 frames | before | 0.0 dB | −27.0 dB | 27.1 | vertical lines, black between |
+  | | after | −41.5 dB | −54.8 dB | 4.3 | an even floor |
+  | A retriever on a beach that barks, seed 1, 121 frames | before | 0.0 dB | −15.6 dB | 6.1 | vertical lines, black between |
+  | | after | −1.6 dB | −18.3 dB | 6.8 | eight low bursts with harmonics over a steady floor of surf |
+
+  The levels tell the two apart only where the scene is quiet; the
+  spectrogram does for both. Nobody has listened to the new tracks either:
+  the eight bursts look like barks and were not heard. A seed's clip is
+  another clip than before, since every draw but the first changed.
+  `ltx_sample::tests::the_sound_of_a_fast_clip_is_not_a_train_of_clicks`
+  is the check, on the weights of the machine: 5.8 with the fix and 11.1
+  without.
+- **The reference has moved since** (its 1.4.0, 29 September 2026): the
+  distilled pipeline's stage 2 is ancestral too, and DFR's stages 1 and 2
+  and its spatial epilogue. Ours are as its 1.3 had them, plain Euler.
 - **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
   6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
   profiling before two stages quadruple the tokens.

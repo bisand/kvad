@@ -695,7 +695,7 @@ impl Ltx {
         // Noise of its own streams, apart from the fast pipeline's.
         let draws = std::cell::Cell::new(0u64);
         let mut noise = |dims: &[usize]| -> Res<Vec<f32>> {
-            let n = crate::image::nn::noise(r.seed.wrapping_add(0xD0F0_0000_0000).wrapping_add(draws.get().wrapping_mul(0x9E37_79B9_7F4A_7C15)), dims, &Device::Cpu, DType::F32)?;
+            let n = crate::image::nn::noise(crate::image::nn::stream(r.seed.wrapping_add(0xD0F0_0000_0000), draws.get()), dims, &Device::Cpu, DType::F32)?;
             draws.set(draws.get() + 1);
             Ok(n.flatten_all()?.to_vec1::<f32>()?)
         };

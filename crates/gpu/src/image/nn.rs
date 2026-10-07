@@ -783,6 +783,19 @@ pub(crate) fn noise(seed: u64, shape: &[usize], device: &Device, dtype: DType) -
     Ok(Tensor::from_vec(out, shape, &Device::Cpu)?.to_dtype(dtype)?.to_device(device)?)
 }
 
+/// The seed of a generation's `draw`th noise, so that no two draws of one
+/// generation share numbers. Draw 0 is the seed itself.
+///
+/// The draw is mixed before it is added, and must be: [`SplitMix`] is a
+/// counter that steps by γ, so `seed + draw·γ` is the *same* stream started
+/// `draw` numbers late, and its noise is draw 0's moved along by `draw`
+/// elements. LTX-2.5's sampler did that, and its ancestral steps put the
+/// noise the latent began as back into it at every step, two mel bins
+/// along: a sound track of clicks (#167).
+pub(crate) fn stream(seed: u64, draw: u64) -> u64 {
+    seed.wrapping_add(SplitMix::mix(draw))
+}
+
 /// A tensor of numbers drawn evenly from `[−bound, bound)`, in f32, from a
 /// seed, the same on every device as [`noise`] is.
 pub(crate) fn uniform(seed: u64, shape: &[usize], bound: f64, device: &Device) -> Res<Tensor> {
@@ -1128,6 +1141,28 @@ mod tests {
         let mean = v.iter().sum::<f32>() / v.len() as f32;
         let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32;
         assert!(mean.abs() < 0.02 && (var - 1.0).abs() < 0.03, "mean {mean}, var {var}");
+    }
+
+    #[test]
+    fn no_two_draws_of_a_seed_share_their_noise() {
+        // The fault: a seed moved along by γ is the same stream one number
+        // late, so its noise is the other's two elements along.
+        let late = |d: u64| 42u64.wrapping_add(d.wrapping_mul(SplitMix::GAMMA));
+        let n = |seed: u64| noise(seed, &[1024], &Device::Cpu, DType::F32).unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(n(late(2))[..1022], n(late(0))[2..]);
+        // The streams: 64 draws of 4096 numbers each, and none twice.
+        assert_eq!(stream(42, 0), 42);
+        let mut seen = std::collections::HashSet::new();
+        for d in 0..64 {
+            let mut rng = SplitMix(stream(42, d));
+            assert!((0..4096).all(|_| seen.insert(rng.next())), "draw {d} repeats an earlier draw's numbers");
+        }
+        // And the noise of two draws is unrelated at every small shift.
+        let (a, b) = (n(stream(42, 0)), n(stream(42, 2)));
+        for shift in 0..8 {
+            let r = a[shift..].iter().zip(&b).map(|(x, y)| x * y).sum::<f32>() / (a.len() - shift) as f32;
+            assert!(r.abs() < 0.15, "shift {shift}: correlation {r}");
+        }
     }
 
     #[test]

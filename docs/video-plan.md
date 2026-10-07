@@ -1622,18 +1622,21 @@ every 10 dB is ten times less error power.
   Through the service on an M5 Pro, q8, 768×512, 5 s, "a fox trots through
   fresh snow towards the camera", seed 3, before and after:
 
-  | | Denoise | Decode | Step into the frame after the tiles' seam |
+  | | Denoise | Decode | Step into the frame after a tiles' seam |
   |---|---|---|---|
   | 241 frames at 48 fps, before | 291.9 s | 51.4 s | 1.13× the clip's median |
   | after | 276.6 s | 47.7 s | 1.08× |
-  | 481 frames at 96 fps, before | 725.5 s | 98.9 s | not measured |
+  | 481 frames at 96 fps, before | 725.5 s | 98.9 s | 0.83×, 1.17×, 1.22× |
+  | after | 494.5 s | 84.7 s | 0.89×, 1.11×, 1.21× |
 
-  At 48 fps neither clip jumps where its two tiles meet (frame 144 to
-  145, by the mean change in luma from frame to frame, and by looking at
-  frames 143 to 146), the two are the same clip but for the second tile,
-  and the sound is the same to the last digit, being stage 1's. The 96 fps
-  clip after the change was still being made when this was written, and
-  its seams were not looked at in either.
+  No clip jumps where its tiles meet: frame 144 to 145 at 48 fps, and
+  144, 288 and 384 to the next at 96, by the mean change in luma from
+  frame to frame and by looking at the four frames about each. Before and
+  after are the same clip but for the tiles after the first, and the
+  sound is the same samples, being stage 1's. The 96 fps clip is a third
+  quicker to denoise, its second round's tiles having a segment less to
+  carry; the two were made hours apart on a machine doing other things, so
+  that is a rough figure. One prompt and seed, and none from a picture.
 - **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
   6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
   profiling before two stages quadruple the tokens.

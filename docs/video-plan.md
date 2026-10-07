@@ -1491,9 +1491,10 @@ every 10 dB is ten times less error power.
   | | after | −1.6 dB | −18.3 dB | 6.8 | eight low bursts with harmonics over a steady floor of surf |
 
   The levels tell the two apart only where the scene is quiet; the
-  spectrogram does for both. Nobody has listened to the new tracks either:
-  the eight bursts look like barks and were not heard. A seed's clip is
-  another clip than before, since every draw but the first changed.
+  spectrogram does for both. The dog's clip was made on the guided
+  pipeline and on DFR as well, with bursts and a floor like these on both,
+  and all three were listened to afterwards, on 7 October 2026. A seed's
+  clip is another clip than before, since every draw but the first changed.
   `ltx_sample::tests::the_sound_of_a_fast_clip_is_not_a_train_of_clicks`
   is the check, on the weights of the machine: 5.8 with the fix and 11.1
   without.

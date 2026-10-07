@@ -11,16 +11,16 @@
 //! what the diffusion decoder reads beside the video.
 //!
 //! 1. [`first`]: at half the width and height, from noise, the video and its
-//!    keyframes together, by the distilled schedule's eight steps, plain Euler
-//!    where the plain distilled pipeline's are ancestral.
+//!    keyframes together, by the distilled schedule's eight steps, ancestral
+//!    at η 1 as the plain distilled pipeline's are.
 //! 2. The video and the keyframes are upsampled ×2 by the spatial upsampler,
 //!    each on its own: the keyframes as a clip of their own, one frame each.
 //! 3. [`second`]: at the full size, the upsampled video and keyframes
-//!    re-noised to 0.909375, three Euler steps, with stage 1's video appended
-//!    clean as a *reference latent* at its own half size, and the DiT with
-//!    the detailing IC-LoRA fused in at 0.5. The sound is re-noised and
-//!    denoised with the video, which reads it, and then dropped: DFR keeps
-//!    stage 1's.
+//!    re-noised to 0.909375, three steps, ancestral too, with stage 1's video
+//!    appended clean as a *reference latent* at its own half size, and the
+//!    DiT with the detailing IC-LoRA fused in at 0.5. The sound is re-noised
+//!    and denoised with the video, which reads it, and then dropped: DFR
+//!    keeps stage 1's.
 //! 4. [`round`], none, once or twice: the clip's frames doubled by the
 //!    temporal upsampler, and denoised again in time tiles that meet at the
 //!    keyframes; see below.
@@ -30,13 +30,21 @@
 //! 48, so a clip played at 48 is laid out at 60; its sound still lasts the
 //! clip, at the frame rate it plays at.
 //!
-//! **A step** ([`stage`]) is the reference's `euler_denoising_loop` with its
-//! `X0Model` and `post_process_latent`. Each token's prediction is `x − σ·m·v`
-//! for its mask `m` (`ltx_cond`), rounded to the latents' dtype; then
-//! blended towards its clean latent, `x₀·m + clean·(1 − m)`, in f32 and
-//! rounded again, which puts a reference latent (`m` 0) back as it was and
-//! pulls an anchor keyframe most of the way to its own. Then the Euler step
-//! at the step's σ for every token alike.
+//! **A step** ([`stage`]) is the reference's `euler_ancestral_denoising_loop`
+//! with its `X0Model` and `post_process_latent`. Each token's prediction is
+//! `x − σ·m·v` for its mask `m` (`ltx_cond`), rounded to the latents' dtype;
+//! then blended towards its clean latent, `x₀·m + clean·(1 − m)`, in f32,
+//! which puts a reference latent (`m` 0) back as it was and pulls an anchor
+//! keyframe most of the way to its own. Then the ancestral step at the
+//! step's σ for every token alike, with noise of its own for the video and
+//! for the sound, and the blend again after the noise; the last step is the
+//! prediction. At η 0 it is the reference's `euler_denoising_loop` instead:
+//! the prediction rounded again, and a plain Euler step.
+//!
+//! Stages 1 and 2 were plain Euler until the reference's 1.4.0 made them
+//! ancestral on LTX-2.5's checkpoints, with the distilled pipeline's stage
+//! 2. Its spatial epilogue, ancestral as well, is not made here. The
+//! temporal rounds stay at η 0.5.
 //!
 //! **The temporal rounds.** Each doubles the frames, `F` latent frames to
 //! `2F − 1` and `N` pixel frames to `2(N − 1) + 1`, and the frame rate with
@@ -104,11 +112,20 @@ pub struct Staged {
 
 /// How a stage steps from one σ to the next.
 pub enum Steps<'a> {
-    /// Plain Euler: DFR's stages 1 and 2.
+    /// Plain Euler: DFR's stages 1 and 2 as the reference's 1.3 ran them.
     Euler,
-    /// Ancestral at `eta`: its temporal rounds. Every step but the last
-    /// asks `noise` for the video's noise and then the sound's.
+    /// Ancestral at `eta`: 1 in stages 1 and 2, 0.5 in the temporal rounds.
+    /// Every step but the last asks `noise` for the video's noise and then
+    /// the sound's.
     Ancestral { eta: f32, noise: Noise<'a> },
+}
+
+impl<'a> Steps<'a> {
+    /// Ancestral at `eta` on `noise`, or plain Euler at 0, which draws none:
+    /// the reference's ancestral loop draws only when η is above 0.
+    fn at(eta: f32, noise: Noise<'a>) -> Self {
+        if eta > 0.0 { Steps::Ancestral { eta, noise } } else { Steps::Euler }
+    }
 }
 
 /// Where a stage's noise comes from: `[n, 128]` numbers for the dims asked,
@@ -228,9 +245,11 @@ fn host(t: &Tensor) -> Res<Vec<f32>> {
 /// keyframes at `keyframes`; the sound timed by `sound`, the same at the
 /// frame rate the clip plays at. `still` is the picture it starts from, as
 /// the first latent frame's tokens at this size. `noise` gives the video's,
-/// every token's including the keyframes', then the sound's.
+/// every token's including the keyframes', then the sound's, and then each
+/// step's. `eta` is how ancestral the steps are: `ltx_sample::ETA` as the
+/// reference runs them, 0 for plain Euler.
 #[allow(clippy::too_many_arguments)]
-pub fn first(dit: &Dit, ctx: &Contexts, shape: Shape, sound: Shape, keyframes: &[usize], still: Option<&Tensor>, noise: Noise<'_>, step: OnStep<'_>)
+pub fn first(dit: &Dit, ctx: &Contexts, shape: Shape, sound: Shape, keyframes: &[usize], eta: f32, still: Option<&Tensor>, noise: Noise<'_>, step: OnStep<'_>)
  -> Res<Staged> {
     let (rows, cols) = shape.grid();
     let dt = dit.dtype();
@@ -244,7 +263,7 @@ pub fn first(dit: &Dit, ctx: &Contexts, shape: Shape, sound: Shape, keyframes: &
     let state = state.noised(&drawn(noise(&[len, C])?, dt), STAGE_1[0])?;
     let na = sound.audio_latents();
     let audio = noised(&vec![0.0; na * C], &drawn(noise(&[na, C])?, dt), STAGE_1[0])?;
-    stage(dit, ctx, &state, &Sound { tokens: &audio, shape: sound, frozen: false }, &STAGE_1, Steps::Euler, step)
+    stage(dit, ctx, &state, &Sound { tokens: &audio, shape: sound, frozen: false }, &STAGE_1, Steps::at(eta, noise), step)
 }
 
 /// What DFR's stage 2 starts from: stage 1's video, upsampled and as it
@@ -258,11 +277,11 @@ pub struct Detailing<'a> {
 
 /// DFR's stage 2: at `shape`, the clip's size, the upsampled video and
 /// keyframes re-noised to [`STAGE_2`]'s first level, stage 1's video appended
-/// as a reference latent `downscale` times smaller, and three Euler steps;
-/// `dit` is the one with the detailing LoRA fused in. `still` and `noise` as
-/// for [`first`], the picture at this size and the noise drawn afresh.
+/// as a reference latent `downscale` times smaller, and three steps; `dit`
+/// is the one with the detailing LoRA fused in. `eta`, `still` and `noise`
+/// as for [`first`], the picture at this size and the noise drawn afresh.
 #[allow(clippy::too_many_arguments)]
-pub fn second(dit: &Dit, ctx: &Contexts, shape: Shape, sound: Shape, keyframes: &[usize], from: &Detailing<'_>, downscale: usize, still: Option<&Tensor>,
+pub fn second(dit: &Dit, ctx: &Contexts, shape: Shape, sound: Shape, keyframes: &[usize], from: &Detailing<'_>, downscale: usize, eta: f32, still: Option<&Tensor>,
               noise: Noise<'_>, step: OnStep<'_>) -> Res<Staged> {
     let dt = dit.dtype();
     let mut state = State::video(&kept(from.upsampled, dt)?, shape)?;
@@ -274,7 +293,7 @@ pub fn second(dit: &Dit, ctx: &Contexts, shape: Shape, sound: Shape, keyframes: 
     let state = state.noised(&drawn(noise(&[len, C])?, dt), STAGE_2[0])?;
     let tokens = host(&audio_tokens(&kept(from.audio, dt)?)?)?;
     let audio = noised(&tokens, &drawn(noise(&[tokens.len() / C, C])?, dt), STAGE_2[0])?;
-    stage(dit, ctx, &state, &Sound { tokens: &audio, shape: sound, frozen: false }, &STAGE_2, Steps::Euler, step)
+    stage(dit, ctx, &state, &Sound { tokens: &audio, shape: sound, frozen: false }, &STAGE_2, Steps::at(eta, noise), step)
 }
 
 // ---------------------------------------------------------------------------

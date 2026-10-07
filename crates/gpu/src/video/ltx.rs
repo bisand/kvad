@@ -29,7 +29,7 @@
 //! peak of the largest clip [`Defaults::max_volume`] allows.
 
 use super::ltx_dit::{video_tokens, Dit, Shape};
-use super::ltx_sample::{dev_sigmas, guided, one_stage, refine, Guide, Latents, AUDIO_GUIDE, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
+use super::ltx_sample::{dev_sigmas, guided, one_stage, refine, Guide, Latents, AUDIO_GUIDE, ETA, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
 use super::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
 use super::{ltx_audio, ltx_dfr, ltx_diffvae, ltx_duration, ltx_upsample, ltx_vae};
 use crate::common::{pooled, settle};
@@ -523,7 +523,9 @@ impl Ltx {
                 report("stage 2", i + 1, s2, done + plan.stage_2 * (i + 1) as f64, Some(look))
             };
             let stage_1_audio = l.audio.clone();
-            let l = refine(second, &ctx, &second.grid(full)?, &Latents { video, audio: l.audio }, r.seed, still_2, &mut step)?;
+            // Ancestral for the distilled model, Euler for the dev model.
+            let eta = if dev.is_some() { 0.0 } else { ETA };
+            let l = refine(second, &ctx, &second.grid(full)?, &Latents { video, audio: l.audio }, r.seed, eta, still_2, &mut step)?;
             match dev {
                 // The reference keeps stage 1's sound: its stage 2 refines
                 // the video only.
@@ -751,7 +753,7 @@ impl Ltx {
             let mut step = |i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
                 report("stage 1", i + 1, s1, done + plan.stage_1 * (i + 1) as f64, Some(preview(clean, half)?))
             };
-            ltx_dfr::first(&dit, &ctx, half, sound, &canvas.keyframes, still_1, &mut noise, &mut step)?
+            ltx_dfr::first(&dit, &ctx, half, sound, &canvas.keyframes, ETA, still_1, &mut noise, &mut step)?
         };
         done += plan.stage_1 * s1 as f64;
         drop(dit);
@@ -777,7 +779,7 @@ impl Ltx {
             let mut step = |i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
                 report("stage 2", i + 1, s2, done + plan.stage_2 * (i + 1) as f64, Some(preview(clean, full)?))
             };
-            ltx_dfr::second(&detailing, &ctx, full, sound, &canvas.keyframes, &from, downscale, still_2, &mut noise, &mut step)?
+            ltx_dfr::second(&detailing, &ctx, full, sound, &canvas.keyframes, &from, downscale, ETA, still_2, &mut noise, &mut step)?
         };
         done += plan.stage_2 * s2 as f64;
         drop((detailing, upsampled, keys));

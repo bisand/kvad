@@ -38,7 +38,7 @@
 use super::ltx_dit::{video_tokens, Dit, Shape};
 use super::ltx_sample::{dev_sigmas, guided, one_stage, refine, Guide, Latents, AUDIO_GUIDE, ETA, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
 use super::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
-use super::{ltx_audio, ltx_dfr, ltx_diffvae, ltx_duration, ltx_upsample, ltx_vae};
+use super::{ltx_audio, ltx_dfr, ltx_diffvae, ltx_duration, ltx_tile, ltx_upsample, ltx_vae};
 use crate::common::{pooled, settle};
 use crate::image::lora;
 use candle_core::quantized::GgmlDType;
@@ -589,9 +589,11 @@ struct DfrPlan {
     /// Each round's tiles' steps, and loading the plain DiT again for them.
     rounds: Vec<f64>,
     load_3: f64,
-    /// The spatial epilogue, its keyframes' rebuilding and its DiT's
-    /// loading with it; 0 without one.
-    epilogue: f64,
+    /// The spatial epilogue: its keyframes' rebuilding and its DiT's
+    /// loading, and then each of its steps, three a window. Nothing without
+    /// one.
+    epilogue_prep: f64,
+    epilogue: Vec<f64>,
     decode: f64,
 }
 
@@ -617,22 +619,51 @@ impl DfrPlan {
             next.dedup();
             seams = next;
         }
-        // The epilogue, roughly: each window's first step in four calls of
-        // about 0.4 of its tokens and its other two in sixteen of about
-        // 0.16, at four times the stages' tokens a frame, the half-size clip
-        // and the keyframes beside; and a keyframe's rebuilding, 2 s.
-        let epilogue_secs = match epilogue {
-            false => 0.0,
+        // The epilogue, step by step: a window's first step in 2 × 2 spatial
+        // tiles and its other two in 4 × 4, each tile a DiT call of its
+        // share of the window's frames and keyframes and of the half-size
+        // clip beside them (`ltx_tile`). A call takes 1.3 times what a
+        // stage's call of as many tokens does: fitted to a 1536×1024 clip
+        // at 48 fps, whose five timed steps it gives to within 11%, and
+        // whose epilogue of 913 s it gives as 923. Before the first step
+        // the keyframes are rebuilt and the DiT loaded: 24 s there, with
+        // seven planes, which is all 10 s and 2 s a plane is fitted to.
+        let (epilogue_prep, epilogue_steps) = match epilogue {
+            false => (0.0, Vec::new()),
             true => {
-                let windows: Vec<usize> = match last.is_empty() {
-                    true => vec![(frames - 1) / 8 + 1],
-                    false => ltx_dfr::tiles(&last, frames, 1 << rounds).unwrap_or_default().iter().map(|t| t.cells()).collect(),
+                // Each window's latent frames, and the keyframes it holds:
+                // those among the frames it keeps, and the opening frame in
+                // the first when there is no picture.
+                let opening = !picture as usize;
+                let windows: Vec<(usize, usize)> = match last.is_empty() {
+                    true => vec![((frames - 1) / 8 + 1, seams.len() + opening)],
+                    false => ltx_dfr::tiles(&last, frames, 1 << rounds)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|t| (t.cells(), seams.iter().filter(|&&p| t.start * 8 <= p && p <= t.pixel_end).count() + if t.start == 0 { opening } else { 0 }))
+                        .collect(),
                 };
-                let per = |cells: usize| {
-                    let n = (1.25 * cells as f64 + cells as f64 / 3.0 + 1.0) * 4.0 * full.frame_tokens() as f64;
-                    4.0 * step((0.4 * n) as usize) + 32.0 * step((0.16 * n) as usize)
+                let (rows, cols) = full.grid();
+                let call = |count: usize, cells: usize, held: usize| -> f64 {
+                    let tiling = ltx_tile::Tiling { count, overlap: ltx_dfr::EPILOGUE_OVERLAP, normalised: true };
+                    tiling
+                        .tiles(2 * rows, 2 * cols)
+                        .iter()
+                        .map(|t| {
+                            // A token of the half-size clip covers two cells.
+                            let beside = (t.rows.end.div_ceil(2) - t.rows.start / 2) * (t.cols.end.div_ceil(2) - t.cols.start / 2);
+                            1.3 * step(t.rows.len() * t.cols.len() * (cells + held) + beside * cells)
+                        })
+                        .sum()
                 };
-                20.0 + 2.0 * (seams.len() + 1) as f64 + windows.iter().map(|&c| per(c)).sum::<f64>()
+                let steps = windows
+                    .iter()
+                    .flat_map(|&(cells, held)| {
+                        let (coarse, fine) = (call(ltx_dfr::EPILOGUE_TILES.0, cells, held), call(ltx_dfr::EPILOGUE_TILES.1, cells, held));
+                        [coarse, fine, fine]
+                    })
+                    .collect();
+                (10.0 + 2.0 * (seams.len() + opening) as f64, steps)
             }
         };
         // The frames decoded are the clip's own, four times the stages'
@@ -648,7 +679,8 @@ impl DfrPlan {
             stage_2: step(full.video_tokens() + keys * full.frame_tokens() + half.video_tokens()),
             rounds: round_secs,
             load_3: if rounds > 0 { 5.0 } else { 0.0 },
-            epilogue: epilogue_secs,
+            epilogue_prep,
+            epilogue: epilogue_steps,
             // As the fast decode's, and the keyframes' 8–21% more.
             decode: match decoder {
                 Some(Decoder::Diffusion) => 1.15 * 22.0 * out / at_768,
@@ -660,7 +692,7 @@ impl DfrPlan {
     fn total(&self) -> f64 {
         let s1 = (STAGE_1.len() - 1) as f64;
         let s2 = (STAGE_2.len() - 1) as f64;
-        self.picture + self.text + self.load + self.stage_1 * s1 + self.upsample + self.load_2 + self.stage_2 * s2 + self.load_3 + self.rounds.iter().sum::<f64>() + self.epilogue + self.decode
+        self.picture + self.text + self.load + self.stage_1 * s1 + self.upsample + self.load_2 + self.stage_2 * s2 + self.load_3 + self.rounds.iter().sum::<f64>() + self.epilogue_prep + self.epilogue.iter().sum::<f64>() + self.decode
     }
 }
 
@@ -913,14 +945,19 @@ impl Ltx {
             let detailing = self.adapted(Dit::load_as(&self.paths[1], Some((&lora, ltx_dfr::DETAILING_STRENGTH as f64)), "transformer-detailing", device, dtype, None, quant, &mut quiet)?)?;
             let up = ltx_upsample::Upsampler::load(&self.paths[2], &self.paths[3], device, DType::F32)?;
             let with = ltx_dfr::Epilogue { keyframes: &keyframes, opening: opening.as_ref(), seams: &last_seams, windows: 1 << rounds, normalised: true };
-            let (wide, secs) = (Shape::new(r.width, r.height, 9, cond)?, plan.epilogue);
+            // The keyframes are rebuilt and the DiT is here: the steps
+            // start, each weighted by what the plan says it takes.
+            let wide = Shape::new(r.width, r.height, 9, cond)?;
+            let start = done + plan.epilogue_prep;
+            let each = plan.epilogue.clone();
+            report("epilogue", 0, each.len().max(1), start, None)?;
             let play = ltx_dfr::conditioning_fps(clip.fps);
             let mut step = |window: usize, windows: usize, i: usize, _sigma: f32, clean: &Tensor| -> Res<()> {
                 let steps = STAGE_2.len() - 1;
                 let at = window * steps + i + 1;
                 let frames = clean.dim(0)? / wide.frame_tokens();
                 let look = preview(clean, Shape::new(r.width, r.height, 8 * (frames - 1) + 1, play)?)?;
-                report("epilogue", at, windows * steps, done + secs * at as f64 / (windows * steps) as f64, Some(look))
+                report("epilogue", at, windows * steps, start + each.iter().take(at).sum::<f64>(), Some(look))
             };
             let video = ltx_dfr::epilogue(&detailing, &ctx, &up, &clip, &with, downscale, &one.audio, canvas.frames as f64 / fps, still_3, &mut noise, &mut step)?;
             clip = ltx_dfr::Clip { video, keyframes, positions: clip.positions.clone(), frames: clip.frames, fps: clip.fps };
@@ -1195,6 +1232,27 @@ fn preview(clean: &Tensor, shape: Shape) -> Res<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The epilogue's steps as the plan weighs them, against the clip they
+    /// were fitted to: 1536×1024, 3 s at 48 fps, whose steps took (from a
+    /// log of 5 s samples) 211 and 230 s, then 78, 125 and 131 s, its first
+    /// with the keyframes' rebuilding 144 s, and all of it 913 s.
+    #[test]
+    fn the_epilogue_s_steps_are_weighed_as_they_were_timed() {
+        let canvas = ltx_dfr::canvas(73).unwrap();
+        let (half, full) = (Shape::new(384, 256, canvas.frames, 24.0).unwrap(), Shape::new(768, 512, canvas.frames, 24.0).unwrap());
+        let plan = DfrPlan::new(half, full, &canvas, 1, true, false, Some(Decoder::Diffusion));
+        let steps: Vec<i64> = plan.epilogue.iter().map(|s| s.round() as i64).collect();
+        assert_eq!((plan.epilogue_prep, steps), (24.0, vec![120, 212, 212, 76, 139, 139]));
+        let all = plan.epilogue_prep + plan.epilogue.iter().sum::<f64>();
+        assert!((all - 913.0).abs() < 0.02 * 913.0, "{all}");
+        // From a picture there is no opening frame to rebuild or to hold.
+        let from = DfrPlan::new(half, full, &canvas, 1, true, true, Some(Decoder::Diffusion));
+        assert!(from.epilogue_prep == 22.0 && from.epilogue[0] < plan.epilogue[0] && from.epilogue[3] == plan.epilogue[3]);
+        // No round is one window, and no epilogue no steps.
+        assert_eq!(DfrPlan::new(half, full, &canvas, 0, true, false, None).epilogue.len(), 3);
+        assert!(DfrPlan::new(half, full, &canvas, 1, false, false, None).epilogue.is_empty());
+    }
 
     /// A GGUF's pull is written where there is no backend, with the files
     /// it fetches of the base listed there: every file a load reads but

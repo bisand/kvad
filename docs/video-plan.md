@@ -1721,8 +1721,30 @@ every 10 dB is ten times less error power.
   never holding the whole frame. The two rows are not one comparison: the
   earlier clip was another prompt and seed, before the rounds' tiles
   changed. One clip, looked at in frames and not played; none from a
-  picture; and the progress estimate ran ahead of it, 38% at twelve
-  minutes of twenty. The web form has the switch since #174.
+  picture. The web form has the switch since #174.
+
+  **Its progress** ran ahead on that clip, 38% at twelve minutes of
+  twenty: the plan weighed the epilogue by a guess at its tiles' sizes and
+  gave every step the same share. It now counts each tile's tokens as
+  `ltx_tile` cuts them, weighs a call at 1.3 times a stage's call of as
+  many tokens, and reports each step at its own weight, with 10 s and 2 s
+  a keyframe before the first for the rebuilding and the DiT's loading.
+  The 1.3 is fitted to that clip's steps, timed from a log of 5 s samples:
+
+  | 1536×1024, 48 fps | Rebuild and step 1 | Step 2 | Step 3 |
+  |---|---|---|---|
+  | Window 1, 13 latent frames, measured | 144 s | 211 s | 230 s |
+  | planned | 24 + 120 s | 212 s | 212 s |
+  | Window 2, 10 latent frames, measured | 78 s | 125 s | 131 s |
+  | planned | 76 s | 139 s | 139 s |
+
+  The epilogue's 913 s comes to 923. On a clip it was not fitted to,
+  768×512 at 48 fps on the new build, the progress reported was within
+  2.4 points of the share of time gone from start to finish, and the
+  epilogue's steps took 37, 107, 115, 28, 85 and 82 s where the plan has
+  38, 103, 103, 25, 69 and 69, after 14 s of rebuilding where it has 24.
+  So the second window's later steps run up to a fifth over. Two clips,
+  one machine, and none from a picture or with no round.
 - **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
   6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
   profiling before two stages quadruple the tokens.

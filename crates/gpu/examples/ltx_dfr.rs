@@ -7,13 +7,14 @@
 //! --upsampler … --vae …` wrote: a 512×320 × 49 clip at 48 fps, so keyframes
 //! at 24 and 48 and the DiT told 60 fps; the reference's stage 1 at 256×160
 //! with the DiT cut to its first two blocks, its video and keyframes
-//! upsampled, and its stage 2, with the noise each drew: both by plain
-//! Euler, η 0, as the reference's 1.3 ran them and as the fixtures' script
-//! still does, where Kvad's pipeline now runs them at η 1 as its 1.4.0 does.
-//! The ancestral step itself is checked by the rounds. `--detailing` is
+//! upsampled, and its stage 2, with the noise each drew, a stage's own
+//! and then each ancestral step's: both at η 1, as the reference has run
+//! them since its 1.4.0 and as Kvad's pipeline does. `--detailing` is
 //! the detailing IC-LoRA, when the fixtures were made with it. With
 //! `--temporal` there too, two temporal rounds follow: 97 frames at 96 fps
-//! in two tiles, then 193 at 192 in four.
+//! in two tiles, then 193 at 192 in four. Those are not compared since the
+//! reference's 1.4.0, which lays its tiles out another way than Kvad's
+//! rounds do: see `docs/video-plan.md`.
 //!
 //! 1. **The canvas** the reference laid out.
 //! 2. **f32, CPU**: both stages and the upsampling between them, each
@@ -26,6 +27,7 @@ use candle_core::{DType, Device, Tensor};
 use kvad::weights::{fetch_file, Watcher};
 use kvad_gpu::video::ltx_dfr::{self, Detailing, Staged};
 use kvad_gpu::video::ltx_dit::{Dit, Shape};
+use kvad_gpu::video::ltx_sample::ETA;
 use kvad_gpu::video::ltx_text::{Contexts, DIT_FILE};
 use kvad_gpu::video::{ltx_upsample, ltx_vae, LTX_REPO};
 use std::collections::HashMap;
@@ -120,7 +122,7 @@ fn main() -> Res<()> {
             Ok(())
         };
         let t = Instant::now();
-        let one = ltx_dfr::first(&dit, &ctx, half, sound, &canvas.keyframes, 0.0, None, &mut replay, &mut |_, _, _| Ok(()))?;
+        let one = ltx_dfr::first(&dit, &ctx, half, sound, &canvas.keyframes, ETA, None, &mut replay, &mut |_, _, _| Ok(()))?;
         device.synchronize()?;
         eprintln!("   stage 1 in {:.2} s", t.elapsed().as_secs_f64());
         say("stage 1", &one, 1)?;
@@ -142,12 +144,12 @@ fn main() -> Res<()> {
         };
         let from = Detailing { upsampled: &upsampled, keyframes: &keys, reference: &one.video, audio: &one.audio };
         let t = Instant::now();
-        let two = ltx_dfr::second(second, &ctx, full, sound, &canvas.keyframes, &from, downscale, 0.0, None, &mut replay, &mut |_, _, _| Ok(()))?;
+        let two = ltx_dfr::second(second, &ctx, full, sound, &canvas.keyframes, &from, downscale, ETA, None, &mut replay, &mut |_, _, _| Ok(()))?;
         device.synchronize()?;
         eprintln!("   stage 2 in {:.2} s", t.elapsed().as_secs_f64());
         say("stage 2", &two, 2)?;
 
-        // The rounds, on the reference's draws after the stages' four.
+        // The rounds, on the reference's draws after the stages'.
         let Some(temporal) = &temporal else { return Ok(()) };
         let up = ltx_upsample::Upsampler::load(temporal, &vae, device, DType::F32)?;
         let mut clip = ltx_dfr::Clip {
@@ -159,7 +161,18 @@ fn main() -> Res<()> {
         };
         for r in 1..=rounds {
             let t = Instant::now();
-            clip = ltx_dfr::round(&dit, &ctx, &up, &clip, r, &one.audio, canvas.frames as f64 / fps, None, &mut replay, &mut |_, _, _, _, _| Ok(()))?;
+            clip = match ltx_dfr::round(&dit, &ctx, &up, &clip, r, &one.audio, canvas.frames as f64 / fps, None, &mut replay, &mut |_, _, _, _, _| Ok(())) {
+                Ok(c) => c,
+                // The reference's 1.4.0 starts every tile after the first on
+                // a keyframe's plane and pins its lead-in to the tile
+                // before. Kvad's rounds are its 1.3's, which denoise a
+                // lead-in and drop it: other tiles, of other sizes, that the
+                // draws of fixtures made since do not fit.
+                Err(e) => {
+                    eprintln!("   round {r}: NOT COMPARED. Kvad's tiles are the reference's 1.3's, and these fixtures' are not: {e}");
+                    return Ok(());
+                }
+            };
             device.synchronize()?;
             let w = |k: &str| get(&want, &format!("round_{r}_{k}"));
             let theirs: Vec<usize> = w("positions")?.to_vec1::<f32>()?.iter().map(|&p| p as usize).collect();

@@ -1,6 +1,6 @@
 //! DFR, LTX-2.5's "Diffusion Fidelity Rendering" (the reference's
-//! `dfr_pipeline.py`): its canvas, its first two stages, and its temporal
-//! rounds.
+//! `dfr_pipeline.py`): its canvas, its first two stages, its temporal
+//! rounds, and its spatial epilogue ([`epilogue`], which has its own notes).
 //!
 //! DFR is the reference's two stages with keyframes in them. The clip is
 //! padded to a whole number of *segments*, 24 or 32 pixel frames, whichever
@@ -43,8 +43,8 @@
 //!
 //! Stages 1 and 2 were plain Euler until the reference's 1.4.0 made them
 //! ancestral on LTX-2.5's checkpoints, with the distilled pipeline's stage
-//! 2. Its spatial epilogue, ancestral as well, is not made here. The
-//! temporal rounds stay at η 0.5.
+//! 2, and its spatial epilogue, which is ancestral here too. The temporal
+//! rounds stay at η 0.5.
 //!
 //! **The temporal rounds.** Each doubles the frames, `F` latent frames to
 //! `2F − 1` and `N` pixel frames to `2(N − 1) + 1`, and the frame rate with

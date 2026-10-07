@@ -91,11 +91,11 @@ pub fn ramp(span: &Span) -> Vec<f32> {
         if i < steps / 2 { from + by * i as f32 } else { to - by * (steps - i - 1) as f32 }
     };
     let (left, right) = (span.left.min(n), span.right.min(n));
-    for k in 0..left {
-        w[k] *= linspace(0.0, 1.0, left + 2, k + 1);
+    for (k, x) in w.iter_mut().take(left).enumerate() {
+        *x *= linspace(0.0, 1.0, left + 2, k + 1);
     }
-    for k in 0..right {
-        w[n - right + k] *= linspace(1.0, 0.0, right + 2, k + 1);
+    for (k, x) in w.iter_mut().skip(n - right).enumerate() {
+        *x *= linspace(1.0, 0.0, right + 2, k + 1);
     }
     w.iter().map(|x| x.clamp(0.0, 1.0)).collect()
 }

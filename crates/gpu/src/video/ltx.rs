@@ -14,6 +14,13 @@
 //! decode. The LoRA is gated on the Hub and fetched by the first DFR
 //! request, so an account without access keeps the fast pipeline.
 //!
+//! A request that asks for DFR's **spatial epilogue** has all of that made
+//! at half its width and height, stage 1 at a quarter. Then its keyframes
+//! and its opening frame are decoded, stretched ×2 and encoded again, the
+//! detailing DiT is loaded once more, and `ltx_dfr::epilogue` upsamples the
+//! clip and details it at the size asked for, each DiT call in spatial
+//! tiles (`ltx_tile`). That is for sizes stage 2 could not hold whole.
+//!
 //! # Nothing is kept between generations
 //!
 //! The plan was to keep the DiT resident and reload the text path for each

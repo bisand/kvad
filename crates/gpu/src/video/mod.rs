@@ -42,6 +42,7 @@ pub mod ltx_dit;
 pub mod ltx_duration;
 pub(crate) mod ltx_fused;
 pub mod ltx_sample;
+pub mod ltx_tile;
 pub(crate) mod ltx_nn;
 pub mod ltx_text;
 pub mod ltx_upsample;

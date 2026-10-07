@@ -159,6 +159,7 @@ fn main() -> Res<()> {
             frames: canvas.frames,
             fps,
         };
+        let mut after_one = None;
         for r in 1..=rounds {
             let t = Instant::now();
             let seams: Vec<usize> = clip.positions.iter().map(|p| 2 * p).collect();
@@ -178,6 +179,21 @@ fn main() -> Res<()> {
             let k = w("keyframes")?;
             eprintln!("   round {r}: video {:5.1} dB, new keyframes {:5.1} dB, carried {:5.1} dB", db(&clip.video, &w("video")?)?, db(&pick(&clip.keyframes, true)?, &pick(&k, true)?)?,
                       db(&pick(&clip.keyframes, false)?, &pick(&k, false)?)?);
+            if r == 1 {
+                after_one = Some((ltx_dfr::Clip { video: clip.video.clone(), keyframes: clip.keyframes.clone(), positions: clip.positions.clone(), frames: clip.frames, fps: clip.fps }, seams.clone()));
+            }
+        }
+        // The spatial epilogue, on the first round's clip, with the
+        // keyframes and the opening frame the reference was given, and the
+        // tiles' weights as it sums them.
+        if let (Some((clip, seams)), Ok(theirs)) = (&after_one, get(&want, "epilogue_video")) {
+            let t = Instant::now();
+            let spatial = ltx_upsample::Upsampler::load(&up_path, &vae, device, DType::F32)?;
+            let (keyframes, opening) = (get(&want, "epilogue_keyframes")?, get(&want, "epilogue_opening")?);
+            let with = ltx_dfr::Epilogue { keyframes: &keyframes, opening: Some(&opening), seams, windows: 2, normalised: false };
+            let got = ltx_dfr::epilogue(second, &ctx, &spatial, clip, &with, downscale, &one.audio, canvas.frames as f64 / fps, None, &mut replay, &mut |_, _, _, _, _| Ok(()))?;
+            device.synchronize()?;
+            eprintln!("   epilogue in {:.2} s: {:?}, video {:5.1} dB", t.elapsed().as_secs_f64(), got.dims(), db(&got, &theirs)?);
         }
         if drawn != want.keys().filter(|k| k.starts_with("noise_")).count() {
             return Err(format!("{drawn} draws used of the reference's {}", want.keys().filter(|k| k.starts_with("noise_")).count()).into());

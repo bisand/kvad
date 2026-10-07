@@ -37,6 +37,11 @@ pub struct State {
     /// Each token's place, the middle of its span: time in seconds, rows
     /// and columns in pixels.
     pub positions: [Vec<f32>; 3],
+    /// How far each token's span reaches either side of its middle on rows
+    /// and columns, in pixels: 16, or more for a smaller latent's tokens.
+    /// What a spatial tile needs to say which appended tokens are its own
+    /// (`ltx_tile`).
+    pub reach: Vec<f32>,
     /// Whether each token is a keyframe, to the DiT's keyframe vector.
     pub marks: Vec<bool>,
     /// The video's own shape, at the frame rate the DiT is told.
@@ -80,6 +85,7 @@ impl State {
             latent: tokens,
             mask: vec![1.0; n],
             positions: shape.video_positions(),
+            reach: vec![16.0; n],
             marks: (0..n).map(|i| i < shape.frame_tokens()).collect(),
             shape,
             slots: None,
@@ -118,11 +124,12 @@ impl State {
         self.shape.video_tokens()
     }
 
-    fn push(&mut self, latent: &[f32], clean: &[f32], mask: f32, positions: [Vec<f32>; 3], mark: bool) {
+    fn push(&mut self, latent: &[f32], clean: &[f32], mask: f32, positions: [Vec<f32>; 3], scale: usize, mark: bool) {
         let n = positions[0].len();
         self.latent.extend_from_slice(latent);
         self.clean.extend_from_slice(clean);
         self.mask.extend(std::iter::repeat_n(mask, n));
+        self.reach.extend(std::iter::repeat_n((16 * scale) as f32, n));
         for (all, p) in self.positions.iter_mut().zip(positions) {
             all.extend(p);
         }
@@ -159,7 +166,7 @@ impl State {
         }
         let clean: Vec<f32> = host(&video_tokens(keyframe)?)?.into_iter().map(bf16).collect();
         let places = self.one_frame(frame, rows, cols, 1);
-        self.push(&vec![0.0; clean.len()], &clean, bf16_mask(strength), places, false);
+        self.push(&vec![0.0; clean.len()], &clean, bf16_mask(strength), places, 1, false);
         Ok(self)
     }
 
@@ -186,7 +193,7 @@ impl State {
         for (k, &f) in frames.iter().enumerate() {
             let places = self.one_frame(f, rows, cols, 1);
             let part = &latent[k * per * C..(k + 1) * per * C];
-            self.push(part, &vec![0.0; part.len()], 1.0, places, true);
+            self.push(part, &vec![0.0; part.len()], 1.0, places, 1, true);
         }
         self.slots = Some((first, frames.to_vec()));
         Ok(self)
@@ -212,7 +219,7 @@ impl State {
         let clean = host(&video_tokens(latent)?)?;
         // Its mask in its dtype, which is f32 in DFR; 0 at strength 1
         // whichever.
-        self.push(&vec![0.0; clean.len()], &clean, 1.0 - strength, places, false);
+        self.push(&vec![0.0; clean.len()], &clean, 1.0 - strength, places, downscale, false);
         Ok(self)
     }
 

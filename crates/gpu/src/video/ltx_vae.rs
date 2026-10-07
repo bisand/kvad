@@ -548,6 +548,60 @@ fn fold(x: &Tensor, [p1, p2, p3]: [usize; 3]) -> candle_core::Result<Tensor> {
         .reshape((t / p1, c * p1 * p2 * p3, h / p2, w / p3))
 }
 
+/// A picture `rgb` of `width × height` stretched to twice each, by a Lanczos
+/// filter of three lobes: Pillow's `resize(..., LANCZOS)` on 8-bit RGB, to
+/// the bit, which is what the reference's `lanczos_x2_fhwc` calls for the
+/// keyframes of DFR's spatial epilogue.
+///
+/// Columns first and then rows, each output pixel a weighted sum of up to
+/// seven of the input's, about the place `(i + ½)/2` it falls at. The
+/// weights are `sinc(x)·sinc(x/3)`, scaled to sum to 1 and then rounded to
+/// 22 bits; a sum is rounded to 8 bits and clamped, between the passes too.
+pub fn lanczos_x2(rgb: &[u8], width: usize, height: usize) -> candle_core::Result<Vec<u8>> {
+    if rgb.len() != width * height * 3 || width == 0 || height == 0 {
+        candle_core::bail!("a {width}×{height} picture of {} bytes", rgb.len());
+    }
+    const BITS: u32 = 22;
+    let sinc = |x: f64| if x == 0.0 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+    let lanczos = |x: f64| if -3.0 < x && x < 3.0 { sinc(x) * sinc(x / 3.0) } else { 0.0 };
+    // For each output pixel along a side of `n`: its first input pixel and
+    // its weights.
+    let weights = |n: usize| -> Vec<(usize, Vec<i64>)> {
+        (0..2 * n)
+            .map(|i| {
+                let center = (i as f64 + 0.5) * 0.5;
+                let lo = ((center - 3.0 + 0.5) as i64).max(0) as usize;
+                let hi = ((center + 3.0 + 0.5) as i64).min(n as i64) as usize;
+                let k: Vec<f64> = (lo..hi).map(|x| lanczos(x as f64 - center + 0.5)).collect();
+                let sum: f64 = k.iter().sum();
+                let fixed = |w: f64| if w < 0.0 { (-0.5 + w * (1i64 << BITS) as f64) as i64 } else { (0.5 + w * (1i64 << BITS) as f64) as i64 };
+                (lo, k.iter().map(|w| fixed(if sum != 0.0 { w / sum } else { *w })).collect())
+            })
+            .collect()
+    };
+    let round = |sum: i64| (sum >> BITS).clamp(0, 255) as u8;
+    let (wide, tall) = (2 * width, 2 * height);
+    let mut across = vec![0u8; height * wide * 3];
+    for (x, (lo, k)) in weights(width).iter().enumerate() {
+        for y in 0..height {
+            for c in 0..3 {
+                let sum: i64 = (1 << (BITS - 1)) + k.iter().enumerate().map(|(j, w)| rgb[(y * width + lo + j) * 3 + c] as i64 * w).sum::<i64>();
+                across[(y * wide + x) * 3 + c] = round(sum);
+            }
+        }
+    }
+    let mut out = vec![0u8; tall * wide * 3];
+    for (y, (lo, k)) in weights(height).iter().enumerate() {
+        for x in 0..wide {
+            for c in 0..3 {
+                let sum: i64 = (1 << (BITS - 1)) + k.iter().enumerate().map(|(j, w)| across[((lo + j) * wide + x) * 3 + c] as i64 * w).sum::<i64>();
+                out[(y * wide + x) * 3 + c] = round(sum);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// A picture `rgb` of `width × height` scaled to cover `w × h` and cut to it
 /// from the middle, as `[3, h, w]` in `[−1, 1]`, f32, on the host: how the
 /// reference prepares a picture for the encoder.
@@ -729,6 +783,32 @@ const MISSES: usize = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pillow 12.3's `resize((2w, 2h), LANCZOS)` of a 7 × 5 picture, to the
+    /// bit.
+    #[test]
+    fn lanczos_is_pillow_s() {
+        let (w, h) = (7usize, 5usize);
+        let rgb: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| (0..3).map(move |c| ((37 * x * x + 91 * y + 53 * c + 11 * x * y * (c + 1)) % 256) as u8))).collect();
+        let want: [u8; 420] = [
+            0, 46, 81, 0, 40, 96, 1, 47, 134, 71, 111, 202, 156, 200, 255, 161, 222, 254, 91, 175, 205, 32, 133, 191, 32, 134, 207, 96, 172, 145,
+            172, 216, 27, 151, 194, 27, 62, 132, 116, 3, 91, 182, 9, 59, 141, 15, 71, 121, 34, 99, 101, 70, 143, 140, 105, 170, 220, 120, 159, 240,
+            113, 121, 192, 106, 88, 178, 109, 89, 198, 119, 137, 138, 130, 196, 25, 119, 186, 29, 95, 125, 122, 81, 83, 188, 46, 94, 220, 67, 128, 151,
+            98, 177, 53, 81, 186, 45, 35, 126, 155, 56, 69, 204, 144, 45, 160, 215, 31, 151, 221, 35, 177, 156, 90, 123, 71, 161, 20, 75, 161, 34,
+            146, 106, 133, 197, 66, 201, 121, 183, 190, 156, 190, 137, 195, 187, 56, 141, 165, 29, 25, 122, 88, 17, 83, 111, 126, 62, 83, 217, 59, 99,
+            224, 73, 148, 159, 109, 108, 79, 142, 12, 96, 125, 46, 182, 81, 169, 241, 52, 249, 176, 255, 56, 211, 205, 79, 249, 110, 111, 215, 86, 112,
+            108, 166, 72, 52, 203, 33, 72, 172, 24, 96, 169, 67, 101, 195, 128, 126, 191, 95, 162, 148, 6, 173, 94, 53, 162, 62, 191, 152, 48, 255,
+            139, 215, 12, 162, 171, 44, 196, 94, 96, 215, 86, 123, 189, 169, 100, 142, 206, 80, 99, 178, 79, 80, 195, 103, 93, 244, 125, 140, 221, 82,
+            183, 121, 8, 155, 38, 39, 89, 15, 140, 46, 14, 203, 41, 87, 94, 51, 112, 60, 81, 147, 22, 152, 158, 49, 221, 129, 144, 229, 97, 216,
+            188, 86, 214, 178, 130, 185, 205, 192, 130, 197, 176, 64, 136, 76, 14, 61, 0, 11, 15, 0, 36, 0, 0, 55, 16, 65, 186, 29, 91, 123,
+            65, 136, 37, 131, 154, 36, 189, 126, 148, 202, 103, 247, 179, 104, 255, 184, 121, 211, 213, 126, 120, 202, 122, 45, 140, 105, 14, 78, 79, 0,
+            49, 65, 0, 40, 58, 0, 69, 149, 219, 98, 113, 180, 143, 70, 120, 165, 82, 86, 138, 159, 115, 107, 212, 170, 94, 213, 201, 98, 175, 176,
+            121, 103, 97, 161, 102, 31, 193, 175, 7, 183, 208, 8, 148, 196, 12, 123, 177, 18, 111, 211, 230, 150, 133, 212, 200, 28, 174, 190, 34, 121,
+            104, 182, 91, 41, 255, 111, 36, 255, 154, 40, 211, 147, 58, 94, 84, 131, 95, 26, 228, 220, 3, 252, 255, 16, 213, 255, 37, 178, 249, 53,
+        ];
+        assert_eq!(lanczos_x2(&rgb, w, h).unwrap(), want);
+        assert!(lanczos_x2(&rgb, w, h + 1).is_err());
+    }
 
     /// A residual step done a few frames at a time is the step done whole,
     /// with the decoder's padding and with the encoder's causal one, whose

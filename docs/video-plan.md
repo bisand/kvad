@@ -928,9 +928,10 @@ LoRA, stage 2 is 28.5 dB from the reference's with it, so it does its part.
 frames with the temporal upsampler, 49 at 48 fps to 97 at 96, and the
 keyframes' places double with them into seams. The clip is cut at the seams
 into `2^round` tiles, the leftover segments going to the first. Every tile
-after the first starts a segment and one latent frame early, a lead-in that
-it denoises for context and then drops, so the tile before keeps the seam's
-frame and nothing is blended. Each tile holds its seams as anchors at 0.95
+after the first started a segment and one latent frame early, a lead-in that
+it denoised for context and then dropped (until the reference's 1.4.0; now
+it starts on a keyframe and is given the frames before its seam, see
+below). Each tile holds its seams as anchors at 0.95
 and generates a keyframe halfway between each pair of marks, seeded from the
 video's nearest latent frame. It is re-noised to 0.975 and takes four
 ancestral steps at η 0.5, the tokens blended towards their clean latents
@@ -962,8 +963,8 @@ Exact in f32 the first time it ran. Unit tests pin the tile plans for both
 rounds and for five segments in two tiles, and a tile's sound.
 
 That was the reference's 1.3. Its 1.4.0 lays the tiles out another way,
-and these figures cannot be made again: see "The reference's temporal
-rounds moved too" below.
+and so does Kvad now: see "The reference's temporal rounds moved too"
+below, which has the figures against 1.4.
 
 **Step 5, the keyframe-aware decode** (`ltx_diffvae::DiffDecoder::decode_keyed`).
 DFR decodes with its keyframes beside the video, as a second stream of
@@ -1071,10 +1072,11 @@ made it (`kvad.pipeline`, migration 015).
   clip is decoded without them.
 
 **Admission.** DFR's largest DiT call is not always stage 2. Each temporal
-round's tiles carry a segment of lead-in, their anchors and their new
+round's tiles carry the frames they are given, their anchors and their new
 keyframes. For 121 frames, stage 2 holds 25 latent frames of tokens: 16 of
-video, 5 keyframes and a reference of 4. At 48 fps the round's second tile
-holds 26, and at 96 fps a tile holds 34. `kvad::video::dfr_frames` counts
+video, 5 keyframes and a reference of 4. At 48 fps a round's largest tile
+holds 25 too, and at 96 fps 28 (26 and 34 before the reference's 1.4.0
+layout). `kvad::video::dfr_frames` counts
 the largest call from the canvas and the tile plans, which now live in the
 `kvad` crate so that a request is checked before it is queued. A DFR clip is
 admitted when that call is no more than the fast pipeline's largest at the
@@ -1579,28 +1581,59 @@ every 10 dB is ten times less error power.
   | the reference's own bf16, MPS | 37.3, 37.4, 48.6 dB | 34.1, 32.8 dB | 36.7, 36.8, 52.2 dB |
 
   So DFR's ancestral stages are the reference's.
-- **The reference's temporal rounds moved too, and Kvad's have not.** The
-  port found it; the changelog does not say it. Until 1.4.0 a tile after
-  the first began a segment and a latent frame early, on the upsampled
-  video, denoised that lead-in for context and dropped it: what
-  `ltx_dfr::round` does. Since 1.4.0 (`dfr_helpers/ops.py`, `TilePrefix`
-  and `lead_in_carryover`) such a tile begins on the last keyframe's plane
+- **The reference's temporal rounds moved too, and Kvad's followed.** The
+  port of the fixtures found it; the changelog does not say it. Until
+  1.4.0 a tile after the first began a segment and a latent frame early,
+  on the upsampled video, denoised that lead-in for context and dropped
+  it. Since 1.4.0 (`dfr_helpers/ops.py`, `TilePrefix` and
+  `lead_in_carryover`) such a tile begins on the last keyframe's plane
   before its seam, as its one-frame first cell, followed by the video from
   there to the seam taken from the tile before as that tile left it and
   held at strength 1, and it denoises from the frame after the seam. The
   reference's reasons: a tile's first cell is read as a single frame, which
   a mid-clip cell is not, so RoPE's time ran seven frames ahead inside a
-  tile; and the two tiles now agree at the seam by construction. A seam's
-  own anchor is dropped where the pinned cells cover it, and a tile may
-  start on a keyframe an earlier tile of the same round made.
+  tile; and the two tiles now agree at the seam by construction. The tiles
+  share no segment, a new keyframe sits at the middle of each of the
+  clip's segments, and a tile may start on a keyframe an earlier tile of
+  the same round made.
 
-  The tiles are other sizes (the second of round 1 is 12 latent frames of
-  tokens there and 17 here), so the fixtures' draws do not fit Kvad's
-  rounds and `examples/ltx_dfr.rs` says "NOT COMPARED" where the rounds'
-  figures were. Kvad's rounds are still what step 4 measured against 1.3;
-  nothing checks them against a reference any more, since the script no
-  longer makes 1.3's fixtures. Following the reference here is its own
-  piece of work, with clips at 48 and 96 fps to compare.
+  `kvad::video::dfr_tiles` is that plan now (its unit tests are the
+  reference's own plans, asked of its 1.4.2), `ltx_cond::State::held`
+  holds several latent frames, and `ltx_dfr::round` gives a tile its plane
+  and the frames before its seam. Against the reference's
+  `run_one_temporal_round`, on from the stages above, every draw replayed,
+  the DiT cut to two blocks:
+
+  | | Round 1: video, new keyframes | Round 2: video, new keyframes |
+  |---|---|---|
+  | f32, CPU | 106.4, 106.4 dB | 106.9, 106.9 dB |
+  | bf16, Metal (upsamplers f32) | 35.0, 34.8 dB | 37.4, 37.4 dB |
+  | the reference's own bf16, MPS (all keyframes) | 34.9, 35.6 dB | 36.9, 36.2 dB |
+
+  The seams' keyframes a round carries are 77 dB in f32: both sides round
+  them to bf16, where a last bit's difference before is a whole bf16 step
+  after.
+
+  A tile's call is smaller: for 121 frames the largest is 25 latent frames
+  of tokens at 48 fps and 28 at 96, where it was 26 and 34, so a round is
+  quicker and admission (`dfr_frames`, and the web form's copy) lets a
+  little more through.
+
+  Through the service on an M5 Pro, q8, 768×512, 5 s, "a fox trots through
+  fresh snow towards the camera", seed 3, before and after:
+
+  | | Denoise | Decode | Step into the frame after the tiles' seam |
+  |---|---|---|---|
+  | 241 frames at 48 fps, before | 291.9 s | 51.4 s | 1.13× the clip's median |
+  | after | 276.6 s | 47.7 s | 1.08× |
+  | 481 frames at 96 fps, before | 725.5 s | 98.9 s | not measured |
+
+  At 48 fps neither clip jumps where its two tiles meet (frame 144 to
+  145, by the mean change in luma from frame to frame, and by looking at
+  frames 143 to 146), the two are the same clip but for the second tile,
+  and the sound is the same to the last digit, being stage 1's. The 96 fps
+  clip after the change was still being made when this was written, and
+  its seams were not looked at in either.
 - **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
   6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
   profiling before two stages quadruple the tokens.

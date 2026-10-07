@@ -154,11 +154,11 @@
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <label class="flex flex-col gap-1">
           <span class="text-sm opacity-70">Width</span>
-          <input class="input" type="number" step={d?.multiple ?? 64} min="64" bind:value={v.width} placeholder={d?.width ?? "default"} />
+          <input class="input" type="number" step={v.multiple} min="64" bind:value={v.width} placeholder={d?.width ?? "default"} />
         </label>
         <label class="flex flex-col gap-1">
           <span class="text-sm opacity-70">Height</span>
-          <input class="input" type="number" step={d?.multiple ?? 64} min="64" bind:value={v.height} placeholder={d?.height ?? "default"} />
+          <input class="input" type="number" step={v.multiple} min="64" bind:value={v.height} placeholder={d?.height ?? "default"} />
         </label>
         <label class="flex flex-col gap-1">
           <span class="text-sm opacity-70">Seconds</span>
@@ -213,10 +213,17 @@
             bind:value={v.pipeline}
             disabled={v.guided}
           >
-            <option value={null}>Pipeline: {v.dfr ? "DFR, for the frame rate" : "fast"}</option>
+            <option value={null}>Pipeline: {v.dfr ? (v.rounds() > 0 ? "DFR, for the frame rate" : "DFR, for the epilogue") : "fast"}</option>
             <option value="fast">Fast pipeline</option>
             <option value="dfr">DFR, production quality</option>
           </select>
+          <label
+            class="label text-sm"
+            title="DFR's spatial epilogue, for large sizes: the clip is made at half the width and height, then upsampled once more and detailed in overlapping tiles at the size asked for. Width and height must be multiples of 128, and it takes several times as long."
+          >
+            <input type="checkbox" class="checkbox checkbox-sm" bind:checked={v.epilogue} disabled={v.guided || v.pipeline === "fast"} />
+            Epilogue
+          </label>
         {/if}
       </div>
       <Loras form={v} takes={d ? d.takes_loras : null} busy={v.starting} />
@@ -373,7 +380,7 @@
             <figcaption class="flex flex-col gap-1 p-3">
               <p class="line-clamp-2 text-sm" title={g.prompt}>{g.prompt}</p>
               <p class="text-xs opacity-60">
-                {g.size} · {lengthOf(g)} · seed {g.kvad.seed}{#if g.kvad.guided}{" · "}guided, {g.kvad.guided.steps} steps{/if}{#if g.kvad.pipeline === "dfr"}{" · "}DFR{/if}{#if g.kvad.decoder === "conv"}{" · "}conv decoder{/if}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
+                {g.size} · {lengthOf(g)} · seed {g.kvad.seed}{#if g.kvad.guided}{" · "}guided, {g.kvad.guided.steps} steps{/if}{#if g.kvad.pipeline === "dfr"}{" · "}DFR{/if}{#if g.kvad.epilogue}{" · "}epilogue{/if}{#if g.kvad.decoder === "conv"}{" · "}conv decoder{/if}{#if !g.kvad.audio} · no sound{/if}{#if g.kvad.picture_url}{" · "}<a
                     class="link"
                     href={g.kvad.picture_url}
                     target="_blank"

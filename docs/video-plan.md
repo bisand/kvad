@@ -42,8 +42,9 @@ read. These points are corrected here and should be corrected there.
   no one-stage path. It denoises at half the width and height, upsamples the
   latent ×2 with a learned upsampler, then runs 3 more steps at full size.
   So the upsampler is part of the pipeline, not a later extra.
-- **Stage 1 on 2.5 samples ancestrally.** It is not deterministic Euler.
-  Fresh noise is added at every step from a second RNG.
+- **Both stages on 2.5 sample ancestrally.** It is not deterministic Euler.
+  Fresh noise is added at every step from a second RNG. Stage 2 has done so
+  since the reference's 1.4.0; see "The reference moved" below.
 - **The audio rate is 48 kHz.** The BWE vocoder config says
   `output_sampling_rate: 48000`, which settles the 24-vs-48 question.
 - **The distilled pipeline predicts the frame count by default.** When no
@@ -404,7 +405,8 @@ LTX-2.5 branches.
   f32.
 - The reference uses one seeded generator, drawn in a fixed order: stage-1
   video, stage-1 audio, stage-2 video, stage-2 audio. The ancestral noise
-  comes from a second generator seeded `seed + 10000`. Bit-matching the
+  comes from a second generator seeded `seed + 10000`, and stage 2's from a
+  third, `seed + 20000`. Bit-matching the
   reference would mean reproducing torch's Philox RNG. **We do not**: a kvad
   seed gives a repeatable kvad video, not the reference's video. Parity tests
   inject the reference's noise instead.
@@ -447,7 +449,7 @@ The code should compute these, and a test should check them against this
 table. The values were derived from the reference's formula, not printed by
 it.
 
-### Upsampler, then stage 2: 3 steps, deterministic
+### Upsampler, then stage 2: 3 steps, ancestral
 
 - The upsampler works on **un-normalised** latents: `x·std + mean`, upsample,
   then `(x − mean)/std`. The per-channel `std` and `mean` are the
@@ -461,8 +463,11 @@ it.
 
   All padding is zeros.
 - Stage 2 re-noises **both** latents, `0.090625·x + 0.909375·ε`, then steps
-  σ = `[0.909375, 0.725, 0.421875, 0]` by plain Euler,
-  `x ← x + v·(σₙ − σ)`. The audio is refined again, not frozen.
+  σ = `[0.909375, 0.725, 0.421875, 0]` as stage 1 steps its last three:
+  rows 5 and 6 of the table above, each with noise of its own for the video
+  and for the sound, and then the prediction. The audio is refined again,
+  not frozen. Until the reference's 1.4.0 these were plain Euler,
+  `x ← x + v·(σₙ − σ)`, and the dev model's stage 2 still is.
 - The docs say stage 2 has 4 steps. The code runs 3: four sigmas make three
   steps.
 
@@ -881,7 +886,8 @@ less and the longer on a tie, and puts a keyframe at the end of each: 121
 frames are five segments of 24, keyframes at 24, 48, 72, 96 and 120. Above
 30 fps the DiT is told 60, with the sound still timed at the clip's own
 rate. Stage 1 is the distilled schedule's eight steps at half size with the
-keyframe slots, *plain* Euler where the plain pipeline's are ancestral. The
+keyframe slots, ancestral at η 1 as the plain pipeline's are (plain Euler
+until the reference's 1.4.0, and when this step was checked). The
 video and the keyframes are then upsampled apart, the keyframes as a clip of
 their own. Stage 2 re-noises both to 0.909375 and takes three steps with
 stage 1's video appended as a clean reference latent at half size and the
@@ -890,7 +896,10 @@ which reads it, and then dropped: DFR ships stage 1's.
 
 A step is the reference's `X0Model` and `post_process_latent`. Each token's
 prediction is `x − σ·m·v`, rounded, blended `x₀·m + clean·(1 − m)` in f32 and
-rounded again, then one Euler step for every token at the step's σ.
+rounded again, then one Euler step for every token at the step's σ. That
+is η 0, which the table below was measured at. At η 1, as the pipeline now
+runs, the step is the rounds' ancestral one (step 4), blended again after
+its noise.
 
 The LoRA is `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`, 0.33
 GB, a gated repo apart from LTX-2.5's own: its terms have to be accepted on
@@ -1497,9 +1506,64 @@ every 10 dB is ten times less error power.
   `ltx_sample::tests::the_sound_of_a_fast_clip_is_not_a_train_of_clicks`
   is the check, on the weights of the machine: 5.8 with the fix and 11.1
   without.
-- **The reference has moved since** (its 1.4.0, 29 September 2026): the
-  distilled pipeline's stage 2 is ancestral too, and DFR's stages 1 and 2
-  and its spatial epilogue. Ours are as its 1.3 had them, plain Euler.
+- **The reference moved, and Kvad followed.** Since its 1.4.0 (29
+  September 2026; read at 1.4.2, `9ec55f9`) the reference samples with
+  Euler ancestral, η 1 and noise scale 1, wherever a distilled LTX-2.5
+  checkpoint denoises: the distilled pipeline's stage 2 as well as its
+  stage 1, and DFR's stages 1 and 2 and its spatial epilogue. Each pass
+  seeds its noise apart (`seed + 10000`, `+ 20000`, `+ 30000`). Its 1.3 had
+  said of stage 2 that "its 3-step refinement schedule is too short to
+  remove freshly injected noise"; the changelog gives no reason for the
+  change of mind, only that the output differs. DFR's temporal tiles stay
+  at η 0.5, and `ti2vid_two_stages`, the dev model's, stays Euler.
+
+  Kvad's `refine` and DFR's `first` and `second` take an η now:
+  `ltx_sample::ETA`, 1, for the distilled model, and 0 for the dev model's
+  stage 2. Three steps are two that add noise and the prediction. Each
+  draw has a stream of its own: 102 to 105 in `refine`, after the two that
+  re-noise, and the next of the request's counter in DFR. There is no
+  spatial epilogue here to change.
+
+  Before and after, on an M5 Pro at q8, 768×512 × 121 at 24 fps, same
+  prompt and seed, from `ffmpeg -af astats`, a `showspectrumpic`
+  spectrogram, and the frames looked at:
+
+  | Clip | | Peak | RMS | Crest factor (L, R) | Spectrogram | Edges |
+  |---|---|---|---|---|---|---|
+  | Fast, a fox in falling snow, seed 3 | Euler | −12.6 dB | −30.0 dB | 8.1, 6.4 | an even floor, no lines | 22.0 |
+  | | ancestral | −16.3 dB | −31.4 dB | 5.9, 4.8 | the same | 20.1 |
+  | Fast, a retriever on a beach that barks, seed 1 | Euler | −0.1 dB | −19.5 dB | 9.4, 9.3 | three bursts with harmonics over surf | 33.8 |
+  | | ancestral | −0.8 dB | −20.2 dB | 9.1, 9.3 | the same three, at the same times | 31.7 |
+  | DFR, the fox, seed 3 | Euler | −7.4 dB | −23.7 dB | 5.4, 5.5 | a low floor that steps up twice | 27.1 |
+  | | ancestral | −10.9 dB | −25.4 dB | 4.6, 4.8 | a low floor that steps up three times | 28.9 |
+
+  "Edges" is the mean of a Sobel filter over every frame's luma, a rough
+  figure for detail.
+
+  - **The sound is not harmed.** No clip has the vertical broadband lines
+    of a click train, and no crest factor rose. That was the worry: an
+    ancestral stage 2 puts noise into the sound at σ 0.725 and 0.42 with
+    one step left to remove it.
+  - **The fast pipeline's picture is the same picture**, since stage 1 is
+    unchanged: the same fox, the same turn of its head, the same dog and
+    waves. It is a little softer, 9% and 6% fewer edges and a latent 3%
+    smaller (RMS 0.906 to 0.875, and 1.006 to 0.978), which shows at 2× on
+    the fox's fur and not at full size. Nothing is broken and nothing is
+    plainly better.
+  - **DFR's is another clip**, since its stage 1 changed: a closer, greyer
+    fox with more texture where Euler made a small pale one by a tree. One
+    pair says nothing about which pipeline makes the better clips.
+  - A seed's clip is another clip than before in both pipelines.
+
+  So this follows the reference because it is the reference, and because
+  nothing measured says not to: it is not a measured gain. One prompt for
+  DFR and two for the fast pipeline, and nobody listened.
+
+  `examples/ltx_dfr.rs` still checks DFR's stages at η 0: its fixtures are
+  the reference's 1.3, and `scripts/ltx-fixtures.py` is written against
+  1.3's modules (`dfr_layout`, the helpers in `dfr_pipeline`), which 1.4.0
+  moved. The ancestral step it would check is the one the rounds' check
+  already covers. Porting the script is not done.
 - **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
   6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
   profiling before two stages quadruple the tokens.
@@ -1516,7 +1580,8 @@ every 10 dB is ten times less error power.
   and so is the reference's own bf16 on MPS. It is 498 M parameters and a
   few seconds of work, so kvad runs it in f32.
 - **Stage 2** re-noises both latents to σ = 0.909375 and takes three Euler
-  steps, sound included.
+  steps, sound included. (Ancestral steps since the reference's 1.4.0: see
+  "The reference moved" above.)
 - **The decoder had to go chunked by blocks, as this plan said it
   should.** Chunking each convolution was not enough:
   - a residual step done whole keeps about five full-size tensors alive,

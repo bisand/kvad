@@ -13,7 +13,8 @@
 //! 2. the DiT runs stage 1's eight steps at half the width and height; the
 //!    upsampler doubles the video latent (in f32: in bf16 it is 27 dB from
 //!    exact, the reference's own bf16 included); the DiT refines both
-//!    latents in three steps at the full size; and it is dropped;
+//!    latents in three steps at the full size, ancestral too; and it is
+//!    dropped;
 //! 3. the video decoder and the audio path decode, and the MP4 is written.
 //!    The video decoder is the diffusion decoder by default, as the
 //!    pipeline's is, its last step from the noise of the seed; `--decoder
@@ -47,7 +48,7 @@
 use candle_core::{DType, Device, Tensor};
 use kvad::weights::{fetch_file, Watcher};
 use kvad_gpu::video::ltx_dit::{Dit, Shape};
-use kvad_gpu::video::ltx_sample::{dev_sigmas, guided, one_stage, refine, Latents, AUDIO_GUIDE, DEV_STEPS, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
+use kvad_gpu::video::ltx_sample::{dev_sigmas, guided, one_stage, refine, Latents, AUDIO_GUIDE, DEV_STEPS, ETA, NEGATIVE_PROMPT, STAGE_1, STAGE_2, VIDEO_GUIDE};
 use kvad_gpu::video::ltx_text::{Contexts, TextEncoder, DEV_FILE, DISTILLED_LORA, DIT_FILE, TEXT_FILE};
 use kvad_gpu::video::{ltx_audio, ltx_diffvae, ltx_upsample, ltx_vae, LTX_REPO};
 use std::time::Instant;
@@ -219,7 +220,8 @@ fn main() -> Res<()> {
                 };
                 let grid = second.grid(shape)?;
                 let stage_1_audio = l.audio.clone();
-                let l = refine(second, &ctx, &grid, &Latents { video, audio: l.audio }, seed, still_2, &mut report(2, STAGE_2.len() - 1))?;
+                let eta = if dev.is_some() { 0.0 } else { ETA };
+                let l = refine(second, &ctx, &grid, &Latents { video, audio: l.audio }, seed, eta, still_2, &mut report(2, STAGE_2.len() - 1))?;
                 eprintln!("   stage 2 at {}×{} in {:.1} s", shape.width, shape.height, t.elapsed().as_secs_f64());
                 match dev {
                     // The reference keeps stage 1's sound: stage 2 refines

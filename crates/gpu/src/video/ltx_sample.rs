@@ -10,10 +10,17 @@
 //!    `euler_ancestral_denoising_loop` does, drawing the video's and then
 //!    the sound's at every step.
 //! 2. The video latent is upsampled ×2 (`ltx_upsample`), and [`refine`]
-//!    re-noises both latents to σ = 0.909375 and takes three plain Euler
-//!    steps at the full size. The sound is refined too, not frozen.
+//!    re-noises both latents to σ = 0.909375 and takes three steps at the
+//!    full size, ancestral as stage 1's are: two that add noise and the
+//!    last, which is the prediction. The sound is refined too, not frozen.
 //!
 //! Stage 1 alone at the full size is the cheaper, rougher path.
+//!
+//! Stage 2 was plain Euler until the reference's 1.4.0, which had said that
+//! three steps are too few to remove noise put in afresh and then made them
+//! ancestral all the same, on LTX-2.5's checkpoints. The dev model's stage 2
+//! (its `ti2vid_two_stages`) is still Euler there and here: [`refine`]'s
+//! `eta` 0.
 //!
 //! The DiT predicts velocity `v = ε − x₀`, with `x_σ = (1 − σ)·x₀ + σ·ε`, so
 //! `x₀ = x − σ·v`. The latents are kept in bf16 between steps, as the
@@ -46,13 +53,15 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 pub const STAGE_1: [f32; 9] = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0];
 
 /// Stage 2's noise levels: the upsampled latent is re-noised to the first,
-/// then three Euler steps. (The reference's docs say four steps; four
-/// levels make three.)
+/// then three steps. (The reference's docs say four steps; four levels make
+/// three.)
 pub const STAGE_2: [f32; 4] = [0.909375, 0.725, 0.421875, 0.0];
 
 /// How much of each step's deterministic move is replaced by noise: 1 is
-/// fully ancestral, 0 plain Euler.
-const ETA: f32 = 1.0;
+/// fully ancestral, 0 plain Euler. The distilled model's, in both stages
+/// and in DFR's first two: the reference's `ANCESTRAL_ETA`. Its
+/// `ANCESTRAL_S_NOISE`, a scale on the noise, is 1 and is not written here.
+pub const ETA: f32 = 1.0;
 
 /// One ancestral step from σ to σₙ, as `x ← a·(r·x + (1 − r)·x₀) + c·ε`.
 ///
@@ -80,6 +89,16 @@ impl Ancestral {
         let (alpha_next, alpha_down) = (1.0 - next, 1.0 - down);
         let c = (next * next - (down * down) * (alpha_next * alpha_next) / (alpha_down * alpha_down)).max(0.0).sqrt();
         Ancestral { a: alpha_next / alpha_down, r, c }
+    }
+
+    /// The step itself, from `x` and the prediction `x0` in their dtype and
+    /// noise drawn from `seed`, a stream that is this draw's alone
+    /// (`image::nn::stream`): in f32, rounded to `x`'s dtype.
+    fn step(&self, x: &Tensor, x0: &Tensor, seed: u64) -> Res<Tensor> {
+        let (keep, f) = (x.dtype(), |t: &Tensor| t.to_dtype(DType::F32));
+        let det = ((f(x)? * self.r as f64)? + (f(x0)? * (1.0 - self.r) as f64)?)?;
+        let eps = noise(seed, x.dims(), x.device(), keep)?;
+        Ok(((det * self.a as f64)? + (f(&eps)? * self.c as f64)?)?.to_dtype(keep)?)
     }
 }
 
@@ -137,13 +156,8 @@ pub fn one_stage(dit: &Dit, ctx: &Contexts, grid: &Grid, seed: u64, still: Optio
                 (xv, xa) = (x0v, x0a);
             } else {
                 let k = Ancestral::new(s, next);
-                let update = |x: &Tensor, x0: &Tensor, draw: u64| -> Res<Tensor> {
-                    let det = ((f(x)? * k.r as f64)? + (f(x0)? * (1.0 - k.r) as f64)?)?;
-                    let eps = noise(stream(seed, draw), x.dims(), dev, keep)?;
-                    Ok(((det * k.a as f64)? + (f(&eps)? * k.c as f64)?)?.to_dtype(keep)?)
-                };
-                xv = hold(&update(&xv, &x0v, 2 + 2 * i as u64)?, still)?;
-                xa = update(&xa, &x0a, 3 + 2 * i as u64)?;
+                xv = hold(&k.step(&xv, &x0v, stream(seed, 2 + 2 * i as u64))?, still)?;
+                xa = k.step(&xa, &x0a, stream(seed, 3 + 2 * i as u64))?;
             }
             Ok(())
         })?;
@@ -162,10 +176,17 @@ pub(crate) fn euler(x: &Tensor, x0: &Tensor, sigma: f32, next: f32) -> candle_co
 }
 
 /// Stage 2: `latents`, the upsampled video and stage 1's sound, re-noised
-/// to [`STAGE_2`]'s first level and refined by three Euler steps at the
-/// grid's size; `still` is the picture at this size, when there is one.
-/// `step` hears each step as it ends; see [`OnStep`].
-pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u64, still: Option<&Tensor>, step: OnStep<'_>) -> Res<Latents> {
+/// to [`STAGE_2`]'s first level and refined by three steps at the grid's
+/// size; `still` is the picture at this size, when there is one. `step`
+/// hears each step as it ends; see [`OnStep`].
+///
+/// `eta` is how ancestral the steps are: [`ETA`] for the distilled model,
+/// as the reference's `distilled.py` has run its stage 2 since 1.4.0, and 0
+/// for the dev model's, plain Euler. An ancestral step draws the video's
+/// noise and then the sound's, as stage 1's does, each from a stream of its
+/// own, and the last is the prediction.
+#[allow(clippy::too_many_arguments)]
+pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u64, eta: f32, still: Option<&Tensor>, step: OnStep<'_>) -> Res<Latents> {
     let shape = grid.shape();
     let n0 = held(still, shape)?;
     let (dev, keep) = (dit.device(), DType::BF16);
@@ -189,9 +210,18 @@ pub fn refine(dit: &Dit, ctx: &Contexts, grid: &Grid, latents: &Latents, seed: u
             let (vv, va) = dit.forward(&xv, &xa, (s, s), n0, ctx, grid)?;
             let x0v = hold(&(f(&xv)? - (f(&vv)? * s as f64)?)?.to_dtype(keep)?, still)?;
             let x0a = (f(&xa)? - (f(&va)? * s as f64)?)?.to_dtype(keep)?;
-            // The picture's velocity is (x − x₀)/σ = 0, so it stays put.
-            xv = euler(&xv, &x0v, s, next)?;
-            xa = euler(&xa, &x0a, s, next)?;
+            if eta == 0.0 {
+                // The picture's velocity is (x − x₀)/σ = 0, so it stays put.
+                xv = euler(&xv, &x0v, s, next)?;
+                xa = euler(&xa, &x0a, s, next)?;
+            } else if next == 0.0 {
+                (xv, xa) = (x0v.clone(), x0a);
+            } else {
+                // Draws 102 to 105, after the two that re-noised.
+                let k = Ancestral::with_eta(s, next, eta);
+                xv = hold(&k.step(&xv, &x0v, stream(seed, 102 + 2 * i as u64))?, still)?;
+                xa = k.step(&xa, &x0a, stream(seed, 103 + 2 * i as u64))?;
+            }
             step(i, next, &x0v)
         })?;
     }
@@ -480,6 +510,27 @@ mod tests {
             let k = Ancestral::new(STAGE_1[i], STAGE_1[i + 1]);
             assert!((k.a - a).abs() < 1e-5 && (k.r - r).abs() < 1e-5 && (k.c - c).abs() < 1e-5, "step {i}: {k:?}");
         }
+    }
+
+    #[test]
+    fn stage_2_steps_as_stage_1_ends() {
+        // Stage 2's levels are stage 1's last four, so its two steps that
+        // add noise are rows 5 and 6 of the table above.
+        assert_eq!(STAGE_2, STAGE_1[5..]);
+        // And a step is the formula, on the noise of the stream it is given
+        // and of no other.
+        let dev = candle_core::Device::Cpu;
+        let x = Tensor::new(&[[0.8f32, -1.3], [2.0, 0.25]], &dev).unwrap();
+        let x0 = Tensor::new(&[[0.1f32, 0.4], [-0.7, 1.5]], &dev).unwrap();
+        let k = Ancestral::with_eta(STAGE_2[0], STAGE_2[1], ETA);
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = flat(&k.step(&x, &x0, stream(7, 102)).unwrap());
+        let eps = flat(&noise(stream(7, 102), &[2, 2], &dev, DType::F32).unwrap());
+        for (i, g) in got.iter().enumerate() {
+            let want = k.a * (k.r * flat(&x)[i] + (1.0 - k.r) * flat(&x0)[i]) + k.c * eps[i];
+            assert!((g - want).abs() < 1e-6, "{got:?}");
+        }
+        assert_ne!(got, flat(&k.step(&x, &x0, stream(7, 103)).unwrap()));
     }
 
     #[test]

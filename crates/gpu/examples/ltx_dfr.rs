@@ -7,7 +7,10 @@
 //! --upsampler … --vae …` wrote: a 512×320 × 49 clip at 48 fps, so keyframes
 //! at 24 and 48 and the DiT told 60 fps; the reference's stage 1 at 256×160
 //! with the DiT cut to its first two blocks, its video and keyframes
-//! upsampled, and its stage 2, with the noise each drew. `--detailing` is
+//! upsampled, and its stage 2, with the noise each drew: both by plain
+//! Euler, η 0, as the reference's 1.3 ran them and as the fixtures' script
+//! still does, where Kvad's pipeline now runs them at η 1 as its 1.4.0 does.
+//! The ancestral step itself is checked by the rounds. `--detailing` is
 //! the detailing IC-LoRA, when the fixtures were made with it. With
 //! `--temporal` there too, two temporal rounds follow: 97 frames at 96 fps
 //! in two tiles, then 193 at 192 in four.
@@ -117,7 +120,7 @@ fn main() -> Res<()> {
             Ok(())
         };
         let t = Instant::now();
-        let one = ltx_dfr::first(&dit, &ctx, half, sound, &canvas.keyframes, None, &mut replay, &mut |_, _, _| Ok(()))?;
+        let one = ltx_dfr::first(&dit, &ctx, half, sound, &canvas.keyframes, 0.0, None, &mut replay, &mut |_, _, _| Ok(()))?;
         device.synchronize()?;
         eprintln!("   stage 1 in {:.2} s", t.elapsed().as_secs_f64());
         say("stage 1", &one, 1)?;
@@ -139,7 +142,7 @@ fn main() -> Res<()> {
         };
         let from = Detailing { upsampled: &upsampled, keyframes: &keys, reference: &one.video, audio: &one.audio };
         let t = Instant::now();
-        let two = ltx_dfr::second(second, &ctx, full, sound, &canvas.keyframes, &from, downscale, None, &mut replay, &mut |_, _, _| Ok(()))?;
+        let two = ltx_dfr::second(second, &ctx, full, sound, &canvas.keyframes, &from, downscale, 0.0, None, &mut replay, &mut |_, _, _| Ok(()))?;
         device.synchronize()?;
         eprintln!("   stage 2 in {:.2} s", t.elapsed().as_secs_f64());
         say("stage 2", &two, 2)?;

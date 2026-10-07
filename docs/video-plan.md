@@ -897,9 +897,10 @@ which reads it, and then dropped: DFR ships stage 1's.
 A step is the reference's `X0Model` and `post_process_latent`. Each token's
 prediction is `x − σ·m·v`, rounded, blended `x₀·m + clean·(1 − m)` in f32 and
 rounded again, then one Euler step for every token at the step's σ. That
-is η 0, which the table below was measured at. At η 1, as the pipeline now
-runs, the step is the rounds' ancestral one (step 4), blended again after
-its noise.
+is η 0, which the table below was measured at, against the reference's
+1.3. At η 1, as the pipeline now runs, the step is the rounds' ancestral
+one (step 4), blended again after its noise; that is measured against the
+reference's 1.4 under "The reference moved" below.
 
 The LoRA is `Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`, 0.33
 GB, a gated repo apart from LTX-2.5's own: its terms have to be accepted on
@@ -959,6 +960,10 @@ where DFR keeps them in bf16, so that the f32 run is f32 throughout.
 
 Exact in f32 the first time it ran. Unit tests pin the tile plans for both
 rounds and for five segments in two tiles, and a tile's sound.
+
+That was the reference's 1.3. Its 1.4.0 lays the tiles out another way,
+and these figures cannot be made again: see "The reference's temporal
+rounds moved too" below.
 
 **Step 5, the keyframe-aware decode** (`ltx_diffvae::DiffDecoder::decode_keyed`).
 DFR decodes with its keyframes beside the video, as a second stream of
@@ -1560,11 +1565,42 @@ every 10 dB is ten times less error power.
   nothing measured says not to: it is not a measured gain. One prompt for
   DFR and two for the fast pipeline, and nobody listened.
 
-  `examples/ltx_dfr.rs` still checks DFR's stages at η 0: its fixtures are
-  the reference's 1.3, and `scripts/ltx-fixtures.py` is written against
-  1.3's modules (`dfr_layout`, the helpers in `dfr_pipeline`), which 1.4.0
-  moved. The ancestral step it would check is the one the rounds' check
-  already covers. Porting the script is not done.
+  **Checked against the reference since.** `scripts/ltx-fixtures.py --dfr`
+  now runs the reference's 1.4 (at 1.4.2), by its own
+  `dfr_stages.denoise_stage1`, `denoise_stage2` and
+  `run_one_temporal_round`, and saves each ancestral step's noise after
+  the stage's own. `examples/ltx_dfr.rs` runs Kvad's stages at η 1 on
+  those 22 draws, the DiT cut to two blocks, 512×320 × 49 at 48 fps:
+
+  | | Stage 1: video, keyframes, sound | Upsampled: video, keyframes | Stage 2: video, keyframes, sound |
+  |---|---|---|---|
+  | f32, CPU | 107.3, 107.4, 122.0 dB | 102.0, 102.3 dB | 106.5, 106.9, 131.5 dB |
+  | bf16, Metal (upsampler f32) | 37.9, 37.8, 46.2 dB | 38.2, 36.7 dB | 37.5, 37.7, 51.1 dB |
+  | the reference's own bf16, MPS | 37.3, 37.4, 48.6 dB | 34.1, 32.8 dB | 36.7, 36.8, 52.2 dB |
+
+  So DFR's ancestral stages are the reference's.
+- **The reference's temporal rounds moved too, and Kvad's have not.** The
+  port found it; the changelog does not say it. Until 1.4.0 a tile after
+  the first began a segment and a latent frame early, on the upsampled
+  video, denoised that lead-in for context and dropped it: what
+  `ltx_dfr::round` does. Since 1.4.0 (`dfr_helpers/ops.py`, `TilePrefix`
+  and `lead_in_carryover`) such a tile begins on the last keyframe's plane
+  before its seam, as its one-frame first cell, followed by the video from
+  there to the seam taken from the tile before as that tile left it and
+  held at strength 1, and it denoises from the frame after the seam. The
+  reference's reasons: a tile's first cell is read as a single frame, which
+  a mid-clip cell is not, so RoPE's time ran seven frames ahead inside a
+  tile; and the two tiles now agree at the seam by construction. A seam's
+  own anchor is dropped where the pinned cells cover it, and a tile may
+  start on a keyframe an earlier tile of the same round made.
+
+  The tiles are other sizes (the second of round 1 is 12 latent frames of
+  tokens there and 17 here), so the fixtures' draws do not fit Kvad's
+  rounds and `examples/ltx_dfr.rs` says "NOT COMPARED" where the rounds'
+  figures were. Kvad's rounds are still what step 4 measured against 1.3;
+  nothing checks them against a reference any more, since the script no
+  longer makes 1.3's fixtures. Following the reference here is its own
+  piece of work, with clips at 48 and 96 fps to compare.
 - **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
   6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
   profiling before two stages quadruple the tokens.

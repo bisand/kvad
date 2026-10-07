@@ -1701,12 +1701,28 @@ every 10 dB is ten times less error power.
 
   Both are coherent clips of a fox trotting, with no grid where the tiles
   meet and, at 48 fps, no jump where the windows do (frame 96 to 97, 0.96×
-  the median change). **That is all that was run.** 768×512 is not what
-  the epilogue is for, and is a worse clip than DFR without it makes
-  there, its first stage being 192×128; the sizes it is for, 1536×1024 and
-  above, were not run, the machine having no memory free for their decode
-  that day. No clip from a picture was made. The web form has no switch
-  for it: it is the API's `epilogue` field.
+  the median change). 768×512 is not what the epilogue is for, and is a
+  worse clip than DFR without it makes there, its first stage being
+  192×128.
+
+  **At 1536×1024**, the size it is for, through the installed service the
+  same day, the same prompt and seed, 3 s at 48 fps (stage 1 at 384×256,
+  stage 2 and the round at 768×512, the epilogue in two windows):
+
+  | | Denoise | Decode | Peak (`top`) |
+  |---|---|---|---|
+  | 145 frames at 48 fps, with the epilogue | 1058.0 s | 103.7 s | 27 GB |
+  | the same without it, measured earlier (above) | 975.9 s | 106.2 s | 30 GB |
+
+  A sharp, coherent clip: fur, whiskers and falling snow hold at full
+  size, there is no grid where the tiles meet, and no jump where the two
+  windows do (0.96× the median change again). It takes about as long as
+  DFR at that size without the epilogue and peaks 3 GB lower, the DiT
+  never holding the whole frame. The two rows are not one comparison: the
+  earlier clip was another prompt and seed, before the rounds' tiles
+  changed. One clip, looked at in frames and not played; none from a
+  picture; and the progress estimate ran ahead of it, 38% at twelve
+  minutes of twenty. The web form has the switch since #174.
 - **A step is twice the estimate above.** 29 s at 768×512 × 121 is about
   6.9 TFLOP/s against the 13 assumed from Qwen-Image. That is for
   profiling before two stages quadruple the tokens.

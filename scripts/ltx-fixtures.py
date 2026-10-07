@@ -1086,11 +1086,13 @@ def transformer(path, out, contexts, blocks, lora=None, guided=False, conditione
                         video_shape=canvas, audio_latent=audio_latent, source_duration=frames / fps, seed=seed,
                         sigmas=DISTILLED_SIGMAS[4:].to(dtype=torch.float32, device=dev), temporal_scale=VIDEO_SCALE_FACTORS.time, **common,
                     )
-                    keyframes = {p: k.to(torch.bfloat16) for p, k in keyframes.items()}
+                    # As the round left them: the seams' as they were given,
+                    # in bf16, and the new ones in the run's dtype.
                     rounds[f"round_{round_idx}_upsampled"] = c(doubled[-1])
                     rounds[f"round_{round_idx}_video"] = c(video_state.latent)
-                    rounds[f"round_{round_idx}_keyframes"] = c(torch.cat(list(keyframes.values()), dim=2))
+                    rounds[f"round_{round_idx}_keyframes"] = c(torch.cat([k.float() for k in keyframes.values()], dim=2))
                     rounds[f"round_{round_idx}_positions"] = torch.tensor(list(keyframes), dtype=torch.float32)
+                    keyframes = {p: k.to(torch.bfloat16) for p, k in keyframes.items()}
                     print(f"dit: DFR round {round_idx}, {2**round_idx} tiles, {canvas.frames} frames at {canvas.fps} fps, in {dtype} on {device}, {time.time() - t:.1f} s")
         return {
             "shape": torch.tensor([width, height, frames, fps]),

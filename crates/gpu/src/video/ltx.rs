@@ -599,7 +599,7 @@ impl DfrPlan {
             frames = 2 * (frames - 1) + 1;
             let doubled: Vec<usize> = seams.iter().map(|p| 2 * p).collect();
             let tiles = ltx_dfr::tiles(&doubled, frames, 1 << r).unwrap_or_default();
-            round_secs.push(tiles.iter().map(|t| step((t.end - t.start + t.anchors.len() + t.slots.len()) * full.frame_tokens()) * 4.0).sum());
+            round_secs.push(tiles.iter().map(|t| step((t.cells() + t.anchors.len() + t.slots.len()) * full.frame_tokens()) * 4.0).sum());
             let mut next: Vec<usize> = doubled.iter().copied().chain(tiles.iter().flat_map(|t| t.slots.iter().copied())).collect();
             next.sort_unstable();
             next.dedup();

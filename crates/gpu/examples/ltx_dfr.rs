@@ -12,9 +12,9 @@
 //! them since its 1.4.0 and as Kvad's pipeline does. `--detailing` is
 //! the detailing IC-LoRA, when the fixtures were made with it. With
 //! `--temporal` there too, two temporal rounds follow: 97 frames at 96 fps
-//! in two tiles, then 193 at 192 in four. Those are not compared since the
-//! reference's 1.4.0, which lays its tiles out another way than Kvad's
-//! rounds do: see `docs/video-plan.md`.
+//! in two tiles, then 193 at 192 in four, each tile after the first on a
+//! keyframe's plane and the frames it is given, as the reference's 1.4.0
+//! lays them out.
 //!
 //! 1. **The canvas** the reference laid out.
 //! 2. **f32, CPU**: both stages and the upsampling between them, each
@@ -161,24 +161,23 @@ fn main() -> Res<()> {
         };
         for r in 1..=rounds {
             let t = Instant::now();
-            clip = match ltx_dfr::round(&dit, &ctx, &up, &clip, r, &one.audio, canvas.frames as f64 / fps, None, &mut replay, &mut |_, _, _, _, _| Ok(())) {
-                Ok(c) => c,
-                // The reference's 1.4.0 starts every tile after the first on
-                // a keyframe's plane and pins its lead-in to the tile
-                // before. Kvad's rounds are its 1.3's, which denoise a
-                // lead-in and drop it: other tiles, of other sizes, that the
-                // draws of fixtures made since do not fit.
-                Err(e) => {
-                    eprintln!("   round {r}: NOT COMPARED. Kvad's tiles are the reference's 1.3's, and these fixtures' are not: {e}");
-                    return Ok(());
-                }
-            };
+            let seams: Vec<usize> = clip.positions.iter().map(|p| 2 * p).collect();
+            clip = ltx_dfr::round(&dit, &ctx, &up, &clip, r, &one.audio, canvas.frames as f64 / fps, None, &mut replay, &mut |_, _, _, _, _| Ok(()))?;
             device.synchronize()?;
             let w = |k: &str| get(&want, &format!("round_{r}_{k}"));
             let theirs: Vec<usize> = w("positions")?.to_vec1::<f32>()?.iter().map(|&p| p as usize).collect();
             eprintln!("   round {r} in {:.2} s: {} frames at {} fps, keyframes at {:?}{}", t.elapsed().as_secs_f64(), clip.frames, clip.fps, clip.positions,
                       if clip.positions == theirs { "" } else { " (DIFFERENT)" });
-            eprintln!("   round {r}: video {:5.1} dB, keyframes {:5.1} dB", db(&clip.video, &w("video")?)?, db(&clip.keyframes, &w("keyframes")?)?);
+            // The keyframes it made, and the seams' it carries: those are
+            // rounded to bf16 on both sides, where a last bit of difference
+            // before the rounding is a whole bf16 step after it.
+            let pick = |t: &Tensor, new: bool| -> Res<Tensor> {
+                let at: Vec<u32> = (0..clip.positions.len()).filter(|&i| seams.contains(&clip.positions[i]) != new).map(|i| i as u32).collect();
+                Ok(t.to_device(&Device::Cpu)?.index_select(&Tensor::from_vec(at.clone(), at.len(), &Device::Cpu)?, 1)?)
+            };
+            let k = w("keyframes")?;
+            eprintln!("   round {r}: video {:5.1} dB, new keyframes {:5.1} dB, carried {:5.1} dB", db(&clip.video, &w("video")?)?, db(&pick(&clip.keyframes, true)?, &pick(&k, true)?)?,
+                      db(&pick(&clip.keyframes, false)?, &pick(&k, false)?)?);
         }
         if drawn != want.keys().filter(|k| k.starts_with("noise_")).count() {
             return Err(format!("{drawn} draws used of the reference's {}", want.keys().filter(|k| k.starts_with("noise_")).count()).into());

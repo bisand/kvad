@@ -373,10 +373,13 @@ function dfrCanvas(frames) {
   return { frames: padded + 1, keyframes };
 }
 
-/** A temporal round's tiles, `kvad::video::dfr_tiles`. */
+/** A temporal round's tiles, `kvad::video::dfr_tiles`: `cells` is a tile's
+ *  latent frames, the ones it keeps and the ones before its seam that it
+ *  is given, from the last keyframe there. */
 function dfrTiles(seams, frames, count) {
   const bounds = [0, ...seams.map((p) => p / 8)];
-  const lead = bounds.length > 1 ? bounds[1] - bounds[0] + 1 : 0;
+  const marks = [0, ...seams];
+  const middles = seams.map((p, i) => Math.floor((marks[i] + p) / 2));
   const segments = bounds.length - 1;
   const n = Math.min(count, segments);
   const base = Math.floor(segments / n);
@@ -384,15 +387,18 @@ function dfrTiles(seams, frames, count) {
   const out = [];
   let cursor = 0;
   for (let t = 0; t < n; t++) {
-    const resume = bounds[cursor] + 1;
-    const start = t === 0 ? 0 : Math.max(0, resume - lead);
+    const start = t === 0 ? 0 : bounds[cursor] + 1;
     cursor += base + (t < leftover ? 1 : 0);
     const end = bounds[cursor] + 1;
     const [ps, pe] = [start * 8, (end - 1) * 8];
-    const anchors = seams.filter((p) => ps <= p && p <= pe);
-    const marks = [ps, ...seams.filter((p) => ps < p && p <= pe)];
-    const slots = marks.slice(1).map((p, i) => Math.floor((marks[i] + p) / 2));
-    out.push({ start, end, anchors, slots });
+    const within = (p) => ps <= p && p <= pe;
+    let pinned = 0;
+    if (t > 0) {
+      const seam = (start - 1) * 8;
+      const planes = [...seams, ...out.flatMap((o) => o.slots)].filter((p) => p < seam);
+      pinned = 1 + (seam - Math.max(...planes)) / 8;
+    }
+    out.push({ cells: pinned + end - start, anchors: seams.filter(within), slots: middles.filter(within) });
   }
   return out;
 }
@@ -410,7 +416,7 @@ function dfrFrames(frames, rounds) {
     f = 2 * (f - 1) + 1;
     const doubled = seams.map((p) => 2 * p);
     const tiles = dfrTiles(doubled, f, 1 << r);
-    for (const t of tiles) most = Math.max(most, t.end - t.start + t.anchors.length + t.slots.length);
+    for (const t of tiles) most = Math.max(most, t.cells + t.anchors.length + t.slots.length);
     seams = [...new Set([...doubled, ...tiles.flatMap((t) => t.slots)])].sort((a, b) => a - b);
   }
   return most;

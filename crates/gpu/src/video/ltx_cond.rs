@@ -9,7 +9,7 @@
 //! | Item | Latent, clean | Mask | Place in time | Keyframe mark |
 //! |---|---|---|---|---|
 //! | the video itself | the latent, the latent | 1 | its latent frames' spans | the first frame |
-//! | [`State::held`], a picture it starts from | the latent, the picture | 0 on the first frame's tokens | the first frame's | — |
+//! | [`State::held`], a picture it starts from, or the frames a tile is given | the latent, what is held | 0 on those frames' tokens | their own | — |
 //! | [`State::anchor`], a given keyframe | 0, the keyframe | `1 − strength`, 0.05 in DFR | one pixel frame, `[f, f + 1)` | no |
 //! | [`State::slots`], keyframes to generate | the initial latents or 0, 0 | 1 | one pixel frame each | yes |
 //! | [`State::reference`], a smaller latent | 0, the latent | `1 − strength`, 0 in DFR | its own frames' spans, rows and columns × the downscale | no |
@@ -86,18 +86,21 @@ impl State {
         })
     }
 
-    /// The video's first latent frame held to `still`, its tokens `[h·w,
+    /// The video's first latent frames held to `still`, their tokens `[k·h·w,
     /// 128]`: the reference's `VideoConditionByLatentIndex` at index 0 and
-    /// strength 1, as a picture a video starts from is held. Its tokens'
-    /// clean latent is the picture's and their mask 0, so that noising
-    /// leaves them the picture and the DiT sees them at σ 0.
+    /// strength 1. One frame is a picture a video starts from; several are
+    /// what a temporal round's tile is given of the tile before
+    /// (`lead_in_carryover`). Their tokens' clean latent is `still`'s and
+    /// their mask 0, so that noising leaves them as they are and the DiT
+    /// sees them at σ 0.
     pub fn held(mut self, still: &Tensor) -> Res<State> {
         let n = self.shape.frame_tokens();
-        if still.dims() != [n, C] {
-            return Err(format!("a picture of {:?} tokens, where a {}×{} frame is [{n}, 128]", still.dims(), self.shape.width, self.shape.height).into());
+        let rows = still.dim(0)?;
+        if still.rank() != 2 || still.dim(1)? != C || rows == 0 || rows % n != 0 || rows > self.shape.video_tokens() {
+            return Err(format!("{:?} tokens to hold, where a {}×{} frame is [{n}, 128] and the clip has {}", still.dims(), self.shape.width, self.shape.height, self.shape.latent_frames()).into());
         }
-        self.clean[..n * C].copy_from_slice(&host(still)?);
-        self.mask[..n].fill(0.0);
+        self.clean[..rows * C].copy_from_slice(&host(still)?);
+        self.mask[..rows].fill(0.0);
         Ok(self)
     }
 

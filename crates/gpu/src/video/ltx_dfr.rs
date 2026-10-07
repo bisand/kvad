@@ -50,23 +50,39 @@
 //! `2F − 1` and `N` pixel frames to `2(N − 1) + 1`, and the frame rate with
 //! them; the keyframes' places double too, and become *seams*. The clip is
 //! cut at them into `2^round` tiles ([`tiles`]), the leftover segments to
-//! the first, and every tile after the first starts a segment and one latent
-//! frame early: a lead-in it denoises for context and then drops, so that
-//! the tile before keeps the seam's own frame and nothing is blended. In
-//! each tile, every seam it holds is an *anchor*, a keyframe held at 0.95
-//! (`ltx_cond`), and a new keyframe is generated halfway between each pair
-//! of marks, seeded with the video's nearest latent frame. The tile is
+//! the first, and each tile keeps whole segments, so nothing is blended.
+//!
+//! A tile after the first is denoised as a clip that begins before its
+//! seam: on the plane of the last keyframe there, a seam's or one an
+//! earlier tile of the round has just made, and then the video from that
+//! keyframe to the seam as the tile before left it. Those frames are *held*
+//! (`ltx_cond::State::held`), clean and at σ 0 throughout, and dropped from
+//! what the tile keeps; it denoises from the frame after the seam. A clip's
+//! first latent frame is one pixel frame and every other is eight, and a
+//! keyframe's plane is one frame, so the tile reads as a clip that starts
+//! from a picture, which the model knows; and the two tiles agree at the
+//! seam because the second is given the first's frames. This is the
+//! reference's since its 1.4.0 (`TilePrefix`, `lead_in_carryover`). Before
+//! it, and here until #171's fixtures showed the difference, a tile began a
+//! segment and a latent frame early on the upsampled video and denoised
+//! that lead-in for context: a first latent frame that was eight frames of
+//! mid-clip video, placed seven frames off.
+//!
+//! In each tile, every seam among the frames it keeps is an *anchor*, a
+//! keyframe held at 0.95 (`ltx_cond`), and a new keyframe is generated at
+//! the middle of each segment, seeded with the video's nearest latent
+//! frame. The tile is
 //! re-noised to 0.975 and takes four *ancestral* steps at η 0.5, seeded
 //! apart from every other tile; after each step's noise the tokens are
 //! blended towards their clean latents again. Its sound is stage 1's,
 //! frozen: resampled linearly over the seconds the tile plays
 //! ([`tile_sound`]) to as many latents as the DiT expects at its frame rate,
-//! and at σ 0. The anchors and the new keyframes, the earlier tile's where
-//! two made one, are the next round's seams.
+//! and at σ 0. The seams' keyframes, in bf16 as DFR carries them, and the
+//! new ones are the next round's seams.
 
 use super::ltx_cond::{bf16, lerp, State};
 pub use kvad::video::{dfr_canvas as canvas, dfr_tiles as tiles, DfrCanvas as Canvas, DfrTile as Tile, DFR_SEGMENTS as SEGMENTS};
-use super::ltx_dit::{audio_latent, audio_tokens, video_latent, Dit, Shape};
+use super::ltx_dit::{audio_latent, audio_tokens, video_latent, video_tokens, Dit, Shape};
 use super::ltx_sample::{euler, Ancestral, OnStep, STAGE_1, STAGE_2};
 use super::ltx_upsample::Upsampler;
 use super::ltx_text::Contexts;
@@ -396,11 +412,31 @@ pub fn round(
     let seams: Vec<usize> = clip.positions.iter().map(|p| 2 * p).collect();
     let cond = conditioning_fps(fps);
     let plan = tiles(&seams, frames, 1 << round)?;
+    // Every keyframe so far by its pixel frame: the seams', rounded to bf16
+    // as DFR carries them, and then each one a tile makes, the earlier
+    // tile's where two made one. A later tile starts on the last of them
+    // before its seam, and they are the next round's seams.
+    let mut planes: std::collections::BTreeMap<usize, Tensor> = std::collections::BTreeMap::new();
+    for (k, &p) in seams.iter().enumerate() {
+        planes.insert(p, kept(&clip.keyframes.narrow(1, k, 1)?, DType::BF16)?);
+    }
     let mut kept_video = Vec::with_capacity(plan.len());
-    let mut slots: Vec<(usize, Tensor)> = Vec::new();
+    // The tile before: the round's latent frame its first stands for, and
+    // what it made, its own pinned frames with it.
+    let mut before: Option<(usize, Tensor)> = None;
     for (t, tile) in plan.iter().enumerate() {
         let shape = Shape::new(32 * cols, 32 * rows, tile.frames(), cond)?;
-        let part = kept(&video.narrow(1, tile.start, tile.end - tile.start)?, dt)?;
+        // Where its clip begins in the round's latent frames, after the
+        // plane when it starts on one.
+        let first = if tile.pinned > 0 { tile.pixel_start / 8 + 1 } else { tile.start };
+        let run = video.narrow(1, first, tile.end - first)?.to_device(&Device::Cpu)?;
+        let part = match tile.pinned {
+            0 => kept(&run, dt)?,
+            _ => {
+                let plane = planes.get(&tile.pixel_start).ok_or("a tile that starts on no keyframe")?;
+                kept(&Tensor::cat(&[&plane.to_dtype(DType::F32)?, &run.to_dtype(DType::F32)?], 1)?, dt)?
+            }
+        };
         let mut state = State::video(&part, shape)?;
         // The picture, where the tile starts where the clip does.
         if let (Some(s), 0) = (still, tile.pixel_start) {
@@ -414,6 +450,14 @@ pub fn round(
         if !local.is_empty() {
             state = state.slots(&local, Some(&initials(&part, &local)?))?;
         }
+        // What it is given: its plane, and the frames from there to the
+        // seam as the tile before left them.
+        if tile.pinned > 0 {
+            let (base, made) = before.as_ref().ok_or("a tile with frames to be given and none before it")?;
+            let at = first.checked_sub(*base).filter(|at| at + tile.pinned - 1 <= made.dim(1).unwrap_or(0)).ok_or("a tile's pinned frames fall outside the tile before")?;
+            let given = Tensor::cat(&[&part.narrow(1, 0, 1)?, &kept(&made.narrow(1, at, tile.pinned - 1)?, dt)?], 1)?;
+            state = state.held(&video_tokens(&given)?)?;
+        }
         // Noised to the first level; the sound's noise is drawn, at 0.
         let len = state.len();
         let state = state.noised(&drawn(noise(&[len, C])?, dt), TEMPORAL[0])?;
@@ -423,23 +467,13 @@ pub fn round(
         let steps = Steps::Ancestral { eta: TEMPORAL_ETA, noise: &mut *noise };
         let n = plan.len();
         let got = stage(dit, ctx, &state, &Sound { tokens: &tokens, shape: sound_shape, frozen: true }, TEMPORAL, steps, &mut |i, s, x| step(t, n, i, s, x))?;
-        kept_video.push(got.video.narrow(1, tile.lead, got.video.dim(1)? - tile.lead)?);
+        kept_video.push(got.video.narrow(1, tile.pinned, got.video.dim(1)? - tile.pinned)?);
         if let Some(k) = got.keyframes {
             for (j, &p) in tile.slots.iter().enumerate() {
-                // Where two tiles made one keyframe, the earlier's.
-                if !slots.iter().any(|(q, _)| *q == p) {
-                    slots.push((p, k.narrow(1, j, 1)?));
-                }
+                planes.entry(p).or_insert(k.narrow(1, j, 1)?.to_device(&Device::Cpu)?);
             }
         }
-    }
-    // The next round's seams: this round's, and the new keyframes.
-    let mut carried: std::collections::BTreeMap<usize, Tensor> = std::collections::BTreeMap::new();
-    for (k, &p) in seams.iter().enumerate() {
-        carried.insert(p, clip.keyframes.narrow(1, k, 1)?.to_device(&Device::Cpu)?);
-    }
-    for (p, k) in slots {
-        carried.insert(p, k.to_device(&Device::Cpu)?);
+        before = Some((if tile.pinned > 0 { first - 1 } else { tile.start }, got.video));
     }
     let video = Tensor::cat(&kept_video, 1)?;
     if video.dim(1)? != (frames - 1) / 8 + 1 {
@@ -447,8 +481,8 @@ pub fn round(
     }
     Ok(Clip {
         video,
-        keyframes: Tensor::cat(&carried.values().collect::<Vec<_>>(), 1)?,
-        positions: carried.into_keys().collect(),
+        keyframes: Tensor::cat(&planes.values().collect::<Vec<_>>(), 1)?,
+        positions: planes.into_keys().collect(),
         frames,
         fps,
     })

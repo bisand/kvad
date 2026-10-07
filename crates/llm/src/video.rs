@@ -286,15 +286,22 @@ pub fn dfr_canvas(frames: usize) -> Res<DfrCanvas> {
     Ok(DfrCanvas { frames: padded + 1, segment, keyframes: (1..=padded / segment).map(|i| i * segment).collect() })
 }
 
-/// One tile of a temporal round: its latent frames `start..end`, of which the
-/// first `lead` are its lead-in; the pixel frames `pixel_start..=pixel_end`
-/// they cover; the seams it holds as anchors and the pixel frames it
-/// generates keyframes at, all in the round's pixel frames.
+/// One tile of a temporal round. It keeps the round's latent frames
+/// `start..end`, whole segments, and every tile after the first denoises
+/// them as a clip that begins earlier: on the plane of the last keyframe
+/// before its seam, at pixel frame `pixel_start`, then the video from there
+/// to the seam as the tile before left it. Those are its `pinned` latent
+/// frames, the plane among them, which it is given and does not denoise.
+/// The first tile pins nothing and starts where the clip does.
+///
+/// `pixel_start..=pixel_end` are the pixel frames its clip covers; `anchors`
+/// the seams it holds and `slots` the pixel frames it generates keyframes
+/// at, both among the frames it keeps and in the round's pixel frames.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DfrTile {
     pub start: usize,
     pub end: usize,
-    pub lead: usize,
+    pub pinned: usize,
     pub pixel_start: usize,
     pub pixel_end: usize,
     pub anchors: Vec<usize>,
@@ -302,15 +309,24 @@ pub struct DfrTile {
 }
 
 impl DfrTile {
-    /// Its pixel frames.
+    /// The latent frames of its clip: the pinned ones and the ones it keeps.
+    pub fn cells(&self) -> usize {
+        self.pinned + self.end - self.start
+    }
+
+    /// Its clip's pixel frames.
     pub fn frames(&self) -> usize {
-        (self.end - self.start - 1) * 8 + 1
+        (self.cells() - 1) * 8 + 1
     }
 }
 
-/// The reference's `TemporalTilePlan` for `seams`, the round's keyframes'
-/// pixel frames, in a clip of `frames`, cut into `count` tiles: its
-/// `split_at_seams`, with the lead-in one segment and one latent frame.
+/// The reference's `TemporalTilePlan` and `tile_prefix`, as of its 1.4.0,
+/// for `seams`, the round's keyframes' pixel frames, in a clip of `frames`,
+/// cut into `count` tiles: the segments dealt out with no overlap, the
+/// leftovers to the first tiles, and a new keyframe at the middle of every
+/// segment, in whichever tile keeps it. A tile after the first starts on
+/// the last keyframe before its seam, a seam's or one an earlier tile of
+/// this round makes.
 pub fn dfr_tiles(seams: &[usize], frames: usize, count: usize) -> Res<Vec<DfrTile>> {
     if seams.iter().any(|&p| p == 0 || p % 8 != 0) || seams.windows(2).any(|w| w[1] <= w[0]) || count == 0 {
         return Err(format!("seams at {seams:?}, in {count} tiles").into());
@@ -320,23 +336,34 @@ pub fn dfr_tiles(seams: &[usize], frames: usize, count: usize) -> Res<Vec<DfrTil
     if bounds[bounds.len() - 1] != latent - 1 {
         return Err(format!("seams at {seams:?} end short of {frames} frames' last").into());
     }
-    let lead = if bounds.len() > 1 { bounds[1] - bounds[0] + 1 } else { 0 };
+    // A segment's middle, of the clip's segments and not of a tile's own.
+    let middles: Vec<usize> = std::iter::once(0).chain(seams.iter().copied()).collect::<Vec<_>>().windows(2).map(|w| (w[0] + w[1]) / 2).collect();
     // The segments dealt out, the leftovers to the first tiles.
     let segments = bounds.len() - 1;
     let n = count.min(segments);
     let (base, leftover) = (segments / n, segments % n);
-    let mut out = Vec::with_capacity(n);
+    let mut out: Vec<DfrTile> = Vec::with_capacity(n);
     let mut cursor = 0;
     for t in 0..n {
-        let resume = bounds[cursor] + 1;
-        let start = if t == 0 { 0 } else { resume.saturating_sub(lead) };
+        let start = if t == 0 { 0 } else { bounds[cursor] + 1 };
         cursor += base + (t < leftover) as usize;
         let end = bounds[cursor] + 1;
-        let (pixel_start, pixel_end) = (start * 8, (end - 1) * 8);
-        let anchors: Vec<usize> = seams.iter().copied().filter(|&p| pixel_start <= p && p <= pixel_end).collect();
-        let marks: Vec<usize> = std::iter::once(pixel_start).chain(seams.iter().copied().filter(|&p| pixel_start < p && p <= pixel_end)).collect();
-        let slots = marks.windows(2).map(|w| (w[0] + w[1]) / 2).collect();
-        out.push(DfrTile { start, end, lead: if t == 0 { 0 } else { resume - start }, pixel_start, pixel_end, anchors, slots });
+        let (first, pixel_end) = (start * 8, (end - 1) * 8);
+        let within = |p: &&usize| first <= **p && **p <= pixel_end;
+        let (pinned, pixel_start) = match t {
+            0 => (0, 0),
+            _ => {
+                // The seam it resumes after, and the last plane before it.
+                let seam = (start - 1) * 8;
+                let planes = seams.iter().chain(out.iter().flat_map(|t| t.slots.iter()));
+                let key = planes.copied().filter(|&p| p < seam).max().ok_or_else(|| format!("no keyframe before the seam at {seam}"))?;
+                if key % 8 != 0 {
+                    return Err(format!("a keyframe at {key}, off the latent frames' borders, before the seam at {seam}").into());
+                }
+                (1 + (seam - key) / 8, key)
+            }
+        };
+        out.push(DfrTile { start, end, pinned, pixel_start, pixel_end, anchors: seams.iter().filter(within).copied().collect(), slots: middles.iter().filter(within).copied().collect() });
     }
     Ok(out)
 }
@@ -344,7 +371,7 @@ pub fn dfr_tiles(seams: &[usize], frames: usize, count: usize) -> Res<Vec<DfrTil
 /// The most tokens a DFR generation's DiT holds in one call, in latent
 /// frames of the clip's size: stage 2's video, its keyframes, a latent frame
 /// each, and its half-size reference, a quarter of the video; or a temporal
-/// round's largest tile, with its lead-in, its anchors and its new
+/// round's largest tile, with its pinned frames, its anchors and its new
 /// keyframes, which in the second round can be more than stage 2. Stage 1 is
 /// at half size, a quarter of stage 2. `frames` is the first stages', which
 /// `rounds` rounds double.
@@ -358,7 +385,7 @@ pub fn dfr_frames(frames: usize, rounds: u32) -> Res<usize> {
         let doubled: Vec<usize> = seams.iter().map(|p| 2 * p).collect();
         let tiles = dfr_tiles(&doubled, f, 1 << r)?;
         for t in &tiles {
-            most = most.max(t.end - t.start + t.anchors.len() + t.slots.len());
+            most = most.max(t.cells() + t.anchors.len() + t.slots.len());
         }
         // The next round's seams: these, and the new keyframes.
         let mut next: Vec<usize> = doubled.iter().copied().chain(tiles.iter().flat_map(|t| t.slots.iter().copied())).collect();
@@ -2004,21 +2031,28 @@ mod tests {
         assert!(dfr_canvas(1).is_err() && dfr_canvas(24).is_err());
     }
 
-    /// The reference's tile plans for DFR's first two rounds on a clip of
-    /// two segments of 24: the second tile's lead-in reaches back to the
-    /// start, and each tile adds keyframes between its marks.
+    /// The reference's tile plans (its 1.4.2's `TemporalTilePlan` and
+    /// `tile_prefix`, asked) for DFR's first two rounds on a clip of two
+    /// segments of 24: the second tile starts on the keyframe the first
+    /// makes at 24, three latent frames of video before its seam at 48, and
+    /// each tile adds a keyframe at its segments' middles.
     #[test]
     fn tiles_follow_the_reference() {
         let t = dfr_tiles(&[48, 96], 97, 2).unwrap();
-        assert_eq!(t[0], DfrTile { start: 0, end: 7, lead: 0, pixel_start: 0, pixel_end: 48, anchors: vec![48], slots: vec![24] });
-        assert_eq!(t[1], DfrTile { start: 0, end: 13, lead: 7, pixel_start: 0, pixel_end: 96, anchors: vec![48, 96], slots: vec![24, 72] });
+        assert_eq!(t[0], DfrTile { start: 0, end: 7, pinned: 0, pixel_start: 0, pixel_end: 48, anchors: vec![48], slots: vec![24] });
+        assert_eq!(t[1], DfrTile { start: 7, end: 13, pinned: 4, pixel_start: 24, pixel_end: 96, anchors: vec![96], slots: vec![72] });
+        assert_eq!((t[1].cells(), t[1].frames()), (10, 73));
         let t = dfr_tiles(&[48, 96, 144, 192], 193, 4).unwrap();
-        let spans: Vec<(usize, usize, usize)> = t.iter().map(|t| (t.start, t.end, t.lead)).collect();
-        assert_eq!(spans, vec![(0, 7, 0), (0, 13, 7), (6, 19, 7), (12, 25, 7)]);
-        assert_eq!((t[2].anchors.clone(), t[2].slots.clone()), (vec![48, 96, 144], vec![72, 120]));
+        let spans: Vec<(usize, usize, usize, usize)> = t.iter().map(|t| (t.start, t.end, t.pinned, t.pixel_start)).collect();
+        assert_eq!(spans, vec![(0, 7, 0, 0), (7, 13, 4, 24), (13, 19, 4, 72), (19, 25, 4, 120)]);
+        assert_eq!((t[2].anchors.clone(), t[2].slots.clone()), (vec![144], vec![120]));
         // Five segments in two tiles: three to the first.
         let t = dfr_tiles(&[48, 96, 144, 192, 240], 241, 2).unwrap();
-        assert_eq!((t[0].end, t[1].start, t[1].lead), (19, 12, 7));
+        assert_eq!(t[0], DfrTile { start: 0, end: 19, pinned: 0, pixel_start: 0, pixel_end: 144, anchors: vec![48, 96, 144], slots: vec![24, 72, 120] });
+        assert_eq!(t[1], DfrTile { start: 19, end: 31, pinned: 4, pixel_start: 120, pixel_end: 240, anchors: vec![192, 240], slots: vec![168, 216] });
+        // One tile is the whole clip, and more tiles than segments are fewer.
+        assert_eq!(dfr_tiles(&[48, 96], 97, 1).unwrap()[0].slots, vec![24, 72]);
+        assert_eq!(dfr_tiles(&[64], 65, 2).unwrap().len(), 1);
         assert!(dfr_tiles(&[48, 96], 105, 2).is_err());
     }
 
@@ -2051,19 +2085,20 @@ mod tests {
         Defaults { dfr: true, ..ltx() }
     }
 
-    /// DFR's largest call: stage 2 for a clip at its own rate; the rounds'
-    /// tiles, with a segment of lead-in, more than that.
+    /// DFR's largest call: stage 2 for a clip at its own rate and at twice
+    /// it; at four times it a tile, with its pinned frames, is more.
     #[test]
     fn dfr_is_held_to_its_largest_call() {
         // 121 frames: 16 latent frames, 5 keyframes, a reference of 4.
         assert_eq!(dfr_frames(121, 0).unwrap(), 25);
-        // At 48 fps the second tile: 19 latent frames, 4 anchors and 3 new
-        // keyframes.
-        assert_eq!(dfr_frames(121, 1).unwrap(), 26);
-        // At 96 fps, a tile of three segments and one of lead-in; and 73
-        // frames at 48, as the web form counts them too.
-        assert_eq!(dfr_frames(121, 2).unwrap(), 34);
-        assert_eq!(dfr_frames(73, 1).unwrap(), 18);
+        // At 48 fps the first tile, three segments: 19 latent frames, 3
+        // anchors and 3 new keyframes, as many as stage 2.
+        assert_eq!(dfr_frames(121, 1).unwrap(), 25);
+        // At 96 fps, a tile of three segments, four frames pinned, 3 anchors
+        // and 3 new keyframes; and 73 frames at 48, as the web form counts
+        // them too.
+        assert_eq!(dfr_frames(121, 2).unwrap(), 28);
+        assert_eq!(dfr_frames(73, 1).unwrap(), 17);
         assert!(dfr_frames(1, 0).is_err());
     }
 

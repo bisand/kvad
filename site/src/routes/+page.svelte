@@ -169,6 +169,7 @@
             <ul class="facts">
               <li><code>/v1/chat/completions</code><span>streaming, <code>reasoning_content</code>, tool calls</span></li>
               <li><code>/v1/images/generations</code><span>with steps, seed, LoRAs and a preview per step</span></li>
+              <li><code>/v1/images/edits</code><span>from a picture, with a mask or without</span></li>
               <li><code>/v1/videos</code><span>a job you start, follow and fetch</span></li>
               <li><code>/v1/models</code><span>says which models can take tools</span></li>
             </ul>
@@ -198,15 +199,19 @@
     <article>
       <h3>Images</h3>
       <p>
-        Stable Diffusion 1.5 and SDXL with their fine-tunes, FLUX.1-schnell and Qwen-Image, including
-        the community's GGUF files.
+        Stable Diffusion 1.5 and SDXL with their fine-tunes, FLUX.1-schnell, FLUX.1-dev and
+        Qwen-Image, including the community's GGUF files. From a prompt, or from a picture on SDXL
+        and SD 1.5.
       </p>
       <p>LoRAs are applied per request, to a model that stays loaded. An SDXL LoRA can be trained on your own pictures.</p>
       <a class="more" href="/docs/images/">Images <span aria-hidden="true">→</span></a>
     </article>
     <article>
       <h3>Video</h3>
-      <p>LTX-2.5, with sound, from a prompt or from a picture, up to 120 frames a second.</p>
+      <p>
+        LTX-2.5, with sound, from a prompt or from a picture, up to 120 frames a second, and up to
+        1536×1024 with its pipeline's last pass run in tiles.
+      </p>
       <p>A video is a job on the server: start it, close the page, and fetch it when it is done.</p>
       <a class="more" href="/docs/video/">Video <span aria-hidden="true">→</span></a>
     </article>
@@ -221,6 +226,18 @@
     <figcaption>
       Made by Kvad for this page: SDXL at 1024², 30 steps, about a minute and a half each on an M5
       Pro. The prompts and seeds are in <a href="/docs/images/">the image guide</a>.
+    </figcaption>
+  </figure>
+
+  <figure class="clip">
+    <!-- svelte-ignore a11y_media_has_caption -->
+    <video controls playsinline preload="none" poster="/gallery/fox-in-snow.webp" width="1536" height="1024" aria-label="A fox trotting through fresh snow towards the camera, snow falling">
+      <source src="/gallery/fox-in-snow.mp4" type="video/mp4" />
+    </video>
+    <figcaption>
+      Made by Kvad: LTX-2.5 at 1536×1024, 3 seconds at 48 frames a second, with its sound. 18
+      minutes to denoise and 2 to decode on an M5 Pro, holding 27 GB at its peak. The prompt and
+      seed are in <a href="/docs/video/#large-sizes">the video guide</a>.
     </figcaption>
   </figure>
 </section>
@@ -632,6 +649,15 @@
     aspect-ratio: 1;
     object-fit: cover;
     border-radius: 8px;
+  }
+  .clip {
+    margin: 32px 0 0;
+  }
+  .clip video {
+    width: 100%;
+    height: auto;
+    border-radius: 8px;
+    background: var(--line);
   }
   figcaption {
     margin-top: 14px;

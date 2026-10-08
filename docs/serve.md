@@ -29,7 +29,8 @@ fields; every picture is kept, with the settings that made it. `/v1/videos` is
 OpenAI's video endpoint, a job that answers at once and is watched until it is
 done, for LTX-2.5's clips with sound, from a prompt or from a picture and a
 prompt, fast from its distilled model, guided from its dev model, or by DFR,
-the reference's production pipeline, which also makes 48 and 96 fps, and decoded
+the reference's production pipeline, which also makes 48 and 96 fps and, with
+its spatial epilogue, sizes its second stage cannot hold whole, and decoded
 by its diffusion decoder or, when asked, its convolutional one
 (`docs/video-plan.md`). Four authentication modes (`none`, `local`, `basic`,
 `oidc`), roles, API keys. SQLite for everything the filesystem cannot answer.

@@ -132,6 +132,8 @@ struct Args {
     /// `videos make` only: which of LTX-2.5's unguided pipelines, `fast` or
     /// `dfr`.
     pipeline: Option<String>,
+    /// `videos make` only: end DFR with its spatial epilogue.
+    epilogue: bool,
     quant: Precision,
     /// `crawl` only.
     out: Option<String>,
@@ -214,6 +216,7 @@ impl Default for Args {
             strength: None,
             decoder: None,
             pipeline: None,
+            epilogue: false,
             quant: Precision::F32,
             out: None,
             pages: None,
@@ -371,6 +374,7 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--key" => a.key = true,
         "--password" => a.password = true,
         "--silent" => a.silent = true,
+        "--epilogue" => a.epilogue = true,
         "--dev" => a.dev = true,
         _ => return false,
     }

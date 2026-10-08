@@ -163,8 +163,8 @@ See [Images](/docs/images/#from-a-picture).
 
 The request takes `prompt`, `model`, `size`, and `seconds` or `frames`, plus
 `fps`, `seed`, `audio`, `input_reference`, `steps`, `guidance_scale`,
-`negative_prompt`, `decoder`, `pipeline` and `loras`. [Video](/docs/video/)
-explains what each one does.
+`negative_prompt`, `decoder`, `pipeline`, `epilogue` and `loras`.
+[Video](/docs/video/) explains what each one does.
 
 ## Everything else
 

@@ -40,6 +40,21 @@ const SHOTS = [
     },
   },
   {
+    name: "videos",
+    path: "/videos",
+    // The form as the clip in the gallery was asked for. It wants the video
+    // model loaded: the pipeline and the epilogue are a loaded model's to offer.
+    prepare: async (p) => {
+      await p.locator("textarea").first().fill("a fox trots through fresh snow towards the camera, snow falling, photograph");
+      await p.locator("select", { hasText: "Size preset" }).selectOption({ label: "Large landscape · 1536×1024" });
+      await p.locator('input[placeholder="auto"]').fill("3");
+      await p.locator('input[type="number"]').nth(3).fill("48");
+      await p.getByText("Fixed seed", { exact: true }).click();
+      await p.locator('input[placeholder="random"]').fill("3");
+      await p.getByText("Epilogue", { exact: true }).click();
+    },
+  },
+  {
     name: "training",
     path: "/training",
     prepare: (p) => p.locator("tr.cursor-pointer").first().click({ timeout: 5000 }),

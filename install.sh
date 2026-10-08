@@ -1365,6 +1365,8 @@ fi
 say ""
 say "  ${B}kvad pull${R} Qwen/Qwen2.5-0.5B-Instruct   download a model"
 say "  ${B}kvad chat${R}                              talk to it"
+say "  ${B}kvad help${R}                              everything else it does"
+say "  ${B}kvad completions${R}                       Tab completion for your shell"
 if [ -f "$SRC/kvad-tui" ]; then
     say "  ${B}kvad-tui${R}                               browse and chat in the terminal"
 fi

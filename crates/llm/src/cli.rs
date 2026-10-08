@@ -17,11 +17,18 @@
 //!   datasets, evals, benchmarks, metrics, accounts, and `kvad api` for any
 //!   route at all.
 //! * [`out`] — tables, questions and progress lines.
+//! * [`spec`] — every command, word and flag in one table, which the next
+//!   two read.
+//! * [`help`] — `kvad help`, and what a mistyped command is told.
+//! * [`complete`] — Tab completion: the shells' scripts, and what they ask.
 
 pub mod api;
+pub mod complete;
+pub mod help;
 pub mod models;
 pub mod out;
 pub mod service;
+pub mod spec;
 
 use crate::Args;
 use kvad::client::{self, Remote, Target};
@@ -126,35 +133,8 @@ pub fn remote(remote: &Remote, args: &Args) -> Res<()> {
         "sessions" => api::sessions(remote, args),
         "keys" => api::keys(remote, args),
         "api" => api::raw(remote, args),
-        other => {
-            eprintln!("unknown command `{other}`");
-            crate::usage();
-        }
+        other => help::unknown_command(other),
     }
-}
-
-/// `--help` after a command: that command's own usage, where it has one.
-pub fn help(command: &str) -> ! {
-    let text = match command {
-        "service" => service::USAGE,
-        "conversations" => api::CONVERSATIONS,
-        "images" => api::IMAGES,
-        "videos" => api::VIDEOS,
-        "jobs" => api::JOBS,
-        "datasets" => api::DATASETS,
-        "tune" => api::TUNE,
-        "evals" => api::EVALS,
-        "bench" => api::BENCH,
-        "metrics" => api::METRICS,
-        "auth" => api::AUTH,
-        "users" => api::USERS,
-        "sessions" => api::SESSIONS,
-        "keys" => api::KEYS,
-        "api" => api::API,
-        _ => crate::usage(),
-    };
-    println!("{text}");
-    std::process::exit(0);
 }
 
 /// The subcommand, and the words after it.

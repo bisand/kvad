@@ -39,6 +39,7 @@ only the models you want listed.
 ```bash
 KVAD_DATA_DIR=/tmp/kvad-demo kvad-serve --bind 127.0.0.1:5899 &
 # load a model, hold a conversation, run a benchmark and a training run
+# for the Videos page: load the video model, and have a clip in the gallery
 node scripts/shots.js http://127.0.0.1:5899
 ```
 

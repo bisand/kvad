@@ -299,6 +299,20 @@
     </div>
     <Shot name="training" alt="The training page: a finished run with its training and validation loss curves, and the text the model wrote at each checkpoint" width={2240} height={1400} />
   </div>
+
+  <div class="row" use:reveal>
+    <div class="say">
+      <p class="label">Video</p>
+      <h2>Start a clip, and come back for it.</h2>
+      <p>
+        Size, length, frame rate, seed, decoder and pipeline are fields on one form, and the form
+        says before you start when a clip is more than this machine can make. The server makes it
+        while you do something else, and keeps it with the settings and the timings that made it.
+      </p>
+      <a class="more" href="/docs/video/">Video <span aria-hidden="true">→</span></a>
+    </div>
+    <Shot name="videos" alt="The videos page: the form set to 1536×1024, 3 seconds at 48 frames a second with DFR's epilogue, beside the clip of a fox in snow that those settings made" width={2240} height={1400} />
+  </div>
 </section>
 
 <section class="silicon" use:reveal>

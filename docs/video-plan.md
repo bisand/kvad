@@ -1747,6 +1747,30 @@ every 10 dB is ten times less error power.
   seed, three frames of each, neither played nor heard, and the fast
   clip's peak not taken.
 
+  **A second pair**, the same day and build: "waves break against a
+  lighthouse on a rocky coast at dusk, spray in the wind, gulls calling,
+  photograph", seed 11, 1536×1024, 3 s.
+
+  | | Frames | Denoise | Decode | Laplacian's spread | Edges' mean |
+  |---|---|---|---|---|---|
+  | Fast, 24 fps | 73 | 143.6 s | 37.8 s | 4.70, 4.01, 3.88 | 3.16, 2.53, 2.28 |
+  | DFR with the epilogue, 48 fps | 145 | 935.1 s | 100.4 s | 5.39, 5.27, 5.33 | 4.50, 4.46, 4.42 |
+
+  The epilogue's frames are 15 to 37% sharper by the Laplacian and 42 to
+  94% by the edges, and hold it through the clip where the fast clip's
+  soften as its wave fills the frame. Both are likely scenes: the fast
+  pipeline's a large, clean lighthouse over one smooth rolling wave, its
+  water soft; the epilogue's a smaller lighthouse on rocks with their
+  texture, a wave breaking on them and a low sun. So the epilogue's is
+  not the worse picture here, as it was of the fox, and which is the
+  better is taste. 6.5 times the denoising, as the fox's 7.2.
+
+  Over the two pairs the epilogue is the sharper and the dearer each
+  time, and neither pipeline makes the better picture each time. The same
+  cautions: another scene from each pipeline, three frames of each, none
+  played or heard, no peak taken. All four clips are on kvad.eu's front
+  page.
+
   **From the command line** (`kvad videos make --epilogue`, #177), the same
   day: 768×512, 3 s at 48 fps, 416.6 s to denoise and 23.3 s to decode,
   and a coherent clip with no grid. The 486.7 s above was the build

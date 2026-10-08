@@ -46,7 +46,7 @@ pub const VIDEOS: &str = "usage: kvad videos [ls]
        kvad videos make PROMPT [--out FILE] [--model MODEL] [--size WxH]
                                [--seconds S | --frames N] [--fps N] [--seed N] [--silent]
                                [--image PICTURE] [--steps N] [--guidance G] [--negative TEXT]
-                               [--decoder diffusion|conv] [--pipeline fast|dfr]
+                               [--decoder diffusion|conv] [--pipeline fast|dfr] [--epilogue]
                                [--lora NAME[:SCALE]]...
        kvad videos show ID
        kvad videos watch ID    follow it until it ends
@@ -76,6 +76,11 @@ detailing pass and a keyframe-aware decode, slower and finer. --fps above 30
 runs it without being asked, doubling a clip at half or a quarter of the rate
 (48, 50, 60, 96, 100, 120 fps). Its detailing LoRA is gated on Hugging Face,
 and the first DFR video fetches it.
+
+--epilogue is for sizes DFR's second stage cannot hold whole: it runs DFR,
+makes the clip at half its width and height, then upsamples it once more and
+details it at the size asked for, in overlapping tiles. Both sides must be
+multiples of 128, and it takes several times as long.
 
 --image starts the video from a picture, which becomes its first frame, scaled
 to cover the video's size and cut from the middle. Any format the server's
@@ -1639,6 +1644,9 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
             if let Some(p) = &args.pipeline {
                 body["pipeline"] = json!(p);
             }
+            if args.epilogue {
+                body["epilogue"] = json!(true);
+            }
             if !args.loras.is_empty() {
                 body["loras"] = json!(args.loras.iter().map(|l| kvad::image::Lora::parse(l)).collect::<Vec<_>>());
             }
@@ -1669,7 +1677,11 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                     out::s(&k["frames"]),
                     out::s(&k["fps"]),
                     out::s(&k["seed"]),
-                    if k["pipeline"] == json!("dfr") { ", DFR" } else { "" },
+                    match (k["pipeline"] == json!("dfr"), k["epilogue"] == json!(true)) {
+                        (_, true) => ", DFR with its epilogue",
+                        (true, false) => ", DFR",
+                        _ => "",
+                    },
                     if k["audio"] == json!(false) { ", no sound" } else { "" },
                     if k["picture_url"].is_string() { "picture and text" } else { "text" },
                     k["encode_secs"].as_f64().unwrap_or(0.0),
@@ -1699,6 +1711,7 @@ pub fn videos(remote: &Remote, args: &Args) -> Res<()> {
                     let (size, seed) = (out::s(&v["size"]), out::s(&v["kvad"]["seed"]));
                     let decoder = v["kvad"]["decoder"].as_str().map(|d| format!(", {d} decoder")).unwrap_or_default();
                     let decoder = match v["kvad"]["pipeline"].as_str() {
+                        Some("dfr") if v["kvad"]["epilogue"] == json!(true) => format!(", DFR with its epilogue{decoder}"),
                         Some("dfr") => format!(", DFR{decoder}"),
                         _ => decoder,
                     };

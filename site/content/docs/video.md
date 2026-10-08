@@ -50,11 +50,36 @@ from the middle. This needs `ffmpeg` on the server.
 | `--steps`, `--guidance`, `--negative` | Runs the dev model with guidance instead: 30 steps at guidance 3 unless given, about four times as long. Its files come from `kvad pull Lightricks/LTX-2.5 --dev`. |
 | `--pipeline dfr` | The reference's production pipeline: generated keyframes, a detailing pass and a keyframe-aware decode. Slower, and finer. |
 | `--fps` above 30 | Runs DFR, making the clip at half or a quarter of the rate and doubling it: 48, 50, 60, 96, 100 or 120 fps. |
+| `--epilogue` | Runs DFR at half the width and height, then details the clip at the size asked for, in tiles. For large sizes: see below. |
 | `--decoder conv` | The convolutional decoder instead of the diffusion one: lighter, and about twice as fast to decode. |
 | `--lora NAME[:SCALE]` | Applies a LoRA to every DiT the pipeline runs. |
 
 DFR's detailing LoRA is gated on Hugging Face, and the first DFR video fetches
 it, so you need to have accepted its terms there.
+
+## Large sizes
+
+DFR's second stage holds the whole clip at once, which sets how large a clip
+this machine can make. `--epilogue` gets past that: the clip is made at half
+its width and height, then upsampled once more and detailed at the size asked
+for, with each pass over it cut into overlapping tiles.
+
+```bash
+kvad videos make "…" --size 1536x1024 --seconds 3 --fps 48 --epilogue
+```
+
+Both sides must be multiples of 128, and it takes several times as long. On
+an M5 Pro, that clip took 18 minutes to denoise and 2 to decode, and held
+27 GB at its peak.
+
+The clip on [the front page](/) is that one:
+
+```bash
+kvad videos make "a fox trots through fresh snow towards the camera, snow falling, photograph" --size 1536x1024 --seconds 3 --fps 48 --epilogue --seed 3
+```
+
+It is for sizes DFR cannot make without it. At 768×512 the clip is worse than
+plain DFR's, because its first stage is then only 192×128.
 
 ## Compression
 

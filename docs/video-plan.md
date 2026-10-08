@@ -1723,6 +1723,35 @@ every 10 dB is ten times less error power.
   changed. One clip, looked at in frames and not played; none from a
   picture. The web form has the switch since #174.
 
+  **Against the fast pipeline at 1536×1024**, the day after, on 0.15.1:
+  the same prompt and seed, 3 s, which the fast pipeline makes at 24 fps,
+  its most being 30. The epilogue's clip is the one above.
+
+  | | Frames | Denoise | Decode | Laplacian's spread | Edges' mean |
+  |---|---|---|---|---|---|
+  | Fast, 24 fps | 73 | 146.6 s | 38.5 s | 3.74, 3.16, 2.54 | 2.14, 1.93, 1.60 |
+  | DFR with the epilogue, 48 fps | 145 | 1058.0 s | 103.7 s | 3.94, 3.67, 3.27 | 2.42, 2.09, 1.84 |
+
+  The two measures are of the luma of the frames at 0.5, 1.5 and 2.5 s:
+  the standard deviation of a 3×3 Laplacian, and the mean of Pillow's
+  `FIND_EDGES`. The epilogue's frames are 5 to 29% sharper by them, and at
+  full size its fur and eyes are crisp where the fast clip's face is soft,
+  as a moving thing's is. It is not the better clip for that: the fast
+  pipeline's fox is the likelier animal, red, long in the leg and large in
+  the frame, and the epilogue's is squat with a striped coat. So at this
+  size the epilogue buys detail and twice the frames for six times the
+  time, and not a better picture on this prompt.
+
+  The two are not one scene, the seed drawing another clip in each
+  pipeline, so the measures are of their compositions too. One prompt and
+  seed, three frames of each, neither played nor heard, and the fast
+  clip's peak not taken.
+
+  **From the command line** (`kvad videos make --epilogue`, #177), the same
+  day: 768×512, 3 s at 48 fps, 416.6 s to denoise and 23.3 s to decode,
+  and a coherent clip with no grid. The 486.7 s above was the build
+  before.
+
   **Its progress** ran ahead on that clip, 38% at twelve minutes of
   twenty: the plan weighed the epilogue by a guess at its tiles' sizes and
   gave every step the same share. It now counts each tile's tokens as

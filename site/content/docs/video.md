@@ -72,11 +72,34 @@ Both sides must be multiples of 128, and it takes several times as long. On
 an M5 Pro, that clip took 18 minutes to denoise and 2 to decode, and held
 27 GB at its peak.
 
-The clip on [the front page](/) is that one:
+### Against the fast pipeline
+
+The fast pipeline makes 1536×1024 too, at 30 frames a second or fewer and
+with no detailing pass. Two prompts were made both ways on an M5 Pro, 3
+seconds each, and [the front page](/#compared) plays all four clips.
 
 ```bash
-kvad videos make "a fox trots through fresh snow towards the camera, snow falling, photograph" --size 1536x1024 --seconds 3 --fps 48 --epilogue --seed 3
+kvad videos make "a fox trots through fresh snow towards the camera, snow falling, photograph" --size 1536x1024 --seconds 3 --seed 3 --fps 24 --pipeline fast
+kvad videos make "a fox trots through fresh snow towards the camera, snow falling, photograph" --size 1536x1024 --seconds 3 --seed 3 --fps 48 --epilogue
+kvad videos make "waves break against a lighthouse on a rocky coast at dusk, spray in the wind, gulls calling, photograph" --size 1536x1024 --seconds 3 --seed 11 --fps 24 --pipeline fast
+kvad videos make "waves break against a lighthouse on a rocky coast at dusk, spray in the wind, gulls calling, photograph" --size 1536x1024 --seconds 3 --seed 11 --fps 48 --epilogue
 ```
+
+| | Frames | Denoise | Decode | Sharper by |
+|---|---|---|---|---|
+| Fox, fast | 73 | 147 s | 39 s | |
+| Fox, with the epilogue | 145 | 1058 s | 104 s | 5 to 29% |
+| Lighthouse, fast | 73 | 144 s | 38 s | |
+| Lighthouse, with the epilogue | 145 | 935 s | 100 s | 15 to 37% |
+
+"Sharper" is the spread of a Laplacian over three frames of each clip. So the
+epilogue buys detail and twice the frames for six to seven times the
+denoising. It does not buy a better picture every time: the fast pipeline's
+fox is the likelier animal, and of the lighthouses neither is the worse.
+
+A seed draws a different scene in each pipeline, so this compares what each
+makes of a prompt, and not one scene made twice. It is two prompts on one
+machine, judged from frames.
 
 It is for sizes DFR cannot make without it. At 768×512 the clip is worse than
 plain DFR's, because its first stage is then only 192×128.

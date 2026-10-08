@@ -71,6 +71,15 @@
     ["book", "An open book on a desk by a window, lit by a candle, in oils"],
   ];
 
+  // The same prompt and seed through two pipelines: file, what it shows,
+  // how it was made, and what it took.
+  const CLIPS = [
+    ["fox-in-snow-fast", "A red fox trotting through fresh snow towards the camera, snow falling", "Fast, 24 fps.", "147 s to denoise, 39 s to decode."],
+    ["fox-in-snow", "A fox with a striped coat trotting through fresh snow towards the camera, snow falling", "DFR with the epilogue, 48 fps.", "1058 s to denoise, 104 s to decode."],
+    ["lighthouse-fast", "A lighthouse on a headland at dusk, a smooth wave rolling in below it", "Fast, 24 fps.", "144 s to denoise, 38 s to decode."],
+    ["lighthouse-epilogue", "A lighthouse on a rocky point at dusk, a wave breaking on the rocks and the sun low", "DFR with the epilogue, 48 fps.", "935 s to denoise, 100 s to decode."],
+  ];
+
   const CRATES = [
     ["nervus", "A neural network and backpropagation, from scratch. No dependencies.", "/docs/internals/nervus/"],
     ["kvad", "Transformer inference by hand: six architectures, quantisation, the kernels.", "/docs/internals/engine/"],
@@ -229,17 +238,38 @@
     </figcaption>
   </figure>
 
-  <figure class="clip">
-    <!-- svelte-ignore a11y_media_has_caption -->
-    <video controls playsinline preload="none" poster="/gallery/fox-in-snow.webp" width="1536" height="1024" aria-label="A fox trotting through fresh snow towards the camera, snow falling">
-      <source src="/gallery/fox-in-snow.mp4" type="video/mp4" />
-    </video>
-    <figcaption>
-      Made by Kvad: LTX-2.5 at 1536×1024, 3 seconds at 48 frames a second, with its sound. 18
-      minutes to denoise and 2 to decode on an M5 Pro, holding 27 GB at its peak. The prompt and
-      seed are in <a href="/docs/video/#large-sizes">the video guide</a>.
-    </figcaption>
-  </figure>
+  <div class="compared" id="compared">
+    <header>
+      <p class="label">Compared</p>
+      <h3>Two prompts, each through two of LTX-2.5's pipelines.</h3>
+      <p>
+        The fast pipeline makes a clip in minutes, at 30 frames a second or fewer. DFR with its
+        epilogue makes 48 and more at 1536×1024, by detailing the clip in overlapping tiles. Both
+        were given the same prompt and seed, twice, on an M5 Pro: 3 seconds at 1536×1024, with
+        sound.
+      </p>
+    </header>
+    <div class="clips">
+      {#each CLIPS as [file, alt, how, cost] (file)}
+        <figure>
+          <!-- svelte-ignore a11y_media_has_caption -->
+          <video controls playsinline preload="none" poster="/gallery/{file}.webp" width="1536" height="1024" aria-label={alt}>
+            <source src="/gallery/{file}.mp4" type="video/mp4" />
+          </video>
+          <figcaption><strong>{how}</strong> {cost}</figcaption>
+        </figure>
+      {/each}
+    </div>
+    <p class="found">
+      The epilogue's clips are the sharper: by 5 to 29% on the fox and 15 to 37% on the lighthouse,
+      measured as the spread of a Laplacian over three frames of each. They took six to seven
+      times as long to denoise, and the fox's held 27 GB at its peak. Sharper was not better each
+      time: the fast pipeline's fox is the likelier animal, and of the lighthouses neither is the
+      worse. A seed draws a different scene in each pipeline, so this is what each makes of a
+      prompt, and not one scene made twice. The prompts, seeds and commands are in
+      <a href="/docs/video/#against-the-fast-pipeline">the video guide</a>.
+    </p>
+  </div>
 </section>
 
 <section class="wrap rows">
@@ -664,14 +694,40 @@
     object-fit: cover;
     border-radius: 8px;
   }
-  .clip {
-    margin: 32px 0 0;
+  .compared {
+    margin: 56px 0 0;
+    scroll-margin-top: 80px;
   }
-  .clip video {
+  .compared header p:not(.label),
+  .compared .found {
+    max-width: 68ch;
+    font-size: 15.5px;
+    color: var(--muted);
+  }
+  .compared h3 {
+    margin-block: 6px 12px;
+  }
+  .clips {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px 12px;
+    margin-block: 28px 20px;
+  }
+  .clips figure {
+    margin: 0;
+  }
+  .clips video {
     width: 100%;
     height: auto;
     border-radius: 8px;
     background: var(--line);
+  }
+  .clips figcaption {
+    margin-top: 8px;
+  }
+  .clips strong {
+    color: var(--muted);
+    font-weight: 600;
   }
   figcaption {
     margin-top: 14px;
@@ -876,6 +932,9 @@
   }
   @media (max-width: 520px) {
     dl {
+      grid-template-columns: 1fr;
+    }
+    .clips {
       grid-template-columns: 1fr;
     }
     dl > div,

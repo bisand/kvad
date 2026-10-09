@@ -502,46 +502,265 @@ pub fn run(words: &[String]) {
 // The shells
 // ---------------------------------------------------------------------------
 
-/// `kvad completions [SHELL]`.
-pub fn completions(shell: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    match shell {
-        Some("zsh") => print!("{ZSH}"),
-        Some("bash") => print!("{BASH}"),
-        Some("fish") => print!("{FISH}"),
-        Some(other) => return Err(format!("no completions for `{other}`: zsh, bash and fish are the shells there are scripts for").into()),
-        None => print!("{}", setup()),
+/// The shells there are scripts for.
+const SHELLS: [&str; 3] = ["zsh", "bash", "fish"];
+
+/// What marks a line in a shell's rc file as one this program wrote, and so
+/// one it may take out again.
+const MARK: &str = "# kvad completions";
+
+type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// `kvad completions ...`: a shell's script, or installing it.
+pub fn completions(words: &[String]) -> Res<()> {
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let places = Places::here();
+    match words.as_slice() {
+        [] => print!("{}", setup(&places)),
+        ["zsh"] => print!("{ZSH}"),
+        ["bash"] => print!("{BASH}"),
+        ["fish"] => print!("{FISH}"),
+        ["install", shells @ ..] => {
+            for shell in places.chosen(shells)? {
+                println!("{}", install(&places, shell)?);
+            }
+        }
+        ["uninstall", shells @ ..] => {
+            // With none named, every shell: taking out is not something to
+            // do by halves.
+            let all = if shells.is_empty() { SHELLS.to_vec() } else { places.chosen(shells)? };
+            for shell in all {
+                println!("{}", uninstall(&places, shell)?);
+            }
+        }
+        ["status"] => {
+            for shell in SHELLS {
+                let state = if installed(&places, shell) { "set up in" } else { "not set up; it would go in" };
+                let login = if places.login.as_deref() == Some(shell) { "  (your login shell)" } else { "" };
+                println!("{shell:<5} {state} {}{login}", places.file(shell).display());
+            }
+            // The exit status answers the one question a script has: does
+            // the shell this person uses complete kvad.
+            let mine = places.login.as_deref().is_some_and(|shell| installed(&places, shell));
+            std::process::exit(if mine { 0 } else { 1 });
+        }
+        [other, ..] => return Err(not_a_shell(other).into()),
     }
     Ok(())
 }
 
-/// How to install them, with the reader's own shell first.
-fn setup() -> String {
-    let shell = std::env::var("SHELL").unwrap_or_default();
-    let mine = ["zsh", "bash", "fish"].into_iter().find(|s| shell.ends_with(s));
-    let how = |shell: &str| match shell {
-        "zsh" => {
-            "zsh — add to ~/.zshrc, after the line that runs compinit if there is one:\n\n    \
-             eval \"$(kvad completions zsh)\"\n"
+fn not_a_shell(word: &str) -> String {
+    format!("`{word}` is not a shell there are completions for: zsh, bash and fish are.\n`kvad help completions` says what this takes.")
+}
+
+/// Where each shell keeps what it reads at startup, on this machine.
+///
+/// A struct and not five calls to `std::env::var`, so that the tests can
+/// install into a directory of their own instead of somebody's home.
+pub struct Places {
+    pub home: std::path::PathBuf,
+    /// `$ZDOTDIR`, where zsh looks instead of the home directory.
+    pub zdotdir: Option<std::path::PathBuf>,
+    /// `$XDG_CONFIG_HOME`, or `~/.config`.
+    pub config: std::path::PathBuf,
+    pub macos: bool,
+    /// The shell `$SHELL` names, when it is one of ours.
+    pub login: Option<String>,
+}
+
+impl Places {
+    pub fn here() -> Places {
+        let dir = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        let home = dir("HOME").unwrap_or_else(|| ".".into());
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        Places {
+            zdotdir: dir("ZDOTDIR"),
+            config: dir("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config")),
+            macos: cfg!(target_os = "macos"),
+            login: SHELLS.into_iter().find(|s| shell.rsplit('/').next() == Some(s)).map(String::from),
+            home,
         }
-        "bash" => "bash — add to ~/.bashrc (on macOS, ~/.bash_profile):\n\n    eval \"$(kvad completions bash)\"\n",
-        _ => "fish — run once:\n\n    kvad completions fish > ~/.config/fish/completions/kvad.fish\n",
+    }
+
+    /// The file a shell's completions go in.
+    ///
+    /// For zsh and bash that is the rc file, which gets one line. bash on a
+    /// Mac is a login shell in every terminal and reads `.bash_profile`,
+    /// not `.bashrc` — unless only the second exists, which says its owner
+    /// has arranged for it to be read. fish has a directory of completions,
+    /// one file to a command, and gets a file of its own.
+    pub fn file(&self, shell: &str) -> std::path::PathBuf {
+        match shell {
+            "zsh" => self.zdotdir.as_ref().unwrap_or(&self.home).join(".zshrc"),
+            "bash" => {
+                let (profile, rc) = (self.home.join(".bash_profile"), self.home.join(".bashrc"));
+                match self.macos && (profile.exists() || !rc.exists()) {
+                    true => profile,
+                    false => rc,
+                }
+            }
+            _ => self.config.join("fish").join("completions").join("kvad.fish"),
+        }
+    }
+
+    /// The shells a command named, or the login shell when it named none.
+    fn chosen<'a>(&'a self, named: &[&'a str]) -> Res<Vec<&'a str>> {
+        if let Some(other) = named.iter().find(|s| !SHELLS.contains(s)) {
+            return Err(not_a_shell(other).into());
+        }
+        match (named.is_empty(), &self.login) {
+            (false, _) => Ok(named.to_vec()),
+            (true, Some(shell)) => Ok(vec![shell.as_str()]),
+            (true, None) => Err(format!(
+                "your login shell is `{}`, and there are completions for zsh, bash and fish.\n\
+                 Name one to set it up anyway:  kvad completions install zsh",
+                std::env::var("SHELL").unwrap_or_else(|_| "unset".into())
+            )
+            .into()),
+        }
+    }
+}
+
+/// The line an rc file is given.
+///
+/// It asks kvad for the script each time a shell starts, which costs a few
+/// milliseconds and means the script on disk can never be an old one. And
+/// it does nothing where there is no kvad: an rc file is shared between
+/// machines more often than a binary is.
+fn rc_line(shell: &str) -> String {
+    format!("command -v kvad >/dev/null 2>&1 && eval \"$(kvad completions {shell})\"  {MARK}")
+}
+
+/// Whether a file already loads kvad's completions, by a line of ours or
+/// one somebody wrote by hand.
+fn loads(text: &str, shell: &str) -> bool {
+    let asked = format!("kvad completions {shell}");
+    text.lines().any(|line| !line.trim_start().starts_with('#') && line.contains(&asked))
+}
+
+fn installed(places: &Places, shell: &str) -> bool {
+    let text = std::fs::read_to_string(places.file(shell)).unwrap_or_default();
+    match shell {
+        "fish" => text.contains("kvad __complete"),
+        _ => loads(&text, shell),
+    }
+}
+
+/// Set one shell up, and say what was done.
+///
+/// Written through the path as it is, never renamed over: an rc file is
+/// often a symlink into a repository of dotfiles, and replacing the link
+/// with a file would quietly take it out of that repository.
+fn install(places: &Places, shell: &str) -> Res<String> {
+    let file = places.file(shell);
+    let at = file.display();
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("could not read {at}: {e}").into()),
     };
-    let mut out = String::from("Tab completion for kvad: commands, their options, and the models on this machine.\n\n");
-    let order: Vec<&str> = mine.into_iter().chain(["zsh", "bash", "fish"].into_iter().filter(|s| Some(*s) != mine)).collect();
-    for (i, shell) in order.iter().enumerate() {
-        if i == 1 && mine.is_some() {
-            out.push_str("Other shells:\n\n");
+    if installed(places, shell) && shell != "fish" {
+        return Ok(format!("{shell}: {at} already loads them"));
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+    }
+    let text = match shell {
+        // The whole file is kvad's, and is rewritten so that an upgrade
+        // brings a newer script. A file there that is not ours is left.
+        "fish" if !existing.is_empty() && !existing.contains("kvad __complete") => {
+            return Ok(format!("fish: {at} is there already and is not kvad's; left alone"));
         }
-        out.push_str(how(shell));
-        out.push('\n');
+        "fish" => FISH.to_string(),
+        _ => {
+            let gap = match existing.as_str() {
+                "" => "",
+                text if text.ends_with("\n\n") => "",
+                text if text.ends_with('\n') => "\n",
+                _ => "\n\n",
+            };
+            format!("{existing}{gap}{}\n", rc_line(shell))
+        }
+    };
+    std::fs::write(&file, text).map_err(|e| format!("could not write {at}: {e}"))?;
+    Ok(match shell {
+        "fish" => format!("fish: wrote {at}; new fish windows complete kvad"),
+        _ => format!("{shell}: added a line to {at}\n  open a new terminal, or run:  eval \"$(kvad completions {shell})\""),
+    })
+}
+
+/// Take one shell's completions out again, and say what was done.
+fn uninstall(places: &Places, shell: &str) -> Res<String> {
+    let file = places.file(shell);
+    let at = file.display();
+    let Ok(existing) = std::fs::read_to_string(&file) else {
+        return Ok(format!("{shell}: nothing to remove"));
+    };
+    if shell == "fish" {
+        return Ok(match existing.contains("kvad __complete") {
+            true => {
+                std::fs::remove_file(&file).map_err(|e| format!("could not remove {at}: {e}"))?;
+                format!("fish: removed {at}")
+            }
+            false => format!("fish: {at} is not kvad's; left alone"),
+        });
+    }
+    // Our line, and the blank one put before it.
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = 0;
+    for line in existing.lines() {
+        match line.trim_end().ends_with(MARK) {
+            true => {
+                removed += 1;
+                if kept.last().is_some_and(|l| l.is_empty()) {
+                    kept.pop();
+                }
+            }
+            false => kept.push(line),
+        }
+    }
+    if removed == 0 {
+        return Ok(match loads(&existing, shell) {
+            true => format!("{shell}: {at} loads them with a line kvad did not write; left alone"),
+            false => format!("{shell}: nothing to remove"),
+        });
+    }
+    // A file with nothing else in it was made for that line, and goes
+    // with it.
+    if kept.iter().all(|line| line.trim().is_empty()) {
+        std::fs::remove_file(&file).map_err(|e| format!("could not remove {at}: {e}"))?;
+        return Ok(format!("{shell}: removed {at}, which held nothing else"));
+    }
+    let text = kept.join("\n") + "\n";
+    std::fs::write(&file, text).map_err(|e| format!("could not write {at}: {e}"))?;
+    Ok(format!("{shell}: removed the line from {at}"))
+}
+
+/// What a bare `kvad completions` says: whether it is set up, and how.
+fn setup(places: &Places) -> String {
+    let mut out = String::from("Tab completion for kvad: commands, their options, and the models on this machine.\n\n");
+    match &places.login {
+        Some(shell) if installed(places, shell) => {
+            out.push_str(&format!("It is set up for {shell}, in {}.\n\n", places.file(shell).display()));
+        }
+        Some(shell) => out.push_str(&format!(
+            "Set it up for {shell}, your shell:\n\n    kvad completions install\n\n\
+             which adds to {}.\n\n",
+            places.file(shell).display()
+        )),
+        None => out.push_str("Set it up for zsh, bash or fish:\n\n    kvad completions install zsh\n\n"),
     }
     out.push_str(
-        "Then open a new terminal, and try:\n\n    \
+        "    kvad completions install [zsh|bash|fish]...   set up those shells\n    \
+         kvad completions uninstall                    take it out of every shell\n    \
+         kvad completions status                       where it is set up\n    \
+         kvad completions zsh|bash|fish                print a shell's script\n\n\
+         Once it is set up, open a new terminal and try:\n\n    \
          kvad <Tab>                  every command, and what it does\n    \
          kvad run --model <Tab>      the models on disk\n    \
          kvad videos make --<Tab>    what a video can be asked for\n\n\
-         Nothing needs doing again after an upgrade: the script only asks the kvad that\n\
-         is installed, so it knows whatever that one knows.\n",
+         Nothing needs doing again after an upgrade: the shell asks the kvad that is\n\
+         installed, so it knows whatever that one knows.\n",
     );
     out
 }
@@ -783,7 +1002,10 @@ mod tests {
         assert_eq!(tab("kvad api /api/he"), ["/api/health"]);
         assert_eq!(tab("kvad api delete /api/k"), ["/api/keys/{id}"]);
         assert_eq!(tab("kvad api po"), ["post"]);
-        assert_eq!(tab("kvad completions "), ["zsh", "bash", "fish"]);
+        assert_eq!(tab("kvad completions "), ["install", "uninstall", "status", "zsh", "bash", "fish"]);
+        assert_eq!(tab("kvad completions install b"), ["bash"]);
+        assert_eq!(tab("kvad completions install zsh ").len(), 3);
+        assert_eq!(tab("kvad completions status "), ["--help"]);
     }
 
     #[test]
@@ -798,6 +1020,92 @@ mod tests {
         assert_eq!(files("kvad run --model "), Files::None);
         assert_eq!(files("kvad run --model ./"), Files::Dirs);
         assert_eq!(files("kvad run --prompt "), Files::None);
+    }
+
+    /// A home directory nobody lives in.
+    fn scratch(name: &str, login: &str) -> Places {
+        let home = std::env::temp_dir().join(format!("kvad-completions-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        Places { zdotdir: None, config: home.join(".config"), macos: true, login: Some(login.into()), home }
+    }
+
+    #[test]
+    fn installing_adds_one_line_once_and_uninstalling_takes_it_out() {
+        let places = scratch("rc", "zsh");
+        let rc = places.file("zsh");
+        std::fs::write(&rc, "export EDITOR=vi\nsource plugins.zsh").unwrap();
+
+        assert!(!installed(&places, "zsh"));
+        assert!(install(&places, "zsh").unwrap().contains("added a line"));
+        assert!(installed(&places, "zsh"));
+        let text = std::fs::read_to_string(&rc).unwrap();
+        assert_eq!(text, format!("export EDITOR=vi\nsource plugins.zsh\n\n{}\n", rc_line("zsh")));
+
+        // A second install changes nothing.
+        assert!(install(&places, "zsh").unwrap().contains("already"));
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), text);
+
+        // And what is left afterwards is what was there before, with the
+        // newline its last line was missing.
+        assert!(uninstall(&places, "zsh").unwrap().contains("removed"));
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), "export EDITOR=vi\nsource plugins.zsh\n");
+        assert!(uninstall(&places, "zsh").unwrap().contains("nothing to remove"));
+
+        // A file made for the line goes with the line.
+        std::fs::remove_file(&rc).unwrap();
+        install(&places, "zsh").unwrap();
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), format!("{}\n", rc_line("zsh")));
+        assert!(uninstall(&places, "zsh").unwrap().contains("held nothing else"));
+        assert!(!rc.exists());
+        std::fs::remove_dir_all(&places.home).unwrap();
+    }
+
+    #[test]
+    fn a_line_somebody_wrote_is_seen_and_left_alone() {
+        let places = scratch("by-hand", "zsh");
+        let rc = places.file("zsh");
+        let theirs = "# kvad completions zsh, commented out\neval \"$(kvad completions zsh)\"\n";
+        std::fs::write(&rc, theirs).unwrap();
+        assert!(install(&places, "zsh").unwrap().contains("already"));
+        assert!(uninstall(&places, "zsh").unwrap().contains("did not write"));
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), theirs);
+        // A comment that mentions it is not a line that loads it.
+        std::fs::write(&rc, "# eval \"$(kvad completions zsh)\"\n").unwrap();
+        assert!(!installed(&places, "zsh"));
+        std::fs::remove_dir_all(&places.home).unwrap();
+    }
+
+    #[test]
+    fn each_shell_has_its_own_file() {
+        let places = scratch("files", "fish");
+        // bash on a Mac: the profile, unless only the rc file is there.
+        assert!(places.file("bash").ends_with(".bash_profile"));
+        std::fs::write(places.home.join(".bashrc"), "").unwrap();
+        assert!(places.file("bash").ends_with(".bashrc"));
+        let linux = Places { macos: false, ..scratch("files-linux", "bash") };
+        assert!(linux.file("bash").ends_with(".bashrc"));
+
+        // fish gets a file that is all kvad's, made with its directories.
+        let fish = places.file("fish");
+        assert!(fish.ends_with(".config/fish/completions/kvad.fish"));
+        assert!(install(&places, "fish").unwrap().contains("wrote"));
+        assert_eq!(std::fs::read_to_string(&fish).unwrap(), FISH);
+        assert!(installed(&places, "fish"));
+        assert!(uninstall(&places, "fish").unwrap().contains("removed"));
+        assert!(!fish.exists());
+        // Somebody else's file of that name is not ours to replace.
+        std::fs::write(&fish, "complete -c kvad -a mine\n").unwrap();
+        assert!(install(&places, "fish").unwrap().contains("left alone"));
+        assert!(uninstall(&places, "fish").unwrap().contains("left alone"));
+
+        assert_eq!(places.chosen(&[]).unwrap(), ["fish"]);
+        assert_eq!(places.chosen(&["zsh", "bash"]).unwrap(), ["zsh", "bash"]);
+        assert!(places.chosen(&["ksh"]).is_err());
+        assert!(Places { login: None, ..scratch("files-none", "zsh") }.chosen(&[]).is_err());
+        for dir in [places.home, linux.home] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// Every word of every command has something written for it: a walk of

@@ -6,9 +6,10 @@
 #
 # Downloads the release tarball for this machine, checks it against the
 # release's SHA256SUMS, and puts the binaries in ~/.local/bin. Then it asks
-# two questions — whether to put that directory on PATH, and whether
-# kvad-serve should start at login — because the honest default for both is
-# "it depends on the machine" and guessing wrong is worse than asking.
+# three questions — whether to put that directory on PATH, whether to set up
+# Tab completion in your shell, and whether kvad-serve should start at
+# login — because the honest default for each is "it depends on the machine"
+# and guessing wrong is worse than asking.
 #
 # It asks on /dev/tty rather than stdin, which is what lets the questions
 # survive `curl | sh`: stdin there is the script itself.
@@ -19,7 +20,8 @@
 #
 # --yes never opens the terminal, and answers every question the quiet way:
 # install the binaries and touch nothing else — no shell rc edited, no service
-# started. Ask for those explicitly with --add-path and --service. A machine
+# started. Ask for those explicitly with --add-path, --completions and
+# --service. A machine
 # that already runs the service is the exception: there the quiet answer is to
 # keep running it, on the binaries just installed.
 #
@@ -408,6 +410,7 @@ PREFIX="${KVAD_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${KVAD_VERSION:-}"
 WANT_SERVICE=ask
 WANT_PATH=ask
+WANT_COMPLETIONS=ask
 UNINSTALL=0
 DATA_DIR=
 
@@ -444,6 +447,8 @@ install.sh — install kvad on macOS or Linux
     --no-service     skip it without asking
     --add-path       add the install directory to PATH without asking
     --no-add-path    leave PATH alone without asking
+    --completions    set up Tab completion in your shell without asking
+    --no-completions leave your shell alone without asking
     -y, --yes        never ask; take the default answer to every question
     --uninstall      remove the binaries and the service, keep models and data
     -h, --help
@@ -480,6 +485,8 @@ while [ $# -gt 0 ]; do
         --no-service)  WANT_SERVICE=no; shift ;;
         --add-path)    WANT_PATH=yes; shift ;;
         --no-add-path) WANT_PATH=no; shift ;;
+        --completions) WANT_COMPLETIONS=yes; shift ;;
+        --no-completions) WANT_COMPLETIONS=no; shift ;;
         -y|--yes)      INTERACTIVE=0; shift ;;
         --uninstall)   UNINSTALL=1; shift ;;
         -h|--help)     usage ;;
@@ -635,6 +642,14 @@ service_paths() {
 # replaced, the new one after.
 cli_has_service() { # path to a kvad binary
     [ -x "$1" ] && "$1" service help >/dev/null 2>&1
+}
+
+# Tab completion is `kvad completions`'s job for the same reason the service
+# is `kvad service`'s: the binary knows which shells it has scripts for and
+# which lines in an rc file are its own. A kvad from before it had the
+# command is not asked.
+cli_has_completions() { # path to a kvad binary
+    [ -x "$1" ] && "$1" help completions >/dev/null 2>&1
 }
 
 # Whether the service manager currently has the job, as opposed to there
@@ -886,6 +901,12 @@ if [ "$UNINSTALL" -eq 1 ]; then
         say "The background service runs $elsewhere/kvad-serve, not this install's; left alone."
     else
         stop_service
+    fi
+    # While there is still a kvad to ask: it wrote the lines, and knows
+    # which ones are its own.
+    if cli_has_completions "$PREFIX/kvad"; then
+        step "Removing Tab completion"
+        "$PREFIX/kvad" completions uninstall 2>&1 | sed 's/^/  /' >&2 || true
     fi
     step "Removing binaries from $PREFIX"
     removed=0
@@ -1158,6 +1179,46 @@ if ! on_path; then
     fi
 fi
 
+# ----------------------------------------------------------- completions --
+
+# Whatever the login shell is: `kvad completions install` reads $SHELL and
+# does what that shell wants — a line in an rc file for zsh and bash, a file
+# among fish's completions. Its `status` exits 0 when that is done already,
+# which is every upgrade after the first, and then there is nothing to ask.
+if cli_has_completions "$PREFIX/kvad" && ! "$PREFIX/kvad" completions status >/dev/null 2>&1; then
+    shell=$(basename "${SHELL:-/bin/sh}")
+    case $shell in
+        zsh|bash|fish)
+            say ""
+            say "${B}kvad${R} can complete its commands, options and model names at a Tab."
+            do_completions=0
+            case $WANT_COMPLETIONS in
+                yes) do_completions=1 ;;
+                no)  do_completions=0 ;;
+                *)   ask "Set that up for $shell?" y n && do_completions=1 ;;
+            esac
+            if [ "$do_completions" -eq 1 ]; then
+                # Captured, not piped: a pipe's status is its last command's,
+                # and that would be the indenting, which never fails.
+                if done_text=$("$PREFIX/kvad" completions install 2>&1); then
+                    printf '%s\n' "$done_text" | sed 's/^/  /' >&2
+                else
+                    warn "could not set it up: $done_text
+  ${B}kvad completions install${R} tries again"
+                fi
+            elif [ "$WANT_COMPLETIONS" = ask ] && [ "$INTERACTIVE" -eq 0 ]; then
+                say "  ${DIM}pass --completions to have this script set it up${R}"
+            else
+                say "  ${DIM}kvad completions install sets it up later${R}"
+            fi ;;
+        *)
+            # Not a failure, and not worth a question: there is no script
+            # for this shell to install.
+            say ""
+            say "${DIM}Tab completion is there for zsh, bash and fish; your shell is $shell.${R}" ;;
+    esac
+fi
+
 # --------------------------------------------------------------- service --
 
 write_launchd() {
@@ -1366,7 +1427,6 @@ say ""
 say "  ${B}kvad pull${R} Qwen/Qwen2.5-0.5B-Instruct   download a model"
 say "  ${B}kvad chat${R}                              talk to it"
 say "  ${B}kvad help${R}                              everything else it does"
-say "  ${B}kvad completions${R}                       Tab completion for your shell"
 if [ -f "$SRC/kvad-tui" ]; then
     say "  ${B}kvad-tui${R}                               browse and chat in the terminal"
 fi

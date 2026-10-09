@@ -80,12 +80,13 @@ does not answer within two seconds is given up on, and Tab offers nothing.
 | `kvad completions zsh` | Print a shell's script, to place yourself. |
 
 For zsh and bash, `install` adds one line to the end of `~/.zshrc`, or
-`~/.bashrc` (`~/.bash_profile` on a Mac). For fish it writes
-`~/.config/fish/completions/kvad.fish`. `uninstall` removes what `install`
-wrote and nothing else. The shell asks the installed `kvad` at every Tab, so
-an upgrade needs nothing done again.
+`~/.bashrc` (`~/.bash_profile` on a Mac). For fish it writes a two-line
+`~/.config/fish/completions/kvad.fish`. Either way the shell asks the
+installed `kvad` for the script as it starts, and for the candidates at every
+Tab, so an upgrade needs nothing done again. `uninstall` removes what
+`install` wrote and nothing else.
 
-The fish script has not been run on a machine with fish; zsh and bash have.
+Checked in zsh 5.9, in the bash 3.2 that macOS ships, and in fish 4.9.
 
 ## Models
 

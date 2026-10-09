@@ -117,25 +117,12 @@ the name of one already there adds to it.";
 pub const TUNE: &str = "usage: kvad tune --data DIR --name NAME [options]
        kvad tune --dataset ID|NAME --name NAME [options]
        kvad tune options                      what a run can be asked for there
+       kvad tune --help                       every option, and what it is
 
 Train a LoRA for SDXL on the server, from a folder of pictures, each with its
 caption in a .txt of the same name. --data uploads the folder as a dataset
 first; --dataset names one the server has. The LoRA is the server's when it is
 done: `kvad images make PROMPT --lora NAME` draws with it.
-
-  --model MODEL       the model it is for (default: SDXL's base)
-  --caption TEXT      the caption of every picture that has none
-  --size N            pixels a side: 512, 768 or 1024 (default 1024)
-  --rank N            (default 16)
-  --steps N           (default 1000)
-  --lr F              (default 1e-4)
-  --eval-every N      steps between measurements (default 100)
-  --seed N            (default 1337)
-  --sample TEXT       a prompt to draw before the first step and at every
-                      measurement; up to four. `kvad jobs pictures ID`
-                      fetches them
-  --sample-size N     pixels a side of a sample (default 512)
-  --sample-steps N    its denoising steps (default 20)
 
 The run is a job: Ctrl-C stops the watching, `kvad jobs cancel ID` the run.
 `kvad-gpu tune` trains the same LoRA in the terminal that asks, with no

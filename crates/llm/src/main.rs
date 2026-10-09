@@ -13,9 +13,12 @@
 //!     kvad chat [--model R] [--system TEXT]
 //!     kvad serve [...]       the HTTP server and web UI
 //!     kvad service ...       that server as a service that starts at login
+//!     kvad help [COMMAND]    every command, or what one takes
+//!     kvad completions       Tab completion for zsh, bash and fish
 //!
-//! Sampling flags: --max-tokens N --temperature F --top-k N --top-p F --seed N
-//! --greedy
+//! That is a sample. The whole list, with every word and flag each command
+//! takes, is the table in [`cli::spec`]: `kvad help` prints it and a shell's
+//! Tab completes from it, so neither is written down a second time here.
 //!
 //! Wherever a model is named, three things are accepted and tried in this
 //! order: a directory that exists, a model trained here by that name, a Hub
@@ -246,111 +249,6 @@ impl Default for Args {
     }
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "usage: kvad <command> [options]\n\n\
-         commands:\n  \
-           search QUERY        find models on the Hub\n  \
-           pull REPO           download a model\n  \
-           crawl URL           read a documentation site into a text file\n  \
-           train               train a model of your own from a text file\n  \
-           ls                  list downloaded and trained models\n  \
-           use MODEL           set the default model\n  \
-           rm MODEL            delete a downloaded or trained model\n  \
-           cache [REPO|clear]  list or delete pre-quantised weight files\n  \
-           info [MODEL]        show a model's config without downloading weights
-  arch                list the architectures this build can run\n  \
-           run                 one-shot completion\n  \
-           chat                interactive conversation\n  \
-           serve [...]         HTTP server and web UI; options are passed through\n  \
-           service ...         run that server at login: status, start, stop,\n  \
-           \u{20}                   restart, logs [-f], install, uninstall\n\n\
-         commands a running server answers (kvad-serve, or `kvad service start`):\n  \
-           ps                  the models in memory, and what is left\n  \
-           load MODEL          put a model in memory  [--backend ID]\n  \
-           unload [ID]         take one out, or all of them\n  \
-           cancel              stop whatever is generating\n  \
-           tokenize TEXT       how the model splits a text\n  \
-           conversations       ls, show ID, edit ID, rm ID\n  \
-           images              ls, make PROMPT [--out FILE], rm ID\n  \
-           videos              ls, make PROMPT [--out FILE], show ID, watch ID, get ID, rm ID\n  \
-           jobs                ls, show ID, watch ID, cancel ID, pictures ID\n  \
-           datasets            ls, add FILE|DIR, crawl URL, show ID, check ID, search ID Q,\n  \
-           \u{20}                   put ID FILE..., get ID FILE, rm ID [FILE...]\n  \
-           tune                train a LoRA for SDXL: --data DIR --name NAME; options\n  \
-           evals               runs, show ID, suites, add FILE, edit ID FILE, rm ID,\n  \
-           \u{20}                   run SUITE MODEL..., perplexity DATASET MODEL...\n  \
-           bench               runs, show ID, run MODEL...\n  \
-           metrics             the machine; requests; log\n  \
-           auth                status, login [--key], logout, setup TOKEN, password\n  \
-           users               ls, add NAME, edit ID, rm ID\n  \
-           sessions | keys     ls, rm ID; keys add NAME\n  \
-           api [METHOD PATH [JSON]]\n  \
-           \u{20}                   any route, raw; with no arguments, the list of them\n\n\
-         -V, --version         print the version and exit\n\n\
-         where it runs:\n  \
-           --remote URL        send the command to the kvad-serve at URL\n  \
-           --local             run it in this process, even with a server running\n  \
-           \u{20}                   Otherwise: $KVAD_URL, then [client] url in kvad.toml,\n  \
-           \u{20}                   then this machine's service if it answers, then here.\n  \
-           \u{20}                   The first line of output says which, and why.\n  \
-           --json              print what the server sent, as JSON\n  \
-           -y, --yes           answer yes to the question a command would ask\n\n\
-         options:\n  \
-           --model MODEL       a name trained here, a directory, or a Hub repo id\n  \
-           \u{20}                   (default: active, else {DEFAULT_MODEL})\n  \
-           --prompt TEXT       prompt for `run`\n  \
-           --system TEXT       system prompt for `chat`\n  \
-           --max-tokens N      generation budget (default 256)\n  \
-           --temperature F     0 is greedy (default 0.7)\n  \
-           --top-k N           keep the N best candidates (default 40)\n  \
-           --top-p F           nucleus threshold (default 0.95)\n  \
-           --seed N            sampling seed (default 7)\n  \
-           --quant f32|q8|q4   quantise weights on load (default f32); on a server,\n  \
-           \u{20}                   the CPU backend at that precision\n  \
-           --backend ID        on a server: which backend to load on, e.g. gpu-q8\n  \
-           --greedy            shorthand for --temperature 0\n  \
-           --raw               `run` on a server: continue the prompt, no chat template\n  \
-           --save              `chat` on a server: keep the conversation there\n  \
-           --conversation ID   `chat` on a server: carry on with a kept one\n\n\
-         kvad crawl options:\n  \
-           --out FILE          where to write it (default: a name from the address)\n  \
-           --pages N           most pages to read (default 400)\n  \
-           --mb F              most text to collect (default 16)\n  \
-           --pause MS          wait between requests (default 250)\n  \
-           --drop-rare N       drop characters seen fewer than N times (default 10)\n  \
-           --same-host         follow links anywhere on the host, not just under\n  \
-           \u{20}                   the address's own directory\n\n\
-         Links are followed under the starting address's directory only, because\n\
-         `/book/` links into the standard library's documentation on nearly every page\n\
-         and that is a hundred times the book. robots.txt is obeyed. Ctrl-C stops it\n\
-         and loses what it has read; the web UI's Stop keeps it.\n\n\
-         kvad train options:\n  \
-           --data FILE         plain text to learn from (required here; on a server,\n  \
-           \u{20}                   uploaded as a dataset first)\n  \
-           --dataset ID|NAME   on a server: train on a dataset it already has\n  \
-           --name NAME         what to call it; one word, no `/`\n  \
-           --from MODEL        train an existing model further, instead of a new one\n  \
-           --size NAME         model shape: {sizes} (default {default_size})\n  \
-           --steps N           training steps (default 2000)\n  \
-           --batch N           windows per step (default 16)\n  \
-           --lr F              peak learning rate (default 0.003)\n  \
-           --warmup N          steps spent climbing to it (default: a tenth of the run)\n  \
-           --decay-to F        fraction of --lr left at the last step (default 0.1)\n  \
-           --clip F            longest the whole gradient may be; 0 for none (default 1)\n  \
-           --eval-every N      steps between checkpoints (default 250)\n  \
-           --threads N         replicas to split each batch across (default: every core)\n  \
-           --sample N          characters to write at each checkpoint, 0 for none\n\n\
-         `--from` has two limits worth knowing. The character vocabulary is fixed at\n\
-         first training, so text with a character the model never saw is refused. And\n\
-         the optimiser's state is not saved, so a resumed run restarts AdamW's running\n\
-         averages: measured at up to 0.06 of training loss over 50 steps, gone by 100.",
-        sizes = train::SIZES.iter().map(|s| s.name).collect::<Vec<_>>().join("|"),
-        default_size = train::SIZES[train::DEFAULT_SIZE].name,
-    );
-    std::process::exit(2);
-}
-
 /// Commands that take words after them, rather than only flags.
 const POSITIONAL: &[&str] = &[
     "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload",
@@ -395,8 +293,10 @@ fn parse_from(argv: Vec<String>) -> Args {
             i = 1;
         }
     }
-    if matches!(a.command.as_str(), "-h" | "--help" | "help") {
-        usage();
+    // Before its flags are read: a typo in the command should be told so,
+    // not told that the word after it is no flag.
+    if cli::spec::command(&a.command).is_none() {
+        cli::help::unknown_command(&a.command);
     }
     let positional = POSITIONAL.contains(&a.command.as_str());
 
@@ -413,9 +313,19 @@ fn parse_from(argv: Vec<String>) -> Args {
             i += 1;
             continue;
         }
+        // A word, after a command that takes none.
+        if !flag.starts_with('-') {
+            let hint = match a.command.as_str() {
+                "run" => "\nThe prompt goes after --prompt.",
+                _ => "",
+            };
+            cli::help::bad_flag(&a.command, &format!("`kvad {}` takes options and no words, and `{flag}` is a word.{hint}", a.command), "");
+        }
+        if cli::spec::takes_value(&flag).is_none() {
+            cli::help::bad_flag(&a.command, &format!("{flag} is not an option of `kvad {}`.", a.command), &flag);
+        }
         let Some(value) = argv.get(i + 1).cloned() else {
-            eprintln!("missing value for {flag}");
-            usage();
+            cli::help::bad_flag(&a.command, &format!("{flag} needs a value after it."), "");
         };
         let num = || -> f64 {
             value.parse().unwrap_or_else(|_| {
@@ -498,10 +408,9 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--window" => a.window = Some(num() as usize),
             "--rounds" => a.rounds = Some(num() as usize),
             "--tokens" => a.tokens = Some(num() as usize),
-            _ => {
-                eprintln!("unknown flag {flag}");
-                usage();
-            }
+            // In the table and not in this match: the test in `cli::spec`
+            // that holds the two together has been broken.
+            _ => cli::help::bad_flag(&a.command, &format!("{flag} is not an option of `kvad {}`.", a.command), &flag),
         }
         i += 2;
     }
@@ -628,14 +537,33 @@ fn real_main() -> Res<()> {
     // Before parsing too, and for the same reason the installer wants it:
     // "what is on this machine already" has to be answerable by a binary
     // that may be older than whatever is asking.
-    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+    let completing = std::env::args().nth(1).is_some_and(|a| a == "__complete");
+    if !completing && std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
         println!("kvad {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
+    // Help, and the two commands that are about the command line itself.
+    // Bare `kvad` is the overview: it used to be `kvad run`, which answered
+    // "what is this" by downloading a model.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        None | Some("-h" | "--help") => cli::help::show(None),
+        Some("help") => cli::help::show(argv.get(1).map(String::as_str)),
+        Some("__complete") => {
+            cli::complete::run(&argv[1..]);
+            return Ok(());
+        }
+        Some("completions") => match argv.iter().skip(1).any(|a| a == "--help" || a == "-h") {
+            true => cli::help::show(Some("completions")),
+            false => return cli::complete::completions(argv.get(1).map(String::as_str)),
+        },
+        _ => {}
+    }
+
     let args = parse_args();
     if args.help {
-        cli::help(&args.command);
+        cli::help::show(Some(&args.command));
     }
 
     // Local-only commands first. `arch` is a fact about this binary, and
@@ -649,8 +577,7 @@ fn real_main() -> Res<()> {
     }
 
     if !cli::known(&args.command) {
-        eprintln!("unknown command `{}`", args.command);
-        usage();
+        cli::help::unknown_command(&args.command);
     }
 
     // Everything else can be answered by a server, and some of it only by
@@ -671,10 +598,7 @@ fn real_main() -> Res<()> {
                 "run" => run(args),
                 "chat" => chat(args),
                 other if cli::remote_only(other) => cli::no_server(other),
-                other => {
-                    eprintln!("unknown command `{other}`");
-                    usage();
-                }
+                other => cli::help::unknown_command(other),
             };
         }
     };

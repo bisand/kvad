@@ -407,6 +407,27 @@ impl Remote {
         Ok(Remote { base, why, auth, agent })
     }
 
+    /// The same server, asked by somebody who will not wait: half a second
+    /// to connect and two for the whole answer.
+    ///
+    /// For shell completion, which runs between a Tab and the next keypress.
+    /// A listing that is late is worth less than no listing, and the agent
+    /// every other request uses has no limit on the answer at all, because a
+    /// generation may take an hour.
+    pub fn hurried(mut self) -> Remote {
+        let loopback = self.base.contains("://127.0.0.1") || self.base.contains("://localhost") || self.base.contains("://[::1]");
+        self.agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .user_agent(concat!("kvad/", env!("CARGO_PKG_VERSION")))
+                .timeout_connect(Some(Duration::from_millis(500)))
+                .timeout_global(Some(Duration::from_secs(2)))
+                .http_status_as_error(false)
+                .proxy(if loopback { None } else { ureq::Proxy::try_from_env() })
+                .build(),
+        );
+        self
+    }
+
     pub fn why_text(&self) -> String {
         match &self.why {
             Why::Flag => "--remote".into(),

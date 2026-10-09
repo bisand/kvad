@@ -71,6 +71,30 @@ the old copy kept until you delete it there. `--host ADDR` and `--port N` answer
 questions ahead of time, for a run that should not stop to ask — `--bind
 HOST:PORT` still says both at once. `sh install.sh --help` lists the rest.
 
+## Help, and Tab completion
+
+`kvad help` lists every command in a line each, and `kvad help COMMAND` — or
+`kvad COMMAND --help` — says what one takes, with examples. A mistyped command
+or option is told the nearest one that exists.
+
+`kvad completions` sets up Tab completion for zsh, bash or fish; it prints the
+one line your shell needs:
+
+```bash
+kvad completions
+```
+
+After that Tab completes commands and their options, and what only the
+machine knows: `kvad run --model <Tab>` lists the language models on disk,
+`kvad images make --model <Tab>` the image models, `kvad unload <Tab>` what is
+in memory, `kvad load M --backend <Tab>` the server's backends, and
+`kvad jobs show <Tab>` the jobs, each with a line saying what it is. With a
+server running the answers are the server's, as the commands' are; `--remote
+URL` earlier on the line asks that one instead.
+
+The shell scripts hold no list of their own. They ask the installed `kvad`
+at each Tab, so an upgrade needs nothing done again.
+
 macOS gets all four binaries. Linux gets `kvad` and a CPU-only `kvad-serve`:
 `kvad-tui` and `kvad-gpu` both link candle against Metal, which is not a thing
 off a Mac. On macOS that means Apple Silicon, which is what this is developed

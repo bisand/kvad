@@ -89,7 +89,8 @@ kvad completions uninstall    # take it out again
 
 For zsh and bash that is one line at the end of `~/.zshrc`, or `~/.bashrc`
 (`~/.bash_profile` on a Mac), which asks `kvad` for the script as each shell
-starts. For fish it is a file, `~/.config/fish/completions/kvad.fish`.
+starts. For fish it is a file, `~/.config/fish/completions/kvad.fish`, which
+asks the same way.
 `uninstall` removes what `install` wrote and nothing else, and the installer's
 `--uninstall` runs it. `kvad completions zsh` prints a shell's script, for
 somebody who would rather place it themselves.

@@ -588,7 +588,8 @@ impl Places {
     /// Mac is a login shell in every terminal and reads `.bash_profile`,
     /// not `.bashrc` — unless only the second exists, which says its owner
     /// has arranged for it to be read. fish has a directory of completions,
-    /// one file to a command, and gets a file of its own.
+    /// one file to a command, and gets a file of its own, which asks kvad
+    /// for the script the same way the line does.
     pub fn file(&self, shell: &str) -> std::path::PathBuf {
         match shell {
             "zsh" => self.zdotdir.as_ref().unwrap_or(&self.home).join(".zshrc"),
@@ -641,7 +642,9 @@ fn loads(text: &str, shell: &str) -> bool {
 fn installed(places: &Places, shell: &str) -> bool {
     let text = std::fs::read_to_string(places.file(shell)).unwrap_or_default();
     match shell {
-        "fish" => text.contains("kvad __complete"),
+        // The loader only. The whole script, from 0.16.0, goes stale with
+        // the binary, and reads as not set up so that it is replaced.
+        "fish" => loads(&text, "fish"),
         _ => loads(&text, shell),
     }
 }
@@ -666,12 +669,12 @@ fn install(places: &Places, shell: &str) -> Res<String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
     }
     let text = match shell {
-        // The whole file is kvad's, and is rewritten so that an upgrade
-        // brings a newer script. A file there that is not ours is left.
-        "fish" if !existing.is_empty() && !existing.contains("kvad __complete") => {
+        // The whole file is kvad's, and is written again whatever it held
+        // of ours. A file there that is not ours is left.
+        "fish" if !existing.is_empty() && !ours_in_fish(&existing) => {
             return Ok(format!("fish: {at} is there already and is not kvad's; left alone"));
         }
-        "fish" => FISH.to_string(),
+        "fish" => FISH_LOADER.to_string(),
         _ => {
             let gap = match existing.as_str() {
                 "" => "",
@@ -697,7 +700,7 @@ fn uninstall(places: &Places, shell: &str) -> Res<String> {
         return Ok(format!("{shell}: nothing to remove"));
     };
     if shell == "fish" {
-        return Ok(match existing.contains("kvad __complete") {
+        return Ok(match ours_in_fish(&existing) {
             true => {
                 std::fs::remove_file(&file).map_err(|e| format!("could not remove {at}: {e}"))?;
                 format!("fish: removed {at}")
@@ -855,6 +858,18 @@ _kvad() {
 complete -F _kvad kvad
 "#;
 
+/// What fish's completions directory is given: not the script, but a line
+/// that asks kvad for it, as the rc line of the other shells does. fish
+/// reads the file the first time `kvad` is completed in a session.
+const FISH_LOADER: &str = "# Tab completion for kvad. From `kvad completions install`.\n\
+                           command -q kvad; and kvad completions fish | source\n";
+
+/// Whether a fish completions file is one kvad wrote: the loader, or the
+/// whole script, which 0.16.0 wrote there.
+fn ours_in_fish(text: &str) -> bool {
+    text.contains("kvad completions fish") || text.contains("kvad __complete")
+}
+
 /// fish, which shows descriptions and filters the candidates itself.
 const FISH: &str = r#"# Tab completion for kvad, in fish. From `kvad completions fish`.
 # It knows nothing itself: it asks `kvad __complete`, so it never goes stale.
@@ -873,7 +888,8 @@ function __kvad_complete
     string match -v -r '^:(files|dirs|none)$' -- $lines
 end
 
-complete -c kvad -f -a '(__kvad_complete)'
+# -k keeps kvad's order: commands by what they are for, the newest job first.
+complete -c kvad -f -k -a '(__kvad_complete)'
 "#;
 
 #[cfg(test)]
@@ -1090,8 +1106,14 @@ mod tests {
         let fish = places.file("fish");
         assert!(fish.ends_with(".config/fish/completions/kvad.fish"));
         assert!(install(&places, "fish").unwrap().contains("wrote"));
-        assert_eq!(std::fs::read_to_string(&fish).unwrap(), FISH);
+        assert_eq!(std::fs::read_to_string(&fish).unwrap(), FISH_LOADER);
         assert!(installed(&places, "fish"));
+        // The whole script, as 0.16.0 wrote it, is ours and is out of date:
+        // not set up, replaced by an install, removed by an uninstall.
+        std::fs::write(&fish, FISH).unwrap();
+        assert!(!installed(&places, "fish"));
+        assert!(install(&places, "fish").unwrap().contains("wrote"));
+        assert_eq!(std::fs::read_to_string(&fish).unwrap(), FISH_LOADER);
         assert!(uninstall(&places, "fish").unwrap().contains("removed"));
         assert!(!fish.exists());
         // Somebody else's file of that name is not ours to replace.

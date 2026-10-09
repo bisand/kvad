@@ -1,14 +1,91 @@
 ---
 title: Command line
-description: Every kvad command, grouped by what it is for.
+description: Every kvad command, grouped by what it is for, with its built-in help and Tab completion.
 ---
 
 ```text
-kvad <command> [options]
+kvad <command> [words] [options]
 ```
 
-`kvad --help` prints the same list. Most commands with subcommands print
-their own usage with `--help`.
+## Help
+
+`kvad help`, or `kvad` with nothing after it, prints every command in a line
+each. `kvad help COMMAND` says what one command takes: its usage, each option
+with what it does, and examples. `kvad COMMAND --help` is the same thing.
+
+```bash
+kvad help
+kvad help videos
+kvad images --help
+```
+
+A command or an option that does not exist is told the nearest one that does:
+
+```text
+$ kvad chta
+`kvad chta` is not a command.
+Did you mean `kvad chat`?
+`kvad help` lists them.
+
+$ kvad run --promt x
+--promt is not an option of `kvad run`.
+Did you mean --prompt?
+`kvad run --help` says what it takes.
+```
+
+Help that was asked for goes to stdout, so `kvad help train | less` works.
+
+## Tab completion
+
+`kvad` completes at a Tab in zsh, bash and fish. The
+[installer](/docs/install/) offers to set it up, and so does:
+
+```bash
+kvad completions install
+```
+
+That sets it up for your login shell; open a new terminal afterwards. Tab then
+completes commands and their options, and what only the machine knows:
+
+| You type | Tab offers |
+|---|---|
+| `kvad ` | Every command, with what it does. |
+| `kvad run --model ` | The language models on disk. |
+| `kvad images make --model ` | The image models. `videos make` gets the video models. |
+| `kvad images make --lora ` | The LoRAs. |
+| `kvad unload ` | The models in the server's memory. |
+| `kvad load MODEL --backend ` | The server's backends, such as `gpu-q8`. |
+| `kvad jobs show ` | The jobs, each with what it is. The same for conversations, pictures, clips and datasets. |
+| `kvad videos make --` | Every option a video takes. |
+| `kvad train --data ` | Files, as your shell completes them. |
+
+zsh and fish show a description beside each candidate:
+
+```text
+$ kvad run --quant <Tab>
+f32  -- weights as they were published
+q8   -- 8 bits a weight: a quarter of the memory
+q4   -- 4 bits a weight: an eighth, and a little worse
+```
+
+With a server running the answers are the server's, as the commands' are, and
+`--remote URL` earlier on the line asks that server instead. A server that
+does not answer within two seconds is given up on, and Tab offers nothing.
+
+| Command | |
+|---|---|
+| `kvad completions install [SHELL...]` | Set it up for your login shell, or for the shells named: `zsh`, `bash`, `fish`. |
+| `kvad completions status` | Where it is set up, and where it would go. |
+| `kvad completions uninstall` | Take it out again, of every shell. |
+| `kvad completions zsh` | Print a shell's script, to place yourself. |
+
+For zsh and bash, `install` adds one line to the end of `~/.zshrc`, or
+`~/.bashrc` (`~/.bash_profile` on a Mac). For fish it writes
+`~/.config/fish/completions/kvad.fish`. `uninstall` removes what `install`
+wrote and nothing else. The shell asks the installed `kvad` at every Tab, so
+an upgrade needs nothing done again.
+
+The fish script has not been run on a machine with fish; zsh and bash have.
 
 ## Models
 
@@ -67,7 +144,7 @@ their own usage with `--help`.
 |---|---|
 | `kvad auth` | `status`, `login [--key]`, `logout`, `setup TOKEN`, `password`. |
 | `kvad users` | `ls`, `add NAME`, `edit ID`, `rm ID`. |
-| `kvad sessions` | `ls`, `rm ID`. |
+| `kvad sessions` | `ls`, `rm HASH`. |
 | `kvad keys` | `ls`, `add NAME`, `rm ID`. |
 
 ## Where a command runs

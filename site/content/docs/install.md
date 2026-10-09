@@ -11,13 +11,18 @@ The script downloads the latest [release](https://github.com/bisand/kvad/release
 for your machine, checks it against that release's `SHA256SUMS`, and puts the
 binaries in `~/.local/bin`. Run the same command again to upgrade.
 
-It asks three things, on `/dev/tty` so the questions survive being piped into
+It asks four things, on `/dev/tty` so the questions survive being piped into
 `sh`:
 
 1. Whether to add `~/.local/bin` to your `PATH`.
-2. Whether `kvad-serve` should start when you log in.
-3. If it should, the address and the port it listens on. The defaults are
+2. Whether to set up [Tab completion](/docs/cli/#tab-completion) for your
+   shell, if that is zsh, bash or fish.
+3. Whether `kvad-serve` should start when you log in.
+4. If it should, the address and the port it listens on. The defaults are
    `127.0.0.1` and `5823`.
+
+Each is asked once. An upgrade finds completion set up and the service
+installed, and does not ask about them again.
 
 An address it cannot serve from is refused with the reason, and asked again: a
 port something else holds, or a non-loopback address while no
@@ -71,6 +76,7 @@ curl -fsSL https://kvad.eu/install.sh | sh -s -- --yes --service
 | `--bind HOST:PORT` | Both at once. |
 | `--service`, `--no-service` | Install the background service, or skip it, without asking. |
 | `--add-path`, `--no-add-path` | Add the install directory to `PATH`, or leave it, without asking. |
+| `--completions`, `--no-completions` | Set up Tab completion in your shell, or leave it, without asking. |
 | `-y`, `--yes` | Never ask. |
 | `--uninstall` | Remove the binaries and the service. Models and data stay. |
 
@@ -95,8 +101,8 @@ same, and exit non-zero.
 curl -fsSL https://kvad.eu/install.sh | sh -s -- --uninstall
 ```
 
-This removes the binaries and the service and leaves your models and
-conversations alone. The data is in `~/.local/share/kvad`, and models pulled
+This removes the binaries, the service and the Tab completion it set up, and
+leaves your models and conversations alone. The data is in `~/.local/share/kvad`, and models pulled
 from Hugging Face are in `~/.cache/huggingface/hub`.
 
 ## From source

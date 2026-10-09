@@ -58,6 +58,7 @@ completes commands and their options, and what only the machine knows:
 | `kvad jobs show ` | The jobs, each with what it is. The same for conversations, pictures, clips and datasets. |
 | `kvad videos make --` | Every option a video takes. |
 | `kvad train --data ` | Files, as your shell completes them. |
+| `kvad-gpu `, `kvad-serve --`, `kvad-tui ` | The other binaries' commands and options, and the models on this disk. |
 
 zsh and fish show a description beside each candidate:
 
@@ -80,8 +81,8 @@ does not answer within two seconds is given up on, and Tab offers nothing.
 | `kvad completions zsh` | Print a shell's script, to place yourself. |
 
 For zsh and bash, `install` adds one line to the end of `~/.zshrc`, or
-`~/.bashrc` (`~/.bash_profile` on a Mac). For fish it writes a two-line
-`~/.config/fish/completions/kvad.fish`. Either way the shell asks the
+`~/.bashrc` (`~/.bash_profile` on a Mac). For fish it writes a two-line file
+for each binary in `~/.config/fish/completions`. Either way the shell asks the
 installed `kvad` for the script as it starts, and for the candidates at every
 Tab, so an upgrade needs nothing done again. `uninstall` removes what
 `install` wrote and nothing else.

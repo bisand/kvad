@@ -196,12 +196,56 @@ pub fn command(name: &str) -> Option<&'static Command> {
 /// Whether a flag takes a value, asked of every command at once: the parser
 /// has one answer for each spelling, whichever command it follows.
 pub fn takes_value(flag: &str) -> Option<bool> {
-    WHERE
-        .iter()
-        .chain(COMMANDS.iter().flat_map(|c| c.all_flags()))
-        .find(|f| f.name == flag || (!f.short.is_empty() && f.short == flag))
-        .map(Flag::takes_value)
+    PROGRAMS[0].takes_value(flag)
 }
+
+/// One of the binaries kvad is installed as.
+///
+/// `kvad` is the first of them and the only one this binary *is*. The
+/// others are here because Tab completion is answered from one place: a
+/// shell that is completing `kvad-gpu` asks `kvad`, which is the binary
+/// every install has, and which already knows how to list the models.
+pub struct Program {
+    pub name: &'static str,
+    pub commands: &'static [Command],
+    /// What flags and words belong to when no command is named: `run`, for
+    /// the two that have commands, and the program itself for the two that
+    /// have none.
+    pub bare: &'static Command,
+    /// Whether `--help` is something to offer after any of it.
+    pub help: bool,
+    /// Runs its models in its own process, so the models to offer are this
+    /// disk's and never a server's.
+    pub local: bool,
+}
+
+impl Program {
+    pub fn command(&self, name: &str) -> Option<&'static Command> {
+        self.commands.iter().find(|c| c.name == name)
+    }
+
+    /// As [`takes_value`], of this program's flags.
+    pub fn takes_value(&self, flag: &str) -> Option<bool> {
+        let routed = self.commands.iter().any(|c| c.routed);
+        WHERE
+            .iter()
+            .filter(|_| routed)
+            .chain(self.commands.iter().chain([self.bare]).flat_map(|c| c.all_flags()))
+            .find(|f| f.name == flag || (!f.short.is_empty() && f.short == flag))
+            .map(Flag::takes_value)
+    }
+}
+
+pub fn program(name: &str) -> Option<&'static Program> {
+    PROGRAMS.iter().find(|p| p.name == name)
+}
+
+pub const PROGRAMS: &[Program] = &[
+    Program { name: "kvad", commands: COMMANDS, bare: &RUN, help: true, local: false },
+    Program { name: "kvad-serve", commands: &[], bare: &SERVE, help: true, local: false },
+    Program { name: "kvad-gpu", commands: GPU_COMMANDS, bare: &GPU_COMMANDS[0], help: false, local: true },
+    Program { name: "kvad-tui", commands: &[], bare: &TUI, help: false, local: true },
+];
 
 // ---------------------------------------------------------------------------
 // Flags several commands share
@@ -389,36 +433,7 @@ pub const COMMANDS: &[Command] = &[
         examples: &["kvad arch"],
     },
     // -- talk to one -------------------------------------------------------
-    Command {
-        name: "run",
-        group: Group::Use,
-        args: "",
-        about: "answer one prompt and exit",
-        server: false,
-        routed: true,
-        words: &[],
-        subs: &[],
-        flags: &[
-            &[
-                TEXT_MODEL,
-                f("--prompt", "TEXT", Kind::Text, "what to answer (default: a prompt that shows the model works)"),
-                f("--system", "TEXT", Kind::Text, "a system prompt before it"),
-                sw("--raw", "on a server: continue the prompt as text, with no chat template"),
-                QUANT,
-                BACKEND,
-            ],
-            SAMPLING,
-        ],
-        usage: None,
-        notes: "`kvad --prompt TEXT`, with no command, is `kvad run --prompt TEXT`.\n\n\
-                The answer goes to stdout and everything else to stderr, so\n\
-                `kvad run --prompt ... > answer.txt` keeps only the answer.",
-        examples: &[
-            "kvad run --prompt \"Why is the sky blue?\"",
-            "kvad run --model Qwen/Qwen2.5-1.5B-Instruct --prompt \"...\" --greedy",
-            "kvad run --local --quant q8 --prompt \"...\"",
-        ],
-    },
+    RUN,
     Command {
         name: "chat",
         group: Group::Use,
@@ -684,28 +699,7 @@ pub const COMMANDS: &[Command] = &[
         examples: &["kvad datasets add book.txt", "kvad datasets add ./my-dog --name my-dog", "kvad train --dataset book --name book"],
     },
     // -- the server --------------------------------------------------------
-    Command {
-        name: "serve",
-        group: Group::Server,
-        args: "[options]",
-        about: "run the HTTP server and web UI in this terminal",
-        server: false,
-        routed: false,
-        words: &[],
-        subs: &[],
-        flags: &[&[
-            f("--bind", "HOST:PORT", Kind::Text, "where to listen (default: server.bind in kvad.toml, else 127.0.0.1:5823)"),
-            f("--config", "FILE", Kind::File, "a kvad.toml other than the usual one"),
-            f("--db", "FILE", Kind::File, "the database to keep conversations, jobs and accounts in"),
-            sw("--insecure", "listen beyond this machine with no accounts; anyone who can reach it can use it"),
-        ]],
-        usage: None,
-        notes: "This hands over to `kvad-serve`, a separate program found beside this one, and\n\
-                everything after `serve` is its to read: `kvad serve --help` is its own help.\n\n\
-                To keep it running after the terminal closes, and start it at login, use\n\
-                `kvad service install` instead.",
-        examples: &["kvad serve", "kvad serve --bind 127.0.0.1:8080"],
-    },
+    SERVE,
     Command {
         name: "service",
         group: Group::Server,
@@ -1071,7 +1065,8 @@ pub const COMMANDS: &[Command] = &[
                 With a shell's name alone, this prints that shell's script.\n\n\
                 Once it is set up, Tab completes commands, their options, and the things only\n\
                 this machine or its server knows: the models on disk and in memory, backends,\n\
-                LoRAs, and the ids of jobs, conversations, pictures, clips and datasets.",
+                LoRAs, and the ids of jobs, conversations, pictures, clips and datasets.\n\n\
+                It completes kvad-serve, kvad-gpu and kvad-tui as well.",
         examples: &["kvad completions install", "kvad completions status", "kvad completions zsh"],
     },
     Command {
@@ -1091,6 +1086,145 @@ pub const COMMANDS: &[Command] = &[
 ];
 
 pub const SHELLS: Kind = Kind::Choice(&[("zsh", ""), ("bash", ""), ("fish", "")]);
+
+/// `kvad run`, and what `kvad --prompt TEXT` means with no command.
+const RUN: Command = Command {
+    name: "run",
+    group: Group::Use,
+    args: "",
+    about: "answer one prompt and exit",
+    server: false,
+    routed: true,
+    words: &[],
+    subs: &[],
+    flags: &[
+        &[
+            TEXT_MODEL,
+            f("--prompt", "TEXT", Kind::Text, "what to answer (default: a prompt that shows the model works)"),
+            f("--system", "TEXT", Kind::Text, "a system prompt before it"),
+            sw("--raw", "on a server: continue the prompt as text, with no chat template"),
+            QUANT,
+            BACKEND,
+        ],
+        SAMPLING,
+    ],
+    usage: None,
+    notes: "`kvad --prompt TEXT`, with no command, is `kvad run --prompt TEXT`.\n\n\
+            The answer goes to stdout and everything else to stderr, so\n\
+            `kvad run --prompt ... > answer.txt` keeps only the answer.",
+    examples: &[
+        "kvad run --prompt \"Why is the sky blue?\"",
+        "kvad run --model Qwen/Qwen2.5-1.5B-Instruct --prompt \"...\" --greedy",
+        "kvad run --local --quant q8 --prompt \"...\"",
+    ],
+};
+
+/// `kvad serve`, and `kvad-serve` itself: the first hands every word after
+/// it to the second.
+const SERVE: Command = Command {
+    name: "serve",
+    group: Group::Server,
+    args: "[options]",
+    about: "run the HTTP server and web UI in this terminal",
+    server: false,
+    routed: false,
+    words: &[],
+    subs: &[],
+    flags: &[&[
+        f("--bind", "HOST:PORT", Kind::Text, "where to listen (default: server.bind in kvad.toml, else 127.0.0.1:5823)"),
+        f("--config", "FILE", Kind::File, "a kvad.toml other than the usual one"),
+        f("--db", "FILE", Kind::File, "the database to keep conversations, jobs and accounts in"),
+        sw("--insecure", "listen beyond this machine with no accounts; anyone who can reach it can use it"),
+        sw("--version", "print the version and exit"),
+    ]],
+    usage: None,
+    notes: "This hands over to `kvad-serve`, a separate program found beside this one, and\n\
+            everything after `serve` is its to read: `kvad serve --help` is its own help.\n\n\
+            To keep it running after the terminal closes, and start it at login, use\n\
+            `kvad service install` instead.",
+    examples: &["kvad serve", "kvad serve --bind 127.0.0.1:8080"],
+};
+
+// ---------------------------------------------------------------------------
+// The other binaries
+// ---------------------------------------------------------------------------
+//
+// Enough of each for a Tab: their words and flags, and what each is. Their
+// help is their own, printed by them. The tests below read their parsers'
+// source, as they read this binary's, so a flag added there and not here
+// fails here.
+
+/// A command of another binary: only what completion reads.
+const fn other(name: &'static str, args: &'static str, about: &'static str, words: &'static [Kind], flags: &'static [&'static [Flag]]) -> Command {
+    Command { name, group: Group::Cli, args, about, server: false, routed: false, words, subs: &[], flags, usage: None, notes: "", examples: &[] }
+}
+
+const GPU_FLAGS: &[Flag] = &[
+    f("--model", "REPO", Kind::Model(Want::Text), "a name trained here, a directory, or a Hub repo id (default: the one `kvad use` set)"),
+    f(
+        "--device",
+        "D",
+        Kind::Choice(&[("metal", "the Mac's GPU"), ("cuda", "an NVIDIA GPU, in a build that has it"), ("cpu", "candle's CPU backend")]),
+        "where to run (default: the best there is)",
+    ),
+    f(
+        "--dtype",
+        "T",
+        Kind::Choice(&[("bf16", "what these checkpoints ship as, and the default"), ("f16", "half precision"), ("f32", "single precision: twice the memory")]),
+        "the precision the weights are held at (default bf16)",
+    ),
+    f(
+        "--quant",
+        "Q",
+        Kind::Choice(&[
+            ("none", "not quantised, and the default"),
+            ("q8", "8 bits a weight"),
+            ("q4", "4 bits a weight"),
+            ("q4k", "4 bits, k-quantised: a little better than q4"),
+            ("q6k", "6 bits, k-quantised"),
+        ]),
+        "quantise the weights on load (default none)",
+    ),
+    f("--prompt", "TEXT", Kind::Text, "what `run` answers"),
+    f("--system", "TEXT", Kind::Text, "a system prompt"),
+];
+
+const GPU_COMMANDS: &[Command] = &[
+    other("run", "", "answer one prompt on the GPU, with no server", &[], &[GPU_FLAGS, SAMPLING]),
+    other("chat", "", "a conversation on the GPU, with no server", &[], &[GPU_FLAGS, SAMPLING]),
+    other(
+        "tune",
+        "[MODEL]",
+        "train a LoRA for SDXL in this terminal, with no server",
+        &[Kind::Model(Want::Image)],
+        &[&[
+            f("--data", "DIR", Kind::Dir, "the folder of pictures and captions"),
+            f("--name", "NAME", Kind::Text, "what to call the LoRA"),
+            f("--out", "FILE", Kind::File, "or the file to write it to"),
+            f("--from", "FILE", Kind::File, "go on from a LoRA this wrote"),
+            f("--caption", "TEXT", Kind::Text, "the caption of every picture that has none"),
+            f("--size", "N", Kind::Text, "pixels a side, a multiple of 64 (default 1024)"),
+            f("--rank", "N", Kind::Text, "the LoRA's rank (default 16)"),
+            f("--alpha", "F", Kind::Text, "the LoRA is scaled by alpha / rank (default: the rank)"),
+            f("--steps", "N", Kind::Text, "training steps (default 1000)"),
+            f("--lr", "F", Kind::Text, "learning rate (default 1e-4)"),
+            f("--eval-every", "N", Kind::Text, "steps between validation measurements (default 100)"),
+            f("--holdout", "N", Kind::Text, "pictures kept out of training to measure on"),
+            f("--sample", "TEXT", Kind::Text, "a prompt to draw before the first step and at every measurement"),
+            f("--sample-size", "N", Kind::Text, "pixels a side of a sample (default: --size)"),
+            f("--sample-steps", "N", Kind::Text, "a sample's denoising steps (default 20)"),
+            f("--samples", "DIR", Kind::Dir, "where the samples are written"),
+            f("--seed", "N", Kind::Text, "(default 1337)"),
+            f("--ffmpeg", "FILE", Kind::File, "the ffmpeg that decodes the pictures (default: found)"),
+            f("--cap", "GB", Kind::Text, "end the run if its memory passes this"),
+            f("--progress", "json", Kind::Choice(&[("json", "one JSON object a line, for a program that follows the run")]), "also say what the run does on standard output"),
+            sw("--help", "every option, and what it is"),
+        ]],
+    ),
+];
+
+/// `kvad-tui`, which takes a model to load as it opens, and nothing else.
+const TUI: Command = other("kvad-tui", "[MODEL]", "browse, download and chat in the terminal", &[Kind::Model(Want::Text)], &[]);
 
 const IMAGE_FLAGS: &[Flag] = &[
     f("--out", "FILE", Kind::File, "where to write it (default image-ID.png)"),
@@ -1158,7 +1292,7 @@ mod tests {
 
     /// `kvad serve`'s flags are `kvad-serve`'s, and this parser never sees
     /// them.
-    const PASSED_THROUGH: &[&str] = &["--bind", "--config", "--db", "--insecure"];
+    const PASSED_THROUGH: &[&str] = &["--bind", "--config", "--db", "--insecure", "--version"];
 
     #[test]
     fn every_flag_the_parser_takes_is_in_the_table() {
@@ -1211,6 +1345,84 @@ mod tests {
         for name in crate::POSITIONAL {
             assert!(command(name).is_some(), "`{name}` takes words and is not in the table");
         }
+    }
+
+    /// The flags a source matches on between two markers: `"--flag" =>`
+    /// arms and `flag == "--flag"` tests alike.
+    fn dashed(source: &str, from: &str, to: &str) -> Vec<String> {
+        let start = source.find(from).unwrap_or_else(|| panic!("no `{from}`"));
+        let end = start + source[start..].find(to).unwrap_or_else(|| panic!("no `{to}` after `{from}`"));
+        let mut found: Vec<String> = Vec::new();
+        for piece in source[start..end].split('"').skip(1).step_by(2) {
+            let flag = piece.len() > 2 && piece.starts_with("--") && piece[2..].chars().all(|c| c == '-' || c.is_ascii_alphanumeric());
+            if flag && !found.iter().any(|f| f == piece) {
+                found.push(piece.to_string());
+            }
+        }
+        found
+    }
+
+    fn names(flags: Vec<&'static Flag>) -> Vec<String> {
+        flags.into_iter().map(|f| f.name.to_string()).collect()
+    }
+
+    fn same_flags(what: &str, mut table: Vec<String>, mut parser: Vec<String>) {
+        table.sort();
+        parser.sort();
+        assert_eq!(table, parser, "{what}: the table on the left, its parser on the right");
+    }
+
+    /// The other binaries' flags are the ones their own parsers take.
+    ///
+    /// Read from their source, which is in other crates: nothing but a test
+    /// reaches across, so the crates still build apart.
+    #[test]
+    fn the_other_binaries_flags_are_their_parsers() {
+        let gpu = include_str!("../../../gpu/src/main.rs");
+        let serve = include_str!("../../../serve/src/main.rs");
+        let of = |program: &str, command: &str| {
+            let p = program_named(program);
+            names(p.command(command).unwrap_or(p.bare).all_flags())
+        };
+
+        // `--help` is asked for with `-h` beside it there, and is not a flag
+        // of `run`; `--greedy` is tested for, not matched.
+        let parsed: Vec<String> = dashed(gpu, "fn parse_args()", "fn load(").into_iter().filter(|f| f != "--help").collect();
+        same_flags("kvad-gpu run", of("kvad-gpu", "run"), parsed.clone());
+        same_flags("kvad-gpu chat", of("kvad-gpu", "chat"), parsed);
+
+        // `tune` takes whatever follows two dashes, so what it takes is what
+        // its usage says: the lines that start with a flag.
+        let usage = &gpu[gpu.find("const TUNE_USAGE").unwrap()..gpu.find("fn tune(").unwrap()];
+        let mut said: Vec<String> = usage.lines().filter_map(|l| l.strip_prefix("  --")).map(|l| format!("--{}", l.split(' ').next().unwrap())).collect();
+        said.push("--help".into());
+        same_flags("kvad-gpu tune", of("kvad-gpu", "tune"), said);
+
+        same_flags("kvad-serve", of("kvad-serve", ""), dashed(serve, "fn parse_args()", "#[tokio::main]").into_iter().filter(|f| f != "--help").collect());
+
+        // And a flag that stands alone there stands alone here.
+        for (program, alone) in [("kvad-gpu", vec!["--greedy", "--help"]), ("kvad-serve", vec!["--insecure", "--version"])] {
+            let p = program_named(program);
+            for c in p.commands.iter().chain([p.bare]) {
+                for flag in c.all_flags() {
+                    assert_eq!(!flag.takes_value(), alone.contains(&flag.name), "{program} {}: {}", c.name, flag.name);
+                }
+            }
+        }
+    }
+
+    fn program_named(name: &str) -> &'static Program {
+        program(name).unwrap_or_else(|| panic!("no program `{name}`"))
+    }
+
+    /// `kvad` is the first program, and its table is the one the rest of
+    /// this file is about.
+    #[test]
+    fn kvad_is_the_first_program() {
+        assert_eq!(PROGRAMS[0].name, "kvad");
+        assert_eq!(PROGRAMS[0].bare.name, "run");
+        assert!(std::ptr::eq(PROGRAMS[0].commands, COMMANDS) || PROGRAMS[0].commands.len() == COMMANDS.len());
+        assert!(command("run").is_some() && command("serve").is_some());
     }
 
     /// A subcommand in the table is one its command's source matches on.

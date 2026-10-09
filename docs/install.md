@@ -89,8 +89,8 @@ kvad completions uninstall    # take it out again
 
 For zsh and bash that is one line at the end of `~/.zshrc`, or `~/.bashrc`
 (`~/.bash_profile` on a Mac), which asks `kvad` for the script as each shell
-starts. For fish it is a file, `~/.config/fish/completions/kvad.fish`, which
-asks the same way.
+starts. For fish it is a file for each binary in
+`~/.config/fish/completions`, which asks the same way.
 `uninstall` removes what `install` wrote and nothing else, and the installer's
 `--uninstall` runs it. `kvad completions zsh` prints a shell's script, for
 somebody who would rather place it themselves.
@@ -105,6 +105,11 @@ URL` earlier on the line asks that one instead.
 
 The shell scripts hold no list of their own. They ask the installed `kvad`
 at each Tab, so an upgrade needs nothing done again.
+
+`kvad-serve`, `kvad-gpu` and `kvad-tui` are completed by the same setup:
+their flags, `kvad-gpu`'s commands, and the models on this disk for
+`kvad-gpu run --model` and `kvad-tui`. Their shells ask `kvad` as well, so
+there is one place that knows.
 
 macOS gets all four binaries. Linux gets `kvad` and a CPU-only `kvad-serve`:
 `kvad-tui` and `kvad-gpu` both link candle against Metal, which is not a thing

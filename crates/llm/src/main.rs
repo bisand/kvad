@@ -537,7 +537,7 @@ fn real_main() -> Res<()> {
     // Before parsing too, and for the same reason the installer wants it:
     // "what is on this machine already" has to be answerable by a binary
     // that may be older than whatever is asking.
-    let completing = std::env::args().nth(1).is_some_and(|a| a == "__complete");
+    let completing = std::env::args().nth(1).is_some_and(|a| a.starts_with("__complete"));
     if !completing && std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
         println!("kvad {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -552,6 +552,12 @@ fn real_main() -> Res<()> {
         Some("help") => cli::help::show(argv.get(1).map(String::as_str)),
         Some("__complete") => {
             cli::complete::run(&argv[1..]);
+            return Ok(());
+        }
+        Some("__complete-for") => {
+            if let Some((program, words)) = argv[1..].split_first() {
+                cli::complete::run_for(program, words);
+            }
             return Ok(());
         }
         Some("completions") => match argv.iter().skip(1).any(|a| a == "--help" || a == "-h") {

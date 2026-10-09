@@ -15,6 +15,16 @@
 //! machine: a model's name is read from the cache directory or asked of the
 //! server, at the moment of the Tab.
 //!
+//! # The other binaries
+//!
+//! `kvad-serve`, `kvad-gpu` and `kvad-tui` are completed too, and by this
+//! binary: their shells ask `kvad __complete-for PROGRAM`. They could each
+//! have answered for themselves, at the price of this file in three more
+//! binaries, or of moving it into the library for the sake of four flags.
+//! Every install has `kvad`, and `kvad` already knows how to list a model.
+//! What it has to be told is their flags, which are in the table beside its
+//! own, and held to their parsers by a test that reads their source.
+//!
 //! # What `__complete` says
 //!
 //! One candidate to a line, a tab, and what it is — zsh and fish show the
@@ -84,25 +94,34 @@ pub trait Source {
 /// The candidates for the last of `words`, which are everything typed after
 /// `kvad`, the word being completed included — empty, when the cursor
 /// follows a space.
+#[cfg(test)]
 pub fn answer(words: &[String], source: &dyn Source) -> Answer {
+    answer_for(&spec::PROGRAMS[0], words, source)
+}
+
+/// The same, for any of the binaries: `words` are what was typed after its
+/// name.
+pub fn answer_for(program: &'static spec::Program, words: &[String], source: &dyn Source) -> Answer {
     let nothing = Answer { items: Vec::new(), files: Files::None };
     let (cur, done) = match words.split_last() {
         Some((cur, done)) => (cur.as_str(), done),
         None => ("", &[][..]),
     };
 
-    // The command itself. Flags before any command are `run`'s.
-    let (command, rest) = match done.first() {
-        None if cur.starts_with('-') => ("run", done),
+    // The command itself. Flags before any command are the bare command's:
+    // `run`'s, or everything a program with no commands takes.
+    let (c, rest) = match done.first() {
+        _ if program.commands.is_empty() => (program.bare, done),
+        None if cur.starts_with('-') => (program.bare, done),
         None => {
-            let commands = spec::COMMANDS.iter().map(|c| (c.name.to_string(), c.about.to_string()));
+            let commands = program.commands.iter().map(|c| (c.name.to_string(), c.about.to_string()));
             return Answer { items: matching(commands, cur), files: Files::None };
         }
-        Some(first) if first.starts_with('-') => ("run", done),
-        Some(first) => (first.as_str(), &done[1..]),
-    };
-    let Some(c) = spec::command(command) else {
-        return nothing;
+        Some(first) if first.starts_with('-') => (program.bare, done),
+        Some(first) => match program.command(first) {
+            Some(c) => (c, &done[1..]),
+            None => return nothing,
+        },
     };
 
     // Walk what is already there: which words are words, and whether the
@@ -117,7 +136,7 @@ pub fn answer(words: &[String], source: &dyn Source) -> Answer {
         }
         if word.len() > 1 && word.starts_with('-') {
             used.push(word);
-            if spec::takes_value(word) == Some(true) {
+            if program.takes_value(word) == Some(true) {
                 waiting = Some(word);
             }
         } else if takes_words {
@@ -137,7 +156,10 @@ pub fn answer(words: &[String], source: &dyn Source) -> Answer {
     let flags = || {
         let offered = applicable(c, sub).into_iter().filter(|f| repeats(f) || !used.iter().any(|u| *u == f.name || *u == f.short));
         let mut items: Vec<(String, String)> = offered.map(|f| (f.name.to_string(), f.about.to_string())).collect();
-        items.push(("--help".into(), format!("what `kvad {}` takes, with examples", c.name)));
+        if program.help {
+            let named = if program.commands.is_empty() { program.name.to_string() } else { format!("{} {}", program.name, c.name) };
+            items.push(("--help".into(), format!("what `{named}` takes")));
+        }
         Answer { items: matching(items.into_iter(), cur), files: Files::None }
     };
     if cur.starts_with('-') {
@@ -329,6 +351,12 @@ pub struct Live {
 impl Live {
     /// `words` are read for `--remote` and `--local`, so that a Tab asks the
     /// server the command is about to be sent to.
+    /// A source that never asks a server, for the binaries that run their
+    /// models themselves.
+    pub fn local() -> Live {
+        Live { choice: Choice::Local, remote: OnceCell::new(), listing: OnceCell::new() }
+    }
+
     pub fn new(words: &[String]) -> Live {
         let mut choice = Choice::Unset;
         for (i, word) in words.iter().enumerate() {
@@ -481,8 +509,18 @@ impl Source for Live {
 
 /// `kvad __complete WORDS...`.
 pub fn run(words: &[String]) {
-    let live = Live::new(words);
-    let answer = answer(words, &live);
+    run_for("kvad", words)
+}
+
+/// `kvad __complete-for PROGRAM WORDS...`: the same for `kvad-serve`,
+/// `kvad-gpu` and `kvad-tui`, whose shells ask this binary and not them.
+pub fn run_for(program: &str, words: &[String]) {
+    let Some(program) = spec::program(program) else {
+        print!(":none\n");
+        return;
+    };
+    let live = if program.local { Live::local() } else { Live::new(words) };
+    let answer = answer_for(program, words, &live);
     let mut text = String::new();
     for (value, about) in &answer.items {
         match about.is_empty() {
@@ -604,6 +642,12 @@ impl Places {
         }
     }
 
+    /// fish's files: one to a program, beside each other.
+    fn fish_files(&self) -> Vec<std::path::PathBuf> {
+        let dir = self.config.join("fish").join("completions");
+        PROGRAMS.iter().map(|program| dir.join(format!("{program}.fish"))).collect()
+    }
+
     /// The shells a command named, or the login shell when it named none.
     fn chosen<'a>(&'a self, named: &[&'a str]) -> Res<Vec<&'a str>> {
         if let Some(other) = named.iter().find(|s| !SHELLS.contains(s)) {
@@ -640,12 +684,13 @@ fn loads(text: &str, shell: &str) -> bool {
 }
 
 fn installed(places: &Places, shell: &str) -> bool {
-    let text = std::fs::read_to_string(places.file(shell)).unwrap_or_default();
+    let loads_from = |file: &std::path::Path| loads(&std::fs::read_to_string(file).unwrap_or_default(), shell);
     match shell {
-        // The loader only. The whole script, from 0.16.0, goes stale with
-        // the binary, and reads as not set up so that it is replaced.
-        "fish" => loads(&text, "fish"),
-        _ => loads(&text, shell),
+        // Every program's file, and the loader only. The whole script, from
+        // 0.16.0, goes stale with the binary; and 0.16.1 wrote a file for
+        // `kvad` alone. Both read as not set up, so that they are replaced.
+        "fish" => places.fish_files().iter().all(|file| loads_from(file)),
+        _ => loads_from(&places.file(shell)),
     }
 }
 
@@ -655,6 +700,9 @@ fn installed(places: &Places, shell: &str) -> bool {
 /// often a symlink into a repository of dotfiles, and replacing the link
 /// with a file would quietly take it out of that repository.
 fn install(places: &Places, shell: &str) -> Res<String> {
+    if shell == "fish" {
+        return install_fish(places);
+    }
     let file = places.file(shell);
     let at = file.display();
     let existing = match std::fs::read_to_string(&file) {
@@ -662,52 +710,74 @@ fn install(places: &Places, shell: &str) -> Res<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("could not read {at}: {e}").into()),
     };
-    if installed(places, shell) && shell != "fish" {
+    if installed(places, shell) {
         return Ok(format!("{shell}: {at} already loads them"));
     }
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
     }
-    let text = match shell {
-        // The whole file is kvad's, and is written again whatever it held
-        // of ours. A file there that is not ours is left.
-        "fish" if !existing.is_empty() && !ours_in_fish(&existing) => {
-            return Ok(format!("fish: {at} is there already and is not kvad's; left alone"));
-        }
-        "fish" => FISH_LOADER.to_string(),
-        _ => {
-            let gap = match existing.as_str() {
-                "" => "",
-                text if text.ends_with("\n\n") => "",
-                text if text.ends_with('\n') => "\n",
-                _ => "\n\n",
-            };
-            format!("{existing}{gap}{}\n", rc_line(shell))
-        }
+    let gap = match existing.as_str() {
+        "" => "",
+        text if text.ends_with("\n\n") => "",
+        text if text.ends_with('\n') => "\n",
+        _ => "\n\n",
     };
+    let text = format!("{existing}{gap}{}\n", rc_line(shell));
     std::fs::write(&file, text).map_err(|e| format!("could not write {at}: {e}"))?;
-    Ok(match shell {
-        "fish" => format!("fish: wrote {at}; new fish windows complete kvad"),
-        _ => format!("{shell}: added a line to {at}\n  open a new terminal, or run:  eval \"$(kvad completions {shell})\""),
-    })
+    Ok(format!("{shell}: added a line to {at}\n  open a new terminal, or run:  eval \"$(kvad completions {shell})\""))
+}
+
+/// fish: a file to a program, each wholly kvad's and written again whatever
+/// it held of ours. A file there that is not ours is left, and said.
+fn install_fish(places: &Places) -> Res<String> {
+    let files = places.fish_files();
+    let dir = files[0].parent().unwrap_or(&places.config).to_path_buf();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+    let mut said = Vec::new();
+    let mut wrote = 0;
+    for file in &files {
+        let existing = std::fs::read_to_string(file).unwrap_or_default();
+        if !existing.is_empty() && !ours_in_fish(&existing) {
+            said.push(format!("fish: {} is there already and is not kvad's; left alone", file.display()));
+            continue;
+        }
+        std::fs::write(file, FISH_LOADER).map_err(|e| format!("could not write {}: {e}", file.display()))?;
+        wrote += 1;
+    }
+    if wrote > 0 {
+        said.insert(0, format!("fish: wrote {wrote} files in {}; new fish windows complete kvad", dir.display()));
+    }
+    Ok(said.join("\n"))
 }
 
 /// Take one shell's completions out again, and say what was done.
 fn uninstall(places: &Places, shell: &str) -> Res<String> {
+    if shell == "fish" {
+        let mut said = Vec::new();
+        let mut removed = 0;
+        for file in places.fish_files() {
+            match std::fs::read_to_string(&file) {
+                Ok(text) if ours_in_fish(&text) => {
+                    std::fs::remove_file(&file).map_err(|e| format!("could not remove {}: {e}", file.display()))?;
+                    removed += 1;
+                }
+                Ok(_) => said.push(format!("fish: {} is not kvad's; left alone", file.display())),
+                Err(_) => {}
+            }
+        }
+        match removed {
+            0 if said.is_empty() => said.push("fish: nothing to remove".into()),
+            0 => {}
+            n => said.insert(0, format!("fish: removed {n} files from {}", places.config.join("fish").join("completions").display())),
+        }
+        return Ok(said.join("\n"));
+    }
     let file = places.file(shell);
     let at = file.display();
     let Ok(existing) = std::fs::read_to_string(&file) else {
         return Ok(format!("{shell}: nothing to remove"));
     };
-    if shell == "fish" {
-        return Ok(match ours_in_fish(&existing) {
-            true => {
-                std::fs::remove_file(&file).map_err(|e| format!("could not remove {at}: {e}"))?;
-                format!("fish: removed {at}")
-            }
-            false => format!("fish: {at} is not kvad's; left alone"),
-        });
-    }
+
     // Our line, and the blank one put before it.
     let mut kept: Vec<&str> = Vec::new();
     let mut removed = 0;
@@ -771,18 +841,30 @@ fn setup(places: &Places) -> String {
 /// zsh. Works both ways it can be installed: evaluated from `.zshrc`, where
 /// the last line registers it, or as a file named `_kvad` on `$fpath`, where
 /// the `#compdef` line does and the last line runs it.
-const ZSH: &str = r#"#compdef kvad
-# Tab completion for kvad, in zsh. From `kvad completions zsh`.
+const ZSH: &str = r#"#compdef kvad kvad-serve kvad-gpu kvad-tui
+# Tab completion for kvad and the binaries beside it, in zsh. From `kvad completions zsh`.
 # It knows nothing itself: it asks `kvad __complete`, so it never goes stale.
 
 _kvad() {
     local -a lines described
+    local -a asked
     local line value about directive kvad
 
-    # The kvad that was typed, which may be a path, and may start with `~`.
+    # The program that was typed, which may be a path, and may start with `~`.
     kvad=${(Q)words[1]}
     kvad=${~kvad}
-    lines=("${(@f)$($kvad __complete "${(@)words[2,CURRENT]}" 2>/dev/null)}")
+    asked=(__complete)
+    # kvad answers for the binaries installed beside it: the kvad beside the
+    # one typed, when that was typed as a path, and else the one on PATH.
+    if [[ ${kvad:t} != kvad ]]; then
+        asked=(__complete-for ${kvad:t})
+        if [[ $kvad == */* && -x ${kvad:h}/kvad ]]; then
+            kvad=${kvad:h}/kvad
+        else
+            kvad=kvad
+        fi
+    fi
+    lines=("${(@f)$($kvad $asked "${(@)words[2,CURRENT]}" 2>/dev/null)}")
     directive=${lines[-1]}
     lines[-1]=()
 
@@ -808,13 +890,13 @@ if [[ ${funcstack[1]} == _kvad ]]; then
 else
     # Evaluated from .zshrc. The completion system may not be up yet.
     (( $+functions[compdef] )) || { autoload -Uz compinit && compinit }
-    compdef _kvad kvad
+    compdef _kvad kvad kvad-serve kvad-gpu kvad-tui
 fi
 "#;
 
 /// bash, 3.2 included: macOS still ships it, so no `mapfile`, and `compopt`
 /// only where it exists.
-const BASH: &str = r#"# Tab completion for kvad, in bash. From `kvad completions bash`.
+const BASH: &str = r#"# Tab completion for kvad and the binaries beside it, in bash. From `kvad completions bash`.
 # It knows nothing itself: it asks `kvad __complete`, so it never goes stale.
 
 _kvad() {
@@ -831,13 +913,26 @@ _kvad() {
         cword=$COMP_CWORD
     fi
 
+    # kvad answers for the binaries installed beside it: the kvad beside the
+    # one typed, when that was typed as a path, and else the one on PATH.
+    local kvad=${words[0]}
+    local -a asked
+    asked=(__complete)
+    if [ "${kvad##*/}" != kvad ]; then
+        asked=(__complete-for "${kvad##*/}")
+        case $kvad in
+            */*) if [ -x "${kvad%/*}/kvad" ]; then kvad=${kvad%/*}/kvad; else kvad=kvad; fi ;;
+            *) kvad=kvad ;;
+        esac
+    fi
+
     COMPREPLY=()
     while IFS= read -r line; do
         case $line in
             :files | :dirs | :none) directive=$line ;;
             *) COMPREPLY+=("${line%%$'\t'*}") ;;
         esac
-    done < <("${words[0]}" __complete "${words[@]:1:$cword}" 2>/dev/null)
+    done < <("$kvad" "${asked[@]}" "${words[@]:1:$cword}" 2>/dev/null)
 
     local IFS=$'\n'
     case $directive in
@@ -855,12 +950,17 @@ _kvad() {
     fi
 }
 
-complete -F _kvad kvad
+complete -F _kvad kvad kvad-serve kvad-gpu kvad-tui
 "#;
+
+/// The programs a shell completes: `kvad`, and the binaries installed
+/// beside it, which it answers for.
+const PROGRAMS: [&str; 4] = ["kvad", "kvad-serve", "kvad-gpu", "kvad-tui"];
 
 /// What fish's completions directory is given: not the script, but a line
 /// that asks kvad for it, as the rc line of the other shells does. fish
-/// reads the file the first time `kvad` is completed in a session.
+/// reads a command's file the first time that command is completed in a
+/// session, so each of [`PROGRAMS`] has one, all alike.
 const FISH_LOADER: &str = "# Tab completion for kvad. From `kvad completions install`.\n\
                            command -q kvad; and kvad completions fish | source\n";
 
@@ -871,13 +971,17 @@ fn ours_in_fish(text: &str) -> bool {
 }
 
 /// fish, which shows descriptions and filters the candidates itself.
-const FISH: &str = r#"# Tab completion for kvad, in fish. From `kvad completions fish`.
+const FISH: &str = r#"# Tab completion for kvad and the binaries beside it, in fish. From `kvad completions fish`.
 # It knows nothing itself: it asks `kvad __complete`, so it never goes stale.
 
 function __kvad_complete
     set -l cur (commandline -ct)
     set -l words (commandline -opc) "$cur"
-    set -l lines (kvad __complete $words[2..-1] 2>/dev/null)
+    # kvad answers for the binaries installed beside it.
+    set -l program (string replace -r '.*/' '' -- $words[1])
+    set -l asked __complete
+    test "$program" != kvad; and set asked __complete-for $program
+    set -l lines (kvad $asked $words[2..-1] 2>/dev/null)
 
     switch "$lines[-1]"
         case ':files'
@@ -889,7 +993,9 @@ function __kvad_complete
 end
 
 # -k keeps kvad's order: commands by what they are for, the newest job first.
-complete -c kvad -f -k -a '(__kvad_complete)'
+for program in kvad kvad-serve kvad-gpu kvad-tui
+    complete -c $program -f -k -a '(__kvad_complete)'
+end
 "#;
 
 #[cfg(test)]
@@ -1102,24 +1208,35 @@ mod tests {
         let linux = Places { macos: false, ..scratch("files-linux", "bash") };
         assert!(linux.file("bash").ends_with(".bashrc"));
 
-        // fish gets a file that is all kvad's, made with its directories.
+        // fish gets a file to a program, each all kvad's, made with their
+        // directories.
         let fish = places.file("fish");
         assert!(fish.ends_with(".config/fish/completions/kvad.fish"));
-        assert!(install(&places, "fish").unwrap().contains("wrote"));
-        assert_eq!(std::fs::read_to_string(&fish).unwrap(), FISH_LOADER);
+        assert!(install(&places, "fish").unwrap().contains("wrote 4 files"));
+        for file in places.fish_files() {
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), FISH_LOADER);
+        }
         assert!(installed(&places, "fish"));
-        // The whole script, as 0.16.0 wrote it, is ours and is out of date:
-        // not set up, replaced by an install, removed by an uninstall.
+        // What older versions left is ours and is out of date: the whole
+        // script, as 0.16.0 wrote it, or a file for `kvad` alone, as 0.16.1
+        // did. Not set up, replaced by an install, removed by an uninstall.
         std::fs::write(&fish, FISH).unwrap();
         assert!(!installed(&places, "fish"));
-        assert!(install(&places, "fish").unwrap().contains("wrote"));
+        install(&places, "fish").unwrap();
         assert_eq!(std::fs::read_to_string(&fish).unwrap(), FISH_LOADER);
-        assert!(uninstall(&places, "fish").unwrap().contains("removed"));
+        std::fs::remove_file(places.fish_files().pop().unwrap()).unwrap();
+        assert!(!installed(&places, "fish"));
+        install(&places, "fish").unwrap();
+        assert!(installed(&places, "fish"));
+        assert!(uninstall(&places, "fish").unwrap().contains("removed 4 files"));
         assert!(!fish.exists());
+        assert!(uninstall(&places, "fish").unwrap().contains("nothing to remove"));
         // Somebody else's file of that name is not ours to replace.
         std::fs::write(&fish, "complete -c kvad -a mine\n").unwrap();
-        assert!(install(&places, "fish").unwrap().contains("left alone"));
+        let said = install(&places, "fish").unwrap();
+        assert!(said.contains("wrote 3 files") && said.contains("left alone"), "{said}");
         assert!(uninstall(&places, "fish").unwrap().contains("left alone"));
+        assert_eq!(std::fs::read_to_string(&fish).unwrap(), "complete -c kvad -a mine\n");
 
         assert_eq!(places.chosen(&[]).unwrap(), ["fish"]);
         assert_eq!(places.chosen(&["zsh", "bash"]).unwrap(), ["zsh", "bash"]);
@@ -1128,6 +1245,43 @@ mod tests {
         for dir in [places.home, linux.home] {
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// What a Tab offers after `line`, typed at any of the binaries.
+    fn tab_at(line: &str) -> Vec<String> {
+        let mut words: Vec<String> = line.split(' ').map(String::from).collect();
+        let program = spec::program(&words.remove(0)).expect("a program");
+        answer_for(program, &words, &Fake).items.into_iter().map(|(value, _)| value).collect()
+    }
+
+    #[test]
+    fn the_other_binaries_are_answered_for() {
+        // kvad-gpu has commands, and `run` is what flags mean without one.
+        assert_eq!(tab_at("kvad-gpu "), ["run", "chat", "tune"]);
+        assert_eq!(tab_at("kvad-gpu run --d"), ["--device", "--dtype"]);
+        assert_eq!(tab_at("kvad-gpu --dtype "), ["bf16", "f16", "f32"]);
+        assert_eq!(tab_at("kvad-gpu chat --quant q4"), ["q4", "q4k"]);
+        assert_eq!(tab_at("kvad-gpu run --model "), ["book", "Qwen/Qwen3-14B"]);
+        // Its `--quant` is not kvad's, and it has no `--remote`.
+        assert!(!tab_at("kvad-gpu run --").iter().any(|f| f == "--remote" || f == "--help"));
+        assert_eq!(tab_at("kvad-gpu tune --sa"), ["--sample", "--sample-size", "--sample-steps", "--samples"]);
+        assert!(tab_at("kvad-gpu tune ").contains(&"stabilityai/sdxl-turbo".to_string()));
+
+        // The other two have no commands: everything is the program's own.
+        assert_eq!(tab_at("kvad-serve "), ["--bind", "--config", "--db", "--insecure", "--version", "--help"]);
+        assert_eq!(tab_at("kvad-serve --bind 127.0.0.1:1 --i"), ["--insecure"]);
+        assert_eq!(tab_at("kvad-tui "), ["book", "Qwen/Qwen3-14B"]);
+        assert_eq!(tab_at("kvad-tui Q"), ["Qwen/Qwen3-14B"]);
+
+        let files = |line: &str| {
+            let mut words: Vec<String> = line.split(' ').map(String::from).collect();
+            answer_for(spec::program(&words.remove(0)).unwrap(), &words, &Fake).files
+        };
+        assert_eq!(files("kvad-serve --config "), Files::Files);
+        assert_eq!(files("kvad-gpu tune --data "), Files::Dirs);
+        assert_eq!(files("kvad-tui ./"), Files::Dirs);
+        // And kvad's own `serve` is the same flags.
+        assert_eq!(tab("kvad serve --c"), ["--config"]);
     }
 
     /// Every word of every command has something written for it: a walk of

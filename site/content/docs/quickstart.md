@@ -34,6 +34,9 @@ kvad use Qwen/Qwen2.5-1.5B-Instruct
 
 `use` makes it the default for every command that names no model.
 
+With [Tab completion](/docs/cli/#tab-completion) set up, `kvad use <Tab>`
+lists the models you have, and `kvad help` lists everything `kvad` does.
+
 ## 3. Have a conversation
 
 ```bash

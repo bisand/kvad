@@ -309,6 +309,10 @@ jobs:
     name: commit the version to master
     needs: [version, upload]
     runs-on: ubuntu-22.04
+    # `actions: write` is for the last step, which starts another workflow.
+    permissions:
+      contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -362,3 +366,15 @@ jobs:
           done
           echo "::error::could not push the version to master after 3 attempts"
           exit 1
+
+      # kvad.eu's front page says the version, read from Cargo.toml when the
+      # site is built, and site.yml lists Cargo.toml among what it deploys
+      # for. But a push made with the workflow's own token starts no
+      # workflow, which is GitHub's guard against one triggering itself for
+      # ever, so the commit above never deployed anything: the front page
+      # said the release before, until something else touched the site.
+      # Starting a workflow by hand is the exception to that rule.
+      - name: Deploy kvad.eu, which says the version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run site.yml --ref master --repo "${{ github.repository }}"

@@ -77,12 +77,22 @@ HOST:PORT` still says both at once. `sh install.sh --help` lists the rest.
 `kvad COMMAND --help` — says what one takes, with examples. A mistyped command
 or option is told the nearest one that exists.
 
-`kvad completions` sets up Tab completion for zsh, bash or fish; it prints the
-one line your shell needs:
+The installer offers to set up Tab completion for your login shell — zsh,
+bash or fish — and `--completions` or `--no-completions` answers ahead of
+time. It asks `kvad` to do it, and so can you:
 
 ```bash
-kvad completions
+kvad completions install      # your login shell; or name them: install zsh fish
+kvad completions status       # where it is set up
+kvad completions uninstall    # take it out again
 ```
+
+For zsh and bash that is one line at the end of `~/.zshrc`, or `~/.bashrc`
+(`~/.bash_profile` on a Mac), which asks `kvad` for the script as each shell
+starts. For fish it is a file, `~/.config/fish/completions/kvad.fish`.
+`uninstall` removes what `install` wrote and nothing else, and the installer's
+`--uninstall` runs it. `kvad completions zsh` prints a shell's script, for
+somebody who would rather place it themselves.
 
 After that Tab completes commands and their options, and what only the
 machine knows: `kvad run --model <Tab>` lists the language models on disk,

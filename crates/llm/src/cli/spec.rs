@@ -1052,19 +1052,27 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "completions",
         group: Group::Cli,
-        args: "[zsh|bash|fish]",
+        args: "[install|uninstall|status|SHELL]",
         about: "set up Tab completion for your shell",
         server: false,
         routed: false,
         words: &[SHELLS],
-        subs: &[],
+        subs: &[
+            Sub { name: "install", args: "[SHELL...]", about: "set it up, for your login shell or the ones named", words: &[SHELLS], flags: &[] },
+            Sub { name: "uninstall", args: "[SHELL...]", about: "take it out, of every shell or the ones named", words: &[SHELLS], flags: &[] },
+            Sub { name: "status", args: "", about: "where it is set up, and where it would go", words: &[], flags: &[] },
+        ],
         flags: &[],
         usage: None,
-        notes: "With a shell's name it prints that shell's script; with none, how to install\n\
-                it. Once it is, Tab completes commands, their options, and the things only\n\
+        notes: "`install` adds one line to your shell's rc file — ~/.zshrc, or ~/.bashrc\n\
+                (~/.bash_profile on a Mac) — or, for fish, writes a file among its completions.\n\
+                The line asks kvad for the script each time a shell starts, so an upgrade needs\n\
+                nothing done again. `uninstall` removes exactly what `install` wrote.\n\n\
+                With a shell's name alone, this prints that shell's script.\n\n\
+                Once it is set up, Tab completes commands, their options, and the things only\n\
                 this machine or its server knows: the models on disk and in memory, backends,\n\
                 LoRAs, and the ids of jobs, conversations, pictures, clips and datasets.",
-        examples: &["kvad completions", "kvad completions zsh"],
+        examples: &["kvad completions install", "kvad completions status", "kvad completions zsh"],
     },
     Command {
         name: "help",
@@ -1208,7 +1216,7 @@ mod tests {
     /// A subcommand in the table is one its command's source matches on.
     #[test]
     fn every_subcommand_is_one_the_source_matches() {
-        let sources = [include_str!("api.rs"), include_str!("models.rs"), include_str!("service.rs"), include_str!("../main.rs")];
+        let sources = [include_str!("api.rs"), include_str!("models.rs"), include_str!("service.rs"), include_str!("complete.rs"), include_str!("../main.rs")];
         for command in COMMANDS {
             for sub in command.subs {
                 let arm = format!("\"{}\"", sub.name);

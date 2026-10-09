@@ -556,7 +556,7 @@ fn real_main() -> Res<()> {
         }
         Some("completions") => match argv.iter().skip(1).any(|a| a == "--help" || a == "-h") {
             true => cli::help::show(Some("completions")),
-            false => return cli::complete::completions(argv.get(1).map(String::as_str)),
+            false => return cli::complete::completions(&argv[1..]),
         },
         _ => {}
     }

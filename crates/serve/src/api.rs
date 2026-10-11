@@ -33,6 +33,7 @@ pub fn routes() -> Router<State> {
         .route("/api/qcache", delete(crate::models::forget_qcache))
         .route("/api/generation", delete(crate::openai::cancel))
         .route("/api/generation/{id}", delete(crate::openai::cancel_one))
+        .route("/api/queue", get(crate::openai::queue))
         .route(
             "/api/conversations",
             get(crate::conversations::list).post(crate::conversations::create),
@@ -106,11 +107,41 @@ impl Fail {
     pub fn denied(why: impl Into<String>) -> Self {
         Fail(StatusCode::FORBIDDEN, why.into())
     }
+    /// Nothing wrong with the request, and no room for it now. Answered
+    /// with a `Retry-After`; see [`RETRY_AFTER_SECS`].
+    pub fn busy(why: impl Into<String>) -> Self {
+        Fail(StatusCode::SERVICE_UNAVAILABLE, why.into())
+    }
 }
+
+/// What a client turned away for want of room is told to wait.
+///
+/// A guess, and a short one: a place in the queue opens when one generation
+/// starts, and how long the one in front of it runs is not something the
+/// server knows until it has. Short enough that a client which obeys it is
+/// not kept out long after room appears; long enough not to be a busy loop.
+pub const RETRY_AFTER_SECS: u64 = 5;
 
 impl IntoResponse for Fail {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
+        let body = Json(serde_json::json!({ "error": self.1 }));
+        match self.0 {
+            StatusCode::SERVICE_UNAVAILABLE => {
+                (self.0, [(axum::http::header::RETRY_AFTER, RETRY_AFTER_SECS.to_string())], body).into_response()
+            }
+            _ => (self.0, body).into_response(),
+        }
+    }
+}
+
+/// A full queue is a 503 and a hint; a scheduler that has stopped is this
+/// server's fault and says so.
+impl From<crate::scheduler::Refused> for Fail {
+    fn from(refused: crate::scheduler::Refused) -> Self {
+        match refused {
+            crate::scheduler::Refused::Full { .. } => Fail::busy(refused.to_string()),
+            crate::scheduler::Refused::Stopped => Fail::internal(refused.to_string()),
+        }
     }
 }
 

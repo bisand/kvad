@@ -51,7 +51,7 @@ use crate::api::{blocking, Fail};
 use crate::auth::{Identity, State};
 use crate::db::Db;
 use crate::models::{sse, stream};
-use crate::scheduler::{Kind, Resident, Stroke};
+use crate::scheduler::{Entry, Kind, Resident, Stroke};
 use crate::videos::Fields;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State as St};
@@ -470,6 +470,8 @@ async fn make(who: Identity, headers: HeaderMap, state: State, asked: Asked) -> 
     request.seed = Some(resolved.seed);
     loras_fit(&state, &request.loras)?;
 
+    // Before the stream opens, while a full queue can still be a 503.
+    state.engine.room()?;
     let job = Job { state, owner: who.id, resident, request, n, format, base: base_url(&headers), sources: sources.map(std::sync::Arc::new) };
     Ok(match stream {
         true => streamed(job).into_response(),
@@ -632,6 +634,15 @@ struct Job {
 }
 
 impl Job {
+    /// The first image is the request arriving; the ones after it are the
+    /// rest of a request already let in.
+    fn entry(&self, i: usize) -> Entry {
+        match i {
+            0 => Entry::Request,
+            _ => Entry::Continued,
+        }
+    }
+
     /// The request for the `i`th image: the same, one seed along.
     fn nth(&self, i: usize) -> ImageRequest {
         ImageRequest { seed: self.request.seed.map(|s| s.wrapping_add(i as u64)), ..self.request.clone() }
@@ -677,7 +688,7 @@ impl Job {
 async fn whole(job: Job) -> Result<Json<serde_json::Value>, Fail> {
     let mut data = Vec::with_capacity(job.n);
     for i in 0..job.n {
-        let (_, mut strokes) = job.state.engine.paint(job.owner, &job.resident.key, job.nth(i)).map_err(Fail::internal)?;
+        let (_, mut strokes) = job.state.engine.paint(job.owner, job.entry(i), &job.resident.key, job.nth(i))?;
         let painted = loop {
             match strokes.recv().await {
                 Some(Stroke::Step(_)) => continue,
@@ -701,10 +712,10 @@ fn streamed(job: Job) -> impl IntoResponse {
     let (events, rx) = tokio::sync::mpsc::channel::<Event>(16);
     tokio::spawn(async move {
         for i in 0..job.n {
-            let mut strokes = match job.state.engine.paint(job.owner, &job.resident.key, job.nth(i)) {
+            let mut strokes = match job.state.engine.paint(job.owner, job.entry(i), &job.resident.key, job.nth(i)) {
                 Ok((_, s)) => s,
                 Err(e) => {
-                    let _ = events.send(sse("error", &json!({ "error": e }))).await;
+                    let _ = events.send(sse("error", &json!({ "error": e.to_string() }))).await;
                     return;
                 }
             };

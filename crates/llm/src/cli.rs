@@ -54,6 +54,7 @@ pub fn remote_only(command: &str) -> bool {
         "ps" | "load"
             | "unload"
             | "cancel"
+            | "queue"
             | "tokenize"
             | "conversations"
             | "images"
@@ -115,6 +116,7 @@ pub fn remote(remote: &Remote, args: &Args) -> Res<()> {
         "load" => models::load(remote, args).map(|_| ()),
         "unload" => models::unload(remote, args),
         "cancel" => models::cancel(remote, args),
+        "queue" => models::queue(remote, args),
         "tokenize" => models::tokenize(remote, args),
         "run" => models::run(remote, args),
         "chat" => models::chat(remote, args),
@@ -287,7 +289,7 @@ mod tests {
     fn every_command_the_table_names_exists() {
         let known: BTreeSet<&str> = [
             "ls", "ps", "search", "info", "pull", "use", "rm", "cache", "load", "unload", "cancel",
-            "tokenize", "run", "chat", "train", "service", "conversations", "images", "videos", "jobs",
+            "queue", "tokenize", "run", "chat", "train", "service", "conversations", "images", "videos", "jobs",
             "datasets", "tune", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api",
         ]
         .into();

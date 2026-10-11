@@ -25,6 +25,13 @@ bind = "127.0.0.1:5823"
 # loads it (see load_on_request).
 # autoload = false
 
+# How many generations may wait for the engine. The request after that is
+# answered 503 with a Retry-After instead of being held: an answer now that
+# says "later" is worth more to a client than a connection that waits four
+# minutes. `kvad queue` shows what is waiting, and whose. 0 lets any number
+# wait.
+# queue = 16
+
 [data]
 # Where the database, generated images, datasets and trained models go.
 # Defaults to $XDG_DATA_HOME/kvad, or ~/.local/share/kvad. `~/` is your home

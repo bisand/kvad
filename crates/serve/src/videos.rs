@@ -91,7 +91,7 @@
 use crate::api::{blocking, Fail};
 use crate::auth::{Identity, State};
 use crate::db::Db;
-use crate::scheduler::{Key, Kind, Reel};
+use crate::scheduler::{Entry, Key, Kind, Reel};
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State as St};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -961,6 +961,13 @@ pub async fn create(who: Identity, headers: HeaderMap, St(state): St<State>, bod
         }
     }
 
+    // Before the row is made: a video refused for want of room should be a
+    // 503 now, not a row that fails a moment later.
+    if let Err(full) = state.engine.room() {
+        forget(&upload);
+        return Err(full.into());
+    }
+
     let (db, owner, model, backend) =
         (state.db.clone(), who.id, resident.model.repo.clone(), resident.model.backend.clone());
     let aside = upload.clone();
@@ -998,9 +1005,9 @@ async fn run(state: State, id: i64, owner: Option<i64>, key: Key, request: Video
             tell(id);
         }
     };
-    let mut reels = match state.engine.film(owner, &key, request) {
+    let mut reels = match state.engine.film(owner, Entry::Request, &key, request) {
         Ok((_, r)) => r,
-        Err(e) => return failed(e).await,
+        Err(e) => return failed(e.to_string()).await,
     };
     // Whether the row is still there is asked every second as well as at
     // each step: a queued video has no steps, and one being made may go a

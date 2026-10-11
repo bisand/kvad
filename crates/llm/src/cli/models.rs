@@ -501,13 +501,58 @@ pub fn unload(remote: &Remote, args: &Args) -> Res<()> {
 
 /// `kvad cancel`.
 pub fn cancel(remote: &Remote, args: &Args) -> Res<()> {
-    let answer = remote.delete("/api/generation")?;
-    match args.json {
-        true => out::json(&answer),
-        false => match answer["stopped"].as_u64() {
+    let answer = match &args.target {
+        Some(word) => {
+            let id = super::id(word)?;
+            remote.delete(&format!("/api/generation/{id}"))?
+        }
+        None => remote.delete("/api/generation")?,
+    };
+    match (args.json, &args.target) {
+        (true, _) => out::json(&answer),
+        (false, Some(id)) => println!("asked generation {id} to stop"),
+        (false, None) => match answer["stopped"].as_u64() {
             Some(0) => println!("nothing of yours is generating on {}", remote.base),
             _ => println!("asked what you have generating on {} to stop", remote.base),
         },
+    }
+    Ok(())
+}
+
+/// `kvad queue`.
+pub fn queue(remote: &Remote, args: &Args) -> Res<()> {
+    let queue = remote.get("/api/queue")?;
+    if args.json {
+        out::json(&queue);
+        return Ok(());
+    }
+    let secs = |v: &Value| v.as_f64().map_or("-".to_string(), |s| format!("{s:.0}s"));
+    let rows: Vec<Vec<String>> = out::items(&queue["generations"])
+        .iter()
+        .map(|g| {
+            let state = match g["running"] == true {
+                true => format!("running {}", secs(&g["running_secs"])),
+                false => format!("waiting {}, {} ahead", secs(&g["waited_secs"]), out::s(&g["ahead"])),
+            };
+            let mut row = vec![out::s(&g["id"]), out::s(&g["kind"]), out::s(&g["model"]), state];
+            // Only an administrator is told whose each one is.
+            if !g["owner"].is_null() {
+                row.push(out::s(&g["owner"]));
+            }
+            row
+        })
+        .collect();
+    let limit = match queue["limit"].as_u64() {
+        Some(0) | None => "any number may wait".to_string(),
+        Some(n) => format!("{n} may wait"),
+    };
+    println!("{} running, {} waiting on {}; {limit}", out::s(&queue["running"]), out::s(&queue["waiting"]), remote.base);
+    if rows.is_empty() {
+        return Ok(());
+    }
+    match rows.iter().any(|r| r.len() == 5) {
+        true => out::table(&["ID", "KIND", "MODEL", "STATE", "WHOSE"], &rows),
+        false => out::table(&["ID", "KIND", "MODEL", "STATE"], &rows),
     }
     Ok(())
 }

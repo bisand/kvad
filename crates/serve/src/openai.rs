@@ -47,7 +47,7 @@
 use crate::api::{blocking, Fail};
 use crate::models::{sse, stream};
 use crate::auth::{Identity, State};
-use crate::scheduler::{Kind, LoadError, Piece, Resident};
+use crate::scheduler::{Entry, Kind, LoadError, Piece, Resident};
 use axum::extract::State as St;
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
@@ -475,8 +475,7 @@ pub async fn completions(
     let offered = !tools.is_empty();
     let (generation, pieces) = state
         .engine
-        .chat(who.id, &resident.key, turns, tools, sampling, false)
-        .map_err(Fail::internal)?;
+        .chat(who.id, Entry::Request, &resident.key, turns, tools, sampling, false)?;
     let id = format!("chatcmpl-{}", now_millis());
     let metrics = state.metrics.clone();
     // Timed from here rather than by the middleware: for a streamed reply the
@@ -629,6 +628,45 @@ pub async fn cancel_one(
         0 => Err(Fail::missing(format!("there is no generation {id}"))),
         _ => Ok(Json(json!({ "cancelled": true, "stopped": 1 }))),
     }
+}
+
+/// Who is waiting for the engine, and for how long.
+///
+/// A signed-in user sees their own generations, and how many there are
+/// altogether — enough to know why a reply has not started. An
+/// administrator sees every one, with whose it is.
+pub async fn queue(who: Identity, St(state): St<State>) -> Result<Json<serde_json::Value>, Fail> {
+    let all = state.engine.queue();
+    let names = match who.is_admin() {
+        true => {
+            let db = state.db.clone();
+            blocking(move || crate::users::list(&db)).await?
+        }
+        false => Vec::new(),
+    };
+    let name = |owner: Option<i64>| match owner {
+        // No account: `auth.mode = "none"`, where there is one person.
+        None => Some("local".to_string()),
+        Some(id) => names.iter().find(|u| u.id == id).map(|u| u.name.clone()),
+    };
+    let generations: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|g| who.is_admin() || g.owner == who.id)
+        .map(|g| {
+            let mut entry = json!(g);
+            entry["mine"] = json!(g.owner == who.id);
+            if who.is_admin() {
+                entry["owner"] = json!(name(g.owner));
+            }
+            entry
+        })
+        .collect();
+    Ok(Json(json!({
+        "limit": state.engine.limit(),
+        "running": all.iter().filter(|g| g.running).count(),
+        "waiting": all.iter().filter(|g| !g.running).count(),
+        "generations": generations,
+    })))
 }
 
 fn now_millis() -> u128 {

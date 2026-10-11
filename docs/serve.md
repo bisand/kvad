@@ -155,13 +155,19 @@ the model is:
 |---|---|---|---|
 | `cpu-q8`, one at a time | 44 | 46 | 4.0 s |
 | `cpu-q8`, together | 93 | 24 | 0.4 s |
-| `gpu-q8`, one at a time | 121 | 124 | 1.5 s |
-| `gpu-q8`, together | 122 | 31 | 0.1 s |
+| `gpu-q8`, one at a time | 127 | 131 | 1.4 s |
+| `gpu-q8`, together | 167 | 43 | 0.1 s |
 
-On the CPU the weights are read once a step for everybody, which is the
-throughput. On the GPU each reply still takes its own pass, so the total is
-what it was and the gain is that nobody waits for somebody else's whole reply
-before their own begins. A reply's `kvad.beside` says how many others it was
+The weights are read once a step for everybody, which is the throughput. On
+the GPU that is worth less than it should be at a few replies and more at
+many: a product with several rows is a different kernel from a product with
+one, and costs three to seven times as much whether the rows are two or
+sixteen. So one pass is used only from where it wins — two replies at bf16,
+three at q8, six at q4 — and below that each reply takes its own step, which
+costs nothing and still means nobody waits for somebody else's whole reply
+before their own begins. With `batch` raised, sixteen replies on Qwen2.5-1.5B
+at `gpu-q8` are 550 tok/s between them against 128 in turn, and on Qwen3-14B
+95 against 17. A reply's `kvad.beside` says how many others it was
 written beside. A request that asks for no cache — a benchmark, an evaluation
 — runs alone.
 
@@ -180,8 +186,10 @@ others is not always word for word the reply written alone. The kernel for
 several rows adds up in a different order, and rounding activations to eight
 bits turns that into differences the size of quantisation itself — 0.3 to 0.5
 in a logit, the same distance from the f32 model either way — which is enough
-to tip a greedy choice between two near-equal tokens. At f32, and on the GPU,
-they are the same reply.
+to tip a greedy choice between two near-equal tokens. The same goes for a
+quantised model on the GPU once enough replies run together for one pass,
+where 3 greedy replies in 20 differed. At f32 on the CPU, and on the GPU
+below that number, they are the same reply.
 
 **Each conversation keeps its cache.** A chat prefills only its newest
 message because the turn before left its keys and values in the model, and

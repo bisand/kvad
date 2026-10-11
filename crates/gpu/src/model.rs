@@ -311,22 +311,8 @@ impl GpuLlama {
                 k_norm: blk.k_norm.as_ref(),
                 eps: spec.eps,
             };
-            // Where MLX's attention kernel takes this step (`fused`, not the
-            // module), the queries go to it in the cache's dtype, which is
-            // what it wants; see `attention`.
-            let cache = self.kv[i].dtype(self.dtype);
-            let q_dtype = if fused(&self.device, hd, m) { cache } else { self.dtype };
-            let (q, k, v) = if self.fuse && fused::rope_cache_fits(&qkv, &heads, &cos, &sin, cache, q_dtype) {
-                let (kb, vb) = self.kv[i].room(&[1, n_kv, m, hd], &[1, n_kv, m, hd], cache, &self.device)?;
-                let q = fused::rope_cache(&qkv, &heads, &cos, &sin, &kb, &vb, self.kv[i].len(), q_dtype)?;
-                let (k, v) = self.kv[i].advance(m)?;
-                (q, k, v)
-            } else {
-                let (q, k, v) = fused::heads(&qkv, &heads, &cos, &sin)?;
-                // Append to the cache along the sequence axis.
-                let (k, v) = self.kv[i].push(&k, &v)?;
-                (q, k, v)
-            };
+            let (q, k, v) =
+                split(&qkv, &heads, &cos, &sin, &mut self.kv[i], self.fuse, self.dtype, &self.device)?;
 
             let out = attention(&q, &k, &v, mask.as_ref(), scale)?.to_dtype(self.dtype)?;
             let out = out.transpose(1, 2)?.reshape((m, n_head * hd))?;
@@ -345,6 +331,136 @@ impl GpuLlama {
         let logits = logits.flatten_all()?.to_vec1::<f32>()?;
         report_failures(&self.device)?;
         Ok(logits)
+    }
+
+    /// Advance several sequences by one token each: `tokens[i]` onto the
+    /// end of `caches[i]`, and a row of logits for each.
+    ///
+    /// [`GpuLlama::run`] with a cache a row. Everything that is the model's
+    /// — the norms, the merged projection, the output projection, the MLP,
+    /// the head — runs once over all the rows, which is the weights read
+    /// once for everybody. Everything that is a sequence's — its rotation,
+    /// its place in its cache, its attention — runs once a row, on that
+    /// row's own cache, with the kernels a single token already uses.
+    ///
+    /// Attention stays a sequence at a time on purpose. One call over
+    /// several sequences would need a mask between them, MLX's kernel takes
+    /// causality as a yes or a no and not as a mask, and the written-out
+    /// path it would fall back to is the slow one. A row at a time, nothing
+    /// is shared, so nothing needs hiding.
+    fn run_each(&self, tokens: &[u32], caches: &mut [&mut (Vec<KvCache>, usize)]) -> Res<Vec<Vec<f32>>> {
+        let b = tokens.len();
+        let spec = &self.spec;
+        let hd = spec.head_dim;
+        let (n_head, n_kv) = (spec.n_head, spec.n_kv_head);
+        let scale = 1.0 / (hd as f64).sqrt();
+        if let Some((_, pos)) = caches.iter().map(|c| &**c).find(|(_, pos)| *pos >= spec.n_ctx) {
+            return Err(format!("context window of {} tokens is full at {pos}", spec.n_ctx).into());
+        }
+
+        let ids = Tensor::from_slice(tokens, (b,), &self.device)?;
+        let mut x = self.embed.rows(&ids)?.to_dtype(self.dtype)?;
+
+        // Each row rotates by its own position: a row of the table each,
+        // copied out once a step rather than once a layer.
+        let mut angles = Vec::with_capacity(b);
+        for (_, pos) in caches.iter().map(|c| &**c) {
+            angles.push((self.cos.narrow(0, *pos, 1)?.contiguous()?, self.sin.narrow(0, *pos, 1)?.contiguous()?));
+        }
+
+        let mut pending: Option<Tensor> = None;
+        for (l, blk) in self.blocks.iter().enumerate() {
+            let h = match pending.take() {
+                None => crate::grad::rms_norm(&x, &blk.attn_norm, spec.eps)?,
+                Some(f) => {
+                    let (h, sum) = fused::add_rms_norm(&x, &f, &blk.attn_norm, spec.eps)?;
+                    x = sum;
+                    h
+                }
+            };
+
+            // One projection for every row: `[b, (n_head + 2 n_kv) hd]`.
+            let qkv = blk.qkv.forward(&h)?;
+            let heads = fused::Heads {
+                n_head,
+                n_kv,
+                head_dim: hd,
+                bias: blk.qkv_b.as_ref(),
+                q_norm: blk.q_norm.as_ref(),
+                k_norm: blk.k_norm.as_ref(),
+                eps: spec.eps,
+            };
+            let mut outs = Vec::with_capacity(b);
+            for (i, cache) in caches.iter_mut().enumerate() {
+                let (cos, sin) = &angles[i];
+                // A row of the projection, where it lies: one row of a
+                // contiguous matrix is contiguous, and the kernels read it
+                // at its offset.
+                let row = qkv.narrow(0, i, 1)?;
+                let (q, k, v) =
+                    split(&row, &heads, cos, sin, &mut cache.0[l], self.fuse, self.dtype, &self.device)?;
+                let out = attention(&q, &k, &v, None, scale)?.to_dtype(self.dtype)?;
+                outs.push(out.transpose(1, 2)?.reshape((1, n_head * hd))?);
+            }
+            // Copied together and laid out plainly: what follows is a
+            // projection, and a strided input sends it down a slow path.
+            let out = Tensor::cat(&outs, 0)?.contiguous()?;
+            let (h, sum) = fused::add_rms_norm(&x, &linear(&out, &blk.o, None)?, &blk.mlp_norm, spec.eps)?;
+            x = sum;
+            pending = Some(blk.mlp.forward(&h, b, spec.n_embd)?);
+        }
+        caches.iter_mut().for_each(|c| c.1 += 1);
+
+        let f = pending.ok_or("a model with no layers")?;
+        let (last, _) = fused::add_rms_norm(&x, &f, &self.final_norm, spec.eps)?;
+        let logits = self.head.forward(&last)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        report_failures(&self.device)?;
+        Ok(logits)
+    }
+
+    /// How many conversations it takes before one pass over all of them
+    /// beats a step for each.
+    ///
+    /// It is not two, and the reason is not in this file. A product of a
+    /// matrix with one row and with several are different kernels on Metal,
+    /// and the one for several costs the same whether that is two rows or
+    /// sixteen — but three to seven times what one row costs:
+    ///
+    /// | Qwen2.5-1.5B's MLP | 1 row | 2 to 16 rows |
+    /// |---|---|---|
+    /// | gate and up, q8 | 0.089 ms | 0.27 ms |
+    /// | down, q8 | 0.043 ms | 0.26 ms |
+    /// | gate and up, q4 | 0.037 ms | 0.28 ms |
+    /// | down, q4 | 0.024 ms | 0.29 ms |
+    /// | gate and up, bf16 | 0.20 ms | 0.27 ms |
+    /// | down, bf16 | 0.13 ms | 0.32 ms |
+    ///
+    /// So a pass over several rows is one expensive step whose price does
+    /// not depend on how many share it, and it wins once enough do. Taking
+    /// the MLP out of the pass took a two-conversation step from 21.7 ms to
+    /// 6.3, which is where this was found; attention and the output head
+    /// are not it.
+    ///
+    /// Measured with `examples/batch_decode`, medians of interleaved rounds,
+    /// tokens a second in turn and in one pass:
+    ///
+    /// | | 2 | 3 | 4 | 6 | 8 | 16 |
+    /// |---|---|---|---|---|---|---|
+    /// | Qwen2.5-1.5B bf16, 68 in turn | 83 | 119 | 153 | 223 | 397 | 650 |
+    /// | Qwen2.5-1.5B q8, 128 in turn | 92 | 133 | 176 | 251 | 320 | 550 |
+    /// | Qwen3-14B q8, 17 in turn | 15 | 22 | 29 | 43 | 49 | 95 |
+    /// | Qwen2.5-1.5B q4, 210 in turn | 87 | 128 | 167 | 237 | 306 | 531 |
+    ///
+    /// The thresholds are where each row first beats its own "in turn". q4
+    /// was measured on the one model. A kernel for a quantised matrix and a
+    /// few rows that cost what one row costs, a row, would move all of them
+    /// to two.
+    fn worth_one_pass(&self) -> usize {
+        match self.quant {
+            None => 2,
+            Some(GgmlDType::Q8_0) => 3,
+            Some(_) => 6,
+        }
     }
 
     fn params(&self) -> usize {
@@ -398,6 +514,43 @@ impl GpuLlama {
         let head = if self.tied { 0 } else { self.head.bytes() };
         blocks + self.embed.bytes() + head + per(&self.final_norm)
     }
+}
+
+/// The queries, keys and values of a pass, out of the merged projection:
+/// split per head, normed where the model norms, rotated, and the keys and
+/// values written onto the end of `cache`. `qkv` is the pass's rows for one
+/// sequence, in order, and `cos` and `sin` their rotations.
+///
+/// The one place a sequence's cache is written, shared by the pass over one
+/// sequence's positions and the pass over several sequences' next position.
+#[allow(clippy::too_many_arguments)]
+fn split(
+    qkv: &Tensor,
+    heads: &fused::Heads,
+    cos: &Tensor,
+    sin: &Tensor,
+    cache: &mut KvCache,
+    fuse: bool,
+    dtype: DType,
+    device: &Device,
+) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
+    let m = qkv.dim(0)?;
+    let (hd, n_kv) = (heads.head_dim, heads.n_kv);
+    // Where MLX's attention kernel takes this step (`fused`, not the
+    // module), the queries go to it in the cache's dtype, which is what it
+    // wants; see `attention`.
+    let stored = cache.dtype(dtype);
+    let q_dtype = if fused(device, hd, m) { stored } else { dtype };
+    if fuse && fused::rope_cache_fits(qkv, heads, cos, sin, stored, q_dtype) {
+        let (kb, vb) = cache.room(&[1, n_kv, m, hd], &[1, n_kv, m, hd], stored, device)?;
+        let q = fused::rope_cache(qkv, heads, cos, sin, &kb, &vb, cache.len(), q_dtype)?;
+        let (k, v) = cache.advance(m)?;
+        return Ok((q, k, v));
+    }
+    let (q, k, v) = fused::heads(qkv, heads, cos, sin)?;
+    // Append to the cache along the sequence axis.
+    let (k, v) = cache.push(&k, &v)?;
+    Ok((q, k, v))
 }
 
 /// Block until the device has finished everything the load queued.
@@ -622,6 +775,38 @@ impl Session for GpuLlama {
         // backend here carries a recurrent state that would refuse; see
         // `kvad::model::KvCache::truncate`.
         Ok(self.pos)
+    }
+
+    /// One pass for all of them where that is the faster thing, and each
+    /// in turn where it is not; see [`GpuLlama::worth_one_pass`].
+    fn forward_each(&mut self, tokens: &[u32], caches: &mut [kvad::model::Parked]) -> Res<Vec<Vec<f32>>> {
+        if tokens.len() != caches.len() {
+            return Err("a token for each conversation, and a conversation for each token".into());
+        }
+        let mut theirs = Vec::with_capacity(caches.len());
+        for cache in caches.iter_mut() {
+            let cache = cache.downcast_mut::<(Vec<KvCache>, usize)>().ok_or("that cache was not this backend's")?;
+            if cache.0.len() != self.kv.len() {
+                return Err("that cache is another model's".into());
+            }
+            theirs.push(cache);
+        }
+        if theirs.len() >= self.worth_one_pass() {
+            // A pool a call, so a pool a token: see `pooled`.
+            return crate::common::pooled(|| self.run_each(tokens, &mut theirs));
+        }
+        // Each in turn: the ordinary step, with the conversation's cache
+        // swapped in for it and back out after.
+        let mut rows = Vec::with_capacity(theirs.len());
+        for (token, one) in tokens.iter().zip(theirs) {
+            std::mem::swap(&mut self.kv, &mut one.0);
+            std::mem::swap(&mut self.pos, &mut one.1);
+            let logits = crate::common::pooled(|| self.run(std::slice::from_ref(token)));
+            std::mem::swap(&mut self.kv, &mut one.0);
+            std::mem::swap(&mut self.pos, &mut one.1);
+            rows.push(logits?);
+        }
+        Ok(rows)
     }
 
     fn room(&self) -> usize {
@@ -1409,6 +1594,91 @@ pub(crate) mod tests {
         assert!(worst < 1e-4, "the cache changes the answer by {worst}");
         assert_eq!(stepped.cached(), 4);
 
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Several conversations advanced in one pass say what each says when
+    /// it is taken back and advanced alone.
+    ///
+    /// Different lengths on purpose: a row that rotated by its neighbour's
+    /// position, or wrote into its neighbour's cache, is only caught when
+    /// the neighbours are not where it is. On the CPU device for the
+    /// arithmetic, and on Metal where there is one, since that is where the
+    /// fused kernels are and where a row read at an offset is read by them.
+    #[test]
+    fn several_conversations_at_once_agree_with_each_alone() {
+        use kvad::model::Parked;
+        let mut spec = tiny_spec();
+        spec.n_layer = 1;
+        let path = write_checkpoint(&spec, true, "llama-each");
+        let prompts: [&[u32]; 3] = [&[3, 17, 8, 0, 29, 41, 5], &[12], &[60, 2, 2, 33]];
+        let next: [[u32; 3]; 4] = [[7, 7, 7], [1, 44, 19], [63, 0, 30], [9, 21, 9]];
+
+        let mut devices = vec![Device::Cpu];
+        devices.extend(Device::new_metal(0));
+        for dev in devices {
+            let kinds: &[(&str, DType, Option<GgmlDType>, f32)] = match dev.is_metal() {
+                true => &[
+                    ("f32", DType::F32, None, 1e-4),
+                    ("bf16", DType::BF16, None, 5e-2),
+                    ("q8", DType::F32, Some(GgmlDType::Q8_0), 1e-3),
+                ],
+                false => &[("f32", DType::F32, None, 1e-4), ("q8", DType::F32, Some(GgmlDType::Q8_0), 1e-3)],
+            };
+            for &(what, dtype, quant, allow) in kinds {
+                let load = || {
+                    GpuLlama::load(std::slice::from_ref(&path), spec.clone(), dtype, quant, dev.clone(), &Vault::off())
+                        .unwrap()
+                };
+                let set_aside = |session: &mut GpuLlama| -> Vec<Parked> {
+                    let parked = prompts
+                        .iter()
+                        .map(|prompt| {
+                            session.forward(prompt).unwrap();
+                            session.park().unwrap()
+                        })
+                        .collect();
+                    // And one it keeps, which the pass must leave alone.
+                    session.forward(&[5, 6]).unwrap();
+                    parked
+                };
+                let (mut one, mut all) = (load(), load());
+                let (mut theirs, mut ours) = (set_aside(&mut one), set_aside(&mut all));
+
+                for (step, tokens) in next.iter().enumerate() {
+                    let got = all.forward_each(tokens, &mut ours).unwrap();
+                    assert_eq!(all.cached(), 2, "{what}: the session's own conversation moved");
+
+                    let own = one.park().unwrap();
+                    for (i, (&token, cache)) in tokens.iter().zip(theirs.iter_mut()).enumerate() {
+                        one.resume(std::mem::replace(cache, Box::new(()))).unwrap();
+                        let want = one.forward(&[token]).unwrap();
+                        *cache = one.park().unwrap();
+                        let worst = got[i].iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                        assert!(got[i].iter().all(|v| v.is_finite()), "{what}: not finite");
+                        assert!(
+                            worst < allow,
+                            "{what} on {:?}, step {step}, conversation {i}: together and alone differ by {worst}",
+                            dev.location()
+                        );
+                    }
+                    one.resume(own).unwrap();
+                }
+
+                // What was advanced is each conversation's own, and as long
+                // as its prompt and the steps since.
+                for (cache, prompt) in ours.into_iter().zip(prompts) {
+                    all.resume(cache).unwrap();
+                    assert_eq!(all.cached(), prompt.len() + next.len(), "{what}");
+                }
+                // One alone goes down the ordinary step, and is the ordinary step.
+                let (mut a, mut b) = (load(), load());
+                a.forward(prompts[0]).unwrap();
+                b.forward(prompts[0]).unwrap();
+                let mut parked = vec![a.park().unwrap()];
+                assert_eq!(a.forward_each(&[11], &mut parked).unwrap()[0], b.forward(&[11]).unwrap(), "{what}");
+            }
+        }
         std::fs::remove_file(&path).unwrap();
     }
 

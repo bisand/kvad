@@ -112,6 +112,12 @@ pub struct Server {
     /// lets one account have the whole queue. Not applied with
     /// `auth.mode = "none"`, where there is nobody to share with.
     pub queue_per_account: Option<usize>,
+    /// How many generations one account may ask for in a minute, before
+    /// its next request is answered 429 with the wait in `Retry-After`.
+    /// Unset or zero, any number: an agent asks many times a minute as a
+    /// matter of course, and what is too many depends on who shares the
+    /// machine. Not applied with `auth.mode = "none"`.
+    pub generations_per_minute: Option<usize>,
 }
 
 /// What happens to a video once it is made.
@@ -270,6 +276,7 @@ impl Default for Server {
             context: None,
             queue: None,
             queue_per_account: None,
+            generations_per_minute: None,
         }
     }
 }

@@ -290,6 +290,9 @@ pub enum Refused {
     Full { waiting: usize, limit: usize },
     /// This account has as many waiting as one account may.
     Yours { waiting: usize, limit: usize },
+    /// This account has started as many in the last minute as one account
+    /// may, and may start another in `retry_secs`.
+    Hurried { limit: usize, retry_secs: u64 },
     /// The scheduler's thread has ended, which it does not do.
     Stopped,
 }
@@ -306,6 +309,11 @@ impl std::fmt::Display for Refused {
                 f,
                 "you have {waiting} generations waiting, and {limit} is as many as one account may. \
                  Try again when one has started"
+            ),
+            Refused::Hurried { limit, retry_secs } => write!(
+                f,
+                "you have asked for {limit} generations in the last minute, which is as many as \
+                 one account may. Try again in {retry_secs} seconds"
             ),
             Refused::Stopped => f.write_str("the engine thread has stopped"),
         }
@@ -437,6 +445,28 @@ struct Waiting {
     /// generations started. An account not in it has never had one.
     served: Served,
     turn: u64,
+    /// When each account's requests of the last minute were let in, oldest
+    /// first. Under the queue's lock because being let in is one decision:
+    /// room in the queue, room in the account's share, and this.
+    asked: std::collections::HashMap<i64, VecDeque<Instant>>,
+}
+
+/// The stretch a rate is counted over.
+const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long `asked`'s owner must wait to be under `limit` a minute at
+/// `now`, having forgotten what is older than a minute. `None` is no wait.
+fn wait_for(asked: &mut VecDeque<Instant>, limit: usize, now: Instant) -> Option<u64> {
+    while asked.front().is_some_and(|at| now.duration_since(*at) >= MINUTE) {
+        asked.pop_front();
+    }
+    if asked.len() < limit {
+        return None;
+    }
+    // The one that has to age out for there to be room: with exactly the
+    // limit held, the oldest.
+    let leaving = asked[asked.len() - limit];
+    Some((MINUTE - now.duration_since(leaving)).as_secs_f64().ceil() as u64)
 }
 
 type Served = std::collections::HashMap<Owner, u64>;
@@ -585,6 +615,9 @@ pub struct Scheduler {
     limit: usize,
     /// How many of them may be one account's. Zero is no limit.
     share: usize,
+    /// How many generations one account may ask for in a minute. Zero is
+    /// no limit, which is what it is unless somebody sets one.
+    rate: usize,
 }
 
 impl Drop for Scheduler {
@@ -693,7 +726,25 @@ impl Scheduler {
             .name("kvad-scheduler".into())
             .spawn(move || run(closing, loaders, budget, theirs))
             .expect("failed to spawn the scheduler thread");
-        Scheduler { queue, shared, budget, limit: DEFAULT_LIMIT, share: DEFAULT_SHARE }
+        Scheduler { queue, shared, budget, limit: DEFAULT_LIMIT, share: DEFAULT_SHARE, rate: 0 }
+    }
+
+    /// Let one account ask for `rate` generations a minute, and refuse the
+    /// next until one of them is a minute old. Zero lets it ask freely.
+    ///
+    /// Counted when a request is let in, not when it runs, and not for the
+    /// rest of a request already in: four images are one request. Like the
+    /// share, it is for accounts, and with none there is nobody to hold to
+    /// it.
+    pub fn pacing(mut self, rate: usize) -> Self {
+        self.rate = rate;
+        self
+    }
+
+    /// How many generations one account may ask for in a minute, or zero
+    /// for any number.
+    pub fn rate(&self) -> usize {
+        self.rate
     }
 
     /// Let one account have `share` generations waiting, and refuse its
@@ -715,13 +766,26 @@ impl Scheduler {
     /// the truer thing to say. The account's share applies only where there
     /// are accounts — with none, `who` is everybody, and a share of the
     /// queue for everybody is just a smaller queue.
-    fn admits(&self, waiting: &Waiting, who: Owner) -> Result<(), Refused> {
+    ///
+    /// The account's rate is asked last and only noted when `counted`: a
+    /// request turned away for want of room has not used one of its
+    /// minute's, and [`Scheduler::room`] is a question, not a request.
+    fn admits(&self, waiting: &mut Waiting, who: Owner, counted: bool) -> Result<(), Refused> {
         let (all, theirs) = waiting.count(who);
         if self.limit > 0 && all >= self.limit {
             return Err(Refused::Full { waiting: all, limit: self.limit });
         }
         if who.is_some() && self.share > 0 && theirs >= self.share {
             return Err(Refused::Yours { waiting: theirs, limit: self.share });
+        }
+        if let (Some(id), true) = (who, self.rate > 0) {
+            let (asked, now) = (waiting.asked.entry(id).or_default(), Instant::now());
+            if let Some(retry_secs) = wait_for(asked, self.rate, now) {
+                return Err(Refused::Hurried { limit: self.rate, retry_secs });
+            }
+            if counted {
+                asked.push_back(now);
+            }
         }
         Ok(())
     }
@@ -753,7 +817,7 @@ impl Scheduler {
     /// first — so that a full queue is still a status code. The submission
     /// itself asks again, under the lock, and that is the one that counts.
     pub fn room(&self, who: Owner) -> Result<(), Refused> {
-        self.admits(&self.queue.waiting(), who)
+        self.admits(&mut self.queue.waiting(), who, false)
     }
 
     /// Every generation waiting or running, in the order they run — which
@@ -922,7 +986,7 @@ impl Scheduler {
             return Err(Refused::Stopped);
         }
         if entry == Entry::Request {
-            self.admits(&waiting, who)?;
+            self.admits(&mut waiting, who, true)?;
         }
         let ticket = self.shared.admit(who, kind, on);
         let id = ticket.id;
@@ -1821,6 +1885,41 @@ mod tests {
         assert_eq!(ask(&sched, Some(2), Entry::Request).unwrap_err(), Refused::Full { waiting: 8, limit: 8 });
 
         held.release().await;
+    }
+
+    /// An account may ask so often and no more, is told how long until it
+    /// may again, and is not held to what another has asked.
+    #[tokio::test]
+    async fn one_account_may_ask_only_so_often() {
+        let sched = refusing().sharing(0).pacing(2);
+        let _a = (ask(&sched, Some(1), Entry::Request).unwrap(), ask(&sched, Some(1), Entry::Request).unwrap());
+        // Asking whether there is room is not asking for a generation.
+        assert!(matches!(sched.room(Some(1)), Err(Refused::Hurried { limit: 2, retry_secs: 59..=60 })));
+        assert!(matches!(
+            ask(&sched, Some(1), Entry::Request).unwrap_err(),
+            Refused::Hurried { limit: 2, retry_secs: 59..=60 }
+        ));
+        // The rest of a request already in is not another request.
+        let _more = ask(&sched, Some(1), Entry::Continued).unwrap();
+        // Another account has its own minute, and no account has none.
+        let _b = ask(&sched, Some(2), Entry::Request).unwrap();
+        let _local: Vec<_> = (0..5).map(|_| ask(&sched, None, Entry::Request).unwrap()).collect();
+    }
+
+    /// The wait is until the request that has to age out has: the oldest
+    /// of the last `limit`, and what is over a minute old is forgotten.
+    #[test]
+    fn the_wait_is_until_the_oldest_of_the_minute_is_a_minute_old() {
+        let start = Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let mut asked: VecDeque<Instant> = [at(0), at(10), at(50)].into();
+        assert_eq!(wait_for(&mut asked, 4, at(55)), None);
+        assert_eq!(wait_for(&mut asked, 3, at(55)), Some(5));
+        // Two a minute, and three held: the second has to go, not the first.
+        assert_eq!(wait_for(&mut asked, 2, at(55)), Some(15));
+        // At the minute the first is forgotten, and there is room for one.
+        assert_eq!(wait_for(&mut asked, 3, at(60)), None);
+        assert_eq!(asked.len(), 2);
     }
 
     /// No limit is no limit.

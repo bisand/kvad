@@ -85,37 +85,42 @@ pub fn routes() -> Router<State> {
 /// in a toast — so it says what went wrong rather than which function it
 /// happened in.
 #[derive(Debug)]
-pub struct Fail(pub StatusCode, pub String);
+pub struct Fail(pub StatusCode, pub String, pub Option<u64>);
 
 impl Fail {
     pub fn bad(why: impl Into<String>) -> Self {
-        Fail(StatusCode::BAD_REQUEST, why.into())
+        Fail(StatusCode::BAD_REQUEST, why.into(), None)
     }
     pub fn missing(what: impl Into<String>) -> Self {
-        Fail(StatusCode::NOT_FOUND, what.into())
+        Fail(StatusCode::NOT_FOUND, what.into(), None)
     }
     /// Refused because of what the server is holding, not because of what
     /// was asked: a model that would fit if something else were unloaded.
     pub fn conflict(why: impl Into<String>) -> Self {
-        Fail(StatusCode::CONFLICT, why.into())
+        Fail(StatusCode::CONFLICT, why.into(), None)
     }
     pub fn internal(why: impl Into<String>) -> Self {
-        Fail(StatusCode::INTERNAL_SERVER_ERROR, why.into())
+        Fail(StatusCode::INTERNAL_SERVER_ERROR, why.into(), None)
     }
     /// Signed in, and not allowed this. Distinct from [`crate::auth::Denied`],
     /// which answers a request that failed to say who it was at all.
     pub fn denied(why: impl Into<String>) -> Self {
-        Fail(StatusCode::FORBIDDEN, why.into())
+        Fail(StatusCode::FORBIDDEN, why.into(), None)
     }
     /// Nothing wrong with the request, and no room for it now. Answered
     /// with a `Retry-After`; see [`RETRY_AFTER_SECS`].
     pub fn busy(why: impl Into<String>) -> Self {
-        Fail(StatusCode::SERVICE_UNAVAILABLE, why.into())
+        Fail(StatusCode::SERVICE_UNAVAILABLE, why.into(), Some(RETRY_AFTER_SECS))
     }
     /// Room for others, and none for this caller, who has had their share.
     /// A `Retry-After` goes with this one too.
     pub fn crowding(why: impl Into<String>) -> Self {
-        Fail(StatusCode::TOO_MANY_REQUESTS, why.into())
+        Fail(StatusCode::TOO_MANY_REQUESTS, why.into(), Some(RETRY_AFTER_SECS))
+    }
+    /// The caller has asked too often, and may again in `secs`: a
+    /// `Retry-After` that is known rather than guessed.
+    pub fn hurried(why: impl Into<String>, secs: u64) -> Self {
+        Fail(StatusCode::TOO_MANY_REQUESTS, why.into(), Some(secs.max(1)))
     }
 }
 
@@ -130,24 +135,24 @@ pub const RETRY_AFTER_SECS: u64 = 5;
 impl IntoResponse for Fail {
     fn into_response(self) -> Response {
         let body = Json(serde_json::json!({ "error": self.1 }));
-        match self.0 {
-            StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => {
-                (self.0, [(axum::http::header::RETRY_AFTER, RETRY_AFTER_SECS.to_string())], body).into_response()
-            }
-            _ => (self.0, body).into_response(),
+        match self.2 {
+            Some(secs) => (self.0, [(axum::http::header::RETRY_AFTER, secs.to_string())], body).into_response(),
+            None => (self.0, body).into_response(),
         }
     }
 }
 
 /// A full queue is a 503 and a hint, and an account over its share of one
 /// a 429 and the same hint: the first is the server's state and the second
-/// the caller's doing. A scheduler that has stopped is this server's fault
+/// the caller's doing. An account asking too often is a 429 too, with the
+/// wait it actually has. A scheduler that has stopped is this server's fault
 /// and says so.
 impl From<crate::scheduler::Refused> for Fail {
     fn from(refused: crate::scheduler::Refused) -> Self {
         match refused {
             crate::scheduler::Refused::Full { .. } => Fail::busy(refused.to_string()),
             crate::scheduler::Refused::Yours { .. } => Fail::crowding(refused.to_string()),
+            crate::scheduler::Refused::Hurried { retry_secs, .. } => Fail::hurried(refused.to_string(), retry_secs),
             crate::scheduler::Refused::Stopped => Fail::internal(refused.to_string()),
         }
     }

@@ -7,7 +7,7 @@
 // than a private one. The *record* of what was said goes to /api/conversations
 // afterwards. Nothing is saved as a side effect of asking a question.
 
-import { api, sse } from "./api.js";
+import { api, sse, stopGeneration } from "./api.js";
 import { toasts } from "./toasts.svelte.js";
 
 /** What the sampler does when nobody touches the controls. Matches the server. */
@@ -40,6 +40,7 @@ class Chat {
   sampler = $state({ ...DEFAULTS });
 
   #abort = null;
+  #opened = null;
 
   async refresh() {
     try {
@@ -206,6 +207,8 @@ class Chat {
           },
         },
         this.#abort.signal,
+        "POST",
+        (response) => (this.#opened = response),
       );
     } catch (e) {
       // An abort is the stop button, not a failure. Whatever arrived before
@@ -213,6 +216,7 @@ class Chat {
       if (e.name !== "AbortError") failed = e.message;
     } finally {
       this.#abort = null;
+      this.#opened = null;
       this.streaming = null;
       this.thinking = null;
       this.sending = false;
@@ -227,7 +231,7 @@ class Chat {
   async stop() {
     if (!this.sending) return;
     try {
-      await api("/api/generation", { method: "DELETE" });
+      await stopGeneration(this.#opened);
     } catch (e) {
       toasts.error(e.message);
     }

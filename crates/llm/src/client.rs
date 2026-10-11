@@ -899,6 +899,12 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("get", "/api/auth/oidc/callback", "where the identity provider sends the browser back"),
     (
+        "delete",
+        "/api/generation/{id}",
+        "names one generation by the id its reply carried, which only the client \
+         holding that reply has. `kvad cancel` stops everything of yours instead",
+    ),
+    (
         "get",
         "/api/images/{id}",
         "the PNG itself, for the web UI's <img>. `kvad images make` writes each picture \

@@ -980,7 +980,7 @@ pub async fn create(who: Identity, headers: HeaderMap, St(state): St<State>, bod
         }
     };
     let herald = Herald::new(stored.id);
-    tokio::spawn(run(state, stored.id, resident.key, request, herald));
+    tokio::spawn(run(state, stored.id, owner, resident.key, request, herald));
     Ok(Json(stored.resource()))
 }
 
@@ -988,7 +988,7 @@ pub async fn create(who: Identity, headers: HeaderMap, St(state): St<State>, bod
 ///
 /// `_herald` is held for as long as this runs, and every change to the row is
 /// told to it; see [`Herald`].
-async fn run(state: State, id: i64, key: Key, request: VideoRequest, _herald: Herald) {
+async fn run(state: State, id: i64, owner: Option<i64>, key: Key, request: VideoRequest, _herald: Herald) {
     let db = state.db.clone();
     let failed = |why: String| {
         let db = db.clone();
@@ -998,8 +998,8 @@ async fn run(state: State, id: i64, key: Key, request: VideoRequest, _herald: He
             tell(id);
         }
     };
-    let mut reels = match state.engine.film(&key, request) {
-        Ok(r) => r,
+    let mut reels = match state.engine.film(owner, &key, request) {
+        Ok((_, r)) => r,
         Err(e) => return failed(e).await,
     };
     // Whether the row is still there is asked every second as well as at

@@ -146,9 +146,9 @@ const WROTE_NOTHING: &str = "the model wrote nothing: it ended its turn before t
 /// The caller decides how the prompt reaches the model — a suite as a chat
 /// turn, a benchmark as raw text — and asks for a cold cache either way.
 async fn once(
-    pieces: Result<tokio::sync::mpsc::Receiver<Piece>, String>,
+    pieces: Result<(u64, tokio::sync::mpsc::Receiver<Piece>), String>,
 ) -> Result<(String, Stats), String> {
-    let mut pieces = pieces?;
+    let (_, mut pieces) = pieces?;
     let mut text = String::new();
     while let Some(piece) = pieces.recv().await {
         match piece {
@@ -247,7 +247,7 @@ pub fn suite(
                 // answer to every case. A base model has no template and gets
                 // the text as it is.
                 let asked = vec![Message::user(case.prompt.clone())];
-                let pieces = engine.chat(&on, asked, Vec::new(), sampling, true);
+                let pieces = engine.chat(owner, &on, asked, Vec::new(), sampling, true);
                 let (got, stats) = match once(pieces).await {
                     Ok(answer) => answer,
                     // A case that could not run at all is a failed case with
@@ -476,7 +476,7 @@ pub fn bench(
                 // Raw text, not a chat turn: a benchmark measures the
                 // arithmetic, and a template would make the same prompt a
                 // different number of tokens on every model.
-                let pieces = engine.complete(&on, p.prompt.clone(), sampling, 0, true);
+                let pieces = engine.complete(owner, &on, p.prompt.clone(), sampling, 0, true);
                 let (text, stats) = match once(pieces).await {
                     // Not a sample: a rate over no tokens is a zero that would
                     // sit in the median looking like a very slow model.

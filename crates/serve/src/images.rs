@@ -677,7 +677,7 @@ impl Job {
 async fn whole(job: Job) -> Result<Json<serde_json::Value>, Fail> {
     let mut data = Vec::with_capacity(job.n);
     for i in 0..job.n {
-        let mut strokes = job.state.engine.paint(&job.resident.key, job.nth(i)).map_err(Fail::internal)?;
+        let (_, mut strokes) = job.state.engine.paint(job.owner, &job.resident.key, job.nth(i)).map_err(Fail::internal)?;
         let painted = loop {
             match strokes.recv().await {
                 Some(Stroke::Step(_)) => continue,
@@ -701,8 +701,8 @@ fn streamed(job: Job) -> impl IntoResponse {
     let (events, rx) = tokio::sync::mpsc::channel::<Event>(16);
     tokio::spawn(async move {
         for i in 0..job.n {
-            let mut strokes = match job.state.engine.paint(&job.resident.key, job.nth(i)) {
-                Ok(s) => s,
+            let mut strokes = match job.state.engine.paint(job.owner, &job.resident.key, job.nth(i)) {
+                Ok((_, s)) => s,
                 Err(e) => {
                     let _ = events.send(sse("error", &json!({ "error": e }))).await;
                     return;

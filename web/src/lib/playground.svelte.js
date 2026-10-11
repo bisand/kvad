@@ -5,7 +5,7 @@
 // come back to, the playground is something you change one knob at a time
 // until you understand what the knob does.
 
-import { api, sse } from "./api.js";
+import { api, sse, stopGeneration } from "./api.js";
 import { toasts } from "./toasts.svelte.js";
 import { models } from "./models.svelte.js";
 
@@ -30,6 +30,7 @@ class Playground {
   running = $state(false);
   error = $state(null);
   #stop = null;
+  #opened = null;
 
   /** The tokeniser inspector's last answer. */
   split = $state(null);
@@ -80,6 +81,8 @@ class Playground {
           },
         },
         this.#stop.signal,
+        "POST",
+        (response) => (this.#opened = response),
       );
     } catch (e) {
       if (e.name !== "AbortError") {
@@ -89,13 +92,14 @@ class Playground {
     } finally {
       this.running = false;
       this.#stop = null;
+      this.#opened = null;
     }
   }
 
   /** Stop generating. The engine's flag, through the same route chat uses. */
   async stop() {
     try {
-      await api("/api/generation", { method: "DELETE" });
+      await stopGeneration(this.#opened);
     } catch (e) {
       toasts.error(e.message);
     }

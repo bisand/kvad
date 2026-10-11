@@ -25,6 +25,18 @@
 //! waiting and for how long, and the order is first-in-first-out rather
 //! than whatever the mutex felt like.
 //!
+//! # Whose turn it is
+//!
+//! First-in-first-out is fair to requests, which is not the same as fair to
+//! people: somebody who sends ten gets ten times the machine. So the next
+//! generation to run is the earliest one of whichever account was served
+//! longest ago — round-robin over accounts, see [`pick`] — and an account
+//! may have only [`Scheduler::share`] of them waiting. With no accounts
+//! there is one person and the order is arrival order, as it was.
+//!
+//! Loads and unloads are not reordered, and nothing passes one: a chat
+//! queued behind an unload runs after it, whoever asked.
+//!
 //! The queue has an end. A request for a generation that arrives when
 //! [`Scheduler::limit`] of them are already waiting is refused there and
 //! then — see [`Refused::Full`] — because an answer now that says "later" is
@@ -275,6 +287,8 @@ pub enum Entry {
 pub enum Refused {
     /// As many are waiting as are allowed to.
     Full { waiting: usize, limit: usize },
+    /// This account has as many waiting as one account may.
+    Yours { waiting: usize, limit: usize },
     /// The scheduler's thread has ended, which it does not do.
     Stopped,
 }
@@ -286,6 +300,11 @@ impl std::fmt::Display for Refused {
                 f,
                 "the queue is full: {waiting} generations are waiting and {limit} is the limit. \
                  Try again in a moment"
+            ),
+            Refused::Yours { waiting, limit } => write!(
+                f,
+                "you have {waiting} generations waiting, and {limit} is as many as one account may. \
+                 Try again when one has started"
             ),
             Refused::Stopped => f.write_str("the engine thread has stopped"),
         }
@@ -413,6 +432,92 @@ struct Waiting {
     /// Nobody will take another job: the scheduler was dropped, or its
     /// thread ended.
     closed: bool,
+    /// When each account last had a generation started, as a count of
+    /// generations started. An account not in it has never had one.
+    served: Served,
+    turn: u64,
+}
+
+type Served = std::collections::HashMap<Owner, u64>;
+
+/// Which of the waiting jobs runs next.
+///
+/// `waiting` is the queue in arrival order: a generation's owner, or `None`
+/// for a job that is not a generation — a load, an unload. The answer is an
+/// index into it.
+///
+/// Only the generations in front of the first other job are candidates,
+/// because that job changes what is in memory and the ones behind it were
+/// queued for the memory as it will be afterwards. Among the candidates,
+/// each account's earliest stands for it, and the account served longest
+/// ago goes first; never served is longest of all, and a tie goes to the
+/// earlier arrival. One account alone is therefore arrival order.
+///
+/// This is round-robin over accounts by turns, not by tokens: two accounts
+/// alternate whatever the length of what they asked for. Weighing a turn by
+/// what it cost is deficit round-robin, and is the next step if turns turn
+/// out to differ enough to matter.
+fn pick(waiting: &[Option<Owner>], served: &Served) -> Option<usize> {
+    let stretch = waiting.iter().take_while(|w| w.is_some()).count();
+    if stretch == 0 {
+        // Nothing, or a job that is not a generation at the front.
+        return (!waiting.is_empty()).then_some(0);
+    }
+    let mut best: Option<(u64, usize)> = None;
+    let mut seen: Vec<Owner> = Vec::new();
+    for (at, owner) in waiting[..stretch].iter().flatten().enumerate() {
+        if seen.contains(owner) {
+            continue;
+        }
+        seen.push(*owner);
+        // Zero is before every turn there has been.
+        let last = served.get(owner).copied().unwrap_or(0);
+        if best.is_none_or(|(least, _)| last < least) {
+            best = Some((last, at));
+        }
+    }
+    best.map(|(_, at)| at)
+}
+
+impl Waiting {
+    fn owners(&self) -> Vec<Option<Owner>> {
+        self.jobs.iter().map(|j| j.ticket().map(|t| t.owner)).collect()
+    }
+
+    /// Take the job whose turn it is, and note whose turn it was.
+    fn take(&mut self) -> Option<Job> {
+        let at = pick(&self.owners(), &self.served)?;
+        let job = self.jobs.remove(at)?;
+        if let Some(ticket) = job.ticket() {
+            self.turn += 1;
+            self.served.insert(ticket.owner, self.turn);
+        }
+        Some(job)
+    }
+
+    /// The ids of the waiting generations, in the order [`Waiting::take`]
+    /// would run them if nothing else arrived.
+    fn order(&self) -> Vec<u64> {
+        let mut left: Vec<(Option<Owner>, Option<u64>)> =
+            self.jobs.iter().map(|j| (j.ticket().map(|t| t.owner), j.ticket().map(|t| t.id))).collect();
+        let (mut served, mut turn) = (self.served.clone(), self.turn);
+        let mut order = Vec::new();
+        while let Some(at) = pick(&left.iter().map(|(owner, _)| *owner).collect::<Vec<_>>(), &served) {
+            let (owner, id) = left.remove(at);
+            if let (Some(owner), Some(id)) = (owner, id) {
+                turn += 1;
+                served.insert(owner, turn);
+                order.push(id);
+            }
+        }
+        order
+    }
+
+    /// How many generations wait, and how many of them are `who`'s.
+    fn count(&self, who: Owner) -> (usize, usize) {
+        let tickets = self.jobs.iter().filter_map(|j| j.ticket());
+        tickets.fold((0, 0), |(all, theirs), t| (all + 1, theirs + usize::from(t.owner == who)))
+    }
 }
 
 impl Queue {
@@ -436,7 +541,7 @@ impl Queue {
             if waiting.closed {
                 return None;
             }
-            if let Some(job) = waiting.jobs.pop_front() {
+            if let Some(job) = waiting.take() {
                 return Some(job);
             }
             waiting = self.arrived.wait(waiting).unwrap_or_else(|e| e.into_inner());
@@ -463,6 +568,10 @@ impl Drop for Closing {
 /// not a target.
 pub const DEFAULT_LIMIT: usize = 16;
 
+/// How many of them may be one account's, when nothing says otherwise: a
+/// quarter of the queue, so that it takes four accounts to fill it.
+pub const DEFAULT_SHARE: usize = 4;
+
 /// Makes the loader for each new engine. One per engine, because a
 /// [`Loader`] is `FnMut` and moves to the thread that calls it.
 type Loaders = Box<dyn Fn() -> Loader + Send>;
@@ -473,6 +582,8 @@ pub struct Scheduler {
     budget: Budget,
     /// How many generations may wait. Zero is no limit.
     limit: usize,
+    /// How many of them may be one account's. Zero is no limit.
+    share: usize,
 }
 
 impl Drop for Scheduler {
@@ -581,7 +692,37 @@ impl Scheduler {
             .name("kvad-scheduler".into())
             .spawn(move || run(closing, loaders, budget, theirs))
             .expect("failed to spawn the scheduler thread");
-        Scheduler { queue, shared, budget, limit: DEFAULT_LIMIT }
+        Scheduler { queue, shared, budget, limit: DEFAULT_LIMIT, share: DEFAULT_SHARE }
+    }
+
+    /// Let one account have `share` generations waiting, and refuse its
+    /// next. Zero lets it have any number, up to the whole queue.
+    pub fn sharing(mut self, share: usize) -> Self {
+        self.share = share;
+        self
+    }
+
+    /// How many generations one account may have waiting, or zero for any
+    /// number.
+    pub fn share(&self) -> usize {
+        self.share
+    }
+
+    /// Whether `who` may queue another generation, given what waits.
+    ///
+    /// The whole queue first: when there is no room for anybody, that is
+    /// the truer thing to say. The account's share applies only where there
+    /// are accounts — with none, `who` is everybody, and a share of the
+    /// queue for everybody is just a smaller queue.
+    fn admits(&self, waiting: &Waiting, who: Owner) -> Result<(), Refused> {
+        let (all, theirs) = waiting.count(who);
+        if self.limit > 0 && all >= self.limit {
+            return Err(Refused::Full { waiting: all, limit: self.limit });
+        }
+        if who.is_some() && self.share > 0 && theirs >= self.share {
+            return Err(Refused::Yours { waiting: theirs, limit: self.share });
+        }
+        Ok(())
     }
 
     /// Let `limit` generations wait, and refuse the one after. Zero lets
@@ -610,22 +751,27 @@ impl Scheduler {
     /// have gone by the time the job is submitted, a video whose row is made
     /// first — so that a full queue is still a status code. The submission
     /// itself asks again, under the lock, and that is the one that counts.
-    pub fn room(&self) -> Result<(), Refused> {
-        let waiting = self.queue.waiting();
-        let generations = waiting.jobs.iter().filter(|j| j.ticket().is_some()).count();
-        match self.limit > 0 && generations >= self.limit {
-            true => Err(Refused::Full { waiting: generations, limit: self.limit }),
-            false => Ok(()),
-        }
+    pub fn room(&self, who: Owner) -> Result<(), Refused> {
+        self.admits(&self.queue.waiting(), who)
     }
 
-    /// Every generation waiting or running, in the order they run.
+    /// Every generation waiting or running, in the order they run — which
+    /// is whose turn it is, not who arrived first; see [`pick`]. The order
+    /// is as things stand: a request arriving from an account that has had
+    /// no turn lately goes in ahead of some of these.
     pub fn queue(&self) -> Vec<Queued> {
         let now = Instant::now();
         let secs = |from: Instant, to: Instant| to.duration_since(from).as_secs_f64();
-        self.shared
-            .live()
-            .iter()
+        // The queue's lock before the books', as everywhere.
+        let order = self.queue.waiting().order();
+        let live = self.shared.live();
+        // What has left the queue comes first; what the scheduler's thread
+        // has taken and not yet marked is between the two for a moment, and
+        // is counted with the first.
+        let place = |l: &Live| order.iter().position(|id| *id == l.id).map_or(0, |at| at + 1);
+        let mut rows: Vec<&Live> = live.iter().collect();
+        rows.sort_by_key(|l| place(l));
+        rows.into_iter()
             .enumerate()
             .map(|(ahead, l)| Queued {
                 id: l.id,
@@ -774,9 +920,8 @@ impl Scheduler {
         if waiting.closed {
             return Err(Refused::Stopped);
         }
-        let generations = waiting.jobs.iter().filter(|j| j.ticket().is_some()).count();
-        if entry == Entry::Request && self.limit > 0 && generations >= self.limit {
-            return Err(Refused::Full { waiting: generations, limit: self.limit });
+        if entry == Entry::Request {
+            self.admits(&waiting, who)?;
         }
         let ticket = self.shared.admit(who, kind, on);
         let id = ticket.id;
@@ -1571,7 +1716,7 @@ mod tests {
 
         let (first, _a) = ask(&sched, Some(1), Entry::Request).unwrap();
         let (_, mut b) = ask(&sched, Some(2), Entry::Request).unwrap();
-        assert_eq!(sched.room(), Err(Refused::Full { waiting: 2, limit: 2 }));
+        assert_eq!(sched.room(Some(3)), Err(Refused::Full { waiting: 2, limit: 2 }));
         assert_eq!(ask(&sched, Some(3), Entry::Request).unwrap_err(), Refused::Full { waiting: 2, limit: 2 });
 
         // Work already let in is not turned away at the door.
@@ -1585,16 +1730,91 @@ mod tests {
         let (last, _c) = ask(&sched, Some(3), Entry::Request).expect("a place given back was not a place");
 
         // The view, in the order they run: the one holding the engine, then
-        // the two that wait, each with what is ahead of it.
+        // the two that wait, each with what is ahead of it. The later
+        // arrival is first of those, because the earlier one's account is
+        // the one that has the engine now.
         let view = sched.queue();
         assert_eq!(view.iter().map(|g| (g.id, g.running, g.ahead)).collect::<Vec<_>>(), [
             (view[0].id, true, 0),
-            (first, false, 1),
-            (last, false, 2),
+            (last, false, 1),
+            (first, false, 2),
         ]);
-        assert_eq!(view.iter().map(|g| g.owner).collect::<Vec<_>>(), [Some(1), Some(1), Some(3)]);
+        assert_eq!(view.iter().map(|g| g.owner).collect::<Vec<_>>(), [Some(1), Some(3), Some(1)]);
         assert!(view.iter().all(|g| g.model == "a/b@cpu-q8" && g.kind == Work::Chat));
         assert!(view[0].running_secs.is_some() && view[1].running_secs.is_none());
+
+        held.release().await;
+    }
+
+    /// Whose turn it is: the account served longest ago, by its earliest
+    /// request, and nothing passes a job that is not a generation.
+    #[test]
+    fn the_next_generation_is_the_one_whose_account_has_waited_longest() {
+        let (a, b, c) = (Some(Some(1)), Some(Some(2)), Some(Some(3)));
+        let never = Served::new();
+        assert_eq!(pick(&[], &never), None);
+        // Nobody has had a turn: arrival order.
+        assert_eq!(pick(&[a, a, b], &never), Some(0));
+        // One account alone is arrival order however often it is served.
+        assert_eq!(pick(&[a, a, a], &Served::from([(Some(1), 9)])), Some(0));
+        // The account just served waits for the one that was not.
+        assert_eq!(pick(&[a, a, b], &Served::from([(Some(1), 1)])), Some(2));
+        // Of two that have been, the one longer ago; and its earliest request.
+        assert_eq!(pick(&[a, b, c, c], &Served::from([(Some(1), 5), (Some(2), 4), (Some(3), 2)])), Some(2));
+        // A load or an unload is not passed, and goes when it is at the front.
+        assert_eq!(pick(&[a, a, None, b], &Served::from([(Some(1), 1)])), Some(0));
+        assert_eq!(pick(&[None, b, a], &never), Some(0));
+        // No accounts is one owner, and so arrival order.
+        assert_eq!(pick(&[Some(None), Some(None)], &Served::from([(None, 3)])), Some(0));
+    }
+
+    /// Ten requests from one account do not hold up one from another: the
+    /// order they run in takes turns.
+    #[tokio::test]
+    async fn accounts_take_turns_whatever_order_they_asked_in() {
+        let sched = refusing();
+        let held = Held::by(&sched, Some(9));
+        let mut streams = Vec::new();
+        let mut ask_as = |who: i64| {
+            let (id, rx) = ask(&sched, Some(who), Entry::Request).unwrap();
+            streams.push(rx);
+            id
+        };
+        let (a1, a2, a3) = (ask_as(1), ask_as(1), ask_as(1));
+        let (b1, b2) = (ask_as(2), ask_as(2));
+        let c1 = ask_as(3);
+
+        let waiting: Vec<u64> = sched.queue().into_iter().filter(|g| !g.running).map(|g| g.id).collect();
+        assert_eq!(waiting, [a1, b1, c1, a2, b2, a3]);
+
+        // And that is the order they are taken in: each ends as it is
+        // reached, so the books empty in turn order.
+        held.release().await;
+        for mut stream in streams {
+            while stream.recv().await.is_some() {}
+        }
+        assert!(sched.queue().is_empty());
+    }
+
+    /// One account may have its share waiting and no more; another account
+    /// is not held to what the first has used, and with no accounts there
+    /// is no share to keep to.
+    #[tokio::test]
+    async fn one_account_cannot_have_the_whole_queue() {
+        let sched = refusing().bounded(8).sharing(2);
+        let held = Held::by(&sched, Some(1));
+
+        let _a = (ask(&sched, Some(1), Entry::Request).unwrap(), ask(&sched, Some(1), Entry::Request).unwrap());
+        assert_eq!(ask(&sched, Some(1), Entry::Request).unwrap_err(), Refused::Yours { waiting: 2, limit: 2 });
+        assert_eq!(sched.room(Some(1)), Err(Refused::Yours { waiting: 2, limit: 2 }));
+        assert!(sched.room(Some(2)).is_ok());
+        let _b = ask(&sched, Some(2), Entry::Request).unwrap();
+        // The rest of a request already let in is not counted at the door.
+        let _more = ask(&sched, Some(1), Entry::Continued).unwrap();
+
+        let _local: Vec<_> = (0..4).map(|_| ask(&sched, None, Entry::Request).unwrap()).collect();
+        // Eight wait now, and that is what the next is told, whoever it is.
+        assert_eq!(ask(&sched, Some(2), Entry::Request).unwrap_err(), Refused::Full { waiting: 8, limit: 8 });
 
         held.release().await;
     }
@@ -1606,7 +1826,7 @@ mod tests {
         let held = Held::by(&sched, None);
         let waiting: Vec<_> = (0..50).map(|_| ask(&sched, None, Entry::Request).unwrap()).collect();
         assert_eq!(sched.queue().len(), 51);
-        assert!(sched.room().is_ok());
+        assert!(sched.room(None).is_ok());
         drop(waiting);
         held.release().await;
     }

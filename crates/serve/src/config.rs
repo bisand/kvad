@@ -107,6 +107,11 @@ pub struct Server {
     /// is answered 503 with a `Retry-After`. Unset,
     /// `scheduler::DEFAULT_LIMIT`; zero lets any number wait.
     pub queue: Option<usize>,
+    /// How many of those may be one account's, before that account's next
+    /// request is answered 429. Unset, `scheduler::DEFAULT_SHARE`; zero
+    /// lets one account have the whole queue. Not applied with
+    /// `auth.mode = "none"`, where there is nobody to share with.
+    pub queue_per_account: Option<usize>,
 }
 
 /// What happens to a video once it is made.
@@ -264,6 +269,7 @@ impl Default for Server {
             memory_gb: None,
             context: None,
             queue: None,
+            queue_per_account: None,
         }
     }
 }

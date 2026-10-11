@@ -963,7 +963,7 @@ pub async fn create(who: Identity, headers: HeaderMap, St(state): St<State>, bod
 
     // Before the row is made: a video refused for want of room should be a
     // 503 now, not a row that fails a moment later.
-    if let Err(full) = state.engine.room() {
+    if let Err(full) = state.engine.room(who.id) {
         forget(&upload);
         return Err(full.into());
     }

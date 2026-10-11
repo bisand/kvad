@@ -32,6 +32,13 @@ bind = "127.0.0.1:5823"
 # wait.
 # queue = 16
 
+# How many of those may be one account's. Its next request is answered 429,
+# with room left for everybody else. Accounts take turns at the engine
+# whatever order they asked in, so this is about places in the queue, not
+# about who goes first. 0 lets one account have the whole queue. Not applied
+# with auth.mode = "none": there is nobody to share with.
+# queue_per_account = 4
+
 [data]
 # Where the database, generated images, datasets and trained models go.
 # Defaults to $XDG_DATA_HOME/kvad, or ~/.local/share/kvad. `~/` is your home

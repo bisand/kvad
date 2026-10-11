@@ -134,6 +134,13 @@ The queue has an end: `[server] queue` generations may wait (16 unless set),
 and the request after that is answered 503 with a `Retry-After` rather than
 held. `kvad queue` and `GET /api/queue` show what is waiting, for how long,
 and — to an administrator — whose it is.
+
+**Accounts take turns.** The next generation is the earliest request of
+whichever account was served longest ago, so somebody who sends ten does not
+get ten times the machine, and one request is not kept behind another
+account's ten. One account may have `[server] queue_per_account` waiting (4
+unless set); its next is a 429. Turns are counted in generations, not in
+tokens. Nothing passes a load or an unload.
 **Comparisons are sequences**: the Playground's "side by side" and the
 Benchmarks page both load each variant in turn, and both say so on the page
 rather than implying a race. **Training is not queued behind chat, or chat

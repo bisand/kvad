@@ -663,6 +663,7 @@ pub async fn queue(who: Identity, St(state): St<State>) -> Result<Json<serde_jso
         .collect();
     Ok(Json(json!({
         "limit": state.engine.limit(),
+        "per_account": state.engine.share(),
         "running": all.iter().filter(|g| g.running).count(),
         "waiting": all.iter().filter(|g| !g.running).count(),
         "generations": generations,

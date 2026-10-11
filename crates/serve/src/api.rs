@@ -112,6 +112,11 @@ impl Fail {
     pub fn busy(why: impl Into<String>) -> Self {
         Fail(StatusCode::SERVICE_UNAVAILABLE, why.into())
     }
+    /// Room for others, and none for this caller, who has had their share.
+    /// A `Retry-After` goes with this one too.
+    pub fn crowding(why: impl Into<String>) -> Self {
+        Fail(StatusCode::TOO_MANY_REQUESTS, why.into())
+    }
 }
 
 /// What a client turned away for want of room is told to wait.
@@ -126,7 +131,7 @@ impl IntoResponse for Fail {
     fn into_response(self) -> Response {
         let body = Json(serde_json::json!({ "error": self.1 }));
         match self.0 {
-            StatusCode::SERVICE_UNAVAILABLE => {
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => {
                 (self.0, [(axum::http::header::RETRY_AFTER, RETRY_AFTER_SECS.to_string())], body).into_response()
             }
             _ => (self.0, body).into_response(),
@@ -134,12 +139,15 @@ impl IntoResponse for Fail {
     }
 }
 
-/// A full queue is a 503 and a hint; a scheduler that has stopped is this
-/// server's fault and says so.
+/// A full queue is a 503 and a hint, and an account over its share of one
+/// a 429 and the same hint: the first is the server's state and the second
+/// the caller's doing. A scheduler that has stopped is this server's fault
+/// and says so.
 impl From<crate::scheduler::Refused> for Fail {
     fn from(refused: crate::scheduler::Refused) -> Self {
         match refused {
             crate::scheduler::Refused::Full { .. } => Fail::busy(refused.to_string()),
+            crate::scheduler::Refused::Yours { .. } => Fail::crowding(refused.to_string()),
             crate::scheduler::Refused::Stopped => Fail::internal(refused.to_string()),
         }
     }

@@ -542,9 +542,11 @@ pub fn queue(remote: &Remote, args: &Args) -> Res<()> {
             row
         })
         .collect();
-    let limit = match queue["limit"].as_u64() {
-        Some(0) | None => "any number may wait".to_string(),
-        Some(n) => format!("{n} may wait"),
+    let limit = match (queue["limit"].as_u64().unwrap_or(0), queue["per_account"].as_u64().unwrap_or(0)) {
+        (0, 0) => "any number may wait".to_string(),
+        (0, each) => format!("any number may wait, {each} of them one account's"),
+        (n, 0) => format!("{n} may wait"),
+        (n, each) => format!("{n} may wait, {each} of them one account's"),
     };
     println!("{} running, {} waiting on {}; {limit}", out::s(&queue["running"]), out::s(&queue["waiting"]), remote.base);
     if rows.is_empty() {

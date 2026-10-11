@@ -586,8 +586,9 @@ pub const COMMANDS: &[Command] = &[
         flags: &[],
         usage: None,
         notes: "Your own generations, and how many there are altogether. An administrator is\n\
-                shown everybody's. When as many are waiting as the server allows, the next\n\
-                request is answered 503 and told when to try again.",
+                shown everybody's. Accounts take turns, so the order is not arrival order.\n\
+                When as many are waiting as the server allows, or as one account may have,\n\
+                the next request is refused and told when to try again.",
         examples: &["kvad queue"],
     },
     Command {

@@ -353,10 +353,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
         summary: "Who is waiting for the engine",
         description: "The caller's generations, waiting and running, in the order they \
                       run: what each is, on which model, how many are ahead of it and how \
-                      long it has waited. `waiting` and `running` count everybody's, and \
-                      `limit` is how many may wait before a request is answered 503 with \
-                      a `Retry-After` — zero for no limit. An administrator is shown every \
-                      generation, with whose it is.",
+                      long it has waited. The order is by turns: the account served \
+                      longest ago goes next, so a later request can be ahead of an \
+                      earlier one. `waiting` and `running` count everybody's. `limit` is \
+                      how many may wait before a request is answered 503 with a \
+                      `Retry-After`, and `per_account` how many of those one account may \
+                      have before its next is answered 429 — zero for no limit. An \
+                      administrator is shown every generation, with whose it is.",
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {

@@ -471,7 +471,7 @@ async fn make(who: Identity, headers: HeaderMap, state: State, asked: Asked) -> 
     loras_fit(&state, &request.loras)?;
 
     // Before the stream opens, while a full queue can still be a 503.
-    state.engine.room()?;
+    state.engine.room(who.id)?;
     let job = Job { state, owner: who.id, resident, request, n, format, base: base_url(&headers), sources: sources.map(std::sync::Arc::new) };
     Ok(match stream {
         true => streamed(job).into_response(),

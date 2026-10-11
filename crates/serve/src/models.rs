@@ -281,7 +281,13 @@ fn describe(m: &hub::LocalModel, trained: bool) -> Model {
     // models has its own — so it is recognised by its index before the
     // architecture checks below would call it a directory of nothing.
     let pipeline = hub::pipeline(m);
+    // Ahead of everything: a tokenizer or a VAE that is here for another
+    // model's sake has no weights or no config of its own, and each of the
+    // answers below would be a wrong one. A language model that is also
+    // somebody's tokenizer is a model, and is asked as one.
+    let support = kvad::pipeline::support(&m.id).filter(|_| pipeline.is_none() && m.arch.is_none());
     let blocker = match (m.complete, &m.model_type, m.arch) {
+        _ if support.is_some() => support.map(|what| format!("not a model of its own: {what}")),
         (false, _, _) if pipeline.is_some() => Some("the download did not finish".to_string()),
         _ if pipeline.is_some() => {
             let p = pipeline.as_deref().unwrap_or_default();
@@ -1039,6 +1045,16 @@ mod tests {
 
         let interrupted = describe(&local("a/b", None, false), false);
         assert!(interrupted.blocker.unwrap().contains("download did not finish"));
+
+        // A tokenizer or a VAE another model reads is neither of those, and
+        // says what it is for; the same repo with a model in it is a model.
+        let tokenizer = describe(&local(kvad::pipeline::CLIP_TOKENIZER_REPO, None, false), false);
+        let why = tokenizer.blocker.unwrap();
+        assert!(why.contains("not a model of its own") && why.contains("tokenizer"), "{why}");
+        let vae = describe(&local(kvad::pipeline::sdxl::VAE_REPO, None, true), false);
+        assert!(vae.blocker.unwrap().contains("the VAE that SDXL decodes with"));
+        let also_a_model = describe(&local(kvad::pipeline::qwen::TOKENIZER_REPO, Some("llama"), true), false);
+        assert_eq!(also_a_model.blocker, None);
 
         let half = describe(&local("a/b", Some("gpt2"), false), false);
         assert!(half.blocker.unwrap().contains("download did not finish"));

@@ -983,38 +983,139 @@ pub fn repo_dir(repo: &str) -> PathBuf {
 }
 
 /// Delete a downloaded model: its cache entry, or for a GGUF or a
-/// checkpoint file its one file.
+/// checkpoint file its one file. And whatever it kept in the cache's shared
+/// store that no other entry has a use for; see [`shared_blobs_of`].
 pub fn remove(model: &LocalModel) -> std::io::Result<()> {
     let repo = model.id.split(':').next().unwrap_or(&model.id);
     match (&model.gguf, &model.single, &model.lora) {
         (Some(g), _, _) => remove_cached(&g.file, &g.repo),
         (None, Some(c), _) => remove_cached(&c.file, repo),
         (None, None, Some(l)) => remove_cached(&l.file, repo),
-        (None, None, None) => std::fs::remove_dir_all(&model.path),
+        (None, None, None) => remove_entry(&model.path),
     }
+}
+
+/// Delete a whole cache entry, and what it alone kept in the shared store.
+fn remove_entry(dir: &Path) -> std::io::Result<()> {
+    let shared = shared_blobs_of(dir);
+    std::fs::remove_dir_all(dir)?;
+    if let Some(root) = dir.parent() {
+        drop_unreferenced(root, &shared);
+    }
+    Ok(())
 }
 
 /// Delete one file of `repo` from the cache: its link in the snapshot and
 /// the blob it points at, and the whole cache entry once no model is left
-/// in it: no GGUF, no checkpoint, and no config of a model of its own.
+/// in it: no GGUF, no checkpoint, and no weights of any other kind.
 pub fn remove_cached(file: &Path, repo: &str) -> std::io::Result<()> {
     let blob = std::fs::canonicalize(file)?;
-    std::fs::remove_file(file)?;
-    if blob != file {
-        std::fs::remove_file(&blob)?;
-    }
     // The cache entry is the file's ancestor named for the repo.
     let entry = format!("models--{}", repo.replace('/', "--"));
-    let Some(dir) = file.ancestors().find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == entry)) else { return Ok(()) };
-    let empty = crate::gguf::locals(dir, repo).is_empty()
+    let dir = file.ancestors().find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == entry));
+    let store = dir.and_then(Path::parent).and_then(|root| std::fs::canonicalize(root.join(SHARED_STORE)).ok());
+
+    std::fs::remove_file(file)?;
+    match (store.filter(|s| blob.starts_with(s)), dir) {
+        // In the shared store: this entry's link to it goes, and the file
+        // itself only if that was the last entry to have one. Deleting it
+        // outright would take it from every other repo that has the same
+        // file, which is the reason it was put there.
+        (Some(_), Some(dir)) => {
+            let links = std::fs::read_dir(dir.join("blobs")).into_iter().flatten().filter_map(|e| e.ok());
+            for link in links.filter(|l| std::fs::canonicalize(l.path()).is_ok_and(|to| to == blob)) {
+                std::fs::remove_file(link.path())?;
+            }
+            if let Some(root) = dir.parent() {
+                drop_unreferenced(root, std::slice::from_ref(&blob));
+            }
+        }
+        _ if blob != file => std::fs::remove_file(&blob)?,
+        _ => {}
+    }
+
+    let Some(dir) = dir else { return Ok(()) };
+    // A config with no weights left beside it is not a model, and used to be
+    // kept as one: deleting a repo's one checkpoint left a `config only`
+    // entry of a few hundred bytes to delete a second time.
+    let no_model = crate::gguf::locals(dir, repo).is_empty()
         && crate::checkpoint::locals(dir, repo).is_empty()
-        && crate::lora::locals(dir, repo).is_empty()
-        && model_file(dir, "config.json").is_none()
-        && model_file(dir, "model_index.json").is_none();
-    if empty {
-        std::fs::remove_dir_all(dir)?;
+        && crate::lora::locals(dir, repo).is_empty();
+    let no_config = model_file(dir, "config.json").is_none() && model_file(dir, "model_index.json").is_none();
+    if no_model && (no_config || !holds_weights(dir)) {
+        remove_entry(dir)?;
     }
     Ok(())
+}
+
+/// The directory, beside the entries of a cache, that some downloaders keep
+/// large files in once for every repo that has them.
+///
+/// `huggingface_hub` does, for files it fetches in chunks: the file is
+/// `blobs/9f/9f6b…` under the cache's root, named by its hash, and each repo
+/// that has it holds a link to that in its own `blobs/`, where its snapshot's
+/// link expects a file. LTX-2.5's distilled transformer and its text
+/// encoder, 68 GB of the model between them, were found there.
+///
+/// It is not something this engine's own downloads make, which is why it
+/// went unseen: a size that counted only an entry's own files said 51.7 GB
+/// for a model that takes 120, and deleting an entry left what it had there
+/// behind, with nothing pointing at it.
+const SHARED_STORE: &str = "blobs";
+
+/// The files of the shared store that a cache entry's blobs are links to.
+fn shared_blobs_of(entry: &Path) -> Vec<PathBuf> {
+    let Some(store) = entry.parent().and_then(|root| std::fs::canonicalize(root.join(SHARED_STORE)).ok()) else {
+        return Vec::new();
+    };
+    let Ok(blobs) = std::fs::read_dir(entry.join("blobs")) else { return Vec::new() };
+    let mut found: Vec<PathBuf> = blobs
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
+        .filter_map(|e| std::fs::canonicalize(e.path()).ok())
+        .filter(|to| to.starts_with(&store) && to.is_file())
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Delete those of `blobs`, files of the shared store of the cache at
+/// `root`, that no entry of the cache links to any longer.
+///
+/// Asked of every entry there is, models and datasets alike, each time:
+/// the store keeps no count of who uses a file, so the links are the only
+/// record, and a file two repos share must outlive the first of them to go.
+/// A failure to delete is left: the file is then merely still there.
+fn drop_unreferenced(root: &Path, blobs: &[PathBuf]) {
+    if blobs.is_empty() {
+        return;
+    }
+    let entries = std::fs::read_dir(root).into_iter().flatten().filter_map(|e| e.ok());
+    let wanted: Vec<PathBuf> = entries.filter(|e| e.file_name() != SHARED_STORE).flat_map(|e| shared_blobs_of(&e.path())).collect();
+    for blob in blobs.iter().filter(|b| !wanted.contains(b)) {
+        if std::fs::remove_file(blob).is_ok() {
+            // Its two-letter directory, if that was the last file in it.
+            let _ = blob.parent().map(std::fs::remove_dir);
+        }
+    }
+}
+
+/// Whether any file of an entry's snapshots is a model's weights.
+fn holds_weights(model_dir: &Path) -> bool {
+    let mut stack = vec![model_dir.join("snapshots")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let ending = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            match path.is_dir() {
+                true => stack.push(path),
+                false if matches!(ending.as_str(), "safetensors" | "gguf" | "bin" | "pt" | "pth" | "ckpt") => return true,
+                false => {}
+            }
+        }
+    }
+    false
 }
 
 fn pipeline_in(dir: &Path) -> Option<String> {
@@ -1096,8 +1197,14 @@ fn snapshot_files(model_dir: &Path) -> Vec<String> {
 /// wanted here: the links under `snapshots/` report as neither file nor
 /// directory and are skipped, so only the real blobs are counted. Following
 /// them would report every model at twice its true size.
+///
+/// The one kind of link that is followed is a blob that is itself a link
+/// into the cache's shared store ([`shared_blobs_of`]): that file is this
+/// entry's as much as any, and is counted, once. An entry's size is then
+/// what it needs on the disk, which for a file two repos share is more than
+/// deleting either would give back.
 fn dir_size(path: &Path) -> u64 {
-    let mut total = 0;
+    let mut total: u64 = shared_blobs_of(path).iter().filter_map(|blob| std::fs::metadata(blob).ok()).map(|m| m.len()).sum();
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
@@ -1225,6 +1332,124 @@ mod tests {
         assert!(crate::video::is_video_pipeline(&pipeline_in(&dir).unwrap()));
         assert!(denoiser_is_here(&dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cache with a shared store, as `huggingface_hub` lays one out, in
+    /// a directory of its own.
+    struct Cache(PathBuf);
+
+    impl Cache {
+        fn new(name: &str) -> Cache {
+            let root = std::env::temp_dir().join(format!("kvad-hub-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(SHARED_STORE)).unwrap();
+            Cache(root)
+        }
+
+        fn entry(&self, repo: &str) -> PathBuf {
+            self.0.join(format!("models--{}", repo.replace('/', "--")))
+        }
+
+        /// `name` in a repo's snapshot, with `bytes` in a blob of its own.
+        fn own(&self, repo: &str, name: &str, bytes: &[u8]) -> PathBuf {
+            let blob = self.entry(repo).join("blobs").join(format!("own-{}", name.replace('/', "-")));
+            std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            std::fs::write(&blob, bytes).unwrap();
+            self.link(repo, name, &blob)
+        }
+
+        /// `name` in a repo's snapshot, with `bytes` in the shared store
+        /// under `hash`: the repo's blob is a link to that.
+        fn shared(&self, repo: &str, name: &str, hash: &str, bytes: &[u8]) -> PathBuf {
+            let file = self.0.join(SHARED_STORE).join(&hash[..2]).join(hash);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, bytes).unwrap();
+            let blob = self.entry(repo).join("blobs").join(format!("etag-{hash}"));
+            std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&file, &blob).unwrap();
+            self.link(repo, name, &blob);
+            file
+        }
+
+        fn link(&self, repo: &str, name: &str, blob: &Path) -> PathBuf {
+            let at = self.entry(repo).join("snapshots/abc").join(name);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(blob, &at).unwrap();
+            at
+        }
+    }
+
+    impl Drop for Cache {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A file an entry keeps in the shared store is the entry's, and is
+    /// counted once, however many links lead to it.
+    #[test]
+    fn a_size_counts_what_an_entry_keeps_in_the_shared_store() {
+        let cache = Cache::new("size");
+        cache.own("a/video", "vae.safetensors", &[0; 10]);
+        cache.shared("a/video", "transformer.safetensors", "9f6b", &[0; 1000]);
+        cache.shared("a/video", "text_encoder.safetensors", "6db1", &[0; 300]);
+        assert_eq!(dir_size(&cache.entry("a/video")), 1310);
+        // A repo with nothing there is its own files and no more.
+        cache.own("a/plain", "model.safetensors", &[0; 7]);
+        assert_eq!(dir_size(&cache.entry("a/plain")), 7);
+        assert!(shared_blobs_of(&cache.entry("a/plain")).is_empty());
+    }
+
+    /// Deleting an entry takes what it alone kept in the shared store, and
+    /// leaves what another entry still has a link to.
+    #[test]
+    fn deleting_an_entry_takes_its_shared_files_and_no_one_elses() {
+        let cache = Cache::new("remove");
+        let alone = cache.shared("a/dev", "transformer.safetensors", "aa11", &[0; 50]);
+        let both = cache.shared("a/dev", "t5.safetensors", "bb22", &[0; 40]);
+        cache.shared("a/schnell", "t5.safetensors", "bb22", &[0; 40]);
+        let other = cache.shared("a/schnell", "transformer.safetensors", "cc33", &[0; 60]);
+
+        remove_entry(&cache.entry("a/dev")).unwrap();
+        assert!(!cache.entry("a/dev").exists());
+        assert!(!alone.exists(), "a file only the deleted repo had is still in the store");
+        assert!(!alone.parent().unwrap().exists(), "and its directory went with it");
+        assert!(both.exists(), "a file the other repo still links to was deleted");
+        assert!(other.exists());
+        assert_eq!(dir_size(&cache.entry("a/schnell")), 100);
+
+        remove_entry(&cache.entry("a/schnell")).unwrap();
+        assert!(!both.exists() && !other.exists());
+        assert!(cache.0.join(SHARED_STORE).exists(), "the store itself is not ours to remove");
+    }
+
+    /// One file of a repo: its links go, the shared file only when nothing
+    /// else has it, and the repo with it once no weights are left — a config
+    /// by itself is not a model.
+    #[test]
+    fn deleting_one_file_leaves_no_shared_file_and_no_empty_repo() {
+        let cache = Cache::new("one-file");
+        let mine = cache.shared("a/checkpoints", "one.safetensors", "dd44", &[0; 30]);
+        let ours = cache.shared("a/checkpoints", "two.safetensors", "ee55", &[0; 20]);
+        cache.shared("b/elsewhere", "two.safetensors", "ee55", &[0; 20]);
+        cache.own("a/checkpoints", "config.json", b"{}");
+
+        let one = cache.entry("a/checkpoints").join("snapshots/abc/one.safetensors");
+        remove_cached(&one, "a/checkpoints").unwrap();
+        assert!(!one.exists() && !mine.exists());
+        assert!(!cache.entry("a/checkpoints").join("blobs/etag-dd44").exists(), "the repo's link to it was left dangling");
+        assert!(cache.entry("a/checkpoints").exists(), "a repo with a checkpoint left in it was deleted");
+
+        let two = cache.entry("a/checkpoints").join("snapshots/abc/two.safetensors");
+        remove_cached(&two, "a/checkpoints").unwrap();
+        assert!(ours.exists(), "a file another repo links to was deleted");
+        assert!(!cache.entry("a/checkpoints").exists(), "a config with no weights beside it was kept as a model");
+        assert!(cache.entry("b/elsewhere").join("snapshots/abc/two.safetensors").exists());
+
+        // A file of the repo's own, as this engine's downloads are: as before.
+        let plain = cache.own("c/plain", "model.gguf", &[0; 9]);
+        remove_cached(&plain, "c/plain").unwrap();
+        assert!(!cache.entry("c/plain").exists());
     }
 
     #[test]

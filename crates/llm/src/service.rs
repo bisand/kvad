@@ -42,7 +42,7 @@ use crate::chat::Message;
 use crate::hub::{self, HubModel, LocalModel};
 use crate::image::{Defaults, ImageRequest, Painted, Painter, Step};
 use crate::quant::Precision;
-use crate::runtime::{Chosen, Llm, Perplexity, Stats, Token};
+use crate::runtime::{Chosen, Llm, Perplexity, Run, Stats, Token};
 use crate::sampler::Sampler;
 use crate::video::{Director, Filmed, VideoRequest};
 use crate::weights::{Fetch, Watcher};
@@ -427,9 +427,28 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
     };
 
     let mut session: Option<Held> = None;
+    // The generation under way, if one is.
+    let mut generating: Option<Generating> = None;
     let _ = tx.send(Evt::Local(hub::local_models()));
 
-    while let Ok(cmd) = rx.recv() {
+    // A step loop, not a command loop: each time round it either advances
+    // the generation by a token or, with none under way, waits for a
+    // command. A generation used to be one call that kept the thread until
+    // it ended; in steps, the thread comes back between tokens, which is
+    // where a second generation will be let in.
+    //
+    // For now there is one, and a command that arrives during it waits for
+    // it to end, as it always did.
+    loop {
+        if let Some(under_way) = generating.take() {
+            generating = match session.as_mut().map(Held::text) {
+                Some(Ok(s)) => advance(under_way, s, &tx, &cancel),
+                // The model went from under it, which nothing here does.
+                _ => None,
+            };
+            continue;
+        }
+        let Ok(cmd) = rx.recv() else { break };
         match cmd {
             Cmd::RefreshLocal => {
                 let _ = tx.send(Evt::Local(hub::local_models()));
@@ -586,7 +605,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 };
                 // The session reuses whatever of the previous turn's cache
                 // still matches, so a chat prefills only the newest message.
-                run(s, &ids, &sampling, 0, &tx, &cancel);
+                generating = begin(s, &ids, &sampling, 0, &tx, &cancel);
             }
 
             Cmd::Complete { prompt, sampling, explain, fresh } => {
@@ -618,7 +637,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                         continue;
                     }
                 };
-                run(s, &ids, &sampling, explain, &tx, &cancel);
+                generating = begin(s, &ids, &sampling, explain, &tx, &cancel);
             }
 
             Cmd::Tokenize(text) => match session.as_mut().map(Held::text) {
@@ -740,42 +759,62 @@ fn aim(s: &mut Loaded, sampling: &Sampling) {
     }
 }
 
-/// Generate from token ids, forwarding every piece down the channel.
+/// A generation between its steps.
+struct Generating {
+    run: Run,
+    /// How many candidates each token is reported with; none sends the
+    /// token's text alone.
+    explain: usize,
+}
+
+/// Start generating from token ids: prefill, and nothing sent yet.
 ///
 /// Shared by chat and raw completion, which differ only in how the ids were
 /// arrived at — and that difference belongs above this line, not inside the
-/// loop.
-fn run(
+/// loop. `None` is a generation that could not start, which has been said.
+fn begin(
     s: &mut Loaded,
     ids: &[u32],
     sampling: &Sampling,
     explain: usize,
     tx: &Sender<Evt>,
     cancel: &Arc<AtomicBool>,
-) {
+) -> Option<Generating> {
     cancel.store(false, Ordering::Relaxed);
-    let tx2 = tx.clone();
-    let cancel2 = Arc::clone(cancel);
-    let result =
-        s.llm.generate_explained(ids, &mut s.sampler, sampling.max_tokens, explain, |chosen| {
-            if cancel2.load(Ordering::Relaxed) {
-                return false;
-            }
-            let evt = match explain {
-                0 => Evt::Token(chosen.text.clone()),
-                _ => Evt::Chose(chosen.clone()),
-            };
-            tx2.send(evt).is_ok()
-        });
-
-    match result {
-        Ok((stats, _)) => {
-            let _ = tx.send(Evt::Done(stats));
-        }
+    match s.llm.begin(ids, sampling.max_tokens, explain) {
+        Ok(run) => Some(Generating { run, explain }),
         Err(e) => {
             let _ = tx.send(Evt::Error(e.to_string()));
+            None
         }
     }
+}
+
+/// Take a generation one token further and send the token down the channel.
+/// `None` once it is over, with its statistics or its failure sent.
+fn advance(mut g: Generating, s: &mut Loaded, tx: &Sender<Evt>, cancel: &AtomicBool) -> Option<Generating> {
+    let over = match s.llm.step(&mut g.run, &mut s.sampler) {
+        Err(e) => {
+            let _ = tx.send(Evt::Error(e.to_string()));
+            return None;
+        }
+        Ok(None) => true,
+        // Asked to stop: the token is not sent. Nobody listening: the same.
+        Ok(Some(_)) if cancel.load(Ordering::Relaxed) => true,
+        Ok(Some(chosen)) => {
+            let evt = match g.explain {
+                0 => Evt::Token(chosen.text),
+                _ => Evt::Chose(chosen),
+            };
+            tx.send(evt).is_err()
+        }
+    };
+    if !over {
+        return Some(g);
+    }
+    let (stats, _) = s.llm.finish(g.run);
+    let _ = tx.send(Evt::Done(stats));
+    None
 }
 
 #[cfg(test)]

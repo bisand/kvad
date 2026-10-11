@@ -139,6 +139,26 @@ pub struct Sampling {
     pub max_tokens: usize,
 }
 
+/// How many tokens a command line writes when `--max-tokens` does not say.
+///
+/// Two answers, because there are two kinds of writing. A reply ends
+/// itself: an instruction-tuned model says its end-of-turn token when it is
+/// done, so the budget is a ceiling that is rarely met, and gets the same
+/// one a request to the server does. A continuation does not end: a base
+/// model, or any model handed a bare prompt, writes until it is stopped, and
+/// 4096 tokens of that is a screenful nobody asked for, and minutes of a
+/// CPU. That keeps the 256 every command had until now.
+pub fn token_budget(given: Option<usize>, continuing: bool) -> usize {
+    match (given, continuing) {
+        (Some(n), _) => n,
+        (None, false) => Sampling::default().max_tokens,
+        (None, true) => CONTINUATION_TOKENS,
+    }
+}
+
+/// What a continuation is written to when nothing says how far.
+pub const CONTINUATION_TOKENS: usize = 256;
+
 impl Default for Sampling {
     fn default() -> Self {
         // Not 512, because of reasoning models. Qwen3 writes its working
@@ -751,6 +771,17 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply gets the server's own budget, a continuation the short one,
+    /// and `--max-tokens` is taken at its word either way.
+    #[test]
+    fn a_reply_and_a_continuation_are_written_to_different_lengths() {
+        assert_eq!(token_budget(None, false), Sampling::default().max_tokens);
+        assert_eq!(token_budget(None, false), 4096);
+        assert_eq!(token_budget(None, true), 256);
+        assert_eq!(token_budget(Some(12), false), 12);
+        assert_eq!(token_budget(Some(9000), true), 9000);
+    }
 
     /// The per-token figure and the cache's own total have to be the same
     /// arithmetic, because the doc comment on one of them says they are.

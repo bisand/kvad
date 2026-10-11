@@ -1115,7 +1115,9 @@ pub fn evals(remote: &Remote, args: &Args) -> Res<()> {
         "run" => {
             let suite = suite_id(remote, needs(words, "a suite", EVALS))?;
             let mut body = json!({ "suite": suite, "variants": variants(remote, &words[1..], args)?, "seed": args.seed });
-            body["max_tokens"] = json!(args.max_tokens);
+            // An eval's answers are short by design, and its budget is its
+            // own: not the one a chat gets.
+            body["max_tokens"] = json!(args.max_tokens.unwrap_or(256));
             let job = remote.post("/api/evals/run", &body)?;
             follow(remote, &job, args)
         }

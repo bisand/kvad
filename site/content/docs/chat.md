@@ -42,7 +42,7 @@ kvad chat --conversation 12
 
 | Option | Default | |
 |---|---|---|
-| `--max-tokens N` | 256 | The generation budget. |
+| `--max-tokens N` | 4096 | The most a reply may be. A model that is done sooner stops sooner. 256 when text is being continued rather than answered: a base model, or `run --raw`. |
 | `--temperature F` | 0.7 | 0 is greedy. |
 | `--top-k N` | 40 | Keep the N best candidates. |
 | `--top-p F` | 0.95 | The nucleus threshold. |

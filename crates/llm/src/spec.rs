@@ -239,7 +239,7 @@ pub const WHERE: &[Flag] = &[
 ];
 
 pub const SAMPLING: &[Flag] = &[
-    f("--max-tokens", "N", Kind::Text, "most tokens to write (default 256)"),
+    f("--max-tokens", "N", Kind::Text, "most tokens to write (default 4096 for a reply; 256 when continuing text, as a base model or --raw does)"),
     f("--temperature", "F", Kind::Text, "how freely to choose; 0 always takes the likeliest (default 0.7)"),
     f("--top-k", "N", Kind::Text, "choose among the N likeliest tokens (default 40)"),
     f("--top-p", "F", Kind::Text, "or among the likeliest that add up to F (default 0.95)"),

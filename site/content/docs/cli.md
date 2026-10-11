@@ -175,7 +175,7 @@ kvad ps --json | jq '.residents[].id'
 | `--model MODEL` | the default model | A name trained here, a directory, or a Hugging Face repository. |
 | `--prompt TEXT` | | The prompt for `run`. |
 | `--system TEXT` | | The system prompt for `chat`. |
-| `--max-tokens N` | 256 | |
+| `--max-tokens N` | 4096 | 256 when continuing text: a base model, or `--raw`. |
 | `--temperature F` | 0.7 | 0 is greedy. |
 | `--top-k N` | 40 | |
 | `--top-p F` | 0.95 | |

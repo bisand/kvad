@@ -21,9 +21,15 @@
 //! # Why a queue and not a lock
 //!
 //! Two requests arriving at once have to wait for each other either way. A
-//! queue makes the waiting visible: [`Scheduler::depth`] is a number the
-//! dashboard can show, and the order is first-in-first-out rather than
-//! whatever the mutex felt like.
+//! queue makes the waiting visible: [`Scheduler::queue`] says whose work is
+//! waiting and for how long, and the order is first-in-first-out rather
+//! than whatever the mutex felt like.
+//!
+//! The queue has an end. A request for a generation that arrives when
+//! [`Scheduler::limit`] of them are already waiting is refused there and
+//! then — see [`Refused::Full`] — because an answer now that says "later" is
+//! worth more to a client than a connection that sits for four minutes and
+//! then times out somewhere in between.
 //!
 //! There is still one queue for every resident, and so one job at a time
 //! across the whole server. Two residents on different hardware — one on
@@ -45,8 +51,10 @@ use kvad::runtime::{Chosen, Perplexity, Stats, Token};
 use kvad::service::{Backend, Cmd, Engine, Evt, Loader, Sampling};
 use kvad::weights::Fetch;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 /// What a load produced, and what `/v1/models` and the dashboard report.
@@ -236,17 +244,86 @@ pub type Owner = Option<i64>;
 /// it as each command starts.
 struct Ticket {
     id: u64,
+    owner: Owner,
     stop: Arc<AtomicBool>,
 }
 
-/// A generation that is waiting or running, as [`Scheduler::cancel`] finds
-/// it.
+/// What a generation is making.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Work {
+    Chat,
+    Completion,
+    Image,
+    Video,
+}
+
+/// Whether a generation may be turned away for want of room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    /// A request arriving: refused when the queue is full.
+    Request,
+    /// The next piece of work already let in — a request's second image, an
+    /// evaluation's next case. Refusing it would throw away what the first
+    /// piece cost, so it is not counted against the limit at the door,
+    /// though it takes a place in the queue like any other.
+    Continued,
+}
+
+/// Why a generation was not queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// As many are waiting as are allowed to.
+    Full { waiting: usize, limit: usize },
+    /// The scheduler's thread has ended, which it does not do.
+    Stopped,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Full { waiting, limit } => write!(
+                f,
+                "the queue is full: {waiting} generations are waiting and {limit} is the limit. \
+                 Try again in a moment"
+            ),
+            Refused::Stopped => f.write_str("the engine thread has stopped"),
+        }
+    }
+}
+
+/// A generation that is waiting or running, as [`Scheduler::cancel`] and
+/// [`Scheduler::queue`] find it. Kept in the order they were let in, which
+/// is the order they run in.
 struct Live {
     id: u64,
     owner: Owner,
+    kind: Work,
+    /// The resident it is for, as a client names one.
+    model: String,
     stop: Arc<AtomicBool>,
     /// The interrupt flag of the engine running it, once one is.
     engine: Option<Arc<AtomicBool>>,
+    queued: Instant,
+    started: Option<Instant>,
+}
+
+/// One generation, as the queue's view reports it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Queued {
+    pub id: u64,
+    #[serde(skip)]
+    pub owner: Owner,
+    pub kind: Work,
+    pub model: String,
+    pub running: bool,
+    /// Generations in front of it, the running one included.
+    pub ahead: usize,
+    /// How long it waited for the engine, or has so far.
+    pub waited_secs: f64,
+    /// How long it has been running, once it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_secs: Option<f64>,
 }
 
 enum Job {
@@ -288,14 +365,120 @@ enum Job {
     Film { ticket: Ticket, on: Key, request: kvad::video::VideoRequest, out: tokio_mpsc::Sender<Reel> },
 }
 
+impl Job {
+    fn ticket(&self) -> Option<&Ticket> {
+        match self {
+            Job::Chat { ticket, .. }
+            | Job::Complete { ticket, .. }
+            | Job::Paint { ticket, .. }
+            | Job::Film { ticket, .. } => Some(ticket),
+            _ => None,
+        }
+    }
+
+    /// End a generation that was stopped before it started. `try_send`,
+    /// because this runs on the runtime's threads and the channel is empty:
+    /// nothing has been sent to a generation that has not begun.
+    fn cancelled(self) {
+        match self {
+            Job::Chat { out, .. } | Job::Complete { out, .. } => {
+                let _ = out.try_send(Piece::Failed(CANCELLED.into()));
+            }
+            Job::Paint { out, .. } => {
+                let _ = out.try_send(Stroke::Failed(CANCELLED.into()));
+            }
+            Job::Film { out, .. } => {
+                let _ = out.try_send(Reel::Failed(CANCELLED.into()));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The jobs nobody has started, and the word that there is one.
+///
+/// A deque under a lock rather than a channel, because a channel can only be
+/// read from its front: counting what waits, taking a stopped generation out
+/// of the middle, and — when the order stops being arrival order — choosing
+/// whose turn it is all need to see the whole of it.
+#[derive(Default)]
+struct Queue {
+    waiting: Mutex<Waiting>,
+    arrived: Condvar,
+}
+
+#[derive(Default)]
+struct Waiting {
+    jobs: VecDeque<Job>,
+    /// Nobody will take another job: the scheduler was dropped, or its
+    /// thread ended.
+    closed: bool,
+}
+
+impl Queue {
+    fn waiting(&self) -> std::sync::MutexGuard<'_, Waiting> {
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stop taking jobs, and drop the ones waiting: their callers find their
+    /// channels closed, which is how they hear.
+    fn close(&self) {
+        let mut waiting = self.waiting();
+        waiting.closed = true;
+        waiting.jobs.clear();
+        self.arrived.notify_all();
+    }
+
+    /// The next job, waiting for one if there is none. `None` once closed.
+    fn next(&self) -> Option<Job> {
+        let mut waiting = self.waiting();
+        loop {
+            if waiting.closed {
+                return None;
+            }
+            if let Some(job) = waiting.jobs.pop_front() {
+                return Some(job);
+            }
+            waiting = self.arrived.wait(waiting).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Closes the queue when the scheduler's thread ends, however it ends, so
+/// that a job submitted afterwards is refused rather than left waiting for
+/// nobody.
+struct Closing(Arc<Queue>);
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// How many generations may wait when nothing says otherwise.
+///
+/// Each one waiting is a client holding a connection open, and at the pace
+/// of a large model each is most of a minute of somebody's patience. Sixteen
+/// is already a long wait for the last of them; it is a ceiling for a burst,
+/// not a target.
+pub const DEFAULT_LIMIT: usize = 16;
+
 /// Makes the loader for each new engine. One per engine, because a
 /// [`Loader`] is `FnMut` and moves to the thread that calls it.
 type Loaders = Box<dyn Fn() -> Loader + Send>;
 
 pub struct Scheduler {
-    jobs: Sender<Job>,
+    queue: Arc<Queue>,
     shared: Shared,
     budget: Budget,
+    /// How many generations may wait. Zero is no limit.
+    limit: usize,
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
 }
 
 /// What the scheduler thread shares with the handle.
@@ -339,11 +522,28 @@ impl Shared {
     }
 
     /// Enter a generation in the books, and hand back what its job carries.
-    fn admit(&self, owner: Owner) -> Ticket {
+    fn admit(&self, owner: Owner, kind: Work, on: &Key) -> Ticket {
         let id = self.issued.fetch_add(1, Ordering::Relaxed) + 1;
         let stop = Arc::new(AtomicBool::new(false));
-        self.live().push(Live { id, owner, stop: Arc::clone(&stop), engine: None });
-        Ticket { id, stop }
+        self.live().push(Live {
+            id,
+            owner,
+            kind,
+            model: id_of(&on.repo, on.backend),
+            stop: Arc::clone(&stop),
+            engine: None,
+            queued: Instant::now(),
+            started: None,
+        });
+        Ticket { id, owner, stop }
+    }
+
+    /// `id` has left the queue and is the scheduler thread's now: it has
+    /// stopped waiting, whatever becomes of it.
+    fn taken(&self, id: u64) {
+        if let Some(live) = self.live().iter_mut().find(|l| l.id == id) {
+            live.started = Some(Instant::now());
+        }
     }
 
     /// The engine has reached `id`: from here stopping it means raising
@@ -373,21 +573,71 @@ impl Shared {
 
 impl Scheduler {
     pub fn spawn(loaders: impl Fn() -> Loader + Send + 'static, budget: Budget) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let queue = Arc::new(Queue::default());
         let shared = Shared::default();
         let (theirs, loaders) = (shared.clone(), Box::new(loaders) as Loaders);
+        let closing = Closing(Arc::clone(&queue));
         std::thread::Builder::new()
             .name("kvad-scheduler".into())
-            .spawn(move || run(rx, loaders, budget, theirs))
+            .spawn(move || run(closing, loaders, budget, theirs))
             .expect("failed to spawn the scheduler thread");
-        Scheduler { jobs: tx, shared, budget }
+        Scheduler { queue, shared, budget, limit: DEFAULT_LIMIT }
     }
 
-    /// How many requests are waiting for an engine, the running one
-    /// included.
+    /// Let `limit` generations wait, and refuse the one after. Zero lets
+    /// any number.
+    pub fn bounded(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// How many generations may wait, or zero for any number.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// How many jobs are waiting for an engine, the running one included.
+    /// Loads and the like are counted; [`Scheduler::queue`] is the
+    /// generations alone, and whose they are.
     pub fn depth(&self) -> usize {
         self.shared.waiting.load(Ordering::Relaxed)
             + usize::from(self.shared.busy.load(Ordering::Relaxed))
+    }
+
+    /// Whether a request for a generation would be let in now.
+    ///
+    /// For a handler that answers before it queues — a stream whose headers
+    /// have gone by the time the job is submitted, a video whose row is made
+    /// first — so that a full queue is still a status code. The submission
+    /// itself asks again, under the lock, and that is the one that counts.
+    pub fn room(&self) -> Result<(), Refused> {
+        let waiting = self.queue.waiting();
+        let generations = waiting.jobs.iter().filter(|j| j.ticket().is_some()).count();
+        match self.limit > 0 && generations >= self.limit {
+            true => Err(Refused::Full { waiting: generations, limit: self.limit }),
+            false => Ok(()),
+        }
+    }
+
+    /// Every generation waiting or running, in the order they run.
+    pub fn queue(&self) -> Vec<Queued> {
+        let now = Instant::now();
+        let secs = |from: Instant, to: Instant| to.duration_since(from).as_secs_f64();
+        self.shared
+            .live()
+            .iter()
+            .enumerate()
+            .map(|(ahead, l)| Queued {
+                id: l.id,
+                owner: l.owner,
+                kind: l.kind,
+                model: l.model.clone(),
+                running: l.started.is_some(),
+                ahead,
+                waited_secs: secs(l.queued, l.started.unwrap_or(now)),
+                running_secs: l.started.map(|s| secs(s, now)),
+            })
+            .collect()
     }
 
     pub fn budget(&self) -> Budget {
@@ -463,33 +713,77 @@ impl Scheduler {
     ///
     /// Somebody else's generation is not counted and not touched, so naming
     /// one reads the same as naming one that does not exist. A waiting
-    /// generation is stopped as well as the running one: it ends with
-    /// [`CANCELLED`] when the engine reaches it, having cost nothing.
+    /// generation is stopped as well as the running one: it leaves the queue
+    /// at once and ends with [`CANCELLED`], having cost nothing, and its
+    /// place is there for the next request.
     pub fn cancel(&self, who: Owner, id: Option<u64>) -> usize {
-        let live = self.shared.live();
-        let theirs = live.iter().filter(|l| l.owner == who && id.is_none_or(|id| l.id == id));
-        theirs
-            .map(|l| {
-                l.stop.store(true, Ordering::Relaxed);
-                if let Some(engine) = &l.engine {
-                    engine.store(true, Ordering::Relaxed);
-                }
-            })
-            .count()
+        let theirs = |owner: Owner, of: u64| owner == who && id.is_none_or(|id| of == id);
+
+        // The queue's lock before the books', here and in `generate`.
+        let mut waiting = self.queue.waiting();
+        let (stopped, staying): (VecDeque<Job>, VecDeque<Job>) = std::mem::take(&mut waiting.jobs)
+            .into_iter()
+            .partition(|job| job.ticket().is_some_and(|t| theirs(t.owner, t.id)));
+        waiting.jobs = staying;
+        drop(waiting);
+
+        let mut count = stopped.len();
+        self.shared.waiting.fetch_sub(count, Ordering::Relaxed);
+        for job in stopped {
+            if let Some(ticket) = job.ticket() {
+                self.shared.finish(ticket.id);
+            }
+            job.cancelled();
+        }
+
+        // What is left of theirs has been taken by the scheduler's thread:
+        // running, or about to be.
+        for l in self.shared.live().iter().filter(|l| theirs(l.owner, l.id)) {
+            l.stop.store(true, Ordering::Relaxed);
+            if let Some(engine) = &l.engine {
+                engine.store(true, Ordering::Relaxed);
+            }
+            count += 1;
+        }
+        count
     }
 
     fn submit(&self, job: Job) -> Result<(), String> {
+        let mut waiting = self.queue.waiting();
+        if waiting.closed {
+            return Err(Refused::Stopped.to_string());
+        }
         self.shared.waiting.fetch_add(1, Ordering::Relaxed);
-        self.jobs.send(job).map_err(|_| {
-            self.shared.waiting.fetch_sub(1, Ordering::Relaxed);
-            "the engine thread has stopped".to_string()
-        })
+        waiting.jobs.push_back(job);
+        self.queue.arrived.notify_one();
+        Ok(())
     }
 
-    /// [`Scheduler::submit`] for a generation, whose ticket leaves the books
-    /// again if the job never reached the queue.
-    fn generate(&self, id: u64, job: Job) -> Result<(), String> {
-        self.submit(job).inspect_err(|_| self.shared.finish(id))
+    /// [`Scheduler::submit`] for a generation: counted against the limit,
+    /// and entered in the books under the same lock that queues it, so the
+    /// books' order is the queue's.
+    fn generate(
+        &self,
+        who: Owner,
+        entry: Entry,
+        kind: Work,
+        on: &Key,
+        job: impl FnOnce(Ticket) -> Job,
+    ) -> Result<u64, Refused> {
+        let mut waiting = self.queue.waiting();
+        if waiting.closed {
+            return Err(Refused::Stopped);
+        }
+        let generations = waiting.jobs.iter().filter(|j| j.ticket().is_some()).count();
+        if entry == Entry::Request && self.limit > 0 && generations >= self.limit {
+            return Err(Refused::Full { waiting: generations, limit: self.limit });
+        }
+        let ticket = self.shared.admit(who, kind, on);
+        let id = ticket.id;
+        self.shared.waiting.fetch_add(1, Ordering::Relaxed);
+        waiting.jobs.push_back(job(ticket));
+        self.queue.arrived.notify_one();
+        Ok(id)
     }
 
     /// Load a model beside the others, if it fits, reporting progress as it
@@ -528,19 +822,26 @@ impl Scheduler {
     pub fn chat(
         &self,
         who: Owner,
+        entry: Entry,
         on: &Key,
         messages: Vec<Message>,
         tools: Vec<serde_json::Value>,
         sampling: Sampling,
         fresh: bool,
-    ) -> Result<(u64, tokio_mpsc::Receiver<Piece>), String> {
+    ) -> Result<(u64, tokio_mpsc::Receiver<Piece>), Refused> {
         // Bounded, so a client that reads slowly slows the generation down
         // rather than filling memory with tokens it has not asked for. 64 is
         // a second or so of decoding at the rates this engine reaches.
         let (out, rx) = tokio_mpsc::channel(64);
-        let ticket = self.shared.admit(who);
-        let id = ticket.id;
-        self.generate(id, Job::Chat { ticket, on: on.clone(), messages, tools, sampling, fresh, out })?;
+        let id = self.generate(who, entry, Work::Chat, on, |ticket| Job::Chat {
+            ticket,
+            on: on.clone(),
+            messages,
+            tools,
+            sampling,
+            fresh,
+            out,
+        })?;
         Ok((id, rx))
     }
 
@@ -552,16 +853,23 @@ impl Scheduler {
     pub fn complete(
         &self,
         who: Owner,
+        entry: Entry,
         on: &Key,
         prompt: String,
         sampling: Sampling,
         explain: usize,
         fresh: bool,
-    ) -> Result<(u64, tokio_mpsc::Receiver<Piece>), String> {
+    ) -> Result<(u64, tokio_mpsc::Receiver<Piece>), Refused> {
         let (out, rx) = tokio_mpsc::channel(64);
-        let ticket = self.shared.admit(who);
-        let id = ticket.id;
-        self.generate(id, Job::Complete { ticket, on: on.clone(), prompt, sampling, explain, fresh, out })?;
+        let id = self.generate(who, entry, Work::Completion, on, |ticket| Job::Complete {
+            ticket,
+            on: on.clone(),
+            prompt,
+            sampling,
+            explain,
+            fresh,
+            out,
+        })?;
         Ok((id, rx))
     }
 
@@ -586,14 +894,14 @@ impl Scheduler {
     pub fn paint(
         &self,
         who: Owner,
+        entry: Entry,
         on: &Key,
         request: kvad::image::ImageRequest,
-    ) -> Result<(u64, tokio_mpsc::Receiver<Stroke>), String> {
+    ) -> Result<(u64, tokio_mpsc::Receiver<Stroke>), Refused> {
         // A step is seconds, so a handful of them buffered is plenty.
         let (out, rx) = tokio_mpsc::channel(8);
-        let ticket = self.shared.admit(who);
-        let id = ticket.id;
-        self.generate(id, Job::Paint { ticket, on: on.clone(), request, out })?;
+        let id =
+            self.generate(who, entry, Work::Image, on, |ticket| Job::Paint { ticket, on: on.clone(), request, out })?;
         Ok((id, rx))
     }
 
@@ -604,13 +912,13 @@ impl Scheduler {
     pub fn film(
         &self,
         who: Owner,
+        entry: Entry,
         on: &Key,
         request: kvad::video::VideoRequest,
-    ) -> Result<(u64, tokio_mpsc::Receiver<Reel>), String> {
+    ) -> Result<(u64, tokio_mpsc::Receiver<Reel>), Refused> {
         let (out, rx) = tokio_mpsc::channel(8);
-        let ticket = self.shared.admit(who);
-        let id = ticket.id;
-        self.generate(id, Job::Film { ticket, on: on.clone(), request, out })?;
+        let id =
+            self.generate(who, entry, Work::Video, on, |ticket| Job::Film { ticket, on: on.clone(), request, out })?;
         Ok((id, rx))
     }
 
@@ -635,7 +943,7 @@ struct Slot {
 }
 
 /// The scheduler thread: one job at a time, in the order they arrived.
-fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
+fn run(queue: Closing, loaders: Loaders, budget: Budget, shared: Shared) {
     let mut slots: Vec<Slot> = Vec::new();
     let mut clock: u64 = 0;
 
@@ -650,12 +958,15 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
     };
     let missing = |key: &Key| format!("{} is not loaded", id_of(&key.repo, key.backend));
 
-    while let Ok(job) = jobs.recv() {
+    while let Some(job) = queue.0.next() {
         // Busy before the job leaves the waiting count, so that for the
         // moment between the two the depth reads one too many rather than one
         // too few: a queue that looks empty while it is not is the worse lie.
         shared.busy.store(true, Ordering::Relaxed);
         shared.waiting.fetch_sub(1, Ordering::Relaxed);
+        if let Some(ticket) = job.ticket() {
+            shared.taken(ticket.id);
+        }
         clock += 1;
 
         // What the caller is waiting for: an answer, or the end of its
@@ -1150,7 +1461,7 @@ mod tests {
         let sched = refusing();
         let on = Key { repo: "a/b".into(), backend: Q8 };
         let (_, mut pieces) = sched
-            .chat(None, &on, vec![Message::user("hello")], Vec::new(), Sampling::default(), false)
+            .chat(None, Entry::Request, &on, vec![Message::user("hello")], Vec::new(), Sampling::default(), false)
             .expect("the scheduler refused to queue the job");
         let piece = pieces.recv().await.expect("the stream ended with nothing in it");
         match piece {
@@ -1166,7 +1477,9 @@ mod tests {
     #[test]
     fn a_generation_is_stopped_only_by_its_owner() {
         let sched = refusing();
-        let (mine, theirs) = (sched.shared.admit(Some(1)), sched.shared.admit(Some(2)));
+        let on = Key { repo: "a/b".into(), backend: Q8 };
+        let (mine, theirs) =
+            (sched.shared.admit(Some(1), Work::Chat, &on), sched.shared.admit(Some(2), Work::Chat, &on));
         assert_ne!(mine.id, theirs.id);
         let engine = Arc::new(AtomicBool::new(false));
         sched.shared.begin(mine.id, &engine);
@@ -1189,36 +1502,55 @@ mod tests {
         assert_eq!(sched.cancel(Some(1), Some(mine.id)), 0);
     }
 
-    /// A generation stopped while it waits ends as cancelled when its turn
-    /// comes, without the engine being asked for anything.
+    /// A job that holds the scheduler's thread until `Held` is let go: its
+    /// answer has nowhere to go while the channel it would go to is full.
+    struct Held(tokio_mpsc::Receiver<Piece>);
+
+    impl Held {
+        fn by(sched: &Scheduler, owner: Owner) -> Held {
+            let on = Key { repo: "a/b".into(), backend: Q8 };
+            let (out, rx) = tokio_mpsc::channel(1);
+            out.try_send(Piece::Token("in the way".into())).unwrap();
+            let ticket = sched.shared.admit(owner, Work::Chat, &on);
+            let job = Job::Chat {
+                ticket,
+                on,
+                messages: Vec::new(),
+                tools: Vec::new(),
+                sampling: Sampling::default(),
+                fresh: false,
+                out,
+            };
+            sched.submit(job).unwrap();
+            // Taken off the queue, so that what waits behind it can be counted.
+            while !sched.shared.busy.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            Held(rx)
+        }
+
+        async fn release(mut self) {
+            while self.0.recv().await.is_some() {}
+        }
+    }
+
+    fn ask(sched: &Scheduler, who: Owner, entry: Entry) -> Result<(u64, tokio_mpsc::Receiver<Piece>), Refused> {
+        let on = Key { repo: "a/b".into(), backend: Q8 };
+        sched.chat(who, entry, &on, vec![Message::user("hello")], Vec::new(), Sampling::default(), false)
+    }
+
+    /// A generation stopped while it waits leaves the queue at once and ends
+    /// as cancelled, without waiting for its turn or the engine being asked.
     #[tokio::test]
     async fn a_waiting_generation_can_be_stopped() {
         let sched = refusing();
-        let on = Key { repo: "a/b".into(), backend: Q8 };
+        let held = Held::by(&sched, Some(1));
 
-        // Something for it to wait behind: a job whose answer has nowhere to
-        // go until this test reads it, which holds the scheduler thread.
-        let (out, mut ahead) = tokio_mpsc::channel(1);
-        out.try_send(Piece::Token("in the way".into())).unwrap();
-        let ticket = sched.shared.admit(Some(1));
-        let job = Job::Chat {
-            ticket,
-            on: on.clone(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            sampling: Sampling::default(),
-            fresh: false,
-            out,
-        };
-        sched.submit(job).unwrap();
-
-        let (id, mut pieces) = sched
-            .chat(Some(2), &on, vec![Message::user("hello")], Vec::new(), Sampling::default(), false)
-            .unwrap();
+        let (id, mut pieces) = ask(&sched, Some(2), Entry::Request).unwrap();
         assert_eq!(sched.cancel(Some(1), Some(id)), 0, "another account stopped it");
         assert_eq!(sched.cancel(Some(2), Some(id)), 1);
 
-        while ahead.recv().await.is_some() {}
+        // The job in front of it is still there: this did not wait its turn.
         match pieces.recv().await.expect("the stream ended with nothing in it") {
             // Not "a/b@cpu-q8 is not loaded": it never got as far as asking.
             Piece::Failed(why) => assert_eq!(why, CANCELLED),
@@ -1226,6 +1558,57 @@ mod tests {
         }
         assert!(pieces.recv().await.is_none(), "the stream continued past its end");
         assert_eq!(sched.cancel(Some(2), Some(id)), 0, "an ended generation was still there to stop");
+        assert_eq!(sched.depth(), 1, "the stopped generation is still counted as waiting");
+        held.release().await;
+    }
+
+    /// The queue has an end: the request after the last place is refused,
+    /// with the numbers, and a place given back is a place again.
+    #[tokio::test]
+    async fn a_full_queue_refuses_the_next_request() {
+        let sched = refusing().bounded(2);
+        let held = Held::by(&sched, Some(1));
+
+        let (first, _a) = ask(&sched, Some(1), Entry::Request).unwrap();
+        let (_, mut b) = ask(&sched, Some(2), Entry::Request).unwrap();
+        assert_eq!(sched.room(), Err(Refused::Full { waiting: 2, limit: 2 }));
+        assert_eq!(ask(&sched, Some(3), Entry::Request).unwrap_err(), Refused::Full { waiting: 2, limit: 2 });
+
+        // Work already let in is not turned away at the door.
+        let (_, mut more) = ask(&sched, Some(2), Entry::Continued).unwrap();
+        assert!(ask(&sched, Some(3), Entry::Request).is_err());
+
+        // Stopping two of the three leaves one, and so a place.
+        assert_eq!(sched.cancel(Some(2), None), 2);
+        assert!(matches!(b.recv().await, Some(Piece::Failed(why)) if why == CANCELLED));
+        assert!(matches!(more.recv().await, Some(Piece::Failed(why)) if why == CANCELLED));
+        let (last, _c) = ask(&sched, Some(3), Entry::Request).expect("a place given back was not a place");
+
+        // The view, in the order they run: the one holding the engine, then
+        // the two that wait, each with what is ahead of it.
+        let view = sched.queue();
+        assert_eq!(view.iter().map(|g| (g.id, g.running, g.ahead)).collect::<Vec<_>>(), [
+            (view[0].id, true, 0),
+            (first, false, 1),
+            (last, false, 2),
+        ]);
+        assert_eq!(view.iter().map(|g| g.owner).collect::<Vec<_>>(), [Some(1), Some(1), Some(3)]);
+        assert!(view.iter().all(|g| g.model == "a/b@cpu-q8" && g.kind == Work::Chat));
+        assert!(view[0].running_secs.is_some() && view[1].running_secs.is_none());
+
+        held.release().await;
+    }
+
+    /// No limit is no limit.
+    #[tokio::test]
+    async fn a_limit_of_zero_lets_any_number_wait() {
+        let sched = refusing().bounded(0);
+        let held = Held::by(&sched, None);
+        let waiting: Vec<_> = (0..50).map(|_| ask(&sched, None, Entry::Request).unwrap()).collect();
+        assert_eq!(sched.queue().len(), 51);
+        assert!(sched.room().is_ok());
+        drop(waiting);
+        held.release().await;
     }
 
     /// Jobs run in the order they were submitted, and the depth says how many
@@ -1278,7 +1661,7 @@ mod tests {
         for backend in [F32, Q8] {
             let on = Key { repo: repo.clone(), backend };
             let sampling = Sampling { temperature: 0.0, max_tokens: 4, ..Sampling::default() };
-            let (_, mut pieces) = sched.complete(None, &on, "the cat".into(), sampling, 0, true).unwrap();
+            let (_, mut pieces) = sched.complete(None, Entry::Request, &on, "the cat".into(), sampling, 0, true).unwrap();
             let mut done = None;
             while let Some(piece) = pieces.recv().await {
                 match piece {

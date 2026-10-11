@@ -820,6 +820,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("post", "/v1/chat/completions", "kvad chat, kvad run"),
     ("get", "/v1/models", "kvad ls"),
     ("delete", "/api/generation", "kvad cancel"),
+    ("delete", "/api/generation/{id}", "kvad cancel"),
+    ("get", "/api/queue", "kvad queue"),
     ("get", "/api/conversations", "kvad conversations"),
     ("post", "/api/conversations", "kvad chat"),
     ("get", "/api/conversations/{id}", "kvad conversations show, kvad chat"),
@@ -898,12 +900,6 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
          there, make a key on the Account page, and give it to `kvad auth login --key`",
     ),
     ("get", "/api/auth/oidc/callback", "where the identity provider sends the browser back"),
-    (
-        "delete",
-        "/api/generation/{id}",
-        "names one generation by the id its reply carried, which only the client \
-         holding that reply has. `kvad cancel` stops everything of yours instead",
-    ),
     (
         "get",
         "/api/images/{id}",

@@ -562,16 +562,33 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "cancel",
         group: Group::Server,
+        args: "[ID]",
+        about: "stop what you have generating, or one generation",
+        server: true,
+        routed: true,
+        words: &[Kind::Text],
+        subs: &[],
+        flags: &[],
+        usage: None,
+        notes: "Stops your own generations, waiting or running, and nobody else's. ID is as\n\
+                `kvad queue` shows it.",
+        examples: &["kvad cancel", "kvad cancel 12"],
+    },
+    Command {
+        name: "queue",
+        group: Group::Server,
         args: "",
-        about: "stop whatever is generating",
+        about: "what is generating, and what is waiting to",
         server: true,
         routed: true,
         words: &[],
         subs: &[],
         flags: &[],
         usage: None,
-        notes: "",
-        examples: &["kvad cancel"],
+        notes: "Your own generations, and how many there are altogether. An administrator is\n\
+                shown everybody's. When as many are waiting as the server allows, the next\n\
+                request is answered 503 and told when to try again.",
+        examples: &["kvad queue"],
     },
     Command {
         name: "jobs",

@@ -349,6 +349,17 @@ pub const ENDPOINTS: &[Endpoint] = &[
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
+        method: "get", path: "/api/queue", tag: "Chat", access: Access::SignedIn,
+        summary: "Who is waiting for the engine",
+        description: "The caller's generations, waiting and running, in the order they \
+                      run: what each is, on which model, how many are ahead of it and how \
+                      long it has waited. `waiting` and `running` count everybody's, and \
+                      `limit` is how many may wait before a request is answered 503 with \
+                      a `Retry-After` — zero for no limit. An administrator is shown every \
+                      generation, with whose it is.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
         method: "delete", path: "/api/generation/{id}", tag: "Chat", access: Access::SignedIn,
         summary: "Stop one generation",
         description: "The id is the one its reply carried in the `x-kvad-generation` \

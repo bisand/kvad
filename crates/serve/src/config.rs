@@ -103,6 +103,10 @@ pub struct Server {
     /// whether another fits. See `memory::DEFAULT_CONTEXT` for the default
     /// and why.
     pub context: Option<usize>,
+    /// How many generations may wait for the engine before the next request
+    /// is answered 503 with a `Retry-After`. Unset,
+    /// `scheduler::DEFAULT_LIMIT`; zero lets any number wait.
+    pub queue: Option<usize>,
 }
 
 /// What happens to a video once it is made.
@@ -259,6 +263,7 @@ impl Default for Server {
             load_on_request: true,
             memory_gb: None,
             context: None,
+            queue: None,
         }
     }
 }

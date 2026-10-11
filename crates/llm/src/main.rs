@@ -253,7 +253,7 @@ impl Default for Args {
 
 /// Commands that take words after them, rather than only flags.
 const POSITIONAL: &[&str] = &[
-    "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload",
+    "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload", "cancel",
     "tokenize", "service", "conversations", "jobs", "datasets", "tune", "evals", "bench", "metrics",
     "auth", "users", "sessions", "keys", "api", "images", "videos",
 ];

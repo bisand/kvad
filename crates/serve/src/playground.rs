@@ -15,7 +15,7 @@
 use crate::api::Fail;
 use crate::auth::{Identity, State};
 use crate::models::{sse, stream};
-use crate::scheduler::{Key, Piece};
+use crate::scheduler::{Entry, Key, Piece};
 use axum::extract::State as St;
 use axum::response::sse::Event;
 use axum::response::IntoResponse;
@@ -114,8 +114,7 @@ async fn complete(
 
     let (generation, mut pieces) = state
         .engine
-        .complete(who.id, &on, prompt, sampling, explain, body.fresh)
-        .map_err(Fail::internal)?;
+        .complete(who.id, Entry::Request, &on, prompt, sampling, explain, body.fresh)?;
 
     let (events, rx) = tokio::sync::mpsc::channel::<Event>(64);
     tokio::spawn(async move {

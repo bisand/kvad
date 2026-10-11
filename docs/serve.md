@@ -130,6 +130,10 @@ series of decisions about where to be honest about it.
 
 A **scheduler** owns the engine thread and everything queues behind it, so
 queue depth is a number on the dashboard rather than a mutex nobody can see.
+The queue has an end: `[server] queue` generations may wait (16 unless set),
+and the request after that is answered 503 with a `Retry-After` rather than
+held. `kvad queue` and `GET /api/queue` show what is waiting, for how long,
+and — to an administrator — whose it is.
 **Comparisons are sequences**: the Playground's "side by side" and the
 Benchmarks page both load each variant in turn, and both say so on the page
 rather than implying a race. **Training is not queued behind chat, or chat

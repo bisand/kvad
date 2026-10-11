@@ -686,6 +686,9 @@ fn extension(stats: &Stats, loaded: &crate::scheduler::Loaded) -> serde_json::Va
     json!({
         "backend": loaded.backend,
         "cached_tokens": stats.cached_tokens,
+        // What the model holds now, across every conversation it is keeping.
+        "held_tokens": stats.held_tokens,
+        "conversations": stats.conversations,
         "prefill_secs": stats.prefill_secs,
         "decode_secs": stats.decode_secs,
         "prefill_tokens_per_sec":
@@ -1164,6 +1167,8 @@ mod tests {
             generated_tokens: 20,
             prefill_secs: 0.5,
             decode_secs: 2.0,
+            held_tokens: 120,
+            conversations: 1,
         };
         let ext = extension(&stats, &loaded);
         // Prefill rate counts what was actually computed, not what was in the

@@ -382,6 +382,18 @@ impl Session for GpuGpt2 {
         Ok(self.pos)
     }
 
+    fn room(&self) -> usize {
+        self.kv.iter().map(KvCache::room_held).max().unwrap_or(0)
+    }
+
+    fn park(&mut self) -> Option<kvad::model::Parked> {
+        Some(KvCache::park(&mut self.kv, &mut self.pos))
+    }
+
+    fn resume(&mut self, parked: kvad::model::Parked) -> Res<()> {
+        KvCache::resume(&mut self.kv, &mut self.pos, parked)
+    }
+
     fn label(&self) -> String {
         self.device_label()
     }

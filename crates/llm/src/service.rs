@@ -55,6 +55,10 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 pub enum Cmd {
     Search(String),
     Load { repo: String, backend: Backend },
+    /// How many tokens of cache the loaded model may keep across every
+    /// conversation: what whoever loaded it has charged it for. Not said,
+    /// the model's own context. See [`crate::runtime::Llm::hold`].
+    Hold(usize),
     /// Drop the loaded model, freeing its weights and its KV cache.
     ///
     /// Not the same as loading something else: a server needs to be able to
@@ -548,6 +552,12 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 }
             }
 
+            Cmd::Hold(tokens) => {
+                if let Some(Ok(s)) = session.as_mut().map(|held| held.text()) {
+                    s.llm.hold(tokens);
+                }
+            }
+
             Cmd::Chat { messages, tools, sampling, fresh } => {
                 let Some(held) = session.as_mut() else {
                     say("no model loaded");
@@ -562,7 +572,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 };
                 aim(s, &sampling);
                 if fresh {
-                    if let Err(e) = s.llm.reset() {
+                    if let Err(e) = s.llm.fresh() {
                         fail(e);
                         continue;
                     }
@@ -593,7 +603,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 };
                 aim(s, &sampling);
                 if fresh {
-                    if let Err(e) = s.llm.reset() {
+                    if let Err(e) = s.llm.fresh() {
                         fail(e);
                         continue;
                     }

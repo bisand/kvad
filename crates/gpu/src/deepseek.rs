@@ -463,6 +463,18 @@ impl Session for GpuDeepSeek {
         Ok(self.pos)
     }
 
+    fn room(&self) -> usize {
+        self.cache.iter().map(KvCache::room_held).max().unwrap_or(0)
+    }
+
+    fn park(&mut self) -> Option<kvad::model::Parked> {
+        Some(KvCache::park(&mut self.cache, &mut self.pos))
+    }
+
+    fn resume(&mut self, parked: kvad::model::Parked) -> Res<()> {
+        KvCache::resume(&mut self.cache, &mut self.pos, parked)
+    }
+
     fn label(&self) -> String {
         self.device_label()
     }

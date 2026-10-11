@@ -156,10 +156,8 @@ pub fn answer_for(program: &'static spec::Program, words: &[String], source: &dy
     let flags = || {
         let offered = applicable(c, sub).into_iter().filter(|f| repeats(f) || !used.iter().any(|u| *u == f.name || *u == f.short));
         let mut items: Vec<(String, String)> = offered.map(|f| (f.name.to_string(), f.about.to_string())).collect();
-        if program.help {
-            let named = if program.commands.is_empty() { program.name.to_string() } else { format!("{} {}", program.name, c.name) };
-            items.push(("--help".into(), format!("what `{named}` takes")));
-        }
+        let named = if program.commands.is_empty() { program.name.to_string() } else { format!("{} {}", program.name, c.name) };
+        items.push(("--help".into(), format!("what `{named}` takes, with examples")));
         Answer { items: matching(items.into_iter(), cur), files: Files::None }
     };
     if cur.starts_with('-') {
@@ -1263,7 +1261,8 @@ mod tests {
         assert_eq!(tab_at("kvad-gpu chat --quant q4"), ["q4", "q4k"]);
         assert_eq!(tab_at("kvad-gpu run --model "), ["book", "Qwen/Qwen3-14B"]);
         // Its `--quant` is not kvad's, and it has no `--remote`.
-        assert!(!tab_at("kvad-gpu run --").iter().any(|f| f == "--remote" || f == "--help"));
+        assert!(!tab_at("kvad-gpu run --").iter().any(|f| f == "--remote" || f == "--raw"));
+        assert_eq!(tab_at("kvad-tui -"), ["--version", "--help"]);
         assert_eq!(tab_at("kvad-gpu tune --sa"), ["--sample", "--sample-size", "--sample-steps", "--samples"]);
         assert!(tab_at("kvad-gpu tune ").contains(&"stabilityai/sdxl-turbo".to_string()));
 

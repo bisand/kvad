@@ -189,12 +189,23 @@ kvad ps --json | jq '.residents[].id'
 
 ## The other binaries
 
-`kvad-tui` takes no arguments. See [The terminal app](/docs/terminal-app/).
+Each has the same kind of help as `kvad`, and is completed at a Tab by the
+same setup.
+
+`kvad-serve --help` lists the server's options. `kvad serve` is the same
+program.
+
+`kvad-tui --help` says what it takes, which is a model to open with and
+nothing else. See [The terminal app](/docs/terminal-app/).
 
 `kvad-gpu` runs the GPU engine without a server:
 
 ```text
-kvad-gpu <run|chat> [--model REPO] [--device metal|cpu] [--dtype bf16|f16|f32]
-                    [--quant none|q8|q4|q4k|q6k] [--prompt TEXT] …
-kvad-gpu tune --help
+kvad-gpu run  [--model REPO] [--device metal|cpu] [--dtype bf16|f16|f32]
+              [--quant none|q8|q4|q4k|q6k] [--prompt TEXT] …
+kvad-gpu chat [the same]
+kvad-gpu tune [MODEL] --data DIR --name NAME …
 ```
+
+`kvad-gpu help` lists those three, and `kvad-gpu help tune`, or
+`kvad-gpu tune --help`, says what one takes.

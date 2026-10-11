@@ -92,19 +92,19 @@ struct Args {
     insecure: bool,
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "kvad-serve — HTTP server and web UI for kvad
+/// `--help`: the page `kvad::help` prints from the table of this program's
+/// flags, and the one thing only this binary knows, which is where the
+/// configuration file is on this machine.
+fn help() -> ! {
+    print!("{}", kvad::help::program(&kvad::spec::SERVE));
+    println!("configuration: {}", config::default_path().display());
+    std::process::exit(0)
+}
 
-    --config PATH   configuration file (default: {})
-    --bind ADDR     address to listen on, e.g. 127.0.0.1:5823
-    --db PATH       SQLite database file
-    --insecure      allow a non-loopback bind with no authentication
-    -V, --version   print the version and exit
-    -h, --help",
-        config::default_path().display()
-    );
-    std::process::exit(2)
+/// A flag that is not one, or one with nothing after it.
+fn bad_flag(problem: &str, flag: &str) -> ! {
+    let program = &kvad::spec::SERVE;
+    kvad::help::bad_flag(program, program.bare, problem, flag)
 }
 
 fn parse_args() -> Args {
@@ -113,8 +113,8 @@ fn parse_args() -> Args {
     let mut i = 0;
     while i < argv.len() {
         let flag = argv[i].as_str();
-        if matches!(flag, "-h" | "--help") {
-            usage();
+        if matches!(flag, "-h" | "--help" | "help") {
+            help();
         }
         if matches!(flag, "-V" | "--version") {
             println!("kvad-serve {}", env!("CARGO_PKG_VERSION"));
@@ -125,9 +125,14 @@ fn parse_args() -> Args {
             i += 1;
             continue;
         }
+        if !matches!(flag, "--config" | "--db" | "--bind") {
+            match flag.starts_with('-') {
+                true => bad_flag(&format!("{flag} is not an option of `kvad-serve`."), flag),
+                false => bad_flag(&format!("`kvad-serve` takes options and no words, and `{flag}` is a word."), ""),
+            }
+        }
         let Some(value) = argv.get(i + 1) else {
-            eprintln!("missing value for {flag}");
-            usage();
+            bad_flag(&format!("{flag} needs a value after it."), "");
         };
         match flag {
             "--config" => a.config = Some(value.into()),
@@ -138,10 +143,9 @@ fn parse_args() -> Args {
                     std::process::exit(2);
                 }))
             }
-            other => {
-                eprintln!("unknown flag {other}");
-                usage();
-            }
+            // Turned away above, so that it is told so before it is told
+            // that it has no value.
+            _ => unreachable!("{flag} was let through and is not matched"),
         }
         i += 2;
     }

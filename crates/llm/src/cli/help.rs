@@ -15,16 +15,13 @@
 //! is. Not the help itself, which pushes the one line that matters off the
 //! top of the terminal.
 
-use super::spec::{self, Command, Flag, Group};
+use super::spec::{self, Command, Group};
+use kvad::help::nearest;
+#[cfg(test)]
+use kvad::help::WIDTH;
 
 /// Wide enough for `conversations` and two spaces.
 const NAME: usize = 15;
-
-/// Wide enough for `--lora NAME[:SCALE]`.
-const FLAG: usize = 22;
-
-/// What a line of options is kept within.
-const WIDTH: usize = 80;
 
 /// `kvad help`.
 pub fn overview() -> String {
@@ -57,116 +54,7 @@ pub fn overview() -> String {
 
 /// `kvad help COMMAND`.
 pub fn command(c: &Command) -> String {
-    let mut out = format!("kvad {} — {}\n", c.name, c.about);
-    if c.server {
-        out.push_str("asks a running server; `kvad service start` starts this machine's\n");
-    }
-    out.push('\n');
-    match c.usage {
-        Some(text) => out.push_str(text),
-        None => out.push_str(&synopsis(c)),
-    }
-    out.push('\n');
-    if !c.notes.is_empty() {
-        out.push_str(&format!("\n{}\n", c.notes));
-    }
-
-    // Subcommands, where the usage above is one this module wrote: a
-    // hand-written one has already said them.
-    if c.usage.is_none() && !c.subs.is_empty() {
-        out.push_str("\ncommands:\n");
-        for s in c.subs {
-            out.push_str(&format!("  {:<FLAG$}{}\n", format!("{} {}", s.name, s.args).trim_end(), s.about));
-        }
-    }
-
-    let own: Vec<&Flag> = c.flags.iter().flat_map(|g| g.iter()).collect();
-    if !own.is_empty() {
-        out.push_str("\noptions:\n");
-        own.iter().for_each(|f| out.push_str(&flag_line(f)));
-    }
-    // Each subcommand's, under its own name — but a group of flags two of
-    // them share is said once, for the first, and pointed at by the rest.
-    let mut said: Vec<(&[Flag], &str)> = Vec::new();
-    for s in c.subs.iter().filter(|s| !s.flags.is_empty()) {
-        out.push_str(&format!("\noptions of `kvad {} {}`:\n", c.name, s.name));
-        for group in s.flags {
-            match said.iter().find(|(seen, _)| same(seen, group)) {
-                Some((_, first)) => out.push_str(&format!("  and every option of `{first}`\n")),
-                None => {
-                    group.iter().for_each(|f| out.push_str(&flag_line(f)));
-                    said.push((group, s.name));
-                }
-            }
-        }
-    }
-
-    if c.routed {
-        out.push_str("\nwhere it runs:\n");
-        spec::WHERE.iter().for_each(|f| out.push_str(&flag_line(f)));
-        out.push_str(
-            "  With neither --remote nor --local: $KVAD_URL, then [client] url in kvad.toml,\n  \
-             then this machine's service if it answers, then this process.\n",
-        );
-    }
-
-    if !c.examples.is_empty() {
-        out.push_str("\nexamples:\n");
-        c.examples.iter().for_each(|e| out.push_str(&format!("  {e}\n")));
-    }
-    out
-}
-
-/// The usage line of a command that has no hand-written one.
-fn synopsis(c: &Command) -> String {
-    let options = if c.flags.is_empty() && !c.routed { "" } else { " [options]" };
-    match (c.subs.is_empty(), c.args.is_empty()) {
-        (_, true) => format!("usage: kvad {}{options}", c.name),
-        (true, false) | (false, false) => format!("usage: kvad {} {}{options}", c.name, c.args),
-    }
-}
-
-/// Whether two groups of flags are one group, named twice. By what is in
-/// them: a `const` has no address to compare.
-fn same(a: &[Flag], b: &[Flag]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.name == b.name && a.about == b.about)
-}
-
-fn flag_line(f: &Flag) -> String {
-    let mut left = match f.short.is_empty() {
-        true => f.name.to_string(),
-        false => format!("{}, {}", f.short, f.name),
-    };
-    if f.takes_value() {
-        left.push(' ');
-        left.push_str(f.value);
-    }
-    // A left side too long for its column takes a line to itself, so the
-    // descriptions still start in one place; and a description too long for
-    // the line carries on under its own start, not under the flag.
-    let mut lines = wrap(f.about, WIDTH - FLAG - 2).into_iter();
-    let first = lines.next().unwrap_or_default();
-    let mut out = match left.chars().count() < FLAG {
-        true => format!("  {left:<FLAG$}{first}\n"),
-        false => format!("  {left}\n  {:<FLAG$}{first}\n", ""),
-    };
-    lines.for_each(|line| out.push_str(&format!("  {:<FLAG$}{line}\n", "")));
-    out
-}
-
-/// `text` in lines of at most `width` characters, broken at spaces.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for word in text.split(' ') {
-        match lines.last_mut() {
-            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
-                line.push(' ');
-                line.push_str(word);
-            }
-            _ => lines.push(word.to_string()),
-        }
-    }
-    lines
+    kvad::help::command("kvad", c)
 }
 
 /// Print a command's help, or the overview, and stop. What `--help` does.
@@ -193,56 +81,13 @@ pub fn unknown_command(name: &str) -> ! {
 
 /// A flag that is not one, or one with nothing after it.
 pub fn bad_flag(command: &str, problem: &str, flag: &str) -> ! {
-    eprintln!("{problem}");
-    let known = spec::command(command);
-    if let Some(c) = known.filter(|_| spec::takes_value(flag).is_none()) {
-        let flags = c.all_flags();
-        if let Some(near) = nearest(flag, flags.iter().copied().chain(spec::WHERE).map(|f| f.name)) {
-            eprintln!("Did you mean {near}?");
+    match spec::command(command) {
+        Some(c) => kvad::help::bad_flag(&spec::PROGRAMS[0], c, problem, flag),
+        None => {
+            eprintln!("{problem}\n`kvad help` lists the commands.");
+            std::process::exit(2);
         }
     }
-    match known {
-        Some(c) => eprintln!("`kvad {} --help` says what it takes.", c.name),
-        None => eprintln!("`kvad help` lists the commands."),
-    }
-    std::process::exit(2);
-}
-
-/// The candidate a typo most likely meant, if any is close.
-///
-/// Close is an edit distance of at most a third of the word, and at least
-/// one: `chta` is `chat`, `pul` is `pull`, and `frobnicate` is nothing.
-fn nearest<'a>(word: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    let allowed = (word.chars().count() / 3).max(1);
-    candidates
-        .map(|c| (distance(word, c), c))
-        .filter(|(d, c)| *d <= allowed || (word.len() > 2 && c.starts_with(word)))
-        .min_by_key(|(d, _)| *d)
-        .map(|(_, c)| c)
-}
-
-/// Edit distance, with a swap of two neighbours counted as one edit: the
-/// commonest typo there is should not cost two.
-fn distance(a: &str, b: &str) -> usize {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    let mut rows = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for (i, row) in rows.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for j in 0..=b.len() {
-        rows[0][j] = j;
-    }
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            let change = usize::from(a[i - 1] != b[j - 1]);
-            let mut best = (rows[i - 1][j] + 1).min(rows[i][j - 1] + 1).min(rows[i - 1][j - 1] + change);
-            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                best = best.min(rows[i - 2][j - 2] + 1);
-            }
-            rows[i][j] = best;
-        }
-    }
-    rows[a.len()][b.len()]
 }
 
 #[cfg(test)]

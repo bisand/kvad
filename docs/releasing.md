@@ -52,8 +52,11 @@ knowing is that the tagged tree does not contain its own version — check out
 `v0.1.1` and `Cargo.toml` says whatever the release before it set. The commit
 on `master` is what carries the number forward.
 
-The commit is the last thing the workflow does, because a build that failed
-should not leave `master` claiming a version with no binaries behind it. It is
+The commit is the last thing the workflow does but one, because a build that
+failed should not leave `master` claiming a version with no binaries behind
+it. The very last is to start `site.yml`: kvad.eu's front page says the
+version, and a commit pushed with a workflow's own token deploys nothing by
+itself, so without that the site says the release before. It is
 also written to be safe to repeat: a re-run against a release whose version
 `master` already carries says so and commits nothing.
 

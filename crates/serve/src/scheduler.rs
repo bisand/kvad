@@ -43,12 +43,26 @@
 //! worth more to a client than a connection that sits for four minutes and
 //! then times out somewhere in between.
 //!
-//! There is still one queue for every resident, and so one job at a time
-//! across the whole server. Two residents on different hardware — one on
-//! the CPU and one on the GPU — could decode at once, and that is the next
-//! step; but two CPU residents decoding at once would fight over every core,
-//! and how to share them is a measurement nobody has made yet. A load is a
-//! job like any other, so a load never runs beside a decode.
+//! There is still one queue for every resident, and one resident at work at
+//! a time. Two residents on different hardware — one on the CPU and one on
+//! the GPU — could decode at once, and that is a later step; but two CPU
+//! residents decoding at once would fight over every core, and how to share
+//! them is a measurement nobody has made yet. A load is a job like any
+//! other, so a load never runs beside a decode.
+//!
+//! # Several replies at once
+//!
+//! On one resident, though, replies run together: up to
+//! [`Scheduler::batch`] of them, each a token further every step, and a
+//! reply that ends gives its place to the next in line without the others
+//! waiting for it. That is the *continuous* in continuous batching. Whose
+//! turn it is to join is the same question as whose turn it is to run, and
+//! has the same answer — [`pick`] — with one addition: if the job whose
+//! turn it is cannot join, because it is for another model or is not a
+//! reply at all, nobody joins and the batch runs down, so that a queue of
+//! chats cannot keep a load or another model's request waiting for ever.
+//!
+//! A request that asked for no cache is a measurement, and runs alone.
 //!
 //! # What does *not* come through here
 //!
@@ -404,6 +418,15 @@ impl Job {
         }
     }
 
+    /// For a reply or a continuation: the resident it is for, and whether
+    /// it asked for no cache.
+    fn text(&self) -> Option<(&Key, bool)> {
+        match self {
+            Job::Chat { on, fresh, .. } | Job::Complete { on, fresh, .. } => Some((on, *fresh)),
+            _ => None,
+        }
+    }
+
     /// End a generation that was stopped before it started. `try_send`,
     /// because this runs on the runtime's threads and the channel is empty:
     /// nothing has been sent to a generation that has not begun.
@@ -517,7 +540,17 @@ impl Waiting {
 
     /// Take the job whose turn it is, and note whose turn it was.
     fn take(&mut self) -> Option<Job> {
+        self.take_if(|_| true)
+    }
+
+    /// Take the job whose turn it is, if it is one that `fits`. A job that
+    /// does not is left, and so is everything behind it in turn: nothing
+    /// that fits is looked for past it.
+    fn take_if(&mut self, fits: impl Fn(&Job) -> bool) -> Option<Job> {
         let at = pick(&self.owners(), &self.served)?;
+        if !fits(&self.jobs[at]) {
+            return None;
+        }
         let job = self.jobs.remove(at)?;
         if let Some(ticket) = job.ticket() {
             self.turn += 1;
@@ -565,6 +598,16 @@ impl Queue {
         self.arrived.notify_all();
     }
 
+    /// The job whose turn it is, without waiting, if there is one and it
+    /// `fits`: what a batch under way asks, to see who may join it.
+    fn joining(&self, fits: impl Fn(&Job) -> bool) -> Option<Job> {
+        let mut waiting = self.waiting();
+        match waiting.closed {
+            true => None,
+            false => waiting.take_if(fits),
+        }
+    }
+
     /// The next job, waiting for one if there is none. `None` once closed.
     fn next(&self) -> Option<Job> {
         let mut waiting = self.waiting();
@@ -602,6 +645,16 @@ pub const DEFAULT_LIMIT: usize = 16;
 /// How many of them may be one account's, when nothing says otherwise: a
 /// quarter of the queue, so that it takes four accounts to fill it.
 pub const DEFAULT_SHARE: usize = 4;
+
+/// How many replies run at once on one resident, when nothing says
+/// otherwise.
+///
+/// Every reply in a batch waits for the whole step, so each is slower than
+/// it would be alone and all of them together are faster than in turn: on
+/// Qwen2.5-1.5B at `cpu-q8`, four at once are 39 ms a token each against 21
+/// alone and 83 in turn. Four is where that trade is still plainly a good
+/// one; past it the wait for a token grows faster than the total does.
+pub const DEFAULT_BATCH: usize = 4;
 
 /// Makes the loader for each new engine. One per engine, because a
 /// [`Loader`] is `FnMut` and moves to the thread that calls it.
@@ -642,6 +695,10 @@ struct Shared {
     issued: Arc<AtomicU64>,
     /// Memory set aside for work that is not a resident; see [`Reserved`].
     reserved: Arc<Mutex<Option<Held>>>,
+    /// How many replies run at once on one resident; see
+    /// [`Scheduler::batching`]. Here because the thread that runs them
+    /// reads it.
+    batch: Arc<AtomicUsize>,
 }
 
 /// Memory of the budget held for something that is no model in this
@@ -721,12 +778,25 @@ impl Scheduler {
         let queue = Arc::new(Queue::default());
         let shared = Shared::default();
         let (theirs, loaders) = (shared.clone(), Box::new(loaders) as Loaders);
+        shared.batch.store(DEFAULT_BATCH, Ordering::Relaxed);
         let closing = Closing(Arc::clone(&queue));
         std::thread::Builder::new()
             .name("kvad-scheduler".into())
             .spawn(move || run(closing, loaders, budget, theirs))
             .expect("failed to spawn the scheduler thread");
         Scheduler { queue, shared, budget, limit: DEFAULT_LIMIT, share: DEFAULT_SHARE, rate: 0 }
+    }
+
+    /// Run up to `batch` replies at once on one resident. One, or zero, is
+    /// one at a time, as it was before there was a choice.
+    pub fn batching(self, batch: usize) -> Self {
+        self.shared.batch.store(batch.max(1), Ordering::Relaxed);
+        self
+    }
+
+    /// How many replies run at once on one resident.
+    pub fn batch(&self) -> usize {
+        self.shared.batch.load(Ordering::Relaxed)
     }
 
     /// Let one account ask for `rate` generations a minute, and refuse the
@@ -1168,16 +1238,70 @@ fn run(queue: Closing, loaders: Loaders, budget: Budget, shared: Shared) {
     };
     let missing = |key: &Key| format!("{} is not loaded", id_of(&key.repo, key.backend));
 
-    while let Some(job) = queue.0.next() {
+    // The replies running together on one resident, if any are.
+    let mut batch: Option<Batch> = None;
+
+    loop {
+        // With replies under way: let in who may join, pass on what the
+        // engine has said, and come round again. Nothing else is taken from
+        // the queue until they have ended.
+        if let Some(b) = batch.as_mut() {
+            // Streams that have ended, dropped only once `busy` is settled.
+            let mut ended: Vec<tokio_mpsc::Sender<Piece>> = Vec::new();
+            match slots.iter().find(|s| s.key == b.on) {
+                Some(slot) => {
+                    let most = shared.batch.load(Ordering::Relaxed).max(1);
+                    while !b.alone && b.streams.len() < most {
+                        let fits = |job: &Job| job.text().is_some_and(|(on, fresh)| on == &b.on && !fresh);
+                        let Some(job) = queue.0.joining(fits) else { break };
+                        shared.waiting.fetch_sub(1, Ordering::Relaxed);
+                        clock += 1;
+                        ended.extend(b.admit(job, slot, &shared));
+                    }
+                    let on = b.on.clone();
+                    ended.extend(b.pump(slot, &shared, &|cached| touch(&on, clock, Some(cached))));
+                }
+                // Unloaded from under them, which nothing here does while
+                // they run.
+                None => ended.extend(b.fail(&missing(&b.on), &shared)),
+            }
+            if b.streams.is_empty() {
+                batch = None;
+                shared.busy.store(false, Ordering::Relaxed);
+            }
+            drop(ended);
+            continue;
+        }
+
+        let Some(job) = queue.0.next() else { break };
         // Busy before the job leaves the waiting count, so that for the
         // moment between the two the depth reads one too many rather than one
         // too few: a queue that looks empty while it is not is the worse lie.
         shared.busy.store(true, Ordering::Relaxed);
         shared.waiting.fetch_sub(1, Ordering::Relaxed);
+        clock += 1;
+
+        // A reply begins a batch, of one for now. What may join it is asked
+        // at the top of the loop.
+        if let Some((on, fresh)) = job.text().map(|(on, fresh)| (on.clone(), fresh)) {
+            let mut b = Batch { on, alone: fresh, streams: Vec::new() };
+            let ended = match slots.iter().find(|s| s.key == b.on) {
+                Some(slot) => b.admit(job, slot, &shared),
+                None => {
+                    shared.taken(job.ticket().map_or(0, |t| t.id));
+                    job.refused(Piece::Failed(missing(&b.on)), &shared)
+                }
+            };
+            match b.streams.is_empty() {
+                true => shared.busy.store(false, Ordering::Relaxed),
+                false => batch = Some(b),
+            }
+            drop(ended);
+            continue;
+        }
         if let Some(ticket) = job.ticket() {
             shared.taken(ticket.id);
         }
-        clock += 1;
 
         // What the caller is waiting for: an answer, or the end of its
         // stream. Handed over only once `busy` is clear, because a caller
@@ -1223,48 +1347,8 @@ fn run(queue: Closing, loaders: Loaders, budget: Budget, shared: Shared) {
                 Box::new(move || drop(done.send(failed.map_or(Ok(gone), Err))))
             }
 
-            Job::Chat { ticket, on, messages, tools, sampling, fresh, out } => {
-                match slots.iter().find(|s| s.key == on) {
-                    // Stopped while it waited: the engine never hears of it.
-                    _ if ticket.stop.load(Ordering::Relaxed) => {
-                        let _ = out.blocking_send(Piece::Failed(CANCELLED.into()));
-                    }
-                    Some(slot) => {
-                        shared.begin(ticket.id, &slot.engine.cancel);
-                        slot.engine.send(Cmd::Chat { messages, tools, sampling, fresh });
-                        // What the cache holds now, across every conversation
-                        // the model is keeping.
-                        let cached = drain_chat(&slot.engine.rx, &out, &ticket.stop, &slot.engine.cancel)
-                            .map(|stats| stats.held_tokens);
-                        touch(&on, clock, cached);
-                    }
-                    None => {
-                        let _ = out.blocking_send(Piece::Failed(missing(&on)));
-                    }
-                }
-                shared.finish(ticket.id);
-                Box::new(move || drop(out))
-            }
-
-            Job::Complete { ticket, on, prompt, sampling, explain, fresh, out } => {
-                match slots.iter().find(|s| s.key == on) {
-                    _ if ticket.stop.load(Ordering::Relaxed) => {
-                        let _ = out.blocking_send(Piece::Failed(CANCELLED.into()));
-                    }
-                    Some(slot) => {
-                        shared.begin(ticket.id, &slot.engine.cancel);
-                        slot.engine.send(Cmd::Complete { prompt, sampling, explain, fresh });
-                        let cached = drain_chat(&slot.engine.rx, &out, &ticket.stop, &slot.engine.cancel)
-                            .map(|stats| stats.held_tokens);
-                        touch(&on, clock, cached);
-                    }
-                    None => {
-                        let _ = out.blocking_send(Piece::Failed(missing(&on)));
-                    }
-                }
-                shared.finish(ticket.id);
-                Box::new(move || drop(out))
-            }
+            // Begun above, as a batch.
+            Job::Chat { .. } | Job::Complete { .. } => Box::new(|| {}),
 
             Job::Tokenize { on, text, done } => {
                 let answer = match slots.iter().find(|s| s.key == on) {
@@ -1486,46 +1570,188 @@ fn drain_score(
     }
 }
 
-/// Forward a generation's tokens, and return the statistics it ended with.
-///
-/// `stop` is the generation's own flag and `cancel` the engine's. The engine
-/// clears its flag as a command starts, so a stop that landed between the
-/// command being sent and the engine picking it up would be lost; raising it
-/// again at each token is what makes it stick.
-fn drain_chat(
-    rx: &Receiver<Evt>,
-    out: &tokio_mpsc::Sender<Piece>,
-    stop: &AtomicBool,
-    cancel: &AtomicBool,
-) -> Option<Stats> {
-    loop {
-        let evt = rx.recv();
-        if stop.load(Ordering::Relaxed) {
-            cancel.store(true, Ordering::Relaxed);
+/// A reply under way: its place in the books, and where its pieces go.
+struct Stream {
+    ticket: Ticket,
+    out: tokio_mpsc::Sender<Piece>,
+    /// Pieces the reader has not had room for yet. A reader slower than the
+    /// engine used to slow the engine down; with several replies on one
+    /// engine that would be one reader slowing everybody's, so what it has
+    /// not taken waits here instead. At most a reply's worth.
+    backlog: VecDeque<Piece>,
+}
+
+/// The replies running together on one resident.
+struct Batch {
+    on: Key,
+    /// Nothing may join: the reply asked for no cache, which makes it a
+    /// measurement, and a measurement shares the engine with nobody.
+    alone: bool,
+    streams: Vec<Stream>,
+}
+
+impl Job {
+    /// End a reply the engine will never hear of, with `piece`, and hand
+    /// back its stream for the caller to drop when it is ready to.
+    ///
+    /// The send waits for room, as it did when replies ran one at a time:
+    /// the channel of a reply that has not started is empty unless a test
+    /// filled it to hold this thread still.
+    fn refused(self, piece: Piece, shared: &Shared) -> Option<tokio_mpsc::Sender<Piece>> {
+        match self {
+            Job::Chat { ticket, out, .. } | Job::Complete { ticket, out, .. } => {
+                let _ = out.blocking_send(piece);
+                shared.finish(ticket.id);
+                Some(out)
+            }
+            _ => None,
         }
-        let piece = match evt {
-            Ok(Evt::Token(text)) => Piece::Token(text),
-            Ok(Evt::Chose(chosen)) => Piece::Chose(chosen),
-            Ok(Evt::Done(stats)) => Piece::Done(stats),
-            Ok(Evt::Error(e)) => Piece::Failed(e),
-            // Sent when no model is loaded, which for a chat is a refusal
+    }
+}
+
+impl Batch {
+    /// Send a reply to the engine to run beside the others. One stopped
+    /// while it waited is ended instead, and its stream handed back.
+    fn admit(&mut self, job: Job, slot: &Slot, shared: &Shared) -> Option<tokio_mpsc::Sender<Piece>> {
+        let ticket = job.ticket()?;
+        shared.taken(ticket.id);
+        if ticket.stop.load(Ordering::Relaxed) {
+            // Stopped while it waited: the engine never hears of it.
+            return job.refused(Piece::Failed(CANCELLED.into()), shared);
+        }
+        let (ticket, what, out) = match job {
+            Job::Chat { ticket, messages, tools, sampling, fresh, out, .. } => {
+                (ticket, Cmd::Chat { messages, tools, sampling, fresh }, out)
+            }
+            Job::Complete { ticket, prompt, sampling, explain, fresh, out, .. } => {
+                (ticket, Cmd::Complete { prompt, sampling, explain, fresh }, out)
+            }
+            _ => return None,
+        };
+        // The reply's own flag goes with it: the engine stops this one when
+        // it is raised, and nobody else's.
+        slot.engine.send(Cmd::Beside { id: ticket.id, stop: Arc::clone(&ticket.stop), what: Box::new(what) });
+        self.streams.push(Stream { ticket, out, backlog: VecDeque::new() });
+        None
+    }
+
+    /// Pass on what the engine has said since last time, waiting a moment
+    /// for it to say something. The streams that ended are handed back.
+    ///
+    /// A moment and no longer, because this is also how often the queue is
+    /// asked who may join: a token is tens of milliseconds, a prefill can
+    /// be seconds, and somebody arriving during one should not wait for it
+    /// to end before they are even sent to the engine.
+    fn pump(
+        &mut self,
+        slot: &Slot,
+        shared: &Shared,
+        held: &dyn Fn(usize),
+    ) -> Vec<tokio_mpsc::Sender<Piece>> {
+        const MOMENT: std::time::Duration = std::time::Duration::from_millis(20);
+        let mut over: Vec<u64> = Vec::new();
+        match slot.engine.rx.recv_timeout(MOMENT) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return self.fail("the engine thread has stopped", shared);
+            }
+            Ok(first) => {
+                let mut next = Some(first);
+                while let Some(evt) = next {
+                    over.extend(self.hear(evt, held));
+                    next = slot.engine.rx.try_recv().ok();
+                }
+            }
+        }
+
+        for stream in &mut self.streams {
+            while let Some(piece) = stream.backlog.pop_front() {
+                match stream.out.try_send(piece) {
+                    Ok(()) => {}
+                    Err(tokio_mpsc::error::TrySendError::Full(piece)) => {
+                        stream.backlog.push_front(piece);
+                        break;
+                    }
+                    // Nobody is reading: stop writing, and stop the reply.
+                    Err(tokio_mpsc::error::TrySendError::Closed(_)) => stream.backlog.clear(),
+                }
+            }
+            if stream.out.is_closed() {
+                stream.ticket.stop.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let (ended, running): (Vec<Stream>, Vec<Stream>) =
+            std::mem::take(&mut self.streams).into_iter().partition(|s| over.contains(&s.ticket.id));
+        self.streams = running;
+        ended.into_iter().map(|stream| stream.end(shared)).collect()
+    }
+
+    /// One thing the engine said: put it on its reply's backlog, and say
+    /// whose reply it ended, if it ended one.
+    fn hear(&mut self, evt: Evt, held: &dyn Fn(usize)) -> Option<u64> {
+        // Anything not under an id is not a reply's: the engine's own news.
+        let Evt::Of(id, evt) = evt else { return None };
+        let stream = self.streams.iter_mut().find(|s| s.ticket.id == id)?;
+        let piece = match *evt {
+            Evt::Token(text) => Piece::Token(text),
+            Evt::Chose(chosen) => Piece::Chose(chosen),
+            Evt::Done(stats) => {
+                // What the cache holds now, across every conversation the
+                // model is keeping.
+                held(stats.held_tokens);
+                Piece::Done(stats)
+            }
+            Evt::Error(e) => Piece::Failed(e),
+            // Sent when no model is loaded, which for a reply is a refusal
             // rather than a status line.
-            Ok(Evt::Status(message)) => Piece::Failed(message),
-            Ok(_) => continue,
-            Err(_) => Piece::Failed("the engine thread has stopped".into()),
+            Evt::Status(message) => Piece::Failed(message),
+            _ => return None,
         };
-        let ended = match &piece {
-            Piece::Token(_) | Piece::Chose(_) => None,
-            Piece::Done(stats) => Some(Some(*stats)),
-            Piece::Failed(_) => Some(None),
-        };
-        // A closed receiver is a client that has gone away. Stop forwarding,
-        // but keep draining until the engine finishes this generation, or the
-        // next request would read this one's leftovers.
-        let _ = out.blocking_send(piece);
-        if let Some(stats) = ended {
-            return stats;
+        let last = !matches!(piece, Piece::Token(_) | Piece::Chose(_));
+        stream.backlog.push_back(piece);
+        last.then_some(id)
+    }
+
+    /// End every reply with `why`.
+    fn fail(&mut self, why: &str, shared: &Shared) -> Vec<tokio_mpsc::Sender<Piece>> {
+        let streams = std::mem::take(&mut self.streams);
+        streams
+            .into_iter()
+            .map(|mut stream| {
+                stream.backlog.push_back(Piece::Failed(why.to_string()));
+                stream.end(shared)
+            })
+            .collect()
+    }
+}
+
+impl Stream {
+    /// The reply is over as far as the engine goes. Its place in the books
+    /// goes now; what its reader has not taken yet follows on a thread of
+    /// its own, so that a slow reader of a finished reply holds nobody up.
+    fn end(mut self, shared: &Shared) -> tokio_mpsc::Sender<Piece> {
+        shared.finish(self.ticket.id);
+        while let Some(piece) = self.backlog.pop_front() {
+            match self.out.try_send(piece) {
+                Ok(()) => {}
+                Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                    self.backlog.clear();
+                }
+                Err(tokio_mpsc::error::TrySendError::Full(piece)) => {
+                    self.backlog.push_front(piece);
+                    let (out, rest) = (self.out.clone(), std::mem::take(&mut self.backlog));
+                    std::thread::spawn(move || {
+                        for piece in rest {
+                            if out.blocking_send(piece).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
         }
+        self.out
     }
 }
 
@@ -2064,6 +2290,69 @@ mod tests {
             assert_eq!(say(&sched, &on, &b_next, true).await.0, b2, "{backend}: a kept cache changed a reply");
 
             sched.unload(Some(on)).await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Several replies on one model run together, and each says what it
+    /// would have said alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replies_run_together_and_say_what_each_says_alone() {
+        let dir = crate::compare::tests::tiny_model("together");
+        let repo = dir.to_string_lossy().into_owned();
+        let prompts = ["the cat", "on the", "sat on", "the mat"];
+
+        async fn read(mut pieces: tokio_mpsc::Receiver<Piece>) -> (String, Stats) {
+            let (mut text, mut done) = (String::new(), None);
+            while let Some(piece) = pieces.recv().await {
+                match piece {
+                    Piece::Token(t) => text.push_str(&t),
+                    Piece::Done(stats) => done = Some(stats),
+                    Piece::Failed(why) => panic!("{why}"),
+                    Piece::Chose(_) => {}
+                }
+            }
+            (text, done.expect("no end to the generation"))
+        }
+        // Greedy, so that what is said depends on the prompt and nothing else.
+        let sampling = Sampling { temperature: 0.0, max_tokens: 20, ..Sampling::default() };
+
+        for backend in [F32, Q8] {
+            let on = Key { repo: repo.clone(), backend };
+
+            // What each says with the engine to itself: one at a time.
+            let alone = Scheduler::spawn(kvad::service::cpu_loader, roomy()).batching(1);
+            alone.load(repo.clone(), backend, nowhere()).await.unwrap();
+            let mut want = Vec::new();
+            for prompt in prompts {
+                let (_, pieces) = alone.complete(None, Entry::Request, &on, prompt.into(), sampling, 0, false).unwrap();
+                let (text, stats) = read(pieces).await;
+                assert_eq!(stats.beside, 0, "{backend}: one at a time ran beside another");
+                want.push(text);
+            }
+            drop(alone);
+
+            // All four asked for before the scheduler looks: the thread is
+            // held until they are queued, so they are there to join.
+            let sched = Scheduler::spawn(kvad::service::cpu_loader, roomy()).bounded(0).batching(3);
+            sched.load(repo.clone(), backend, nowhere()).await.unwrap();
+            let held = Held::by(&sched, None);
+            let streams: Vec<_> = prompts
+                .iter()
+                .map(|p| sched.complete(None, Entry::Request, &on, p.to_string(), sampling, 0, false).unwrap().1)
+                .collect();
+            held.release().await;
+
+            let mut most = 0;
+            for (stream, want) in streams.into_iter().zip(&want) {
+                let (text, stats) = read(stream).await;
+                assert_eq!(&text, want, "{backend}: a reply written beside others is not the one written alone");
+                most = most.max(stats.beside);
+            }
+            // Three at once and never four: the fourth waits for a place.
+            assert_eq!(most, 2, "{backend}: the batch was not three");
+            assert!(sched.queue().is_empty());
+            assert_eq!(sched.depth(), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

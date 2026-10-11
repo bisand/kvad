@@ -61,10 +61,10 @@ than arms in a `match`.
 There is now an HTTP API and a web UI around it: OpenAI-compatible completions
 — including tool calling, so an agent like OpenCode drives it as a provider —
 plus model management, training, evals, benchmarks and monitoring. None of that
-makes it a fast server, and it is built not to pretend otherwise — requests
-queue behind one another because the engine runs one generation at a time, and
-the queue depth is a number on the dashboard rather than a mutex nobody can
-see. What it did change is that the decode numbers in this README now have a
+makes it a fast server, and it is built not to pretend otherwise — a few
+replies run at once on a model and the rest queue behind them, and the queue
+is something the dashboard and `kvad queue` show rather than a mutex nobody
+can see. What it did change is that the decode numbers in this README now have a
 button that reproduces them: interleaved rounds, medians and ranges, and a
 refusal to measure a machine that is busy doing something else.
 

@@ -665,6 +665,7 @@ pub async fn queue(who: Identity, St(state): St<State>) -> Result<Json<serde_jso
         "limit": state.engine.limit(),
         "per_account": state.engine.share(),
         "per_minute": state.engine.rate(),
+        "batch": state.engine.batch(),
         "running": all.iter().filter(|g| g.running).count(),
         "waiting": all.iter().filter(|g| !g.running).count(),
         "generations": generations,
@@ -690,6 +691,8 @@ fn extension(stats: &Stats, loaded: &crate::scheduler::Loaded) -> serde_json::Va
         // What the model holds now, across every conversation it is keeping.
         "held_tokens": stats.held_tokens,
         "conversations": stats.conversations,
+        // The most other replies this one was written beside.
+        "beside": stats.beside,
         "prefill_secs": stats.prefill_secs,
         "decode_secs": stats.decode_secs,
         "prefill_tokens_per_sec":
@@ -1176,6 +1179,7 @@ mod tests {
             decode_secs: 2.0,
             held_tokens: 120,
             conversations: 1,
+            beside: 0,
         };
         let ext = extension(&stats, &loaded);
         // Prefill rate counts what was actually computed, not what was in the

@@ -98,6 +98,20 @@ pub enum Cmd {
         /// ever see. A benchmark sets this; a person typing does not.
         fresh: bool,
     },
+    /// A [`Cmd::Chat`] or a [`Cmd::Complete`] that may run beside others.
+    ///
+    /// On their own those two are one generation at a time: the next
+    /// command waits for it. Sent like this, a generation is let in while
+    /// others sent like this are under way, and all of them are advanced
+    /// together, a token each a step — in one pass over the model where the
+    /// backend can ([`crate::model::Session::forward_each`]).
+    ///
+    /// Everything it has to say comes back as [`Evt::Of`] under `id`, since
+    /// the channel is one and the generations are several. It stops when
+    /// `stop` is raised, and nobody else's does.
+    ///
+    /// Where the backend keeps one conversation, it waits its turn instead.
+    Beside { id: u64, stop: Arc<AtomicBool>, what: Box<Cmd> },
     /// How the loaded model's tokenizer splits a text.
     Tokenize(String),
     /// Score a text the model did not write.
@@ -287,6 +301,9 @@ pub enum Evt {
     /// event would otherwise be sent at its size.
     Filmed(Box<Filmed>),
     Error(String),
+    /// Something a generation sent with [`Cmd::Beside`] has to say — a
+    /// token, its end, its failure — with the id it was sent under.
+    Of(u64, Box<Evt>),
     /// A request refused by what served it, for the asker to change:
     /// [`crate::image::Refused`].
     Refused(String),
@@ -427,8 +444,9 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
     };
 
     let mut session: Option<Held> = None;
-    // The generation under way, if one is.
-    let mut generating: Option<Generating> = None;
+    // The generations under way. More than one only when every one of them
+    // was sent with `Cmd::Beside`.
+    let mut generating: Vec<Generating> = Vec::new();
     let _ = tx.send(Evt::Local(hub::local_models()));
 
     // A step loop, not a command loop: each time round it either advances
@@ -437,18 +455,52 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
     // it ended; in steps, the thread comes back between tokens, which is
     // where a second generation will be let in.
     //
-    // For now there is one, and a command that arrives during it waits for
-    // it to end, as it always did.
+    //
+    // A generation sent with `Cmd::Beside` may be joined by others sent the
+    // same way: between steps the channel is looked at without waiting, and
+    // one that can join is prefilled and joins. Anything else that arrives
+    // — a load, a plain chat, a generation the backend has no room to run
+    // beside the rest — is kept in `held`, and nothing more is heard until
+    // the generations have ended: commands are still taken in order.
+    let mut held: Option<Cmd> = None;
     loop {
-        if let Some(under_way) = generating.take() {
-            generating = match session.as_mut().map(Held::text) {
-                Some(Ok(s)) => advance(under_way, s, &tx, &cancel),
-                // The model went from under it, which nothing here does.
-                _ => None,
-            };
-            continue;
-        }
-        let Ok(cmd) = rx.recv() else { break };
+        let cmd = match generating.is_empty() {
+            true => match held.take() {
+                Some(cmd) => cmd,
+                None => match rx.recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                },
+            },
+            false => {
+                let joining = match held {
+                    Some(_) => None,
+                    None => match rx.try_recv() {
+                        Ok(cmd) => Some(cmd),
+                        Err(mpsc::TryRecvError::Empty) => None,
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    },
+                };
+                let Some(Ok(s)) = session.as_mut().map(Held::text) else {
+                    // The model went from under them, which nothing here does.
+                    generating.clear();
+                    continue;
+                };
+                match joining {
+                    Some(cmd) if can_join(&cmd, &mut generating, s) => cmd,
+                    waits => {
+                        held = held.or(waits);
+                        advance(&mut generating, s, &tx, &cancel);
+                        continue;
+                    }
+                }
+            }
+        };
+        // A generation sent to run beside others answers under its id.
+        let (tag, cmd) = match cmd {
+            Cmd::Beside { id, stop, what } => (Some(Tag { id, stop }), *what),
+            alone => (None, alone),
+        };
         match cmd {
             Cmd::RefreshLocal => {
                 let _ = tx.send(Evt::Local(hub::local_models()));
@@ -578,66 +630,57 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
             }
 
             Cmd::Chat { messages, tools, sampling, fresh } => {
-                let Some(held) = session.as_mut() else {
-                    say("no model loaded");
-                    continue;
-                };
-                let s = match held.text() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        fail(e.into());
+                let s = match session.as_mut().map(Held::text) {
+                    None => {
+                        tell(&tx, &tag, Evt::Status("no model loaded".into()));
                         continue;
                     }
-                };
-                aim(s, &sampling);
-                if fresh {
-                    if let Err(e) = s.llm.fresh() {
-                        fail(e);
+                    Some(Err(e)) => {
+                        tell(&tx, &tag, Evt::Error(e));
                         continue;
                     }
-                }
-                let ids = match s.llm.encode_chat(&messages, &tools) {
+                    Some(Ok(s)) => s,
+                };
+                let ids = match fresh.then(|| s.llm.fresh()).transpose().and_then(|_| s.llm.encode_chat(&messages, &tools)) {
                     Ok(ids) => ids,
                     Err(e) => {
-                        fail(e);
+                        tell(&tx, &tag, Evt::Error(e.to_string()));
                         continue;
                     }
                 };
                 // The session reuses whatever of the previous turn's cache
                 // still matches, so a chat prefills only the newest message.
-                generating = begin(s, &ids, &sampling, 0, &tx, &cancel);
+                generating.extend(begin(s, &ids, &sampling, 0, tag, &tx, &cancel));
             }
 
             Cmd::Complete { prompt, sampling, explain, fresh } => {
-                let Some(held) = session.as_mut() else {
-                    say("no model loaded");
-                    continue;
-                };
-                let s = match held.text() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        fail(e.into());
+                let s = match session.as_mut().map(Held::text) {
+                    None => {
+                        tell(&tx, &tag, Evt::Status("no model loaded".into()));
                         continue;
                     }
-                };
-                aim(s, &sampling);
-                if fresh {
-                    if let Err(e) = s.llm.fresh() {
-                        fail(e);
+                    Some(Err(e)) => {
+                        tell(&tx, &tag, Evt::Error(e));
                         continue;
                     }
-                }
+                    Some(Ok(s)) => s,
+                };
                 // No template: the prompt is the text, which is what makes
                 // this a different view of the model rather than a second
                 // chat window.
-                let ids = match s.llm.encode(&prompt) {
+                let ids = match fresh.then(|| s.llm.fresh()).transpose().and_then(|_| s.llm.encode(&prompt)) {
                     Ok(ids) => ids,
                     Err(e) => {
-                        fail(e);
+                        tell(&tx, &tag, Evt::Error(e.to_string()));
                         continue;
                     }
                 };
-                generating = begin(s, &ids, &sampling, explain, &tx, &cancel);
+                generating.extend(begin(s, &ids, &sampling, explain, tag, &tx, &cancel));
+            }
+
+            // Unwrapped above; one inside another is nothing anybody sends.
+            Cmd::Beside { .. } => {
+                tell(&tx, &tag, Evt::Error("a generation cannot be sent beside itself".into()));
             }
 
             Cmd::Tokenize(text) => match session.as_mut().map(Held::text) {
@@ -746,17 +789,19 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
     }
 }
 
-/// Point the session's sampler at what this request asked for.
-///
-/// The knobs are the request's; the generator is the session's, unless the
-/// request asked for one of its own.
-fn aim(s: &mut Loaded, sampling: &Sampling) {
-    s.sampler.temperature = sampling.temperature;
-    s.sampler.top_k = sampling.top_k;
-    s.sampler.top_p = sampling.top_p;
-    if let Some(seed) = sampling.seed {
-        s.sampler.reseed(seed);
-    }
+/// What a generation sent with [`Cmd::Beside`] is known by.
+struct Tag {
+    id: u64,
+    stop: Arc<AtomicBool>,
+}
+
+/// Send `evt`, under the generation's id if it has one.
+fn tell(tx: &Sender<Evt>, tag: &Option<Tag>, evt: Evt) -> bool {
+    let evt = match tag {
+        Some(tag) => Evt::Of(tag.id, Box::new(evt)),
+        None => evt,
+    };
+    tx.send(evt).is_ok()
 }
 
 /// A generation between its steps.
@@ -765,6 +810,25 @@ struct Generating {
     /// How many candidates each token is reported with; none sends the
     /// token's text alone.
     explain: usize,
+    /// Its own, because several generations cannot share one stream of
+    /// draws; see [`Sampler::for_one`].
+    sampler: Sampler,
+    tag: Option<Tag>,
+    /// The most others it has run beside so far.
+    beside: usize,
+}
+
+/// Whether `cmd` may start beside the generations under way, having made
+/// room for it if so.
+///
+/// It may when it and all of them were sent with [`Cmd::Beside`], and the
+/// one whose conversation is in the session can carry it instead — which a
+/// backend that keeps one conversation cannot, and then the answer is no and
+/// the command waits, as every command did before.
+fn can_join(cmd: &Cmd, generating: &mut [Generating], s: &mut Loaded) -> bool {
+    matches!(cmd, Cmd::Beside { .. })
+        && generating.iter().all(|g| g.tag.is_some())
+        && generating.iter_mut().all(|g| s.llm.detach(&mut g.run))
 }
 
 /// Start generating from token ids: prefill, and nothing sent yet.
@@ -777,44 +841,86 @@ fn begin(
     ids: &[u32],
     sampling: &Sampling,
     explain: usize,
+    tag: Option<Tag>,
     tx: &Sender<Evt>,
     cancel: &Arc<AtomicBool>,
 ) -> Option<Generating> {
-    cancel.store(false, Ordering::Relaxed);
+    // The engine's own flag is for a generation running alone, whose
+    // caller has nothing else to stop it by. One with a tag has its own.
+    if tag.is_none() {
+        cancel.store(false, Ordering::Relaxed);
+    }
+    let sampler = s.sampler.for_one(sampling.temperature, sampling.top_k, sampling.top_p, sampling.seed);
     match s.llm.begin(ids, sampling.max_tokens, explain) {
-        Ok(run) => Some(Generating { run, explain }),
+        Ok(run) => Some(Generating { run, explain, sampler, tag, beside: 0 }),
         Err(e) => {
-            let _ = tx.send(Evt::Error(e.to_string()));
+            tell(tx, &tag, Evt::Error(e.to_string()));
             None
         }
     }
 }
 
-/// Take a generation one token further and send the token down the channel.
-/// `None` once it is over, with its statistics or its failure sent.
-fn advance(mut g: Generating, s: &mut Loaded, tx: &Sender<Evt>, cancel: &AtomicBool) -> Option<Generating> {
-    let over = match s.llm.step(&mut g.run, &mut s.sampler) {
-        Err(e) => {
-            let _ = tx.send(Evt::Error(e.to_string()));
-            return None;
-        }
-        Ok(None) => true,
-        // Asked to stop: the token is not sent. Nobody listening: the same.
-        Ok(Some(_)) if cancel.load(Ordering::Relaxed) => true,
-        Ok(Some(chosen)) => {
-            let evt = match g.explain {
-                0 => Evt::Token(chosen.text),
-                _ => Evt::Chose(chosen),
-            };
-            tx.send(evt).is_err()
+/// Take every generation one token further and send each its token. The
+/// ones that are over leave, with their statistics or their failure sent.
+fn advance(generating: &mut Vec<Generating>, s: &mut Loaded, tx: &Sender<Evt>, cancel: &AtomicBool) {
+    // One alone, with its conversation in the session, is the step it
+    // always was; several are one pass. A failure is the pass's, and so
+    // every generation's that was in it.
+    let others = generating.len().saturating_sub(1);
+    generating.iter_mut().for_each(|g| g.beside = g.beside.max(others));
+    let chosen = match generating.as_mut_slice() {
+        [alone] => s.llm.step(&mut alone.run, &mut alone.sampler).map(|chosen| vec![chosen]),
+        several => {
+            // The one that began last still has its conversation in the
+            // session; it carries it from here, like the rest. `can_join`
+            // found the backend able to, or there would not be several.
+            for g in several.iter_mut() {
+                s.llm.detach(&mut g.run);
+            }
+            let (mut runs, mut samplers): (Vec<&mut Run>, Vec<&mut Sampler>) =
+                several.iter_mut().map(|g| (&mut g.run, &mut g.sampler)).unzip();
+            s.llm.step_each(&mut runs, &mut samplers)
         }
     };
-    if !over {
-        return Some(g);
+    let chosen = match chosen {
+        Ok(chosen) => chosen,
+        Err(e) => {
+            for g in generating.drain(..) {
+                tell(tx, &g.tag, Evt::Error(e.to_string()));
+                s.llm.abandon(g.run);
+            }
+            return;
+        }
+    };
+
+    let mut still = Vec::with_capacity(generating.len());
+    for (g, chosen) in generating.drain(..).zip(chosen) {
+        let stopped = match &g.tag {
+            Some(tag) => tag.stop.load(Ordering::Relaxed),
+            None => cancel.load(Ordering::Relaxed),
+        };
+        let over = match chosen {
+            None => true,
+            // Asked to stop: the token is not sent. Nobody listening: the same.
+            Some(_) if stopped => true,
+            Some(chosen) => {
+                let evt = match g.explain {
+                    0 => Evt::Token(chosen.text),
+                    _ => Evt::Chose(chosen),
+                };
+                !tell(tx, &g.tag, evt)
+            }
+        };
+        match over {
+            false => still.push(g),
+            true => {
+                let (mut stats, _) = s.llm.finish(g.run);
+                stats.beside = g.beside;
+                tell(tx, &g.tag, Evt::Done(stats));
+            }
+        }
     }
-    let (stats, _) = s.llm.finish(g.run);
-    let _ = tx.send(Evt::Done(stats));
-    None
+    *generating = still;
 }
 
 #[cfg(test)]

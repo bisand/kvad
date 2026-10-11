@@ -39,6 +39,13 @@ bind = "127.0.0.1:5823"
 # with auth.mode = "none": there is nobody to share with.
 # queue_per_account = 4
 
+# How many generations one account may ask for in a minute. Its next request
+# is answered 429, with the seconds until it may ask again in Retry-After.
+# Unset, any number: an agent asks many times a minute as a matter of
+# course, so what is too many depends on who shares the machine. Counted
+# per request, so four images are one. Not applied with auth.mode = "none".
+# generations_per_minute = 30
+
 [data]
 # Where the database, generated images, datasets and trained models go.
 # Defaults to $XDG_DATA_HOME/kvad, or ~/.local/share/kvad. `~/` is your home

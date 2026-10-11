@@ -76,7 +76,7 @@ pub async fn sign_in(
     .await
     // A refused sign-in is 401 and not 500, and it says the one thing it is
     // allowed to say.
-    .map_err(|e| Fail(axum::http::StatusCode::UNAUTHORIZED, e.1))?;
+    .map_err(|e| Fail(axum::http::StatusCode::UNAUTHORIZED, e.1, None))?;
 
     Ok(([(SET_COOKIE, session_cookie(&token, secure))], Json(identity_of(&user))))
 }
@@ -117,6 +117,7 @@ pub async fn setup(
             "that is not this server's setup token. It is printed in the terminal when the \
              server starts with no accounts."
                 .into(),
+            None,
         ));
     }
     let secure = is_https(&headers);

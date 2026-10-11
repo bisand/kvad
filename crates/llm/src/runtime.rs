@@ -4,7 +4,7 @@
 //! This is the API the CLI and the TUI both drive.
 
 use crate::chat::{ChatTemplate, Message};
-use crate::model::{CpuSession, Session, Spec};
+use crate::model::{CpuSession, Parked, Session, Spec};
 use crate::qcache;
 use crate::quant::Precision;
 use crate::sampler::Sampler;
@@ -28,6 +28,49 @@ pub struct Llm {
     /// Exactly the tokens the session's cache currently represents, so the
     /// next turn can find the shared prefix.
     cached_ids: Vec<u32>,
+    /// How many of those were the prompt, the rest being the reply to it.
+    prompt_len: usize,
+    /// When the conversation in the session last spoke; see `clock`.
+    used: u64,
+    /// Conversations set aside, each with its cache; see [`Llm::seat`].
+    parked: Vec<Conversation>,
+    /// Counts generations, to say which conversation has waited longest.
+    clock: u64,
+    /// Tokens of cache this model may hold across every conversation.
+    hold: usize,
+}
+
+/// A conversation that is not the one in the session: its tokens, and the
+/// cache that represents them, waiting for its next turn.
+struct Conversation {
+    ids: Vec<u32>,
+    prompt_len: usize,
+    used: u64,
+    /// Positions its cache has memory for; see [`Session::room`].
+    room: usize,
+    cache: Parked,
+}
+
+/// As many conversations as are ever set aside, whatever room there is.
+///
+/// The tokens are the real limit — see [`Llm::hold`] — and this is only so
+/// that a thousand three-token prompts do not leave a thousand of them to
+/// search.
+const MOST_PARKED: usize = 16;
+
+/// Whether a prompt sharing `shared` leading tokens with a conversation
+/// whose own prompt was `prompt_len` long is that conversation speaking
+/// again.
+///
+/// Its next turn begins with all of its last prompt, and an edited or
+/// regenerated turn with most of it. Another conversation under the same
+/// system prompt shares only that, which is a small part of a long
+/// conversation and most of a short one — and a short one costs little to
+/// take over. So: at least half. Taking a conversation over cuts its cache
+/// back to what is shared, so the half that is wrong about is the half
+/// that was cheapest to lose.
+fn continues(shared: usize, prompt_len: usize) -> bool {
+    shared > 0 && shared * 2 >= prompt_len
 }
 
 /// Builds the backend for a model whose files are already on disk.
@@ -109,6 +152,10 @@ pub struct Stats {
     pub prompt_tokens: usize,
     /// Prompt tokens served from an existing KV cache rather than recomputed.
     pub cached_tokens: usize,
+    /// Tokens of cache the model holds once this is over, across every
+    /// conversation it is keeping, and how many conversations that is.
+    pub held_tokens: usize,
+    pub conversations: usize,
     pub generated_tokens: usize,
     pub prefill_secs: f32,
     pub decode_secs: f32,
@@ -204,7 +251,13 @@ impl Llm {
             param_count,
             weight_bytes,
             cached_ids: Vec::new(),
-        })
+            prompt_len: 0,
+            used: 0,
+            parked: Vec::new(),
+            clock: 0,
+            hold: 0,
+        }
+        .holding(usize::MAX))
     }
 
     pub fn is_instruct(&self) -> bool {
@@ -250,13 +303,149 @@ impl Llm {
         self.session.label()
     }
 
-    /// Forget the conversation so far, so the next prompt starts clean.
+    /// Forget every conversation, so the next prompt starts clean and
+    /// nothing is held.
     pub fn reset(&mut self) -> Res<()> {
+        self.parked.clear();
+        self.clear()
+    }
+
+    /// Forget the conversation in the session, and leave the ones set aside.
+    fn clear(&mut self) -> Res<()> {
         self.cached_ids.clear();
+        self.prompt_len = 0;
         // Rewinding to zero is the one request every cache can honour, so the
         // answer is not worth checking here.
         self.session.truncate(0)?;
         Ok(())
+    }
+
+    /// Start the next prompt with an empty cache, without costing anybody
+    /// theirs: the conversation in the session is set aside where the
+    /// backend can do that, and forgotten where it cannot.
+    ///
+    /// For a request that asked for no cache — a measurement, mostly. It
+    /// used to be [`Llm::reset`], which on a server is one account's
+    /// benchmark throwing away every other account's conversation.
+    pub fn fresh(&mut self) -> Res<()> {
+        match self.set_aside() {
+            true => Ok(()),
+            false => self.clear(),
+        }
+    }
+
+    /// Let the model hold `tokens` of cache across every conversation, or
+    /// its own context if that is less: what a server has charged it for.
+    ///
+    /// One conversation may still grow to the model's context, as it always
+    /// could; this is what the ones set aside have to fit in beside it.
+    pub fn hold(&mut self, tokens: usize) {
+        self.hold = tokens.min(self.spec.n_ctx);
+    }
+
+    fn holding(mut self, tokens: usize) -> Self {
+        self.hold(tokens);
+        self
+    }
+
+    /// Tokens of cache held, across the session and everything set aside.
+    pub fn held(&self) -> usize {
+        self.session.cached() + self.parked.iter().map(|c| c.ids.len()).sum::<usize>()
+    }
+
+    /// Move the conversation in the session out of it, leaving the session
+    /// empty. `false` from a backend that cannot, with nothing changed.
+    fn set_aside(&mut self) -> bool {
+        if self.cached_ids.is_empty() {
+            // Nothing to keep, and an empty session is what was wanted.
+            return self.clear().is_ok();
+        }
+        let room = self.session.room();
+        let Some(cache) = self.session.park() else {
+            return false;
+        };
+        self.parked.push(Conversation {
+            ids: std::mem::take(&mut self.cached_ids),
+            prompt_len: std::mem::take(&mut self.prompt_len),
+            used: self.used,
+            room,
+            cache,
+        });
+        true
+    }
+
+    /// Put the conversation `prompt_ids` continues into the session, so
+    /// that what follows finds its cache there.
+    ///
+    /// The session holds one conversation, and until this existed the model
+    /// did too: two people taking turns each found the other's conversation
+    /// in the cache, shared nothing with it past the template's opening,
+    /// and prefilled their own from the start, every turn. Measured on
+    /// Qwen3-14B, the wait for a first token at turn eight was six times
+    /// what it was alone, and growing with the conversation.
+    ///
+    /// So the conversations that are not speaking are set aside whole, and
+    /// the one that is, is found by its tokens: whichever shares the longest
+    /// prefix with the prompt, if that is enough of it to be the same
+    /// conversation — see [`continues`]. Nothing names a conversation,
+    /// because nothing has to: an OpenAI client sends the whole transcript
+    /// and no id, and the transcript is the better key anyway.
+    ///
+    /// A prompt that continues none of them starts an empty cache, and the
+    /// one in the session is set aside rather than overwritten. What is set
+    /// aside is kept while it fits in [`Llm::hold`] beside what this
+    /// generation may grow to; past that the one that spoke longest ago
+    /// goes first.
+    fn seat(&mut self, prompt_ids: &[u32], max_tokens: usize) -> Res<()> {
+        let here = Self::common_prefix(&self.cached_ids, prompt_ids);
+        let there = self
+            .parked
+            .iter()
+            .enumerate()
+            .map(|(at, c)| (Self::common_prefix(&c.ids, prompt_ids), at, c.prompt_len))
+            // The longest, and of two as long the one that spoke last.
+            .max_by_key(|&(shared, at, _)| (shared, self.parked[at].used));
+
+        match there {
+            // One set aside is the better match, and is this conversation.
+            Some((shared, at, prompt_len)) if shared > here && continues(shared, prompt_len) => {
+                let next = self.parked.remove(at);
+                // Where the backend cannot set one aside it could not have
+                // given this one out either, so this does not fail; if the
+                // session's is empty there is nothing to keep.
+                self.set_aside();
+                self.session.resume(next.cache)?;
+                (self.cached_ids, self.prompt_len, self.used) = (next.ids, next.prompt_len, next.used);
+            }
+            // The one in the session is, or the session is empty.
+            _ if self.cached_ids.is_empty() || continues(here, self.prompt_len) => {}
+            // None of them is: a conversation not seen before. Where the
+            // backend keeps only one, this falls through to what it always
+            // did, and the cache is cut back to whatever is shared.
+            _ => {
+                self.set_aside();
+            }
+        }
+
+        // Room for what this generation may come to, beside the rest.
+        self.make_room(prompt_ids.len().saturating_add(max_tokens));
+        Ok(())
+    }
+
+    /// Let go of conversations set aside until `coming` tokens in the
+    /// session fit beside the rest, the one that spoke longest ago first.
+    ///
+    /// Counted in the memory each one has, not the tokens in it, since the
+    /// memory is what was charged for.
+    fn make_room(&mut self, coming: usize) {
+        let coming = coming.min(self.spec.n_ctx).max(self.session.room());
+        let waiting = |parked: &[Conversation]| parked.iter().map(|c| c.room).sum::<usize>();
+        while !self.parked.is_empty()
+            && (self.parked.len() > MOST_PARKED || waiting(&self.parked) + coming > self.hold)
+        {
+            let oldest = (0..self.parked.len()).min_by_key(|&at| self.parked[at].used).unwrap_or(0);
+            self.parked.remove(oldest);
+        }
     }
 
     /// How many leading tokens two sequences share.
@@ -310,6 +499,8 @@ impl Llm {
             return Err("prompt encoded to zero tokens".into());
         }
 
+        self.seat(prompt_ids, max_tokens)?;
+
         // Always leave at least one token to process, or there would be no
         // logits to sample the next token from.
         let wanted = Self::common_prefix(&self.cached_ids, prompt_ids)
@@ -361,6 +552,11 @@ impl Llm {
         stats.decode_secs = t1.elapsed().as_secs_f32();
 
         self.cached_ids = ids.clone();
+        self.prompt_len = prompt_ids.len();
+        self.clock += 1;
+        self.used = self.clock;
+        stats.held_tokens = self.held();
+        stats.conversations = self.parked.len() + 1;
         Ok((stats, ids))
     }
 
@@ -435,6 +631,10 @@ impl Llm {
         }
         let window = window.clamp(2, self.spec.n_ctx);
         let vocab = self.spec.vocab_size;
+        // Whoever was mid-conversation keeps it, where there is room for it
+        // beside a window of this.
+        self.fresh()?;
+        self.make_room(window);
 
         let mut nats = 0.0f64;
         let mut scored = 0usize;
@@ -448,7 +648,7 @@ impl Llm {
             }
             // Every window is independent, so the cache from the last one
             // would be a prefix this text never had.
-            self.reset()?;
+            self.clear()?;
             let logits = self.session.forward_all(part)?;
             if logits.len() != part.len() * vocab {
                 return Err(format!(
@@ -471,7 +671,7 @@ impl Llm {
 
         // The cache now holds a stretch of somebody's test set, which is not
         // a prefix of anyone's next conversation.
-        self.reset()?;
+        self.clear()?;
 
         let mean = nats / scored.max(1) as f64;
         Ok(Perplexity {

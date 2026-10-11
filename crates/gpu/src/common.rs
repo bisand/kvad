@@ -583,6 +583,35 @@ impl KvCache {
         KvCache { k: None, v: None, len: 0, axis, store: None }
     }
 
+    /// Positions the buffers have memory for, held or not.
+    pub(crate) fn room_held(&self) -> usize {
+        self.k.as_ref().and_then(|k| k.dim(self.axis).ok()).unwrap_or(0)
+    }
+
+    /// A cache like this one with nothing in it: what a session holds after
+    /// its conversation has been set aside.
+    pub(crate) fn emptied(&self) -> Self {
+        KvCache { k: None, v: None, len: 0, axis: self.axis, store: self.store }
+    }
+
+    /// Set a session's caches aside, leaving empty ones: the body of
+    /// `Session::park` for every backend whose cache is keys and values and
+    /// a position.
+    pub(crate) fn park(kv: &mut Vec<KvCache>, pos: &mut usize) -> kvad::model::Parked {
+        let empty = kv.iter().map(KvCache::emptied).collect();
+        Box::new((std::mem::replace(kv, empty), std::mem::take(pos)))
+    }
+
+    /// Take back what [`KvCache::park`] set aside.
+    pub(crate) fn resume(kv: &mut Vec<KvCache>, pos: &mut usize, parked: kvad::model::Parked) -> Res<()> {
+        let (theirs, at) = *parked.downcast::<(Vec<KvCache>, usize)>().map_err(|_| "that cache was not this backend's")?;
+        if theirs.len() != kv.len() {
+            return Err("that cache is another model's".into());
+        }
+        (*kv, *pos) = (theirs, at);
+        Ok(())
+    }
+
     /// Bytes one cached number takes, for a model that computes in
     /// `compute`: what `Session::kv_number_bytes` reports.
     pub(crate) fn number_bytes(&self, compute: DType) -> usize {

@@ -650,6 +650,12 @@ pub fn attend(spec: &Spec, q: &[f32], k_cache: &[f32], v_cache: &[f32], n_positi
 /// through the host between layers. So the cache moves inside, and everything
 /// above this line (prefix reuse, sampling, streaming) stops caring which
 /// backend it is talking to.
+/// A session's cache, taken out of it: one conversation's keys and values,
+/// to be put back when that conversation speaks again. Opaque, because what
+/// it is belongs to the backend that made it, and only that backend can
+/// take it back.
+pub type Parked = Box<dyn std::any::Any + Send>;
+
 pub trait Session: Send {
     fn spec(&self) -> &Spec;
     /// Run `tokens` and return logits for the **last** one.
@@ -666,6 +672,35 @@ pub trait Session: Send {
     /// the answer and what the alternative would cost.
     #[must_use]
     fn truncate(&mut self, len: usize) -> Res<usize>;
+    /// Positions the cache has memory for, which is at least the tokens it
+    /// holds and, where a backend grows its buffers ahead of need, more.
+    ///
+    /// What a conversation set aside costs is this and not its length: a
+    /// buffer that doubled to take token 257 is 512 positions of memory
+    /// whatever is in it.
+    fn room(&self) -> usize {
+        self.cached()
+    }
+
+    /// Take the cache out and leave an empty one in its place, or `None`
+    /// from a backend that keeps only the one conversation.
+    ///
+    /// This is what lets several conversations share a model without each
+    /// turn re-reading the whole of its own: the weights are everybody's,
+    /// and the cache is the only thing that is one conversation's. Setting
+    /// it aside moves a few pointers and copies nothing.
+    ///
+    /// `None` must leave the session exactly as it was.
+    fn park(&mut self) -> Option<Parked> {
+        None
+    }
+
+    /// Put back a cache [`Session::park`] gave out, in place of whatever
+    /// is held now, which is dropped.
+    fn resume(&mut self, _parked: Parked) -> Res<()> {
+        Err("this backend keeps one conversation, and has none set aside to take back".into())
+    }
+
     /// Short description of where this runs, e.g. `cpu q8` or `metal bf16`.
     fn label(&self) -> String;
     fn param_count(&self) -> usize;
@@ -837,6 +872,16 @@ impl Session for CpuSession {
 
     fn truncate(&mut self, len: usize) -> Res<usize> {
         Ok(self.cache.truncate(len))
+    }
+
+    fn park(&mut self) -> Option<Parked> {
+        let empty = KvCache::new(self.model.spec());
+        Some(Box::new(std::mem::replace(&mut self.cache, empty)))
+    }
+
+    fn resume(&mut self, parked: Parked) -> Res<()> {
+        self.cache = *parked.downcast::<KvCache>().map_err(|_| "that cache was not this backend's")?;
+        Ok(())
     }
 
     fn label(&self) -> String {

@@ -140,7 +140,8 @@ pub struct Resident {
     /// Whether it reads its experts from the disk through a cache, because
     /// it did not fit in what was left when it loaded.
     pub streams: bool,
-    /// Tokens in its KV cache after its last generation.
+    /// Tokens in its KV cache after its last generation, across every
+    /// conversation it is keeping.
     ///
     /// Read from the last `Stats` rather than from the session, because the
     /// session lives on the engine thread and asking it during a generation
@@ -1167,10 +1168,10 @@ fn run(queue: Closing, loaders: Loaders, budget: Budget, shared: Shared) {
                     Some(slot) => {
                         shared.begin(ticket.id, &slot.engine.cancel);
                         slot.engine.send(Cmd::Chat { messages, tools, sampling, fresh });
-                        // What the cache holds now: the prompt it prefilled
-                        // plus everything it generated.
+                        // What the cache holds now, across every conversation
+                        // the model is keeping.
                         let cached = drain_chat(&slot.engine.rx, &out, &ticket.stop, &slot.engine.cancel)
-                            .map(|stats| stats.prompt_tokens + stats.generated_tokens);
+                            .map(|stats| stats.held_tokens);
                         touch(&on, clock, cached);
                     }
                     None => {
@@ -1190,7 +1191,7 @@ fn run(queue: Closing, loaders: Loaders, budget: Budget, shared: Shared) {
                         shared.begin(ticket.id, &slot.engine.cancel);
                         slot.engine.send(Cmd::Complete { prompt, sampling, explain, fresh });
                         let cached = drain_chat(&slot.engine.rx, &out, &ticket.stop, &slot.engine.cancel)
-                            .map(|stats| stats.prompt_tokens + stats.generated_tokens);
+                            .map(|stats| stats.held_tokens);
                         touch(&on, clock, cached);
                     }
                     None => {
@@ -1217,9 +1218,9 @@ fn run(queue: Closing, loaders: Loaders, budget: Budget, shared: Shared) {
                     Some(slot) => {
                         slot.engine.send(Cmd::Perplexity { text, window });
                         let scored = drain_score(&slot.engine.rx, &progress);
-                        // Scoring ends by clearing the cache, so nothing is
-                        // held.
-                        touch(&on, clock, Some(0));
+                        // Scoring holds nothing of its own afterwards, and
+                        // what it found the model holding is still held.
+                        touch(&on, clock, None);
                         scored
                     }
                     None => Err(missing(&on)),
@@ -1299,6 +1300,9 @@ fn load(
     kvad::experts::set_room(Some(room));
     let engine = Engine::spawn(loaders());
     engine.send(Cmd::Load { repo: key.repo.clone(), backend: key.backend });
+    // What the model is charged for below is what it may keep: every
+    // conversation's cache together, not each one's.
+    engine.send(Cmd::Hold(budget.context));
     let result = drain_load(&engine.rx, progress);
     kvad::experts::set_room(None);
     let model = result.map_err(LoadError::Failed)?;
@@ -1900,6 +1904,68 @@ mod tests {
         assert_eq!(gone, [id_of(&repo, F32)]);
         assert_eq!(sched.residents().iter().map(|r| r.id.clone()).collect::<Vec<_>>(), [id_of(&repo, Q8)]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two conversations taking turns on one model each find their own
+    /// cache when they speak again, and say what they would have said alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conversations_taking_turns_keep_their_caches() {
+        let dir = crate::compare::tests::tiny_model("turns");
+        let repo = dir.to_string_lossy().into_owned();
+        let sched = Scheduler::spawn(kvad::service::cpu_loader, roomy());
+
+        // One continuation: what was said, and what the cache had to offer.
+        async fn say(sched: &Scheduler, on: &Key, prompt: &str, fresh: bool) -> (String, Stats) {
+            let sampling = Sampling { temperature: 0.0, max_tokens: 3, ..Sampling::default() };
+            let (_, mut pieces) = sched.complete(None, Entry::Request, on, prompt.into(), sampling, 0, fresh).unwrap();
+            let (mut text, mut done) = (String::new(), None);
+            while let Some(piece) = pieces.recv().await {
+                match piece {
+                    Piece::Token(t) => text.push_str(&t),
+                    Piece::Done(stats) => done = Some(stats),
+                    Piece::Failed(why) => panic!("{why}"),
+                    Piece::Chose(_) => {}
+                }
+            }
+            (text, done.expect("no end to the generation"))
+        }
+
+        for backend in [F32, Q8] {
+            sched.load(repo.clone(), backend, nowhere()).await.unwrap();
+            let on = Key { repo: repo.clone(), backend };
+
+            // The tiny model reads characters, so a token is a character, and
+            // its context is 32 of them: two conversations fit and three do
+            // not.
+            let (a, b) = ("the cat", "on the");
+            let (a1, first) = say(&sched, &on, a, false).await;
+            assert_eq!((first.cached_tokens, first.conversations), (0, 1));
+            let (b1, other) = say(&sched, &on, b, false).await;
+            assert_eq!(other.cached_tokens, 0, "{backend}: one conversation was read as another's prefix");
+            assert_eq!(other.conversations, 2, "{backend}: the first conversation was not kept");
+            assert_eq!(other.held_tokens, a.len() + b.len() + 6);
+
+            // Each speaks again, and finds everything it said and was told.
+            let a_next = format!("{a}{a1} s");
+            let (a2, again) = say(&sched, &on, &a_next, false).await;
+            assert_eq!(again.cached_tokens, a.len() + 3, "{backend}: the first conversation lost its cache");
+            let b_next = format!("{b}{b1} m");
+            let (b2, _) = say(&sched, &on, &b_next, false).await;
+
+            // A third has no room beside both: the one that spoke longest
+            // ago goes, and what is held stays inside the context.
+            let (_, third) = say(&sched, &on, "sat on the mat", false).await;
+            assert_eq!(third.cached_tokens, 0);
+            assert!(third.held_tokens <= 32, "{backend}: {} tokens held of a context of 32", third.held_tokens);
+            assert_eq!(third.conversations, 2, "{backend}: nothing was let go to make room");
+
+            // With no cache at all, the same prompts get the same replies.
+            assert_eq!(say(&sched, &on, &a_next, true).await.0, a2, "{backend}: a kept cache changed a reply");
+            assert_eq!(say(&sched, &on, &b_next, true).await.0, b2, "{backend}: a kept cache changed a reply");
+
+            sched.unload(Some(on)).await.unwrap();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

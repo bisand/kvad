@@ -141,6 +141,18 @@ get ten times the machine, and one request is not kept behind another
 account's ten. One account may have `[server] queue_per_account` waiting (4
 unless set); its next is a 429. Turns are counted in generations, not in
 tokens. Nothing passes a load or an unload.
+
+**Each conversation keeps its cache.** A chat prefills only its newest
+message because the turn before left its keys and values in the model, and
+until several were kept that held for one conversation at a time: two people
+taking turns each found the other's conversation there and re-read their own
+from the start, every turn. Now the conversations that are not speaking are
+set aside whole — a few pointers moved, nothing copied — and the one that
+speaks is found by its tokens, as whichever shares the longest prefix with
+the prompt. Nothing names a conversation; the transcript an OpenAI client
+sends is the key. They fit in the context the model was already charged for
+(`[server] context`), and when they do not, the one that spoke longest ago
+goes. A reply's `kvad.conversations` and `kvad.held_tokens` say what is kept.
 **Comparisons are sequences**: the Playground's "side by side" and the
 Benchmarks page both load each variant in turn, and both say so on the page
 rather than implying a race. **Training is not queued behind chat, or chat

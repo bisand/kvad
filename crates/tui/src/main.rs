@@ -29,6 +29,27 @@ use std::time::Duration;
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn main() -> Res<()> {
+    // Before the screen is taken over: help and the version are printed and
+    // read, not drawn. A word that starts with a dash is not a model, and
+    // used to be loaded as one.
+    if let Some(first) = std::env::args().nth(1) {
+        let program = &kvad::spec::TUI;
+        match first.as_str() {
+            "-h" | "--help" | "help" => {
+                print!("{}", kvad::help::program(program));
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("kvad-tui {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            flag if flag.starts_with('-') => {
+                kvad::help::bad_flag(program, program.bare, &format!("{flag} is not an option of `kvad-tui`."), flag)
+            }
+            _ => {}
+        }
+    }
+
     // A panic with the terminal in raw mode leaves the shell unusable and the
     // message invisible. Restore first, then let the default hook print.
     let default_hook = std::panic::take_hook();

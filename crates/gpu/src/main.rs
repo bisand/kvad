@@ -3,6 +3,11 @@
 //!     kvad-gpu run  [--model REPO] [--prompt TEXT] [--device metal] [--dtype bf16]
 //!     kvad-gpu chat [--model REPO] [--system TEXT]
 //!     kvad-gpu tune [MODEL] --data DIR --name NAME      (a LoRA for SDXL)
+//!     kvad-gpu help [COMMAND]
+//!
+//! What each takes is in `kvad::spec::GPU`, which is what `help` prints and
+//! what `kvad` completes this binary's command line from. The parsers below
+//! stay a `match`; a test beside that table reads them, so the two agree.
 //!
 //! Everything except the forward pass is shared with the CPU engine: the same
 //! Hub client, tokenizer, chat template, sampler and generation loop. Only the
@@ -57,22 +62,12 @@ impl Default for Args {
     }
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "usage: kvad-gpu <run|chat> [options]\n       kvad-gpu tune --help\n\n\
-         options:\n  \
-           --model REPO        HuggingFace repo id (default: active, else {DEFAULT_MODEL})\n  \
-           --device D          metal | cuda | cpu (default: best available)\n  \
-           --dtype T           bf16 | f16 | f32 (default bf16)\n  \
-           --quant Q           none | q8 | q4 | q4k | q6k (default none)\n  \
-           --prompt TEXT       prompt for `run`\n  \
-           --system TEXT       system prompt for `chat`\n  \
-           --max-tokens N      generation budget (default 256)\n  \
-           --temperature F     0 is greedy (default 0.7)\n  \
-           --top-k N / --top-p F / --seed N\n  \
-           --greedy            shorthand for --temperature 0"
-    );
-    std::process::exit(2);
+/// What this binary's command line is: its commands, and each one's flags.
+const PROGRAM: &kvad::spec::Program = &kvad::spec::GPU;
+
+/// A flag that is not one, or one with nothing after it, of `command`.
+fn bad_flag(command: &str, problem: &str, flag: &str) -> ! {
+    kvad::help::bad_flag(PROGRAM, PROGRAM.command(command).unwrap_or(PROGRAM.bare), problem, flag)
 }
 
 fn parse_args() -> Args {
@@ -85,8 +80,8 @@ fn parse_args() -> Args {
             i = 1;
         }
     }
-    if matches!(a.command.as_str(), "-h" | "--help" | "help") {
-        usage();
+    if PROGRAM.command(&a.command).is_none() {
+        kvad::help::unknown_command(PROGRAM, &a.command);
     }
     while i < argv.len() {
         let flag = argv[i].clone();
@@ -95,9 +90,16 @@ fn parse_args() -> Args {
             i += 1;
             continue;
         }
+        // A word, after a command that takes none.
+        if !flag.starts_with('-') {
+            let problem = format!("`kvad-gpu {}` takes options and no words, and `{flag}` is a word.", a.command);
+            bad_flag(&a.command, &problem, "");
+        }
+        if PROGRAM.takes_value(&flag).is_none() {
+            bad_flag(&a.command, &format!("{flag} is not an option of `kvad-gpu {}`.", a.command), &flag);
+        }
         let Some(value) = argv.get(i + 1).cloned() else {
-            eprintln!("missing value for {flag}");
-            usage();
+            bad_flag(&a.command, &format!("{flag} needs a value after it."), "");
         };
         let num = || -> f64 {
             value.parse().unwrap_or_else(|_| {
@@ -117,10 +119,8 @@ fn parse_args() -> Args {
             "--top-k" => a.top_k = num() as usize,
             "--top-p" => a.top_p = num() as f32,
             "--seed" => a.seed = num() as u64,
-            _ => {
-                eprintln!("unknown flag {flag}");
-                usage();
-            }
+            // `tune`'s, which `run` and `chat` do not take.
+            _ => bad_flag(&a.command, &format!("{flag} is not an option of `kvad-gpu {}`.", a.command), &flag),
         }
         i += 2;
     }
@@ -167,8 +167,39 @@ fn load(args: &Args) -> Res<Llm> {
 // several lines of prose meant to be read: the unread-tensor guard names the
 // weights it found, and the quantiser names the block size that does not fit.
 fn main() {
-    // `tune` has options of its own, and reads them itself.
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Help and the version before anything is parsed. Bare `kvad-gpu` is the
+    // first page: it used to be `run`, which answered "what is this" by
+    // loading a model. `--help` after a command is that command's page.
+    //
+    // Asked for as a flag, that is: not as the value of one. `tune` is run by
+    // the server with a caption somebody typed, and `--sample --help` is a
+    // prompt, however odd a one.
+    let asked = |flags: &[&str]| {
+        let mut words = argv.iter().map(String::as_str);
+        while let Some(word) = words.next() {
+            if flags.contains(&word) {
+                return true;
+            }
+            if PROGRAM.takes_value(word) == Some(true) {
+                words.next();
+            }
+        }
+        false
+    };
+    match argv.first().map(String::as_str) {
+        None => kvad::help::show(PROGRAM, None),
+        Some("help") => kvad::help::show(PROGRAM, argv.get(1).map(String::as_str)),
+        Some(first) if asked(&["-h", "--help"]) => {
+            kvad::help::show(PROGRAM, Some(first).filter(|f| !f.starts_with('-')))
+        }
+        _ if asked(&["-V", "--version"]) => {
+            println!("kvad-gpu {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        _ => {}
+    }
+    // `tune` has options of its own, and reads them itself.
     if argv.first().map(String::as_str) == Some("tune") {
         if let Err(e) = tune(&argv[1..]) {
             eprintln!("error: {e}");
@@ -180,10 +211,7 @@ fn main() {
     let done = match args.command.as_str() {
         "run" => run(args),
         "chat" => chat(args),
-        other => {
-            eprintln!("unknown command `{other}`");
-            usage();
-        }
+        other => kvad::help::unknown_command(PROGRAM, other),
     };
     if let Err(e) = done {
         eprintln!("error: {e}");
@@ -191,48 +219,14 @@ fn main() {
     }
 }
 
-const TUNE_USAGE: &str = "usage: kvad-gpu tune [MODEL] --data DIR --name NAME [options]
-
-Train a LoRA for SDXL on a folder of pictures, each with its caption in a
-.txt of the same name beside it. MODEL is SDXL's repo unless given.
-
-options:
-  --data DIR          the folder of pictures and captions
-  --name NAME         what to call the LoRA; it is written to the data
-                      directory's loras/NAME.safetensors
-  --out FILE          or the file to write it to
-  --from FILE         go on from a LoRA this wrote
-  --caption TEXT      the caption of every picture that has none
-  --size N            pixels a side, a multiple of 64 (default 1024)
-  --rank N            (default 16)
-  --alpha F           the LoRA is scaled by alpha / rank (default: the rank)
-  --steps N           (default 1000)
-  --lr F              (default 1e-4)
-  --eval-every N      steps between validation measurements (default 100)
-  --holdout N         pictures kept out of training to measure on
-                      (default: a tenth, from one to four; none of under 5)
-  --sample TEXT       a prompt to draw before the first step and at every
-                      measurement, from the same seed each time; may be
-                      given more than once
-  --sample-size N     pixels a side of a sample (default: --size)
-  --sample-steps N    its denoising steps (default 20)
-  --samples DIR       where they are written (default: the LoRA's file's
-                      name, ending .samples)
-  --seed N            (default 1337)
-  --ffmpeg FILE       the ffmpeg that decodes the pictures (default: found)
-  --cap GB            end the run if its memory passes this (default: three
-                      quarters of the machine's)
-  --progress json     also say what the run does on standard output, one
-                      JSON object a line, for a program that follows it;
-                      the run then ends when the program that started it
-                      does";
+/// Where `tune`'s mistakes point: its page, which `kvad::help` prints.
+const TUNE_HELP: &str = "`kvad-gpu tune --help` says what it takes.";
 
 /// `kvad-gpu tune`: [`kvad_gpu::image::tune::run`] from a command line.
 fn tune(argv: &[String]) -> Res<()> {
     use kvad_gpu::image::tune;
-    if argv.is_empty() || argv.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
-        eprintln!("{TUNE_USAGE}");
-        std::process::exit(2);
+    if argv.is_empty() {
+        kvad::help::show(PROGRAM, Some("tune"));
     }
     let (mut model, mut flags, mut samples) = (None, std::collections::HashMap::new(), Vec::new());
     let mut i = 0;
@@ -251,14 +245,14 @@ fn tune(argv: &[String]) -> Res<()> {
                 model = Some(argv[i].clone());
                 i += 1;
             }
-            None => return Err(format!("`{}` is one model too many\n\n{TUNE_USAGE}", argv[i]).into()),
+            None => return Err(format!("`{}` is one model too many\n{TUNE_HELP}", argv[i]).into()),
         }
     }
     let mut take = |flag: &str| flags.remove(flag);
     fn number<T: std::str::FromStr>(flag: &str, value: Option<String>) -> Res<Option<T>> {
         value.map(|v| v.parse::<T>().map_err(|_| format!("--{flag} expects a number, got `{v}`").into())).transpose()
     }
-    let data = std::path::PathBuf::from(take("data").ok_or_else(|| format!("which pictures? --data DIR\n\n{TUNE_USAGE}"))?);
+    let data = std::path::PathBuf::from(take("data").ok_or_else(|| format!("which pictures? --data DIR\n{TUNE_HELP}"))?);
     let out = match (take("out"), take("name")) {
         (Some(file), _) => std::path::PathBuf::from(file),
         (None, Some(name)) => {
@@ -267,7 +261,7 @@ fn tune(argv: &[String]) -> Res<()> {
             }
             kvad::weights::data_dir().join("loras").join(format!("{name}.safetensors"))
         }
-        (None, None) => return Err(format!("a LoRA needs a name: --name NAME\n\n{TUNE_USAGE}").into()),
+        (None, None) => return Err(format!("a LoRA needs a name: --name NAME\n{TUNE_HELP}").into()),
     };
     let ffmpeg = match take("ffmpeg") {
         Some(file) => std::path::PathBuf::from(file),
@@ -302,7 +296,7 @@ fn tune(argv: &[String]) -> Res<()> {
         Some(other) => return Err(format!("--progress json is the one there is, not `{other}`").into()),
     };
     if let Some(flag) = flags.keys().next() {
-        return Err(format!("unknown flag --{flag}\n\n{TUNE_USAGE}").into());
+        bad_flag("tune", &format!("--{flag} is not an option of `kvad-gpu tune`."), &format!("--{flag}"));
     }
     // A backward pass that does not fit is not refused by the system: it
     // takes the machine down. The run ends itself first.

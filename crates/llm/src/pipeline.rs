@@ -61,6 +61,23 @@ pub fn component(repo: &str, dir: &str, weights: &str, watch: &Watcher) -> Res<(
 /// SD 1.5's and FLUX's CLIP all read it.
 pub const CLIP_TOKENIZER_REPO: &str = "openai/clip-vit-large-patch14";
 
+/// What a repo is in the cache for, when it is there for other models'
+/// sake and is not one: a tokenizer or a VAE that a pipeline reads from
+/// somewhere other than its own repo.
+///
+/// A listing asks, so that it can say so. Left to the questions it asks of a
+/// model, a tokenizer by itself is "a download that did not finish", which
+/// invites somebody to finish it, or to delete what SDXL cannot load without.
+pub fn support(repo: &str) -> Option<&'static str> {
+    let is = |other: &str| repo.eq_ignore_ascii_case(other);
+    match () {
+        _ if is(CLIP_TOKENIZER_REPO) => Some("CLIP's tokenizer, which SDXL, SD 1.5 and FLUX read from here"),
+        _ if is(sdxl::VAE_REPO) => Some("the VAE that SDXL decodes with"),
+        _ if is(qwen::TOKENIZER_REPO) => Some("the tokenizer that Qwen-Image reads from here"),
+        _ => None,
+    }
+}
+
 /// SDXL: two text encoders and a UNet of the repo's own, and a VAE that is
 /// not.
 pub mod sdxl {

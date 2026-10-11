@@ -373,6 +373,11 @@ impl Session for GpuGpt2 {
         self.pos
     }
 
+    /// Whole chunks from the front, as `forward` cuts.
+    fn prefill_pass(&self, left: usize) -> usize {
+        left.min(PREFILL_CHUNK)
+    }
+
     fn truncate(&mut self, len: usize) -> Res<usize> {
         self.rewind(len)?;
         // Keys and values rewind exactly, and `rewind` clamps a request for

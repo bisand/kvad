@@ -246,3 +246,45 @@ fn a_session_advances_conversations_it_has_set_aside() {
         assert_eq!(all.cached(), prompt.len() + NEXT.len());
     }
 }
+
+/// A prompt read a pass at a time is the prompt read in one call: the same
+/// logits to the last bit, and the same cache.
+///
+/// The engine reads a long prompt between other replies' tokens, a pass at
+/// a time, and promises that this changes when the prompt is read and not
+/// what the model makes of it. That holds only if the passes are cut where
+/// the backend would have cut them itself, which is what
+/// [`Session::prefill_pass`] is for. Exact, not close: at q8 a pass cut
+/// somewhere else is a different order of additions, and rounding turns
+/// that into a different reply.
+#[test]
+fn a_prompt_read_a_pass_at_a_time_is_the_prompt_read_at_once() {
+    let prompt: Vec<u32> = (0..23u32).map(|i| (i * 7 + 3) % VOCAB as u32).collect();
+    for (model_type, precision) in [("llama", Precision::F32), ("qwen3", Precision::Q8)] {
+        let build = |tag: &str| {
+            let (model, _) = tiny(model_type, precision, tag);
+            // Five tokens a pass: four whole passes and three left over.
+            CpuSession::new(model, precision).reading(5)
+        };
+        let (mut once, mut passes) = (build("read-once"), build("read-passes"));
+
+        let want = once.forward(&prompt).unwrap();
+
+        let (mut at, mut got, mut count) = (0, Vec::new(), 0);
+        while at < prompt.len() {
+            let pass = passes.prefill_pass(prompt.len() - at);
+            assert!((1..=prompt.len() - at).contains(&pass), "a pass of {pass} with {} left", prompt.len() - at);
+            got = passes.forward(&prompt[at..at + pass]).unwrap();
+            // Something else's token, between the passes: a conversation
+            // set aside is advanced and the prompt's cache is left alone.
+            at += pass;
+            count += 1;
+        }
+        assert_eq!(count, 5, "{model_type}: the prompt was not read in passes");
+        assert_eq!(passes.cached(), once.cached());
+        assert_eq!(got, want, "{model_type} {precision}: a pass at a time changed what the model made of the prompt");
+
+        // And the next token after it agrees too, so the caches do.
+        assert_eq!(passes.forward(&[9]).unwrap(), once.forward(&[9]).unwrap());
+    }
+}

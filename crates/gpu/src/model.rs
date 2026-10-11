@@ -606,6 +606,15 @@ impl Session for GpuLlama {
         self.pos
     }
 
+    /// The odd-sized chunk first and whole ones after: as `forward` cuts,
+    /// for the reason it gives.
+    fn prefill_pass(&self, left: usize) -> usize {
+        match left % PREFILL_CHUNK {
+            0 => left.min(PREFILL_CHUNK),
+            ragged => ragged,
+        }
+    }
+
     fn truncate(&mut self, len: usize) -> Res<usize> {
         self.rewind(len)?;
         // Keys and values rewind exactly, and `rewind` clamps a request for

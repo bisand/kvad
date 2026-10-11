@@ -695,6 +695,21 @@ pub trait Session: Send {
     /// the answer and what the alternative would cost.
     #[must_use]
     fn truncate(&mut self, len: usize) -> Res<usize>;
+    /// How many of `left` prompt tokens this backend would read in its
+    /// next pass, were it handed all of them.
+    ///
+    /// A long prompt is read in several passes whoever asks — a pass over
+    /// everything at once is an attention matrix that does not fit. This
+    /// says where the backend would cut, so that a caller with something to
+    /// do between passes can feed the prompt a pass at a time and have the
+    /// model do exactly the arithmetic it would have done in one call.
+    ///
+    /// The default is all of them: a backend that does not say reads a
+    /// prompt in one go.
+    fn prefill_pass(&self, left: usize) -> usize {
+        left
+    }
+
     /// Positions the cache has memory for, which is at least the tokens it
     /// holds and, where a backend grows its buffers ahead of need, more.
     ///
@@ -837,6 +852,16 @@ impl CpuSession {
     }
 }
 
+impl CpuSession {
+    /// Read a prompt `chunk` tokens a pass rather than the usual 64. For
+    /// measuring what the size is worth, and for tests that want several
+    /// passes out of a prompt a small model can hold.
+    pub fn reading(mut self, chunk: usize) -> Self {
+        self.chunk = chunk.max(1);
+        self
+    }
+}
+
 /// How many threads to decode on.
 ///
 /// Not `num_cpus`. This machine reports 18 logical CPUs, but six of them are
@@ -929,6 +954,12 @@ impl Session for CpuSession {
 
     fn cached(&self) -> usize {
         self.cache.len
+    }
+
+    /// Whole chunks from the front, and what is left over last: as
+    /// [`CpuSession::forward`] cuts.
+    fn prefill_pass(&self, left: usize) -> usize {
+        left.min(self.chunk)
     }
 
     fn truncate(&mut self, len: usize) -> Res<usize> {

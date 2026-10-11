@@ -118,6 +118,13 @@ pub struct Server {
     /// matter of course, and what is too many depends on who shares the
     /// machine. Not applied with `auth.mode = "none"`.
     pub generations_per_minute: Option<usize>,
+    /// How many replies run at once on one model, each a token further
+    /// every step. Unset, `scheduler::DEFAULT_BATCH`; one is one at a time.
+    ///
+    /// More at once is more tokens a second in total and fewer for each
+    /// reply, and a reply that begins makes the others wait while its
+    /// prompt is read.
+    pub batch: Option<usize>,
 }
 
 /// What happens to a video once it is made.
@@ -277,6 +284,7 @@ impl Default for Server {
             queue: None,
             queue_per_account: None,
             generations_per_minute: None,
+            batch: None,
         }
     }
 }

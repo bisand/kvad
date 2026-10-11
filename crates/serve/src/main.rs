@@ -246,7 +246,7 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
     ));
     let state = auth::State {
         auth: auth::provider(cfg.auth.mode, &cfg.auth.oidc)?.into(),
-        engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader, budget).bounded(cfg.server.queue.unwrap_or(scheduler::DEFAULT_LIMIT)).sharing(cfg.server.queue_per_account.unwrap_or(scheduler::DEFAULT_SHARE)).pacing(cfg.server.generations_per_minute.unwrap_or(0))),
+        engine: std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader, budget).bounded(cfg.server.queue.unwrap_or(scheduler::DEFAULT_LIMIT)).sharing(cfg.server.queue_per_account.unwrap_or(scheduler::DEFAULT_SHARE)).pacing(cfg.server.generations_per_minute.unwrap_or(0)).batching(cfg.server.batch.unwrap_or(scheduler::DEFAULT_BATCH))),
         jobs: std::sync::Arc::clone(&job_runner),
         metrics: std::sync::Arc::clone(&metrics),
         setup: std::sync::Arc::clone(&setup),

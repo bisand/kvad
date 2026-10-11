@@ -124,7 +124,7 @@ in this parser rather than a redesign.
 
 ## One model at a time, said out loud
 
-The engine holds one loaded model and runs one generation at a time. Every
+An engine holds one loaded model, and one engine works at a time. Every
 awkward thing about this server follows from that, and the design is mostly a
 series of decisions about where to be honest about it.
 
@@ -143,6 +143,36 @@ unless set); its next is a 429. Turns are counted in generations, not in
 tokens. Nothing passes a load or an unload. An account can also be held to
 `[server] generations_per_minute`, which is off unless set; over it, the 429
 says how many seconds until the next request will be taken.
+
+**A few replies run at once.** On one model, up to `[server] batch` replies
+(4 unless set) are written together, each a token further every step, and one
+that ends gives its place to the next in line. Whose turn it is to join is
+whose turn it is to run; if that is a load, or a request for another model,
+nobody joins and the batch runs down first. What this buys depends on where
+the model is:
+
+| Qwen2.5-1.5B, four clients at once | total tok/s | each reply, tok/s | first token, median |
+|---|---|---|---|
+| `cpu-q8`, one at a time | 44 | 46 | 4.0 s |
+| `cpu-q8`, together | 93 | 24 | 0.4 s |
+| `gpu-q8`, one at a time | 121 | 124 | 1.5 s |
+| `gpu-q8`, together | 122 | 31 | 0.1 s |
+
+On the CPU the weights are read once a step for everybody, which is the
+throughput. On the GPU each reply still takes its own pass, so the total is
+what it was and the gain is that nobody waits for somebody else's whole reply
+before their own begins. A reply's `kvad.beside` says how many others it was
+written beside. A new reply's prompt is read in one go, and the others wait
+while it is. A request that asks for no cache — a benchmark, an evaluation —
+runs alone.
+
+At `cpu-q8` on a CPU with the `i8mm` instructions, a reply written beside
+others is not always word for word the reply written alone. The kernel for
+several rows adds up in a different order, and rounding activations to eight
+bits turns that into differences the size of quantisation itself — 0.3 to 0.5
+in a logit, the same distance from the f32 model either way — which is enough
+to tip a greedy choice between two near-equal tokens. At f32, and on the GPU,
+they are the same reply.
 
 **Each conversation keeps its cache.** A chat prefills only its newest
 message because the turn before left its keys and values in the model, and

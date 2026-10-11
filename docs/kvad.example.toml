@@ -46,6 +46,12 @@ bind = "127.0.0.1:5823"
 # per request, so four images are one. Not applied with auth.mode = "none".
 # generations_per_minute = 30
 
+# How many replies are written at once on one model, each a token further
+# every step. More at once is more tokens a second in total on the CPU, and
+# on the GPU the same total; either way each reply is slower and nobody
+# waits for another's whole reply before theirs begins. 1 is one at a time.
+# batch = 4
+
 [data]
 # Where the database, generated images, datasets and trained models go.
 # Defaults to $XDG_DATA_HOME/kvad, or ~/.local/share/kvad. `~/` is your home

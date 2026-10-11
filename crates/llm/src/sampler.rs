@@ -39,6 +39,19 @@ impl Sampler {
         self.rng = Rng::new(seed);
     }
 
+    /// A sampler of its own for one generation, set as that generation
+    /// asked.
+    ///
+    /// Several generations at once cannot share one stream: which draws
+    /// each got would depend on how the others' tokens fell between them.
+    /// With a seed, this is the stream that seed always meant. Without one
+    /// it is seeded from this sampler's own stream, which moves on — so two
+    /// requests alike in everything still differ, as they did when they ran
+    /// one after the other.
+    pub fn for_one(&mut self, temperature: f32, top_k: usize, top_p: f32, seed: Option<u64>) -> Sampler {
+        Sampler::new(temperature, top_k, top_p, seed.unwrap_or_else(|| self.rng.next_u64()))
+    }
+
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
         if self.temperature <= 0.0 {
             return argmax(logits) as u32;

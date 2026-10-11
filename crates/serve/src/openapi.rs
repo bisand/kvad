@@ -360,7 +360,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       `Retry-After`, and `per_account` how many of those one account may \
                       have before its next is answered 429 — zero for no limit. \
                       `per_minute` is how many generations one account may ask for in a \
-                      minute, zero for any number. An \
+                      minute, zero for any number. `batch` is how many replies are \
+                      written at once on one model. An \
                       administrator is shown every generation, with whose it is.",
         query: &[], body: None, produces: JSON, events: &[],
     },

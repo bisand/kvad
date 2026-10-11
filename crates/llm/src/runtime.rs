@@ -38,6 +38,9 @@ pub struct Llm {
     clock: u64,
     /// Tokens of cache this model may hold across every conversation.
     hold: usize,
+    /// Tokens of that spoken for by generations whose caches are out of the
+    /// model's hands while they run; see [`Llm::detach`].
+    lent: usize,
 }
 
 /// A generation under way: what [`Llm::begin`] hands out, [`Llm::step`]
@@ -58,6 +61,20 @@ pub struct Run {
     stats: Stats,
     /// When prefill ended and decoding began.
     decoding: Instant,
+    /// The generation's own cache, once it has been taken out of the
+    /// session so that another generation can use it; see [`Llm::detach`].
+    cache: Option<Parked>,
+    /// Tokens of the model's hold this generation was counted for when its
+    /// cache left: what it may grow to.
+    reserved: usize,
+}
+
+impl Run {
+    /// Whether the generation's cache is its own to carry rather than the
+    /// session's: whether it can be advanced beside others.
+    pub fn detached(&self) -> bool {
+        self.cache.is_some()
+    }
 }
 
 /// A conversation that is not the one in the session: its tokens, and the
@@ -176,6 +193,10 @@ pub struct Stats {
     /// conversation it is keeping, and how many conversations that is.
     pub held_tokens: usize,
     pub conversations: usize,
+    /// The most other generations this one ran beside at any step. Each
+    /// step is everybody's, so this is why a reply was slower than the
+    /// model's own pace: it was not the only one being written.
+    pub beside: usize,
     pub generated_tokens: usize,
     pub prefill_secs: f32,
     pub decode_secs: f32,
@@ -276,6 +297,7 @@ impl Llm {
             parked: Vec::new(),
             clock: 0,
             hold: 0,
+            lent: 0,
         }
         .holding(usize::MAX))
     }
@@ -458,7 +480,7 @@ impl Llm {
     /// Counted in the memory each one has, not the tokens in it, since the
     /// memory is what was charged for.
     fn make_room(&mut self, coming: usize) {
-        let coming = coming.min(self.spec.n_ctx).max(self.session.room());
+        let coming = coming.min(self.spec.n_ctx).max(self.session.room()) + self.lent;
         let waiting = |parked: &[Conversation]| parked.iter().map(|c| c.room).sum::<usize>();
         while !self.parked.is_empty()
             && (self.parked.len() > MOST_PARKED || waiting(&self.parked) + coming > self.hold)
@@ -568,7 +590,74 @@ impl Llm {
             explain,
             stats,
             decoding: Instant::now(),
+            cache: None,
+            reserved: 0,
         })
+    }
+
+    /// Take a generation's cache out of the session and give it to the
+    /// generation to carry, leaving the session free for another's prefill.
+    /// `false` from a backend that keeps one conversation, with nothing
+    /// changed.
+    ///
+    /// `run` has to be the generation whose conversation the session holds:
+    /// the one begun last, with none detached since. Until it is finished
+    /// the model does not count its conversation among the ones it keeps,
+    /// but does count the room it may come to against [`Llm::hold`].
+    ///
+    /// This is what lets several generations run at once. The session has
+    /// one conversation in it; a generation that carries its own cache can
+    /// be advanced beside others in one pass —
+    /// [`Session::forward_each`] — and needs the session only to begin and
+    /// to end.
+    pub fn detach(&mut self, run: &mut Run) -> bool {
+        if run.cache.is_some() {
+            return true;
+        }
+        let Some(cache) = self.session.park() else {
+            return false;
+        };
+        run.cache = Some(cache);
+        run.reserved = (run.ids.len() + run.left).min(self.spec.n_ctx);
+        self.lent += run.reserved;
+        self.cached_ids.clear();
+        self.prompt_len = 0;
+        true
+    }
+
+    /// Give up on a generation that failed: what [`Llm::finish`] is to one
+    /// that did not. Its cache, if it carried one, goes with it.
+    pub fn abandon(&mut self, run: Run) {
+        self.lent = self.lent.saturating_sub(run.reserved);
+    }
+
+    /// The next token of each of several generations, all of them detached:
+    /// [`Llm::step`] for more than one, with the model read once for all of
+    /// them where the backend can.
+    ///
+    /// `None` for a generation is the end of that one; the others go on. An
+    /// error is everybody's, since the pass that failed was.
+    pub fn step_each(&mut self, runs: &mut [&mut Run], samplers: &mut [&mut Sampler]) -> Res<Vec<Option<Chosen>>> {
+        // Feed every token handed out last time, in one pass.
+        let waiting: Vec<usize> = (0..runs.len()).filter(|&i| !runs[i].fed).collect();
+        if !waiting.is_empty() {
+            let mut tokens = Vec::with_capacity(waiting.len());
+            let mut caches = Vec::with_capacity(waiting.len());
+            for &i in &waiting {
+                tokens.push(*runs[i].ids.last().expect("a run holds its prompt, which is not empty"));
+                caches.push(runs[i].cache.take().ok_or("a generation advanced beside others has to be detached")?);
+            }
+            let fed = self.session.forward_each(&tokens, &mut caches);
+            // The caches go back whatever happened, or they are lost.
+            for (&i, cache) in waiting.iter().zip(caches) {
+                runs[i].cache = Some(cache);
+            }
+            for (&i, logits) in waiting.iter().zip(fed?) {
+                runs[i].logits = logits;
+                runs[i].fed = true;
+            }
+        }
+        runs.iter_mut().zip(samplers.iter_mut()).map(|(run, sampler)| self.choose(run, sampler)).collect()
     }
 
     /// The generation's next token, or `None` when it has ended: at an
@@ -579,11 +668,19 @@ impl Llm {
     /// steps — an interrupt, a reader that went away — cost nothing for the
     /// token nobody will follow.
     pub fn step(&mut self, run: &mut Run, sampler: &mut Sampler) -> Res<Option<Chosen>> {
+        if run.cache.is_some() {
+            return Ok(self.step_each(&mut [run], &mut [sampler])?.pop().flatten());
+        }
         if !run.fed {
             let last = *run.ids.last().expect("a run holds its prompt, which is not empty");
             run.logits = self.session.forward(&[last])?;
             run.fed = true;
         }
+        self.choose(run, sampler)
+    }
+
+    /// Sample a generation's next token from the logits it holds.
+    fn choose(&self, run: &mut Run, sampler: &mut Sampler) -> Res<Option<Chosen>> {
         if run.left == 0 {
             return Ok(None);
         }
@@ -618,9 +715,26 @@ impl Llm {
     /// the failure left, and dropping the [`Run`] leaves the model believing
     /// what it believed before, which the next prompt checks against the
     /// cache's own length.
+    ///
+    /// A generation that carried its own cache hands it back here: its
+    /// conversation becomes the one in the session, and whatever was there
+    /// is set aside.
     pub fn finish(&mut self, run: Run) -> (Stats, Vec<u32>) {
-        let Run { ids, prompt_len, mut stats, decoding, .. } = run;
+        let Run { ids, prompt_len, mut stats, decoding, cache, reserved, .. } = run;
         stats.decode_secs = decoding.elapsed().as_secs_f32();
+
+        self.lent = self.lent.saturating_sub(reserved);
+        if let Some(cache) = cache {
+            // A backend that gave the cache out can set one aside and take
+            // one back; if it somehow will not, the conversation is lost
+            // and the next prompt finds an empty cache, which is slow and
+            // not wrong.
+            if !self.set_aside() || self.session.resume(cache).is_err() {
+                let _ = self.clear();
+                return (stats, ids);
+            }
+            self.make_room(self.session.room());
+        }
 
         self.cached_ids = ids.clone();
         self.prompt_len = prompt_len;

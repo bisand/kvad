@@ -43,6 +43,11 @@ pub struct Request {
     pub path: String,
     pub status: u16,
     pub millis: f64,
+    /// Whose it was, for a generation on a server with accounts. Null for
+    /// everything else: the middleware that records the rest does not know
+    /// who asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<Generation>,
 }
@@ -93,6 +98,7 @@ impl Metrics {
             path: path.to_string(),
             status,
             millis: took.as_secs_f64() * 1000.0,
+            owner: None,
             generation: None,
         };
         push(&self.requests, request.clone(), REQUESTS);
@@ -106,8 +112,11 @@ impl Metrics {
     /// streamed reply the middleware's timing would be time-to-first-*byte* —
     /// the moment the headers went out, which for a chat is the moment
     /// before all the work. Timing it here measures the generation.
+    ///
+    /// `owner` is whose it was, which is what [`usage`] adds up by.
     pub fn record_generation(
         &self,
+        owner: Option<i64>,
         method: &str,
         path: &str,
         status: u16,
@@ -121,6 +130,7 @@ impl Metrics {
             path: path.to_string(),
             status,
             millis: took.as_secs_f64() * 1000.0,
+            owner,
             generation: Some(g),
         };
         push(&self.requests, request.clone(), REQUESTS);
@@ -157,8 +167,9 @@ impl Metrics {
             c.execute("BEGIN", [])?;
             for r in &batch {
                 c.execute(
-                    "INSERT INTO requests (method, path, status, millis, tokens, decode_per_sec, ttft_millis)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO requests (method, path, status, millis, tokens, decode_per_sec, ttft_millis,
+                                           owner, prompt_tokens, cached_tokens)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
                         r.method,
                         r.path,
@@ -167,6 +178,9 @@ impl Metrics {
                         r.generation.map(|g| g.generated_tokens as i64),
                         r.generation.map(|g| g.decode_per_sec),
                         r.generation.map(|g| g.ttft_millis),
+                        r.owner,
+                        r.generation.map(|g| g.prompt_tokens as i64),
+                        r.generation.map(|g| g.cached_tokens as i64),
                     ],
                 )?;
             }
@@ -181,6 +195,80 @@ impl Metrics {
             c.execute("DELETE FROM requests WHERE at < datetime('now', ?1)", [format!("-{days} days")])
         })
     }
+}
+
+/// What one account's generations came to over a stretch of days.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Usage {
+    /// The account's row, or null for generations with no account: a server
+    /// with none, and rows from before they were recorded.
+    pub owner: Option<i64>,
+    pub generations: usize,
+    pub prompt_tokens: u64,
+    /// How many of the prompt tokens came out of a cache.
+    pub cached_tokens: u64,
+    pub generated_tokens: u64,
+    /// Time to the first token, which is the wait somebody sat through.
+    pub ttft_millis: Summary,
+    /// The whole reply, first byte to last.
+    pub millis: Summary,
+}
+
+/// Who used the engine in the last `days`, most tokens first.
+///
+/// From the table, not the ring buffer: the question is about last Tuesday
+/// as often as about now. The caller flushes first if the last few seconds
+/// matter. Rows are read and added up here rather than in SQL because the
+/// percentiles want the samples, and a week of generations is few enough
+/// to sort.
+pub fn usage(db: &Db, days: u32) -> Res<Vec<Usage>> {
+    type Row = (Option<i64>, Option<i64>, Option<i64>, i64, Option<f64>, f64);
+    let rows: Vec<Row> = db.with(|c| {
+        let mut q = c.prepare(
+            "SELECT owner, prompt_tokens, cached_tokens, tokens, ttft_millis, millis FROM requests
+             WHERE tokens IS NOT NULL AND at >= datetime('now', ?1)",
+        )?;
+        let rows = q
+            .query_map([format!("-{days} days")], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })?
+            .collect();
+        rows
+    })?;
+
+    #[derive(Default)]
+    struct Sum {
+        generations: usize,
+        prompt: u64,
+        cached: u64,
+        generated: u64,
+        ttft: Vec<f64>,
+        millis: Vec<f64>,
+    }
+    let mut by: std::collections::HashMap<Option<i64>, Sum> = std::collections::HashMap::new();
+    for (owner, prompt, cached, generated, ttft, millis) in rows {
+        let sum = by.entry(owner).or_default();
+        sum.generations += 1;
+        sum.prompt += prompt.unwrap_or(0).max(0) as u64;
+        sum.cached += cached.unwrap_or(0).max(0) as u64;
+        sum.generated += generated.max(0) as u64;
+        sum.ttft.extend(ttft);
+        sum.millis.push(millis);
+    }
+    let mut out: Vec<Usage> = by
+        .into_iter()
+        .map(|(owner, s)| Usage {
+            owner,
+            generations: s.generations,
+            prompt_tokens: s.prompt,
+            cached_tokens: s.cached,
+            generated_tokens: s.generated,
+            ttft_millis: summarise(s.ttft),
+            millis: summarise(s.millis),
+        })
+        .collect();
+    out.sort_by_key(|u| (std::cmp::Reverse(u.prompt_tokens + u.generated_tokens), u.owner));
+    Ok(out)
 }
 
 fn push<T>(store: &Mutex<VecDeque<T>>, value: T, cap: usize) {
@@ -270,6 +358,7 @@ mod tests {
             path: path.into(),
             status,
             millis,
+            owner: None,
             generation: None,
         }
     }
@@ -346,8 +435,8 @@ mod tests {
             ttft_millis: 120.0,
         };
         m.record("GET", "/api/health", 200, Duration::from_millis(1));
-        m.record_generation("POST", "/v1/chat/completions", 200, Duration::from_millis(900), g(64));
-        m.record_generation("POST", "/v1/chat/completions", 200, Duration::from_millis(400), g(32));
+        m.record_generation(None, "POST", "/v1/chat/completions", 200, Duration::from_millis(900), g(64));
+        m.record_generation(None, "POST", "/v1/chat/completions", 200, Duration::from_millis(400), g(32));
 
         let recent = m.recent(10); // newest first
         assert_eq!(recent[0].generation.unwrap().generated_tokens, 32);
@@ -367,6 +456,49 @@ mod tests {
             })
             .unwrap();
         assert_eq!(tokens, [None, Some(64), Some(32)]);
+    }
+
+    /// A generation is added to its own account's figures and nobody
+    /// else's, what it read as well as what it wrote; a request that is
+    /// not a generation is not usage; and a row too old is not counted.
+    #[test]
+    fn usage_is_added_up_by_account() {
+        let db = Db::in_memory().unwrap();
+        let m = Metrics::new();
+        let g = |prompt, cached, generated, ttft| Generation {
+            prompt_tokens: prompt,
+            cached_tokens: cached,
+            generated_tokens: generated,
+            decode_per_sec: 50.0,
+            ttft_millis: ttft,
+        };
+        let chat = "/v1/chat/completions";
+        m.record_generation(Some(1), "POST", chat, 200, Duration::from_millis(900), g(100, 0, 50, 300.0));
+        m.record_generation(Some(1), "POST", chat, 200, Duration::from_millis(500), g(200, 150, 30, 100.0));
+        m.record_generation(Some(2), "POST", chat, 200, Duration::from_millis(700), g(1000, 0, 400, 800.0));
+        m.record_generation(None, "POST", chat, 200, Duration::from_millis(100), g(10, 0, 5, 20.0));
+        m.record("GET", "/api/health", 200, Duration::from_millis(1));
+        m.flush(&db).unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO requests (at, method, path, status, millis, tokens, owner, prompt_tokens)
+                 VALUES (datetime('now', '-30 days'), 'POST', ?1, 200, 1.0, 9999, 1, 9999)",
+                [chat],
+            )
+        })
+        .unwrap();
+
+        let week = usage(&db, 7).unwrap();
+        // Most tokens first.
+        assert_eq!(week.iter().map(|u| u.owner).collect::<Vec<_>>(), [Some(2), Some(1), None]);
+        let one = &week[1];
+        assert_eq!((one.generations, one.prompt_tokens, one.cached_tokens, one.generated_tokens), (2, 300, 150, 80));
+        assert_eq!((one.ttft_millis.median, one.ttft_millis.worst), (100.0, 300.0));
+        assert_eq!(one.millis.worst, 900.0);
+        assert_eq!(week[2].generations, 1, "health was counted as a generation");
+
+        // A longer look back finds the old row.
+        assert_eq!(usage(&db, 60).unwrap().iter().find(|u| u.owner == Some(1)).unwrap().generated_tokens, 80 + 9999);
     }
 
     /// Flushing empties the pending batch, and does it in one transaction.

@@ -865,6 +865,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("get", "/api/metrics", "kvad metrics"),
     ("get", "/api/metrics/requests", "kvad metrics requests"),
     ("get", "/api/metrics/log", "kvad metrics log"),
+    ("get", "/api/metrics/usage", "kvad metrics usage"),
     ("get", "/api/auth", "kvad auth status"),
     ("post", "/api/auth/login", "kvad auth login"),
     ("post", "/api/auth/logout", "kvad auth login"),

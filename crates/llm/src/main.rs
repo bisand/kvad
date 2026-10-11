@@ -102,7 +102,9 @@ struct Args {
     model: Option<String>,
     prompt: Option<String>,
     system: Option<String>,
-    max_tokens: usize,
+    /// `--max-tokens`, if given. What it is otherwise depends on whether a
+    /// reply or a continuation is being written; see `token_budget`.
+    max_tokens: Option<usize>,
     temperature: f32,
     top_k: usize,
     top_p: f32,
@@ -200,7 +202,7 @@ impl Default for Args {
             model: None,
             prompt: None,
             system: None,
-            max_tokens: 256,
+            max_tokens: None,
             temperature: 0.7,
             top_k: 40,
             top_p: 0.95,
@@ -337,7 +339,7 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--model" => a.model = Some(value.clone()),
             "--prompt" => a.prompt = Some(value.clone()),
             "--system" => a.system = Some(value.clone()),
-            "--max-tokens" => a.max_tokens = num() as usize,
+            "--max-tokens" => a.max_tokens = Some(num() as usize),
             "--temperature" => a.temperature = num() as f32,
             "--top-k" => a.top_k = num() as usize,
             "--top-p" => a.top_p = num() as f32,
@@ -1216,7 +1218,8 @@ fn run(args: Args) -> Res<()> {
     eprintln!("  prompt is {} tokens\n", ids.len());
 
     let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
-    let (stats, _) = llm.generate(&ids, &mut sampler, args.max_tokens, |piece| {
+    let budget = kvad::service::token_budget(args.max_tokens, !llm.is_instruct());
+    let (stats, _) = llm.generate(&ids, &mut sampler, budget, |piece| {
         print!("{piece}");
         let _ = std::io::stdout().flush();
         true
@@ -1275,7 +1278,8 @@ fn chat(args: Args) -> Res<()> {
         // The cache lives in the session and survives between turns: only the
         // newest message is prefilled, not the whole transcript.
         let mut reply = String::new();
-        let (stats, _) = llm.generate(&ids, &mut sampler, args.max_tokens, |piece| {
+        let budget = kvad::service::token_budget(args.max_tokens, !llm.is_instruct());
+        let (stats, _) = llm.generate(&ids, &mut sampler, budget, |piece| {
             print!("{piece}");
             let _ = std::io::stdout().flush();
             reply.push_str(piece);

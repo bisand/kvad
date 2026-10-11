@@ -601,12 +601,13 @@ fn said(resident: Value) -> Res<Value> {
 }
 
 /// The sampling a generation asks for, from the same flags the local
-/// commands read.
-fn sampling(args: &Args, body: &mut Value) {
+/// commands read. `continuing` is whether the model is carrying a prompt on
+/// rather than answering it, which decides how far it goes unasked.
+fn sampling(args: &Args, body: &mut Value, continuing: bool) {
     body["temperature"] = json!(args.temperature);
     body["top_k"] = json!(args.top_k);
     body["top_p"] = json!(args.top_p);
-    body["max_tokens"] = json!(args.max_tokens);
+    body["max_tokens"] = json!(kvad::service::token_budget(args.max_tokens, continuing));
     body["seed"] = json!(args.seed);
 }
 
@@ -680,7 +681,7 @@ pub fn run(remote: &Remote, args: &Args) -> Res<()> {
 
     if raw {
         let mut body = json!({ "model": id, "prompt": prompt });
-        sampling(args, &mut body);
+        sampling(args, &mut body, true);
         if !args.json {
             print!("{prompt}");
             std::io::stdout().flush()?;
@@ -717,7 +718,7 @@ pub fn run(remote: &Remote, args: &Args) -> Res<()> {
     }
     messages.push(json!({ "role": "user", "content": prompt }));
     let mut body = json!({ "model": id, "messages": messages, "stream": true });
-    sampling(args, &mut body);
+    sampling(args, &mut body, false);
     let reply = stream_chat(remote, &body, args.json)?;
     if !args.json {
         eprintln!(
@@ -810,7 +811,8 @@ pub fn chat(remote: &Remote, args: &Args) -> Res<()> {
         }
         messages.extend(history.iter().cloned());
         let mut body = json!({ "model": model_id, "messages": messages, "stream": true });
-        sampling(args, &mut body);
+        // A base model in a chat is warned about above, and continues.
+        sampling(args, &mut body, model["instruct"] == false);
 
         let reply = stream_chat(remote, &body, false)?;
         println!();

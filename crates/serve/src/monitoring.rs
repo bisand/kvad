@@ -5,7 +5,7 @@
 //! a query.
 
 use crate::api::{blocking, Fail};
-use crate::auth::{Admin, State};
+use crate::auth::{Admin, Identity, State};
 use crate::machine::{self, Disk};
 use crate::metrics::{self, ByRoute, Generation, Request, Summary};
 use axum::extract::{Query, State as St};
@@ -17,6 +17,7 @@ pub fn routes() -> Router<State> {
         .route("/api/metrics", get(overview))
         .route("/api/metrics/requests", get(requests))
         .route("/api/metrics/log", get(log))
+        .route("/api/metrics/usage", get(usage))
 }
 
 #[derive(serde::Serialize)]
@@ -126,4 +127,62 @@ pub async fn requests(
 
 pub async fn log(_: Admin, St(state): St<State>, Query(q): Query<Limit>) -> Json<Vec<String>> {
     Json(state.metrics.log(q.limit.unwrap_or(200).clamp(1, 500)))
+}
+
+#[derive(serde::Deserialize)]
+pub struct Days {
+    #[serde(default)]
+    days: Option<u32>,
+}
+
+/// One account's usage, with whose it is.
+#[derive(serde::Serialize)]
+pub struct Used {
+    /// The account's name: `local` for a server with no accounts, and null
+    /// for an account that has since been removed.
+    name: Option<String>,
+    mine: bool,
+    #[serde(flatten)]
+    usage: metrics::Usage,
+}
+
+#[derive(serde::Serialize)]
+pub struct UsageReport {
+    days: u32,
+    accounts: Vec<Used>,
+}
+
+/// Who has used the engine, and what they waited for it.
+///
+/// A signed-in user is shown their own figures; an administrator
+/// everybody's. From the table rather than the ring buffer, since the
+/// question is as often about last week as about now — and what has not
+/// been written yet is written first, so the last few seconds are in it.
+pub async fn usage(who: Identity, St(state): St<State>, Query(q): Query<Days>) -> Result<Json<UsageReport>, Fail> {
+    let days = q.days.unwrap_or(7).clamp(1, 365);
+    let (db, metrics) = (state.db.clone(), state.metrics.clone());
+    let admin = who.is_admin();
+    let (all, users) = blocking(move || {
+        metrics.flush(&db)?;
+        let users = match admin {
+            true => crate::users::list(&db)?,
+            false => Vec::new(),
+        };
+        Ok((metrics::usage(&db, days)?, users))
+    })
+    .await?;
+    let accounts = all
+        .into_iter()
+        .filter(|u| admin || u.owner == who.id)
+        .map(|usage| Used {
+            name: match usage.owner {
+                None => Some("local".to_string()),
+                Some(id) if Some(id) == who.id => Some(who.name.clone()),
+                Some(id) => users.iter().find(|u| u.id == id).map(|u| u.name.clone()),
+            },
+            mine: usage.owner == who.id,
+            usage,
+        })
+        .collect();
+    Ok(Json(UsageReport { days, accounts }))
 }

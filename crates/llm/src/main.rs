@@ -81,6 +81,7 @@ struct Args {
     host: Option<String>,
     port: Option<u16>,
     limit: Option<usize>,
+    days: Option<u32>,
     role: Option<String>,
     title: Option<String>,
     dataset: Option<String>,
@@ -186,6 +187,7 @@ impl Default for Args {
             host: None,
             port: None,
             limit: None,
+            days: None,
             role: None,
             title: None,
             dataset: None,
@@ -402,6 +404,7 @@ fn parse_from(argv: Vec<String>) -> Args {
                 }))
             }
             "--limit" | "--lines" | "-n" => a.limit = Some(num() as usize),
+            "--days" => a.days = Some(num() as u32),
             "--role" => a.role = Some(value.clone()),
             "--title" => a.title = Some(value.clone()),
             "--dataset" => a.dataset = Some(value.clone()),

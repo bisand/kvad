@@ -153,6 +153,14 @@ the prompt. Nothing names a conversation; the transcript an OpenAI client
 sends is the key. They fit in the context the model was already charged for
 (`[server] context`), and when they do not, the one that spoke longest ago
 goes. A reply's `kvad.conversations` and `kvad.held_tokens` say what is kept.
+
+**Who used it is written down.** Every chat completion's row in the
+`requests` table carries the account that asked, what the prompt came to and
+how much of it was cached, beside what was generated and how long the first
+token took. `kvad metrics usage` and `GET /api/metrics/usage` add that up by
+account over the last days: your own figures, or everybody's for an
+administrator. It answers who is using the machine and who waited for it,
+and it only knows about replies made since it was added.
 **Comparisons are sequences**: the Playground's "side by side" and the
 Benchmarks page both load each variant in turn, and both say so on the page
 rather than implying a race. **Training is not queued behind chat, or chat

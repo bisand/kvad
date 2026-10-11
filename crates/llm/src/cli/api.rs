@@ -149,6 +149,7 @@ warms up shows as a trend rather than as a winner.";
 pub const METRICS: &str = "usage: kvad metrics             what the machine is doing
        kvad metrics requests    [--limit N]  recent requests, and what each route costs
        kvad metrics log         [--limit N]  the server's log tail
+       kvad metrics usage       [--days N]   tokens and waiting, by account
 
 For this machine's service, `kvad service logs -f` follows the whole log.";
 
@@ -1289,6 +1290,41 @@ pub fn metrics(remote: &Remote, args: &Args) -> Res<()> {
                     for line in out::items(&lines) {
                         println!("{}", out::s(line).trim_end());
                     }
+                }
+            }
+            Ok(())
+        }
+        "usage" => {
+            let days = args.days.unwrap_or(7);
+            let u = remote.get(&format!("/api/metrics/usage?days={days}"))?;
+            if args.json {
+                out::json(&u);
+                return Ok(());
+            }
+            let ms = |v: &Value| v.as_f64().map_or("-".to_string(), |m| format!("{m:.0} ms"));
+            let rows: Vec<Vec<String>> = out::items(&u["accounts"])
+                .iter()
+                .map(|a| {
+                    vec![
+                        match &a["name"] {
+                            Value::String(name) => name.clone(),
+                            // An account removed since: its row is all that is left.
+                            _ => format!("account {}", out::s(&a["owner"])),
+                        },
+                        out::s(&a["generations"]),
+                        out::s(&a["prompt_tokens"]),
+                        out::s(&a["cached_tokens"]),
+                        out::s(&a["generated_tokens"]),
+                        ms(&a["ttft_millis"]["median"]),
+                        ms(&a["ttft_millis"]["p95"]),
+                    ]
+                })
+                .collect();
+            match rows.is_empty() {
+                true => println!("no generations in the last {} days", out::s(&u["days"])),
+                false => {
+                    println!("the last {} days", out::s(&u["days"]));
+                    out::table(&["ACCOUNT", "REPLIES", "PROMPT", "CACHED", "GENERATED", "FIRST TOKEN", "P95"], &rows)
                 }
             }
             Ok(())

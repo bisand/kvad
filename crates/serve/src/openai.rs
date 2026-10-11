@@ -484,8 +484,8 @@ pub async fn completions(
     let started = std::time::Instant::now();
 
     let mut response = match body.stream {
-        true => streamed(id, loaded, pieces, metrics, started, offered).into_response(),
-        false => whole(id, loaded, pieces, metrics, started, offered).await?.into_response(),
+        true => streamed(id, loaded, pieces, metrics, who.id, started, offered).into_response(),
+        false => whole(id, loaded, pieces, metrics, who.id, started, offered).await?.into_response(),
     };
     response.extensions_mut().insert(crate::watching::RecordedItself);
     response.headers_mut().insert(GENERATION, generation.into());
@@ -731,6 +731,8 @@ fn streamed(
     loaded: crate::scheduler::Loaded,
     mut pieces: tokio::sync::mpsc::Receiver<Piece>,
     metrics: std::sync::Arc<crate::metrics::Metrics>,
+    // Whose generation this is, for the row that records what it cost.
+    owner: Option<i64>,
     started: std::time::Instant,
     // `offered` is whether this request offered tools, and so whether
     // `<tool_call>` in the reply is a call rather than a model writing
@@ -818,6 +820,7 @@ fn streamed(
                 }
                 Piece::Done(stats) => {
                     metrics.record_generation(
+                        owner,
                         "POST",
                         ROUTE,
                         200,
@@ -893,6 +896,8 @@ async fn whole(
     loaded: crate::scheduler::Loaded,
     mut pieces: tokio::sync::mpsc::Receiver<Piece>,
     metrics: std::sync::Arc<crate::metrics::Metrics>,
+    // Whose generation this is, for the row that records what it cost.
+    owner: Option<i64>,
     started: std::time::Instant,
     offered: bool,
 ) -> Result<Json<serde_json::Value>, Fail> {
@@ -927,6 +932,7 @@ async fn whole(
             }
             Piece::Done(stats) => {
                 metrics.record_generation(
+                    owner,
                     "POST",
                     ROUTE,
                     200,

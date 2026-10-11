@@ -715,8 +715,8 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "metrics",
         group: Group::Measure,
-        args: "[requests|log]",
-        about: "what the server's machine is doing, and its recent requests",
+        args: "[requests|log|usage]",
+        about: "what the server is doing, its requests, and who used it",
         server: true,
         routed: true,
         words: &[],
@@ -724,11 +724,12 @@ pub const COMMANDS: &[Command] = &[
             Sub { name: "overview", args: "", about: "memory, load and the queue", words: &[], flags: &[] },
             Sub { name: "requests", args: "", about: "recent requests, and what each route costs", words: &[], flags: &[&[f("--limit", "N", Kind::Text, "how many")]] },
             Sub { name: "log", args: "", about: "the end of the server's log", words: &[], flags: &[&[f("--limit", "N", Kind::Text, "how many lines")]] },
+            Sub { name: "usage", args: "", about: "tokens and waiting, by account", words: &[], flags: &[&[f("--days", "N", Kind::Text, "how far back (default 7)")]] },
         ],
         flags: &[],
         usage: Some(super::api::METRICS),
         notes: "",
-        examples: &["kvad metrics", "kvad metrics requests --limit 20"],
+        examples: &["kvad metrics", "kvad metrics requests --limit 20", "kvad metrics usage --days 30"],
     },
     // -- accounts ----------------------------------------------------------
     Command {

@@ -967,6 +967,18 @@ pub const ENDPOINTS: &[Endpoint] = &[
         query: &[("limit", false, "How many lines.")],
         body: None, produces: JSON, events: &[],
     },
+    Endpoint {
+        method: "get", path: "/api/metrics/usage", tag: "Monitoring", access: Access::SignedIn,
+        summary: "Who has used the engine",
+        description: "Per account, over the last `days`: how many generations, the \
+                      prompt tokens they read and how many of those came out of a cache, \
+                      the tokens they generated, and the time to a first token and to a \
+                      whole reply as median, p95 and worst. The caller's own figures; an \
+                      administrator is shown every account's. Chat completions only, and \
+                      only since accounts were recorded with them.",
+        query: &[("days", false, "How far back to look. 7 unless given, 365 at most.")],
+        body: None, produces: JSON, events: &[],
+    },
 
     // -- Accounts -----------------------------------------------------------
     Endpoint {

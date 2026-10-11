@@ -11,11 +11,14 @@ import { api, sse } from "./api.js";
 import { toasts } from "./toasts.svelte.js";
 
 /** What the sampler does when nobody touches the controls. Matches the server. */
-// 1024 rather than 512 because of reasoning models. Qwen3 writes its working
-// before its answer, and on a grounded question that working alone ran to
-// about 650 tokens — at 512 the reply is a thinking block and an empty
-// bubble, which reads as a bug and is a budget.
-export const DEFAULTS = { temperature: 0.7, top_p: 0.95, top_k: 40, max_tokens: 1024 };
+// A reply is cut where the budget ends, and a cut reply reads as a bug. It
+// was 512, where Qwen3, which writes its working before its answer, spent
+// about 650 tokens on the working of a grounded question and left a thinking
+// block and an empty bubble. Then 1024, which is room for the working and a
+// short answer and not for a long one: a recipe, a page of code. 4096 is
+// half of what the server allows, and costs nothing when the model stops
+// sooner, which it does when it is done.
+export const DEFAULTS = { temperature: 0.7, top_p: 0.95, top_k: 40, max_tokens: 4096 };
 
 class Chat {
   /** Every conversation, newest first. */

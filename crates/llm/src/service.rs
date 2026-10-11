@@ -141,12 +141,18 @@ pub struct Sampling {
 
 impl Default for Sampling {
     fn default() -> Self {
-        // 1024 rather than 512 because of reasoning models. Qwen3 writes its
-        // working before its answer, and on a grounded question that working
-        // alone ran to about 650 tokens — so at 512 a request that names no
-        // limit gets a trace and no answer. Measured: at 400 the same model
-        // spent every token thinking and never reached one.
-        Sampling { temperature: 0.7, top_k: 40, top_p: 0.95, seed: None, max_tokens: 1024 }
+        // Not 512, because of reasoning models. Qwen3 writes its working
+        // before its answer, and on a grounded question that working alone
+        // ran to about 650 tokens — so at 512 a request that names no limit
+        // gets a trace and no answer. Measured: at 400 the same model spent
+        // every token thinking and never reached one.
+        //
+        // And not 1024, which is room for the working and a short answer and
+        // cuts a long one off in the middle. 4096 is what the web UI's chat
+        // starts at too (`DEFAULTS` in web/src/lib/chat.svelte.js); a model
+        // that is done sooner stops sooner, so the budget costs nothing
+        // until it is needed.
+        Sampling { temperature: 0.7, top_k: 40, top_p: 0.95, seed: None, max_tokens: 4096 }
     }
 }
 

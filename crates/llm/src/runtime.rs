@@ -40,6 +40,26 @@ pub struct Llm {
     hold: usize,
 }
 
+/// A generation under way: what [`Llm::begin`] hands out, [`Llm::step`]
+/// advances and [`Llm::finish`] takes back.
+pub struct Run {
+    /// The prompt, and every token generated since.
+    ids: Vec<u32>,
+    prompt_len: usize,
+    /// What the model made of everything it has been fed: the next token is
+    /// sampled from these.
+    logits: Vec<f32>,
+    /// Whether the last of `ids` has been through the model. Not, between a
+    /// token being handed out and the step after it.
+    fed: bool,
+    /// Tokens it may still generate.
+    left: usize,
+    explain: usize,
+    stats: Stats,
+    /// When prefill ended and decoding began.
+    decoding: Instant,
+}
+
 /// A conversation that is not the one in the session: its tokens, and the
 /// cache that represents them, waiting for its next turn.
 struct Conversation {
@@ -495,6 +515,24 @@ impl Llm {
         explain: usize,
         mut on_token: impl FnMut(&Chosen) -> bool,
     ) -> Res<(Stats, Vec<u32>)> {
+        let mut run = self.begin(prompt_ids, max_tokens, explain)?;
+        while let Some(chosen) = self.step(&mut run, sampler)? {
+            if !on_token(&chosen) {
+                break;
+            }
+        }
+        Ok(self.finish(run))
+    }
+
+    /// Start a generation: find the prompt's conversation, prefill what of
+    /// it the cache does not hold, and hand back the generation, ready for
+    /// its first [`Llm::step`].
+    ///
+    /// A generation in three parts rather than one call, so that whoever
+    /// drives it gets the thread back between tokens. [`Llm::generate`] is
+    /// the three in a loop; an engine that advances several generations at
+    /// once is the same three with something else between the steps.
+    pub fn begin(&mut self, prompt_ids: &[u32], max_tokens: usize, explain: usize) -> Res<Run> {
         if prompt_ids.is_empty() {
             return Err("prompt encoded to zero tokens".into());
         }
@@ -518,46 +556,79 @@ impl Llm {
             Stats { prompt_tokens: prompt_ids.len(), cached_tokens: reuse, ..Default::default() };
 
         let t0 = Instant::now();
-        let mut logits = self.session.forward(&prompt_ids[reuse..])?;
+        let logits = self.session.forward(&prompt_ids[reuse..])?;
         stats.prefill_secs = t0.elapsed().as_secs_f32();
 
-        let mut ids: Vec<u32> = prompt_ids.to_vec();
-        let budget = max_tokens.min(self.spec.n_ctx.saturating_sub(ids.len()));
+        Ok(Run {
+            ids: prompt_ids.to_vec(),
+            prompt_len: prompt_ids.len(),
+            logits,
+            fed: true,
+            left: max_tokens.min(self.spec.n_ctx.saturating_sub(prompt_ids.len())),
+            explain,
+            stats,
+            decoding: Instant::now(),
+        })
+    }
 
-        let t1 = Instant::now();
-        for _ in 0..budget {
-            let (next, top) = match explain {
-                0 => (sampler.sample(&logits), Vec::new()),
-                k => sampler.sample_explained(&logits, k),
-            };
-            if self.eos.contains(&next) {
-                break;
-            }
-            ids.push(next);
-            stats.generated_tokens += 1;
-
-            let chosen = Chosen {
-                id: next,
-                text: added(&self.tokenizer, &ids)?,
-                // Resolved here rather than by the caller, because the
-                // tokenizer is here and an id means nothing without it.
-                top: top.into_iter().map(|r| self.candidate(r)).collect(),
-            };
-            if !on_token(&chosen) {
-                break;
-            }
-
-            logits = self.session.forward(&[next])?;
+    /// The generation's next token, or `None` when it has ended: at an
+    /// end-of-sequence token, or with its budget spent.
+    ///
+    /// The token a step hands out is not yet in the cache. The step after
+    /// feeds it, which is what makes a generation that stops between two
+    /// steps — an interrupt, a reader that went away — cost nothing for the
+    /// token nobody will follow.
+    pub fn step(&mut self, run: &mut Run, sampler: &mut Sampler) -> Res<Option<Chosen>> {
+        if !run.fed {
+            let last = *run.ids.last().expect("a run holds its prompt, which is not empty");
+            run.logits = self.session.forward(&[last])?;
+            run.fed = true;
         }
-        stats.decode_secs = t1.elapsed().as_secs_f32();
+        if run.left == 0 {
+            return Ok(None);
+        }
+        let (next, top) = match run.explain {
+            0 => (sampler.sample(&run.logits), Vec::new()),
+            k => sampler.sample_explained(&run.logits, k),
+        };
+        if self.eos.contains(&next) {
+            run.left = 0;
+            return Ok(None);
+        }
+        run.ids.push(next);
+        run.fed = false;
+        run.left -= 1;
+        run.stats.generated_tokens += 1;
+
+        Ok(Some(Chosen {
+            id: next,
+            text: added(&self.tokenizer, &run.ids)?,
+            // Resolved here rather than by the caller, because the
+            // tokenizer is here and an id means nothing without it.
+            top: top.into_iter().map(|r| self.candidate(r)).collect(),
+        }))
+    }
+
+    /// End a generation, wherever it got to, and say what it came to: its
+    /// statistics, and every token of the prompt and the reply.
+    ///
+    /// This is where the model learns what its cache now holds, so a
+    /// generation that was begun has to be finished, even one that was
+    /// interrupted. One that failed is the exception: its cache is whatever
+    /// the failure left, and dropping the [`Run`] leaves the model believing
+    /// what it believed before, which the next prompt checks against the
+    /// cache's own length.
+    pub fn finish(&mut self, run: Run) -> (Stats, Vec<u32>) {
+        let Run { ids, prompt_len, mut stats, decoding, .. } = run;
+        stats.decode_secs = decoding.elapsed().as_secs_f32();
 
         self.cached_ids = ids.clone();
-        self.prompt_len = prompt_ids.len();
+        self.prompt_len = prompt_len;
         self.clock += 1;
         self.used = self.clock;
         stats.held_tokens = self.held();
         stats.conversations = self.parked.len() + 1;
-        Ok((stats, ids))
+        (stats, ids)
     }
 
     fn candidate(&self, r: crate::sampler::Ranked) -> Candidate {

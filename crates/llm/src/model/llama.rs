@@ -179,12 +179,28 @@ impl Model {
     /// work: generation needs the last position's logits, scoring needs all
     /// of them, and the thirty layers in between are identical.
     fn run_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        self.run_rows(tokens, Rows::Following(cache))
+    }
+
+    /// The same, for rows that are either one sequence's next positions or
+    /// several sequences' next position each; see [`Rows`].
+    ///
+    /// One body for prefill and for batched decode, because between the
+    /// lines that touch a cache they are the same arithmetic: `m` rows
+    /// through each projection and each MLP as one matmul.
+    fn run_rows(&self, tokens: &[u32], mut rows: Rows) -> Vec<f32> {
         let spec = &self.spec;
         let (m, e) = (tokens.len(), spec.n_embd);
         let qdim = spec.n_head * spec.head_dim;
         let kvdim = spec.kv_dim();
-        let pos0 = cache.len;
-        assert!(pos0 + m <= spec.n_ctx, "context window of {} tokens is full", spec.n_ctx);
+        // Where each row sits in its own sequence, fixed before anything is
+        // pushed: a cache's length does not move until the pass is over.
+        let at: Vec<usize> = (0..m).map(|i| rows.position(i)).collect();
+        assert!(
+            at.iter().all(|&pos| pos < spec.n_ctx),
+            "context window of {} tokens is full",
+            spec.n_ctx
+        );
 
         // No position embedding: position arrives inside attention, as RoPE.
         let mut xs = vec![0.0f32; m * e];
@@ -207,19 +223,23 @@ impl Model {
             for i in 0..m {
                 norm_heads(&mut q[i * qdim..(i + 1) * qdim], block.q_norm.as_deref(), spec);
                 norm_heads(&mut k[i * kvdim..(i + 1) * kvdim], block.k_norm.as_deref(), spec);
-                self.apply_rope(&mut q[i * qdim..(i + 1) * qdim], pos0 + i);
-                self.apply_rope(&mut k[i * kvdim..(i + 1) * kvdim], pos0 + i);
-                cache.push(l, &k[i * kvdim..(i + 1) * kvdim], &v[i * kvdim..(i + 1) * kvdim]);
+                self.apply_rope(&mut q[i * qdim..(i + 1) * qdim], at[i]);
+                self.apply_rope(&mut k[i * kvdim..(i + 1) * kvdim], at[i]);
+                rows.cache(i).push(l, &k[i * kvdim..(i + 1) * kvdim], &v[i * kvdim..(i + 1) * kvdim]);
             }
 
+            // Each row attends over its own sequence up to itself. For one
+            // sequence that is the causal mask, for nothing; for several it
+            // is what keeps them apart, for nothing as well.
             let mut attn = vec![0.0f32; m * qdim];
             for i in 0..m {
+                let cache = rows.cache(i);
                 attn[i * qdim..(i + 1) * qdim].copy_from_slice(&attend(
                     spec,
                     &q[i * qdim..(i + 1) * qdim],
                     cache.keys(l),
                     cache.values(l),
-                    pos0 + i + 1,
+                    at[i] + 1,
                 ));
             }
             let proj = block.o_w.matmul_bt(&attn, m, None);
@@ -238,8 +258,46 @@ impl Model {
             }
         }
 
-        cache.len += m;
+        rows.advance(m);
         xs
+    }
+}
+
+/// Whose positions the rows of a pass are.
+///
+/// Prefill and batched decode run the same rows through the same weights and
+/// differ only in this: where a row's keys and values go, and what it may
+/// attend to.
+enum Rows<'a, 'b> {
+    /// One sequence's next positions, in order: prefill.
+    Following(&'a mut KvCache),
+    /// The next position of each of several sequences: decode, batched.
+    Each(&'a mut [&'b mut KvCache]),
+}
+
+impl Rows<'_, '_> {
+    /// The cache row `i` belongs to.
+    fn cache(&mut self, i: usize) -> &mut KvCache {
+        match self {
+            Rows::Following(cache) => cache,
+            Rows::Each(caches) => caches[i],
+        }
+    }
+
+    /// Where row `i` sits in its sequence, before the pass has counted it.
+    fn position(&self, i: usize) -> usize {
+        match self {
+            Rows::Following(cache) => cache.len + i,
+            Rows::Each(caches) => caches[i].len,
+        }
+    }
+
+    /// Count the pass's `m` rows as held.
+    fn advance(&mut self, m: usize) {
+        match self {
+            Rows::Following(cache) => cache.len += m,
+            Rows::Each(caches) => caches.iter_mut().for_each(|c| c.len += 1),
+        }
     }
 }
 
@@ -305,6 +363,27 @@ impl Transformer for Model {
     fn forward_batch_all(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
         let (m, e) = (tokens.len(), self.spec.n_embd);
         let mut xs = self.run_batch(tokens, cache);
+        for i in 0..m {
+            let normed = rms_norm(&xs[i * e..(i + 1) * e], &self.final_norm, self.spec.eps);
+            xs[i * e..(i + 1) * e].copy_from_slice(&normed);
+        }
+        self.lm_head.as_ref().unwrap_or(&self.embed).matmul_bt(&xs, m, None)
+    }
+
+    /// One matmul per projection for all of them, and per-sequence
+    /// attention: the same pass as prefill, with a cache a row.
+    fn forward_each(&self, tokens: &[u32], caches: &mut [&mut KvCache]) -> Vec<f32> {
+        assert_eq!(tokens.len(), caches.len(), "a token for each sequence, and a sequence for each token");
+        let (m, e) = (tokens.len(), self.spec.n_embd);
+        match m {
+            0 => return Vec::new(),
+            // One sequence is the ordinary step, and the ordinary step's
+            // kernels are the ones written for a single row: on a small
+            // model the batched ones measured 7% slower at one.
+            1 => return self.forward(tokens[0], caches[0]),
+            _ => {}
+        }
+        let mut xs = self.run_rows(tokens, Rows::Each(caches));
         for i in 0..m {
             let normed = rms_norm(&xs[i * e..(i + 1) * e], &self.final_norm, self.spec.eps);
             xs[i * e..(i + 1) * e].copy_from_slice(&normed);

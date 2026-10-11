@@ -428,6 +428,29 @@ pub trait Transformer: Send + Sync {
         }
         all
     }
+    /// Advance several sequences by one token each: `tokens[i]` goes onto
+    /// the end of `caches[i]`, and the answer is `tokens.len()` rows of
+    /// `vocab_size`, logits for each sequence's next token.
+    ///
+    /// This is decode, batched. Generating one token reads every weight in
+    /// the model to produce one row of logits; the weights are the same for
+    /// every sequence, so the projections and the MLP for `B` sequences can
+    /// be `B` rows of one matmul each, and the weights are read once. What
+    /// cannot be shared is attention: each sequence has its own history, of
+    /// its own length, and attends over that and nothing else — which is
+    /// also why no mask is needed between them.
+    ///
+    /// The default is the loop over sequences, which is correct on anything
+    /// and reads the weights `B` times. It is what the batched
+    /// implementations are tested against.
+    fn forward_each(&self, tokens: &[u32], caches: &mut [&mut KvCache]) -> Vec<f32> {
+        assert_eq!(tokens.len(), caches.len(), "a token for each sequence, and a sequence for each token");
+        let mut all = Vec::new();
+        for (&t, cache) in tokens.iter().zip(caches.iter_mut()) {
+            all.extend(self.forward(t, cache));
+        }
+        all
+    }
     fn param_count(&self) -> usize;
     /// Bytes the weight matrices occupy in memory, after quantisation.
     fn memory_bytes(&self) -> usize;
@@ -701,6 +724,44 @@ pub trait Session: Send {
         Err("this backend keeps one conversation, and has none set aside to take back".into())
     }
 
+    /// Advance several conversations by one token each: `tokens[i]` onto
+    /// the end of `caches[i]`, each a cache [`Session::park`] gave out. The
+    /// answer is a row of logits for each, in order. The session's own
+    /// conversation is as it was afterwards.
+    ///
+    /// See [`Transformer::forward_each`] for why this is worth having. The
+    /// default takes each cache in turn — resume, one token, park — which
+    /// is right wherever a cache can be set aside, and no faster than doing
+    /// that by hand.
+    fn forward_each(&mut self, tokens: &[u32], caches: &mut [Parked]) -> Res<Vec<Vec<f32>>> {
+        if tokens.len() != caches.len() {
+            return Err("a token for each conversation, and a conversation for each token".into());
+        }
+        let Some(own) = self.park() else {
+            return Err("this backend keeps one conversation, and cannot advance several".into());
+        };
+        let mut rows = Vec::with_capacity(tokens.len());
+        let mut failed = None;
+        for (&token, cache) in tokens.iter().zip(caches.iter_mut()) {
+            // The slot holds a placeholder for as long as its cache is in
+            // the session.
+            let theirs = std::mem::replace(cache, Box::new(()));
+            let step = self.resume(theirs).and_then(|()| self.forward(&[token]));
+            if let Some(back) = self.park() {
+                *cache = back;
+            }
+            match step {
+                Ok(logits) => rows.push(logits),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        self.resume(own)?;
+        failed.map_or(Ok(rows), Err)
+    }
+
     /// Short description of where this runs, e.g. `cpu q8` or `metal bf16`.
     fn label(&self) -> String;
     fn param_count(&self) -> usize;
@@ -872,6 +933,21 @@ impl Session for CpuSession {
 
     fn truncate(&mut self, len: usize) -> Res<usize> {
         Ok(self.cache.truncate(len))
+    }
+
+    /// One pass for all of them, inside the pool like every other.
+    fn forward_each(&mut self, tokens: &[u32], caches: &mut [Parked]) -> Res<Vec<Vec<f32>>> {
+        if tokens.len() != caches.len() {
+            return Err("a token for each conversation, and a conversation for each token".into());
+        }
+        let mut theirs = Vec::with_capacity(caches.len());
+        for cache in caches.iter_mut() {
+            theirs.push(cache.downcast_mut::<KvCache>().ok_or("that cache was not this backend's")?);
+        }
+        let CpuSession { model, pool, .. } = self;
+        let vocab = model.spec().vocab_size;
+        let all = pool.install(|| model.forward_each(tokens, &mut theirs));
+        Ok(all.chunks(vocab).map(<[f32]>::to_vec).collect())
     }
 
     fn park(&mut self) -> Option<Parked> {

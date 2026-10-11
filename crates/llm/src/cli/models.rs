@@ -504,7 +504,10 @@ pub fn cancel(remote: &Remote, args: &Args) -> Res<()> {
     let answer = remote.delete("/api/generation")?;
     match args.json {
         true => out::json(&answer),
-        false => println!("asked whatever is generating on {} to stop", remote.base),
+        false => match answer["stopped"].as_u64() {
+            Some(0) => println!("nothing of yours is generating on {}", remote.base),
+            _ => println!("asked what you have generating on {} to stop", remote.base),
+        },
     }
     Ok(())
 }

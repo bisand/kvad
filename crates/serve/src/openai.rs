@@ -473,8 +473,10 @@ pub async fn completions(
     }
 
     let offered = !tools.is_empty();
-    let pieces =
-        state.engine.chat(&resident.key, turns, tools, sampling, false).map_err(Fail::internal)?;
+    let (generation, pieces) = state
+        .engine
+        .chat(who.id, &resident.key, turns, tools, sampling, false)
+        .map_err(Fail::internal)?;
     let id = format!("chatcmpl-{}", now_millis());
     let metrics = state.metrics.clone();
     // Timed from here rather than by the middleware: for a streamed reply the
@@ -487,8 +489,14 @@ pub async fn completions(
         false => whole(id, loaded, pieces, metrics, started, offered).await?.into_response(),
     };
     response.extensions_mut().insert(crate::watching::RecordedItself);
+    response.headers_mut().insert(GENERATION, generation.into());
     Ok(response)
 }
+
+/// The header a reply carries its generation's id in: what the client that
+/// started it names to stop that one and no other. A header rather than a
+/// field, because the body is OpenAI's shape and its `id` is theirs.
+pub const GENERATION: axum::http::HeaderName = axum::http::HeaderName::from_static("x-kvad-generation");
 
 /// The model in memory a request is for, loading it first if it may be.
 ///
@@ -597,15 +605,30 @@ fn measured(stats: &Stats) -> crate::metrics::Generation {
     }
 }
 
-/// Stop whatever the engine is generating.
+/// Stop everything the caller has generating or waiting to.
 ///
-/// A `DELETE` with no body, because there is one generation running at a
-/// time across every model in memory, and the request that started it is
-/// the one holding the stream. When several can run at once this grows an
-/// id.
-pub async fn cancel(_: Identity, St(state): St<State>) -> Json<serde_json::Value> {
-    state.engine.cancel();
-    Json(json!({ "cancelled": true }))
+/// The caller's and nobody else's: one engine serves every account, and
+/// whose generation is running is not something a signed-in user gets to
+/// decide for another.
+pub async fn cancel(who: Identity, St(state): St<State>) -> Json<serde_json::Value> {
+    let stopped = state.engine.cancel(who.id, None);
+    Json(json!({ "cancelled": stopped > 0, "stopped": stopped }))
+}
+
+/// Stop one generation, named by the id its reply carried in
+/// [`GENERATION`].
+///
+/// Somebody else's is not found rather than refused, as their conversation
+/// would be: a 403 would confirm that it exists.
+pub async fn cancel_one(
+    who: Identity,
+    St(state): St<State>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Result<Json<serde_json::Value>, Fail> {
+    match state.engine.cancel(who.id, Some(id)) {
+        0 => Err(Fail::missing(format!("there is no generation {id}"))),
+        _ => Ok(Json(json!({ "cancelled": true, "stopped": 1 }))),
+    }
 }
 
 fn now_millis() -> u128 {

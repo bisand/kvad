@@ -32,6 +32,7 @@ pub fn routes() -> Router<State> {
         .route("/api/models/pull", post(crate::models::pull))
         .route("/api/qcache", delete(crate::models::forget_qcache))
         .route("/api/generation", delete(crate::openai::cancel))
+        .route("/api/generation/{id}", delete(crate::openai::cancel_one))
         .route(
             "/api/conversations",
             get(crate::conversations::list).post(crate::conversations::create),

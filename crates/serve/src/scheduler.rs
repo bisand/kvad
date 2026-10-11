@@ -44,7 +44,7 @@ use kvad::chat::Message;
 use kvad::runtime::{Chosen, Perplexity, Stats, Token};
 use kvad::service::{Backend, Cmd, Engine, Evt, Loader, Sampling};
 use kvad::weights::Fetch;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
@@ -221,6 +221,34 @@ pub enum Piece {
 
 type Answer<T> = oneshot::Sender<Result<T, String>>;
 
+/// What a generation that was stopped before the engine reached it ends
+/// with, in place of a reply.
+pub const CANCELLED: &str = "cancelled";
+
+/// Whose a generation is: the account's row, or `None` with no
+/// authentication, where the one person there is owns all of them.
+pub type Owner = Option<i64>;
+
+/// A generation's place in the queue's books, which travels with its job.
+///
+/// `stop` is this generation's and nobody else's. The engine's own flag
+/// cannot be, because the engine has one for everything it runs and clears
+/// it as each command starts.
+struct Ticket {
+    id: u64,
+    stop: Arc<AtomicBool>,
+}
+
+/// A generation that is waiting or running, as [`Scheduler::cancel`] finds
+/// it.
+struct Live {
+    id: u64,
+    owner: Owner,
+    stop: Arc<AtomicBool>,
+    /// The interrupt flag of the engine running it, once one is.
+    engine: Option<Arc<AtomicBool>>,
+}
+
 enum Job {
     Load {
         repo: String,
@@ -231,6 +259,7 @@ enum Job {
     /// `None` unloads every resident.
     Unload { which: Option<Key>, done: Answer<Vec<String>> },
     Chat {
+        ticket: Ticket,
         on: Key,
         messages: Vec<Message>,
         tools: Vec<serde_json::Value>,
@@ -239,6 +268,7 @@ enum Job {
         out: tokio_mpsc::Sender<Piece>,
     },
     Complete {
+        ticket: Ticket,
         on: Key,
         prompt: String,
         sampling: Sampling,
@@ -254,8 +284,8 @@ enum Job {
         progress: tokio_mpsc::Sender<(usize, usize)>,
         done: Answer<Perplexity>,
     },
-    Paint { on: Key, request: kvad::image::ImageRequest, out: tokio_mpsc::Sender<Stroke> },
-    Film { on: Key, request: kvad::video::VideoRequest, out: tokio_mpsc::Sender<Reel> },
+    Paint { ticket: Ticket, on: Key, request: kvad::image::ImageRequest, out: tokio_mpsc::Sender<Stroke> },
+    Film { ticket: Ticket, on: Key, request: kvad::video::VideoRequest, out: tokio_mpsc::Sender<Reel> },
 }
 
 /// Makes the loader for each new engine. One per engine, because a
@@ -277,8 +307,11 @@ struct Shared {
     busy: Arc<AtomicBool>,
     /// In the order they were loaded.
     residents: Arc<Mutex<Vec<Resident>>>,
-    /// The interrupt flag of whichever engine is generating.
-    running: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// Every generation submitted and not yet finished, the waiting ones
+    /// included: a generation can be stopped before the engine reaches it.
+    live: Arc<Mutex<Vec<Live>>>,
+    /// The id the next generation gets. They start at one.
+    issued: Arc<AtomicU64>,
     /// Memory set aside for work that is not a resident; see [`Reserved`].
     reserved: Arc<Mutex<Option<Held>>>,
 }
@@ -301,8 +334,29 @@ impl Shared {
         self.residents.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn running(&self) -> std::sync::MutexGuard<'_, Option<Arc<AtomicBool>>> {
-        self.running.lock().unwrap_or_else(|e| e.into_inner())
+    fn live(&self) -> std::sync::MutexGuard<'_, Vec<Live>> {
+        self.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Enter a generation in the books, and hand back what its job carries.
+    fn admit(&self, owner: Owner) -> Ticket {
+        let id = self.issued.fetch_add(1, Ordering::Relaxed) + 1;
+        let stop = Arc::new(AtomicBool::new(false));
+        self.live().push(Live { id, owner, stop: Arc::clone(&stop), engine: None });
+        Ticket { id, stop }
+    }
+
+    /// The engine has reached `id`: from here stopping it means raising
+    /// `engine`'s flag as well.
+    fn begin(&self, id: u64, engine: &Arc<AtomicBool>) {
+        if let Some(live) = self.live().iter_mut().find(|l| l.id == id) {
+            live.engine = Some(Arc::clone(engine));
+        }
+    }
+
+    /// `id` is over, however it ended.
+    fn finish(&self, id: u64) {
+        self.live().retain(|l| l.id != id);
     }
 
     fn reserved(&self) -> std::sync::MutexGuard<'_, Option<Held>> {
@@ -404,15 +458,24 @@ impl Scheduler {
         self.current().map(|r| r.model)
     }
 
-    /// Stop the generation that is running, if one is.
+    /// Stop `who`'s generations: the one with this id, or every one of
+    /// theirs for `None`. How many were told to stop.
     ///
-    /// Affects whatever an engine is doing *now*, not a particular request:
-    /// with one job at a time across every resident those are the same
-    /// thing, and when residents run at once this grows an argument.
-    pub fn cancel(&self) {
-        if let Some(flag) = self.shared.running().as_ref() {
-            flag.store(true, Ordering::Relaxed);
-        }
+    /// Somebody else's generation is not counted and not touched, so naming
+    /// one reads the same as naming one that does not exist. A waiting
+    /// generation is stopped as well as the running one: it ends with
+    /// [`CANCELLED`] when the engine reaches it, having cost nothing.
+    pub fn cancel(&self, who: Owner, id: Option<u64>) -> usize {
+        let live = self.shared.live();
+        let theirs = live.iter().filter(|l| l.owner == who && id.is_none_or(|id| l.id == id));
+        theirs
+            .map(|l| {
+                l.stop.store(true, Ordering::Relaxed);
+                if let Some(engine) = &l.engine {
+                    engine.store(true, Ordering::Relaxed);
+                }
+            })
+            .count()
     }
 
     fn submit(&self, job: Job) -> Result<(), String> {
@@ -421,6 +484,12 @@ impl Scheduler {
             self.shared.waiting.fetch_sub(1, Ordering::Relaxed);
             "the engine thread has stopped".to_string()
         })
+    }
+
+    /// [`Scheduler::submit`] for a generation, whose ticket leaves the books
+    /// again if the job never reached the queue.
+    fn generate(&self, id: u64, job: Job) -> Result<(), String> {
+        self.submit(job).inspect_err(|_| self.shared.finish(id))
     }
 
     /// Load a model beside the others, if it fits, reporting progress as it
@@ -453,20 +522,26 @@ impl Scheduler {
     ///
     /// `fresh` drops the KV cache first, as for [`Scheduler::complete`]; a
     /// conversation leaves it off so the next turn reuses this one's cache.
+    ///
+    /// The number beside the receiver is the generation's id, which is what
+    /// `who` names to [`Scheduler::cancel`] it.
     pub fn chat(
         &self,
+        who: Owner,
         on: &Key,
         messages: Vec<Message>,
         tools: Vec<serde_json::Value>,
         sampling: Sampling,
         fresh: bool,
-    ) -> Result<tokio_mpsc::Receiver<Piece>, String> {
+    ) -> Result<(u64, tokio_mpsc::Receiver<Piece>), String> {
         // Bounded, so a client that reads slowly slows the generation down
         // rather than filling memory with tokens it has not asked for. 64 is
         // a second or so of decoding at the rates this engine reaches.
         let (out, rx) = tokio_mpsc::channel(64);
-        self.submit(Job::Chat { on: on.clone(), messages, tools, sampling, fresh, out })?;
-        Ok(rx)
+        let ticket = self.shared.admit(who);
+        let id = ticket.id;
+        self.generate(id, Job::Chat { ticket, on: on.clone(), messages, tools, sampling, fresh, out })?;
+        Ok((id, rx))
     }
 
     /// Continue a prompt, with no chat template involved.
@@ -476,15 +551,18 @@ impl Scheduler {
     /// that is a measurement question rather than an output one.
     pub fn complete(
         &self,
+        who: Owner,
         on: &Key,
         prompt: String,
         sampling: Sampling,
         explain: usize,
         fresh: bool,
-    ) -> Result<tokio_mpsc::Receiver<Piece>, String> {
+    ) -> Result<(u64, tokio_mpsc::Receiver<Piece>), String> {
         let (out, rx) = tokio_mpsc::channel(64);
-        self.submit(Job::Complete { on: on.clone(), prompt, sampling, explain, fresh, out })?;
-        Ok(rx)
+        let ticket = self.shared.admit(who);
+        let id = ticket.id;
+        self.generate(id, Job::Complete { ticket, on: on.clone(), prompt, sampling, explain, fresh, out })?;
+        Ok((id, rx))
     }
 
     /// How a resident's tokenizer splits a text.
@@ -507,23 +585,33 @@ impl Scheduler {
     /// stops the generation at the next step.
     pub fn paint(
         &self,
+        who: Owner,
         on: &Key,
         request: kvad::image::ImageRequest,
-    ) -> Result<tokio_mpsc::Receiver<Stroke>, String> {
+    ) -> Result<(u64, tokio_mpsc::Receiver<Stroke>), String> {
         // A step is seconds, so a handful of them buffered is plenty.
         let (out, rx) = tokio_mpsc::channel(8);
-        self.submit(Job::Paint { on: on.clone(), request, out })?;
-        Ok(rx)
+        let ticket = self.shared.admit(who);
+        let id = ticket.id;
+        self.generate(id, Job::Paint { ticket, on: on.clone(), request, out })?;
+        Ok((id, rx))
     }
 
     /// Make a video on `on`, as [`Scheduler::paint`] makes an image.
     ///
     /// The engine is this job's for minutes, and every other request on the
     /// same engine waits behind it.
-    pub fn film(&self, on: &Key, request: kvad::video::VideoRequest) -> Result<tokio_mpsc::Receiver<Reel>, String> {
+    pub fn film(
+        &self,
+        who: Owner,
+        on: &Key,
+        request: kvad::video::VideoRequest,
+    ) -> Result<(u64, tokio_mpsc::Receiver<Reel>), String> {
         let (out, rx) = tokio_mpsc::channel(8);
-        self.submit(Job::Film { on: on.clone(), request, out })?;
-        Ok(rx)
+        let ticket = self.shared.admit(who);
+        let id = ticket.id;
+        self.generate(id, Job::Film { ticket, on: on.clone(), request, out })?;
+        Ok((id, rx))
     }
 
     /// Score a text the model did not write.
@@ -614,39 +702,46 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                 Box::new(move || drop(done.send(failed.map_or(Ok(gone), Err))))
             }
 
-            Job::Chat { on, messages, tools, sampling, fresh, out } => {
+            Job::Chat { ticket, on, messages, tools, sampling, fresh, out } => {
                 match slots.iter().find(|s| s.key == on) {
+                    // Stopped while it waited: the engine never hears of it.
+                    _ if ticket.stop.load(Ordering::Relaxed) => {
+                        let _ = out.blocking_send(Piece::Failed(CANCELLED.into()));
+                    }
                     Some(slot) => {
-                        *shared.running() = Some(Arc::clone(&slot.engine.cancel));
+                        shared.begin(ticket.id, &slot.engine.cancel);
                         slot.engine.send(Cmd::Chat { messages, tools, sampling, fresh });
                         // What the cache holds now: the prompt it prefilled
                         // plus everything it generated.
-                        let cached = drain_chat(&slot.engine.rx, &out)
+                        let cached = drain_chat(&slot.engine.rx, &out, &ticket.stop, &slot.engine.cancel)
                             .map(|stats| stats.prompt_tokens + stats.generated_tokens);
-                        *shared.running() = None;
                         touch(&on, clock, cached);
                     }
                     None => {
                         let _ = out.blocking_send(Piece::Failed(missing(&on)));
                     }
                 }
+                shared.finish(ticket.id);
                 Box::new(move || drop(out))
             }
 
-            Job::Complete { on, prompt, sampling, explain, fresh, out } => {
+            Job::Complete { ticket, on, prompt, sampling, explain, fresh, out } => {
                 match slots.iter().find(|s| s.key == on) {
+                    _ if ticket.stop.load(Ordering::Relaxed) => {
+                        let _ = out.blocking_send(Piece::Failed(CANCELLED.into()));
+                    }
                     Some(slot) => {
-                        *shared.running() = Some(Arc::clone(&slot.engine.cancel));
+                        shared.begin(ticket.id, &slot.engine.cancel);
                         slot.engine.send(Cmd::Complete { prompt, sampling, explain, fresh });
-                        let cached = drain_chat(&slot.engine.rx, &out)
+                        let cached = drain_chat(&slot.engine.rx, &out, &ticket.stop, &slot.engine.cancel)
                             .map(|stats| stats.prompt_tokens + stats.generated_tokens);
-                        *shared.running() = None;
                         touch(&on, clock, cached);
                     }
                     None => {
                         let _ = out.blocking_send(Piece::Failed(missing(&on)));
                     }
                 }
+                shared.finish(ticket.id);
                 Box::new(move || drop(out))
             }
 
@@ -676,37 +771,43 @@ fn run(jobs: Receiver<Job>, loaders: Loaders, budget: Budget, shared: Shared) {
                 Box::new(move || drop(done.send(answer)))
             }
 
-            Job::Paint { on, request, out } => {
+            Job::Paint { ticket, on, request, out } => {
                 match slots.iter().find(|s| s.key == on) {
+                    _ if ticket.stop.load(Ordering::Relaxed) => {
+                        let _ = out.blocking_send(Stroke::Failed(CANCELLED.into()));
+                    }
                     Some(slot) => {
-                        *shared.running() = Some(Arc::clone(&slot.engine.cancel));
+                        shared.begin(ticket.id, &slot.engine.cancel);
                         slot.engine.send(Cmd::Paint(request));
-                        drain_paint(&slot.engine.rx, &out, &slot.engine.cancel);
-                        *shared.running() = None;
+                        drain_paint(&slot.engine.rx, &out, &ticket.stop, &slot.engine.cancel);
                         touch(&on, clock, None);
                     }
                     None => {
                         let _ = out.blocking_send(Stroke::Failed(missing(&on)));
                     }
                 }
+                shared.finish(ticket.id);
                 Box::new(move || drop(out))
             }
 
-            Job::Film { on, request, out } => {
+            Job::Film { ticket, on, request, out } => {
                 match slots.iter().find(|s| s.key == on) {
                     // Deleted while it waited: a minute of the GPU saved.
                     _ if out.is_closed() => {}
+                    _ if ticket.stop.load(Ordering::Relaxed) => {
+                        let _ = out.blocking_send(Reel::Failed(CANCELLED.into()));
+                    }
                     Some(slot) => {
-                        *shared.running() = Some(Arc::clone(&slot.engine.cancel));
+                        shared.begin(ticket.id, &slot.engine.cancel);
                         slot.engine.send(Cmd::Film(request));
-                        drain_film(&slot.engine.rx, &out, &slot.engine.cancel);
-                        *shared.running() = None;
+                        drain_film(&slot.engine.rx, &out, &ticket.stop, &slot.engine.cancel);
                         touch(&on, clock, None);
                     }
                     None => {
                         let _ = out.blocking_send(Reel::Failed(missing(&on)));
                     }
                 }
+                shared.finish(ticket.id);
                 Box::new(move || drop(out))
             }
         };
@@ -862,9 +963,23 @@ fn drain_score(
 }
 
 /// Forward a generation's tokens, and return the statistics it ended with.
-fn drain_chat(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Piece>) -> Option<Stats> {
+///
+/// `stop` is the generation's own flag and `cancel` the engine's. The engine
+/// clears its flag as a command starts, so a stop that landed between the
+/// command being sent and the engine picking it up would be lost; raising it
+/// again at each token is what makes it stick.
+fn drain_chat(
+    rx: &Receiver<Evt>,
+    out: &tokio_mpsc::Sender<Piece>,
+    stop: &AtomicBool,
+    cancel: &AtomicBool,
+) -> Option<Stats> {
     loop {
-        let piece = match rx.recv() {
+        let evt = rx.recv();
+        if stop.load(Ordering::Relaxed) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let piece = match evt {
             Ok(Evt::Token(text)) => Piece::Token(text),
             Ok(Evt::Chose(chosen)) => Piece::Chose(chosen),
             Ok(Evt::Done(stats)) => Piece::Done(stats),
@@ -898,11 +1013,11 @@ fn drain_chat(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Piece>) -> Option<Sta
 /// is set as soon as the receiver is gone, not at the first event nobody
 /// received: that would let the engine run one more step, which at
 /// 1536×1024 is fifty seconds of a video nobody wants.
-fn drain_film(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Reel>, cancel: &AtomicBool) {
+fn drain_film(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Reel>, stop: &AtomicBool, cancel: &AtomicBool) {
     loop {
         let reel = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if out.is_closed() {
+                if out.is_closed() || stop.load(Ordering::Relaxed) {
                     cancel.store(true, Ordering::Relaxed);
                 }
                 continue;
@@ -930,9 +1045,13 @@ fn drain_film(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Reel>, cancel: &Atomi
 /// engine only learns of it through the cancel flag, which is set on the
 /// first step nobody received. Draining carries on to the engine's answer
 /// either way, or the next job would read this one's leftovers.
-fn drain_paint(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Stroke>, cancel: &AtomicBool) {
+fn drain_paint(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Stroke>, stop: &AtomicBool, cancel: &AtomicBool) {
     loop {
-        let stroke = match rx.recv() {
+        let evt = rx.recv();
+        if stop.load(Ordering::Relaxed) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let stroke = match evt {
             Ok(Evt::Painting(step)) => Stroke::Step(step),
             Ok(Evt::Painted(p)) => Stroke::Done(Box::new(p)),
             Ok(Evt::Error(e)) => Stroke::Failed(e),
@@ -1030,8 +1149,8 @@ mod tests {
     async fn chatting_with_no_such_resident_fails_the_stream() {
         let sched = refusing();
         let on = Key { repo: "a/b".into(), backend: Q8 };
-        let mut pieces = sched
-            .chat(&on, vec![Message::user("hello")], Vec::new(), Sampling::default(), false)
+        let (_, mut pieces) = sched
+            .chat(None, &on, vec![Message::user("hello")], Vec::new(), Sampling::default(), false)
             .expect("the scheduler refused to queue the job");
         let piece = pieces.recv().await.expect("the stream ended with nothing in it");
         match piece {
@@ -1040,6 +1159,73 @@ mod tests {
         }
         assert!(pieces.recv().await.is_none(), "the stream continued past its end");
         assert_eq!(sched.depth(), 0);
+    }
+
+    /// Stopping reaches the caller's generations and nobody else's, by id or
+    /// all at once, and one that has ended is no longer there to stop.
+    #[test]
+    fn a_generation_is_stopped_only_by_its_owner() {
+        let sched = refusing();
+        let (mine, theirs) = (sched.shared.admit(Some(1)), sched.shared.admit(Some(2)));
+        assert_ne!(mine.id, theirs.id);
+        let engine = Arc::new(AtomicBool::new(false));
+        sched.shared.begin(mine.id, &engine);
+
+        // Somebody else's id reads as no generation at all.
+        assert_eq!(sched.cancel(Some(2), Some(mine.id)), 0);
+        assert_eq!(sched.cancel(None, Some(mine.id)), 0);
+        assert!(!mine.stop.load(Ordering::Relaxed) && !engine.load(Ordering::Relaxed));
+
+        // Everything of one account's is that account's only.
+        assert_eq!(sched.cancel(Some(2), None), 1);
+        assert!(theirs.stop.load(Ordering::Relaxed));
+        assert!(!mine.stop.load(Ordering::Relaxed) && !engine.load(Ordering::Relaxed));
+
+        // The running one takes its engine's flag with it.
+        assert_eq!(sched.cancel(Some(1), Some(mine.id)), 1);
+        assert!(mine.stop.load(Ordering::Relaxed) && engine.load(Ordering::Relaxed));
+
+        sched.shared.finish(mine.id);
+        assert_eq!(sched.cancel(Some(1), Some(mine.id)), 0);
+    }
+
+    /// A generation stopped while it waits ends as cancelled when its turn
+    /// comes, without the engine being asked for anything.
+    #[tokio::test]
+    async fn a_waiting_generation_can_be_stopped() {
+        let sched = refusing();
+        let on = Key { repo: "a/b".into(), backend: Q8 };
+
+        // Something for it to wait behind: a job whose answer has nowhere to
+        // go until this test reads it, which holds the scheduler thread.
+        let (out, mut ahead) = tokio_mpsc::channel(1);
+        out.try_send(Piece::Token("in the way".into())).unwrap();
+        let ticket = sched.shared.admit(Some(1));
+        let job = Job::Chat {
+            ticket,
+            on: on.clone(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            sampling: Sampling::default(),
+            fresh: false,
+            out,
+        };
+        sched.submit(job).unwrap();
+
+        let (id, mut pieces) = sched
+            .chat(Some(2), &on, vec![Message::user("hello")], Vec::new(), Sampling::default(), false)
+            .unwrap();
+        assert_eq!(sched.cancel(Some(1), Some(id)), 0, "another account stopped it");
+        assert_eq!(sched.cancel(Some(2), Some(id)), 1);
+
+        while ahead.recv().await.is_some() {}
+        match pieces.recv().await.expect("the stream ended with nothing in it") {
+            // Not "a/b@cpu-q8 is not loaded": it never got as far as asking.
+            Piece::Failed(why) => assert_eq!(why, CANCELLED),
+            other => panic!("expected a cancellation, got {other:?}"),
+        }
+        assert!(pieces.recv().await.is_none(), "the stream continued past its end");
+        assert_eq!(sched.cancel(Some(2), Some(id)), 0, "an ended generation was still there to stop");
     }
 
     /// Jobs run in the order they were submitted, and the depth says how many
@@ -1092,7 +1278,7 @@ mod tests {
         for backend in [F32, Q8] {
             let on = Key { repo: repo.clone(), backend };
             let sampling = Sampling { temperature: 0.0, max_tokens: 4, ..Sampling::default() };
-            let mut pieces = sched.complete(&on, "the cat".into(), sampling, 0, true).unwrap();
+            let (_, mut pieces) = sched.complete(None, &on, "the cat".into(), sampling, 0, true).unwrap();
             let mut done = None;
             while let Some(piece) = pieces.recv().await {
                 match piece {

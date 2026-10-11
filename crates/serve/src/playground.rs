@@ -93,7 +93,7 @@ struct Candidate {
 }
 
 async fn complete(
-    _: Identity,
+    who: Identity,
     St(state): St<State>,
     Json(body): Json<CompleteRequest>,
 ) -> Result<impl IntoResponse, Fail> {
@@ -112,9 +112,9 @@ async fn complete(
     };
     let explain = body.explain.unwrap_or(0).min(MAX_EXPLAIN);
 
-    let mut pieces = state
+    let (generation, mut pieces) = state
         .engine
-        .complete(&on, prompt, sampling, explain, body.fresh)
+        .complete(who.id, &on, prompt, sampling, explain, body.fresh)
         .map_err(Fail::internal)?;
 
     let (events, rx) = tokio::sync::mpsc::channel::<Event>(64);
@@ -161,7 +161,7 @@ async fn complete(
         }
     });
 
-    Ok(stream(rx))
+    Ok(([(crate::openai::GENERATION, generation.to_string())], stream(rx)))
 }
 
 #[derive(serde::Deserialize)]

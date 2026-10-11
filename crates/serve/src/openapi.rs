@@ -344,9 +344,16 @@ pub const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         method: "delete", path: "/api/generation", tag: "Chat", access: Access::SignedIn,
         summary: "Stop generating",
-        description: "Affects whatever is generating now, not a particular request — \
-                      with one generation at a time across every model in memory, \
-                      those are the same thing.",
+        description: "Stops everything the caller has generating or waiting to, and \
+                      nobody else's. `stopped` is how many that was.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "delete", path: "/api/generation/{id}", tag: "Chat", access: Access::SignedIn,
+        summary: "Stop one generation",
+        description: "The id is the one its reply carried in the `x-kvad-generation` \
+                      header. A generation that has ended, and one that is somebody \
+                      else's, are both a 404.",
         query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {

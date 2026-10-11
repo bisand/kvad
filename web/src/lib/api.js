@@ -10,6 +10,21 @@
 // "Could not reach the server: could not reach the server: Failed to fetch".
 
 /**
+ * Stop a generation this page started.
+ *
+ * `response` is the one that opened its stream, whose header names the
+ * generation; with it, only that one stops, and another tab's carries on.
+ * Before the stream has opened there is no name to give, and everything
+ * this account has generating is stopped instead.
+ *
+ * @param {Response | null} response
+ */
+export function stopGeneration(response) {
+  const id = response?.headers.get("x-kvad-generation");
+  return api(id ? `/api/generation/${id}` : "/api/generation", { method: "DELETE" });
+}
+
+/**
  * @param {string} path e.g. "/api/health"
  * @param {RequestInit} [options]
  */
@@ -61,8 +76,10 @@ export const health = () => api("/api/health");
  * @param {Record<string, (data: string) => void>} on
  * @param {AbortSignal} [signal]
  * @param {"POST"|"GET"} [method]
+ * @param {(response: Response) => void} [opened] called with the response
+ *   once the stream is open, for a caller that wants its headers
  */
-export async function sse(path, body, on, signal, method = "POST") {
+export async function sse(path, body, on, signal, method = "POST", opened) {
   const response = await fetch(path, {
     method,
     headers:
@@ -81,6 +98,7 @@ export async function sse(path, body, on, signal, method = "POST") {
     } catch {}
     throw new Error(`${path} failed: ${why}.`);
   }
+  opened?.(response);
 
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";

@@ -754,7 +754,7 @@ fn streamed(job: Job) -> impl IntoResponse {
                                 d["output_format"] = json!("png");
                                 sse("image_generation.completed", &d)
                             }
-                            Err(Fail(_, why)) => sse("error", &json!({ "error": why })),
+                            Err(Fail(_, why, _)) => sse("error", &json!({ "error": why })),
                         };
                         let _ = events.send(done).await;
                         break;
@@ -1055,7 +1055,7 @@ mod against_a_real_model {
                 let who = Identity { id: None, name: "local".into(), role: crate::auth::Role::Admin };
                 match generations(who, HeaderMap::new(), St(state), Json(body)).await {
                     Ok(_) => panic!("a language model answered an image request"),
-                    Err(Fail(status, why)) => (status, why),
+                    Err(Fail(status, why, _)) => (status, why),
                 }
             }
         };

@@ -140,7 +140,9 @@ whichever account was served longest ago, so somebody who sends ten does not
 get ten times the machine, and one request is not kept behind another
 account's ten. One account may have `[server] queue_per_account` waiting (4
 unless set); its next is a 429. Turns are counted in generations, not in
-tokens. Nothing passes a load or an unload.
+tokens. Nothing passes a load or an unload. An account can also be held to
+`[server] generations_per_minute`, which is off unless set; over it, the 429
+says how many seconds until the next request will be taken.
 
 **Each conversation keeps its cache.** A chat prefills only its newest
 message because the turn before left its keys and values in the model, and

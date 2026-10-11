@@ -548,7 +548,11 @@ pub fn queue(remote: &Remote, args: &Args) -> Res<()> {
         (n, 0) => format!("{n} may wait"),
         (n, each) => format!("{n} may wait, {each} of them one account's"),
     };
-    println!("{} running, {} waiting on {}; {limit}", out::s(&queue["running"]), out::s(&queue["waiting"]), remote.base);
+    let pace = match queue["per_minute"].as_u64() {
+        Some(0) | None => String::new(),
+        Some(n) => format!("; one account may ask {n} times a minute"),
+    };
+    println!("{} running, {} waiting on {}; {limit}{pace}", out::s(&queue["running"]), out::s(&queue["waiting"]), remote.base);
     if rows.is_empty() {
         return Ok(());
     }

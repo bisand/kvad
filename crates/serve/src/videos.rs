@@ -1050,7 +1050,7 @@ async fn run(state: State, id: i64, owner: Option<i64>, key: Key, request: Video
                 let ffmpeg = FFMPEG.get().cloned().flatten();
                 let finished = blocking(move || finish(&db, &dir(), id, &filmed, ffmpeg.as_deref())).await;
                 match finished {
-                    Err(Fail(_, why)) => failed(why).await,
+                    Err(Fail(_, why, _)) => failed(why).await,
                     Ok(_) => tell(id),
                 }
                 return;
@@ -1631,7 +1631,7 @@ mod tests {
     fn what_this_model_cannot_do_is_refused_by_name() {
         let refuse = |v: Value| match Asked::read(&json_fields(v)) {
             Ok(_) => panic!("accepted"),
-            Err(Fail(_, why)) => why,
+            Err(Fail(_, why, _)) => why,
         };
         assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "image_url": "https://example.com/a.png" } })).contains("fetches nothing"));
         assert!(refuse(json!({ "prompt": "a dog", "input_reference": { "image_url": "x" } })).contains("not a data: URL"));
@@ -1679,7 +1679,7 @@ mod tests {
         // Any other file is refused by name.
         let other = body.replace("name=\"input_reference\"", "name=\"mask\"");
         let f = Fields::read(&h, other.as_bytes()).unwrap();
-        assert!(matches!(Asked::read(&f), Err(Fail(_, why)) if why.contains("mask")));
+        assert!(matches!(Asked::read(&f), Err(Fail(_, why, _)) if why.contains("mask")));
         assert!(form(b"--abc123\r\nno headers end", "multipart/form-data; boundary=abc123").is_err());
         assert!(form(body.as_bytes(), "multipart/form-data").is_err());
     }

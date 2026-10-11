@@ -358,7 +358,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       earlier one. `waiting` and `running` count everybody's. `limit` is \
                       how many may wait before a request is answered 503 with a \
                       `Retry-After`, and `per_account` how many of those one account may \
-                      have before its next is answered 429 — zero for no limit. An \
+                      have before its next is answered 429 — zero for no limit. \
+                      `per_minute` is how many generations one account may ask for in a \
+                      minute, zero for any number. An \
                       administrator is shown every generation, with whose it is.",
         query: &[], body: None, produces: JSON, events: &[],
     },

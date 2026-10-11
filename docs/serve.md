@@ -162,9 +162,18 @@ On the CPU the weights are read once a step for everybody, which is the
 throughput. On the GPU each reply still takes its own pass, so the total is
 what it was and the gain is that nobody waits for somebody else's whole reply
 before their own begins. A reply's `kvad.beside` says how many others it was
-written beside. A new reply's prompt is read in one go, and the others wait
-while it is. A request that asks for no cache — a benchmark, an evaluation —
-runs alone.
+written beside. A request that asks for no cache — a benchmark, an evaluation
+— runs alone.
+
+A reply that joins has a prompt to read first, and a long one takes seconds.
+It is read a pass at a time — 64 tokens on the CPU, 512 on the GPU, where the
+backend would have cut it anyway, so the arithmetic is the same — and the
+replies under way write a token between passes. With a 2,300-token prompt
+arriving while a reply streams from Qwen2.5-1.5B, the longest the stream goes
+quiet is 0.4 s rather than 16.7 at `cpu-q8`, and 0.3 s rather than 1.3 at
+`gpu-q8`. The newcomer's own first token comes when it did, or a tenth of a
+second later. One prompt is read at a time; a second newcomer waits for the
+first to finish reading.
 
 At `cpu-q8` on a CPU with the `i8mm` instructions, a reply written beside
 others is not always word for word the reply written alone. The kernel for

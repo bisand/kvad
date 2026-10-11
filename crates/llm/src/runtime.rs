@@ -41,6 +41,11 @@ pub struct Llm {
     /// Tokens of that spoken for by generations whose caches are out of the
     /// model's hands while they run; see [`Llm::detach`].
     lent: usize,
+    /// Whether the session's cache is a generation's that has not finished:
+    /// from [`Llm::open`] until that generation is detached, finished or
+    /// abandoned. While it is, `cached_ids` does not describe what the
+    /// session holds, and nothing else may be put there.
+    busy: bool,
 }
 
 /// A generation under way: what [`Llm::begin`] hands out, [`Llm::step`]
@@ -49,6 +54,9 @@ pub struct Run {
     /// The prompt, and every token generated since.
     ids: Vec<u32>,
     prompt_len: usize,
+    /// How much of the prompt has been through the model, or was in its
+    /// cache already. Short of `prompt_len` while the prompt is being read.
+    read: usize,
     /// What the model made of everything it has been fed: the next token is
     /// sampled from these.
     logits: Vec<f32>,
@@ -59,7 +67,9 @@ pub struct Run {
     left: usize,
     explain: usize,
     stats: Stats,
-    /// When prefill ended and decoding began.
+    /// When the generation was opened, and when its prompt had been read
+    /// and decoding began — the same moment until it has.
+    opened: Instant,
     decoding: Instant,
     /// The generation's own cache, once it has been taken out of the
     /// session so that another generation can use it; see [`Llm::detach`].
@@ -74,6 +84,12 @@ impl Run {
     /// session's: whether it can be advanced beside others.
     pub fn detached(&self) -> bool {
         self.cache.is_some()
+    }
+
+    /// Whether the whole prompt has been read, and there are logits to
+    /// sample a first token from.
+    pub fn ready(&self) -> bool {
+        self.read == self.prompt_len
     }
 }
 
@@ -298,6 +314,7 @@ impl Llm {
             clock: 0,
             hold: 0,
             lent: 0,
+            busy: false,
         }
         .holding(usize::MAX))
     }
@@ -538,9 +555,14 @@ impl Llm {
         mut on_token: impl FnMut(&Chosen) -> bool,
     ) -> Res<(Stats, Vec<u32>)> {
         let mut run = self.begin(prompt_ids, max_tokens, explain)?;
-        while let Some(chosen) = self.step(&mut run, sampler)? {
-            if !on_token(&chosen) {
-                break;
+        loop {
+            match self.step(&mut run, sampler) {
+                Ok(Some(chosen)) if on_token(&chosen) => {}
+                Ok(_) => break,
+                Err(e) => {
+                    self.abandon(run);
+                    return Err(e);
+                }
             }
         }
         Ok(self.finish(run))
@@ -555,6 +577,24 @@ impl Llm {
     /// the three in a loop; an engine that advances several generations at
     /// once is the same three with something else between the steps.
     pub fn begin(&mut self, prompt_ids: &[u32], max_tokens: usize, explain: usize) -> Res<Run> {
+        let mut run = self.open(prompt_ids, max_tokens, explain)?;
+        match self.prefill(&mut run, true) {
+            Ok(_) => Ok(run),
+            Err(e) => {
+                self.abandon(run);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Llm::begin`] without reading the prompt: the conversation is found
+    /// and its cache cut back to what the prompt shares with it, and the
+    /// rest is for [`Llm::prefill`] to read.
+    ///
+    /// Apart, because reading a long prompt is the one long thing a
+    /// generation does, and whoever is driving several may want it done a
+    /// pass at a time with something in between.
+    pub fn open(&mut self, prompt_ids: &[u32], max_tokens: usize, explain: usize) -> Res<Run> {
         if prompt_ids.is_empty() {
             return Err("prompt encoded to zero tokens".into());
         }
@@ -574,25 +614,56 @@ impl Llm {
         // See `KvCache::truncate`.
         let reuse = self.session.truncate(wanted)?;
 
-        let mut stats =
-            Stats { prompt_tokens: prompt_ids.len(), cached_tokens: reuse, ..Default::default() };
-
-        let t0 = Instant::now();
-        let logits = self.session.forward(&prompt_ids[reuse..])?;
-        stats.prefill_secs = t0.elapsed().as_secs_f32();
+        let stats = Stats { prompt_tokens: prompt_ids.len(), cached_tokens: reuse, ..Default::default() };
+        let now = Instant::now();
+        self.busy = true;
 
         Ok(Run {
             ids: prompt_ids.to_vec(),
             prompt_len: prompt_ids.len(),
-            logits,
+            read: reuse,
+            logits: Vec::new(),
             fed: true,
             left: max_tokens.min(self.spec.n_ctx.saturating_sub(prompt_ids.len())),
             explain,
             stats,
-            decoding: Instant::now(),
+            opened: now,
+            decoding: now,
             cache: None,
             reserved: 0,
         })
+    }
+
+    /// Read more of a generation's prompt: all that is left of it, or one
+    /// of the backend's passes. `true` once the whole prompt is read.
+    ///
+    /// A pass at a time is the same arithmetic as all at once — the cuts
+    /// are where the backend would have made them itself, see
+    /// [`Session::prefill_pass`] — so a prompt read between other
+    /// generations' tokens is the prompt read in one go, later.
+    ///
+    /// The generation's conversation has to be the one in the session,
+    /// which it is from [`Llm::open`] until it is detached.
+    pub fn prefill(&mut self, run: &mut Run, all: bool) -> Res<bool> {
+        if run.cache.is_some() {
+            return Err("a prompt is read in the session, before the generation carries its cache away".into());
+        }
+        if run.read < run.prompt_len {
+            let left = run.prompt_len - run.read;
+            let pass = match all {
+                true => left,
+                false => self.session.prefill_pass(left).clamp(1, left),
+            };
+            run.logits = self.session.forward(&run.ids[run.read..run.read + pass])?;
+            run.read += pass;
+            if run.read == run.prompt_len {
+                // What somebody waited before the first token: the whole
+                // of it, whatever else was done in between.
+                run.stats.prefill_secs = run.opened.elapsed().as_secs_f32();
+                run.decoding = Instant::now();
+            }
+        }
+        Ok(run.ready())
     }
 
     /// Take a generation's cache out of the session and give it to the
@@ -622,13 +693,20 @@ impl Llm {
         self.lent += run.reserved;
         self.cached_ids.clear();
         self.prompt_len = 0;
+        self.busy = false;
         true
     }
 
     /// Give up on a generation that failed: what [`Llm::finish`] is to one
-    /// that did not. Its cache, if it carried one, goes with it.
+    /// that did not. Its cache goes with it — the one it carried, or the
+    /// session's, which after a failure holds some of a prompt and nobody
+    /// knows how much.
     pub fn abandon(&mut self, run: Run) {
         self.lent = self.lent.saturating_sub(run.reserved);
+        if run.cache.is_none() {
+            self.busy = false;
+            let _ = self.clear();
+        }
     }
 
     /// The next token of each of several generations, all of them detached:
@@ -681,6 +759,9 @@ impl Llm {
 
     /// Sample a generation's next token from the logits it holds.
     fn choose(&self, run: &mut Run, sampler: &mut Sampler) -> Res<Option<Chosen>> {
+        if !run.ready() {
+            return Err("a generation's prompt has to be read before its first token".into());
+        }
         if run.left == 0 {
             return Ok(None);
         }
@@ -720,20 +801,50 @@ impl Llm {
     /// conversation becomes the one in the session, and whatever was there
     /// is set aside.
     pub fn finish(&mut self, run: Run) -> (Stats, Vec<u32>) {
-        let Run { ids, prompt_len, mut stats, decoding, cache, reserved, .. } = run;
-        stats.decode_secs = decoding.elapsed().as_secs_f32();
+        let Run { mut ids, mut prompt_len, read, mut stats, decoding, cache, reserved, .. } = run;
+        if read < prompt_len {
+            // Stopped while its prompt was being read: the cache holds what
+            // was read and no more, and that is the conversation there is.
+            ids.truncate(read);
+            prompt_len = read;
+        } else {
+            stats.decode_secs = decoding.elapsed().as_secs_f32();
+        }
 
         self.lent = self.lent.saturating_sub(reserved);
-        if let Some(cache) = cache {
-            // A backend that gave the cache out can set one aside and take
-            // one back; if it somehow will not, the conversation is lost
-            // and the next prompt finds an empty cache, which is slow and
-            // not wrong.
-            if !self.set_aside() || self.session.resume(cache).is_err() {
-                let _ = self.clear();
+        match cache {
+            // Its conversation is the one in the session, and stays there.
+            None => self.busy = false,
+            // The session is another generation's, still reading its prompt
+            // or not yet detached: this conversation goes straight among
+            // the ones set aside. What its cache has memory for is not
+            // known from here, so it is counted as what was reserved for
+            // it, which it cannot have outgrown.
+            Some(cache) if self.busy => {
+                self.clock += 1;
+                self.parked.push(Conversation {
+                    room: reserved.max(ids.len()),
+                    prompt_len,
+                    used: self.clock,
+                    cache,
+                    ids: ids.clone(),
+                });
+                self.make_room(0);
+                stats.held_tokens = self.held();
+                stats.conversations = self.parked.len() + 1;
                 return (stats, ids);
             }
-            self.make_room(self.session.room());
+            Some(cache) => {
+                // A backend that gave the cache out can set one aside and
+                // take one back; if it somehow will not, the conversation
+                // is lost and the next prompt finds an empty cache, which
+                // is slow and not wrong.
+                if !self.set_aside() || self.session.resume(cache).is_err() {
+                    let _ = self.clear();
+                    return (stats, ids);
+                }
+                self.make_room(self.session.room());
+            }
         }
 
         self.cached_ids = ids.clone();

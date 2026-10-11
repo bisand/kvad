@@ -473,8 +473,11 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 },
             },
             false => {
-                let joining = match held {
-                    Some(_) => None,
+                // What was held is asked again each time round: a generation
+                // that could not join while another was reading its prompt
+                // can once that one has.
+                let joining = match held.take() {
+                    Some(cmd) => Some(cmd),
                     None => match rx.try_recv() {
                         Ok(cmd) => Some(cmd),
                         Err(mpsc::TryRecvError::Empty) => None,
@@ -489,7 +492,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 match joining {
                     Some(cmd) if can_join(&cmd, &mut generating, s) => cmd,
                     waits => {
-                        held = held.or(waits);
+                        held = waits;
                         advance(&mut generating, s, &tx, &cancel);
                         continue;
                     }
@@ -828,10 +831,15 @@ struct Generating {
 fn can_join(cmd: &Cmd, generating: &mut [Generating], s: &mut Loaded) -> bool {
     matches!(cmd, Cmd::Beside { .. })
         && generating.iter().all(|g| g.tag.is_some())
+        // One prompt is read at a time, in the session. The next waits for
+        // it, and is asked again when it is done.
+        && generating.iter().all(|g| g.run.ready())
         && generating.iter_mut().all(|g| s.llm.detach(&mut g.run))
 }
 
-/// Start generating from token ids: prefill, and nothing sent yet.
+/// Start generating from token ids: the conversation found, and its prompt
+/// still to read — [`advance`] does that, a pass at a time when there are
+/// others to keep writing in between.
 ///
 /// Shared by chat and raw completion, which differ only in how the ids were
 /// arrived at — and that difference belongs above this line, not inside the
@@ -851,7 +859,7 @@ fn begin(
         cancel.store(false, Ordering::Relaxed);
     }
     let sampler = s.sampler.for_one(sampling.temperature, sampling.top_k, sampling.top_p, sampling.seed);
-    match s.llm.begin(ids, sampling.max_tokens, explain) {
+    match s.llm.open(ids, sampling.max_tokens, explain) {
         Ok(run) => Some(Generating { run, explain, sampler, tag, beside: 0 }),
         Err(e) => {
             tell(tx, &tag, Evt::Error(e.to_string()));
@@ -862,7 +870,49 @@ fn begin(
 
 /// Take every generation one token further and send each its token. The
 /// ones that are over leave, with their statistics or their failure sent.
+///
+/// A generation still reading its prompt reads on instead: all of it when
+/// there is nobody else, and one pass when there is, so that the others
+/// write a token between each pass rather than waiting for the whole
+/// prompt. That is chunked prefill, and it is what keeps a long prompt
+/// arriving from stopping every reply under way for as long as it takes to
+/// read.
 fn advance(generating: &mut Vec<Generating>, s: &mut Loaded, tx: &Sender<Evt>, cancel: &AtomicBool) {
+    let (writing, reading): (Vec<Generating>, Vec<Generating>) =
+        generating.drain(..).partition(|g| g.run.ready());
+    let alone = writing.is_empty();
+    for mut g in reading {
+        let stopped = match &g.tag {
+            Some(tag) => tag.stop.load(Ordering::Relaxed),
+            None => cancel.load(Ordering::Relaxed),
+        };
+        match stopped {
+            // Stopped before its prompt was read: over, with nothing said.
+            true => {
+                let (stats, _) = s.llm.finish(g.run);
+                tell(tx, &g.tag, Evt::Done(stats));
+            }
+            false => match s.llm.prefill(&mut g.run, alone) {
+                // Read or not, it writes nothing this time round: its first
+                // token is the next step's.
+                Ok(_) => generating.push(g),
+                Err(e) => {
+                    tell(tx, &g.tag, Evt::Error(e.to_string()));
+                    s.llm.abandon(g.run);
+                }
+            },
+        }
+    }
+    if writing.is_empty() {
+        return;
+    }
+    let reading = std::mem::replace(generating, writing);
+    step(generating, s, tx, cancel);
+    generating.extend(reading);
+}
+
+/// Take every generation that has read its prompt one token further.
+fn step(generating: &mut Vec<Generating>, s: &mut Loaded, tx: &Sender<Evt>, cancel: &AtomicBool) {
     // One alone, with its conversation in the session, is the step it
     // always was; several are one pass. A failure is the pass's, and so
     // every generation's that was in it.

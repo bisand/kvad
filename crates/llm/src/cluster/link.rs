@@ -192,14 +192,23 @@ fn classify(iface: &str, seen: &Seen) -> Link {
     // "Link Status: 0x100" ends in "Status:" as well, so the line is matched
     // and not the word: counting the word finds six ports on a machine that
     // has three.
-    let status: Vec<&str> = seen.thunderbolt.lines().map(str::trim).filter(|l| l.starts_with("Status:")).collect();
+    // And only this machine's own ports: a dock on one of them lists
+    // ports of its own further in, and they are not ways to another Mac.
+    let own = seen.thunderbolt.lines().filter(|l| l.trim_start().starts_with("Status:")).map(|l| l.len() - l.trim_start().len()).min();
+    let status: Vec<&str> =
+        seen.thunderbolt.lines().filter(|l| Some(l.len() - l.trim_start().len()) == own).map(str::trim).filter(|l| l.starts_with("Status:")).collect();
     let live = status.iter().filter(|l| !l.contains("No device connected")).count();
     let member = seen.bridge.contains(&format!("member: {iface} "));
     let bridge_up = field(seen.bridge, "status") == Some("active");
 
     let what = if above.iter().any(|(_, class)| class.starts_with("AppleThunderboltIP")) {
         What::Thunderbolt
-    } else if above.iter().any(|(_, class)| class.starts_with("AppleUSBNCM")) {
+    } else if above.iter().any(|(_, class)| class.starts_with("AppleUSB") && class.contains("NCM")) {
+        // `AppleUSBNCM…` on the Mac that is the cable's host, and
+        // `AppleUSBDeviceNCM…` on the one that is its device: which is
+        // which depends on the order they were plugged in, and it is the
+        // same link from either end. The device's end hangs off no port
+        // that says its speed.
         // `usb-drdN-port-hs` is USB 2.0 High Speed and `-ss` is SuperSpeed.
         // The connector is the same shape either way, which is the whole
         // problem.
@@ -429,6 +438,62 @@ en13: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             link.evidence,
             [("ioreg", "AppleUSBNCM11Data".to_string()), ("bridge0", "not a member, inactive".to_string()), ("Thunderbolt", "0 of 3 ports with a device".to_string())]
         );
+    }
+
+    // The same pair on the same day with the cable the other way round:
+    // this Mac is the USB device, and what it printed for its end.
+    const IOREG_DEVICE_END: &str = "\
++-o Root  <class IORegistryEntry, id 0x100000100, retain 46>
+  +-o J714sAP  <class IOPlatformExpertDevice, id 0x10000037c, registered, matched, active, busy 0 (18093 ms), retain 45>
+    +-o AppleARMPE  <class AppleARMPE, id 0x100000382, registered, matched, active, busy 0 (9199 ms), retain 59>
+      +-o arm-io@10F00000  <class IOPlatformDevice, id 0x1000003be, registered, matched, active, busy 0 (8917 ms), retain 252>
+        +-o AppleSoCIO  <class AppleSoCIO, id 0x1000003fa, registered, matched, active, busy 0 (8906 ms), retain 250>
+          +-o usb-drd1@AA280000  <class AppleARMIODevice, id 0x1000004b0, registered, matched, active, busy 0 (615 ms), retain 14>
+            +-o AppleT8142USBXDCI@1  <class AppleT8142USBXDCI, id 0x1000004b2, registered, matched, active, busy 0 (119 ms), retain 99>
+              +-o AppleUSBNCMData@1  <class IOUSBDeviceInterface, id 0x10000c001, registered, matched, active, busy 0 (45 ms), retain 9>
+                +-o AppleUSBDeviceNCM11Data  <class AppleUSBDeviceNCM11Data, id 0x10000c002, registered, matched, active, busy 0 (22 ms), retain 7>
+                  +-o en4  <class IOEthernetInterface, id 0x10000c003, registered, matched, active, busy 0 (70 ms), retain 11>
+";
+
+    /// A Mac with a dock on one port and another Mac on a second, as
+    /// `system_profiler` lays it out: the dock's own ports are further in.
+    const THUNDERBOLT_WITH_A_DOCK: &str = "\
+    Thunderbolt/USB4 Bus 2:
+      Port:
+          Status: No device connected
+          Speed: Up to 120 Gb/s
+    Thunderbolt/USB4 Bus 1:
+      Port:
+          Status: Device connected
+          Speed: 20 Gb/s
+        MacBook Air:
+          Vendor Name: Apple Inc.
+    Thunderbolt/USB4 Bus 0:
+      Port:
+          Status: Device connected
+          Speed: 40 Gb/s
+        ThinkPad Thunderbolt 4 Dock:
+          Port (Upstream):
+              Status: Device connected
+              Speed: 40 Gb/s
+          Port:
+              Status: No device connected
+              Speed: Up to 40 Gb/s
+";
+
+    /// The cable looks the same from the Mac that is its device as from
+    /// the one that is its host, and is not taken for an Ethernet adapter
+    /// because macOS has a port name for that end.
+    #[test]
+    fn a_charging_cable_is_named_from_its_device_end_too() {
+        let ports = format!("{PORTS}\nHardware Port: Ethernet Adapter (en4)\nDevice: en4\nEthernet Address: a2:19:80:e5:b2:f9\n");
+        let link = classify("en4", &Seen { ioreg: IOREG_DEVICE_END, iface: "\tmedia: 100baseTX <full-duplex>\n", bridge: BRIDGE_IDLE, thunderbolt: THUNDERBOLT_WITH_A_DOCK, ports: &ports });
+        assert_eq!(link.what, What::UsbNcm(Usb::Unsaid), "the device's end names no port, and so no speed");
+        assert!(link.caution().unwrap().contains("not Thunderbolt"));
+        assert!(link.evidence.contains(&("ioreg", "AppleUSBDeviceNCM11Data".to_string())));
+        // Three ports on this machine, two with something on them: the
+        // dock's own two ports are the dock's.
+        assert!(link.evidence.contains(&("Thunderbolt", "2 of 3 ports with a device".to_string())), "{:?}", link.evidence);
     }
 
     #[test]

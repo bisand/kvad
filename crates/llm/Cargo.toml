@@ -39,6 +39,9 @@ nervus = { path = "../nervus" }
 rayon = "1.10.0"
 safetensors = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }
+# For the cluster key's handshake: HMAC is written out in `cluster/key.rs`
+# and this is the hash under it. Already in the tree, by way of `hf-hub`.
+sha2 = "0.11"
 # `preserve_order` because a tool schema reaches the model as text. Every
 # chat template dumps the schemas the client sent with `tojson`, and a `Value`
 # backed by a BTreeMap sorts the keys on the way: OpenAI's

@@ -4,8 +4,12 @@
 #![allow(dead_code)]
 
 use kvad::cluster::session::PipelineSession;
-use kvad::model::{CpuSession, Session, Shard, Spec, Transformer};
+use kvad::model::{gpt2, llama, CpuSession, Json, Session, Shard, Spec, Transformer};
+use kvad::qcache::Live;
 use kvad::quant::Precision;
+use kvad::weights::Checkpoint;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 fn bits(xs: &[f32]) -> Vec<u32> {
     xs.iter().map(|x| x.to_bits()).collect()
@@ -82,4 +86,198 @@ pub fn every_cut_is_the_model(spec: &Spec, precision: Precision, what: &str, loa
         assert_eq!(split.param_count(), whole.param_count(), "{what}: and between them that is the model");
         same_answers(&mut whole, &mut split, &what);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Small models, built here
+// ---------------------------------------------------------------------------
+
+/// Deterministic pseudo-random numbers, so a failure is reproducible.
+pub struct Rng(pub u64);
+
+impl Rng {
+    pub fn next(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        ((self.0 >> 40) as f32 / 8_388_608.0 - 1.0) * 0.25
+    }
+
+    pub fn matrix(&mut self, rows: usize, cols: usize) -> Mat {
+        Mat { rows, cols, data: (0..rows * cols).map(|_| self.next()).collect() }
+    }
+
+    /// A bias: one row.
+    pub fn vector(&mut self, n: usize) -> Mat {
+        self.matrix(1, n)
+    }
+
+    /// Norm weights, which are near one rather than near zero.
+    pub fn ones(&mut self, n: usize) -> Mat {
+        Mat { rows: 1, cols: n, data: (0..n).map(|_| 1.0 + self.next()).collect() }
+    }
+}
+
+pub struct Mat {
+    pub rows: usize,
+    pub cols: usize,
+    pub data: Vec<f32>,
+}
+
+/// The smallest safetensors writer that will do: a JSON header, its length,
+/// and the arrays.
+pub fn write_safetensors(path: &PathBuf, tensors: &BTreeMap<String, Mat>) {
+    let mut header = String::from("{");
+    let mut blob: Vec<u8> = Vec::new();
+    for (i, (name, m)) in tensors.iter().enumerate() {
+        let start = blob.len();
+        for v in &m.data {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        let shape = match m.rows {
+            1 => format!("[{}]", m.cols),
+            r => format!("[{r},{}]", m.cols),
+        };
+        if i > 0 {
+            header.push(',');
+        }
+        header.push_str(&format!("\"{name}\":{{\"dtype\":\"F32\",\"shape\":{shape},\"data_offsets\":[{start},{}]}}", blob.len()));
+    }
+    header.push('}');
+    while (header.len() + 8) % 8 != 0 {
+        header.push(' ');
+    }
+    let mut out = (header.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(&blob);
+    std::fs::write(path, out).unwrap();
+}
+
+pub const VOCAB: usize = 64;
+
+/// A checkpoint on disk for as long as a test wants shards read from it.
+pub struct Fixture {
+    pub path: PathBuf,
+    pub ckpt: Checkpoint,
+    pub spec: Spec,
+}
+
+impl Fixture {
+    pub fn new(tag: &str, tensors: &BTreeMap<String, Mat>, config: serde_json::Value) -> Fixture {
+        let path = std::env::temp_dir().join(format!("kvad-split-{}-{tag}.safetensors", std::process::id()));
+        write_safetensors(&path, tensors);
+        let ckpt = Checkpoint::open(std::slice::from_ref(&path)).unwrap();
+        Fixture { path, ckpt, spec: Spec::from_config(Json::new(config)).unwrap() }
+    }
+
+    /// One shard, read through the same audit a whole model is: whatever it
+    /// did not read it has to have said it was leaving.
+    pub fn load(&self, precision: Precision, shard: &Shard) -> Box<dyn Transformer> {
+        read_shard(&self.ckpt, &self.spec, precision, shard)
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A small Llama, four layers of it: grouped-query attention, an untied
+/// head, and — for `qwen3` — the per-head norms on Q and K.
+///
+/// Every matrix has a row length that is a multiple of 32, because anything
+/// narrower the quantiser leaves as f32, and a tiny model that quietly
+/// skipped quantisation would test the wrong kernels.
+pub fn llama(model_type: &str, tag: &str) -> Fixture {
+    let (hidden, n_head, n_kv_head, n_layer, inter) = (64usize, 4usize, 2usize, 4usize, 128usize);
+    let head_dim = hidden / n_head;
+    let mut r = Rng(0x0bad_5eed_1234_5678);
+    let mut t: BTreeMap<String, Mat> = BTreeMap::new();
+    t.insert("model.embed_tokens.weight".into(), r.matrix(VOCAB, hidden));
+    t.insert("model.norm.weight".into(), r.ones(hidden));
+    t.insert("lm_head.weight".into(), r.matrix(VOCAB, hidden));
+    for l in 0..n_layer {
+        let p = format!("model.layers.{l}");
+        t.insert(format!("{p}.input_layernorm.weight"), r.ones(hidden));
+        t.insert(format!("{p}.post_attention_layernorm.weight"), r.ones(hidden));
+        t.insert(format!("{p}.self_attn.q_proj.weight"), r.matrix(n_head * head_dim, hidden));
+        t.insert(format!("{p}.self_attn.k_proj.weight"), r.matrix(n_kv_head * head_dim, hidden));
+        t.insert(format!("{p}.self_attn.v_proj.weight"), r.matrix(n_kv_head * head_dim, hidden));
+        t.insert(format!("{p}.self_attn.o_proj.weight"), r.matrix(hidden, n_head * head_dim));
+        if model_type == "qwen3" {
+            t.insert(format!("{p}.self_attn.q_norm.weight"), r.ones(head_dim));
+            t.insert(format!("{p}.self_attn.k_norm.weight"), r.ones(head_dim));
+        }
+        t.insert(format!("{p}.mlp.gate_proj.weight"), r.matrix(inter, hidden));
+        t.insert(format!("{p}.mlp.up_proj.weight"), r.matrix(inter, hidden));
+        t.insert(format!("{p}.mlp.down_proj.weight"), r.matrix(hidden, inter));
+    }
+    let config = serde_json::json!({
+        "model_type": model_type,
+        "hidden_size": hidden,
+        "num_attention_heads": n_head,
+        "num_key_value_heads": n_kv_head,
+        "num_hidden_layers": n_layer,
+        "vocab_size": VOCAB,
+        "intermediate_size": inter,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "max_position_embeddings": 64,
+        "tie_word_embeddings": false,
+    });
+    Fixture::new(tag, &t, config)
+}
+
+/// A small GPT-2, three layers: learned positions added at the door, which
+/// is the one place a shard needs telling where in the sequence it is; and
+/// tied embeddings, so the head is the table the other end of the model
+/// reads.
+pub fn gpt2_model(tag: &str) -> Fixture {
+    let (e, n_head, n_layer, n_ctx) = (64usize, 4usize, 3usize, 48usize);
+    let mut r = Rng(0x5eed_0f_a_9272);
+    let mut t: BTreeMap<String, Mat> = BTreeMap::new();
+    t.insert("wte.weight".into(), r.matrix(VOCAB, e));
+    t.insert("wpe.weight".into(), r.matrix(n_ctx, e));
+    t.insert("ln_f.weight".into(), r.ones(e));
+    t.insert("ln_f.bias".into(), r.vector(e));
+    for l in 0..n_layer {
+        let p = format!("h.{l}");
+        t.insert(format!("{p}.ln_1.weight"), r.ones(e));
+        t.insert(format!("{p}.ln_1.bias"), r.vector(e));
+        // Stored `[in, out]`, as a Conv1D writes them.
+        t.insert(format!("{p}.attn.c_attn.weight"), r.matrix(e, 3 * e));
+        t.insert(format!("{p}.attn.c_attn.bias"), r.vector(3 * e));
+        t.insert(format!("{p}.attn.c_proj.weight"), r.matrix(e, e));
+        t.insert(format!("{p}.attn.c_proj.bias"), r.vector(e));
+        t.insert(format!("{p}.ln_2.weight"), r.ones(e));
+        t.insert(format!("{p}.ln_2.bias"), r.vector(e));
+        t.insert(format!("{p}.mlp.c_fc.weight"), r.matrix(e, 4 * e));
+        t.insert(format!("{p}.mlp.c_fc.bias"), r.vector(4 * e));
+        t.insert(format!("{p}.mlp.c_proj.weight"), r.matrix(4 * e, e));
+        t.insert(format!("{p}.mlp.c_proj.bias"), r.vector(e));
+    }
+    let config = serde_json::json!({
+        "model_type": "gpt2",
+        "n_embd": e,
+        "n_head": n_head,
+        "n_layer": n_layer,
+        "n_positions": n_ctx,
+        "vocab_size": VOCAB,
+        "layer_norm_epsilon": 1e-5,
+    });
+    Fixture::new(tag, &t, config)
+}
+
+/// One shard out of a checkpoint, with nothing in the file unaccounted for.
+pub fn read_shard(ckpt: &Checkpoint, spec: &Spec, precision: Precision, shard: &Shard) -> Box<dyn Transformer> {
+    let live = Live::new(ckpt, precision);
+    let model: Box<dyn Transformer> = match spec.arch.id() {
+        "gpt2" => Box::new(gpt2::Model::load_shard(&live, spec.clone(), shard).unwrap()),
+        _ => Box::new(llama::Model::load_shard(&live, spec.clone(), shard).unwrap()),
+    };
+    let unread = live.unread();
+    assert!(unread.is_empty(), "{shard}: neither read nor left to another shard: {unread:?}");
+    assert_eq!(model.shard(), *shard);
+    model
 }

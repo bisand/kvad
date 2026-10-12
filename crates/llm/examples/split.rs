@@ -19,8 +19,19 @@
 //! Arguments: the model, its precision (`f32`, `q8`, `q4`), then optionally
 //! the rounds (5), the tokens decoded a run (48) and the prompt's length in
 //! tokens (256). The model has to be on disk already.
+//!
+//! Two more arguments put real machines in it: the workers, as `--workers`
+//! takes them, and the layers each machine holds, as `--split` does. The
+//! comparison is then the model whole on this machine against the model
+//! across this one and those, with the cluster key from where a coordinator
+//! finds it — and it is still by the bit first.
+//!
+//! ```text
+//! cargo run --release -p kvad --example split -- MODEL q8 5 48 256 'fe80::1c%en12' 0..14,14..28
+//! ```
 
-use kvad::cluster::session::PipelineSession;
+use kvad::cluster::key::Key;
+use kvad::cluster::session::{self, PipelineSession};
 use kvad::model::{CpuSession, Session, Shard, Spec};
 use kvad::qcache;
 use kvad::quant::Precision;
@@ -83,17 +94,35 @@ fn main() -> Res<()> {
     let mut whole = CpuSession::new(qcache::load_shard(&files, &spec, precision, &Shard::whole(&spec))?, precision);
     let (reference, ..) = run(&mut whole, &prompt, steps)?;
 
+    // Across machines, if any were named; otherwise every cut in here.
+    let across = match (args.get(5), args.get(6)) {
+        (Some(workers), Some(split)) => {
+            let workers: Vec<String> = workers.split(',').map(str::to_string).collect();
+            Some((workers, session::parse_split(split)?, Key::ours()?))
+        }
+        _ => None,
+    };
+    let counts: &[usize] = if across.is_some() { &[0] } else { &[1, 2, 3, 4] };
+
     println!("| shards | prefill, tok/s whole | cut | cut / whole | decode, tok/s whole | cut | cut / whole |");
     println!("|---|---|---|---|---|---|---|");
-    for parts in [1, 2, 3, 4] {
-        let cut = Shard::cut(spec.n_layer, parts);
-        eprintln!("loading {parts} shard(s): {}", cut.iter().map(Shard::to_string).collect::<Vec<_>>().join("; "));
-        let shards = cut.iter().map(|shard| qcache::load_shard(&files, &spec, precision, shard)).collect::<Res<Vec<_>>>()?;
-        let mut split = PipelineSession::local(shards, precision)?;
+    for &parts in counts {
+        let mut split: Box<dyn Session> = match &across {
+            Some((workers, split, key)) => {
+                session::across(&kvad::weights::model_id(model), &files, &spec, precision, workers, split, key, &mut |msg| eprintln!("  {msg}"))?
+            }
+            None => {
+                let cut = Shard::cut(spec.n_layer, parts);
+                eprintln!("loading {parts} shard(s): {}", cut.iter().map(Shard::to_string).collect::<Vec<_>>().join("; "));
+                let shards = cut.iter().map(|shard| qcache::load_shard(&files, &spec, precision, shard)).collect::<Res<Vec<_>>>()?;
+                Box::new(PipelineSession::local(shards, precision)?)
+            }
+        };
+        let parts = across.as_ref().map_or(parts, |(workers, ..)| workers.len() + 1);
 
         // The answer first. A speed for a model that says something else is
         // a speed for a different model.
-        let (rows, ..) = run(&mut split, &prompt, steps)?;
+        let (rows, ..) = run(split.as_mut(), &prompt, steps)?;
         for (i, (a, b)) in reference.iter().zip(&rows).enumerate() {
             if bits(a) != bits(b) {
                 let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
@@ -105,7 +134,7 @@ fn main() -> Res<()> {
         for round in 0..rounds {
             // Whole first on even rounds, cut first on odd ones.
             for which in [round % 2, 1 - round % 2] {
-                let session: &mut dyn Session = if which == 0 { &mut whole } else { &mut split };
+                let session: &mut dyn Session = if which == 0 { &mut whole } else { split.as_mut() };
                 let (_, p, d) = run(session, &prompt, steps)?;
                 prefill[which].push(length as f64 / p);
                 decode[which].push(steps as f64 / d);

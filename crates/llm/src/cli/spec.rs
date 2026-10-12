@@ -80,6 +80,12 @@ pub const CLUSTER: &str = "usage: kvad cluster find [--all]        who is on the
 
 With no HOST, `ping` measures the one machine `find` finds, if it finds one.";
 
+/// `run` and `chat`, for a model spread over several machines.
+const ACROSS: &[Flag] = &[
+    f("--workers", "HOST[,HOST]", Kind::Text, "spread the model over these machines, each running `kvad worker`"),
+    f("--split", "A..B,C..D", Kind::Text, "the layers each machine holds: this one first, then each worker"),
+];
+
 const CLUSTER_PORT: Flag = f("--port", "N", Kind::Text, "the port to listen on, or to reach (default 7420)");
 
 const LORA: Flag = f("--lora", "NAME[:SCALE]", Kind::Lora, "apply a LoRA, at SCALE if given (default 1); as often as you like");
@@ -238,6 +244,7 @@ pub const COMMANDS: &[Command] = &[
                 BACKEND,
             ],
             SAMPLING,
+            ACROSS,
         ],
         usage: None,
         notes: "Inside it: /reset forgets the conversation so far, /quit leaves.",
@@ -782,6 +789,35 @@ pub const COMMANDS: &[Command] = &[
                 loads nothing and reads nothing, and is not meant to be left running.",
         examples: &["kvad cluster listen", "kvad cluster find", "kvad cluster ping", "kvad cluster ping 'fe80::1c%en12' --sizes 16k,32k,64k"],
     },
+    Command {
+        name: "worker",
+        group: Group::Server,
+        args: "",
+        about: "hold some of a model's layers for another machine that runs it",
+        server: false,
+        routed: false,
+        words: &[],
+        subs: &[],
+        flags: &[&[
+            f("--host", "ADDR", Kind::Text, "the address to listen on (default: every one this machine has)"),
+            f("--port", "N", Kind::Text, "the port to listen on (default 7420)"),
+        ]],
+        usage: None,
+        notes: "A model too large for one machine can be run across several: its layers are\n\
+                divided between them, and what passes from one to the next is the model's\n\
+                working state for each token, a few kilobytes. This is the machine that\n\
+                holds layers and nothing else. The one that has the prompt names it:\n\n\
+                \x20 kvad run --model MODEL --workers THIS-MACHINE --split 0..12,12..24\n\n\
+                which keeps layers 0 to 11 itself and asks this one for 12 to 23. The\n\
+                worker fetches the model if it has not got it.\n\n\
+                It answers only a machine that holds the same cluster key. The first start\n\
+                makes one, keeps it in the data directory as cluster.key and prints it;\n\
+                copy that file to the other machines, or give them the key in\n\
+                KVAD_CLUSTER_KEY. What crosses between machines is not encrypted.\n\n\
+                Both ends have to be the same version of kvad, and the split is by hand:\n\
+                nothing yet works out which machine should hold what.",
+        examples: &["kvad worker", "kvad worker --port 7421"],
+    },
     // -- accounts ----------------------------------------------------------
     Command {
         name: "auth",
@@ -951,11 +987,14 @@ const RUN: Command = Command {
             BACKEND,
         ],
         SAMPLING,
+        ACROSS,
     ],
     usage: None,
     notes: "`kvad --prompt TEXT`, with no command, is `kvad run --prompt TEXT`.\n\n\
             The answer goes to stdout and everything else to stderr, so\n\
-            `kvad run --prompt ... > answer.txt` keeps only the answer.",
+            `kvad run --prompt ... > answer.txt` keeps only the answer.\n\n\
+            --workers and --split run one model across several machines, in this\n\
+            process and theirs: see `kvad help worker`.",
     examples: &[
         "kvad run --prompt \"Why is the sky blue?\"",
         "kvad run --model Qwen/Qwen2.5-1.5B-Instruct --prompt \"...\" --greedy",
@@ -1086,7 +1125,7 @@ mod tests {
     #[test]
     fn the_table_holds_every_command_and_only_those() {
         for command in COMMANDS {
-            let handled = matches!(command.name, "arch" | "crawl" | "service" | "cluster" | "serve" | "help" | "completions");
+            let handled = matches!(command.name, "arch" | "crawl" | "service" | "cluster" | "worker" | "serve" | "help" | "completions");
             assert!(handled || crate::cli::known(command.name), "`{}` is in the table and nothing runs it", command.name);
             assert_eq!(command.server, crate::cli::remote_only(command.name), "`{}`: does it need a server?", command.name);
             // The parser gathers words only for the commands it knows take

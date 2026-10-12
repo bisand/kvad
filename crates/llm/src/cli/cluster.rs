@@ -7,7 +7,7 @@
 
 use super::Res;
 use crate::Args;
-use kvad::cluster::{link, ping, wire};
+use kvad::cluster::{key, link, ping, wire, worker as far};
 use std::net::TcpListener;
 
 use super::spec::CLUSTER as USAGE;
@@ -164,5 +164,46 @@ fn measure(args: &Args, host: Option<&str>) -> Res<()> {
         true => println!("Some medians sit well off their minimums: a machine was busy, and this run is\nworth repeating rather than quoting."),
         false => println!("Every median sits on its minimum, which is what a quiet run looks like."),
     }
+    Ok(())
+}
+
+/// `kvad worker`: hold layers for a coordinator that has the key.
+pub fn worker(args: &Args) -> Res<()> {
+    let path = key::path();
+    let (key, new) = key::Key::read_or_create(&path)?;
+    match new {
+        // Once, and to the terminal that started it: after this it is a
+        // file only its owner can read.
+        true => println!("cluster key: {}\n  new, and kept in {}. Every machine of the cluster needs the same one:\n  copy that file to them, or set {} there.", key.to_hex(), path.display(), key::ENV),
+        false => println!("cluster key: the one in {}", path.display()),
+    }
+    let port = args.port.unwrap_or(wire::PORT);
+    // `::` and not `0.0.0.0`: a cable's addresses are link-local IPv6, and
+    // an IPv6 socket takes IPv4 as well.
+    let listener = match &args.host {
+        Some(host) => TcpListener::bind((host.as_str(), port)),
+        None => TcpListener::bind(("::", port)).or_else(|_| TcpListener::bind(("0.0.0.0", port))),
+    }
+    .map_err(|e| format!("cannot listen on port {port}: {e}"))?;
+    println!("{} is a worker on port {port}; ^C to stop", kvad::cluster::hostname());
+
+    let started = std::time::Instant::now();
+    far::serve(&listener, &key, &mut far::from_disk(), &mut |event| {
+        let at = started.elapsed().as_secs_f32();
+        match event {
+            far::Event::Came(from, hello) => println!("[{at:>9.3}s] <- {} ({}, kvad {})", from.ip(), hello.name, hello.version),
+            far::Event::Progress(message) => println!("[{at:>9.3}s]    {message}"),
+            far::Event::Loaded(load, ready) => println!(
+                "[{at:>9.3}s]    holding layers {}..{} of {} at {}: {:.1}M parameters, {:.0} MB",
+                load.layers[0],
+                load.layers[1],
+                load.repo,
+                load.precision,
+                ready.params as f64 / 1e6,
+                ready.bytes as f64 / 1e6
+            ),
+            far::Event::Went(from, how) => println!("[{at:>9.3}s] -> {} gone: {how}", from.ip()),
+        }
+    })?;
     Ok(())
 }

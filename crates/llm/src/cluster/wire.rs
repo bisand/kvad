@@ -62,6 +62,23 @@ pub enum Kind {
     /// Rows for a stage's layers, and the rows that come back.
     Forward = 7,
     Hidden = 8,
+    /// Proof of the cluster key: JSON, `{"proof": "..."}`. See
+    /// [`super::key`].
+    Auth = 9,
+    /// Which part of which model to hold: JSON, [`Load`]. Answered by any
+    /// number of [`Kind::Progress`] and then a [`Kind::Ready`].
+    Load = 10,
+    /// A line about a load in progress: JSON, `{"message": "..."}`.
+    Progress = 11,
+    /// The stage is loaded: JSON, [`Ready`].
+    Ready = 12,
+    /// Drop a conversation's cache past a length: JSON, [`Truncate`]. The
+    /// answer is a [`Kind::Truncated`] of the same shape, with how far back
+    /// it got.
+    Truncate = 13,
+    Truncated = 14,
+    /// Let the stage go. Answered by an [`Kind::Ack`].
+    Unload = 15,
 }
 
 impl Kind {
@@ -75,6 +92,13 @@ impl Kind {
             6 => Kind::Ack,
             7 => Kind::Forward,
             8 => Kind::Hidden,
+            9 => Kind::Auth,
+            10 => Kind::Load,
+            11 => Kind::Progress,
+            12 => Kind::Ready,
+            13 => Kind::Truncate,
+            14 => Kind::Truncated,
+            15 => Kind::Unload,
             _ => return None,
         })
     }
@@ -169,6 +193,10 @@ pub struct Hello {
     pub threads: usize,
     #[serde(default)]
     pub architectures: Vec<String>,
+    /// Random, and new for each connection: what the other end's proof of
+    /// the key is made over. Empty from an end that is only measuring.
+    #[serde(default)]
+    pub nonce: String,
 }
 
 impl Hello {
@@ -181,6 +209,7 @@ impl Hello {
             memory: crate::machine::usable_memory_cached(),
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
             architectures: crate::model::arch::registry().iter().map(|a| a.id().to_string()).collect(),
+            nonce: String::new(),
         }
     }
 
@@ -212,6 +241,62 @@ pub fn error_text(payload: &[u8]) -> String {
         .ok()
         .and_then(|v| v["error"].as_str().map(str::to_string))
         .unwrap_or_else(|| String::from_utf8_lossy(payload).into_owned())
+}
+
+/// What a worker is asked to hold.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Load {
+    /// A Hub repo id, or the worker's own name for a model. Never a path.
+    pub repo: String,
+    /// `f32`, `q8` or `q4`.
+    pub precision: String,
+    /// The layers, first and one past the last. A worker never holds the
+    /// ends: those stay with the tokens.
+    pub layers: [usize; 2],
+}
+
+/// A loaded stage, and what it holds.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Ready {
+    pub params: usize,
+    pub bytes: usize,
+}
+
+/// A conversation, and the length to cut its cache to — or, coming back,
+/// the length it was cut to.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Truncate {
+    pub seq: u64,
+    pub len: usize,
+}
+
+/// Send a control frame.
+pub fn send<T: serde::Serialize>(w: &mut impl Write, kind: Kind, body: &T) -> io::Result<()> {
+    write(w, kind, &serde_json::to_vec(body).map_err(|e| invalid(e.to_string()))?)
+}
+
+/// Read a control frame's body.
+pub fn parse<T: serde::de::DeserializeOwned>(kind: Kind, payload: &[u8]) -> io::Result<T> {
+    serde_json::from_slice(payload).map_err(|e| invalid(format!("a {kind:?} frame that does not read: {e}")))
+}
+
+/// `host:port`, `[v6]:port`, or a bare host — which for an IPv6 address
+/// scoped to its interface is the only spelling without brackets, since it
+/// is full of colons already.
+pub fn host_port(text: &str) -> (String, u16) {
+    let text = text.trim();
+    if let Some((host, port)) = text.strip_prefix('[').and_then(|rest| rest.split_once("]:")) {
+        if let Ok(port) = port.parse() {
+            return (host.to_string(), port);
+        }
+    }
+    match text.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => match port.parse() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => (text.to_string(), PORT),
+        },
+        _ => (text.trim_start_matches('[').trim_end_matches(']').to_string(), PORT),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +438,31 @@ mod tests {
         let err = Hello::parse(br#"{"protocol": 2, "name": "air"}"#).unwrap_err();
         assert!(err.to_string().contains("air speaks protocol 2"), "{err}");
         assert!(Hello::parse(b"hello").is_err());
+    }
+
+    #[test]
+    fn an_address_is_read_with_its_port_or_without() {
+        assert_eq!(host_port("air.local:7421"), ("air.local".to_string(), 7421));
+        assert_eq!(host_port("10.0.0.7"), ("10.0.0.7".to_string(), PORT));
+        assert_eq!(host_port("fe80::ca1:57c7%en13"), ("fe80::ca1:57c7%en13".to_string(), PORT));
+        assert_eq!(host_port("[fe80::ca1:57c7%en13]:7000"), ("fe80::ca1:57c7%en13".to_string(), 7000));
+        assert_eq!(host_port("[::1]"), ("::1".to_string(), PORT));
+        assert_eq!(host_port(" air:x "), ("air:x".to_string(), PORT));
+    }
+
+    #[test]
+    fn control_frames_keep_their_shape() {
+        let load = Load { repo: "Qwen/Qwen2.5-1.5B-Instruct".into(), precision: "q8".into(), layers: [14, 28] };
+        let mut wire = Vec::new();
+        send(&mut wire, Kind::Load, &load).unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(read(&mut Cursor::new(wire), 1 << 16, &mut buf).unwrap(), Kind::Load);
+        assert_eq!(parse::<Load>(Kind::Load, &buf).unwrap(), load);
+        assert!(parse::<Ready>(Kind::Ready, &buf).is_err());
+        for byte in 1..=15u8 {
+            assert_eq!(Kind::from_u8(byte).map(|k| k as u8), Some(byte));
+        }
+        assert_eq!(Kind::from_u8(16), None);
     }
 
     #[test]

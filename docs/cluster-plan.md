@@ -451,7 +451,10 @@ chips differing is of no interest to TCP.
 
 - With the right cable, System Settings → Network → Thunderbolt Bridge shows
   a self-assigned `169.254.x.x` address on each side. The firewall may ask
-  about incoming connections the first time a worker listens.
+  about incoming connections the first time a worker listens — and until
+  it is answered the worker looks, from the other machine, like one that
+  takes a connection and never speaks. The allowance is for the program at
+  the path it was run from: a new copy somewhere else is asked about again.
 - Both machines build the same revision; the handshake insists.
 - The M2 has `i8mm`, so both take the same kernels. A pair where one side
   lacks it (an M1) is a different question: the integer sums are exact
@@ -480,7 +483,12 @@ does not run open.
 
 - A pre-shared cluster key, required. `kvad worker` generates one on first
   start, stores it in `data_dir()`, prints it once. The handshake is an HMAC
-  challenge in both directions; the key never crosses the wire.
+  challenge in both directions; the key never crosses the wire. *As built:*
+  `cluster.key`, readable by its owner only; a coordinator reads the same
+  file, or `KVAD_CLUSTER_KEY`, and never takes the key as an argument. A
+  nonce from each end and a label for each role go under the HMAC, so a
+  proof is good for one connection and one direction. A worker checks the
+  coordinator's before it shows its own.
 - `Load` accepts Hub repo ids and the worker's own model names, never a path.
 - v1 sends activations in the clear and says so. They are not the prompt, but
   they are not nothing. TLS is a later option; `rustls` is already in the
@@ -489,7 +497,11 @@ does not run open.
 ### Failure
 
 A socket that dies mid-token fails the generation with an error naming the
-node; the scheduler reports it as it reports any failed load. The cluster
+node; the scheduler reports it as it reports any failed load. A pass that
+fails half way down the pipeline leaves the stages before the failure ahead
+of the ones after it; the session notes that and rewinds every stage to
+where the conversation really is before it runs anything else, so a stage
+that refused one frame costs that pass and not the conversation. The cluster
 does not heal, re-plan or retry in v1. A worker whose coordinator vanishes
 drops its stage and its cache and goes back to listening.
 
@@ -596,6 +608,74 @@ for each architecture, a model cut into 1, 2 and 3 shards produces logits
 uncut, five interleaved rounds — the refactor must cost nothing, and if it
 does, that is found here.
 
+**Phase 2 is half done**, the half that is a worker: `worker.rs`,
+`RemoteStage` (`remote.rs`), the handshake and the key (`key.rs`),
+`kvad worker`, `--workers` and `--split` on `run` and `chat`. On loopback a
+model with its layers on one worker, and on two with none kept by the
+coordinator, answers to the bit as the model whole at f32, q8 and q4
+(`tests/worker.rs`), and the same file holds the failures: the wrong key at
+either end, another build, a worker that goes away in the middle of a
+reply, a pass that fails half way down the pipeline, a load by path, and a
+`--split` with a gap, an overlap or the wrong number of runs.
+
+What a hop costs with no cable in it, from `examples/split.rs` with a worker
+on `127.0.0.1`, seven rounds, the model whole against half its layers in
+another process: decode at 0.94 and 0.96 of whole on SmolLM2-135M (q8 and
+f32), 0.99 on Qwen2.5-1.5B at q8, and 1.00 with every layer on the worker.
+That is a third of a millisecond a token, visible at 6 ms a token and gone
+at 20. Prefill is 1.00 everywhere.
+
+Not done, and all of it the second half of this phase: the machine id,
+`_kvad._tcp`, the path probe, and a git revision in `Hello` where the
+package version stands in for one.
+
+The run across the rig's cable was tried on 2026-10-12 and at first did not
+get as far as a hidden state, for a reason worth knowing. The Air's
+firewall is on. It had been told to allow the binary that `kvad cluster
+ping` was measured with, by the path that one was copied to, and the worker
+was copied to another. macOS then *completes the TCP connection* and holds
+every byte of it, with a question on the Air's screen that nobody at the
+coordinator can see: `nc` reports the port open, the coordinator's greeting
+is sent, the worker sits in `accept` and logs nothing. The coordinator
+waited out its five-minute patience and said `Resource temporarily
+unavailable`. It now waits ten seconds for a greeting and says what this
+looks like and where to look. Discovery will meet the same wall, and should
+say the same thing.
+
+With the firewall told, the same day: **a hidden state left a machine.**
+SmolLM2-135M, layers 0 to 14 on the M5 Pro and 15 to 29 on the M2 Air, over
+the charging cable (USB 2 NCM, identified as such), wrote the text the model
+whole writes. `examples/split.rs` then held every logit of a 256-token
+prefill and 48 decoded tokens to the whole model's for four splits at f32
+and at q8, and all eight agree to the bit — across two machines, two chips
+and two thread counts, which is the answer to whether a split model is the
+same model when the halves are not on the same processor. Both have `i8mm`;
+a pair where one does not is still unasked.
+
+And the first number that does not fit. Decode, milliseconds a token, five
+rounds, medians, against the model whole on each machine (8.3 on the M5
+Pro and 19.2 on the Air at f32; 6.5 and 6.6 at q8) and a round trip of
+0.8 ms for a frame this size:
+
+| layers here / on the Air | f32 measured | Σ + round trip | q8 measured | Σ + round trip |
+|---|---|---|---|---|
+| 25 / 5 | 15.5 | 10.9 | 11.8 | 7.3 |
+| 15 / 15 | 15.9 | 14.6 | 9.3 | 7.4 |
+| 5 / 25 | 21.2 | 18.2 | 9.7 | 7.4 |
+| 0 / 30 | 22.4 | 20.0 | 9.3 | 7.4 |
+
+Every row is slower than `Σ stages + hops × RTT` says, by 1.3 to 4.6 ms, and
+by most where the Air has least to do: five layers there cost 4.5 ms more
+than they should at either precision, and at q8 giving the Air *more*
+layers made the token faster. So a hop on this rig costs something the
+ping does not see, and it grows when a machine sits idle between frames.
+Two guesses, neither tested: the Air's cores and its thread pool going to
+sleep between one token's work and the next, or the USB link answering a
+lone frame after ten idle milliseconds more slowly than it answers a sweep
+of them back to back. Phase 4 owes an account of the difference, and this
+is where it starts; `kvad cluster ping` wants a mode that leaves a gap
+between frames before the second guess can be told from the first.
+
 **Phase 2 — a worker on loopback.** `worker.rs`, `RemoteStage`, the handshake
 and the key, `kvad worker`, `--workers`, and `--split`, because without it a
 small model never leaves the coordinator. Also the machine id, `_kvad._tcp`
@@ -643,7 +723,9 @@ at which a cluster stops being only about memory.
   test compares bits and passes for GPT-2, the Llama family and DeepSeek V2
   and V3 at every precision. Across two machines it is the same question
   again with a different answer possible — two CPUs, and kernels chosen by
-  what each has — and Phase 2 asks it.
+  what each has — and Phase 2 asked it of an M5 Pro and an M2 over the
+  rig's cable: yes, at f32 and q8, for the Llama family. A pair without the
+  same kernels is still open.
 - Should the coordinator hold layers at all when it is also running
   `kvad-serve`, a database and a browser? Probably yes, fewer of them — the
   planner's headroom figure is where that is expressed.

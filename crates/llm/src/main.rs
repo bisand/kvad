@@ -102,6 +102,10 @@ struct Args {
     /// `cluster` only: the frame sizes to sweep, megabytes to send one
     /// way, and whether `find` asks every interface.
     sizes: Option<String>,
+    /// `run` and `chat`: the machines to spread a model over, and which
+    /// layers each holds.
+    workers: Option<String>,
+    split: Option<String>,
     stream_mb: Option<usize>,
     all: bool,
     tokens: Option<usize>,
@@ -206,6 +210,8 @@ impl Default for Args {
             window: None,
             rounds: None,
             sizes: None,
+            workers: None,
+            split: None,
             stream_mb: None,
             all: false,
             tokens: None,
@@ -422,6 +428,8 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--window" => a.window = Some(num() as usize),
             "--rounds" => a.rounds = Some(num() as usize),
             "--sizes" => a.sizes = Some(value.clone()),
+            "--workers" => a.workers = Some(value.clone()),
+            "--split" => a.split = Some(value.clone()),
             "--stream-mb" => a.stream_mb = Some(num() as usize),
             "--tokens" => a.tokens = Some(num() as usize),
             // In the table and not in this match: the test in `cli::spec`
@@ -432,6 +440,17 @@ fn parse_from(argv: Vec<String>) -> Args {
     }
     if !a.words.is_empty() {
         a.target = Some(a.words.join(" "));
+    }
+    // A model spread over workers is put together in this process: a server
+    // has its own models, and no way to be told of somebody else's workers.
+    if a.workers.is_some() || a.split.is_some() {
+        match a.choice {
+            kvad::client::Choice::Remote(_) => {
+                eprintln!("--workers builds the model in this process, and --remote asks a server for one: not both.");
+                std::process::exit(2);
+            }
+            _ => a.choice = kvad::client::Choice::Local,
+        }
     }
     if let (true, None, Some(given)) = (a.command == "train", a.sample, a.samples.first()) {
         eprintln!("--sample expects a number, got `{given}`");
@@ -455,9 +474,30 @@ fn load(args: &Args) -> Res<Llm> {
     // Timestamped progress, because the interesting question about a load is
     // not how long it took but which part of it took that long.
     let t0 = std::time::Instant::now();
-    let llm = Llm::load_with(&repo, args.quant, &mut |msg| {
-        eprintln!("  [{:>6.3}s] {msg}", t0.elapsed().as_secs_f32())
-    })?;
+    let mut said = |msg: &str| eprintln!("  [{:>6.3}s] {msg}", t0.elapsed().as_secs_f32());
+    let llm = match (&args.workers, &args.split) {
+        (None, None) => Llm::load_with(&repo, args.quant, &mut said)?,
+        #[cfg(feature = "cluster")]
+        (Some(workers), Some(split)) => {
+            use kvad::cluster::{key::Key, session};
+            let workers: Vec<String> = workers.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect();
+            let split = session::parse_split(split)?;
+            let key = Key::ours()?;
+            let name = weights::model_id(&repo);
+            Llm::load_custom(&repo, &mut said, &weights::Watcher::none(), &mut |files, spec, progress| {
+                session::across(&name, files, spec, args.quant, &workers, &split, &key, progress)
+            })?
+        }
+        #[cfg(feature = "cluster")]
+        (Some(_), None) => {
+            return Err("--workers needs --split to say which layers each machine holds, this one first:\n  --workers HOST --split 0..12,12..24\nNothing places them for you yet."
+                .into())
+        }
+        #[cfg(feature = "cluster")]
+        (None, Some(_)) => return Err("--split says which layers each machine holds, and needs --workers to say which machines.".into()),
+        #[cfg(not(feature = "cluster"))]
+        _ => return Err("this build was made without the `cluster` feature.".into()),
+    };
     eprintln!("  {}", llm.spec.summary());
     eprintln!(
         "  {:.1}M parameters · weights {:.0} MB ({}) · loaded in {:.1}s",
@@ -597,6 +637,10 @@ fn real_main() -> Res<()> {
         "service" => return cli::service::run(&args),
         #[cfg(feature = "cluster")]
         "cluster" => return cli::cluster::run(&args),
+        #[cfg(feature = "cluster")]
+        "worker" => return cli::cluster::worker(&args),
+        #[cfg(not(feature = "cluster"))]
+        "worker" => return Err("this build was made without the `cluster` feature.".into()),
         #[cfg(not(feature = "cluster"))]
         "cluster" => return Err("this build was made without the `cluster` feature.".into()),
         _ => {}

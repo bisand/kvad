@@ -4,6 +4,9 @@
 //! * [`stage`] — some of a model's blocks, wherever they are, and
 //!   [`session`], the pipeline of them that the rest of the engine sees as
 //!   one model.
+//! * [`worker`] — the far end: a stage for a coordinator that holds the
+//!   key. [`remote`] is the near end of the same socket, and [`key`] is how
+//!   each shows the other it belongs.
 //! * [`wire`] — the framing two machines speak.
 //! * [`ping`] — a listener that sends frames straight back, and the
 //!   measurement of a link made against it: what a stage boundary costs
@@ -12,11 +15,14 @@
 //!   socket, because a charging cable and a Thunderbolt cable are told apart
 //!   by nothing a socket can observe.
 
+pub mod key;
 pub mod link;
 pub mod ping;
+pub mod remote;
 pub mod session;
 pub mod stage;
 pub mod wire;
+pub mod worker;
 
 /// This machine's name for itself, without its domain.
 pub fn hostname() -> String {

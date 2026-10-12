@@ -1006,10 +1006,31 @@ cache of its own: this machine's fifteen layers were ready while the worker
 was still 8 MB into a 257 MB download, and both rows showed it. Not tried
 across a cable; the Air was not reachable that day.
 
-Not yet: GPU stages; and the
-scheduler's memory, which
-charges a spread model as if all of it were here and does not charge a
-server for the layers it holds for somebody else.
+**One budget a machine.** The scheduler charged a model across machines as
+if all of it were here, and a server holding layers for another machine
+charged nothing for them. Now:
+
+- A coordinator's resident is charged the weights on this machine (its
+  stage and the ends, from the pipeline's own report) and the cache of its
+  own layers.
+- A worker inside a server asks the scheduler for room before it reads
+  anything, where its disk can say what the layers take, and is charged
+  what they came to once loaded: weights, and the cache for the context the
+  `Load` now names. The room is given back when the stage is dropped. A
+  server's own model and a guest's layers refuse each other by the same
+  rule, and a guest is never admitted "alone, whatever it takes".
+- A worker's greeting says what its budget has left, and the placing takes
+  this machine's memory to be what the scheduler has left for the load.
+  A model that does not fit beside the residents is no longer refused
+  before the placing is asked, when there are workers to put the rest on.
+
+Tried with two servers on one machine, SmolLM2-135M at q8, fifteen layers
+each: 280 MB charged here and 248 MB there, which is the 529 MB the model
+whole is charged. A coordinator given 0.4 GB kept layers 0..22 and placed
+eight on the worker without being told to; a worker given 0.05 GB was
+refused at the plan, by name.
+
+Not yet: GPU stages.
 
 **Phase 5 — the server.** `[cluster]` and `[worker]` in `kvad.toml`, worker
 mode inside `kvad-serve`, a Cluster page (nodes, memory, layers per node,

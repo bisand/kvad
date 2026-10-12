@@ -59,7 +59,7 @@ fn a_worker(fixture: &Fixture) -> String {
 }
 
 fn asked(precision: Precision, layers: std::ops::Range<usize>) -> Load {
-    Load { repo: "tiny".into(), precision: precision.to_string(), layers: [layers.start, layers.end] }
+    Load { repo: "tiny".into(), precision: precision.to_string(), layers: [layers.start, layers.end], context: 64 }
 }
 
 fn remote(at: &str, precision: Precision, layers: std::ops::Range<usize>) -> Box<dyn Stage> {
@@ -183,11 +183,11 @@ fn a_worker_loads_a_model_by_name_and_says_why_it_could_not() {
     let fixture = llama("llama", "worker-load");
     let at = a_worker(&fixture);
     for (repo, layers) in [("../../etc", [1, 4]), ("/tmp/model", [1, 4]), ("tiny", [2, 2])] {
-        let load = Load { repo: repo.into(), precision: "f32".into(), layers };
+        let load = Load { repo: repo.into(), precision: "f32".into(), layers, context: 0 };
         let why = refusal(&at, &key(), &load);
         assert!(why.contains("could not load") && why.contains("by its name"), "{repo}: {why}");
     }
-    let why = refusal(&at, &key(), &Load { repo: "tiny".into(), precision: "q7".into(), layers: [1, 4] });
+    let why = refusal(&at, &key(), &Load { repo: "tiny".into(), precision: "q7".into(), layers: [1, 4], context: 0 });
     assert!(why.contains("could not load tiny: no such precision"), "{why}");
     // None of which has cost the next coordinator anything.
     let mut seen = Vec::new();
@@ -324,7 +324,7 @@ fn a_load_across_machines_says_what_each_of_them_is_doing() {
         move |fetch| seen.lock().unwrap().push(fetch)
     });
     let split = [0..1, 1..3, 3..4];
-    let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &workers, split: Some(&split), key: &key(), params: None, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &watch };
+    let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &workers, split: Some(&split), key: &key(), params: None, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &watch, memory: None };
     let mut lines = Vec::new();
     session::across(&want, &mut |line| lines.push(line.to_string())).unwrap();
     assert!(lines.iter().any(|line| line.ends_with(": reading the test's checkpoint")), "{lines:?}");
@@ -363,7 +363,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
         generation_config: None,
     };
     let want = |workers: &[String], split: Option<&[std::ops::Range<usize>]>, params: Option<u64>| {
-        let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers, split, key: &key(), params, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none() };
+        let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers, split, key: &key(), params, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none(), memory: None };
         session::across(&want, &mut |_| {}).map_err(|e| e.to_string())
     };
     let why = |workers: &[&str], split: &str| {
@@ -403,7 +403,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
     // and held to itself: whole and said to be, or in stages.
     let mut lines = Vec::new();
     let params = fixture.load(Precision::F32, &Shard::whole(&fixture.spec)).param_count() as u64;
-    let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none() };
+    let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none(), memory: None };
     let mut session = session::across(&placed, &mut |line| lines.push(line.to_string())).unwrap();
     assert!(lines.iter().any(|l| l.starts_with("MACHINE")), "{lines:?}");
     match lines.iter().any(|l| l.contains("the workers hold nothing")) {

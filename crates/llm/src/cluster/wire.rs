@@ -273,6 +273,11 @@ pub struct Load {
     /// The layers, first and one past the last. A worker never holds the
     /// ends: those stay with the tokens.
     pub layers: [usize; 2],
+    /// The longest conversation the coordinator means to have, in tokens,
+    /// so that a worker with a budget can count the cache its layers will
+    /// grow. Zero from one that did not say.
+    #[serde(default)]
+    pub context: usize,
 }
 
 /// What a worker says of a load while it loads: a line of its own, or
@@ -536,7 +541,7 @@ mod tests {
 
     #[test]
     fn control_frames_keep_their_shape() {
-        let load = Load { repo: "Qwen/Qwen2.5-1.5B-Instruct".into(), precision: "q8".into(), layers: [14, 28] };
+        let load = Load { repo: "Qwen/Qwen2.5-1.5B-Instruct".into(), precision: "q8".into(), layers: [14, 28], context: 8192 };
         let mut wire = Vec::new();
         send(&mut wire, Kind::Load, &load).unwrap();
         let mut buf = Vec::new();

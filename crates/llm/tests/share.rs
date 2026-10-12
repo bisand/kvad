@@ -38,7 +38,7 @@ fn names(files: &ModelFiles) -> Vec<String> {
 }
 
 fn fetch(dir: &Path, shard: &Shard) -> ModelFiles {
-    weights::fetch_for(dir.to_str().unwrap(), &|tensor| shard.wants(tensor), &mut |_| {}).unwrap()
+    weights::fetch_for(dir.to_str().unwrap(), &|tensor| shard.wants(tensor), &mut |_| {}, &weights::Watcher::none()).unwrap()
 }
 
 /// The quantised cache is one directory for the whole process, named by a

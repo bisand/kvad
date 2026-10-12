@@ -334,6 +334,40 @@
           {:else}
             <progress class="progress"></progress>
           {/if}
+          {#if models.busy.machines.length}
+            <ul class="mt-3 space-y-2">
+              {#each models.busy.machines as m (`${m.machine} ${m.layers[0]}`)}
+                <li class="text-xs">
+                  <div class="flex items-baseline gap-2">
+                    <span class="font-medium">{m.machine}</span>
+                    <span class="opacity-60">layers {m.layers[0]}–{m.layers[1] - 1}</span>
+                    <span class="ml-auto truncate opacity-70" class:text-error={m.state === "failed"}>
+                      {#if m.state === "ready"}
+                        ready, {humanBytes(m.bytes)}
+                      {:else if m.state === "failed"}
+                        failed: {m.message}
+                      {:else if m.state === "asked"}
+                        asked
+                      {:else if m.file && m.total > 0}
+                        {m.file} — {humanBytes(m.bytes)} of {humanBytes(m.total)}
+                      {:else}
+                        {m.message}
+                      {/if}
+                    </span>
+                  </div>
+                  {#if m.state === "ready"}
+                    <progress class="progress progress-success" value="1" max="1"></progress>
+                  {:else if m.state === "failed"}
+                    <progress class="progress progress-error" value="1" max="1"></progress>
+                  {:else if m.file && m.total > 0}
+                    <progress class="progress" value={m.bytes} max={m.total}></progress>
+                  {:else}
+                    <progress class="progress"></progress>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </div>
       {/if}
     </div>

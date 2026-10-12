@@ -54,6 +54,7 @@ fn across(repo: &str, backend: Backend, progress: &mut dyn FnMut(&str), watch: &
                 // what a plan leaves room for unless told.
                 context: spec.n_ctx.min(8192),
                 mix,
+                watch,
             };
             session::across(&want, progress)
         })?;

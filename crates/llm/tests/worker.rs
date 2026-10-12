@@ -20,7 +20,7 @@ use kvad::cluster::wire::{self, Hello, Kind, Load};
 use kvad::cluster::{path, ping, remote, worker};
 use kvad::model::{CpuSession, Session, Shard, Transformer};
 use kvad::quant::Precision;
-use kvad::weights::Checkpoint;
+use kvad::weights::{Checkpoint, Fetch};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 
@@ -32,7 +32,13 @@ fn key() -> Key {
 /// own checkpoint. The repo's name is the checkpoint's.
 fn factory(fixture: &Fixture) -> worker::Factory {
     let (path, spec) = (fixture.path.clone(), fixture.spec.clone());
-    Box::new(move |load, progress| {
+    Box::new(move |load, progress, watch| {
+        // As a worker that had to fetch its layers would: half a file,
+        // the whole of it, and then that it has it.
+        for bytes in [5, 10] {
+            watch.emit(Fetch::Download { file: "layers.safetensors".into(), bytes, total: 10 });
+        }
+        watch.emit(Fetch::Fetched { file: "layers.safetensors".into() });
         progress("reading the test's checkpoint");
         let precision = Precision::parse(&load.precision).ok_or("no such precision")?;
         let ckpt = Checkpoint::open(std::slice::from_ref(&path)).map_err(|e| e.to_string())?;
@@ -57,7 +63,7 @@ fn asked(precision: Precision, layers: std::ops::Range<usize>) -> Load {
 }
 
 fn remote(at: &str, precision: Precision, layers: std::ops::Range<usize>) -> Box<dyn Stage> {
-    Box::new(RemoteStage::open(at, &key(), &asked(precision, layers), &mut |_| {}).unwrap())
+    Box::new(RemoteStage::open(at, &key(), &asked(precision, layers), &mut |_| {}, &kvad::weights::Watcher::none()).unwrap())
 }
 
 /// The claim of the phase before, again with sockets in it: a model whose
@@ -91,7 +97,7 @@ fn a_model_across_workers_answers_to_the_bit() {
 }
 
 fn refusal(at: &str, key: &Key, load: &Load) -> String {
-    RemoteStage::open(at, key, load, &mut |_| {}).err().expect("refused").to_string()
+    RemoteStage::open(at, key, load, &mut |_| {}, &kvad::weights::Watcher::none()).err().expect("refused").to_string()
 }
 
 /// A worker does not answer a coordinator with another key, and a
@@ -104,7 +110,7 @@ fn the_wrong_key_is_refused_by_whichever_end_notices() {
     let why = refusal(&at, &other, &asked(Precision::F32, 1..4));
     assert!(why.contains("refused: that is not this cluster's key"), "{why}");
     // And it is still there for one that has the key.
-    assert!(RemoteStage::open(&at, &key(), &asked(Precision::F32, 1..4), &mut |_| {}).is_ok());
+    assert!(RemoteStage::open(&at, &key(), &asked(Precision::F32, 1..4), &mut |_| {}, &kvad::weights::Watcher::none()).is_ok());
 
     // A worker that has the wrong key and says yes anyway: it cannot make
     // the proof, and the coordinator will not take its word.
@@ -185,7 +191,7 @@ fn a_worker_loads_a_model_by_name_and_says_why_it_could_not() {
     assert!(why.contains("could not load tiny: no such precision"), "{why}");
     // None of which has cost the next coordinator anything.
     let mut seen = Vec::new();
-    assert!(RemoteStage::open(&at, &key(), &asked(Precision::F32, 1..4), &mut |line| seen.push(line.to_string())).is_ok());
+    assert!(RemoteStage::open(&at, &key(), &asked(Precision::F32, 1..4), &mut |line| seen.push(line.to_string()), &kvad::weights::Watcher::none()).is_ok());
     assert!(seen.iter().any(|line| line.contains("reading the test's checkpoint")), "what the worker says while loading is passed on: {seen:?}");
 }
 
@@ -208,7 +214,7 @@ fn a_worker_that_goes_away_fails_the_reply_and_is_named() {
     });
 
     let ends: Arc<dyn Transformer> = Arc::from(fixture.load(Precision::F32, &Shard { layers: 0..2, ends: true }));
-    let mut far = RemoteStage::open(&at, &key(), &asked(Precision::F32, 2..4), &mut |_| {}).unwrap();
+    let mut far = RemoteStage::open(&at, &key(), &asked(Precision::F32, 2..4), &mut |_| {}, &kvad::weights::Watcher::none()).unwrap();
 
     // Rows from the wrong place are refused across the wire as they are in
     // one process, and the connection outlives the refusal.
@@ -297,6 +303,55 @@ fn a_pass_that_fails_part_way_is_undone_before_the_next() {
 }
 
 /// `--split` is checked before anything is read or anybody is asked.
+/// Every machine of a load says what it is doing under its own layers:
+/// asked, then its own lines and its own download, then ready with what it
+/// holds. This machine is one of them.
+#[test]
+fn a_load_across_machines_says_what_each_of_them_is_doing() {
+    use kvad::weights::Part;
+    let fixture = llama("llama", "worker-parts");
+    let workers = [a_worker(&fixture), a_worker(&fixture)];
+    let files = kvad::weights::ModelFiles {
+        weights: vec![fixture.path.clone()],
+        tokenizer: "none".into(),
+        config: "none".into(),
+        tokenizer_config: None,
+        generation_config: None,
+    };
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let watch = kvad::weights::Watcher::new({
+        let seen = seen.clone();
+        move |fetch| seen.lock().unwrap().push(fetch)
+    });
+    let split = [0..1, 1..3, 3..4];
+    let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &workers, split: Some(&split), key: &key(), params: None, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &watch };
+    let mut lines = Vec::new();
+    session::across(&want, &mut |line| lines.push(line.to_string())).unwrap();
+    assert!(lines.iter().any(|line| line.ends_with(": reading the test's checkpoint")), "{lines:?}");
+
+    let seen = seen.lock().unwrap();
+    let of = |layers: [usize; 2]| -> Vec<Part> {
+        seen.iter().filter_map(|fetch| match fetch { Fetch::Part { layers: l, step, .. } if *l == layers => Some(step.clone()), _ => None }).collect()
+    };
+    for (i, layers) in [[0, 1], [1, 3], [3, 4]].into_iter().enumerate() {
+        let steps = of(layers);
+        assert_eq!(steps.first(), Some(&Part::Asked), "{layers:?}: {steps:?}");
+        assert!(matches!(steps.last(), Some(Part::Ready { bytes }) if *bytes > 0), "{layers:?}: {steps:?}");
+        let fetched = steps.iter().filter(|step| matches!(step, Part::Download { .. } | Part::Fetched { .. })).cloned().collect::<Vec<_>>();
+        match i {
+            // Read from this machine's own file: nothing was fetched.
+            0 => assert_eq!(fetched, []),
+            // The last of a download is always told, however fast it went.
+            _ => {
+                let file = || "layers.safetensors".to_string();
+                assert_eq!(fetched.last(), Some(&Part::Fetched { file: file() }), "{fetched:?}");
+                assert!(fetched.contains(&Part::Download { file: file(), bytes: 10, total: 10 }), "{fetched:?}");
+                assert!(steps.contains(&Part::Said("reading the test's checkpoint".into())), "{steps:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
     let fixture = llama("llama", "worker-split");
@@ -308,7 +363,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
         generation_config: None,
     };
     let want = |workers: &[String], split: Option<&[std::ops::Range<usize>]>, params: Option<u64>| {
-        let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers, split, key: &key(), params, context: 64, mix: kvad::cluster::plan::Mix::REPLY };
+        let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers, split, key: &key(), params, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none() };
         session::across(&want, &mut |_| {}).map_err(|e| e.to_string())
     };
     let why = |workers: &[&str], split: &str| {
@@ -348,7 +403,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
     // and held to itself: whole and said to be, or in stages.
     let mut lines = Vec::new();
     let params = fixture.load(Precision::F32, &Shard::whole(&fixture.spec)).param_count() as u64;
-    let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64, mix: kvad::cluster::plan::Mix::REPLY };
+    let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none() };
     let mut session = session::across(&placed, &mut |line| lines.push(line.to_string())).unwrap();
     assert!(lines.iter().any(|l| l.starts_with("MACHINE")), "{lines:?}");
     match lines.iter().any(|l| l.contains("the workers hold nothing")) {
@@ -378,7 +433,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
 fn a_worker_holds_one_model_and_greets_everybody() {
     let fixture = llama("llama", "worker-busy");
     let at = a_worker(&fixture);
-    let mut first = RemoteStage::open(&at, &key(), &asked(Precision::F32, 1..4), &mut |_| {}).unwrap();
+    let mut first = RemoteStage::open(&at, &key(), &asked(Precision::F32, 1..4), &mut |_| {}, &kvad::weights::Watcher::none()).unwrap();
 
     let why = refusal(&at, &key(), &asked(Precision::F32, 2..4));
     assert!(why.contains("holding layers for another coordinator"), "{why}");
@@ -393,7 +448,7 @@ fn a_worker_holds_one_model_and_greets_everybody() {
     drop(first);
     let again = (0..50).find_map(|_| {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        RemoteStage::open(&at, &key(), &asked(Precision::F32, 2..4), &mut |_| {}).ok()
+        RemoteStage::open(&at, &key(), &asked(Precision::F32, 2..4), &mut |_| {}, &kvad::weights::Watcher::none()).ok()
     });
     assert!(again.is_some(), "the worker never let go of the first coordinator's place");
 }

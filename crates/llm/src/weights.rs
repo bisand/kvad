@@ -299,6 +299,28 @@ pub enum Fetch {
     Download { file: String, bytes: u64, total: u64 },
     /// A file is on disk, whether it was downloaded now or cached earlier.
     Fetched { file: String },
+    /// A model loaded across several machines, and what one of them has
+    /// just done about the layers it was given. Every machine loads at
+    /// once, so these come interleaved, and it is the name that says whose
+    /// each is. This machine is one of them, under its own name.
+    Part { machine: String, layers: [usize; 2], step: Part },
+}
+
+/// A step of one machine's part of a load: see [`Fetch::Part`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    /// It has been asked for its layers, and has said nothing yet.
+    Asked,
+    /// A line of its own about what it is doing.
+    Said(String),
+    /// Bytes of a file it is downloading, as [`Fetch::Download`].
+    Download { file: String, bytes: u64, total: u64 },
+    /// A file it has on its disk now.
+    Fetched { file: String },
+    /// Its layers are in memory, in this many bytes, and it can run them.
+    Ready { bytes: u64 },
+    /// It could not, and the load has failed with it.
+    Failed(String),
 }
 
 /// Where [`Fetch`] events go.
@@ -328,7 +350,9 @@ impl Watcher {
         self.0.is_some()
     }
 
-    fn emit(&self, event: Fetch) {
+    /// Tell whoever is listening. Public for a loader that is not in this
+    /// crate: what makes a cluster worker's stages may be.
+    pub fn emit(&self, event: Fetch) {
         if let Some(f) = &self.0 {
             f(event);
         }
@@ -422,8 +446,8 @@ pub fn fetch_watched(
 ///
 /// What a worker calls, with [`crate::model::Shard::wants`]: see
 /// [`shards_for`].
-pub fn fetch_for(repo_id: &str, wants: Wants, progress: &mut dyn FnMut(&str)) -> Res<ModelFiles> {
-    resolve(repo_id, progress, &Watcher::none(), Ask::CacheFirst, Some(wants))
+pub fn fetch_for(repo_id: &str, wants: Wants, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<ModelFiles> {
+    resolve(repo_id, progress, watch, Ask::CacheFirst, Some(wants))
 }
 
 /// As [`fetch`], but asking the Hub for every file, so that a model already

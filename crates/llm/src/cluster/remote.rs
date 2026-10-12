@@ -15,6 +15,7 @@ use super::key::{self, Key, Role};
 use super::stage::{Fault, Stage};
 use super::wire::{self, Hello, Kind, Load, Ready, Rows, Truncate};
 use crate::model::Shard;
+use crate::weights::{Fetch, Part, Watcher};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -137,27 +138,38 @@ impl RemoteStage {
     /// [`connect`], and then have the worker load `layers` of `repo`.
     /// Returns when the stage is ready to run, which for a model the worker
     /// has to fetch or quantise is a while; what it says in the meantime
-    /// goes to `progress`.
-    pub fn open(address: &str, key: &Key, load: &Load, progress: &mut dyn FnMut(&str)) -> Result<RemoteStage, Fault> {
+    /// goes to `progress`, and every step of it to `watch` under the
+    /// worker's name, a download's bytes among them.
+    pub fn open(address: &str, key: &Key, load: &Load, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Result<RemoteStage, Fault> {
         let (mut stream, hello) = connect(address, key)?;
         let name = format!("{} ({address})", hello.name);
+        let part = |step: Part| watch.emit(Fetch::Part { machine: hello.name.clone(), layers: load.layers, step });
+        let failed = |why: String| -> Fault {
+            part(Part::Failed(why.clone()));
+            why.into()
+        };
 
         // A load is as long as it is: a download, or the quantising of
         // forty layers, with a line now and then.
         stream.set_read_timeout(None)?;
         wire::send(&mut stream, Kind::Load, load)?;
+        part(Part::Asked);
         let mut buf = Vec::new();
         let held = loop {
-            match wire::read(&mut stream, 1 << 16, &mut buf).map_err(|e| format!("{name} went away while loading: {e}"))? {
+            match wire::read(&mut stream, 1 << 16, &mut buf).map_err(|e| failed(format!("{name} went away while loading: {e}")))? {
                 Kind::Progress => {
-                    let line = wire::parse::<serde_json::Value>(Kind::Progress, &buf)?;
-                    progress(&format!("{}: {}", hello.name, line["message"].as_str().unwrap_or("")));
+                    let step = wire::parse::<wire::Progress>(Kind::Progress, &buf)?.step();
+                    if let Part::Said(line) = &step {
+                        progress(&format!("{}: {line}", hello.name));
+                    }
+                    part(step);
                 }
                 Kind::Ready => break wire::parse::<Ready>(Kind::Ready, &buf)?,
-                Kind::Error => return Err(format!("{name} could not load {}: {}", load.repo, wire::error_text(&buf)).into()),
-                kind => return Err(format!("{name} sent a {kind:?} in the middle of a load").into()),
+                Kind::Error => return Err(failed(format!("{name} could not load {}: {}", load.repo, wire::error_text(&buf)))),
+                kind => return Err(failed(format!("{name} sent a {kind:?} in the middle of a load"))),
             }
         };
+        part(Part::Ready { bytes: held.bytes as u64 });
         stream.set_read_timeout(Some(PATIENCE))?;
         let shard = Shard { layers: load.layers[0]..load.layers[1], ends: false };
         let place = super::stage::Place { machine: hello.name.clone(), address: Some(address.to_string()), link: None, hop_ms: None, chunk_ms: None };

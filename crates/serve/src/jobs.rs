@@ -749,8 +749,10 @@ pub fn train(
 
 fn from_fetch(f: kvad::weights::Fetch) -> Option<Update> {
     match f {
+        // A pull is of this machine's files and no other's.
         kvad::weights::Fetch::Download { total: 0, .. }
         | kvad::weights::Fetch::Local
+        | kvad::weights::Fetch::Part { .. }
         | kvad::weights::Fetch::Shards(_) => None,
         kvad::weights::Fetch::Download { file, bytes, total } => {
             Some(Update::Download { file, bytes, total })
@@ -1098,6 +1100,13 @@ impl From<Progress> for Update {
             Progress::Status { message } => Update::Status { message },
             Progress::Download { file, bytes, total } => Update::Download { file, bytes, total },
             Progress::Fetched { file } => Update::Status { message: format!("fetched {file}") },
+            // A job's log is lines, and a machine's step is one of them.
+            Progress::Machine { machine, state, message, file, .. } => Update::Status {
+                message: match message.or(file) {
+                    Some(what) => format!("{machine}: {what}"),
+                    None => format!("{machine}: {state}"),
+                },
+            },
         }
     }
 }

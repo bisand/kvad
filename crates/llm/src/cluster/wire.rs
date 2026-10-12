@@ -68,7 +68,7 @@ pub enum Kind {
     /// Which part of which model to hold: JSON, [`Load`]. Answered by any
     /// number of [`Kind::Progress`] and then a [`Kind::Ready`].
     Load = 10,
-    /// A line about a load in progress: JSON, `{"message": "..."}`.
+    /// A step of a load in progress: JSON, [`Progress`].
     Progress = 11,
     /// The stage is loaded: JSON, [`Ready`].
     Ready = 12,
@@ -273,6 +273,48 @@ pub struct Load {
     /// The layers, first and one past the last. A worker never holds the
     /// ends: those stay with the tokens.
     pub layers: [usize; 2],
+}
+
+/// What a worker says of a load while it loads: a line of its own, or
+/// where a download has got to. One or the other: a frame with a `file`
+/// is about that file, and `done` once it is on the worker's disk.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Progress {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub file: String,
+    pub bytes: u64,
+    pub total: u64,
+    pub done: bool,
+}
+
+impl Progress {
+    pub fn said(message: &str) -> Self {
+        Progress { message: message.to_string(), ..Default::default() }
+    }
+
+    /// What a download's event is on the wire, if it is anything: a file
+    /// answered from the cache has no size and is not a download.
+    pub fn of(fetch: &crate::weights::Fetch) -> Option<Self> {
+        use crate::weights::Fetch;
+        match fetch {
+            Fetch::Download { total: 0, .. } | Fetch::Local | Fetch::Shards(_) | Fetch::Part { .. } => None,
+            Fetch::Download { file, bytes, total } => Some(Progress { file: file.clone(), bytes: *bytes, total: *total, ..Default::default() }),
+            Fetch::Fetched { file } => Some(Progress { file: file.clone(), done: true, ..Default::default() }),
+        }
+    }
+
+    /// The same, read at the other end.
+    pub fn step(self) -> crate::weights::Part {
+        use crate::weights::Part;
+        match (self.file.is_empty(), self.done) {
+            (true, _) => Part::Said(self.message),
+            (false, true) => Part::Fetched { file: self.file },
+            (false, false) => Part::Download { file: self.file, bytes: self.bytes, total: self.total },
+        }
+    }
 }
 
 /// A loaded stage, and what it holds.

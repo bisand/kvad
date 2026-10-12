@@ -631,6 +631,9 @@ pub struct Across<'a> {
     /// What the layers are placed for, when they are placed here: so much
     /// prompt read to so much reply written.
     pub mix: plan::Mix,
+    /// Who is shown the load a machine at a time: every machine's steps
+    /// go here under its name, as [`crate::weights::Fetch::Part`].
+    pub watch: &'a crate::weights::Watcher,
 }
 
 /// The machines of a plan: this one, timed, and each worker reached by its
@@ -758,19 +761,74 @@ pub fn pipeline(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<PipelineSe
 
 /// The pipeline a plan describes: this machine's shard loaded, and each
 /// worker with layers asked for them.
+///
+/// All at once. A machine's load is its own disk and its own processor,
+/// and often its own download, so nothing is gained by one waiting for
+/// another, and a model across three machines is ready when the slowest of
+/// them is and not after the sum of them. What each says arrives in the
+/// order it was said, which is no longer a machine at a time: a worker's
+/// lines carry its name, and [`Across::watch`] is told whose every step is.
 fn staged(want: &Across, plan: &plan::Plan, ways: &[path::Path], progress: &mut dyn FnMut(&str)) -> Res<PipelineSession> {
-
+    use crate::weights::{Fetch, Part};
     let here = Shard { layers: plan.shares[0].layers.clone(), ends: true };
+    let me = super::hostname();
+    let mine = |step: Part| want.watch.emit(Fetch::Part { machine: me.clone(), layers: [here.layers.start, here.layers.end], step });
+    let asked: Vec<(&path::Path, Load)> = ways
+        .iter()
+        .zip(&plan.shares[1..])
+        .filter(|(_, share)| !share.layers.is_empty())
+        .map(|(way, share)| (way, Load { repo: want.repo.to_string(), precision: want.precision.to_string(), layers: [share.layers.start, share.layers.end] }))
+        .collect();
     progress(&format!("reading {here} here"));
-    let ends: Arc<dyn Transformer> = Arc::from(crate::qcache::load_shard(want.repo, want.files, want.spec, want.precision, &here, progress)?);
+    for (way, load) in &asked {
+        progress(&format!("asking {} for layers {}..{}", way.hello.name, load.layers[0], load.layers[1]));
+    }
+
+    let (said, lines) = std::sync::mpsc::channel::<String>();
+    let (ends, far) = std::thread::scope(|scope| {
+        let local = scope.spawn({
+            let (said, here, mine) = (said.clone(), &here, &mine);
+            move || {
+                mine(Part::Asked);
+                let mut line = |line: &str| {
+                    mine(Part::Said(line.to_string()));
+                    let _ = said.send(line.to_string());
+                };
+                let read = crate::qcache::load_shard(want.repo, want.files, want.spec, want.precision, here, &mut line).map_err(|e| e.to_string());
+                match &read {
+                    Ok(model) => mine(Part::Ready { bytes: model.memory_bytes() as u64 }),
+                    Err(why) => mine(Part::Failed(why.clone())),
+                }
+                read
+            }
+        });
+        let far: Vec<_> = asked
+            .iter()
+            .map(|(way, load)| {
+                let said = said.clone();
+                scope.spawn(move || {
+                    let mut line = |line: &str| {
+                        let _ = said.send(line.to_string());
+                    };
+                    RemoteStage::open(&way.address, want.key, load, &mut line, want.watch).map(|stage| stage.reached_by(way)).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        // Every sender is a loader's now: the lines end when the loads do.
+        drop(said);
+        for line in lines {
+            progress(&line);
+        }
+        let gone = |_| "a load panicked".to_string();
+        (local.join().unwrap_or_else(|e| Err(gone(e))), far.into_iter().map(|load| load.join().unwrap_or_else(|e| Err(gone(e)))).collect::<Vec<_>>())
+    });
+    let ends: Arc<dyn Transformer> = Arc::from(ends?);
     let mut stages: Vec<Box<dyn Stage>> = Vec::new();
     if !here.layers.is_empty() {
         stages.push(Box::new(LocalStage::new(ends.clone())));
     }
-    for (way, share) in ways.iter().zip(&plan.shares[1..]).filter(|(_, share)| !share.layers.is_empty()) {
-        progress(&format!("asking {} for layers {}..{}", way.hello.name, share.layers.start, share.layers.end));
-        let load = Load { repo: want.repo.to_string(), precision: want.precision.to_string(), layers: [share.layers.start, share.layers.end] };
-        stages.push(Box::new(RemoteStage::open(&way.address, want.key, &load, progress).map_err(plain)?.reached_by(way)));
+    for stage in far {
+        stages.push(Box::new(stage?));
     }
     Ok(PipelineSession::new(ends, stages, want.precision)?.shown_as(want.repo))
 }

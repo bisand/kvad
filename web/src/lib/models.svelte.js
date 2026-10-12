@@ -90,18 +90,26 @@ class Models {
       toasts.warning(`Already ${this.busy.what}. Wait for it to finish.`);
       return false;
     }
-    this.busy = { what, message: "starting", bytes: 0, total: 0 };
+    this.busy = { what, message: "starting", bytes: 0, total: 0, machines: [] };
     let ok = false;
     try {
       await sse(path, body, {
         progress: (data) => {
           const p = JSON.parse(data);
-          if (p.kind === "download") {
-            this.busy = { what, message: p.file, bytes: p.bytes, total: p.total };
+          const machines = this.busy?.machines ?? [];
+          if (p.kind === "machine") {
+            // A model across several machines: each loads its own layers
+            // at once, and has a row of its own. A line that says nothing
+            // new about a download leaves the bar where it was.
+            const was = machines.find((m) => m.machine === p.machine && m.layers[0] === p.layers[0]);
+            const now = { ...was, ...p, message: p.message ?? p.file ?? was?.message ?? "" };
+            this.busy = { ...this.busy, machines: was ? machines.map((m) => (m === was ? now : m)) : [...machines, now] };
+          } else if (p.kind === "download") {
+            this.busy = { what, message: p.file, bytes: p.bytes, total: p.total, machines };
           } else if (p.kind === "fetched") {
-            this.busy = { what, message: `fetched ${p.file}`, bytes: 0, total: 0 };
+            this.busy = { what, message: `fetched ${p.file}`, bytes: 0, total: 0, machines };
           } else {
-            this.busy = { what, message: p.message, bytes: 0, total: 0 };
+            this.busy = { what, message: p.message, bytes: 0, total: 0, machines };
           }
         },
         [finished]: (data) => {

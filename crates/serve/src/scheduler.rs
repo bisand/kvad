@@ -222,6 +222,23 @@ pub enum Progress {
     Download { file: String, bytes: u64, total: u64 },
     /// The file is on disk, downloaded or already cached.
     Fetched { file: String },
+    /// A model across several machines, and where one of them has got to
+    /// with its layers. They load at once, so these come interleaved; this
+    /// machine is one of them. `state` is `asked`, `loading`, `ready` or
+    /// `failed`: `loading` carries a line in `message` or a download in
+    /// `file`, `bytes` and `total`; `ready` the memory its layers took, in
+    /// `bytes`; `failed` why, in `message`.
+    Machine {
+        machine: String,
+        layers: [usize; 2],
+        state: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        bytes: u64,
+        total: u64,
+    },
 }
 
 /// A step of an image, or the image.
@@ -1827,6 +1844,18 @@ fn fetch_progress(f: Fetch) -> Option<Progress> {
         Fetch::Download { total: 0, .. } | Fetch::Local | Fetch::Shards(_) => None,
         Fetch::Download { file, bytes, total } => Some(Progress::Download { file, bytes, total }),
         Fetch::Fetched { file } => Some(Progress::Fetched { file }),
+        Fetch::Part { machine, layers, step } => {
+            use kvad::weights::Part;
+            let (state, message, file, bytes, total) = match step {
+                Part::Asked => ("asked", None, None, 0, 0),
+                Part::Said(line) => ("loading", Some(line), None, 0, 0),
+                Part::Download { file, bytes, total } => ("loading", None, Some(file), bytes, total),
+                Part::Fetched { file } => ("loading", Some(format!("fetched {file}")), None, 0, 0),
+                Part::Ready { bytes } => ("ready", None, None, bytes, 0),
+                Part::Failed(why) => ("failed", Some(why), None, 0, 0),
+            };
+            Some(Progress::Machine { machine, layers, state, message, file, bytes, total })
+        }
     }
 }
 

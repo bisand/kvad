@@ -24,10 +24,14 @@ use super::stage::{Fault, LocalStage, Stage};
 use super::wire::{self, Hello, Kind, Load, Ready, Rows, Truncate};
 use crate::model::{Shard, Spec};
 use crate::quant::Precision;
+use crate::weights::Watcher;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How often a coordinator is told where one file's download has got to.
+const OFTEN: Duration = Duration::from_millis(100);
 
 /// The longest tensor frame taken: a prefill chunk of the widest model
 /// there is comes to a few megabytes, and this is not a place to find out
@@ -41,17 +45,21 @@ const GREETING: Duration = Duration::from_secs(30);
 /// What turns a [`Load`] into something that runs. It comes from whoever
 /// starts the worker, as a session's backend does, so that a binary with a
 /// GPU in it can make GPU stages and this crate need not know.
-pub type Factory = Box<dyn FnMut(&Load, &mut dyn FnMut(&str)) -> Result<Box<dyn Stage>, Fault> + Send>;
+///
+/// It is given two places to say how it is getting on, as every load in
+/// this crate is: lines for a person, and a download's bytes for a bar.
+/// Both cross to the coordinator.
+pub type Factory = Box<dyn FnMut(&Load, &mut dyn FnMut(&str), &Watcher) -> Result<Box<dyn Stage>, Fault> + Send>;
 
 /// The stages this crate can make by itself: the model's files from this
 /// machine's disk, or the Hub if it has not got them, and the shard read
 /// from them onto the CPU.
 pub fn from_disk() -> Factory {
-    Box::new(|load, progress| {
+    Box::new(|load, progress, watch| {
         let precision = Precision::parse(&load.precision).ok_or_else(|| format!("`{}` is not a precision", load.precision))?;
         let shard = Shard { layers: load.layers[0]..load.layers[1], ends: false };
         // Its own layers' files, and none of the rest of the checkpoint.
-        let files = crate::weights::fetch_for(&load.repo, &|tensor| shard.wants(tensor), progress).map_err(|e| e.to_string())?;
+        let files = crate::weights::fetch_for(&load.repo, &|tensor| shard.wants(tensor), progress, watch).map_err(|e| e.to_string())?;
         let spec = Spec::from_json(&files.config).map_err(|e| e.to_string())?;
         progress(&format!("reading {shard} of {} at {precision}", load.repo));
         let model = crate::qcache::load_shard(&load.repo, &files, &spec, precision, &shard, progress).map_err(|e| e.to_string())?;
@@ -288,15 +296,43 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
                     false if named => Err("this worker is holding layers for another coordinator".to_string()),
                     false => Err(format!("`{}`, layers {}..{}: a worker loads a model by its name, and at least one layer of it", load.repo, load.layers[0], load.layers[1])),
                     true => {
-                        let mut failed = None;
-                        let mut factory = shared.factory.lock().map_err(|_| other("a load on this worker panicked"))?;
-                        let made = factory(&load, &mut |message| {
-                            shared.say(Event::Progress(message));
-                            if let Err(e) = wire::send(stream, Kind::Progress, &serde_json::json!({ "message": message })) {
-                                failed.get_or_insert(e);
+                        // A download is watched from threads that are not
+                        // this one, so the frames about it are written
+                        // through a second handle to the socket, one at a
+                        // time, no oftener than a bar can show, and not at
+                        // all while the bytes stand where they stood.
+                        let out = Arc::new(Mutex::new((stream.try_clone()?, None::<io::Error>, Instant::now(), String::new(), 0u64)));
+                        let tell = |out: &Mutex<(TcpStream, Option<io::Error>, Instant, String, u64)>, step: wire::Progress| {
+                            let Ok(mut out) = out.lock() else { return };
+                            let moving = !step.file.is_empty() && !step.done && step.bytes < step.total;
+                            if moving && out.3 == step.file && (out.2.elapsed() < OFTEN || out.4 == step.bytes) {
+                                return;
+                            }
+                            if moving {
+                                (out.2, out.3, out.4) = (Instant::now(), step.file.clone(), step.bytes);
+                            }
+                            if let Err(e) = wire::send(&mut out.0, Kind::Progress, &step) {
+                                out.1.get_or_insert(e);
+                            }
+                        };
+                        let watch = Watcher::new({
+                            let out = out.clone();
+                            move |fetch| {
+                                if let Some(step) = wire::Progress::of(&fetch) {
+                                    tell(&out, step)
+                                }
                             }
                         });
-                        if let Some(e) = failed {
+                        let mut factory = shared.factory.lock().map_err(|_| other("a load on this worker panicked"))?;
+                        let made = factory(
+                            &load,
+                            &mut |message| {
+                                shared.say(Event::Progress(message));
+                                tell(&out, wire::Progress::said(message));
+                            },
+                            &watch,
+                        );
+                        if let Some(e) = out.lock().ok().and_then(|mut out| out.1.take()) {
                             return Err(e);
                         }
                         made.map_err(|fault| fault.to_string())

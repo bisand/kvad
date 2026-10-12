@@ -262,6 +262,14 @@ every model spread out now, which machine holds which layers and where a
 token's time goes: each stage's layers, and for a stage on another machine
 the round trip to it.
 
+Every machine loads its own layers at once, so a model across three is
+ready when the slowest of them is. The load's stream says whose each step
+is: beside the lines and the bar it always had, a `progress` event of
+`"kind": "machine"` carries a machine's name, its layers, and a `state` of
+`asked`, `loading`, `ready` or `failed` — with a line of the machine's own,
+or the bytes of a file it is downloading, or the memory its layers took. The
+Models page draws a row for each while the model loads.
+
 What this does not do yet, said plainly:
 
 - **GPU backends are not spread.** A stage is CPU layers; `gpu-q8` loads

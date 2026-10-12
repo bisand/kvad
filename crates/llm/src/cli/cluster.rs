@@ -288,7 +288,7 @@ fn plan(args: &Args, model: Option<&str>) -> Res<()> {
     // The files are not wanted, only what is known about the model.
     let files = kvad::weights::ModelFiles { weights: Vec::new(), tokenizer: Default::default(), config: Default::default(), tokenizer_config: None, generation_config: None };
     let mix = args.place.as_deref().map(kvad::cluster::plan::Mix::parse).transpose()?.unwrap_or(kvad::cluster::plan::Mix::REPLY);
-    let want = session::Across { repo: model, files: &files, spec: &spec, precision: args.quant, workers: &workers, split: split.as_deref(), key, params, context, mix };
+    let want = session::Across { repo: model, files: &files, spec: &spec, precision: args.quant, workers: &workers, split: split.as_deref(), key, params, context, mix, watch: &crate::weights::Watcher::none() };
     let plan = session::planned(&want, &nodes)?;
     println!();
     for line in kvad::cluster::plan::table(&nodes, &plan) {

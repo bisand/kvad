@@ -985,7 +985,28 @@ The hop is the difference of two numbers and they have to be from the same
 moment: the board keeps the coordinator's counts as they stood when the
 worker was asked, beside the worker's answer.
 
-Not yet: a load's progress a machine at a time; GPU stages; and the
+**A load, a machine at a time** (#230). Every machine's share is
+now loaded at once: this one's in one thread, each worker's `Load` in
+another, and the pipeline is made when the last of them is ready. Before,
+they went in turn, and a model across three machines waited for the sum of
+three loads where it need only wait for the longest.
+
+That is also what made the progress worth doing. A `Progress` frame was a
+line of text; it is now a line or a download's bytes
+(`{file, bytes, total, done}`), sent from the worker's download threads
+through a second handle on the socket, at most ten a second for a file and
+none while the count stands still. The coordinator hands every step to a
+`Watcher` as `Fetch::Part { machine, layers, step }` — asked, said,
+download, fetched, ready with the bytes held, failed — this machine's own
+share among them. The server passes them down the load's SSE as
+`"kind": "machine"` and the Models page keeps a row for each machine.
+
+Tried on one machine, a coordinator and a worker server with an empty Hub
+cache of its own: this machine's fifteen layers were ready while the worker
+was still 8 MB into a 257 MB download, and both rows showed it. Not tried
+across a cable; the Air was not reachable that day.
+
+Not yet: GPU stages; and the
 scheduler's memory, which
 charges a spread model as if all of it were here and does not charge a
 server for the layers it holds for somebody else.

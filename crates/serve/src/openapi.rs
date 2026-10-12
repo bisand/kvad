@@ -250,7 +250,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
                                      wherever the GPU backend can run it."),
         produces: SSE,
         events: &[
-            ("progress", "A status line, or bytes for a download bar."),
+            ("progress", "A status line, or bytes for a download bar. For a model \
+                          across several machines, also each machine's own steps: \
+                          `kind` is `machine`, with its name, its layers, and a \
+                          `state` of `asked`, `loading`, `ready` or `failed`."),
             ("loaded", "The model is in memory; the payload describes it."),
             ("error", "It did not load, and why. `full` is true when it was refused \
                        for want of memory rather than tried and failed."),

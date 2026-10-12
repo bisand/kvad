@@ -23,7 +23,7 @@
 //! than an error, which is why the counting test in the README exists.
 
 use super::ffn::{Ffn, Layout, Mlp, Moe, Router};
-use super::{attend, Architecture, KvCache, Spec, Transformer};
+use super::{attend, Architecture, KvCache, Shard, Spec, Transformer};
 use crate::qcache::{head, Source};
 use crate::quant::Weight;
 use crate::tensor::{rms_norm, Rope};
@@ -57,7 +57,7 @@ pub static ARCH: Architecture = Architecture {
     model_types: &["llama", "mistral", "qwen2", "qwen3", "qwen3_moe"],
     about: "Llama 2/3, Mistral, Qwen2/2.5/3, Qwen3-MoE, SmolLM2: RoPE, RMSNorm, SwiGLU, GQA",
     configure: |_| Ok(()),
-    load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
+    load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
 };
 
 pub struct Block {
@@ -88,14 +88,23 @@ pub struct Block {
 
 pub struct Model {
     spec: Spec,
+    /// Which of the model's layers `blocks` holds, and whether `ends` is
+    /// here. Everything and yes, for a model on one machine.
+    shard: Shard,
+    ends: Option<Ends>,
+    blocks: Vec<Block>,
+    rope: Rope,
+}
+
+/// The two ends of the model, which stay together when the blocks between
+/// them are spread out: see [`Shard`].
+struct Ends {
     embed: Weight,
     /// Separate output projection, when the model does not tie its embeddings.
     /// Small models almost always tie (it is a large fraction of their
     /// parameters); large ones often do not.
     lm_head: Option<Weight>,
-    blocks: Vec<Block>,
     final_norm: Vec<f32>,
-    rope: Rope,
 }
 
 /// RMSNorm every head of a projection in place, if this model has the weights
@@ -117,7 +126,16 @@ fn norm_heads(x: &mut [f32], weight: Option<&[f32]>, spec: &Spec) {
 }
 
 impl Model {
+    /// The whole model.
     pub fn load(src: &dyn Source, spec: Spec) -> Res<Self> {
+        let whole = Shard::whole(&spec);
+        Model::load_shard(src, spec, &whole)
+    }
+
+    /// The part of the model `shard` names, reading that and nothing else.
+    /// What it leaves to the other shards it says it is leaving, so the
+    /// check for weights nobody read keeps meaning what it means.
+    pub fn load_shard(src: &dyn Source, spec: Spec, shard: &Shard) -> Res<Self> {
         // Dense unless the config says otherwise, and what says otherwise is an
         // expert count. `qwen3_moe` is the only `model_type` here that has one;
         // reading it this way rather than off `model_type` means the branch is
@@ -128,8 +146,13 @@ impl Model {
             Some(_) => Some((Router::read(&spec.config)?, Layout::read(&spec.config))),
         };
 
-        let mut blocks = Vec::with_capacity(spec.n_layer);
+        let mut blocks = Vec::with_capacity(shard.layers.len());
         for i in 0..spec.n_layer {
+            // Another shard's layer: known about, and deliberately not read.
+            if !shard.layers.contains(&i) {
+                src.skip_under(&format!("layers.{i}."));
+                continue;
+            }
             let p = |s: &str| format!("layers.{i}.{s}");
             blocks.push(Block {
                 attn_norm: src.vector(&p("input_layernorm.weight"))?,
@@ -152,13 +175,24 @@ impl Model {
             });
         }
 
-        let lm_head = head(src, &spec, "lm_head.weight")?;
+        let ends = match shard.ends {
+            true => Some(Ends {
+                lm_head: head(src, &spec, "lm_head.weight")?,
+                embed: src.matrix("embed_tokens.weight")?,
+                final_norm: src.vector("norm.weight")?,
+            }),
+            false => {
+                for name in ["lm_head.weight", "embed_tokens.weight", "norm.weight"] {
+                    src.skip(name);
+                }
+                None
+            }
+        };
 
         Ok(Model {
-            embed: src.matrix("embed_tokens.weight")?,
-            lm_head,
+            shard: shard.clone(),
+            ends,
             blocks,
-            final_norm: src.vector("norm.weight")?,
             // Precompute every rotation angle once. Cheap: two floats per
             // position per coordinate pair.
             rope: Rope::new(spec.head_dim, spec.n_ctx, spec.rope_theta),
@@ -172,25 +206,23 @@ impl Model {
             self.rope.apply(head, pos);
         }
     }
-    /// Every block, over a batch of tokens, leaving the residual stream as
-    /// it is — no output head.
-    ///
-    /// Split out because the two callers want different slices of the same
-    /// work: generation needs the last position's logits, scoring needs all
-    /// of them, and the thirty layers in between are identical.
-    fn run_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        self.run_rows(tokens, Rows::Following(cache))
+    /// The embedding and the head, on the shard that has them.
+    fn ends(&self) -> &Ends {
+        self.ends.as_ref().unwrap_or_else(|| panic!("{} of this model were asked for its ends, which another shard holds", self.shard))
     }
 
-    /// The same, for rows that are either one sequence's next positions or
-    /// several sequences' next position each; see [`Rows`].
+    /// This shard's blocks over `m` rows of the residual stream, in place,
+    /// for rows that are either one sequence's next positions or several
+    /// sequences' next position each; see [`Rows`].
     ///
     /// One body for prefill and for batched decode, because between the
     /// lines that touch a cache they are the same arithmetic: `m` rows
-    /// through each projection and each MLP as one matmul.
-    fn run_rows(&self, tokens: &[u32], mut rows: Rows) -> Vec<f32> {
+    /// through each projection and each MLP as one matmul. And no embedding
+    /// before it or head after it, because what goes in and what comes out
+    /// is the residual stream, wherever it came from and is going.
+    fn run_rows(&self, xs: &mut [f32], m: usize, mut rows: Rows) {
         let spec = &self.spec;
-        let (m, e) = (tokens.len(), spec.n_embd);
+        let e = spec.n_embd;
         let qdim = spec.n_head * spec.head_dim;
         let kvdim = spec.kv_dim();
         // Where each row sits in its own sequence, fixed before anything is
@@ -201,12 +233,6 @@ impl Model {
             "context window of {} tokens is full",
             spec.n_ctx
         );
-
-        // No position embedding: position arrives inside attention, as RoPE.
-        let mut xs = vec![0.0f32; m * e];
-        for (i, &t) in tokens.iter().enumerate() {
-            xs[i * e..(i + 1) * e].copy_from_slice(&self.embed.row(t as usize));
-        }
 
         let mut hs = vec![0.0f32; m * e];
         for (l, block) in self.blocks.iter().enumerate() {
@@ -259,7 +285,6 @@ impl Model {
         }
 
         rows.advance(m);
-        xs
     }
 }
 
@@ -327,10 +352,10 @@ impl Transformer for Model {
                 + opt(&b.q_norm)
                 + opt(&b.k_norm)
         });
-        self.embed.param_count()
-            + self.lm_head.as_ref().map_or(0, |h| h.param_count())
-            + self.final_norm.len()
-            + per_block * self.blocks.len()
+        let ends = self.ends.as_ref().map_or(0, |ends| {
+            ends.embed.param_count() + ends.lm_head.as_ref().map_or(0, |h| h.param_count()) + ends.final_norm.len()
+        });
+        ends + per_block * self.blocks.len()
     }
 
     fn memory_bytes(&self) -> usize {
@@ -341,40 +366,59 @@ impl Transformer for Model {
                 + b.o_w.bytes()
                 + b.mlp.bytes()
         });
-        self.embed.bytes()
-            + self.lm_head.as_ref().map_or(0, |h| h.bytes())
-            + per_block * self.blocks.len()
+        let ends = self.ends.as_ref().map_or(0, |ends| ends.embed.bytes() + ends.lm_head.as_ref().map_or(0, |h| h.bytes()));
+        ends + per_block * self.blocks.len()
     }
 
-    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        let (m, e) = (tokens.len(), self.spec.n_embd);
-        let xs = self.run_batch(tokens, cache);
-        let last = rms_norm(&xs[(m - 1) * e..m * e], &self.final_norm, self.spec.eps);
-        self.lm_head.as_ref().unwrap_or(&self.embed).matvec_bt(&last, None)
+    fn shard(&self) -> Shard {
+        self.shard.clone()
     }
 
-    /// Logits for **every** position, not just the last.
-    ///
-    /// The residual stream already holds all of them; what `forward_batch`
-    /// throws away is the output head applied to the other rows. Scoring text
-    /// — perplexity — needs exactly those, and running the head over `m` rows
-    /// as one matmul costs a fraction of the `m` forward passes the default
-    /// implementation would do instead.
-    fn forward_batch_all(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        let (m, e) = (tokens.len(), self.spec.n_embd);
-        let mut xs = self.run_batch(tokens, cache);
-        for i in 0..m {
-            let normed = rms_norm(&xs[i * e..(i + 1) * e], &self.final_norm, self.spec.eps);
-            xs[i * e..(i + 1) * e].copy_from_slice(&normed);
+    fn splits(&self) -> bool {
+        true
+    }
+
+    /// A row of the table for each token, and nothing else: position
+    /// arrives inside attention, as RoPE.
+    fn embed(&self, tokens: &[u32], _pos0: usize) -> Vec<f32> {
+        let (e, embed) = (self.spec.n_embd, &self.ends().embed);
+        let mut xs = vec![0.0f32; tokens.len() * e];
+        for (i, &t) in tokens.iter().enumerate() {
+            xs[i * e..(i + 1) * e].copy_from_slice(&embed.row(t as usize));
         }
-        self.lm_head.as_ref().unwrap_or(&self.embed).matmul_bt(&xs, m, None)
+        xs
+    }
+
+    fn blocks(&self, xs: &mut [f32], m: usize, cache: &mut KvCache) {
+        self.run_rows(xs, m, Rows::Following(cache))
+    }
+
+    /// The final norm and the projection back to the vocabulary.
+    ///
+    /// Generation wants the last position's logits and nothing else, so
+    /// that stays a matrix-vector product. Scoring text — perplexity —
+    /// wants every position's, and the residual stream already holds them
+    /// all: the head over `m` rows as one matmul costs a fraction of the
+    /// `m` forward passes it would otherwise take.
+    fn head(&self, xs: &[f32], m: usize, all: bool) -> Vec<f32> {
+        let (e, ends) = (self.spec.n_embd, self.ends());
+        let table = ends.lm_head.as_ref().unwrap_or(&ends.embed);
+        if !all {
+            let last = rms_norm(&xs[(m - 1) * e..m * e], &ends.final_norm, self.spec.eps);
+            return table.matvec_bt(&last, None);
+        }
+        let mut normed = vec![0.0f32; m * e];
+        for i in 0..m {
+            normed[i * e..(i + 1) * e].copy_from_slice(&rms_norm(&xs[i * e..(i + 1) * e], &ends.final_norm, self.spec.eps));
+        }
+        table.matmul_bt(&normed, m, None)
     }
 
     /// One matmul per projection for all of them, and per-sequence
     /// attention: the same pass as prefill, with a cache a row.
     fn forward_each(&self, tokens: &[u32], caches: &mut [&mut KvCache]) -> Vec<f32> {
         assert_eq!(tokens.len(), caches.len(), "a token for each sequence, and a sequence for each token");
-        let (m, e) = (tokens.len(), self.spec.n_embd);
+        let m = tokens.len();
         match m {
             0 => return Vec::new(),
             // One sequence is the ordinary step, and the ordinary step's
@@ -383,12 +427,9 @@ impl Transformer for Model {
             1 => return self.forward(tokens[0], caches[0]),
             _ => {}
         }
-        let mut xs = self.run_rows(tokens, Rows::Each(caches));
-        for i in 0..m {
-            let normed = rms_norm(&xs[i * e..(i + 1) * e], &self.final_norm, self.spec.eps);
-            xs[i * e..(i + 1) * e].copy_from_slice(&normed);
-        }
-        self.lm_head.as_ref().unwrap_or(&self.embed).matmul_bt(&xs, m, None)
+        let mut xs = self.embed(tokens, 0);
+        self.run_rows(&mut xs, m, Rows::Each(caches));
+        self.head(&xs, m, true)
     }
 
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32> {
@@ -398,7 +439,8 @@ impl Transformer for Model {
 
         // No position embedding here. The token vector is all that enters the
         // residual stream; position arrives later, inside attention.
-        let mut x = self.embed.row(token as usize);
+        let ends = self.ends();
+        let mut x = ends.embed.row(token as usize);
 
         for (l, block) in self.blocks.iter().enumerate() {
             // ---- Attention sub-block -------------------------------------
@@ -442,7 +484,7 @@ impl Transformer for Model {
 
         cache.len += 1;
 
-        let x = rms_norm(&x, &self.final_norm, spec.eps);
-        self.lm_head.as_ref().unwrap_or(&self.embed).matvec_bt(&x, None)
+        let x = rms_norm(&x, &ends.final_norm, spec.eps);
+        ends.lm_head.as_ref().unwrap_or(&ends.embed).matvec_bt(&x, None)
     }
 }

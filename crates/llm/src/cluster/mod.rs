@@ -1,6 +1,9 @@
 //! One model across several machines. See `docs/cluster-plan.md`, which is
 //! the design; this is as much of it as exists.
 //!
+//! * [`stage`] — some of a model's blocks, wherever they are, and
+//!   [`session`], the pipeline of them that the rest of the engine sees as
+//!   one model.
 //! * [`wire`] — the framing two machines speak.
 //! * [`ping`] — a listener that sends frames straight back, and the
 //!   measurement of a link made against it: what a stage boundary costs
@@ -11,6 +14,8 @@
 
 pub mod link;
 pub mod ping;
+pub mod session;
+pub mod stage;
 pub mod wire;
 
 /// This machine's name for itself, without its domain.

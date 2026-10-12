@@ -198,6 +198,29 @@ pub trait Transformer: Send + Sync {
 }
 ```
 
+**As built** (Phase 1), with three differences from the sketch above, each
+for a reason:
+
+- `forward` stays a method of its own. Llama and GPT-2 each have a
+  hand-written one-row pass beside the batched one, and they are what the
+  batched passes are tested against. What a session calls, whole or cut, is
+  the batched pass at every `m`, so the two cannot differ by which kernel a
+  single row took.
+- A `splits()` method says whether an architecture has the three. Qwen3.5
+  does not yet — its pass is one token at a time — and loads whole or not
+  at all. The defaults of `forward_batch` and `forward_batch_all` are the
+  three in a row where they exist, and the old loop where they do not.
+- `embed` takes `pos0` for GPT-2 alone, which adds position at the door.
+  Everything since puts it in inside attention, where each shard counts it
+  from its own cache.
+
+A shard load reads its own layers and names the rest as left to others, a
+layer at a time, so the loader's check for weights nobody read still means
+what it meant. It quantises from the checkpoint on every load and stays out
+of the cache file; that is Phase 3's, below.
+
+The sketch, as it was written:
+
 - `Architecture::load` gains the `Shard`. A whole model is
   `Shard { layers: 0..n_layer, ends: true }`, which is what every caller
   passes today.
@@ -215,8 +238,8 @@ Then a new module, `crates/llm/src/cluster/`, behind a `cluster` feature:
 | `wire.rs` | The framing. `u32 length, u8 kind, payload`. Control messages are JSON (`serde_json` is already here); tensors are a fixed header — `seq, pos0, m, n_embd` — and little-endian f32. `std::net`, `TCP_NODELAY`, no async: the `kvad` crate has no tokio and does not need one. Hand-written, because 200 lines of framing is something this repository can teach and gRPC is something it would have to apologise for. **Written**, with `Hello`, `Error`, the tensor frames and the four kinds a measurement uses. |
 | `ping.rs` | The listener that sends frames straight back and the sweep made against it: `kvad cluster listen` and `kvad cluster ping`. **Written.** |
 | `link.rs` | What a link is, from the registry and not from the socket, and who is on each cable: `kvad cluster link` and `kvad cluster find`. **Written.** |
-| `stage.rs` | `trait Stage { fn run(&mut self, seq, pos0, m, xs) -> Res<Vec<f32>>; fn truncate(..); }`, with `LocalStage` (a `Transformer` shard plus its cache and pool) and `RemoteStage` (a socket). |
-| `session.rs` | `PipelineSession: Session`. Embeds, walks its stages in order, applies the head. This is the only thing `Llm` ever sees. |
+| `stage.rs` | `trait Stage { fn run(&mut self, seq, pos0, m, xs) -> Res<Vec<f32>>; fn truncate(..); }`, with `LocalStage` (a `Transformer` shard plus its cache and pool) and `RemoteStage` (a socket). **`LocalStage` is written.** It keeps a cache a conversation, refuses rows that are not at the end of what it holds, and has no pool: the pass runs inside the session's, and a worker will bring its own. |
+| `session.rs` | `PipelineSession: Session`. Embeds, walks its stages in order, applies the head. This is the only thing `Llm` ever sees. **Written**, for one conversation: it does not yet set a cache aside, so a model in stages keeps one conversation where a model whole keeps several. |
 | `worker.rs` | `serve(listener, key, factory)`: accept a coordinator, answer `Hello`, build a stage on `Load`, run `Forward` frames until told otherwise. The `factory` comes from the binary, as `Engine::spawn`'s loader does, so a GPU-capable binary makes GPU stages. |
 | `plan.rs` | Placement, below. |
 
@@ -534,6 +557,36 @@ boundary is a round trip and because an iperf3 figure would describe this
 link's ceiling while saying nothing about what a 32 KB hop pays before its
 first byte moves. `kvad cluster ping` should keep that shape.
 
+**Phase 1 is done.** Every cut of every architecture that splits — whole,
+in two, in three, the ends on a shard with no layers, the ends on the last
+shard — answers to the bit as the model whole, at f32, q8 and q4, through a
+prompt read in several passes, decode, a rewind and every position's logits
+(`tests/split.rs`, and in `tests/deepseek.rs` for V2 and V3). On real
+weights `examples/split.rs` checks every logit of a 256-token prefill and 48
+decoded tokens, and then times it. Qwen2.5-1.5B at q8 on the M5 Pro, nine
+rounds with whole and cut back to back, medians, cut over whole:
+
+| shards | prefill | decode |
+|---|---|---|
+| 1 | 0.97 | 0.99 |
+| 2 | 1.00 | 0.97 |
+| 3 | 1.01 | 1.03 |
+| 4 | 1.01 | 1.00 |
+
+That is no cost that this machine can show: the best rounds of whole and cut
+are within 3% of each other in every row, and the medians wander by 3% either
+way on a desktop that was not idle. SmolLM2-135M says the same at f32 and
+q8. Against the build before the refactor, the model whole writes the same
+text at the same speed (0.97 to 1.09 over two models and two precisions,
+five rounds; 1.00 on the one repeated with nine).
+
+One thing the measurement turned up that is not about cutting. With the
+whole model mapped from its cache file and the shards quantised onto the
+heap, the shards were 4% faster in all eight cells, one shard included;
+with both read the same way the difference went. So weights on the heap
+ran about 4% faster than the same weights mapped, on one model, once. Not
+chased, and worth a measurement of its own before anybody believes it.
+
 **Phase 1 — split the model, in one process.** `Shard`, the three-method
 `Transformer`, shard-aware `load` and `KvCache` for GPT-2, Llama and DeepSeek.
 `LocalStage` and `PipelineSession` with every stage local. No sockets. Test:
@@ -586,9 +639,11 @@ at which a cluster stops being only about memory.
 - Does the Thunderbolt Bridge add enough software latency on the middle
   machine of a chain to matter? Phase 0, with three machines if there are
   three.
-- Is a split model really bit-identical? It should be: each output row of a
-  matmul is computed by one thread whatever the split, and attention is per
-  head. Phase 1's test is the answer, not this paragraph.
+- ~~Is a split model really bit-identical?~~ Yes, in one process: Phase 1's
+  test compares bits and passes for GPT-2, the Llama family and DeepSeek V2
+  and V3 at every precision. Across two machines it is the same question
+  again with a different answer possible — two CPUs, and kernels chosen by
+  what each has — and Phase 2 asks it.
 - Should the coordinator hold layers at all when it is also running
   `kvad-serve`, a database and a browser? Probably yes, fewer of them — the
   planner's headroom figure is where that is expressed.

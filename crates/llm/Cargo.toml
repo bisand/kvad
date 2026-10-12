@@ -56,3 +56,7 @@ ureq = { version = "3.4.2", default-features = false, features = ["rustls", "jso
 # Resolving `../ch01.html` against the page that linked it, for `crawl`: fiddly
 # and security-relevant arithmetic, and the one place a crate earns its keep.
 url = "2.5.8"
+
+[[example]]
+name = "split"
+required-features = ["cluster"]

@@ -384,9 +384,119 @@ impl Spec {
     }
 }
 
+/// Which part of a model one process holds.
+///
+/// A model is its embedding, a stack of blocks, and an output head. Cut the
+/// stack and the only thing that crosses a cut is the residual stream —
+/// `n_embd` floats a token — so the blocks can live on as many machines as
+/// it takes to hold them. The two ends stay together, on whichever machine
+/// has the tokens and wants the logits: sending the final hidden state back
+/// is 32 KB a token for a 70B where sending logits would be half a megabyte,
+/// and with tied embeddings the table then exists once and not twice.
+///
+/// A whole model is the shard with every layer and the ends, and is what
+/// every load was before there was this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shard {
+    pub layers: std::ops::Range<usize>,
+    /// The embedding, the final norm and the output head. Exactly one shard
+    /// of a model has them.
+    pub ends: bool,
+}
+
+impl Shard {
+    pub fn whole(spec: &Spec) -> Shard {
+        Shard { layers: 0..spec.n_layer, ends: true }
+    }
+
+    pub fn is_whole(&self, spec: &Spec) -> bool {
+        *self == Shard::whole(spec)
+    }
+
+    /// `n_layer` layers in `parts` runs as near equal as they come, the
+    /// first of them with the ends.
+    pub fn cut(n_layer: usize, parts: usize) -> Vec<Shard> {
+        let parts = parts.clamp(1, n_layer.max(1));
+        (0..parts).map(|i| Shard { layers: i * n_layer / parts..(i + 1) * n_layer / parts, ends: i == 0 }).collect()
+    }
+
+    /// Whether these, in this order, are one model: every layer once, in
+    /// order, and the ends exactly once.
+    pub fn check(shards: &[Shard], n_layer: usize) -> Res<()> {
+        let mut next = 0;
+        for shard in shards {
+            if shard.layers.start != next {
+                let what = if shard.layers.start < next { "twice" } else { "nowhere" };
+                return Err(format!("layer {} is {what}: the split has to cover every layer once, in order", shard.layers.start.min(next)).into());
+            }
+            next = shard.layers.end.max(next);
+        }
+        if next != n_layer {
+            return Err(format!("the split covers {next} layers of {n_layer}").into());
+        }
+        match shards.iter().filter(|s| s.ends).count() {
+            1 => Ok(()),
+            n => Err(format!("{n} shards hold the embedding and the output head, and exactly one has to").into()),
+        }
+    }
+}
+
+impl std::fmt::Display for Shard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "layers {}..{}{}", self.layers.start, self.layers.end, if self.ends { " and the ends" } else { "" })
+    }
+}
+
 /// The interface the runtime talks to. Two implementations, one shape.
+///
+/// # The three methods a model splits into
+///
+/// [`Transformer::embed`], [`Transformer::blocks`] and [`Transformer::head`]
+/// are a forward pass in three pieces, and an architecture that has them
+/// says so with [`Transformer::splits`]. `forward_batch` and
+/// `forward_batch_all` are then those three in a row and nothing else, which
+/// is the property everything about a cluster rests on: a model run as
+/// several shards does the same arithmetic in the same order as the model
+/// run whole, because the model run whole *is* the three calls.
 pub trait Transformer: Send + Sync {
     fn spec(&self) -> &Spec;
+
+    /// The part of the model this is. Everything, unless it was loaded as
+    /// less.
+    fn shard(&self) -> Shard {
+        Shard::whole(self.spec())
+    }
+
+    /// Whether this architecture has the three methods below. One that does
+    /// not runs whole and only whole.
+    fn splits(&self) -> bool {
+        false
+    }
+
+    /// Tokens into rows of the residual stream: `tokens.len()` rows of
+    /// `n_embd`, the first of them at position `pos0` of its sequence. Needs
+    /// the ends.
+    ///
+    /// The position is here for the one architecture that adds it at the
+    /// door. Everything since GPT-2 puts position in inside attention, where
+    /// each shard knows it from the length of its own cache.
+    fn embed(&self, _tokens: &[u32], _pos0: usize) -> Vec<f32> {
+        panic!("the `{}` architecture does not split", self.spec().arch)
+    }
+
+    /// This shard's blocks over `m` rows, in place, adding the rows' keys
+    /// and values to `cache` — which is this shard's own, a layer for each
+    /// of its blocks; see [`KvCache::for_shard`].
+    fn blocks(&self, _xs: &mut [f32], _m: usize, _cache: &mut KvCache) {
+        panic!("the `{}` architecture does not split", self.spec().arch)
+    }
+
+    /// Rows of the residual stream into logits: for the last row, or for
+    /// `all` of them as `m` rows of `vocab_size`. Needs the ends.
+    fn head(&self, _xs: &[f32], _m: usize, _all: bool) -> Vec<f32> {
+        panic!("the `{}` architecture does not split", self.spec().arch)
+    }
+
     /// Run one token and return logits over the vocabulary.
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32>;
 
@@ -402,9 +512,14 @@ pub trait Transformer: Send + Sync {
     /// positions — so it never sees a token that comes after it, without an
     /// explicit mask anywhere.
     ///
-    /// The default is the equivalent loop, which is also what the batched
-    /// implementations are tested against.
+    /// The default is the three pieces in a row where the architecture has
+    /// them, and otherwise the equivalent loop.
     fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        if self.splits() {
+            let mut xs = self.embed(tokens, cache.len);
+            self.blocks(&mut xs, tokens.len(), cache);
+            return self.head(&xs, tokens.len(), false);
+        }
         let mut logits = Vec::new();
         for &t in tokens {
             logits = self.forward(t, cache);
@@ -419,9 +534,14 @@ pub trait Transformer: Send + Sync {
     /// them, and getting them from `m` separate forward passes would cost `m`
     /// times the memory traffic for the same arithmetic.
     ///
-    /// The default is that slow, correct loop, which is also what the batched
-    /// implementations are tested against.
+    /// The default is the three pieces again, with the head over every row;
+    /// or, for an architecture without them, that slow, correct loop.
     fn forward_batch_all(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        if self.splits() {
+            let mut xs = self.embed(tokens, cache.len);
+            self.blocks(&mut xs, tokens.len(), cache);
+            return self.head(&xs, tokens.len(), true);
+        }
         let mut all = Vec::new();
         for &t in tokens {
             all.extend(self.forward(t, cache));
@@ -470,21 +590,31 @@ pub struct KvCache {
     /// has none, which is all of them so far.
     state: Vec<Vec<f32>>,
     shape: CacheLayout,
+    /// The model's layer that this cache's layer 0 is: nonzero for a shard
+    /// that starts part way up the stack.
+    first: usize,
     pub len: usize,
 }
 
 impl KvCache {
     pub fn new(spec: &Spec) -> Self {
+        KvCache::for_shard(spec, &Shard::whole(spec))
+    }
+
+    /// A cache for one shard's blocks and no others: layer `i` here is the
+    /// shard's `i`th block, which is how a shard's own loop counts them.
+    pub fn for_shard(spec: &Spec, shard: &Shard) -> Self {
         // Deliberately not pre-allocated: a 32k-context model would reserve
         // gigabytes up front for a conversation that may run to fifty tokens.
         // The recurrent state is the opposite case and *is* allocated: it is
         // a fixed size that the first token needs in full, and zero is its
         // correct initial value.
         KvCache {
-            k: (0..spec.n_layer).map(|_| Vec::new()).collect(),
-            v: (0..spec.n_layer).map(|_| Vec::new()).collect(),
-            state: (0..spec.n_layer).map(|i| vec![0.0; spec.cache.at(i).state]).collect(),
+            k: shard.layers.clone().map(|_| Vec::new()).collect(),
+            v: shard.layers.clone().map(|_| Vec::new()).collect(),
+            state: shard.layers.clone().map(|i| vec![0.0; spec.cache.at(i).state]).collect(),
             shape: spec.cache.clone(),
+            first: shard.layers.start,
             len: 0,
         }
     }
@@ -559,7 +689,7 @@ impl KvCache {
             return 0;
         }
         for (i, (k, v)) in self.k.iter_mut().zip(self.v.iter_mut()).enumerate() {
-            let shape = self.shape.at(i);
+            let shape = self.shape.at(self.first + i);
             k.truncate(len * shape.k);
             v.truncate(len * shape.v);
         }
@@ -582,7 +712,7 @@ impl KvCache {
 
     /// Bytes currently held.
     pub fn bytes(&self) -> usize {
-        self.shape.bytes(self.k.len(), self.len)
+        (self.first..self.first + self.k.len()).map(|layer| self.shape.at(layer).bytes(self.len)).sum()
     }
 
     /// Bytes this cache would hold at full context.
@@ -836,20 +966,25 @@ pub struct CpuSession {
 impl CpuSession {
     pub fn new(model: Box<dyn Transformer>, precision: crate::quant::Precision) -> Self {
         let cache = KvCache::new(model.spec());
-        // Tunable so the effect of batching stays measurable; 1 gives the old
-        // token-at-a-time behaviour.
-        let chunk = std::env::var("KVAD_PREFILL_CHUNK")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(64);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads())
-            .thread_name(|i| format!("kvad-{i}"))
-            .build()
-            .expect("building a thread pool");
-        CpuSession { model, cache, precision, chunk, pool }
+        CpuSession { model, cache, precision, chunk: prefill_chunk(), pool: pool() }
     }
+}
+
+/// Prompt tokens a batched prefill pass, unless a session is told otherwise.
+///
+/// Tunable so the effect of batching stays measurable; 1 gives the old
+/// token-at-a-time behaviour.
+pub fn prefill_chunk() -> usize {
+    std::env::var("KVAD_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0).unwrap_or(64)
+}
+
+/// The threads a session's matmuls run on: [`threads`] of them.
+pub fn pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads())
+        .thread_name(|i| format!("kvad-{i}"))
+        .build()
+        .expect("building a thread pool")
 }
 
 impl CpuSession {
@@ -1150,6 +1285,68 @@ mod tests {
 
         assert_eq!(cache.truncate(5), 5);
         assert_eq!(cache.state(1), &[2.5; 6], "nothing was dropped, so nothing was reset");
+    }
+
+    #[test]
+    fn a_model_is_cut_into_runs_that_cover_it() {
+        let whole = Shard::cut(30, 1);
+        assert_eq!(whole, [Shard { layers: 0..30, ends: true }]);
+        let four: Vec<_> = Shard::cut(30, 4).iter().map(|s| (s.layers.clone(), s.ends)).collect();
+        assert_eq!(four, [(0..7, true), (7..15, false), (15..22, false), (22..30, false)]);
+        // More parts than layers is a part a layer, and never an empty one.
+        assert_eq!(Shard::cut(2, 5).len(), 2);
+        for parts in 1..=6 {
+            assert!(Shard::check(&Shard::cut(5, parts), 5).is_ok(), "{parts} parts");
+        }
+        assert_eq!(Shard { layers: 7..15, ends: false }.to_string(), "layers 7..15");
+        assert_eq!(Shard { layers: 0..7, ends: true }.to_string(), "layers 0..7 and the ends");
+        assert!(Shard::whole(&test_spec()).is_whole(&test_spec()));
+    }
+
+    #[test]
+    fn a_split_with_a_gap_an_overlap_or_the_wrong_ends_is_refused() {
+        let part = |layers: std::ops::Range<usize>, ends: bool| Shard { layers, ends };
+        let why = |shards: &[Shard]| Shard::check(shards, 6).unwrap_err().to_string();
+        assert!(Shard::check(&[part(0..0, true), part(0..4, false), part(4..6, false)], 6).is_ok(), "ends on their own");
+        assert!(why(&[part(0..2, true), part(3..6, false)]).contains("layer 2 is nowhere"));
+        assert!(why(&[part(0..4, true), part(2..6, false)]).contains("layer 2 is twice"));
+        assert!(why(&[part(1..6, true)]).contains("layer 0 is nowhere"));
+        assert!(why(&[part(0..5, true)]).contains("5 layers of 6"));
+        assert!(why(&[part(0..3, false), part(3..6, false)]).contains("0 shards hold"));
+        assert!(why(&[part(0..3, true), part(3..6, true)]).contains("2 shards hold"));
+        // Out of order is a gap and then an overlap, and is refused as one.
+        assert!(Shard::check(&[part(3..6, false), part(0..3, true)], 6).is_err());
+    }
+
+    /// A shard's cache counts its own layers from zero, and knows which of
+    /// the model's they are: a layout that differs by layer is read at the
+    /// layer the shard really holds.
+    #[test]
+    fn a_shards_cache_is_its_own_layers_at_their_own_shapes() {
+        let mut spec = test_spec();
+        spec.n_layer = 4;
+        spec.cache = CacheLayout::per_layer(vec![CacheShape::kv(4, 4), CacheShape::kv(2, 6), CacheShape::recurrent(5), CacheShape::kv(4, 4)]);
+        let mut cache = KvCache::for_shard(&spec, &Shard { layers: 1..3, ends: false });
+        assert_eq!(cache.state(0).len(), 0, "the model's layer 1 holds keys and values");
+        assert_eq!(cache.state(1).len(), 5, "and its layer 2 a state");
+        for _ in 0..3 {
+            cache.push(0, &[1.0; 2], &[1.0; 6]);
+            cache.len += 1;
+        }
+        let f = std::mem::size_of::<f32>();
+        assert_eq!(cache.bytes(), (3 * 8 + 5) * f);
+
+        // With no recurrent layer in it, a shard rewinds at its own widths.
+        spec.cache = CacheLayout::per_layer(vec![CacheShape::kv(4, 4), CacheShape::kv(2, 6), CacheShape::kv(4, 4), CacheShape::kv(4, 4)]);
+        let mut cache = KvCache::for_shard(&spec, &Shard { layers: 1..3, ends: false });
+        for _ in 0..3 {
+            cache.push(0, &[1.0; 2], &[1.0; 6]);
+            cache.push(1, &[1.0; 4], &[1.0; 4]);
+            cache.len += 1;
+        }
+        assert_eq!(cache.truncate(1), 1);
+        assert_eq!((cache.keys(0).len(), cache.values(0).len(), cache.keys(1).len()), (2, 6, 4));
+        assert_eq!(KvCache::new(&spec).bytes(), 0);
     }
 
     /// The recurrent state is a cost per layer, not per position, and the

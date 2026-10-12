@@ -72,7 +72,7 @@
 //! avoid. safetensors makes the same trade. The checks are about provenance —
 //! is this the right file, written by the right rules — not integrity.
 
-use crate::model::{Spec, Transformer};
+use crate::model::{Shard, Spec, Transformer};
 use crate::quant::{Parts, Precision, Weight, BLOCK};
 use crate::tensor::Tensor;
 use crate::weights::{Audit, Checkpoint, ModelFiles};
@@ -1360,7 +1360,37 @@ pub fn load(
 /// architecture is a module and one line in `model/arch.rs`, not an arm in
 /// every loader that ever learned the old list.
 fn build(src: &dyn Source, spec: &Spec) -> Res<Box<dyn Transformer>> {
-    spec.arch.load(src, spec.clone())
+    spec.arch.load(src, spec.clone(), &Shard::whole(spec))
+}
+
+/// One [`Shard`] of a model, straight from the checkpoint.
+///
+/// Quantised as it is read and never from the cache file, nor into it. The
+/// file is one model at one precision, and a reader takes a name it does
+/// not hold for a tensor the model does not have: a file written by layers
+/// 20 to 49 and later mapped for the whole model would fail on layer 0 —
+/// or, worse, answer `None` for an untied output head and run with the
+/// wrong one. Until a shard is part of what a cache file says it is, a
+/// shard pays for its quantising on every load.
+///
+/// The check for weights nobody read still runs, and still means what it
+/// meant: a shard names what it leaves to the others, layer by layer, so
+/// what is left over is what no shard would have read.
+pub fn load_shard(files: &ModelFiles, spec: &Spec, precision: Precision, shard: &Shard) -> Res<Box<dyn Transformer>> {
+    let ckpt = Checkpoint::open(&files.weights)?;
+    let live = Live::new(&ckpt, precision);
+    let model = spec.arch.load(&live, spec.clone(), shard)?;
+    let left = live.unread();
+    if !left.is_empty() {
+        return Err(format!(
+            "this checkpoint holds {} tensor(s) that the `{}` loader never reads:\n  {}",
+            left.len(),
+            spec.arch,
+            crate::weights::collapsed(&left).join("\n  "),
+        )
+        .into());
+    }
+    Ok(model)
 }
 
 #[cfg(test)]

@@ -20,7 +20,10 @@
 //! engine's claim that the permutation cancels inside the dot product is one
 //! of the things being checked.
 
-use kvad::model::{deepseek, Json, KvCache, Spec, Transformer};
+#[cfg(feature = "cluster")]
+mod common;
+
+use kvad::model::{deepseek, Json, KvCache, Shard, Spec, Transformer};
 use kvad::qcache::Live;
 use kvad::quant::Precision;
 use kvad::tensor::rms_norm;
@@ -884,6 +887,36 @@ fn the_quantised_path_predicts_the_same_tokens() {
             - want.iter().copied().fold(f32::INFINITY, f32::min);
         let worst = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         assert!(worst < spread / 10.0, "{tag}: q8 moved a logit by {worst} of {spread}");
+    }
+}
+
+/// A DeepSeek cut into shards is the same DeepSeek, to the bit.
+///
+/// The cache here is the latent and the rotary key, two streams of
+/// different widths, and each shard keeps its own layers' and counts
+/// positions from it; the routed layers and the dense ones fall on
+/// different sides of a cut. V3 also carries a block the loader skips on
+/// purpose, filed past the last layer, which a shard has to go on skipping
+/// rather than mistake for a layer that is somebody else's.
+#[cfg(feature = "cluster")]
+#[test]
+fn a_model_cut_into_shards_answers_to_the_bit() {
+    for (flavour, name) in [(Flavour::V2, "deepseek v2"), (Flavour::V3, "deepseek v3")] {
+        let t = tiny(flavour);
+        let path = std::env::temp_dir().join(format!("kvad-ds-{}-split-{}.safetensors", std::process::id(), name.replace(' ', "-")));
+        write_safetensors(&path, &t.tensors);
+        let ckpt = Checkpoint::open(std::slice::from_ref(&path)).unwrap();
+        let spec = Spec::from_config(Json::new(t.config.clone())).unwrap();
+        for precision in [Precision::F32, Precision::Q8] {
+            common::every_cut_is_the_model(&spec, precision, name, &|shard: &Shard| {
+                let live = Live::new(&ckpt, precision);
+                let model = deepseek::Model::load_shard(&live, spec.clone(), shard).unwrap();
+                let unread = live.unread();
+                assert!(unread.is_empty(), "{name}, {shard}: neither read nor left to another shard: {unread:?}");
+                Box::new(model) as Box<dyn Transformer>
+            });
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 

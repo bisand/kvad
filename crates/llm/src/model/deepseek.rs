@@ -71,7 +71,7 @@
 //! needed to run the model. Its weights are skipped.
 
 use super::ffn::{Ffn, Layout, Mlp, Moe, Router};
-use super::{Architecture, CacheLayout, CacheShape, Json, KvCache, Spec, Transformer};
+use super::{Architecture, CacheLayout, CacheShape, Json, KvCache, Shard, Spec, Transformer};
 use crate::qcache::{head, Source};
 use crate::quant::Weight;
 use crate::tensor::{dot, rms_norm, softmax_inplace, Rope};
@@ -86,7 +86,7 @@ pub static V2: Architecture = Architecture {
     model_types: &["deepseek_v2"],
     about: "DeepSeek V2: latent attention (MLA) over a 512-wide cache, 64 routed experts",
     configure,
-    load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
+    load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
 };
 
 /// DeepSeek V3, and R1, which is V3 with different weights.
@@ -99,7 +99,7 @@ pub static V3: Architecture = Architecture {
     model_types: &["deepseek_v3"],
     about: "DeepSeek V3/R1: MLA, 256 experts in 8 groups, sigmoid routing with a learned bias",
     configure,
-    load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
+    load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
 };
 
 // ---------------------------------------------------------------------------
@@ -327,21 +327,44 @@ struct Block {
 pub struct Model {
     spec: Spec,
     mla: Mla,
-    embed: Weight,
-    lm_head: Option<Weight>,
+    /// Which of the model's layers `blocks` holds, and whether `ends` is
+    /// here. Everything and yes, for a model on one machine.
+    shard: Shard,
+    ends: Option<Ends>,
     blocks: Vec<Block>,
-    final_norm: Vec<f32>,
     rope: Rope,
 }
 
+/// The two ends of the model, which stay together when the blocks between
+/// them are spread out: see [`Shard`].
+struct Ends {
+    embed: Weight,
+    lm_head: Option<Weight>,
+    final_norm: Vec<f32>,
+}
+
 impl Model {
+    /// The whole model.
     pub fn load(src: &dyn Source, spec: Spec) -> Res<Self> {
+        let whole = Shard::whole(&spec);
+        Model::load_shard(src, spec, &whole)
+    }
+
+    /// The part of the model `shard` names, reading that and nothing else.
+    /// What it leaves to the other shards it says it is leaving, so the
+    /// check for weights nobody read keeps meaning what it means.
+    pub fn load_shard(src: &dyn Source, spec: Spec, shard: &Shard) -> Res<Self> {
         let mla = Mla::read(&spec.config, spec.n_head)?;
         let router = Router::read(&spec.config)?;
         let layout = Layout::read(&spec.config);
 
-        let mut blocks = Vec::with_capacity(spec.n_layer);
+        let mut blocks = Vec::with_capacity(shard.layers.len());
         for i in 0..spec.n_layer {
+            // Another shard's layer: known about, and deliberately not read.
+            if !shard.layers.contains(&i) {
+                src.skip_under(&format!("layers.{i}."));
+                continue;
+            }
             let p = |s: &str| format!("layers.{i}.{s}");
             let attn = Attn {
                 norm: src.vector(&p("input_layernorm.weight"))?,
@@ -398,37 +421,43 @@ impl Model {
             src.skip_under(&format!("layers.{i}."));
         }
 
-        let lm_head = head(src, &spec, "lm_head.weight")?;
+        let ends = match shard.ends {
+            true => Some(Ends {
+                lm_head: head(src, &spec, "lm_head.weight")?,
+                embed: src.matrix("embed_tokens.weight")?,
+                final_norm: src.vector("norm.weight")?,
+            }),
+            false => {
+                for name in ["lm_head.weight", "embed_tokens.weight", "norm.weight"] {
+                    src.skip(name);
+                }
+                None
+            }
+        };
         let rope = build_rope(mla.qk_rope, spec.n_ctx, spec.rope_theta, &spec.config)?;
 
         Ok(Model {
-            embed: src.matrix("embed_tokens.weight")?,
-            lm_head,
+            shard: shard.clone(),
+            ends,
             blocks,
-            final_norm: src.vector("norm.weight")?,
             mla,
             rope,
             spec,
         })
     }
 
-    /// Every block over a batch of tokens, leaving the residual stream as it
-    /// is — no output head. Both public entry points are this plus a norm and
-    /// a projection, over different rows.
-    fn run_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+    /// This shard's blocks over a batch of rows, leaving the residual stream
+    /// as it is — no embedding before and no output head after. A forward
+    /// pass is this between the two, over whichever rows are wanted.
+    fn run_blocks(&self, xs: &mut [f32], m: usize, cache: &mut KvCache) {
         let spec = &self.spec;
-        let (m, e) = (tokens.len(), spec.n_embd);
+        let e = spec.n_embd;
         let pos0 = cache.len;
         assert!(
             pos0 + m <= spec.n_ctx,
             "context window of {} tokens is full",
             spec.n_ctx
         );
-
-        let mut xs = vec![0.0f32; m * e];
-        for (i, &t) in tokens.iter().enumerate() {
-            xs[i * e..(i + 1) * e].copy_from_slice(&self.embed.row(t as usize));
-        }
 
         let mut hs = vec![0.0f32; m * e];
         for (l, block) in self.blocks.iter().enumerate() {
@@ -458,7 +487,6 @@ impl Model {
         }
 
         cache.len += m;
-        xs
     }
 
     /// Latent attention for a batch of positions.
@@ -566,8 +594,9 @@ impl Model {
         w.o.matmul_bt(&heads, m, None)
     }
 
-    fn head(&self) -> &Weight {
-        self.lm_head.as_ref().unwrap_or(&self.embed)
+    /// The embedding and the head, on the shard that has them.
+    fn ends(&self) -> &Ends {
+        self.ends.as_ref().unwrap_or_else(|| panic!("{} of this model were asked for its ends, which another shard holds", self.shard))
     }
 }
 
@@ -580,33 +609,49 @@ impl Transformer for Model {
         self.forward_batch(&[token], cache)
     }
 
-    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        let (m, e) = (tokens.len(), self.spec.n_embd);
-        let xs = self.run_batch(tokens, cache);
-        let last = rms_norm(&xs[(m - 1) * e..m * e], &self.final_norm, self.spec.eps);
-        self.head().matvec_bt(&last, None)
+    fn shard(&self) -> Shard {
+        self.shard.clone()
     }
 
-    fn forward_batch_all(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        let (m, e) = (tokens.len(), self.spec.n_embd);
-        let mut xs = self.run_batch(tokens, cache);
-        for i in 0..m {
-            let normed = rms_norm(&xs[i * e..(i + 1) * e], &self.final_norm, self.spec.eps);
-            xs[i * e..(i + 1) * e].copy_from_slice(&normed);
+    fn splits(&self) -> bool {
+        true
+    }
+
+    fn embed(&self, tokens: &[u32], _pos0: usize) -> Vec<f32> {
+        let (e, embed) = (self.spec.n_embd, &self.ends().embed);
+        let mut xs = vec![0.0f32; tokens.len() * e];
+        for (i, &t) in tokens.iter().enumerate() {
+            xs[i * e..(i + 1) * e].copy_from_slice(&embed.row(t as usize));
         }
-        self.head().matmul_bt(&xs, m, None)
+        xs
+    }
+
+    fn blocks(&self, xs: &mut [f32], m: usize, cache: &mut KvCache) {
+        self.run_blocks(xs, m, cache)
+    }
+
+    fn head(&self, xs: &[f32], m: usize, all: bool) -> Vec<f32> {
+        let (e, ends) = (self.spec.n_embd, self.ends());
+        let table = ends.lm_head.as_ref().unwrap_or(&ends.embed);
+        if !all {
+            let last = rms_norm(&xs[(m - 1) * e..m * e], &ends.final_norm, self.spec.eps);
+            return table.matvec_bt(&last, None);
+        }
+        let mut normed = vec![0.0f32; m * e];
+        for i in 0..m {
+            normed[i * e..(i + 1) * e].copy_from_slice(&rms_norm(&xs[i * e..(i + 1) * e], &ends.final_norm, self.spec.eps));
+        }
+        table.matmul_bt(&normed, m, None)
     }
 
     fn param_count(&self) -> usize {
-        self.embed.param_count()
-            + self.lm_head.as_ref().map_or(0, |h| h.param_count())
-            + self.final_norm.len()
-            + self.blocks.iter().map(|b| b.param_count()).sum::<usize>()
+        self.ends.as_ref().map_or(0, |ends| {
+            ends.embed.param_count() + ends.lm_head.as_ref().map_or(0, |h| h.param_count()) + ends.final_norm.len()
+        }) + self.blocks.iter().map(|b| b.param_count()).sum::<usize>()
     }
 
     fn memory_bytes(&self) -> usize {
-        self.embed.bytes()
-            + self.lm_head.as_ref().map_or(0, |h| h.bytes())
+        self.ends.as_ref().map_or(0, |ends| ends.embed.bytes() + ends.lm_head.as_ref().map_or(0, |h| h.bytes()))
             + self.blocks.iter().map(|b| b.bytes()).sum::<usize>()
     }
 }

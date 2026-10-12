@@ -1093,7 +1093,9 @@ engine's, since #233. So everything that runs on the device now takes a
 turn (`common::alone`), taken where every pass, image and step already
 has its autorelease pool. Tried with a server writing four replies from
 its own GPU model while it held a stage for another server that was
-writing: no crash. An image or video *load* is not yet inside a turn.
+writing: no crash. An image or a video model's load takes a turn too; an
+image pipeline finds its files as it loads, so one that has to download
+holds the turn while it does, and a stage on that GPU waits.
 
 Across the cable again, the same split, medians of seven replies:
 270 to 282 tok/s where it was 161 to 225, and 100 to 108 with

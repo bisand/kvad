@@ -224,16 +224,23 @@ impl Ltx {
 
         let tag = crate::qcache::tag(quant);
         let cached = |component: &str| kvad::qcache::path_for_tag(&format!("{}/{component}", super::LTX_REPO), &tag).is_file();
-        if kvad::qcache::enabled() && !cached("text_encoder") {
-            progress("quantising the text path to q8, once");
-            drop(TextEncoder::load(&paths[0], &paths[1], &device, DType::BF16, Some(quant), progress)?);
-            settle(&device)?;
-        }
-        if kvad::qcache::enabled() && !cached("transformer") && gguf.is_none() {
-            progress("quantising the DiT to q8, once");
-            drop(Dit::load(&paths[1], &device, DType::BF16, None, Some(quant), progress)?);
-            settle(&device)?;
-        }
+        // The files are all here by now. What follows is on the device, and
+        // takes a turn at it: a server may be running layers for another
+        // machine on this GPU meanwhile. A video's own parts are loaded when
+        // it is made, inside the turn its pool is.
+        crate::common::alone(|| -> Res<()> {
+            if kvad::qcache::enabled() && !cached("text_encoder") {
+                progress("quantising the text path to q8, once");
+                drop(TextEncoder::load(&paths[0], &paths[1], &device, DType::BF16, Some(quant), progress)?);
+                settle(&device)?;
+            }
+            if kvad::qcache::enabled() && !cached("transformer") && gguf.is_none() {
+                progress("quantising the DiT to q8, once");
+                drop(Dit::load(&paths[1], &device, DType::BF16, None, Some(quant), progress)?);
+                settle(&device)?;
+            }
+            Ok(())
+        })?;
 
         let made = gguf.map(|g| crate::gguf::Gguf::open(g).map(|f| f.make_up())).transpose()?;
         let params = [

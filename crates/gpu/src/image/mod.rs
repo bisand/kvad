@@ -237,36 +237,46 @@ pub fn load_with(
     if gguf.is_some() && !GGUF_PIPELINES.contains(&class) {
         return Err(format!("`{repo}` is a {class}, and a GGUF's denoiser is read for {} only, so far", GGUF_PIPELINES.join(" and ")).into());
     }
-    match class {
-        "StableDiffusionXLPipeline" => {
-            if quant.is_some() {
-                progress("SDXL runs in f16; ignoring the quantisation asked for");
+    // A turn at the device for the whole of it, as a language model's load
+    // has: the weights go up as they are read, and a server may be running
+    // layers for another machine on this GPU meanwhile. A pipeline finds
+    // its own files as it goes, so one that has to download something holds
+    // the turn while it does.
+    crate::common::alone(|| -> Res<Box<dyn Painter>> {
+        match class {
+            "StableDiffusionXLPipeline" => {
+                if quant.is_some() {
+                    progress("SDXL runs in f16; ignoring the quantisation asked for");
+                }
+                Ok(Box::new(sdxl::Sdxl::load(repo, device, progress, watch)?))
             }
-            Ok(Box::new(sdxl::Sdxl::load(repo, device, progress, watch)?))
-        }
-        "StableDiffusionPipeline" => {
-            if quant.is_some() {
-                progress("SD 1.5 runs in f16; ignoring the quantisation asked for");
+            "StableDiffusionPipeline" => {
+                if quant.is_some() {
+                    progress("SD 1.5 runs in f16; ignoring the quantisation asked for");
+                }
+                Ok(Box::new(sd15::Sd15::load(repo, device, progress, watch)?))
             }
-            Ok(Box::new(sd15::Sd15::load(repo, device, progress, watch)?))
+            "QwenImagePipeline" => Ok(Box::new(qwen::QwenImage::load_with(repo, gguf, quant, device, progress, watch)?)),
+            "FluxPipeline" => Ok(Box::new(flux::Flux::load_with(repo, gguf, quant, device, progress, watch)?)),
+            other => Err(format!(
+                "`{repo}` is a {other}; the pipelines implemented here are {}",
+                PIPELINES.join(" and ")
+            )
+            .into()),
         }
-        "QwenImagePipeline" => Ok(Box::new(qwen::QwenImage::load_with(repo, gguf, quant, device, progress, watch)?)),
-        "FluxPipeline" => Ok(Box::new(flux::Flux::load_with(repo, gguf, quant, device, progress, watch)?)),
-        other => Err(format!(
-            "`{repo}` is a {other}; the pipelines implemented here are {}",
-            PIPELINES.join(" and ")
-        )
-        .into()),
-    }
+    })
 }
 
 /// A checkpoint in one file, on this machine, by its kind's pipeline, with
 /// the configs of that kind's base.
 fn load_single(file: &Path, kind: Kind, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Box<dyn Painter>> {
     let device = crate::model::pick_device(None)?;
-    Ok(match kind {
-        Kind::Sdxl => Box::new(sdxl::Sdxl::load_with(sdxl::REPO, Some(file), device, progress, watch)?),
-        Kind::Sd15 => Box::new(sd15::Sd15::load_with(sd15::REPO, Some(file), device, progress, watch)?),
+    // A turn at the device, as in `load_with`.
+    crate::common::alone(|| -> Res<Box<dyn Painter>> {
+        Ok(match kind {
+            Kind::Sdxl => Box::new(sdxl::Sdxl::load_with(sdxl::REPO, Some(file), device, progress, watch)?),
+            Kind::Sd15 => Box::new(sd15::Sd15::load_with(sd15::REPO, Some(file), device, progress, watch)?),
+        })
     })
 }
 

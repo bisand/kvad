@@ -314,3 +314,86 @@ fn a_run_with_nowhere_to_put_its_model_does_not_start() {
     let error = train::run(&missing, &mut |_| {}).unwrap_err().to_string();
     assert!(error.contains("not a model on this machine"), "{error}");
 }
+
+/// A session that notes each pass it is asked for: how many tokens, and the
+/// logits that came back, to the bit.
+struct Noted {
+    inner: Box<dyn kvad::model::Session>,
+    passes: Arc<Mutex<Vec<(usize, Vec<u32>)>>>,
+}
+
+impl kvad::model::Session for Noted {
+    fn spec(&self) -> &kvad::model::Spec {
+        self.inner.spec()
+    }
+    fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let logits = self.inner.forward(tokens)?;
+        self.passes.lock().unwrap().push((tokens.len(), logits.iter().map(|l| l.to_bits()).collect()));
+        Ok(logits)
+    }
+    fn cached(&self) -> usize {
+        self.inner.cached()
+    }
+    fn truncate(&mut self, len: usize) -> Result<usize, Box<dyn std::error::Error>> {
+        self.inner.truncate(len)
+    }
+    fn prefill_pass(&self, left: usize) -> usize {
+        self.inner.prefill_pass(left)
+    }
+    fn label(&self) -> String {
+        self.inner.label()
+    }
+    fn param_count(&self) -> usize {
+        self.inner.param_count()
+    }
+    fn weight_bytes(&self) -> usize {
+        self.inner.weight_bytes()
+    }
+}
+
+/// The same prompt sent twice is answered from the same logits, to the bit.
+///
+/// The second time, everything but the prompt's last token is in the cache
+/// and that token is run alone. So it is run alone the first time as well,
+/// after the rest in a pass: one row and several rows are different
+/// kernels, which agree to rounding and not to the bit, and a reply at
+/// temperature 0 that depended on which was a reply that changed when it
+/// was asked for again.
+#[test]
+fn a_prompt_sent_twice_is_answered_from_the_same_logits() {
+    let _alone = alone();
+    let name = "twice";
+    let data = corpus_file("twice", &SENTENCE.repeat(40));
+    let summary = train::run(&options(data, name), &mut |_| {}).unwrap();
+
+    let passes = Arc::new(Mutex::new(Vec::new()));
+    let mut llm = Llm::load_custom(name, &mut |_| {}, &weights::Watcher::none(), &mut |files, spec, progress| {
+        let model = kvad::qcache::load(name, files, spec, Precision::F32, progress)?;
+        let inner = Box::new(kvad::model::CpuSession::new(model, Precision::F32).reading(4));
+        Ok(Box::new(Noted { inner, passes: passes.clone() }))
+    })
+    .unwrap();
+
+    let prompt = llm.encode("the cat sat on").unwrap();
+    let n = prompt.len();
+    assert!(n > 9, "long enough to be read in several passes of four");
+    let mut ask = |llm: &mut Llm| {
+        passes.lock().unwrap().clear();
+        let (_, reply) = llm.generate(&prompt, &mut Sampler::new(0.0, 0, 1.0, 0), 12, |_| true).unwrap();
+        // The passes that read the prompt, and the logits the reply began from.
+        let read: Vec<(usize, Vec<u32>)> = passes.lock().unwrap().iter().take_while(|(m, _)| *m > 1).cloned().collect();
+        let first = passes.lock().unwrap()[read.len()].clone();
+        (read.iter().map(|(m, _)| *m).collect::<Vec<_>>(), first, reply)
+    };
+
+    let (read, fresh, first) = ask(&mut llm);
+    assert_eq!(read.iter().sum::<usize>(), n - 1, "everything but the last token, in passes: {read:?}");
+    assert_eq!(fresh.0, 1, "and the last token by itself");
+
+    let (read, cached, second) = ask(&mut llm);
+    assert_eq!(read, Vec::<usize>::new(), "the prompt is in the cache the second time");
+    assert_eq!(cached, fresh, "the reply begins from the same logits, to the bit");
+    assert_eq!(second, first);
+
+    std::fs::remove_dir_all(&summary.dir).unwrap();
+}

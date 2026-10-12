@@ -648,11 +648,22 @@ impl Llm {
         if run.cache.is_some() {
             return Err("a prompt is read in the session, before the generation carries its cache away".into());
         }
-        if run.read < run.prompt_len {
+        while run.read < run.prompt_len {
             let left = run.prompt_len - run.read;
-            let pass = match all {
-                true => left,
-                false => self.session.prefill_pass(left).clamp(1, left),
+            // The prompt's last token is read by itself, whatever came
+            // before it. That is how it is read the second time the same
+            // conversation is sent, when everything before it is in the
+            // cache, and one row is not the kernel that several rows are:
+            // on a GPU the two disagree in the fourth digit, and a reply at
+            // temperature 0 that was the first to a prompt parted from the
+            // second a few dozen tokens in. Read alone both times, it is
+            // the same arithmetic on the same cache, to the bit.
+            // `kvad-gpu`'s `examples/replay` measures it on every engine.
+            let body = left - 1;
+            let pass = match (body, all) {
+                (0, _) => 1,
+                (body, true) => body,
+                (body, false) => self.session.prefill_pass(body).clamp(1, body),
             };
             run.logits = self.session.forward(&run.ids[run.read..run.read + pass])?;
             run.read += pass;
@@ -661,6 +672,10 @@ impl Llm {
                 // of it, whatever else was done in between.
                 run.stats.prefill_secs = run.opened.elapsed().as_secs_f32();
                 run.decoding = Instant::now();
+            }
+            // One pass a call unless asked for all of it.
+            if !all {
+                break;
             }
         }
         Ok(run.ready())

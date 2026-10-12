@@ -1167,7 +1167,7 @@ mod tests {
                 // And against candle's own backward, where it has one: at
                 // stride 2 it takes the rows' leftover for the columns too,
                 // and fails where they differ.
-                if stride == 1 || (h - wd) % 2 == 0 {
+                if stride == 1 || h.abs_diff(wd) % 2 == 0 {
                     let var = Var::from_tensor(&x).unwrap();
                     let want = f(var.as_tensor()).unwrap().backward().unwrap().get(var.as_tensor()).unwrap().clone();
                     assert!(off(&got, &want) < 1e-5, "{what}: {} apart", off(&got, &want));

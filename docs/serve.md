@@ -191,6 +191,19 @@ quantised model on the GPU once enough replies run together for one pass,
 where 3 greedy replies in 20 differed. At f32 on the CPU, and on the GPU
 below that number, they are the same reply.
 
+The same request sent twice is the same reply at temperature 0, on every
+backend. It was not always: the second time the prompt is in the cache and
+only its last token is run, alone, where the first time that token was the
+last row of a pass over the whole prompt, and one row is not the kernel
+that several are. The two agreed to rounding — one part in ten thousand on
+a GPU, which a bf16 model's logits turned into 0.6 and a q8 head on the CPU
+into 0.09 — and a greedy reply parted from its twin at the first near tie,
+12 tokens in at bf16 and 112 for a q8 model in two GPU stages. So a
+prompt's last token is always read by itself, after the rest. That costs a
+fresh prompt one token's time, and on a GPU a prompt that happened to be a
+whole number of 32-token tiles reads like any other length instead of twice
+as fast. `crates/gpu/examples/replay.rs` measures all of it.
+
 **Each conversation keeps its cache.** A chat prefills only its newest
 message because the turn before left its keys and values in the model, and
 until several were kept that held for one conversation at a time: two people

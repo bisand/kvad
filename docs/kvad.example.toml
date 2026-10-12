@@ -68,6 +68,34 @@ bind = "127.0.0.1:5823"
 # HF_HOME, when set, still decide. The Hugging Face token stays where it is.
 # dir = "/Volumes/Models/kvad"
 
+[cluster]
+# Other machines to put a model's layers on, each running `kvad worker` or a
+# server with [worker] below turned on. By the name a worker prints when it
+# starts, its id, or an address. A language model loaded at a CPU backend is
+# then placed across this machine and them: as many layers as fit on the
+# fastest, then the next. A model that fits here stays here, whole, and is
+# loaded as it always was; a model too large for this machine is what the
+# workers are for. Every machine needs the same build of kvad and the same
+# cluster.key in its data directory. See docs/cluster-plan.md.
+# workers = ["studio", "689fdb39"]
+
+# What to place layers for: "reply" for the reply written quickest, "prompt"
+# for the prompt read quickest, which shares the work out where a reply
+# would not, or tokens read to tokens written, as "2000:200".
+# place = "reply"
+
+# The layers each machine holds, this one first, for every model loaded.
+# For a rig with one model on it.
+# split = "0..14,14..28"
+
+[worker]
+# Hold layers for another machine's models, beside serving this one's own.
+# It answers only a machine with the same cluster.key, which is made in the
+# data directory the first time this is on; copy that file to the others.
+# What crosses between machines is not encrypted.
+# enabled = true
+# port = 7420
+
 [videos]
 # The ffmpeg that compresses each video once it is made: H.264 at CRF 19 and
 # AAC, as LTX's reference writes them. kvad writes an MP4 itself that

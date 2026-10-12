@@ -28,6 +28,7 @@ pub static ARCH: Architecture = Architecture {
     model_types: &["gpt2"],
     about: "GPT-2 (2019): learned positions, LayerNorm, GELU, one fused QKV matrix",
     configure: |_| Ok(()),
+    splits: true,
     load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
 };
 

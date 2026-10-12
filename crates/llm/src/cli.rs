@@ -190,6 +190,7 @@ mod tests {
         ("models.rs", include_str!("cli/models.rs")),
         ("api.rs", include_str!("cli/api.rs")),
         ("service.rs", include_str!("cli/service.rs")),
+        ("cluster.rs", include_str!("cli/cluster.rs")),
     ];
 
     const METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
@@ -293,7 +294,7 @@ mod tests {
         let known: BTreeSet<&str> = [
             "ls", "ps", "search", "info", "pull", "use", "rm", "cache", "load", "unload", "cancel",
             "queue", "tokenize", "run", "chat", "train", "service", "conversations", "images", "videos", "jobs",
-            "datasets", "tune", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api",
+            "datasets", "tune", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api", "cluster",
         ]
         .into();
         for (method, path, commands) in client::COMMANDS {
@@ -301,7 +302,7 @@ mod tests {
                 let word = command.split_whitespace().nth(1).unwrap_or("");
                 assert!(known.contains(word), "{method} {path} names `{command}`, which is not a command");
                 assert!(
-                    word == "service" || word == "api" || remote_only(word) || crate::cli::models::LOCAL_TOO.contains(&word),
+                    word == "service" || word == "api" || word == "cluster" || remote_only(word) || crate::cli::models::LOCAL_TOO.contains(&word),
                     "`{word}` is dispatched to neither a server nor this process"
                 );
             }

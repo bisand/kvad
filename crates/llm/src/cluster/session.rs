@@ -557,7 +557,24 @@ fn checked(want: &Across) -> Res<()> {
 /// every machine's share is held to its memory before anything is loaded,
 /// and the plan is said.
 pub fn across(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<Box<dyn Session>> {
-    Ok(Box::new(pipeline(want, progress)?))
+    checked(want)?;
+    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, progress)?;
+    let plan = planned(want, &nodes)?;
+    for line in plan::table(&nodes, &plan) {
+        progress(&line);
+    }
+    // Nothing for any worker: then this is a model on one machine, and is
+    // loaded as one. Not as a pipeline of one stage, which would be the
+    // same arithmetic without what a model whole has that a pipeline has
+    // not yet — its cache file, several conversations, replies in a batch.
+    if plan.shares.iter().skip(1).all(|share| share.layers.is_empty()) {
+        if want.split.is_none() {
+            progress("it fits on this machine, and a layer here costs no round trip: the workers hold nothing. --split overrules.");
+        }
+        let model = crate::qcache::load(want.repo, want.files, want.spec, want.precision, progress)?;
+        return Ok(Box::new(crate::model::CpuSession::new(model, want.precision)));
+    }
+    Ok(Box::new(staged(want, &plan, &ways, progress)?))
 }
 
 /// [`across`], as the pipeline it is: for a caller that wants to ask it
@@ -569,9 +586,12 @@ pub fn pipeline(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<PipelineSe
     for line in plan::table(&nodes, &plan) {
         progress(&line);
     }
-    if want.split.is_none() && plan.shares.iter().skip(1).all(|s| s.layers.is_empty()) {
-        progress("it fits on this machine, and a layer here costs no round trip: the workers hold nothing. --split overrules.");
-    }
+    staged(want, &plan, &ways, progress)
+}
+
+/// The pipeline a plan describes: this machine's shard loaded, and each
+/// worker with layers asked for them.
+fn staged(want: &Across, plan: &plan::Plan, ways: &[path::Path], progress: &mut dyn FnMut(&str)) -> Res<PipelineSession> {
 
     let here = Shard { layers: plan.shares[0].layers.clone(), ends: true };
     progress(&format!("reading {here} here"));

@@ -12,6 +12,56 @@ use kvad::quant::Precision;
 use kvad::service::Model;
 use kvad::service::{Backend, Loader};
 
+/// A language model at a CPU backend, across this machine and the workers
+/// `[cluster]` names — or `None` where that is not what this load is: no
+/// workers named, or not a model that could be spread.
+///
+/// What comes back for a model that fits here is that model whole, loaded
+/// as it always was: the placing gives the workers nothing, and
+/// `session::across` then makes no pipeline. So this costs a model that
+/// needs no cluster the asking and nothing else.
+fn across(repo: &str, backend: Backend, progress: &mut dyn FnMut(&str), watch: &kvad::weights::Watcher) -> Option<Result<kvad::service::Model, Box<dyn std::error::Error>>> {
+    use kvad::cluster::{key::Key, plan::Mix, session};
+    let cluster = crate::cluster::running();
+    let Backend::Cpu(precision) = backend else { return None };
+    if cluster.workers.is_empty() || kvad::dit::is_one(repo) || kvad::dit::is_clips(repo) {
+        return None;
+    }
+    let name = kvad::weights::model_id(repo);
+    let local = kvad::hub::find_local(&name).or_else(|| kvad::hub::find_trained(&name));
+    // An architecture that runs whole and only whole is loaded whole. One
+    // not on this disk yet has no config to ask, and is tried: the load
+    // says so if it cannot be.
+    if local.as_ref().and_then(|model| model.arch).is_some_and(|arch| !arch.splits()) {
+        return None;
+    }
+    let params = local.and_then(|model| model.params);
+    let mut load = || -> Result<kvad::service::Model, Box<dyn std::error::Error>> {
+        let key = Key::ours()?;
+        let mix = Mix::parse(&cluster.place)?;
+        let split = cluster.split.as_deref().map(session::parse_split).transpose()?;
+        let llm = kvad::runtime::Llm::load_custom(repo, progress, watch, &mut |files, spec, progress| {
+            let want = session::Across {
+                repo: &name,
+                files,
+                spec,
+                precision,
+                workers: &cluster.workers,
+                split: split.as_deref(),
+                key: &key,
+                params,
+                // As long a conversation as this model can have, up to
+                // what a plan leaves room for unless told.
+                context: spec.n_ctx.min(8192),
+                mix,
+            };
+            session::across(&want, progress)
+        })?;
+        Ok(kvad::service::Model::from(llm))
+    };
+    Some(load())
+}
+
 /// A loader for whatever this build can run.
 pub fn loader() -> Loader {
     #[cfg(feature = "gpu")]
@@ -35,7 +85,10 @@ pub fn loader() -> Loader {
                     if video { "videos" } else { "images" }
                 )
                 .into()),
-                Backend::Cpu(_) => cpu(repo, backend, progress, watch),
+                Backend::Cpu(_) => match across(repo, backend, progress, watch) {
+                    Some(loaded) => loaded,
+                    None => cpu(repo, backend, progress, watch),
+                },
                 Backend::Gpu(mode) if video => gpu::film(repo, mode, progress, watch),
                 Backend::Gpu(mode) if image => gpu::paint(repo, mode, progress, watch),
                 Backend::Gpu(mode) => gpu::load(repo, mode, progress, watch).map(Model::from),
@@ -43,7 +96,13 @@ pub fn loader() -> Loader {
         })
     }
     #[cfg(not(feature = "gpu"))]
-    kvad::service::cpu_loader()
+    {
+        let mut cpu = kvad::service::cpu_loader();
+        Box::new(move |repo, backend, progress, watch| match across(repo, backend, progress, watch) {
+            Some(loaded) => loaded,
+            None => cpu(repo, backend, progress, watch),
+        })
+    }
 }
 
 /// The backend to use when nobody has said which.

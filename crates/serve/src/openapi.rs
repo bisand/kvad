@@ -983,6 +983,20 @@ pub const ENDPOINTS: &[Endpoint] = &[
         body: None, produces: JSON, events: &[],
     },
 
+    Endpoint {
+        method: "get", path: "/api/cluster", tag: "Monitoring", access: Access::Admin,
+        summary: "This server's part in a cluster",
+        description: "What `[cluster]` and `[worker]` in `kvad.toml` came to: the workers \
+                      this server spreads a model too large for it over, what it places \
+                      layers for, and whether it is itself a worker for other machines and \
+                      on which port. Then every worker the local network says is there, \
+                      found by asking, which takes a couple of seconds: its name, its id, \
+                      its build and whether that is this one, and the addresses it can be \
+                      reached on.",
+        query: &[],
+        body: None, produces: JSON, events: &[],
+    },
+
     // -- Accounts -----------------------------------------------------------
     Endpoint {
         method: "get", path: "/api/auth", tag: "Accounts", access: Access::Anyone,
@@ -1287,6 +1301,7 @@ mod tests {
         ("videos.rs", include_str!("videos.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("storage.rs", include_str!("storage.rs")),
+        ("cluster.rs", include_str!("cluster.rs")),
     ];
 
     const METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];

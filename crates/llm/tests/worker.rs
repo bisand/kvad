@@ -350,7 +350,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
     let params = fixture.load(Precision::F32, &Shard::whole(&fixture.spec)).param_count() as u64;
     let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64, mix: kvad::cluster::plan::Mix::REPLY };
     let mut session = session::across(&placed, &mut |line| lines.push(line.to_string())).unwrap();
-    assert_eq!(session.label(), "cpu f32 in 1 stages");
+    assert_eq!(session.label(), "cpu f32", "a model on one machine, and loaded as one");
     assert!(lines.iter().any(|l| l.starts_with("MACHINE")) && lines.iter().any(|l| l.contains("the workers hold nothing")), "{lines:?}");
     assert_eq!(session.forward(&[1, 2, 3]).unwrap().len(), common::VOCAB);
     // And with nothing known of its size, nothing is placed.

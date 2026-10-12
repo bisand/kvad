@@ -57,6 +57,7 @@ pub static ARCH: Architecture = Architecture {
     model_types: &["llama", "mistral", "qwen2", "qwen3", "qwen3_moe"],
     about: "Llama 2/3, Mistral, Qwen2/2.5/3, Qwen3-MoE, SmolLM2: RoPE, RMSNorm, SwiGLU, GQA",
     configure: |_| Ok(()),
+    splits: true,
     load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
 };
 

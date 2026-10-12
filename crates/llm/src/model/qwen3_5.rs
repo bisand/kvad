@@ -102,6 +102,7 @@ pub static ARCH: Architecture = Architecture {
     model_types: &["qwen3_5"],
     about: "Qwen3.5/3.8: gated delta net on three layers in four, gated attention on the fourth",
     configure,
+    splits: false,
     load: whole,
 };
 
@@ -111,6 +112,7 @@ pub static NEXT: Architecture = Architecture {
     model_types: &["qwen3_next"],
     about: "Qwen3-Next/Coder-Next: the same hybrid, 512 experts and a gated shared one",
     configure,
+    splits: false,
     load: whole,
 };
 

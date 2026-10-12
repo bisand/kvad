@@ -17,6 +17,7 @@ pub fn run(args: &Args) -> Res<()> {
     match word(0) {
         Some("find") => find(args.all),
         Some("plan") => plan(args, word(1)),
+        Some("status") => status(args),
         Some("listen") => listen(args.port.unwrap_or(wire::PORT)),
         Some("ping") => measure(args, word(1)),
         Some("link") => match word(1) {
@@ -299,5 +300,68 @@ fn plan(args: &Args, model: Option<&str>) -> Res<()> {
         true => println!("It fits on this machine, where a layer costs no round trip: kvad run --model {model}"),
         false => println!("kvad run --model {model} --workers {} --split {}", workers.join(","), plan.split()),
     }
+    Ok(())
+}
+
+/// `kvad cluster status`: a server's part in a cluster, asked of the server.
+fn status(args: &Args) -> Res<()> {
+    let remote = match super::target(args)? {
+        kvad::client::Target::Remote(remote) => remote,
+        kvad::client::Target::Local { .. } => super::no_server("cluster"),
+    };
+    let cluster = remote.get("/api/cluster")?;
+    if args.json {
+        super::out::json(&cluster);
+        return Ok(());
+    }
+    let s = super::out::s;
+    println!("kvad {}", s(&cluster["build"]));
+    match cluster["worker"].is_object() {
+        true => println!(
+            "a worker for other machines: {} ({}) on port {}{}",
+            s(&cluster["worker"]["name"]),
+            s(&cluster["worker"]["id"]),
+            s(&cluster["worker"]["port"]),
+            if cluster["worker"]["advertised"] == true { "" } else { ", not advertised: name it by its address" }
+        ),
+        false => println!("not a worker for other machines: [worker] enabled = true in kvad.toml makes it one"),
+    }
+    let named: Vec<String> = super::out::items(&cluster["workers"]).iter().map(s).collect();
+    match named.is_empty() {
+        true => println!("spreads its models over nobody: [cluster] workers names the machines"),
+        false => println!(
+            "spreads a model too large for it over {}, placed for {}{}",
+            named.join(", "),
+            s(&cluster["place"]),
+            if cluster["split"].is_string() { format!(", split {} by hand", s(&cluster["split"])) } else { String::new() }
+        ),
+    }
+    if cluster["has_key"] != true {
+        println!("no cluster key here: a worker makes one the first time it starts, and every machine needs the same");
+    }
+    let found = super::out::items(&cluster["found"]);
+    if found.is_empty() {
+        println!("\nNo worker says it is on the network.");
+        return Ok(());
+    }
+    println!();
+    let rows: Vec<Vec<String>> = found
+        .iter()
+        .map(|w| {
+            let mut notes = Vec::new();
+            if w["this_machine"] == true {
+                notes.push("this server");
+            }
+            if w["named"] == true {
+                notes.push("named in [cluster]");
+            }
+            if w["same_build"] != true {
+                notes.push("another build, and would be refused");
+            }
+            let addresses: Vec<String> = super::out::items(&w["addresses"]).iter().map(s).collect();
+            vec![s(&w["name"]), s(&w["id"]), s(&w["build"]), addresses.len().to_string(), notes.join("; ")]
+        })
+        .collect();
+    super::out::table(&["WORKER", "ID", "BUILD", "ADDRESSES", ""], &rows);
     Ok(())
 }

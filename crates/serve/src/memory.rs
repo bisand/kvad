@@ -181,6 +181,16 @@ pub fn admit(budget: &Budget, held: &[Held], id: &str, need: &Need) -> Admission
     ))
 }
 
+/// The bytes `params` parameters take as weights at `backend`.
+pub fn weights_of(params: u64, backend: Backend) -> u64 {
+    match backend {
+        Backend::Cpu(p) => p.weight_bytes(params),
+        Backend::Gpu(GpuMode::Bf16) => params * 2,
+        Backend::Gpu(GpuMode::Q8) => Precision::Q8.weight_bytes(params),
+        Backend::Gpu(GpuMode::Q4) => Precision::Q4.weight_bytes(params),
+    }
+}
+
 /// What `repo` would take at `backend`, from what is on the disk.
 ///
 /// Blocking: it reads a directory listing and a config. The scheduler calls
@@ -204,12 +214,7 @@ pub fn need(repo: &str, backend: Backend, context: usize) -> Need {
         }
         _ => None,
     };
-    let from_params = local.params.map(|n| match backend {
-        Backend::Cpu(p) => p.weight_bytes(n),
-        Backend::Gpu(GpuMode::Bf16) => n * 2,
-        Backend::Gpu(GpuMode::Q8) => Precision::Q8.weight_bytes(n),
-        Backend::Gpu(GpuMode::Q4) => Precision::Q4.weight_bytes(n),
-    });
+    let from_params = local.params.map(|n| weights_of(n, backend));
     let weights = written.or(from_params).or(Some(local.bytes).filter(|&b| b > 0));
 
     let kv = kvad::hub::model_file(&local.path, "config.json")

@@ -96,6 +96,48 @@ fn a_model_across_workers_answers_to_the_bit() {
     }
 }
 
+/// Layers run some way this crate does not know, as a GPU's are: the ends
+/// are read here alone, this machine's stage is made by whoever knows how,
+/// the worker is asked in that way's words, and the pipeline says what
+/// runs it. With a stage maker that is the CPU's after all, the model is
+/// still the model, to the bit.
+#[test]
+fn layers_run_another_way_are_made_by_whoever_knows_how() {
+    let fixture = llama("llama", "worker-runs");
+    let at = a_worker(&fixture);
+    let files = kvad::weights::ModelFiles {
+        weights: vec![fixture.path.clone()],
+        tokenizer: "none".into(),
+        config: "none".into(),
+        tokenizer_config: None,
+        generation_config: None,
+    };
+    let made = std::sync::Mutex::new(Vec::new());
+    let stage = |shard: &Shard, _: &mut dyn FnMut(&str)| -> Result<Box<dyn Stage>, Fault> {
+        made.lock().unwrap().push(shard.clone());
+        Ok(Box::new(LocalStage::new(Arc::from(fixture.load(Precision::F32, shard)))))
+    };
+    let bench = || kvad::cluster::plan::Speed { layer_ms: 1.0, prompt_layer_ms: 0.5 };
+    // The worker here is asked for `f32`, which it knows: what is under
+    // test is this end.
+    let runs = session::Runs { asks: "f32", stage: &stage, bench: &bench };
+    let split = [0..1, 1..4];
+    let workers = [at];
+    let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &workers, split: Some(&split), key: &key(), params: None, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none(), memory: None, runs: Some(runs) };
+    let session::Placed::Staged(pipeline) = session::placed(&want, &mut |_| {}).unwrap() else { panic!("a split was asked for") };
+    assert_eq!(*made.lock().unwrap(), [Shard { layers: 0..1, ends: false }], "this machine's layers and not the ends");
+    assert_eq!(pipeline.label(), "f32 in 2 stages");
+    let report = session::live().into_iter().find(|r| r.repo == "tiny" && r.precision == "f32" && r.layers_here == 1).expect("shown");
+    assert!(report.bytes_here > 0);
+    let mut pipeline = pipeline.reading(8);
+    let mut whole = CpuSession::new(fixture.load(Precision::F32, &Shard::whole(&fixture.spec)), Precision::F32).reading(8);
+    common::same_answers(&mut whole, &mut pipeline, "layers run another way");
+
+    // And with nothing for the worker, the model is the caller's to load.
+    let all = [0..4, 4..4];
+    assert!(session::placed(&session::Across { split: Some(&all), ..want }, &mut |_| {}).is_err(), "a worker with no layers is left out of --workers");
+}
+
 fn refusal(at: &str, key: &Key, load: &Load) -> String {
     RemoteStage::open(at, key, load, &mut |_| {}, &kvad::weights::Watcher::none()).err().expect("refused").to_string()
 }
@@ -324,7 +366,7 @@ fn a_load_across_machines_says_what_each_of_them_is_doing() {
         move |fetch| seen.lock().unwrap().push(fetch)
     });
     let split = [0..1, 1..3, 3..4];
-    let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &workers, split: Some(&split), key: &key(), params: None, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &watch, memory: None };
+    let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &workers, split: Some(&split), key: &key(), params: None, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &watch, memory: None, runs: None };
     let mut lines = Vec::new();
     session::across(&want, &mut |line| lines.push(line.to_string())).unwrap();
     assert!(lines.iter().any(|line| line.ends_with(": reading the test's checkpoint")), "{lines:?}");
@@ -363,7 +405,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
         generation_config: None,
     };
     let want = |workers: &[String], split: Option<&[std::ops::Range<usize>]>, params: Option<u64>| {
-        let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers, split, key: &key(), params, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none(), memory: None };
+        let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers, split, key: &key(), params, context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none(), memory: None, runs: None };
         session::across(&want, &mut |_| {}).map_err(|e| e.to_string())
     };
     let why = |workers: &[&str], split: &str| {
@@ -403,7 +445,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
     // and held to itself: whole and said to be, or in stages.
     let mut lines = Vec::new();
     let params = fixture.load(Precision::F32, &Shard::whole(&fixture.spec)).param_count() as u64;
-    let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none(), memory: None };
+    let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64, mix: kvad::cluster::plan::Mix::REPLY, watch: &kvad::weights::Watcher::none(), memory: None, runs: None };
     let mut session = session::across(&placed, &mut |line| lines.push(line.to_string())).unwrap();
     assert!(lines.iter().any(|l| l.starts_with("MACHINE")), "{lines:?}");
     match lines.iter().any(|l| l.contains("the workers hold nothing")) {

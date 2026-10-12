@@ -128,6 +128,7 @@ fn main() -> Res<()> {
                     mix: kvad::cluster::plan::Mix::REPLY,
                     watch: &kvad::weights::Watcher::none(),
                     memory: None,
+                    runs: None,
                 };
                 session::across(&want, &mut |msg| eprintln!("  {msg}"))?
             }

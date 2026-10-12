@@ -62,6 +62,9 @@ pub struct PipelineSession {
     torn: bool,
     chunk: usize,
     precision: Precision,
+    /// What runs the layers where it is not the CPU at `precision`: see
+    /// [`PipelineSession::run_as`].
+    runs: Option<String>,
     pool: rayon::ThreadPool,
 }
 
@@ -99,8 +102,17 @@ impl PipelineSession {
             torn: false,
             chunk: prefill_chunk(),
             precision,
+            runs: None,
             pool: pool(),
         })
+    }
+
+    /// Say what runs this pipeline's layers, where it is not the CPU at
+    /// its precision: `gpu-q8`, for stages a GPU holds. It is what the
+    /// pipeline is called and what its report says under `precision`.
+    pub fn run_as(mut self, runs: &str) -> Self {
+        self.runs = Some(runs.to_string());
+        self
     }
 
     /// Every stage in this process: the shards of one model, in any order.
@@ -232,7 +244,10 @@ impl Session for PipelineSession {
     }
 
     fn label(&self) -> String {
-        format!("cpu {} in {} stages", self.precision, self.stages.len())
+        match &self.runs {
+            Some(runs) => format!("{runs} in {} stages", self.stages.len()),
+            None => format!("cpu {} in {} stages", self.precision, self.stages.len()),
+        }
     }
 
     fn param_count(&self) -> usize {
@@ -527,7 +542,7 @@ impl PipelineSession {
         let ends = if self.ends.shard().layers.is_empty() { self.ends.memory_bytes() } else { 0 };
         Report {
             repo: repo.to_string(),
-            precision: self.precision.to_string(),
+            precision: self.runs.clone().unwrap_or_else(|| self.precision.to_string()),
             positions: self.len,
             layers: self.stages.iter().map(|stage| stage.shard().layers.len()).sum(),
             layers_here: here().map(|stage| stage.shard().layers.len()).sum(),
@@ -648,6 +663,23 @@ pub struct Across<'a> {
     /// keeps count: a server with other models in memory has less than the
     /// machine has. `None` is the machine's own memory.
     pub memory: Option<u64>,
+    /// What runs the layers, where it is not this crate's CPU kernels.
+    pub runs: Option<Runs<'a>>,
+}
+
+/// Layers run some way this crate does not know: on a GPU, by a crate that
+/// depends on this one. The embedding and the head stay on the CPU at
+/// [`Across::precision`], with whoever has the tokens; every layer, here
+/// and on the workers, is run this way.
+#[derive(Clone, Copy)]
+pub struct Runs<'a> {
+    /// What a worker is asked for where a CPU load says a precision, in
+    /// its `Load` and its `Bench`: `gpu-q8`.
+    pub asks: &'a str,
+    /// This machine's stage for a run of layers.
+    pub stage: &'a (dyn Fn(&Shard, &mut dyn FnMut(&str)) -> std::result::Result<Box<dyn Stage>, super::stage::Fault> + Sync),
+    /// How long a layer of this model takes this machine that way.
+    pub bench: &'a (dyn Fn() -> plan::Speed + Sync),
 }
 
 /// The machines of a plan: this one, timed, and each worker reached by its
@@ -655,7 +687,10 @@ pub struct Across<'a> {
 ///
 /// `memory` is what this machine has for the model if the caller keeps
 /// count of that, and its usable memory if not. A worker says its own.
-pub fn survey(spec: &Spec, precision: Precision, workers: &[String], key: &Key, memory: Option<u64>, progress: &mut dyn FnMut(&str)) -> Res<(Vec<plan::Node>, Vec<path::Path>)> {
+///
+/// Timed as the layers will be run: on the CPU at `precision`, or as `runs`
+/// says, on every machine alike.
+pub fn survey(spec: &Spec, precision: Precision, workers: &[String], key: &Key, memory: Option<u64>, runs: Option<&Runs>, progress: &mut dyn FnMut(&str)) -> Res<(Vec<plan::Node>, Vec<path::Path>)> {
     // Asked once, and only if somebody was named rather than addressed:
     // an answer to multicast is waited for, and that is a couple of seconds.
     let found = match workers.iter().any(|w| discover::is_a_name(w)) {
@@ -665,7 +700,11 @@ pub fn survey(spec: &Spec, precision: Precision, workers: &[String], key: &Key, 
         }
         false => Vec::new(),
     };
-    let here = plan::bench(spec.n_embd, spec.intermediate, precision);
+    let here = match runs {
+        Some(runs) => (runs.bench)(),
+        None => plan::bench(spec.n_embd, spec.intermediate, precision),
+    };
+    let asks = runs.map_or_else(|| precision.to_string(), |runs| runs.asks.to_string());
     let mut nodes = vec![plan::Node {
         name: super::hostname(),
         memory: memory.or_else(crate::machine::usable_memory_cached).unwrap_or(u64::MAX),
@@ -680,7 +719,7 @@ pub fn survey(spec: &Spec, precision: Precision, workers: &[String], key: &Key, 
     let mut ways = Vec::with_capacity(workers.len());
     for worker in workers {
         let way = way_to(worker, &found, key, progress)?;
-        let there = super::remote::bench(&way.address, key, spec.n_embd, spec.intermediate, precision).map_err(plain)?;
+        let there = super::remote::bench(&way.address, key, spec.n_embd, spec.intermediate, &asks).map_err(plain)?;
         nodes.push(plan::Node {
             name: way.hello.name.clone(),
             // A worker that does not say is taken at its word about
@@ -744,31 +783,50 @@ fn checked(want: &Across) -> Res<()> {
 /// every machine's share is held to its memory before anything is loaded,
 /// and the plan is said.
 pub fn across(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<Box<dyn Session>> {
+    match placed(want, progress)? {
+        Placed::Staged(pipeline) => Ok(Box::new(pipeline)),
+        Placed::Whole => {
+            let model = crate::qcache::load(want.repo, want.files, want.spec, want.precision, progress)?;
+            Ok(Box::new(crate::model::CpuSession::new(model, want.precision)))
+        }
+    }
+}
+
+/// What came of placing a model: a pipeline across machines, loaded, or
+/// the word that every layer is this machine's.
+pub enum Placed {
+    /// Nothing for any worker: then this is a model on one machine, and is
+    /// for the caller to load as one. Not as a pipeline of one stage, which
+    /// would be the same arithmetic without what a model whole has that a
+    /// pipeline has not yet — its cache file, several conversations,
+    /// replies in a batch.
+    Whole,
+    Staged(PipelineSession),
+}
+
+/// [`across`] up to the point where a model that stays here would be
+/// loaded, for a caller that loads its own: a GPU's.
+pub fn placed(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<Placed> {
     checked(want)?;
-    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, want.memory, progress)?;
+    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, want.memory, want.runs.as_ref(), progress)?;
     let plan = planned(want, &nodes)?;
     for line in plan::table(&nodes, &plan) {
         progress(&line);
     }
-    // Nothing for any worker: then this is a model on one machine, and is
-    // loaded as one. Not as a pipeline of one stage, which would be the
-    // same arithmetic without what a model whole has that a pipeline has
-    // not yet — its cache file, several conversations, replies in a batch.
     if plan.shares.iter().skip(1).all(|share| share.layers.is_empty()) {
         if want.split.is_none() {
             progress("it fits on this machine, and a layer here costs no round trip: the workers hold nothing. --split overrules.");
         }
-        let model = crate::qcache::load(want.repo, want.files, want.spec, want.precision, progress)?;
-        return Ok(Box::new(crate::model::CpuSession::new(model, want.precision)));
+        return Ok(Placed::Whole);
     }
-    Ok(Box::new(staged(want, &plan, &ways, progress)?))
+    Ok(Placed::Staged(staged(want, &plan, &ways, progress)?))
 }
 
 /// [`across`], as the pipeline it is: for a caller that wants to ask it
 /// where its time went.
 pub fn pipeline(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<PipelineSession> {
     checked(want)?;
-    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, want.memory, progress)?;
+    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, want.memory, want.runs.as_ref(), progress)?;
     let plan = planned(want, &nodes)?;
     for line in plan::table(&nodes, &plan) {
         progress(&line);
@@ -794,7 +852,7 @@ fn staged(want: &Across, plan: &plan::Plan, ways: &[path::Path], progress: &mut 
         .iter()
         .zip(&plan.shares[1..])
         .filter(|(_, share)| !share.layers.is_empty())
-        .map(|(way, share)| (way, Load { repo: want.repo.to_string(), precision: want.precision.to_string(), layers: [share.layers.start, share.layers.end], context: want.context }))
+        .map(|(way, share)| (way, Load { repo: want.repo.to_string(), precision: want.runs.map_or_else(|| want.precision.to_string(), |runs| runs.asks.to_string()), layers: [share.layers.start, share.layers.end], context: want.context }))
         .collect();
     progress(&format!("reading {here} here"));
     for (way, load) in &asked {
@@ -811,9 +869,17 @@ fn staged(want: &Across, plan: &plan::Plan, ways: &[path::Path], progress: &mut 
                     mine(Part::Said(line.to_string()));
                     let _ = said.send(line.to_string());
                 };
-                let read = crate::qcache::load_shard(want.repo, want.files, want.spec, want.precision, here, &mut line).map_err(|e| e.to_string());
+                // Run some other way, the layers are not this crate's to
+                // read: the ends alone are, and the stage is made beside.
+                let ends = Shard { layers: if want.runs.is_some() { 0..0 } else { here.layers.clone() }, ends: true };
+                let read = crate::qcache::load_shard(want.repo, want.files, want.spec, want.precision, &ends, &mut line).map_err(|e| e.to_string());
+                let stage = match (&read, want.runs) {
+                    (Ok(_), Some(runs)) if !here.layers.is_empty() => (runs.stage)(&Shard { ends: false, ..here.clone() }, &mut line).map(Some).map_err(|e| e.to_string()),
+                    _ => Ok(None),
+                };
+                let read = read.and_then(|model| stage.map(|stage| (model, stage)));
                 match &read {
-                    Ok(model) => mine(Part::Ready { bytes: model.memory_bytes() as u64 }),
+                    Ok((model, stage)) => mine(Part::Ready { bytes: (model.memory_bytes() + stage.as_ref().map_or(0, |stage| stage.holds().1)) as u64 }),
                     Err(why) => mine(Part::Failed(why.clone())),
                 }
                 read
@@ -839,13 +905,21 @@ fn staged(want: &Across, plan: &plan::Plan, ways: &[path::Path], progress: &mut 
         let gone = |_| "a load panicked".to_string();
         (local.join().unwrap_or_else(|e| Err(gone(e))), far.into_iter().map(|load| load.join().unwrap_or_else(|e| Err(gone(e)))).collect::<Vec<_>>())
     });
-    let ends: Arc<dyn Transformer> = Arc::from(ends?);
+    let (ends, local) = ends?;
+    let ends: Arc<dyn Transformer> = Arc::from(ends);
     let mut stages: Vec<Box<dyn Stage>> = Vec::new();
-    if !here.layers.is_empty() {
-        stages.push(Box::new(LocalStage::new(ends.clone())));
+    match local {
+        Some(stage) => stages.push(stage),
+        None if !here.layers.is_empty() => stages.push(Box::new(LocalStage::new(ends.clone()))),
+        None => {}
     }
     for stage in far {
         stages.push(Box::new(stage?));
     }
-    Ok(PipelineSession::new(ends, stages, want.precision)?.shown_as(want.repo))
+    let pipeline = PipelineSession::new(ends, stages, want.precision)?;
+    Ok(match want.runs {
+        Some(runs) => pipeline.run_as(runs.asks),
+        None => pipeline,
+    }
+    .shown_as(want.repo))
 }

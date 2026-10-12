@@ -1030,7 +1030,40 @@ whole is charged. A coordinator given 0.4 GB kept layers 0..22 and placed
 eight on the worker without being told to; a worker given 0.05 GB was
 refused at the plan, by name.
 
-Not yet: GPU stages.
+**GPU stages.** `kvad_gpu::model::stage::GpuStage` is a run of a Llama's
+blocks on the device behind `Stage`: rows in from the host, through the
+blocks with `GpuLlama`'s own kernels and cache (the pass through the blocks
+is now one function both use), rows out. The last block's MLP output, which
+a whole model fuses into the next norm, is added plainly. A test holds a
+model in two GPU stages with CPU ends to the whole GPU model within 1e-4, on
+the CPU device and on Metal.
+
+The engine crate cannot know a GPU, so a load says how its layers run:
+`Across::runs` carries the word a worker is asked for where a CPU load says
+a precision (`gpu-q8`), a maker of this machine's stage, and a timing of a
+layer that way. The ends are then read alone on the CPU. `session::placed`
+is `across` up to the point where a model that stays here would be loaded,
+so the server loads that one whole on the GPU as it always did. A worker
+makes a GPU stage when the `Load` names a GPU backend and times a layer on
+its GPU when the `Bench` does (`worker::Bencher`): three blocks of zeros at
+the model's widths, run as a stage runs them.
+
+What it costs was measured on one machine, two servers, SmolLM2-135M at
+gpu-q8 split 15/15: the same text as the model whole, 417 to 444 tok/s
+against 522 to 600. Both halves were on one GPU, so that is the price of
+two stage boundaries and a CPU head and nothing gained.
+
+Across the USB 2 cable, fifteen layers on the M5 Pro's GPU and fifteen on
+the M2 Air's: the same text again, at 161 to 225 tok/s where the M5 alone
+wrote 506 to 563. A model this small is all hop. One thing in it is not
+explained: this machine's fifteen layers took 2.0 ms a token with the Air
+in the loop and 0.94 ms with the other stage on this machine, so a GPU
+stage that waits between tokens seems to run slower, as a CPU one did
+before it was kept warm. Not chased yet.
+
+Limits: the Llama family; every machine on its GPU or none; a stage's
+quantised cache is a file of its own a split; a bf16 load is planned as if
+its weights were f32, which places fewer layers a machine than would fit.
 
 **Phase 5 — the server.** `[cluster]` and `[worker]` in `kvad.toml`, worker
 mode inside `kvad-serve`, a Cluster page (nodes, memory, layers per node,

@@ -111,7 +111,13 @@ struct Shared<'f, 's> {
     factory: std::sync::Mutex<&'f mut Factory>,
     said: std::sync::Mutex<&'s mut (dyn FnMut(Event) + Send)>,
     room: Room<'s>,
+    bench: Bencher<'s>,
 }
+
+/// How long a layer takes this worker some other way than on its CPU: for
+/// a `Bench` whose precision is not a CPU's, such as `gpu-q8`. `None` is
+/// "not a way this worker runs layers", and the coordinator is told so.
+pub type Bencher<'b> = &'b (dyn Fn(&wire::Bench) -> Option<Result<super::plan::Speed, String>> + Sync);
 
 /// What this worker has for a coordinator's layers, in bytes, asked at
 /// every greeting: a worker that is also a server has what its own models
@@ -158,12 +164,14 @@ impl Drop for Held<'_, '_, '_> {
 
 /// Answer coordinators for ever, each on a thread of its own.
 pub fn serve(listener: &TcpListener, key: &Key, factory: &mut Factory, said: &mut (dyn FnMut(Event) + Send)) -> io::Result<()> {
-    serve_with(listener, key, factory, said, &|| None)
+    serve_with(listener, key, factory, said, &|| None, &|_| None)
 }
 
 /// [`serve`], by a worker that keeps count of its memory: see [`Room`].
-pub fn serve_with<'a>(listener: &TcpListener, key: &Key, factory: &mut Factory, said: &'a mut (dyn FnMut(Event) + Send), room: Room<'a>) -> io::Result<()> {
-    let shared = Shared { busy: false.into(), factory: factory.into(), said: said.into(), room };
+///
+/// And one that runs layers some way this crate does not: see [`Bencher`].
+pub fn serve_with<'a>(listener: &TcpListener, key: &Key, factory: &mut Factory, said: &'a mut (dyn FnMut(Event) + Send), room: Room<'a>, bench: Bencher<'a>) -> io::Result<()> {
+    let shared = Shared { busy: false.into(), factory: factory.into(), said: said.into(), room, bench };
     std::thread::scope(|threads| {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -192,7 +200,7 @@ pub fn serve_with<'a>(listener: &TcpListener, key: &Key, factory: &mut Factory, 
 
 /// One coordinator, until it goes: [`serve`] for a single connection.
 pub fn serve_one(stream: &mut TcpStream, key: &Key, factory: &mut Factory, said: &mut (dyn FnMut(Event) + Send)) -> io::Result<()> {
-    one(stream, key, &Shared { busy: false.into(), factory: factory.into(), said: said.into(), room: &|| None })
+    one(stream, key, &Shared { busy: false.into(), factory: factory.into(), said: said.into(), room: &|| None, bench: &|_| None })
 }
 
 fn other(what: impl Into<String>) -> io::Error {
@@ -384,6 +392,11 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
                     (Some(precision), true) => {
                         wire::send(stream, Kind::Benched, &super::plan::bench(asked.n_embd, asked.intermediate, precision))?
                     }
+                    (None, true) => match (shared.bench)(&asked) {
+                        Some(Ok(speed)) => wire::send(stream, Kind::Benched, &speed)?,
+                        Some(Err(why)) => wire::send_error(stream, &why)?,
+                        None => wire::send_error(stream, &format!("this worker does not run layers at `{}`", asked.precision))?,
+                    },
                     _ => wire::send_error(stream, "that is not the shape of a layer")?,
                 }
             }

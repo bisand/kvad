@@ -512,6 +512,7 @@ fn load(args: &Args) -> Res<Llm> {
                     mix,
                     watch: &weights::Watcher::none(),
                     memory: None,
+                    runs: None,
                 };
                 session::across(&want, progress)
             })?

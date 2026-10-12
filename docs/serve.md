@@ -229,8 +229,8 @@ everything else before anyone asked for it.
 
 ## A model too large for this machine, on several
 
-A language model at a CPU backend can be spread over other machines, its
-layers divided between them; [`cluster-plan.md`](cluster-plan.md) is the
+A language model can be spread over other machines, its layers divided
+between them; [`cluster-plan.md`](cluster-plan.md) is the
 whole of how and why. The server's part is two sections of `kvad.toml`.
 
 ```toml
@@ -282,10 +282,25 @@ large for what is left here is not refused out of hand when `[cluster]`
 names workers: it goes to the placing, which puts on them what does not
 fit.
 
+At a GPU backend the layers go onto each machine's GPU, a stage of them at
+a time: rows of the residual stream go up to the device and come back once
+a stage, here and on every worker. With SmolLM2-135M at `gpu-q8`, fifteen
+layers on each of two servers on one machine, the reply was the whole
+model's to the letter at 417 to 444 tokens a second against 522 to 600
+whole: on one GPU a split is only its cost, which is the round trips and a
+head on the CPU. With the second fifteen on an M2 Air's GPU over a USB 2
+cable it was the same text at 161 to 225 tokens a second: a model this
+small gains nothing from a second machine, and the point is the one that
+does not fit on the first.
+
 What this does not do yet, said plainly:
 
-- **GPU backends are not spread.** A stage is CPU layers; `gpu-q8` loads
-  whole or not at all.
+- **On a GPU, the Llama family only**, and every machine alike: a model
+  loaded at `gpu-q8` has its layers on each machine's GPU, so every worker
+  has to be a `kvad-serve` with the GPU backend. The embedding and the head
+  stay on this machine's CPU. `kvad worker` holds CPU layers only.
+- **A GPU stage's cache file is its own**, named for its layers: another
+  split of the same model quantises again.
 - **A model in stages keeps one conversation.** A second one costs the
   first its cache, and replies are not written in a batch.
 - **A worker that goes away fails the reply** and the model stays loaded

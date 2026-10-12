@@ -64,21 +64,33 @@ pub fn room() -> Option<u64> {
 /// across machines: workers are named, the backend is a CPU's, and the
 /// model is a language model of an architecture that can be cut. One not
 /// on this disk yet has no config to ask, and is tried.
+///
+/// At a GPU backend the same, where this build has one and the model is of
+/// the family whose blocks the GPU holds a stage at a time.
 pub fn spreads(repo: &str, backend: Backend) -> bool {
-    let Backend::Cpu(_) = backend else { return false };
     if running().workers.is_empty() || kvad::dit::is_one(repo) || kvad::dit::is_clips(repo) {
         return false;
     }
     let name = kvad::weights::model_id(repo);
-    let local = kvad::hub::find_local(&name).or_else(|| kvad::hub::find_trained(&name));
-    !local.and_then(|model| model.arch).is_some_and(|arch| !arch.splits())
+    let arch = kvad::hub::find_local(&name).or_else(|| kvad::hub::find_trained(&name)).and_then(|model| model.arch);
+    match backend {
+        Backend::Cpu(_) => !arch.is_some_and(|arch| !arch.splits()),
+        #[cfg(feature = "gpu")]
+        Backend::Gpu(_) => !arch.is_some_and(|arch| !(arch.splits() && kvad_gpu::model::stage::supports(arch))),
+        #[cfg(not(feature = "gpu"))]
+        Backend::Gpu(_) => false,
+    }
 }
 
 /// The model of this name loaded across machines now, if it is: what of
 /// it is on this machine is in there.
 pub fn here(repo: &str, backend: Backend) -> Option<session::Report> {
-    let Backend::Cpu(precision) = backend else { return None };
-    let (name, precision) = (kvad::weights::model_id(repo), precision.to_string());
+    // A pipeline says what runs its layers: a precision on the CPU, and
+    // the backend's own name on a GPU.
+    let (name, precision) = (kvad::weights::model_id(repo), match backend {
+        Backend::Cpu(precision) => precision.to_string(),
+        Backend::Gpu(_) => crate::engine::id_of(backend),
+    });
     session::live().into_iter().find(|report| report.repo == name && report.precision == precision)
 }
 
@@ -95,14 +107,16 @@ pub fn host(scheduler: std::sync::Arc<Scheduler>) {
 fn sizes(load: &wire::Load) -> Option<(u64, u64)> {
     let local = kvad::hub::find_local(&load.repo).or_else(|| kvad::hub::find_trained(&load.repo))?;
     let spec = kvad::hub::model_file(&local.path, "config.json").and_then(|config| kvad::model::Spec::from_json(&config).ok())?;
-    let precision = kvad::quant::Precision::parse(&load.precision)?;
+    let backend = kvad::quant::Precision::parse(&load.precision).map(Backend::Cpu).or_else(|| crate::engine::parse(&load.precision))?;
     let count = load.layers[1].saturating_sub(load.layers[0]);
-    let weights = precision.weight_bytes(local.params?) * count as u64 / spec.n_layer.max(1) as u64;
+    let whole = crate::memory::weights_of(local.params?, backend);
+    let weights = whole * count as u64 / spec.n_layer.max(1) as u64;
     let context = match load.context {
         0 => spec.n_ctx,
         said => said.min(spec.n_ctx),
     };
-    Some((weights, spec.cache.bytes_as(count, context, 4, 4) as u64))
+    let (number, state) = (crate::engine::kv_number_bytes(&spec, backend), crate::engine::state_number_bytes(&spec, backend));
+    Some((weights, spec.cache.bytes_as(count, context, number, state) as u64))
 }
 
 /// Stages from this machine's disk, as any worker makes them, counted
@@ -116,13 +130,30 @@ fn budgeted() -> worker::Factory {
         let what = format!("layers {}..{} of {} at {}, for another machine", load.layers[0], load.layers[1], load.repo, load.precision);
         let ask = sizes(load).map_or(0, |(weights, cache)| weights + cache);
         let lodged = HOST.get().map(|host| host.lodge(&what, ask)).transpose()?;
-        let stage = from_disk(load, progress, watch)?;
+        let stage = match crate::engine::parse(&load.precision) {
+            #[cfg(feature = "gpu")]
+            Some(Backend::Gpu(mode)) => crate::engine::worker_stage(load, mode, progress, watch)?,
+            None if load.precision.starts_with("gpu-") => return Err(format!("this worker has no GPU backend to hold layers at {}", load.precision).into()),
+            _ => from_disk(load, progress, watch)?,
+        };
         if let Some(lodged) = &lodged {
             // The files are here now, whether they were or not.
             lodged.resize(stage.holds().1 as u64 + sizes(load).map_or(0, |(_, cache)| cache));
         }
         Ok(Box::new(Lodging { stage, _lodged: lodged }) as Box<dyn Stage>)
     })
+}
+
+/// A layer's time some way a CPU worker would not know: on this build's
+/// GPU, if it has one.
+fn speed(asked: &wire::Bench) -> Option<Result<kvad::cluster::plan::Speed, String>> {
+    #[cfg(feature = "gpu")]
+    return crate::engine::worker_speed(asked);
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = asked;
+        None
+    }
 }
 
 /// A stage, and its place in the budget: both go together.
@@ -214,7 +245,7 @@ fn listen(port: u16) -> Result<Listening, String> {
                     ready.bytes as f64 / 1e6
                 ),
                 worker::Event::Went(from, how) => tracing::info!("worker: {} gone: {how}", from.ip()),
-            }, &|| HOST.get().map(|host| host.left()));
+            }, &|| HOST.get().map(|host| host.left()), &speed);
             if let Err(e) = served {
                 tracing::error!("the worker stopped: {e}");
             }

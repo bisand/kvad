@@ -413,6 +413,15 @@ fn describe(f: &Fetch) -> Option<String> {
             100.0 * *bytes as f64 / *total as f64
         )),
         Fetch::Fetched { file } => Some(format!("fetched {file}")),
+        // Another machine's part of a load. Its lines are status lines
+        // already; its download is said here, under its name.
+        Fetch::Part { machine, step: kvad::weights::Part::Download { file, bytes, total }, .. } if *total > 0 => Some(format!(
+            "{machine}: {file}  {} of {}  ({:.0}%)",
+            hub::human_bytes(*bytes),
+            hub::human_bytes(*total),
+            100.0 * *bytes as f64 / *total as f64
+        )),
+        Fetch::Part { .. } => None,
     }
 }
 

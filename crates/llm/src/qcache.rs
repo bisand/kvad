@@ -498,10 +498,15 @@ impl<'a> Live<'a> {
     /// Close the cache file, stamping it with everything needed to decide
     /// later whether it is still valid. Returns the bytes written.
     pub fn finish(&mut self, repo: &str, files: &[PathBuf], spec: &Spec) -> Res<Option<u64>> {
+        self.finish_shard(repo, files, spec, &Shard::whole(spec))
+    }
+
+    /// As [`Live::finish`], stamping the file as one shard's.
+    pub fn finish_shard(&mut self, repo: &str, files: &[PathBuf], spec: &Spec, shard: &Shard) -> Res<Option<u64>> {
         let Some(writer) = self.out.get_mut().take() else {
             return Ok(None);
         };
-        let mut header = header(repo, files, spec, self.precision)?;
+        let mut header = header_for(repo, files, spec, self.precision, shard)?;
         // The checkpoint's whole tensor list, not just the part that was read.
         // A later load of this file can then ask what [`Live::unread`] asks
         // without opening the checkpoint — see [`VERSION`]. Everything is
@@ -619,13 +624,19 @@ impl Mapped {
         spec: &Spec,
         precision: Precision,
     ) -> Res<Option<Self>> {
+        Mapped::open_shard(path, repo, files, spec, precision, &Shard::whole(spec))
+    }
+
+    /// As [`Mapped::open`], for the file of one shard: valid only if it
+    /// was written for exactly that shard.
+    pub fn open_shard(path: &Path, repo: &str, files: &[PathBuf], spec: &Spec, precision: Precision, shard: &Shard) -> Res<Option<Self>> {
         let Some(file) = Container::open(path)? else {
             return Ok(None);
         };
         let json = file.header();
 
-        let want = header(repo, files, spec, precision)?;
-        for key in ["version", "precision", "block", "repo", "spec", "sources"] {
+        let want = header_for(repo, files, spec, precision, shard)?;
+        for key in ["version", "precision", "block", "repo", "spec", "sources", "shard"] {
             if json.get(key) != want.get(key) {
                 let was = json.get(key).unwrap_or(&serde_json::Value::Null).to_string();
                 let was = brief(&was);
@@ -1077,12 +1088,34 @@ pub fn sources(files: &[PathBuf]) -> Res<serde_json::Value> {
 }
 
 /// Everything that has to match for a cache file to be reusable.
+#[cfg(test)]
 fn header(
     repo: &str,
     files: &[PathBuf],
     spec: &Spec,
     precision: Precision,
 ) -> Res<serde_json::Value> {
+    header_for(repo, files, spec, precision, &Shard::whole(spec))
+}
+
+/// [`header`], for a file that holds one shard of the model.
+///
+/// The shard is part of what a cache file is. A reader takes a name the
+/// file does not hold for a tensor the model does not have, so a file
+/// written by layers 20 to 49 and mapped for the whole model would fail on
+/// layer 0 — or answer `None` for an untied output head and run with the
+/// wrong one. So a shard's file says which shard, and is only ever opened
+/// for that one. A whole model's says nothing, as it always has, which is
+/// what keeps every file written before there were shards valid.
+fn header_for(repo: &str, files: &[PathBuf], spec: &Spec, precision: Precision, shard: &Shard) -> Res<serde_json::Value> {
+    let mut header = whole_header(repo, files, spec, precision)?;
+    if !shard.is_whole(spec) {
+        header["shard"] = serde_json::json!({ "layers": [shard.layers.start, shard.layers.end], "ends": shard.ends });
+    }
+    Ok(header)
+}
+
+fn whole_header(repo: &str, files: &[PathBuf], spec: &Spec, precision: Precision) -> Res<serde_json::Value> {
     let sources = sources(files)?;
     Ok(serde_json::json!({
         "format": "nanollm-quant",
@@ -1128,6 +1161,15 @@ fn home() -> PathBuf {
 /// The cache file for one model at one precision.
 pub fn path_for(repo: &str, precision: Precision) -> PathBuf {
     path_for_tag(repo, &precision.to_string())
+}
+
+/// The cache file for one shard of a model: the whole model's file for
+/// the whole model, and a file of its own for anything less.
+pub fn path_for_shard(repo: &str, precision: Precision, spec: &Spec, shard: &Shard) -> PathBuf {
+    match shard.is_whole(spec) {
+        true => path_for(repo, precision),
+        false => path_for_tag(repo, &format!("{precision}-{}", shard.tag())),
+    }
 }
 
 /// The same, for a payload this module does not define.
@@ -1268,18 +1310,37 @@ pub fn load(
     precision: Precision,
     progress: &mut dyn FnMut(&str),
 ) -> Res<Box<dyn Transformer>> {
+    load_shard(repo, files, spec, precision, &Shard::whole(spec), progress)
+}
+
+/// [`load`], for one [`Shard`] of the model: the same three routes, to a
+/// cache file that is that shard's and nobody else's.
+///
+/// The check for weights nobody read runs here as it does for a whole
+/// model, and means what it meant: a shard names what it leaves to the
+/// others, layer by layer, so what is left over is what no shard would
+/// have read.
+pub fn load_shard(
+    repo: &str,
+    files: &ModelFiles,
+    spec: &Spec,
+    precision: Precision,
+    shard: &Shard,
+    progress: &mut dyn FnMut(&str),
+) -> Res<Box<dyn Transformer>> {
+    let build = |src: &dyn Source| spec.arch.load(src, spec.clone(), shard);
     // There is nothing to cache at f32: the checkpoint already *is* the
     // weights, and a copy of them widened to 32 bits would be twice the size
     // of the file it came from.
-    let path = (precision != Precision::F32 && enabled()).then(|| path_for(repo, precision));
+    let path = (precision != Precision::F32 && enabled()).then(|| path_for_shard(repo, precision, spec, shard));
 
     let mut rebuilding = false;
     if let Some(path) = &path {
-        match Mapped::open(path, repo, &files.weights, spec, precision) {
+        match Mapped::open_shard(path, repo, &files.weights, spec, precision, shard) {
             Ok(Some(cache)) => {
                 let mb = cache.bytes() / 1_000_000;
                 progress(&format!("mapping {precision} weights ({mb} MB)"));
-                match build(&cache, spec) {
+                match build(&cache) {
                     // A cache that cannot build the model it was written for is
                     // one this build has outgrown too — the same fact as below,
                     // arriving as an error rather than as a silence because the
@@ -1320,7 +1381,7 @@ pub fn load(
         }
     }
 
-    let model = build(&live, spec)?;
+    let model = build(&live)?;
 
     // Before `finish`, so a refused load leaves no cache behind: dropping the
     // `Writer` removes the partial file. And after the cache route above, which
@@ -1341,7 +1402,7 @@ pub fn load(
         .into());
     }
 
-    match live.finish(repo, &files.weights, spec) {
+    match live.finish_shard(repo, &files.weights, spec, shard) {
         Ok(Some(bytes)) => progress(&format!("cached for next time ({} MB)", bytes / 1_000_000)),
         Ok(None) => {
             if let Some(e) = live.failure() {
@@ -1350,45 +1411,6 @@ pub fn load(
         }
         // Failing to *write* the cache is not a reason to fail the load.
         Err(e) => progress(&format!("not caching: {e}")),
-    }
-    Ok(model)
-}
-
-/// Hand the weights to whichever architecture the config named.
-///
-/// There is no `match` here any more, and that is the point: a new
-/// architecture is a module and one line in `model/arch.rs`, not an arm in
-/// every loader that ever learned the old list.
-fn build(src: &dyn Source, spec: &Spec) -> Res<Box<dyn Transformer>> {
-    spec.arch.load(src, spec.clone(), &Shard::whole(spec))
-}
-
-/// One [`Shard`] of a model, straight from the checkpoint.
-///
-/// Quantised as it is read and never from the cache file, nor into it. The
-/// file is one model at one precision, and a reader takes a name it does
-/// not hold for a tensor the model does not have: a file written by layers
-/// 20 to 49 and later mapped for the whole model would fail on layer 0 —
-/// or, worse, answer `None` for an untied output head and run with the
-/// wrong one. Until a shard is part of what a cache file says it is, a
-/// shard pays for its quantising on every load.
-///
-/// The check for weights nobody read still runs, and still means what it
-/// meant: a shard names what it leaves to the others, layer by layer, so
-/// what is left over is what no shard would have read.
-pub fn load_shard(files: &ModelFiles, spec: &Spec, precision: Precision, shard: &Shard) -> Res<Box<dyn Transformer>> {
-    let ckpt = Checkpoint::open(&files.weights)?;
-    let live = Live::new(&ckpt, precision);
-    let model = spec.arch.load(&live, spec.clone(), shard)?;
-    let left = live.unread();
-    if !left.is_empty() {
-        return Err(format!(
-            "this checkpoint holds {} tensor(s) that the `{}` loader never reads:\n  {}",
-            left.len(),
-            spec.arch,
-            crate::weights::collapsed(&left).join("\n  "),
-        )
-        .into());
     }
     Ok(model)
 }

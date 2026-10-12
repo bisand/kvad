@@ -420,6 +420,33 @@ impl Shard {
         (0..parts).map(|i| Shard { layers: i * n_layer / parts..(i + 1) * n_layer / parts, ends: i == 0 }).collect()
     }
 
+    /// Whether a tensor of the checkpoint, by its name, is this shard's to
+    /// read: a layer's if the layer is one of these, and anything that is
+    /// no layer's — the embedding, the final norm, the head — if this
+    /// shard has the ends.
+    ///
+    /// By name and for every architecture at once, because this is asked
+    /// before a model exists to ask: it decides which files of a checkpoint
+    /// a machine downloads. A layer's tensors are filed under `layers.N.`
+    /// by everything since GPT-2, which files them under `h.N.`.
+    pub fn wants(&self, tensor: &str) -> bool {
+        let mut parts = tensor.split('.');
+        while let Some(part) = parts.next() {
+            if part == "layers" || part == "h" {
+                if let Some(Ok(layer)) = parts.clone().next().map(str::parse::<usize>) {
+                    return self.layers.contains(&layer);
+                }
+            }
+        }
+        self.ends
+    }
+
+    /// As a cache file is tagged: `layers-15-30`, and `-ends` after it
+    /// where the shard has them.
+    pub fn tag(&self) -> String {
+        format!("layers-{}-{}{}", self.layers.start, self.layers.end, if self.ends { "-ends" } else { "" })
+    }
+
     /// Whether these, in this order, are one model: every layer once, in
     /// order, and the ends exactly once.
     pub fn check(shards: &[Shard], n_layer: usize) -> Res<()> {
@@ -1301,6 +1328,25 @@ mod tests {
         assert_eq!(Shard { layers: 7..15, ends: false }.to_string(), "layers 7..15");
         assert_eq!(Shard { layers: 0..7, ends: true }.to_string(), "layers 0..7 and the ends");
         assert!(Shard::whole(&test_spec()).is_whole(&test_spec()));
+    }
+
+    #[test]
+    fn a_shard_knows_its_tensors_by_their_names() {
+        let middle = Shard { layers: 2..4, ends: false };
+        let first = Shard { layers: 0..2, ends: true };
+        for name in ["model.layers.2.self_attn.q_proj.weight", "layers.3.mlp.down_proj.weight", "transformer.h.2.attn.c_attn.weight", "h.3.ln_1.bias"] {
+            assert!(middle.wants(name) && !first.wants(name), "{name}");
+        }
+        for name in ["model.layers.0.input_layernorm.weight", "h.1.mlp.c_fc.weight", "model.layers.12.mlp.gate_proj.weight"] {
+            assert!(!middle.wants(name), "{name}");
+        }
+        assert!(!first.wants("model.layers.12.mlp.gate_proj.weight"), "a layer past the last is nobody's");
+        for name in ["model.embed_tokens.weight", "lm_head.weight", "model.norm.weight", "wte.weight", "ln_f.bias"] {
+            assert!(first.wants(name) && !middle.wants(name), "{name}");
+        }
+        // A name that only looks like a layer's.
+        assert!(first.wants("model.layers.weight") && first.wants("h.bias"));
+        assert_eq!((middle.tag(), first.tag()), ("layers-2-4".to_string(), "layers-0-2-ends".to_string()));
     }
 
     #[test]

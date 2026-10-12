@@ -21,6 +21,7 @@ pub mod discover;
 pub mod key;
 pub mod link;
 pub mod path;
+pub mod plan;
 pub mod ping;
 pub mod remote;
 pub mod session;

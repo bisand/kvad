@@ -190,6 +190,13 @@ impl Drop for Fixture {
 /// narrower the quantiser leaves as f32, and a tiny model that quietly
 /// skipped quantisation would test the wrong kernels.
 pub fn llama(model_type: &str, tag: &str) -> Fixture {
+    let (tensors, config) = llama_parts(model_type);
+    Fixture::new(tag, &tensors, config)
+}
+
+/// The same model as its tensors and its config, for a test that wants to
+/// file them some other way than in one file.
+pub fn llama_parts(model_type: &str) -> (BTreeMap<String, Mat>, serde_json::Value) {
     let (hidden, n_head, n_kv_head, n_layer, inter) = (64usize, 4usize, 2usize, 4usize, 128usize);
     let head_dim = hidden / n_head;
     let mut r = Rng(0x0bad_5eed_1234_5678);
@@ -226,7 +233,7 @@ pub fn llama(model_type: &str, tag: &str) -> Fixture {
         "max_position_embeddings": 64,
         "tie_word_embeddings": false,
     });
-    Fixture::new(tag, &t, config)
+    (t, config)
 }
 
 /// A small GPT-2, three layers: learned positions added at the door, which
@@ -280,4 +287,28 @@ pub fn read_shard(ckpt: &Checkpoint, spec: &Spec, precision: Precision, shard: &
     assert!(unread.is_empty(), "{shard}: neither read nor left to another shard: {unread:?}");
     assert_eq!(model.shard(), *shard);
     model
+}
+
+/// A model as a directory, the way a large one is published: its tensors
+/// across several weight files, an index saying which file holds which,
+/// and a config. `file_of` says which file a tensor goes in.
+pub fn sharded_dir(tag: &str, tensors: BTreeMap<String, Mat>, config: &serde_json::Value, file_of: &dyn Fn(&str) -> usize) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("kvad-sharded-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut files: BTreeMap<usize, BTreeMap<String, Mat>> = BTreeMap::new();
+    let mut weight_map = serde_json::Map::new();
+    for (name, mat) in tensors {
+        let file = file_of(&name);
+        weight_map.insert(name.clone(), serde_json::json!(format!("model-{file:05}.safetensors")));
+        files.entry(file).or_default().insert(name, mat);
+    }
+    for (file, tensors) in &files {
+        write_safetensors(&dir.join(format!("model-{file:05}.safetensors")), tensors);
+    }
+    std::fs::write(dir.join("model.safetensors.index.json"), serde_json::json!({ "weight_map": weight_map }).to_string()).unwrap();
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    // Asked for by name and never opened by anything here.
+    std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+    dir
 }

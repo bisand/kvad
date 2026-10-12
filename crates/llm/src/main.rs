@@ -106,6 +106,8 @@ struct Args {
     /// layers each holds.
     workers: Option<String>,
     split: Option<String>,
+    /// The longest conversation a plan leaves room for, in tokens.
+    context: Option<usize>,
     stream_mb: Option<usize>,
     all: bool,
     tokens: Option<usize>,
@@ -212,6 +214,7 @@ impl Default for Args {
             sizes: None,
             workers: None,
             split: None,
+            context: None,
             stream_mb: None,
             all: false,
             tokens: None,
@@ -430,6 +433,7 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--sizes" => a.sizes = Some(value.clone()),
             "--workers" => a.workers = Some(value.clone()),
             "--split" => a.split = Some(value.clone()),
+            "--context" => a.context = Some(num() as usize),
             "--stream-mb" => a.stream_mb = Some(num() as usize),
             "--tokens" => a.tokens = Some(num() as usize),
             // In the table and not in this match: the test in `cli::spec`
@@ -478,20 +482,27 @@ fn load(args: &Args) -> Res<Llm> {
     let llm = match (&args.workers, &args.split) {
         (None, None) => Llm::load_with(&repo, args.quant, &mut said)?,
         #[cfg(feature = "cluster")]
-        (Some(workers), Some(split)) => {
+        (Some(workers), split) => {
             use kvad::cluster::{key::Key, session};
             let workers: Vec<String> = workers.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect();
-            let split = session::parse_split(split)?;
+            let split = split.as_deref().map(session::parse_split).transpose()?;
             let key = Key::ours()?;
             let name = weights::model_id(&repo);
+            let params = kvad::hub::find_local(&name).and_then(|model| model.params);
             Llm::load_custom(&repo, &mut said, &weights::Watcher::none(), &mut |files, spec, progress| {
-                session::across(&name, files, spec, args.quant, &workers, &split, &key, progress)
+                let want = session::Across {
+                    repo: &name,
+                    files,
+                    spec,
+                    precision: args.quant,
+                    workers: &workers,
+                    split: split.as_deref(),
+                    key: &key,
+                    params,
+                    context: args.context.unwrap_or(spec.n_ctx.min(cli::cluster::CONTEXT)),
+                };
+                session::across(&want, progress)
             })?
-        }
-        #[cfg(feature = "cluster")]
-        (Some(_), None) => {
-            return Err("--workers needs --split to say which layers each machine holds, this one first:\n  --workers HOST --split 0..12,12..24\nNothing places them for you yet."
-                .into())
         }
         #[cfg(feature = "cluster")]
         (None, Some(_)) => return Err("--split says which layers each machine holds, and needs --workers to say which machines.".into()),

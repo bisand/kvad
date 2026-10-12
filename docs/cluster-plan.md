@@ -311,7 +311,8 @@ nobody identified.
 ### Weights
 
 Each worker fetches its own. `weights::fetch_watched` downloads every shard
-file today; it gains a filter. `model.safetensors.index.json` maps tensor
+file; `weights::fetch_for` is the same with a filter, and is what a worker
+calls. `model.safetensors.index.json` maps tensor
 names to files, and a tensor whose name carries a layer number outside the
 shard's range (`.layers.N.`, or GPT-2's `.h.N.`) is not needed, nor are the
 embedding and head on a shard without `ends`. Fetch only the files that still
@@ -737,6 +738,70 @@ thing by hand across the development rig's cable, which is the first time a
 hidden state leaves a machine — found by discovery rather than by an address,
 and with the chosen path and its speed printed, so that what it crossed is on
 the record.
+
+**Phase 3 is done.**
+
+- *The fetch filter* (`weights::fetch_for`, `Shard::wants`). A checkpoint
+  split across files has an index from every tensor's name to its file,
+  and a name says which layer it is; so a worker fetches the files its own
+  layers are in and no others. By file and not by tensor: a file with one
+  wanted tensor comes whole. A checkpoint in one file is that file.
+- *The shard in the cache's identity.* A shard's quantised weights go in a
+  file of its own, `….q8-layers-15-30.nq`, whose header says which shard;
+  it is opened for that shard and refused for any other, and the whole
+  model's file is the one it always was, so nothing written before is
+  stale. A shard no longer quantises on every load.
+- *Memory.* Every machine's share — its layers' weights, their cache at
+  the context asked for, and the ends on the coordinator — is held to what
+  that machine says it has, for a split made by hand as for one made here.
+  `--context` says how long a conversation to leave room for.
+- *The planner* (`plan.rs`). `--workers` without `--split` now places the
+  layers: each on the fastest machine with room, the ends with the tokens,
+  and a machine left with nothing left out. `kvad cluster plan MODEL
+  --workers …` prints the table and loads nothing. How fast a machine is
+  comes from timing a layer's seven matrix products at the model's widths,
+  there, on a `Bench` frame.
+
+The tests are the two this phase named: a checkpoint filed as three files,
+from which a worker's machine is given the one file its layers are in and
+nothing else, and loads and answers to the bit (`tests/share.rs`); and a
+shard load followed by a whole-model load of the same checkpoint on the
+same disk, which quantises its own file and is refused the shard's.
+
+On the rig, 2026-10-12, with the Air a worker:
+
+```text
+$ kvad cluster plan Qwen/Qwen3-14B --quant f32 --workers 689fdb39
+59.1 GB of weights and 2.7 GB of cache for a conversation of 8192 tokens
+error: does not fit: the model is 61.8 GB at this precision and context, and 2 machine(s)
+have 45.1 GB for it between them, which leaves 13 of its 40 layers with nowhere to go
+
+$ kvad cluster plan Qwen/Qwen3-14B --quant q8 --context 40960 --workers 689fdb39
+MACHINE             LAYERS      WEIGHTS     CACHE        OF      LEFT  MS A LAYER
+bisand-macbook-pro  0..40       16.6 GB   13.4 GB   38.7 GB    8.6 GB       2.744
+DESKTOP-8GF7H0F     none         0.0 GB    0.0 GB    6.4 GB    6.4 GB       8.604
+```
+
+and SmolLM2-135M at q8 by hand, 15 layers each: the first run quantised and
+kept a shard on each machine, the second mapped both, and every logit
+agreed with the whole model's.
+
+What it is not yet:
+
+- *The timing is rough.* It orders machines; it does not predict them. On
+  this pair it said 0.24 and 0.34 ms a layer for SmolLM2 at q8 where the
+  model whole measures 0.22 on each, and at f32 it was out by a factor of
+  two one way on the M5 Pro and three the other on the Air. The table says
+  it is an estimate, and it is one.
+- *Sizes are averages.* A layer is the model less its ends, divided by its
+  layers. A model whose layers differ — a mixture with dense first layers
+  — is placed as if they did not.
+- *Nothing here could be placed across two machines for real.* Everything
+  that fits the pair fits the larger machine alone, so the planner's
+  answer on this rig is always "here", and its other answers are unit
+  tests. That is Phase 4's rig, as this document said it would be.
+- *The plan knows nothing of the 1.3 to 4.6 ms a hop really costs here.*
+- The Air named itself a third way this session: `DESKTOP-8GF7H0F`.
 
 **Phase 3 — load only your share.** The fetch filter, the shard in the
 quantised cache's identity, per-node memory checks, `plan.rs` and

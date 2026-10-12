@@ -17,7 +17,7 @@
 //! stage, `head`. The test that holds it to that compares bits.
 
 use super::key::Key;
-use super::{discover, path};
+use super::{discover, path, plan};
 use super::remote::RemoteStage;
 use super::stage::{Fault, LocalStage, Stage};
 use super::wire::Load;
@@ -272,46 +272,30 @@ pub fn parse_split(text: &str) -> Res<Vec<std::ops::Range<usize>>> {
     text.split(',').map(|word| range(word).ok_or_else(|| format!("`{}` is not a run of layers; --split is written 0..12,12..24", word.trim()).into())).collect()
 }
 
-/// A model across this machine and `workers`: the session `--workers` and
-/// `--split` ask for.
-///
-/// `split` names the layers by hand, a run for each machine in order, this
-/// one first. This machine always holds the ends, and may hold no layers
-/// (`0..0`). A worker has to hold at least one, or it is a hop for nothing.
-///
-/// By hand because the alternative, a planner that fills the fastest
-/// machine first, gives every worker nothing for any model small enough to
-/// try this with.
-pub fn across(
-    repo: &str,
-    files: &crate::weights::ModelFiles,
-    spec: &Spec,
-    precision: Precision,
-    workers: &[String],
-    split: &[std::ops::Range<usize>],
-    key: &Key,
-    progress: &mut dyn FnMut(&str),
-) -> Res<Box<dyn Session>> {
-    if split.len() != workers.len() + 1 {
-        return Err(format!(
-            "--split names {} run(s) of layers and there are {} machine(s): this one, then each of --workers, a run apiece",
-            split.len(),
-            workers.len() + 1
-        )
-        .into());
-    }
-    let shards: Vec<Shard> = split.iter().enumerate().map(|(i, layers)| Shard { layers: layers.clone(), ends: i == 0 }).collect();
-    Shard::check(&shards, spec.n_layer)?;
-    if let Some(i) = (1..shards.len()).find(|&i| shards[i].layers.is_empty()) {
-        return Err(format!("{} is given no layers; leave it out of --workers", workers[i - 1]).into());
-    }
+/// What `--workers` asks for: a model, the machines to put it on, and
+/// what is known about how.
+pub struct Across<'a> {
+    /// The model, as a worker will be asked for it.
+    pub repo: &'a str,
+    pub files: &'a crate::weights::ModelFiles,
+    pub spec: &'a Spec,
+    pub precision: Precision,
+    /// As `--workers` gives them: names, ids or addresses.
+    pub workers: &'a [String],
+    /// The layers each machine holds, this one first, when the operator
+    /// says; and when not, they are placed: see [`plan`].
+    pub split: Option<&'a [std::ops::Range<usize>]>,
+    pub key: &'a Key,
+    /// The model's parameters, where anything knows. Without them nothing
+    /// can be said about memory, and nothing is placed.
+    pub params: Option<u64>,
+    /// The longest conversation to leave room for, in tokens.
+    pub context: usize,
+}
 
-    progress(&format!("reading {} here", shards[0]));
-    let ends: Arc<dyn Transformer> = Arc::from(crate::qcache::load_shard(files, spec, precision, &shards[0])?);
-    let mut stages: Vec<Box<dyn Stage>> = Vec::new();
-    if !shards[0].layers.is_empty() {
-        stages.push(Box::new(LocalStage::new(ends.clone())));
-    }
+/// The machines of a plan: this one, timed, and each worker reached by its
+/// quickest path and timed there.
+pub fn survey(spec: &Spec, precision: Precision, workers: &[String], key: &Key, progress: &mut dyn FnMut(&str)) -> Res<(Vec<plan::Node>, Vec<path::Path>)> {
     // Asked once, and only if somebody was named rather than addressed:
     // an answer to multicast is waited for, and that is a couple of seconds.
     let found = match workers.iter().any(|w| discover::is_a_name(w)) {
@@ -321,11 +305,97 @@ pub fn across(
         }
         false => Vec::new(),
     };
-    for (worker, shard) in workers.iter().zip(&shards[1..]) {
+    let mut nodes = vec![plan::Node {
+        name: super::hostname(),
+        memory: crate::machine::usable_memory_cached().unwrap_or(u64::MAX),
+        layer_ms: plan::bench(spec.n_embd, spec.intermediate, precision),
+        hop_ms: 0.0,
+    }];
+    let mut ways = Vec::with_capacity(workers.len());
+    for worker in workers {
         let way = way_to(worker, &found, key, progress)?;
-        progress(&format!("asking {} for {shard}", way.hello.name));
-        let load = Load { repo: repo.to_string(), precision: precision.to_string(), layers: [shard.layers.start, shard.layers.end] };
-        stages.push(Box::new(RemoteStage::open(&way.address, key, &load, progress).map_err(plain)?));
+        nodes.push(plan::Node {
+            name: way.hello.name.clone(),
+            // A worker that does not say is taken at its word about
+            // nothing: it is given what it is given, and finds out.
+            memory: way.hello.memory.unwrap_or(u64::MAX),
+            layer_ms: super::remote::bench(&way.address, key, spec.n_embd, spec.intermediate, precision).map_err(plain)?,
+            hop_ms: way.hop_ms,
+        });
+        ways.push(way);
     }
-    Ok(Box::new(PipelineSession::new(ends, stages, precision)?))
+    Ok((nodes, ways))
+}
+
+/// The plan for `want` over `nodes`: the operator's split, checked against
+/// each machine's memory, or one made here.
+pub fn planned(want: &Across, nodes: &[plan::Node]) -> Res<plan::Plan> {
+    checked(want)?;
+    let sizes = want.params.map(|params| plan::Sizes::of(want.spec, params, want.precision, want.context));
+    match (want.split, sizes) {
+        (Some(split), Some(sizes)) => Ok(plan::check(nodes, &sizes, split)?),
+        // Nothing is known of the model's size, so nothing is checked: the
+        // operator's word is the plan.
+        (Some(split), None) => {
+            let nothing = plan::Sizes { n_layer: want.spec.n_layer, ends: 0, layer: 0, cache: 0 };
+            Ok(plan::check(nodes, &nothing, split)?)
+        }
+        (None, Some(sizes)) => Ok(plan::place(nodes, &sizes)?),
+        (None, None) => Err("how large this model is could not be found out, so its layers cannot be placed; say where they go with --split".into()),
+    }
+}
+
+/// What `--split` has to be before anything is asked of anybody: a run for
+/// each machine, covering the model, and no worker with none.
+fn checked(want: &Across) -> Res<()> {
+    let Some(split) = want.split else { return Ok(()) };
+    if split.len() != want.workers.len() + 1 {
+        return Err(format!(
+            "--split names {} run(s) of layers and there are {} machine(s): this one, then each of --workers, a run apiece",
+            split.len(),
+            want.workers.len() + 1
+        )
+        .into());
+    }
+    let shards: Vec<Shard> = split.iter().enumerate().map(|(i, layers)| Shard { layers: layers.clone(), ends: i == 0 }).collect();
+    Shard::check(&shards, want.spec.n_layer)?;
+    if let Some(i) = (1..shards.len()).find(|&i| shards[i].layers.is_empty()) {
+        return Err(format!("{} is given no layers; leave it out of --workers", want.workers[i - 1]).into());
+    }
+    Ok(())
+}
+
+/// A model across this machine and others: the session `--workers` asks
+/// for.
+///
+/// This machine always holds the ends, and may hold no layers. With
+/// `--split` the layers go where the operator says, a run for each machine
+/// in order, this one first; without it they are placed, fastest machine
+/// first, and a worker the plan has no use for is left out. Either way
+/// every machine's share is held to its memory before anything is loaded,
+/// and the plan is said.
+pub fn across(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<Box<dyn Session>> {
+    checked(want)?;
+    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, progress)?;
+    let plan = planned(want, &nodes)?;
+    for line in plan::table(&nodes, &plan) {
+        progress(&line);
+    }
+    if want.split.is_none() && plan.shares.iter().skip(1).all(|s| s.layers.is_empty()) {
+        progress("it fits on this machine, and a layer here costs no round trip: the workers hold nothing. --split overrules.");
+    }
+
+    let here = Shard { layers: plan.shares[0].layers.clone(), ends: true };
+    progress(&format!("reading {here} here"));
+    let ends: Arc<dyn Transformer> = Arc::from(crate::qcache::load_shard(want.repo, want.files, want.spec, want.precision, &here, progress)?);
+    let mut stages: Vec<Box<dyn Stage>> = Vec::new();
+    if !here.layers.is_empty() {
+        stages.push(Box::new(LocalStage::new(ends.clone())));
+    }
+    for (way, share) in ways.iter().zip(&plan.shares[1..]).filter(|(_, share)| !share.layers.is_empty()) {
+        progress(&format!("asking {} for layers {}..{}", way.hello.name, share.layers.start, share.layers.end));
+        let load = Load { repo: want.repo.to_string(), precision: want.precision.to_string(), layers: [share.layers.start, share.layers.end] };
+        stages.push(Box::new(RemoteStage::open(&way.address, want.key, &load, progress).map_err(plain)?));
+    }
+    Ok(Box::new(PipelineSession::new(ends, stages, want.precision)?))
 }

@@ -213,6 +213,12 @@ pub fn trained_name(dir: &Path) -> Option<String> {
 impl ModelFiles {
     /// The files of a model that is already in `dir`.
     pub fn from_dir(dir: &Path) -> Res<Self> {
+        ModelFiles::from_dir_for(dir, None)
+    }
+
+    /// As [`ModelFiles::from_dir`], with only the weight files that hold a
+    /// tensor `wants` says yes to: see [`fetch_for`].
+    pub fn from_dir_for(dir: &Path, wants: Option<Wants>) -> Res<Self> {
         let need = |name: &str| -> Res<PathBuf> {
             let path = dir.join(name);
             match path.is_file() {
@@ -228,7 +234,7 @@ impl ModelFiles {
                 let index = maybe("model.safetensors.index.json").ok_or_else(|| {
                     format!("{} has no model.safetensors, and no shard index either", dir.display())
                 })?;
-                shard_names(&index)?.iter().map(|s| need(s)).collect::<Res<Vec<_>>>()?
+                shards_for(&index, wants)?.iter().map(|s| need(s)).collect::<Res<Vec<_>>>()?
             }
         };
 
@@ -244,11 +250,32 @@ impl ModelFiles {
 
 /// The distinct files a shard index points at.
 fn shard_names(index: &Path) -> Res<Vec<String>> {
+    shards_for(index, None)
+}
+
+/// Says, of a tensor's name, whether somebody wants it.
+pub type Wants<'a> = &'a dyn Fn(&str) -> bool;
+
+/// The files a shard index points at that hold at least one tensor
+/// `wants` says yes to — or every file, asked with no `wants`.
+///
+/// This is how a machine holding layers 20 to 49 of a model downloads
+/// those and not the other three hundred gigabytes. A large checkpoint is
+/// a dozen files and an index from every tensor's name to the file it is
+/// in; a tensor's name says which layer it belongs to; so which files a
+/// run of layers needs is known before a byte of any of them is fetched.
+/// The cut is by file and not by tensor: a file that holds one wanted
+/// tensor is fetched whole, with whatever else is in it.
+fn shards_for(index: &Path, wants: Option<Wants>) -> Res<Vec<String>> {
     let json = read_json(index)?;
     let map = json.get("weight_map").and_then(|m| m.as_object()).ok_or("shard index has no weight_map")?;
 
     // Many tensor names point at the same handful of files.
-    let mut shards: Vec<String> = map.values().filter_map(|v| v.as_str().map(String::from)).collect();
+    let mut shards: Vec<String> = map
+        .iter()
+        .filter(|(tensor, _)| wants.is_none_or(|wants| wants(tensor)))
+        .filter_map(|(_, file)| file.as_str().map(String::from))
+        .collect();
     shards.sort();
     shards.dedup();
     Ok(shards)
@@ -385,7 +412,18 @@ pub fn fetch_watched(
     progress: &mut dyn FnMut(&str),
     watch: &Watcher,
 ) -> Res<ModelFiles> {
-    resolve(repo_id, progress, watch, Ask::CacheFirst)
+    resolve(repo_id, progress, watch, Ask::CacheFirst, None)
+}
+
+/// As [`fetch_with`], for a part of a model: of a checkpoint split across
+/// files, only the files that hold a tensor `wants` says yes to are
+/// fetched, and only those are in the answer. A checkpoint in one file is
+/// that file whatever is wanted of it.
+///
+/// What a worker calls, with [`crate::model::Shard::wants`]: see
+/// [`shards_for`].
+pub fn fetch_for(repo_id: &str, wants: Wants, progress: &mut dyn FnMut(&str)) -> Res<ModelFiles> {
+    resolve(repo_id, progress, &Watcher::none(), Ask::CacheFirst, Some(wants))
 }
 
 /// As [`fetch`], but asking the Hub for every file, so that a model already
@@ -397,14 +435,14 @@ pub fn pull(repo_id: &str) -> Res<ModelFiles> {
 
 /// As [`pull`], with progress to a callback and [`Fetch`] events to `watch`.
 pub fn pull_watched(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<ModelFiles> {
-    resolve(repo_id, progress, watch, Ask::Hub)
+    resolve(repo_id, progress, watch, Ask::Hub, None)
 }
 
 /// The files of `repo_id` if all of them are on this machine already — a
 /// directory, or the Hub cache — and `None` if any would need a download.
 /// Never touches the network.
 pub fn in_cache(repo_id: &str) -> Option<ModelFiles> {
-    resolve(repo_id, &mut |_| {}, &Watcher::none(), Ask::CacheOnly).ok()
+    resolve(repo_id, &mut |_| {}, &Watcher::none(), Ask::CacheOnly, None).ok()
 }
 
 /// What the Hub cache on this machine knows about one file of a repo, found
@@ -473,14 +511,14 @@ enum Ask {
     Hub,
 }
 
-fn resolve(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher, ask: Ask) -> Res<ModelFiles> {
+fn resolve(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher, ask: Ask, wants: Option<Wants>) -> Res<ModelFiles> {
     if let Some(dir) = local_dir(repo_id) {
         progress(match trained_name(&dir) {
             Some(_) => "a model trained here; nothing to fetch",
             None => "a directory on this machine; nothing to fetch",
         });
         watch.emit(Fetch::Local);
-        return ModelFiles::from_dir(&dir);
+        return ModelFiles::from_dir_for(&dir, wants);
     }
     // Typed as a path, so meant as one: say the directory is missing, rather
     // than go and ask the Hub for a repo called `./out`.
@@ -550,8 +588,11 @@ fn resolve(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher, ask: 
         }
     };
     let sharded = |index: PathBuf| -> Res<Vec<PathBuf>> {
-        let shards = shard_names(&index)?;
-        (progress.borrow_mut())(&format!("checkpoint is split across {} shards", shards.len()));
+        let shards = shards_for(&index, wants)?;
+        (progress.borrow_mut())(&match wants {
+            None => format!("checkpoint is split across {} shards", shards.len()),
+            Some(_) => format!("checkpoint is split across {} shards, of which {} hold what is wanted here", shard_names(&index)?.len(), shards.len()),
+        });
         watch.emit(Fetch::Shards(shards.len()));
         shards.iter().map(|s| get(s)).collect()
     };
@@ -561,7 +602,7 @@ fn resolve(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher, ask: 
     // single file — whether or not a `.no_exist` marker is there to say so.
     let whole_set = || -> Option<PathBuf> {
         let Cached::Here(index) = cache("model.safetensors.index.json") else { return None };
-        let shards = shard_names(&index).ok()?;
+        let shards = shards_for(&index, wants).ok()?;
         shards.iter().all(|s| matches!(cache(s), Cached::Here(_))).then_some(index)
     };
 

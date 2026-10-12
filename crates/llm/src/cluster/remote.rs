@@ -110,6 +110,22 @@ pub fn connect_within(address: &str, key: &Key, reach: Duration, greeting: Durat
     Ok((stream, hello))
 }
 
+/// Ask the worker at `address` how long a layer of this shape takes it,
+/// in milliseconds: [`super::plan::bench`], run there.
+pub fn bench(address: &str, key: &Key, n_embd: usize, intermediate: usize, precision: crate::quant::Precision) -> Result<f64, Fault> {
+    let (mut stream, hello) = connect(address, key)?;
+    wire::send(&mut stream, Kind::Bench, &wire::Bench { n_embd, intermediate, precision: precision.to_string() })?;
+    let mut buf = Vec::new();
+    match wire::read(&mut stream, 1 << 16, &mut buf).map_err(|e| format!("{} ({address}): {e}", hello.name))? {
+        Kind::Benched => wire::parse::<serde_json::Value>(Kind::Benched, &buf)?["layer_ms"]
+            .as_f64()
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+            .ok_or_else(|| format!("{} timed a layer and gave no time", hello.name).into()),
+        Kind::Error => Err(format!("{} ({address}): {}", hello.name, wire::error_text(&buf)).into()),
+        kind => Err(format!("{} answered a timing with a {kind:?}", hello.name).into()),
+    }
+}
+
 impl RemoteStage {
     /// [`connect`], and then have the worker load `layers` of `repo`.
     /// Returns when the stage is ready to run, which for a model the worker

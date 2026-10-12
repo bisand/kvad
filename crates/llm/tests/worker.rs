@@ -299,10 +299,13 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
         tokenizer_config: None,
         generation_config: None,
     };
+    let want = |workers: &[String], split: Option<&[std::ops::Range<usize>]>, params: Option<u64>| {
+        let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers, split, key: &key(), params, context: 64 };
+        session::across(&want, &mut |_| {}).map_err(|e| e.to_string())
+    };
     let why = |workers: &[&str], split: &str| {
         let workers: Vec<String> = workers.iter().map(|w| w.to_string()).collect();
-        let split = session::parse_split(split).unwrap();
-        session::across("tiny", &files, &fixture.spec, Precision::F32, &workers, &split, &key(), &mut |_| {}).err().expect("refused").to_string()
+        want(&workers, Some(&session::parse_split(split).unwrap()), None).err().expect("refused")
     };
     // Nobody is listening at these, and nobody is asked.
     assert!(why(&["a:1"], "0..4").contains("1 run(s) of layers and there are 2 machine(s)"));
@@ -321,9 +324,30 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
     // With a worker really there, the same call makes a session that runs.
     let at = a_worker(&fixture);
     let split = session::parse_split("0..1,1..4").unwrap();
-    let mut session = session::across("tiny", &files, &fixture.spec, Precision::F32, &[at], &split, &key(), &mut |_| {}).unwrap();
+    let mut session = want(&[at.clone()], Some(&split), None).unwrap();
     assert_eq!(session.forward(&[1, 2, 3]).unwrap().len(), common::VOCAB);
     assert_eq!(session.label(), "cpu f32 in 2 stages");
+    drop(session);
+
+    // A split by hand is held to each machine's memory, when the model's
+    // size is known: a model of a million gigabytes is nobody's to hold.
+    let huge = want(&[at.clone()], Some(&split), Some(250_000_000_000_000)).err().expect("refused");
+    assert!(huge.contains("is given layers") && huge.contains("for a model"), "{huge}");
+
+    // With no split the layers are placed, and a model that fits on the
+    // machine with the tokens stays there: a worker is a hop, and here a
+    // hop buys nothing. The session that results asks the worker for
+    // nothing and runs in one stage.
+    let mut lines = Vec::new();
+    let params = fixture.load(Precision::F32, &Shard::whole(&fixture.spec)).param_count() as u64;
+    let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64 };
+    let mut session = session::across(&placed, &mut |line| lines.push(line.to_string())).unwrap();
+    assert_eq!(session.label(), "cpu f32 in 1 stages");
+    assert!(lines.iter().any(|l| l.starts_with("MACHINE")) && lines.iter().any(|l| l.contains("the workers hold nothing")), "{lines:?}");
+    assert_eq!(session.forward(&[1, 2, 3]).unwrap().len(), common::VOCAB);
+    // And with nothing known of its size, nothing is placed.
+    let unknown = session::Across { params: None, ..placed };
+    assert!(session::across(&unknown, &mut |_| {}).err().expect("refused").to_string().contains("could not be found out"));
 }
 
 /// A worker holds one model, and says so to the second coordinator that

@@ -73,7 +73,8 @@ const CRAWL: &[Flag] = &[
 
 /// `kvad cluster`'s usage. Here and not beside the command, which a build
 /// without the `cluster` feature does not have.
-pub const CLUSTER: &str = "usage: kvad cluster find [--all]        who is on the other end of each cable
+pub const CLUSTER: &str = "usage: kvad cluster plan MODEL --workers NAME[,NAME]   which machine would hold what
+       kvad cluster find [--all]        who is on the other end of each cable
        kvad cluster listen [--port N]   be the far end of a measurement
        kvad cluster ping [HOST]         measure the link to a machine that is listening
        kvad cluster link IFACE          say what one interface's link is
@@ -83,7 +84,8 @@ With no HOST, `ping` measures the one machine `find` finds, if it finds one.";
 /// `run` and `chat`, for a model spread over several machines.
 const ACROSS: &[Flag] = &[
     f("--workers", "NAME[,NAME]", Kind::Text, "spread the model over these machines, each running `kvad worker`: by name, id or address"),
-    f("--split", "A..B,C..D", Kind::Text, "the layers each machine holds: this one first, then each worker"),
+    f("--split", "A..B,C..D", Kind::Text, "the layers each machine holds, this one first, instead of the ones worked out"),
+    f("--context", "N", Kind::Text, "the longest conversation to leave memory for, in tokens (default: the model's, at most 8192)"),
 ];
 
 const CLUSTER_PORT: Flag = f("--port", "N", Kind::Text, "the port to listen on, or to reach (default 7420)");
@@ -752,7 +754,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "cluster",
         group: Group::Measure,
-        args: "[find|listen|ping|link]",
+        args: "[find|plan|listen|ping|link]",
         about: "measure the link between two machines, and say what it is",
         server: false,
         routed: false,
@@ -773,6 +775,13 @@ pub const COMMANDS: &[Command] = &[
                 ]],
             },
             Sub { name: "link", args: "IFACE", about: "say what one interface's link is", words: &[Kind::Text], flags: &[] },
+            Sub {
+                name: "plan",
+                args: "MODEL",
+                about: "say which machine would hold which layers of a model, and load nothing",
+                words: &[Kind::Model(Want::Text)],
+                flags: &[&[QUANT], ACROSS],
+            },
         ],
         flags: &[],
         usage: Some(CLUSTER),
@@ -807,9 +816,13 @@ pub const COMMANDS: &[Command] = &[
                 divided between them, and what passes from one to the next is the model's\n\
                 working state for each token, a few kilobytes. This is the machine that\n\
                 holds layers and nothing else. The one that has the prompt names it:\n\n\
-                \x20 kvad run --model MODEL --workers THIS-MACHINE --split 0..12,12..24\n\n\
-                which keeps layers 0 to 11 itself and asks this one for 12 to 23. The\n\
-                worker fetches the model if it has not got it.\n\n\
+                \x20 kvad run --model MODEL --workers THIS-MACHINE\n\n\
+                and the layers are placed: as many as fit on the fastest machine, then the\n\
+                next, and a machine the model has no need of is left out. `kvad cluster\n\
+                plan MODEL --workers ...` shows the placing and loads nothing. --split\n\
+                0..12,12..24 places them by hand instead: 0 to 11 on the machine with the\n\
+                prompt, 12 to 23 here. A worker fetches the files its own layers are in,\n\
+                if it has not got them, and no others.\n\n\
                 THIS-MACHINE is the name the worker prints when it starts, the id beside\n\
                 it, or an address. By name or id it is found on the network, every way to\n\
                 it is measured, and the quickest is used and said: a machine on a cable\n\
@@ -819,9 +832,8 @@ pub const COMMANDS: &[Command] = &[
                 makes one, keeps it in the data directory as cluster.key and prints it;\n\
                 copy that file to the other machines, or give them the key in\n\
                 KVAD_CLUSTER_KEY. What crosses between machines is not encrypted.\n\n\
-                Both ends have to be the same build of kvad, to the commit, and the split\n\
-                is by hand: nothing yet works out which machine should hold what. Finding\n\
-                a worker by name is written for macOS; elsewhere, give its address.",
+                Both ends have to be the same build of kvad, to the commit. Finding a\n\
+                worker by name is written for macOS; elsewhere, give its address.",
         examples: &["kvad worker", "kvad worker --port 7421"],
     },
     // -- accounts ----------------------------------------------------------

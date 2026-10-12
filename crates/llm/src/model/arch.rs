@@ -103,6 +103,12 @@ impl Arch {
         (self.0.configure)(spec)
     }
 
+    /// [`Arch::load`], for a caller outside this crate with a source of
+    /// its own: a measurement that wants weights read one particular way.
+    pub fn load_from(self, src: &dyn Source, spec: Spec, shard: &Shard) -> Res<Box<dyn Transformer>> {
+        self.load(src, spec, shard)
+    }
+
     pub(crate) fn load(self, src: &dyn Source, spec: Spec, shard: &Shard) -> Res<Box<dyn Transformer>> {
         if shard.layers.start > shard.layers.end || shard.layers.end > spec.n_layer {
             return Err(format!("{shard} is not a part of a model of {} layers", spec.n_layer).into());

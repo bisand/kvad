@@ -49,11 +49,12 @@ pub type Factory = Box<dyn FnMut(&Load, &mut dyn FnMut(&str)) -> Result<Box<dyn 
 pub fn from_disk() -> Factory {
     Box::new(|load, progress| {
         let precision = Precision::parse(&load.precision).ok_or_else(|| format!("`{}` is not a precision", load.precision))?;
-        let files = crate::weights::fetch_with(&load.repo, progress).map_err(|e| e.to_string())?;
-        let spec = Spec::from_json(&files.config).map_err(|e| e.to_string())?;
         let shard = Shard { layers: load.layers[0]..load.layers[1], ends: false };
+        // Its own layers' files, and none of the rest of the checkpoint.
+        let files = crate::weights::fetch_for(&load.repo, &|tensor| shard.wants(tensor), progress).map_err(|e| e.to_string())?;
+        let spec = Spec::from_json(&files.config).map_err(|e| e.to_string())?;
         progress(&format!("reading {shard} of {} at {precision}", load.repo));
-        let model = crate::qcache::load_shard(&files, &spec, precision, &shard).map_err(|e| e.to_string())?;
+        let model = crate::qcache::load_shard(&load.repo, &files, &spec, precision, &shard, progress).map_err(|e| e.to_string())?;
         Ok(Box::new(LocalStage::new(Arc::from(model))) as Box<dyn Stage>)
     })
 }
@@ -304,6 +305,19 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
                 wire::skip(stream, len)?;
                 held.release();
                 wire::write(stream, Kind::Ack, &[])?;
+            }
+            Kind::Bench if len <= 1 << 16 => {
+                wire::read_payload(stream, len, &mut buf)?;
+                let asked: wire::Bench = wire::parse(Kind::Bench, &buf)?;
+                // Widths a stranger with the key chose: bounded, so that
+                // being asked how fast is not a way to be asked for memory.
+                match (Precision::parse(&asked.precision), asked.n_embd <= 1 << 16 && asked.intermediate <= 1 << 20) {
+                    (Some(precision), true) => {
+                        let layer_ms = super::plan::bench(asked.n_embd, asked.intermediate, precision);
+                        wire::send(stream, Kind::Benched, &serde_json::json!({ "layer_ms": layer_ms }))?
+                    }
+                    _ => wire::send_error(stream, "that is not the shape of a layer")?,
+                }
             }
             // A worker is a place to measure the link to, as well.
             Kind::Ping if len <= MOST_ECHOED => {

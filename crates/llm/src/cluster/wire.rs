@@ -79,6 +79,11 @@ pub enum Kind {
     Truncated = 14,
     /// Let the stage go. Answered by an [`Kind::Ack`].
     Unload = 15,
+    /// Time a layer of a model this shape: JSON, [`Bench`]. The answer is
+    /// a [`Kind::Benched`], `{"layer_ms": …}`. What a plan is made from,
+    /// before anything is loaded.
+    Bench = 16,
+    Benched = 17,
 }
 
 impl Kind {
@@ -99,6 +104,8 @@ impl Kind {
             13 => Kind::Truncate,
             14 => Kind::Truncated,
             15 => Kind::Unload,
+            16 => Kind::Bench,
+            17 => Kind::Benched,
             _ => return None,
         })
     }
@@ -266,6 +273,14 @@ pub struct Load {
 pub struct Ready {
     pub params: usize,
     pub bytes: usize,
+}
+
+/// The shape of a layer to time: see [`super::plan::bench`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Bench {
+    pub n_embd: usize,
+    pub intermediate: usize,
+    pub precision: String,
 }
 
 /// A conversation, and the length to cut its cache to — or, coming back,
@@ -465,10 +480,10 @@ mod tests {
         assert_eq!(read(&mut Cursor::new(wire), 1 << 16, &mut buf).unwrap(), Kind::Load);
         assert_eq!(parse::<Load>(Kind::Load, &buf).unwrap(), load);
         assert!(parse::<Ready>(Kind::Ready, &buf).is_err());
-        for byte in 1..=15u8 {
+        for byte in 1..=17u8 {
             assert_eq!(Kind::from_u8(byte).map(|k| k as u8), Some(byte));
         }
-        assert_eq!(Kind::from_u8(16), None);
+        assert_eq!(Kind::from_u8(18), None);
     }
 
     #[test]

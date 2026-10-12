@@ -7,7 +7,7 @@
 
 use super::Res;
 use crate::Args;
-use kvad::cluster::{discover, key, link, ping, wire, worker as far};
+use kvad::cluster::{discover, key, link, ping, session, wire, worker as far};
 use std::net::TcpListener;
 
 use super::spec::CLUSTER as USAGE;
@@ -16,6 +16,7 @@ pub fn run(args: &Args) -> Res<()> {
     let word = |i: usize| args.words.get(i).map(String::as_str);
     match word(0) {
         Some("find") => find(args.all),
+        Some("plan") => plan(args, word(1)),
         Some("listen") => listen(args.port.unwrap_or(wire::PORT)),
         Some("ping") => measure(args, word(1)),
         Some("link") => match word(1) {
@@ -227,5 +228,72 @@ pub fn worker(args: &Args) -> Res<()> {
             far::Event::Went(from, how) => println!("[{at:>9.3}s] -> {} gone: {how}", from.ip()),
         }
     })?;
+    Ok(())
+}
+
+/// The longest conversation a plan leaves room for unless told, where the
+/// model allows it: 8192 tokens.
+pub const CONTEXT: usize = 8192;
+
+/// A model's shape and its size, from this machine's disk if it is there
+/// and from the Hub's few kilobytes about it if not. Nothing is fetched
+/// that is a weight.
+fn shape_of(model: &str) -> Res<(kvad::model::Spec, Option<u64>)> {
+    use kvad::model::{Json, Spec};
+    if let Some(local) = kvad::hub::find_local(model).filter(|m| m.complete) {
+        let files = kvad::weights::fetch_with(model, &mut |_| {})?;
+        return Ok((Spec::from_json(&files.config)?, local.params));
+    }
+    if let Some(dir) = kvad::hub::find_trained(model) {
+        return Ok((Spec::from_json(&dir.path.join("config.json"))?, dir.params));
+    }
+    let config = kvad::hub::remote_config(model).ok_or_else(|| format!("{model} is not on this machine, and the Hub did not answer for its config"))?;
+    let params = kvad::hub::search(model, 10).ok().and_then(|found| found.into_iter().find(|m| m.id.eq_ignore_ascii_case(model))).and_then(|m| m.params);
+    Ok((Spec::from_config(Json::new(config))?, params))
+}
+
+/// `kvad cluster plan MODEL --workers ...`: which machine would hold
+/// which layers, before anything is downloaded or loaded.
+fn plan(args: &Args, model: Option<&str>) -> Res<()> {
+    let model = model.or(args.model.as_deref()).ok_or("which model? `kvad cluster plan MODEL --workers NAME`")?;
+    let workers: Vec<String> = args.workers.as_deref().unwrap_or("").split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect();
+    let split = args.split.as_deref().map(session::parse_split).transpose()?;
+    let (spec, params) = shape_of(model)?;
+    let context = args.context.unwrap_or(spec.n_ctx.min(CONTEXT));
+    println!("{model} at {}: {}", args.quant, spec.summary());
+    match params {
+        Some(params) => {
+            let sizes = kvad::cluster::plan::Sizes::of(&spec, params, args.quant, context);
+            println!(
+                "{:.1} GB of weights and {:.1} GB of cache for a conversation of {context} tokens",
+                (sizes.ends + sizes.n_layer as u64 * sizes.layer) as f64 / 1e9,
+                (sizes.n_layer as u64 * sizes.cache) as f64 / 1e9
+            );
+        }
+        None => println!("its size is not known here, so memory cannot be checked"),
+    }
+
+    // A plan for this machine alone needs nobody's key.
+    let key = match workers.is_empty() {
+        true => None,
+        false => Some(key::Key::ours()?),
+    };
+    let nobody = key::Key::from_hex(&"00".repeat(32))?;
+    let key = key.as_ref().unwrap_or(&nobody);
+    let (nodes, _) = session::survey(&spec, args.quant, &workers, key, &mut |line| eprintln!("{line}"))?;
+    // The files are not wanted, only what is known about the model.
+    let files = kvad::weights::ModelFiles { weights: Vec::new(), tokenizer: Default::default(), config: Default::default(), tokenizer_config: None, generation_config: None };
+    let want = session::Across { repo: model, files: &files, spec: &spec, precision: args.quant, workers: &workers, split: split.as_deref(), key, params, context };
+    let plan = session::planned(&want, &nodes)?;
+    println!();
+    for line in kvad::cluster::plan::table(&nodes, &plan) {
+        println!("{line}");
+    }
+    let used: Vec<&str> = workers.iter().zip(&plan.shares[1..]).filter(|(_, share)| !share.layers.is_empty()).map(|(w, _)| w.as_str()).collect();
+    println!();
+    match used.is_empty() {
+        true => println!("It fits on this machine, where a layer costs no round trip: kvad run --model {model}"),
+        false => println!("kvad run --model {model} --workers {} --split {}", workers.join(","), plan.split()),
+    }
     Ok(())
 }

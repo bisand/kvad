@@ -33,7 +33,6 @@
 use kvad::cluster::key::Key;
 use kvad::cluster::session::{self, PipelineSession};
 use kvad::model::{CpuSession, Session, Shard, Spec};
-use kvad::qcache;
 use kvad::quant::Precision;
 use std::time::Instant;
 
@@ -86,12 +85,18 @@ fn main() -> Res<()> {
     // any tokens, and these need no tokenizer to make.
     let prompt: Vec<u32> = (0..length).map(|i| ((i * 7919 + 13) % spec.vocab_size) as u32).collect();
 
+    // Straight from the checkpoint, every time, and through no cache
+    // file: see below for why whole and cut must be read the same way.
+    let ckpt = kvad::weights::Checkpoint::open(&files.weights)?;
+    let load = |shard: &Shard| -> Res<Box<dyn kvad::model::Transformer>> {
+        spec.arch.load_from(&kvad::qcache::Live::new(&ckpt, precision), spec.clone(), shard)
+    };
     // Whole and cut are read the same way, straight from the checkpoint,
     // so that the cut is the only difference between them. A whole model
     // mapped from its cache file measured about 4% slower than the same
     // weights quantised onto the heap, on one model, and that is a fact
     // about where weights live and not about where a model is cut.
-    let mut whole = CpuSession::new(qcache::load_shard(&files, &spec, precision, &Shard::whole(&spec))?, precision);
+    let mut whole = CpuSession::new(load(&Shard::whole(&spec))?, precision);
     let (reference, ..) = run(&mut whole, &prompt, steps)?;
 
     // Across machines, if any were named; otherwise every cut in here.
@@ -109,12 +114,24 @@ fn main() -> Res<()> {
     for &parts in counts {
         let mut split: Box<dyn Session> = match &across {
             Some((workers, split, key)) => {
-                session::across(&kvad::weights::model_id(model), &files, &spec, precision, workers, split, key, &mut |msg| eprintln!("  {msg}"))?
+                let repo = kvad::weights::model_id(model);
+                let want = session::Across {
+                    repo: &repo,
+                    files: &files,
+                    spec: &spec,
+                    precision,
+                    workers,
+                    split: Some(split),
+                    key,
+                    params: kvad::hub::find_local(&repo).and_then(|m| m.params),
+                    context: spec.n_ctx.min(8192),
+                };
+                session::across(&want, &mut |msg| eprintln!("  {msg}"))?
             }
             None => {
                 let cut = Shard::cut(spec.n_layer, parts);
                 eprintln!("loading {parts} shard(s): {}", cut.iter().map(Shard::to_string).collect::<Vec<_>>().join("; "));
-                let shards = cut.iter().map(|shard| qcache::load_shard(&files, &spec, precision, shard)).collect::<Res<Vec<_>>>()?;
+                let shards = cut.iter().map(&load).collect::<Res<Vec<_>>>()?;
                 Box::new(PipelineSession::local(shards, precision)?)
             }
         };

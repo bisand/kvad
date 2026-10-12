@@ -24,17 +24,12 @@ fn across(repo: &str, backend: Backend, progress: &mut dyn FnMut(&str), watch: &
     use kvad::cluster::{key::Key, plan::Mix, session};
     let cluster = crate::cluster::running();
     let Backend::Cpu(precision) = backend else { return None };
-    if cluster.workers.is_empty() || kvad::dit::is_one(repo) || kvad::dit::is_clips(repo) {
+    // An architecture that runs whole and only whole is loaded whole.
+    if !crate::cluster::spreads(repo, backend) {
         return None;
     }
     let name = kvad::weights::model_id(repo);
     let local = kvad::hub::find_local(&name).or_else(|| kvad::hub::find_trained(&name));
-    // An architecture that runs whole and only whole is loaded whole. One
-    // not on this disk yet has no config to ask, and is tried: the load
-    // says so if it cannot be.
-    if local.as_ref().and_then(|model| model.arch).is_some_and(|arch| !arch.splits()) {
-        return None;
-    }
     let params = local.and_then(|model| model.params);
     let mut load = || -> Result<kvad::service::Model, Box<dyn std::error::Error>> {
         let key = Key::ours()?;
@@ -55,6 +50,9 @@ fn across(repo: &str, backend: Backend, progress: &mut dyn FnMut(&str), watch: &
                 context: spec.n_ctx.min(8192),
                 mix,
                 watch,
+                // What the server's other models have left, and not what
+                // the machine has: the scheduler said before it asked.
+                memory: crate::cluster::room(),
             };
             session::across(&want, progress)
         })?;

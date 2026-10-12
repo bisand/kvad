@@ -118,7 +118,7 @@ pub enum Admission {
 }
 
 /// A model already resident, as admission sees it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Held {
     pub id: String,
     pub commit: u64,

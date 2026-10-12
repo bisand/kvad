@@ -255,6 +255,11 @@
                 {humanBytes(m.left)} left · each charged for {m.context.toLocaleString()} tokens of
                 context
               </p>
+              {#each m.guests ?? [] as g (g.id)}
+                <p class="mt-1 text-xs opacity-70">
+                  {humanBytes(g.commit)} of that is {g.id}
+                </p>
+              {/each}
             </div>
           {/if}
           {#if models.residents.length === 0}

@@ -712,6 +712,9 @@ struct Shared {
     issued: Arc<AtomicU64>,
     /// Memory set aside for work that is not a resident; see [`Reserved`].
     reserved: Arc<Mutex<Option<Held>>>,
+    /// Layers held for models on other machines; see [`Lodged`]. Each with
+    /// the number its guard knows it by.
+    guests: Arc<Mutex<Vec<(u64, Held)>>>,
     /// How many replies run at once on one resident; see
     /// [`Scheduler::batching`]. Here because the thread that runs them
     /// reads it.
@@ -724,6 +727,32 @@ struct Shared {
 /// so a model is not loaded into the memory a backward pass is about to
 /// take. Given back when this is dropped.
 pub struct Reserved(Arc<Mutex<Option<Held>>>);
+
+/// Memory this server has given to a model that is another machine's: the
+/// layers it holds as a cluster worker, and the cache they will grow.
+/// Admission counts it as it counts a resident, so a server's own models
+/// and the layers it holds for others share one budget. Given back when
+/// this is dropped, which is when the coordinator lets go.
+pub struct Lodged {
+    guests: Arc<Mutex<Vec<(u64, Held)>>>,
+    number: u64,
+}
+
+impl Lodged {
+    /// Charge what it turned out to be, now that it is loaded.
+    pub fn resize(&self, bytes: u64) {
+        let mut guests = self.guests.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, held)) = guests.iter_mut().find(|(number, _)| *number == self.number) {
+            held.commit = bytes;
+        }
+    }
+}
+
+impl Drop for Lodged {
+    fn drop(&mut self) {
+        self.guests.lock().unwrap_or_else(|e| e.into_inner()).retain(|(number, _)| *number != self.number);
+    }
+}
 
 impl Drop for Reserved {
     fn drop(&mut self) {
@@ -786,6 +815,7 @@ impl Shared {
     fn held(&self) -> Vec<Held> {
         let mut held: Vec<Held> = self.residents().iter().map(|r| Held { id: r.id.clone(), commit: r.commit }).collect();
         held.extend(self.reserved().clone());
+        held.extend(self.guests.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(_, held)| held.clone()));
         held
     }
 }
@@ -967,7 +997,7 @@ impl Scheduler {
             return Err(format!("{} already has {} set aside for it", other.id, gb(other.commit)));
         }
         let residents = self.shared.residents();
-        let spent: u64 = residents.iter().map(|r| r.commit).sum();
+        let spent: u64 = residents.iter().map(|r| r.commit).sum::<u64>() + self.guests().iter().map(|g| g.commit).sum::<u64>();
         let left = self.budget.total.saturating_sub(spent);
         if bytes > left {
             let holding = match residents.is_empty() {
@@ -982,6 +1012,32 @@ impl Scheduler {
         }
         *reserved = Some(Held { id: what.to_string(), commit: bytes });
         Ok(Reserved(Arc::clone(&self.shared.reserved)))
+    }
+
+    /// What is held here for models on other machines.
+    pub fn guests(&self) -> Vec<Held> {
+        self.shared.guests.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(_, held)| held.clone()).collect()
+    }
+
+    /// Take `bytes` of the budget for `what`, which another machine's model
+    /// asks this one to hold, or say why not. Never "alone, whatever it
+    /// takes": the model is not this server's, and the coordinator that
+    /// asked can place the layers somewhere else.
+    pub fn lodge(&self, what: &str, bytes: u64) -> Result<Lodged, String> {
+        let gb = |b: u64| format!("{:.1} GB", b as f64 / 1e9);
+        let held = self.shared.held();
+        let left = self.budget.total.saturating_sub(held.iter().map(|h| h.commit).sum());
+        if bytes > left {
+            let holding = match held.is_empty() {
+                true => String::new(),
+                false => format!(", with {} in memory", held.iter().map(|h| format!("{} ({})", h.id, gb(h.commit))).collect::<Vec<_>>().join(", ")),
+            };
+            return Err(format!("{what} takes about {}, and this machine has {} left of {} for models{holding}", gb(bytes), gb(left), gb(self.budget.total)));
+        }
+        let mut guests = self.shared.guests.lock().unwrap_or_else(|e| e.into_inner());
+        let number = guests.iter().map(|(number, _)| number + 1).max().unwrap_or(1);
+        guests.push((number, Held { id: what.to_string(), commit: bytes }));
+        Ok(Lodged { guests: Arc::clone(&self.shared.guests), number })
     }
 
     /// The resident a name means: `repo@backend` exactly, or the bare repo's
@@ -1450,7 +1506,15 @@ fn load(
     let id = id_of(&key.repo, key.backend);
     let held = shared.held();
     let need = crate::memory::need(&key.repo, key.backend, budget.context);
-    let admission = crate::memory::admit(&budget, &held, &id, &need);
+    let left = budget.total.saturating_sub(held.iter().map(|h| h.commit).sum());
+    let admission = match crate::memory::admit(&budget, &held, &id, &need) {
+        // Too large for what is left here, and `[cluster]` names machines
+        // to put the rest on: that is the model they are for. It goes to
+        // the placing, which is told what is left and refuses it in its
+        // own words if no placing fits.
+        Admission::Refused(_) if left > 0 && need.bytes().is_some() && crate::cluster::spreads(&key.repo, key.backend) => Admission::Fits { commit: left },
+        other => other,
+    };
     let room = match admission {
         Admission::Refused(why) => return Err(LoadError::Full(why)),
         Admission::Streams { room } => room,
@@ -1463,6 +1527,7 @@ fn load(
     // estimate came in low would otherwise size its cache against the whole
     // machine rather than against what the other residents left of it.
     kvad::experts::set_room(Some(room));
+    crate::cluster::set_room(Some(room));
     let engine = Engine::spawn(loaders());
     engine.send(Cmd::Load { repo: key.repo.clone(), backend: key.backend });
     // What the model is charged for below is what it may keep: every
@@ -1470,6 +1535,7 @@ fn load(
     engine.send(Cmd::Hold(budget.context));
     let result = drain_load(&engine.rx, progress);
     kvad::experts::set_room(None);
+    crate::cluster::set_room(None);
     let model = result.map_err(LoadError::Failed)?;
 
     // Charged what it turned out to be, now that it is loaded, rather than
@@ -1479,9 +1545,16 @@ fn load(
         0 => (model.kv_bytes_per_token * model.n_ctx.min(budget.context)) as u64,
         kv => kv,
     };
+    // A model across machines is charged what of it is here: this
+    // machine's layers and the ends, and the cache of those layers. The
+    // rest is the workers' to count, and they do.
+    let (weights, kv) = match crate::cluster::here(&key.repo, key.backend) {
+        Some(spread) => (spread.bytes_here as u64, kv * spread.layers_here as u64 / spread.layers.max(1) as u64),
+        None => (model.weight_bytes as u64, kv),
+    };
     let (commit, streams) = match admission {
         Admission::Streams { room } => (room, true),
-        _ => ((model.weight_bytes as u64 + kv).min(budget.total), false),
+        _ => ((weights + kv).min(budget.total), false),
     };
     let resident =
         Resident { id, model, commit, streams, cached_tokens: 0, key: key.clone(), used: 0 };
@@ -2383,6 +2456,42 @@ mod tests {
             assert!(sched.queue().is_empty());
             assert_eq!(sched.depth(), 0);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Layers held for another machine's model take of the budget as a
+    /// model of this server's does: they are refused when they do not fit,
+    /// a model is refused for want of the room they have, and the room is
+    /// back when they are let go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn layers_held_for_another_machine_are_counted_against_this_ones_models() {
+        let dir = crate::compare::tests::tiny_model("lodging");
+        let repo = dir.to_string_lossy().into_owned();
+        let probe = Scheduler::spawn(kvad::service::cpu_loader, roomy());
+        probe.load(repo.clone(), F32, nowhere()).await.unwrap();
+        let one = probe.residents()[0].commit;
+        drop(probe);
+
+        let sched = Scheduler::spawn(kvad::service::cpu_loader, Budget { total: one + 10, context: 1024 });
+        let why = sched.lodge("layers 0..2 of a model, for another machine", one + 11).err().expect("refused");
+        assert!(why.contains("layers 0..2 of a model") && why.contains("left of"), "{why}");
+        assert!(sched.guests().is_empty());
+
+        let lodged = sched.lodge("layers 0..2 of a model, for another machine", 4).unwrap();
+        assert_eq!(sched.left(), one + 6);
+        lodged.resize(11);
+        assert_eq!((sched.left(), sched.guests()[0].commit), (one - 1, 11));
+
+        // Not alone any more, so not admitted whatever it takes.
+        let err = sched.load(repo.clone(), F32, nowhere()).await.unwrap_err();
+        let LoadError::Full(why) = &err else { panic!("expected a refusal, got {err:?}") };
+        assert!(why.contains("for another machine"), "who holds the rest is said: {why}");
+
+        drop(lodged);
+        assert_eq!(sched.left(), one + 10);
+        sched.load(repo, F32, nowhere()).await.unwrap();
+        // And the other way: a model in memory is room a guest does not have.
+        assert!(sched.lodge("more layers", 11).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

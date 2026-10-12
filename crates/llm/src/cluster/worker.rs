@@ -110,7 +110,13 @@ struct Shared<'f, 's> {
     busy: std::sync::atomic::AtomicBool,
     factory: std::sync::Mutex<&'f mut Factory>,
     said: std::sync::Mutex<&'s mut (dyn FnMut(Event) + Send)>,
+    room: Room<'s>,
 }
+
+/// What this worker has for a coordinator's layers, in bytes, asked at
+/// every greeting: a worker that is also a server has what its own models
+/// have left, and that changes. `None` is the machine's usable memory.
+pub type Room<'r> = &'r (dyn Fn() -> Option<u64> + Sync);
 
 impl Shared<'_, '_> {
     fn say(&self, event: Event) {
@@ -152,7 +158,12 @@ impl Drop for Held<'_, '_, '_> {
 
 /// Answer coordinators for ever, each on a thread of its own.
 pub fn serve(listener: &TcpListener, key: &Key, factory: &mut Factory, said: &mut (dyn FnMut(Event) + Send)) -> io::Result<()> {
-    let shared = Shared { busy: false.into(), factory: factory.into(), said: said.into() };
+    serve_with(listener, key, factory, said, &|| None)
+}
+
+/// [`serve`], by a worker that keeps count of its memory: see [`Room`].
+pub fn serve_with<'a>(listener: &TcpListener, key: &Key, factory: &mut Factory, said: &'a mut (dyn FnMut(Event) + Send), room: Room<'a>) -> io::Result<()> {
+    let shared = Shared { busy: false.into(), factory: factory.into(), said: said.into(), room };
     std::thread::scope(|threads| {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -181,7 +192,7 @@ pub fn serve(listener: &TcpListener, key: &Key, factory: &mut Factory, said: &mu
 
 /// One coordinator, until it goes: [`serve`] for a single connection.
 pub fn serve_one(stream: &mut TcpStream, key: &Key, factory: &mut Factory, said: &mut (dyn FnMut(Event) + Send)) -> io::Result<()> {
-    one(stream, key, &Shared { busy: false.into(), factory: factory.into(), said: said.into() })
+    one(stream, key, &Shared { busy: false.into(), factory: factory.into(), said: said.into(), room: &|| None })
 }
 
 fn other(what: impl Into<String>) -> io::Error {
@@ -189,7 +200,7 @@ fn other(what: impl Into<String>) -> io::Error {
 }
 
 /// The worker's half of the handshake in [`super::key`].
-fn greet(stream: &mut TcpStream, key: &Key, buf: &mut Vec<u8>) -> io::Result<Hello> {
+fn greet(stream: &mut TcpStream, key: &Key, room: Room, buf: &mut Vec<u8>) -> io::Result<Hello> {
     let theirs = match wire::read(stream, 1 << 16, buf)? {
         Kind::Hello => Hello::parse(buf)?,
         kind => return Err(other(format!("a {kind:?} before any greeting"))),
@@ -197,7 +208,8 @@ fn greet(stream: &mut TcpStream, key: &Key, buf: &mut Vec<u8>) -> io::Result<Hel
     if theirs.nonce.is_empty() {
         return Err(other("a greeting with no nonce: this is a worker, and `kvad cluster listen` is the one that only measures"));
     }
-    let ours = Hello { nonce: key::nonce()?, ..Hello::ours() };
+    let mut ours = Hello { nonce: key::nonce()?, ..Hello::ours() };
+    ours.memory = room().or(ours.memory);
     ours.send(stream)?;
     let proof = match wire::read(stream, 1 << 16, buf)? {
         Kind::Auth => wire::parse::<serde_json::Value>(Kind::Auth, buf)?["proof"].as_str().unwrap_or("").to_string(),
@@ -216,7 +228,7 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
     stream.set_write_timeout(Some(GREETING))?;
     let (mut buf, mut out) = (Vec::new(), Vec::new());
     let from = stream.peer_addr()?;
-    shared.say(Event::Came(from, &greet(stream, key, &mut buf)?));
+    shared.say(Event::Came(from, &greet(stream, key, shared.room, &mut buf)?));
 
     // From here a silence is a coordinator with nothing to say, which is
     // most of a coordinator's life; the kernel's probes say when it is gone.

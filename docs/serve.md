@@ -270,15 +270,24 @@ is: beside the lines and the bar it always had, a `progress` event of
 or the bytes of a file it is downloading, or the memory its layers took. The
 Models page draws a row for each while the model loads.
 
+Memory is one budget on each machine. A model across machines is charged
+here for what of it is here: this machine's layers, the embedding and the
+head, and the cache of those layers. The layers a server holds for another
+machine's model come out of the same budget as its own models, are refused
+when they do not fit, and are given back when the coordinator lets go; the
+Models page says how much of what is taken is theirs. A worker tells a
+coordinator what it has left and not what the machine has, and a
+coordinator places against what its own models have left. So a model too
+large for what is left here is not refused out of hand when `[cluster]`
+names workers: it goes to the placing, which puts on them what does not
+fit.
+
 What this does not do yet, said plainly:
 
 - **GPU backends are not spread.** A stage is CPU layers; `gpu-q8` loads
   whole or not at all.
 - **A model in stages keeps one conversation.** A second one costs the
   first its cache, and replies are not written in a batch.
-- **Memory is counted by each machine for itself.** The scheduler charges a
-  spread model as if all of it were here, and a server holding layers for
-  another machine does not count them against its own models.
 - **A worker that goes away fails the reply** and the model stays loaded
   and broken until it is unloaded. Nothing reconnects.
 - **Each load asks the network again**, which is about ten seconds of

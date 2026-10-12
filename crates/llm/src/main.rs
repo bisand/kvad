@@ -511,6 +511,7 @@ fn load(args: &Args) -> Res<Llm> {
                     context: args.context.unwrap_or(spec.n_ctx.min(cli::cluster::CONTEXT)),
                     mix,
                     watch: &weights::Watcher::none(),
+                    memory: None,
                 };
                 session::across(&want, progress)
             })?

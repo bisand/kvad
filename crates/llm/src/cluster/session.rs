@@ -301,6 +301,11 @@ pub struct Report {
     pub precision: String,
     /// Positions of the conversation every stage holds.
     pub positions: usize,
+    /// The model's layers, and how many of them are on this machine.
+    pub layers: usize,
+    pub layers_here: usize,
+    /// The bytes of weights on this machine: its stage, and the ends.
+    pub bytes_here: usize,
     pub stages: Vec<Staged>,
 }
 
@@ -518,10 +523,15 @@ impl PipelineSession {
     }
 
     fn report(&self, repo: &str) -> Report {
+        let here = || self.stages.iter().filter(|stage| !stage.elsewhere());
+        let ends = if self.ends.shard().layers.is_empty() { self.ends.memory_bytes() } else { 0 };
         Report {
             repo: repo.to_string(),
             precision: self.precision.to_string(),
             positions: self.len,
+            layers: self.stages.iter().map(|stage| stage.shard().layers.len()).sum(),
+            layers_here: here().map(|stage| stage.shard().layers.len()).sum(),
+            bytes_here: ends + here().map(|stage| stage.holds().1).sum::<usize>(),
             stages: self
                 .stages
                 .iter()
@@ -634,11 +644,18 @@ pub struct Across<'a> {
     /// Who is shown the load a machine at a time: every machine's steps
     /// go here under its name, as [`crate::weights::Fetch::Part`].
     pub watch: &'a crate::weights::Watcher,
+    /// What this machine has for the model, in bytes, where something
+    /// keeps count: a server with other models in memory has less than the
+    /// machine has. `None` is the machine's own memory.
+    pub memory: Option<u64>,
 }
 
 /// The machines of a plan: this one, timed, and each worker reached by its
 /// quickest path and timed there.
-pub fn survey(spec: &Spec, precision: Precision, workers: &[String], key: &Key, progress: &mut dyn FnMut(&str)) -> Res<(Vec<plan::Node>, Vec<path::Path>)> {
+///
+/// `memory` is what this machine has for the model if the caller keeps
+/// count of that, and its usable memory if not. A worker says its own.
+pub fn survey(spec: &Spec, precision: Precision, workers: &[String], key: &Key, memory: Option<u64>, progress: &mut dyn FnMut(&str)) -> Res<(Vec<plan::Node>, Vec<path::Path>)> {
     // Asked once, and only if somebody was named rather than addressed:
     // an answer to multicast is waited for, and that is a couple of seconds.
     let found = match workers.iter().any(|w| discover::is_a_name(w)) {
@@ -651,7 +668,7 @@ pub fn survey(spec: &Spec, precision: Precision, workers: &[String], key: &Key, 
     let here = plan::bench(spec.n_embd, spec.intermediate, precision);
     let mut nodes = vec![plan::Node {
         name: super::hostname(),
-        memory: crate::machine::usable_memory_cached().unwrap_or(u64::MAX),
+        memory: memory.or_else(crate::machine::usable_memory_cached).unwrap_or(u64::MAX),
         layer_ms: here.layer_ms,
         hop_ms: 0.0,
         prompt_layer_ms: here.prompt_layer_ms,
@@ -728,7 +745,7 @@ fn checked(want: &Across) -> Res<()> {
 /// and the plan is said.
 pub fn across(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<Box<dyn Session>> {
     checked(want)?;
-    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, progress)?;
+    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, want.memory, progress)?;
     let plan = planned(want, &nodes)?;
     for line in plan::table(&nodes, &plan) {
         progress(&line);
@@ -751,7 +768,7 @@ pub fn across(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<Box<dyn Sess
 /// where its time went.
 pub fn pipeline(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<PipelineSession> {
     checked(want)?;
-    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, progress)?;
+    let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, want.memory, progress)?;
     let plan = planned(want, &nodes)?;
     for line in plan::table(&nodes, &plan) {
         progress(&line);
@@ -777,7 +794,7 @@ fn staged(want: &Across, plan: &plan::Plan, ways: &[path::Path], progress: &mut 
         .iter()
         .zip(&plan.shares[1..])
         .filter(|(_, share)| !share.layers.is_empty())
-        .map(|(way, share)| (way, Load { repo: want.repo.to_string(), precision: want.precision.to_string(), layers: [share.layers.start, share.layers.end] }))
+        .map(|(way, share)| (way, Load { repo: want.repo.to_string(), precision: want.precision.to_string(), layers: [share.layers.start, share.layers.end], context: want.context }))
         .collect();
     progress(&format!("reading {here} here"));
     for (way, load) in &asked {

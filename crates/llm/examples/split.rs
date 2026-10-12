@@ -127,6 +127,7 @@ fn main() -> Res<()> {
                     context: spec.n_ctx.min(8192),
                     mix: kvad::cluster::plan::Mix::REPLY,
                     watch: &kvad::weights::Watcher::none(),
+                    memory: None,
                 };
                 session::across(&want, &mut |msg| eprintln!("  {msg}"))?
             }

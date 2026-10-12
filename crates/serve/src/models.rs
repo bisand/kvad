@@ -381,12 +381,15 @@ pub struct Budgeted {
     left: u64,
     /// Tokens of KV cache each resident is charged for.
     context: usize,
+    /// What is held here for a model on another machine, which takes of
+    /// the budget as a resident does and is nobody's to chat with.
+    guests: Vec<crate::memory::Held>,
 }
 
 impl Budgeted {
     pub fn of(engine: &crate::scheduler::Scheduler) -> Budgeted {
         let budget = engine.budget();
-        Budgeted { total: budget.total, left: engine.left(), context: budget.context }
+        Budgeted { total: budget.total, left: engine.left(), context: budget.context, guests: engine.guests() }
     }
 }
 

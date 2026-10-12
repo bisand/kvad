@@ -86,6 +86,7 @@ pub static V2: Architecture = Architecture {
     model_types: &["deepseek_v2"],
     about: "DeepSeek V2: latent attention (MLA) over a 512-wide cache, 64 routed experts",
     configure,
+    splits: true,
     load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
 };
 
@@ -99,6 +100,7 @@ pub static V3: Architecture = Architecture {
     model_types: &["deepseek_v3"],
     about: "DeepSeek V3/R1: MLA, 256 experts in 8 groups, sigmoid routing with a learned bias",
     configure,
+    splits: true,
     load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
 };
 

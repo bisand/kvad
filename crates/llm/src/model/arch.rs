@@ -62,6 +62,11 @@ pub struct Architecture {
     /// [`Spec::config`](Spec) here.
     pub configure: fn(&mut Spec) -> Res<()>,
 
+    /// Whether a model of this architecture can be loaded as less than the
+    /// whole: see [`Shard`]. Asked before a model is, by something
+    /// deciding whether its layers could go on several machines.
+    pub splits: bool,
+
     /// Build the thing that runs, given somewhere to get weights from: the
     /// whole model, or the [`Shard`] of it asked for. An architecture that
     /// does not split refuses anything less than the whole.
@@ -97,6 +102,11 @@ impl Arch {
     /// what else exists.
     pub fn is(self, id: &str) -> bool {
         self.0.id == id
+    }
+
+    /// Whether a model of this architecture can be cut into shards.
+    pub fn splits(self) -> bool {
+        self.0.splits
     }
 
     pub(crate) fn configure(self, spec: &mut Spec) -> Res<()> {

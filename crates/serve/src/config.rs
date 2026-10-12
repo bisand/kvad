@@ -49,6 +49,8 @@ pub struct Config {
     pub database: Database,
     pub auth: Auth,
     pub videos: Videos,
+    pub cluster: Cluster,
+    pub worker: Worker,
     /// The command line's, not the server's. It is here so that a file with
     /// it in is not refused as having a key nobody knows.
     pub client: Client,
@@ -125,6 +127,51 @@ pub struct Server {
     /// reply, and a reply that begins makes the others wait while its
     /// prompt is read.
     pub batch: Option<usize>,
+}
+
+/// Other machines to put a model's layers on: see `docs/cluster-plan.md`.
+///
+/// With workers named, a language model loaded at a CPU backend is placed
+/// across this machine and them: as many layers as fit on the fastest,
+/// then the next. A model that fits here stays here whole, and its load is
+/// the load it always was, so naming workers costs the models that do not
+/// need them nothing but the asking.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Cluster {
+    /// Each by the name `kvad worker` prints, its id, or an address.
+    pub workers: Vec<String>,
+    /// What to place layers for: `reply`, `prompt`, or `N:M` for N tokens
+    /// read to M written.
+    pub place: String,
+    /// The layers each machine holds, this one first, for every model
+    /// loaded: `0..12,12..24`. For a rig with one model on it, where the
+    /// placing wanted is not the one worked out.
+    pub split: Option<String>,
+}
+
+impl Default for Cluster {
+    fn default() -> Self {
+        Cluster { workers: Vec::new(), place: "reply".into(), split: None }
+    }
+}
+
+/// This server as a worker for another machine's models.
+///
+/// It answers a coordinator that holds the same cluster key, which is the
+/// file `cluster.key` in the data directory: made on the first start with
+/// this on, and copied to the other machines.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Worker {
+    pub enabled: bool,
+    pub port: u16,
+}
+
+impl Default for Worker {
+    fn default() -> Self {
+        Worker { enabled: false, port: kvad::cluster::wire::PORT }
+    }
 }
 
 /// What happens to a video once it is made.

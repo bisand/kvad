@@ -957,6 +957,25 @@ and prefill against Phase 0's prediction of `Σ stages + hops × RTT`, and an
 account of the difference. Pipelined prefill chunks, measured before and
 after. The README chapter gets written here, from the numbers.
 
+**Phase 5 has begun**, with the part that makes the rest reachable:
+`[cluster]` and `[worker]` in `kvad.toml`, a worker inside `kvad-serve`, and
+`GET /api/cluster` with `kvad cluster status` in front of it. A server with
+workers named spreads a CPU load over them through the same `session::across`
+that `--workers` uses, and a model the plan leaves wholly here is loaded
+whole and not as a pipeline of one stage — which it was, briefly, and which
+would have cost every model on such a server its cache file and its
+several conversations for the sake of the one model that needed workers.
+
+Tried with two servers on one machine, one a worker and one naming it with
+a split by hand: the same reply as the model whole, and the worker's log in
+the first server's log.
+
+Not yet: the Cluster page; a load's progress a machine at a time; per-stage
+timing out of a running model (`PipelineSession::timing` has it, and nothing
+carries it out of the engine); GPU stages; and the scheduler's memory, which
+charges a spread model as if all of it were here and does not charge a
+server for the layers it holds for somebody else.
+
 **Phase 5 — the server.** `[cluster]` and `[worker]` in `kvad.toml`, worker
 mode inside `kvad-serve`, a Cluster page (nodes, memory, layers per node,
 per-hop latency, a per-stage share of each token, and for each peer the chosen

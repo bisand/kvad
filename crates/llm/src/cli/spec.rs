@@ -74,6 +74,7 @@ const CRAWL: &[Flag] = &[
 /// `kvad cluster`'s usage. Here and not beside the command, which a build
 /// without the `cluster` feature does not have.
 pub const CLUSTER: &str = "usage: kvad cluster plan MODEL --workers NAME[,NAME]   which machine would hold what
+       kvad cluster status              what a running server's part in a cluster is
        kvad cluster find [--all]        who is on the other end of each cable
        kvad cluster listen [--port N]   be the far end of a measurement
        kvad cluster ping [HOST]         measure the link to a machine that is listening
@@ -760,7 +761,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "cluster",
         group: Group::Measure,
-        args: "[find|plan|listen|ping|link]",
+        args: "[find|plan|status|listen|ping|link]",
         about: "measure the link between two machines, and say what it is",
         server: false,
         routed: false,
@@ -782,6 +783,7 @@ pub const COMMANDS: &[Command] = &[
                 ]],
             },
             Sub { name: "link", args: "IFACE", about: "say what one interface's link is", words: &[Kind::Text], flags: &[] },
+            Sub { name: "status", args: "", about: "a server's part in a cluster: whether it is a worker, and whose", words: &[], flags: &[] },
             Sub {
                 name: "plan",
                 args: "MODEL",

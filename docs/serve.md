@@ -227,6 +227,53 @@ second one. It is off by default, because the cost is a model in memory a
 minute after boot whether or not anybody turns up, and a load queued ahead of
 everything else before anyone asked for it.
 
+## A model too large for this machine, on several
+
+A language model at a CPU backend can be spread over other machines, its
+layers divided between them; [`cluster-plan.md`](cluster-plan.md) is the
+whole of how and why. The server's part is two sections of `kvad.toml`.
+
+```toml
+[cluster]
+workers = ["studio", "689fdb39"]   # by name, id or address
+
+[worker]
+enabled = true                     # and this server holds layers for others
+```
+
+With `[cluster] workers` set, a load asks those machines how fast they are
+and how much they can hold, and places the layers: as many as fit on the
+fastest, then the next. **A model that fits here stays here**, whole, loaded
+exactly as it is with no workers named — same cache file, same several
+conversations, same replies in a batch. The workers are for the model that
+does not fit. `place = "prompt"` or `"2000:200"` places for the prompt read
+quickest instead of the reply written quickest, which shares the work out
+where the default would not.
+
+With `[worker] enabled`, the server answers coordinators on port 7420 beside
+serving its own models, and says so on the local network. It answers only a
+machine with the same `cluster.key`, which is made in the data directory the
+first time a worker starts there and is copied by hand to the others. Both
+ends have to be the same build, to the commit.
+
+`GET /api/cluster` and `kvad cluster status` say what the two sections came
+to, and which workers the network says are there.
+
+What this does not do yet, said plainly:
+
+- **GPU backends are not spread.** A stage is CPU layers; `gpu-q8` loads
+  whole or not at all.
+- **A model in stages keeps one conversation.** A second one costs the
+  first its cache, and replies are not written in a batch.
+- **Memory is counted by each machine for itself.** The scheduler charges a
+  spread model as if all of it were here, and a server holding layers for
+  another machine does not count them against its own models.
+- **A worker that goes away fails the reply** and the model stays loaded
+  and broken until it is unloaded. Nothing reconnects.
+- **Each load asks the network again**, which is about ten seconds of
+  finding and measuring before anything is read.
+- What crosses between machines is not encrypted.
+
 ## The default backend is the one that is faster here
 
 Which backend a load uses when nobody picks one used to be `cpu-q8`, from

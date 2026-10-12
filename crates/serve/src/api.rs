@@ -21,6 +21,7 @@ use axum::{Json, Router};
 
 pub fn routes() -> Router<State> {
     Router::new()
+        .merge(crate::cluster::routes())
         .route("/api/health", get(health))
         .route("/api/openapi.json", get(crate::openapi::document))
         .route("/api/models", get(crate::models::list).delete(crate::models::remove))

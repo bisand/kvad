@@ -44,6 +44,7 @@ mod assets;
 mod auth;
 mod bench;
 mod chat;
+mod cluster;
 mod compare;
 mod config;
 mod conversations;
@@ -237,6 +238,8 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
         matches!(cfg.auth.mode, config::Mode::Local | config::Mode::Basic) && accounts == 0;
 
     let budget = memory::Budget::of_machine(cfg.server.memory_gb, cfg.server.context);
+    // Before the engine can load anything: a load asks what the cluster is.
+    cluster::start(&cfg.cluster, &cfg.worker);
     let settings = std::sync::Arc::new(settings::Running::new(
         config_path.clone(),
         &cfg,

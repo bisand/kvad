@@ -125,6 +125,7 @@ fn main() -> Res<()> {
                     key,
                     params: kvad::hub::find_local(&repo).and_then(|m| m.params),
                     context: spec.n_ctx.min(8192),
+                    mix: kvad::cluster::plan::Mix::REPLY,
                 };
                 session::across(&want, &mut |msg| eprintln!("  {msg}"))?
             }

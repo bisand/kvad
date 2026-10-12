@@ -58,7 +58,7 @@ fn main() -> Res<()> {
     let workers: Vec<String> = workers.split(',').map(str::to_string).collect();
     let split = session::parse_split(split)?;
     let key = Key::ours()?;
-    let want = Across { repo: &repo, files: &files, spec: &spec, precision, workers: &workers, split: Some(&split), key: &key, params: None, context: spec.n_ctx.min(8192) };
+    let want = Across { repo: &repo, files: &files, spec: &spec, precision, workers: &workers, split: Some(&split), key: &key, params: None, context: spec.n_ctx.min(8192), mix: kvad::cluster::plan::Mix::REPLY };
     let mut across = session::pipeline(&want, &mut |msg| eprintln!("  {msg}"))?;
     let mut whole = CpuSession::new(kvad::qcache::load(&repo, &files, &spec, precision, &mut |_| {})?, precision);
 

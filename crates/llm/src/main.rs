@@ -110,6 +110,8 @@ struct Args {
     split: Option<String>,
     /// The longest conversation a plan leaves room for, in tokens.
     context: Option<usize>,
+    /// What layers are placed for: `reply`, `prompt` or `N:M`.
+    place: Option<String>,
     stream_mb: Option<usize>,
     all: bool,
     tokens: Option<usize>,
@@ -218,6 +220,7 @@ impl Default for Args {
             workers: None,
             split: None,
             context: None,
+            place: None,
             stream_mb: None,
             all: false,
             tokens: None,
@@ -438,6 +441,7 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--workers" => a.workers = Some(value.clone()),
             "--split" => a.split = Some(value.clone()),
             "--context" => a.context = Some(num() as usize),
+            "--place" => a.place = Some(value.clone()),
             "--stream-mb" => a.stream_mb = Some(num() as usize),
             "--tokens" => a.tokens = Some(num() as usize),
             // In the table and not in this match: the test in `cli::spec`
@@ -493,6 +497,7 @@ fn load(args: &Args) -> Res<Llm> {
             let key = Key::ours()?;
             let name = weights::model_id(&repo);
             let params = kvad::hub::find_local(&name).and_then(|model| model.params);
+            let mix = args.place.as_deref().map(kvad::cluster::plan::Mix::parse).transpose()?.unwrap_or(kvad::cluster::plan::Mix::REPLY);
             Llm::load_custom(&repo, &mut said, &weights::Watcher::none(), &mut |files, spec, progress| {
                 let want = session::Across {
                     repo: &name,
@@ -504,6 +509,7 @@ fn load(args: &Args) -> Res<Llm> {
                     key: &key,
                     params,
                     context: args.context.unwrap_or(spec.n_ctx.min(cli::cluster::CONTEXT)),
+                    mix,
                 };
                 session::across(&want, progress)
             })?

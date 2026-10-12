@@ -86,6 +86,12 @@ const ACROSS: &[Flag] = &[
     f("--workers", "NAME[,NAME]", Kind::Text, "spread the model over these machines, each running `kvad worker`: by name, id or address"),
     f("--split", "A..B,C..D", Kind::Text, "the layers each machine holds, this one first, instead of the ones worked out"),
     f("--context", "N", Kind::Text, "the longest conversation to leave memory for, in tokens (default: the model's, at most 8192)"),
+    f(
+        "--place",
+        "reply|prompt|N:M",
+        Kind::Text,
+        "what to place the layers for: the reply written quickest (default), the prompt read quickest, or N tokens read to M written",
+    ),
 ];
 
 const CLUSTER_PORT: Flag = f("--port", "N", Kind::Text, "the port to listen on, or to reach (default 7420)");
@@ -819,7 +825,12 @@ pub const COMMANDS: &[Command] = &[
                 holds layers and nothing else. The one that has the prompt names it:\n\n\
                 \x20 kvad run --model MODEL --workers THIS-MACHINE\n\n\
                 and the layers are placed: as many as fit on the fastest machine, then the\n\
-                next, and a machine the model has no need of is left out. `kvad cluster\n\
+                next, and a machine the model has no need of is left out. That is the\n\
+                placing that writes a reply quickest. A prompt is another matter: it is\n\
+                read by every machine at once, and quickest with the work shared out, so\n\
+                --place prompt gives a slower machine some layers where --place reply\n\
+                gives it none, and --place 2000:200 places for that much reading to that\n\
+                much writing. `kvad cluster\n\
                 plan MODEL --workers ...` shows the placing and loads nothing. --split\n\
                 0..12,12..24 places them by hand instead: 0 to 11 on the machine with the\n\
                 prompt, 12 to 23 here. A worker fetches the files its own layers are in,\n\

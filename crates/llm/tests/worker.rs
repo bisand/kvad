@@ -308,7 +308,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
         generation_config: None,
     };
     let want = |workers: &[String], split: Option<&[std::ops::Range<usize>]>, params: Option<u64>| {
-        let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers, split, key: &key(), params, context: 64 };
+        let want = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers, split, key: &key(), params, context: 64, mix: kvad::cluster::plan::Mix::REPLY };
         session::across(&want, &mut |_| {}).map_err(|e| e.to_string())
     };
     let why = |workers: &[&str], split: &str| {
@@ -348,7 +348,7 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
     // nothing and runs in one stage.
     let mut lines = Vec::new();
     let params = fixture.load(Precision::F32, &Shard::whole(&fixture.spec)).param_count() as u64;
-    let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64 };
+    let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64, mix: kvad::cluster::plan::Mix::REPLY };
     let mut session = session::across(&placed, &mut |line| lines.push(line.to_string())).unwrap();
     assert_eq!(session.label(), "cpu f32 in 1 stages");
     assert!(lines.iter().any(|l| l.starts_with("MACHINE")) && lines.iter().any(|l| l.contains("the workers hold nothing")), "{lines:?}");

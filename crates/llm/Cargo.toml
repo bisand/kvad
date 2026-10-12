@@ -63,3 +63,7 @@ url = "2.5.8"
 [[example]]
 name = "split"
 required-features = ["cluster"]
+
+[[example]]
+name = "hops"
+required-features = ["cluster"]

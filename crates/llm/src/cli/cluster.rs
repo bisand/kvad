@@ -116,6 +116,9 @@ fn measure(args: &Args, host: Option<&str>) -> Res<()> {
     if let Some(sizes) = &args.sizes {
         options.sizes = ping::parse_sizes(sizes)?;
     }
+    if let Some(ms) = args.gap {
+        options.gap = std::time::Duration::from_secs_f64(ms.clamp(0.0, 10_000.0) / 1e3);
+    }
     if let Some(mb) = args.stream_mb {
         options.stream = mb.min(4095) << 20;
     }

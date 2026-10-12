@@ -37,6 +37,23 @@ pub trait Stage: Send {
 
     /// Parameters held, and the bytes they take.
     fn holds(&self) -> (usize, usize);
+
+    /// For a stage somewhere else: the passes it has run and the time it
+    /// was inside its layers for them, since this was last asked. `None`
+    /// from a stage in this process, whose every millisecond is already
+    /// the caller's to see.
+    ///
+    /// A round trip to a worker is its layers' time and the hop's, and
+    /// only the worker can say which is which.
+    fn inside(&mut self) -> Option<super::wire::Spent> {
+        None
+    }
+
+    /// Whether this stage's layers are on another machine, so that this
+    /// one waits while they run.
+    fn elsewhere(&self) -> bool {
+        false
+    }
 }
 
 /// A stage in this process: a shard of the model and the caches for it.

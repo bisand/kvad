@@ -63,7 +63,7 @@ fn measured(address: &str, mut stream: TcpStream, hello: Hello) -> Result<Path, 
         (Ok(local), Ok(peer)) => link::between(&local.ip(), &peer.ip()),
         _ => None,
     };
-    let options = ping::Options { rounds: 3, sizes: vec![DECODE_HOP, PREFILL_CHUNK], stream: 0 };
+    let options = ping::Options { rounds: 3, sizes: vec![DECODE_HOP, PREFILL_CHUNK], stream: 0, gap: std::time::Duration::ZERO };
     let got = ping::measure(&mut stream, &options, &mut |_| {}).map_err(|e| format!("{address}: {e}"))?;
     Ok(Path { address: address.to_string(), hello, link, hop_ms: got.median(0), chunk_ms: got.median(1) })
 }

@@ -145,11 +145,16 @@ pub struct Options {
     pub sizes: Vec<usize>,
     /// Bytes sent one way, for the ceiling.
     pub stream: usize,
+    /// How long to leave the link idle before each frame. Nothing, for a
+    /// sweep back to back; a token's worth of milliseconds, to measure a
+    /// hop as a model takes one, which is a frame, a wait while somebody
+    /// computes, and a frame.
+    pub gap: Duration,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { rounds: 7, sizes: SIZES.to_vec(), stream: 64 << 20 }
+        Options { rounds: 7, sizes: SIZES.to_vec(), stream: 64 << 20, gap: Duration::ZERO }
     }
 }
 
@@ -194,6 +199,9 @@ pub fn measure(stream: &mut TcpStream, options: &Options, round_done: &mut dyn F
     let mut back = Vec::new();
     for round in 0..=options.rounds {
         for (blob, samples) in blobs.iter().zip(&mut samples) {
+            if !options.gap.is_zero() {
+                std::thread::sleep(options.gap);
+            }
             let start = Instant::now();
             wire::write(stream, Kind::Ping, blob)?;
             let kind = wire::read(stream, MOST_ECHOED, &mut back)?;
@@ -328,7 +336,7 @@ mod tests {
     fn a_sweep_over_loopback_times_every_size_every_round() {
         let (mut stream, peer) = connect("127.0.0.1", local()).unwrap();
         assert_eq!(peer, Hello::ours());
-        let options = Options { rounds: 3, sizes: vec![0, 1, 1 << 10, DECODE_HOP, 300_000], stream: 1 << 20 };
+        let options = Options { rounds: 3, sizes: vec![0, 1, 1 << 10, DECODE_HOP, 300_000], stream: 1 << 20, gap: std::time::Duration::ZERO };
         let mut rounds = Vec::new();
         let got = measure(&mut stream, &options, &mut |r| rounds.push(r)).unwrap();
         assert_eq!(rounds, [0, 1, 2, 3], "the warm-up is a round too, and is said");
@@ -340,7 +348,7 @@ mod tests {
         }
         assert!(got.stream_ms > 0.0 && got.ceiling() > 0.0);
         // The same connection measures again: nothing was left on the wire.
-        assert!(measure(&mut stream, &Options { rounds: 1, sizes: vec![64], stream: 0 }, &mut |_| {}).is_ok());
+        assert!(measure(&mut stream, &Options { rounds: 1, sizes: vec![64], stream: 0, gap: std::time::Duration::ZERO }, &mut |_| {}).is_ok());
     }
 
     #[test]
@@ -368,7 +376,7 @@ mod tests {
 
         // And after all that it still answers the next one.
         let (mut stream, _) = connect("127.0.0.1", port).unwrap();
-        assert!(measure(&mut stream, &Options { rounds: 1, sizes: vec![1024], stream: 1024 }, &mut |_| {}).is_ok());
+        assert!(measure(&mut stream, &Options { rounds: 1, sizes: vec![1024], stream: 1024, gap: std::time::Duration::ZERO }, &mut |_| {}).is_ok());
     }
 
     #[test]

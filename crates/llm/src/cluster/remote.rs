@@ -203,4 +203,16 @@ impl Stage for RemoteStage {
     fn holds(&self) -> (usize, usize) {
         (self.held.params, self.held.bytes)
     }
+
+    fn elsewhere(&self) -> bool {
+        true
+    }
+
+    fn inside(&mut self) -> Option<wire::Spent> {
+        self.out.clear();
+        match self.ask(Kind::Spend, 1 << 16) {
+            Ok(Kind::Spent) => wire::parse(Kind::Spent, &self.back).ok(),
+            _ => None,
+        }
+    }
 }

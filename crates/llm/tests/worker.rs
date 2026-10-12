@@ -417,3 +417,39 @@ fn the_quickest_way_to_a_worker_is_one_that_answers() {
     let (_, hello) = remote::connect(&at, &key()).unwrap();
     assert_eq!(hello.version, kvad::cluster::build());
 }
+
+/// A pipeline says where its time went: each stage's passes and their
+/// milliseconds, and for a stage on another machine how much of that the
+/// machine was inside its layers. What is left of a round trip is the hop,
+/// and no one end could say so alone.
+#[test]
+fn a_pipeline_says_where_a_tokens_time_went() {
+    let fixture = llama("llama", "worker-timing");
+    let at = a_worker(&fixture);
+    let ends: Arc<dyn Transformer> = Arc::from(fixture.load(Precision::F32, &Shard { layers: 0..1, ends: true }));
+    let stages: Vec<Box<dyn Stage>> = vec![Box::new(LocalStage::new(ends.clone())), remote(&at, Precision::F32, 1..4)];
+    let mut split = PipelineSession::new(ends, stages, Precision::F32).unwrap().reading(8);
+
+    let mut logits = split.forward(&[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5]).unwrap();
+    // The prompt was two passes; asking empties the count.
+    let (stages, head) = split.timing();
+    assert_eq!(stages.iter().map(|s| s.runs).collect::<Vec<_>>(), [2, 2]);
+    assert_eq!(head.0, 1, "and the head ran once, on the last of them");
+
+    for _ in 0..5 {
+        let next = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        logits = split.forward(&[next]).unwrap();
+    }
+    let (stages, head) = split.timing();
+    assert_eq!((stages[0].shard.layers.clone(), stages[1].shard.layers.clone()), (0..1, 1..4));
+    assert_eq!((stages[0].runs, stages[1].runs, head.0), (5, 5, 5));
+    assert!(stages[0].inside_ms.is_none(), "a stage here has nothing to add to what was seen");
+    let inside = stages[1].inside_ms.expect("a worker says what it spent");
+    assert!(inside > 0.0 && inside <= stages[1].ms, "{inside} ms inside a round trip of {}", stages[1].ms);
+    assert!(stages[0].ms > 0.0 && head.1 > 0.0);
+
+    // Asked again with nothing run, there is nothing to say.
+    let (stages, head) = split.timing();
+    assert!(stages.iter().all(|s| s.runs == 0 && s.ms == 0.0) && head == (0, 0.0));
+    assert_eq!(stages[1].inside_ms, Some(0.0));
+}

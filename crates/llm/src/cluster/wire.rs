@@ -288,6 +288,12 @@ pub struct Ready {
 pub struct Spent {
     pub runs: u64,
     pub ms: f64,
+    /// Of those, the passes of one row, which are tokens being written
+    /// and not a prompt being read, and their milliseconds.
+    #[serde(default)]
+    pub one_runs: u64,
+    #[serde(default)]
+    pub one_ms: f64,
 }
 
 /// The shape of a layer to time: see [`super::plan::bench`].

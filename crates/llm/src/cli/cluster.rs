@@ -339,6 +339,29 @@ fn status(args: &Args) -> Res<()> {
     if cluster["has_key"] != true {
         println!("no cluster key here: a worker makes one the first time it starts, and every machine needs the same");
     }
+    for model in super::out::items(&cluster["models"]) {
+        println!("\n{} at {}, across machines:", s(&model["repo"]), s(&model["precision"]));
+        let rows: Vec<Vec<String>> = super::out::items(&model["stages"])
+            .iter()
+            .map(|stage| {
+                let per = |ms: &serde_json::Value, runs: &serde_json::Value| match (ms.as_f64(), runs.as_f64()) {
+                    (Some(ms), Some(runs)) if runs > 0.0 => format!("{:.2} ms", ms / runs),
+                    _ => "-".to_string(),
+                };
+                vec![
+                    format!("{}..{}", s(&stage["layers"][0]), s(&stage["layers"][1])),
+                    s(&stage["machine"]),
+                    if stage["here"] == true { "here".to_string() } else { s(&stage["link"]) },
+                    per(&stage["one_ms"], &stage["one_runs"]),
+                    match stage["here"] == true {
+                        true => per(&stage["one_ms"], &stage["one_runs"]),
+                        false => per(&stage["inside_one_ms"], &stage["asked_one_runs"]),
+                    },
+                ]
+            })
+            .collect();
+        super::out::table(&["LAYERS", "MACHINE", "LINK", "A TOKEN", "IN ITS LAYERS"], &rows);
+    }
     let found = super::out::items(&cluster["found"]);
     if found.is_empty() {
         println!("\nNo worker says it is on the network.");

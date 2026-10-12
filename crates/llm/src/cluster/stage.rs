@@ -49,11 +49,31 @@ pub trait Stage: Send {
         None
     }
 
+    /// Where this stage's layers are, for whoever is shown the pipeline.
+    fn place(&self) -> Place {
+        Place { machine: super::hostname(), address: None, link: None, hop_ms: None, chunk_ms: None }
+    }
+
     /// Whether this stage's layers are on another machine, so that this
     /// one waits while they run.
     fn elsewhere(&self) -> bool {
         false
     }
+}
+
+/// Where a stage is: the machine, and for one that is not this machine,
+/// how it is reached and what the way there measured.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Place {
+    pub machine: String,
+    /// As it was connected to. `None` for a stage in this process.
+    pub address: Option<String>,
+    /// What the link is, in the words `kvad cluster link` uses.
+    pub link: Option<String>,
+    /// Milliseconds there and back for 32 KB and for 2 MB, as measured
+    /// when the stage was opened.
+    pub hop_ms: Option<f64>,
+    pub chunk_ms: Option<f64>,
 }
 
 /// A stage in this process: a shard of the model and the caches for it.

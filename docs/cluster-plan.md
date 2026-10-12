@@ -970,9 +970,23 @@ Tried with two servers on one machine, one a worker and one naming it with
 a split by hand: the same reply as the model whole, and the worker's log in
 the first server's log.
 
-Not yet: the Cluster page; a load's progress a machine at a time; per-stage
-timing out of a running model (`PipelineSession::timing` has it, and nothing
-carries it out of the engine); GPU stages; and the scheduler's memory, which
+**The Cluster page** is built, and with it the way a running model's
+stages get out of the engine: not through it. A pipeline keeps an account
+of itself — each stage, the machine and the link it is on, what it has
+taken to write a token and to read a chunk — on a board that
+`session::live()` reads from any thread, there for as long as the model is
+loaded. `GET /api/cluster` carries it, `kvad cluster status` prints it, and
+the page draws a token's time as a bar a stage, in two colours for a stage
+on another machine: its own layers, and what is left of the round trip.
+
+A worker is asked for its own time every fifty tokens or two seconds, not
+every token, so what it has said is behind what the coordinator has seen.
+The hop is the difference of two numbers and they have to be from the same
+moment: the board keeps the coordinator's counts as they stood when the
+worker was asked, beside the worker's answer.
+
+Not yet: a load's progress a machine at a time; GPU stages; and the
+scheduler's memory, which
 charges a spread model as if all of it were here and does not charge a
 server for the layers it holds for somebody else.
 

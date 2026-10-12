@@ -245,8 +245,13 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
                             .map_err(|panic| panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "the stage panicked".into()))
                             .and_then(|ran| ran.map_err(|fault| fault.to_string()))
                         });
+                        let took = started.elapsed().as_secs_f64() * 1e3;
                         spent.runs += 1;
-                        spent.ms += started.elapsed().as_secs_f64() * 1e3;
+                        spent.ms += took;
+                        if m == 1 {
+                            spent.one_runs += 1;
+                            spent.one_ms += took;
+                        }
                         awake = crate::model::linger(Some(pool));
                         ran
                     }

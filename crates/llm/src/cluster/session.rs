@@ -16,7 +16,10 @@
 //! `head` (see [`Transformer`]), and this is `embed`, one `blocks` per
 //! stage, `head`. The test that holds it to that compares bits.
 
+use super::key::Key;
+use super::remote::RemoteStage;
 use super::stage::{Fault, LocalStage, Stage};
+use super::wire::Load;
 use crate::model::{pool, prefill_chunk, Session, Shard, Spec, Transformer};
 use crate::quant::Precision;
 use std::sync::Arc;
@@ -38,6 +41,9 @@ pub struct PipelineSession {
     stages: Vec<Box<dyn Stage>>,
     /// Positions every stage holds.
     len: usize,
+    /// A pass failed part way down the pipeline, so the stages before the
+    /// failure hold rows the ones after it never saw.
+    torn: bool,
     chunk: usize,
     precision: Precision,
     pool: rayon::ThreadPool,
@@ -63,7 +69,7 @@ impl PipelineSession {
         }
         layers.insert(0, Shard { layers: 0..0, ends: true });
         Shard::check(&layers, spec.n_layer)?;
-        Ok(PipelineSession { ends, stages, len: 0, chunk: prefill_chunk(), precision, pool: pool() })
+        Ok(PipelineSession { ends, stages, len: 0, torn: false, chunk: prefill_chunk(), precision, pool: pool() })
     }
 
     /// Every stage in this process: the shards of one model, in any order.
@@ -116,7 +122,8 @@ impl Session for PipelineSession {
     /// of them ends in the head: the logits of a position in the middle of
     /// a prompt are nobody's to read.
     fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
-        let PipelineSession { ends, stages, len, chunk, pool, .. } = self;
+        self.mend()?;
+        let PipelineSession { ends, stages, len, chunk, pool, torn, .. } = self;
         let logits = pool.install(|| -> Result<Vec<f32>, Fault> {
             let mut logits = Vec::new();
             let mut parts = tokens.chunks(*chunk).peekable();
@@ -128,11 +135,13 @@ impl Session for PipelineSession {
             }
             Ok(logits)
         });
+        *torn = logits.is_err();
         logits.map_err(plain)
     }
 
     fn forward_all(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
-        let PipelineSession { ends, stages, len, chunk, pool, .. } = self;
+        self.mend()?;
+        let PipelineSession { ends, stages, len, chunk, pool, torn, .. } = self;
         let all = pool.install(|| -> Result<Vec<f32>, Fault> {
             let mut all = Vec::new();
             for part in tokens.chunks(*chunk) {
@@ -141,6 +150,7 @@ impl Session for PipelineSession {
             }
             Ok(all)
         });
+        *torn = all.is_err();
         all.map_err(plain)
     }
 
@@ -156,6 +166,7 @@ impl Session for PipelineSession {
     /// pipeline whose stages hold different lengths of one conversation has
     /// no position to carry on from.
     fn truncate(&mut self, len: usize) -> Res<usize> {
+        self.mend()?;
         if len >= self.len {
             return Ok(self.len);
         }
@@ -185,6 +196,27 @@ impl Session for PipelineSession {
 }
 
 impl PipelineSession {
+    /// Put the stages back in step after a pass that failed part way.
+    ///
+    /// The stages before the failure ran the pass's rows and the ones
+    /// after did not, and `len` was never moved: so every stage is told to
+    /// hold `len` positions, which is a rewind for some and nothing for the
+    /// rest. A stage that cannot — it has gone — fails this as it failed
+    /// the pass, and the session stays torn.
+    fn mend(&mut self) -> Res<()> {
+        if !self.torn {
+            return Ok(());
+        }
+        for stage in self.stages.iter_mut() {
+            let held = stage.truncate(SEQ, self.len).map_err(plain)?;
+            if held != self.len {
+                return Err(format!("{} holds {held} positions of a conversation that is {} long", stage.shard(), self.len).into());
+            }
+        }
+        self.torn = false;
+        Ok(())
+    }
+
     /// Parameters and bytes across the stages, and the ends where no stage
     /// has them: a stage that is also the ends counts them as its own.
     fn held(&self) -> (usize, usize) {
@@ -192,4 +224,62 @@ impl PipelineSession {
         let start = if ends_apart { (self.ends.param_count(), self.ends.memory_bytes()) } else { (0, 0) };
         self.stages.iter().map(|s| s.holds()).fold(start, |a, b| (a.0 + b.0, a.1 + b.1))
     }
+}
+
+/// `0..12,12..24` as layer ranges: what `--split` takes.
+pub fn parse_split(text: &str) -> Res<Vec<std::ops::Range<usize>>> {
+    let range = |word: &str| -> Option<std::ops::Range<usize>> {
+        let (from, to) = word.trim().split_once("..")?;
+        let (from, to) = (from.trim().parse().ok()?, to.trim().parse().ok()?);
+        (from <= to).then_some(from..to)
+    };
+    text.split(',').map(|word| range(word).ok_or_else(|| format!("`{}` is not a run of layers; --split is written 0..12,12..24", word.trim()).into())).collect()
+}
+
+/// A model across this machine and `workers`: the session `--workers` and
+/// `--split` ask for.
+///
+/// `split` names the layers by hand, a run for each machine in order, this
+/// one first. This machine always holds the ends, and may hold no layers
+/// (`0..0`). A worker has to hold at least one, or it is a hop for nothing.
+///
+/// By hand because the alternative, a planner that fills the fastest
+/// machine first, gives every worker nothing for any model small enough to
+/// try this with.
+pub fn across(
+    repo: &str,
+    files: &crate::weights::ModelFiles,
+    spec: &Spec,
+    precision: Precision,
+    workers: &[String],
+    split: &[std::ops::Range<usize>],
+    key: &Key,
+    progress: &mut dyn FnMut(&str),
+) -> Res<Box<dyn Session>> {
+    if split.len() != workers.len() + 1 {
+        return Err(format!(
+            "--split names {} run(s) of layers and there are {} machine(s): this one, then each of --workers, a run apiece",
+            split.len(),
+            workers.len() + 1
+        )
+        .into());
+    }
+    let shards: Vec<Shard> = split.iter().enumerate().map(|(i, layers)| Shard { layers: layers.clone(), ends: i == 0 }).collect();
+    Shard::check(&shards, spec.n_layer)?;
+    if let Some(i) = (1..shards.len()).find(|&i| shards[i].layers.is_empty()) {
+        return Err(format!("{} is given no layers; leave it out of --workers", workers[i - 1]).into());
+    }
+
+    progress(&format!("reading {} here", shards[0]));
+    let ends: Arc<dyn Transformer> = Arc::from(crate::qcache::load_shard(files, spec, precision, &shards[0])?);
+    let mut stages: Vec<Box<dyn Stage>> = Vec::new();
+    if !shards[0].layers.is_empty() {
+        stages.push(Box::new(LocalStage::new(ends.clone())));
+    }
+    for (worker, shard) in workers.iter().zip(&shards[1..]) {
+        progress(&format!("asking {worker} for {shard}"));
+        let load = Load { repo: repo.to_string(), precision: precision.to_string(), layers: [shard.layers.start, shard.layers.end] };
+        stages.push(Box::new(RemoteStage::open(worker, key, &load, progress).map_err(plain)?));
+    }
+    Ok(Box::new(PipelineSession::new(ends, stages, precision)?))
 }

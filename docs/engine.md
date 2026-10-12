@@ -21,6 +21,7 @@ kvad info --model openai-community/gpt2-medium   # config only, no weights
 kvad arch                          # architectures this build can run
 kvad cache                         # pre-quantised weight files
 kvad cluster ping                  # measure the cable to another machine
+kvad worker                        # hold some of a model's layers for another machine
 ```
 
 Read in this order:

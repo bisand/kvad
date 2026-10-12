@@ -909,6 +909,49 @@ the stages equal — more layers on the M5 Pro, which is the faster — and
 Placing layers for the prompt and placing them for the reply are therefore
 two different questions, and the planner asks only the second.
 
+**It asks both now.** `--place reply` is the planner as it was and still
+what it does unasked; `--place prompt` places for the prompt read quickest;
+and `--place 2000:200` for that much reading to that much writing. A
+plan's cost for a prompt is the slowest stage's share of a chunk — its
+layers at what a layer costs there *for a chunk*, which is timed apart from
+what it costs for one token because the two are different arithmetic on
+the same weights, and its round trip for a chunk's worth of rows. From the
+two fillings it already made, the planner moves layers between machines
+for as long as moving some makes the mix quicker, several at once where
+one alone would only buy a round trip.
+
+On the rig, SmolLM2-135M, what `kvad cluster plan --place prompt` chose
+and what a 1024-token prompt measured at around it, tokens a second:
+
+| layers here / on the Air | q8 | f32 |
+|---|---|---|
+| 27 / 3 | 563 | 484 |
+| 25 / 5 | 582 | 522 |
+| 23 / 7 | 636 | 574 |
+| 21 / 9 | 695 | **601** |
+| 20 / 10 | **704** | 571 |
+| 18 / 12 | 674 | 534 |
+| the model whole, here | 495 | 450 |
+
+The planner chose 20 or 21 here at q8 over three askings, which is the
+best there is, and 22 to 24 at f32, where the best is 21: within 5% of it.
+
+It did not start there. Its first answers were 23 to 25 at q8 and 25 at
+f32, a tenth and more short of the best, and the reason was the last
+finding again. The layer is timed on each machine when the plan is asked
+for, and a worker asked out of the blue has been idle; timed cold it
+looked three times slower than the machine that asked, where it is less
+than twice. The timing now runs the machine for a tenth of a second
+before it starts the clock.
+
+What the plan's numbers are still not is right in themselves. It thinks a
+layer reads a token in 0.023 ms here where the model whole says 0.067,
+because seven matrix products are not a layer; the placing comes out
+because the machines are wrong by about the same factor. For a reply they
+are not — it has the M5 Pro 2.7 times the Air's speed where the truth is
+1.15 — which costs nothing while the only question for a reply is which
+machine is faster, and would the day it is how much.
+
 **Phase 4 — two real machines.** A model that does not fit on either. Decode
 and prefill against Phase 0's prediction of `Σ stages + hops × RTT`, and an
 account of the difference. Pipelined prefill chunks, measured before and

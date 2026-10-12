@@ -37,6 +37,16 @@ pub struct Path {
 }
 
 impl Path {
+    /// What a frame of `bytes` should take there and back, from the two
+    /// that were measured: a straight line through them, which is what a
+    /// link is — a wait, and then so much a byte.
+    pub fn round_trip(&self, bytes: usize) -> f64 {
+        let a_byte = (self.chunk_ms - self.hop_ms) / (PREFILL_CHUNK - DECODE_HOP) as f64;
+        // Never less than a tenth of the small frame: below it the line is
+        // being asked about a wait it was not drawn through.
+        (self.hop_ms + a_byte * (bytes as f64 - DECODE_HOP as f64)).max(self.hop_ms / 10.0)
+    }
+
     /// One line: where, what, and how fast.
     pub fn line(&self) -> String {
         let what = match &self.link {
@@ -123,6 +133,22 @@ pub fn quickest(addresses: &[String], id: &str, key: &Key, said: &mut dyn FnMut(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The charging cable's own numbers: 2.6 ms for 32 KB and 106 ms for
+    /// 2 MB. A frame between is on the line between, one past is past it,
+    /// and a very small one is not said to take no time.
+    #[test]
+    fn a_frame_of_any_size_is_timed_from_the_two_that_were_measured() {
+        let way = Path { address: "air".into(), hello: Hello::ours(), link: None, hop_ms: 2.6, chunk_ms: 106.0 };
+        assert!((way.round_trip(DECODE_HOP) - 2.6).abs() < 1e-9 && (way.round_trip(PREFILL_CHUNK) - 106.0).abs() < 1e-9);
+        // A chunk of a small model: 64 rows of 576 floats.
+        let chunk = way.round_trip(64 * 576 * 4);
+        assert!(chunk > 7.0 && chunk < 10.0, "{chunk}");
+        let row = way.round_trip(576 * 4);
+        assert!(row > 0.26 && row < 2.6, "{row}");
+        assert!(way.round_trip(0) >= 0.26);
+        assert!(way.round_trip(2 * PREFILL_CHUNK) > 200.0);
+    }
 
     #[test]
     fn an_address_takes_its_port_the_way_it_can() {

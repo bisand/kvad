@@ -461,6 +461,9 @@ pub struct Across<'a> {
     pub params: Option<u64>,
     /// The longest conversation to leave room for, in tokens.
     pub context: usize,
+    /// What the layers are placed for, when they are placed here: so much
+    /// prompt read to so much reply written.
+    pub mix: plan::Mix,
 }
 
 /// The machines of a plan: this one, timed, and each worker reached by its
@@ -475,22 +478,31 @@ pub fn survey(spec: &Spec, precision: Precision, workers: &[String], key: &Key, 
         }
         false => Vec::new(),
     };
+    let here = plan::bench(spec.n_embd, spec.intermediate, precision);
     let mut nodes = vec![plan::Node {
         name: super::hostname(),
         memory: crate::machine::usable_memory_cached().unwrap_or(u64::MAX),
-        layer_ms: plan::bench(spec.n_embd, spec.intermediate, precision),
+        layer_ms: here.layer_ms,
         hop_ms: 0.0,
+        prompt_layer_ms: here.prompt_layer_ms,
+        prompt_hop_ms: 0.0,
     }];
+    // What crosses: a row of the residual stream for a token written, and
+    // a chunk of them for a prompt.
+    let row = spec.n_embd * std::mem::size_of::<f32>();
     let mut ways = Vec::with_capacity(workers.len());
     for worker in workers {
         let way = way_to(worker, &found, key, progress)?;
+        let there = super::remote::bench(&way.address, key, spec.n_embd, spec.intermediate, precision).map_err(plain)?;
         nodes.push(plan::Node {
             name: way.hello.name.clone(),
             // A worker that does not say is taken at its word about
             // nothing: it is given what it is given, and finds out.
             memory: way.hello.memory.unwrap_or(u64::MAX),
-            layer_ms: super::remote::bench(&way.address, key, spec.n_embd, spec.intermediate, precision).map_err(plain)?,
-            hop_ms: way.hop_ms,
+            layer_ms: there.layer_ms,
+            hop_ms: way.round_trip(row),
+            prompt_layer_ms: there.prompt_layer_ms,
+            prompt_hop_ms: way.round_trip(row * prefill_chunk()),
         });
         ways.push(way);
     }
@@ -510,7 +522,7 @@ pub fn planned(want: &Across, nodes: &[plan::Node]) -> Res<plan::Plan> {
             let nothing = plan::Sizes { n_layer: want.spec.n_layer, ends: 0, layer: 0, cache: 0 };
             Ok(plan::check(nodes, &nothing, split)?)
         }
-        (None, Some(sizes)) => Ok(plan::place(nodes, &sizes)?),
+        (None, Some(sizes)) => Ok(plan::place(nodes, &sizes, want.mix)?),
         (None, None) => Err("how large this model is could not be found out, so its layers cannot be placed; say where they go with --split".into()),
     }
 }

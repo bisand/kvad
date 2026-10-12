@@ -80,7 +80,7 @@ pub enum Kind {
     /// Let the stage go. Answered by an [`Kind::Ack`].
     Unload = 15,
     /// Time a layer of a model this shape: JSON, [`Bench`]. The answer is
-    /// a [`Kind::Benched`], `{"layer_ms": …}`. What a plan is made from,
+    /// a [`Kind::Benched`], JSON [`super::plan::Speed`]. What a plan is made from,
     /// before anything is loaded.
     Bench = 16,
     Benched = 17,

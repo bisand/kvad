@@ -111,16 +111,22 @@ pub fn connect_within(address: &str, key: &Key, reach: Duration, greeting: Durat
 }
 
 /// Ask the worker at `address` how long a layer of this shape takes it,
-/// in milliseconds: [`super::plan::bench`], run there.
-pub fn bench(address: &str, key: &Key, n_embd: usize, intermediate: usize, precision: crate::quant::Precision) -> Result<f64, Fault> {
+/// written and read: [`super::plan::bench`], run there.
+pub fn bench(address: &str, key: &Key, n_embd: usize, intermediate: usize, precision: crate::quant::Precision) -> Result<super::plan::Speed, Fault> {
     let (mut stream, hello) = connect(address, key)?;
     wire::send(&mut stream, Kind::Bench, &wire::Bench { n_embd, intermediate, precision: precision.to_string() })?;
     let mut buf = Vec::new();
     match wire::read(&mut stream, 1 << 16, &mut buf).map_err(|e| format!("{} ({address}): {e}", hello.name))? {
-        Kind::Benched => wire::parse::<serde_json::Value>(Kind::Benched, &buf)?["layer_ms"]
-            .as_f64()
-            .filter(|ms| ms.is_finite() && *ms > 0.0)
-            .ok_or_else(|| format!("{} timed a layer and gave no time", hello.name).into()),
+        Kind::Benched => {
+            let mut speed: super::plan::Speed = wire::parse(Kind::Benched, &buf)?;
+            if !(speed.layer_ms.is_finite() && speed.layer_ms > 0.0) {
+                return Err(format!("{} timed a layer and gave no time", hello.name).into());
+            }
+            if !(speed.prompt_layer_ms.is_finite() && speed.prompt_layer_ms > 0.0) {
+                speed.prompt_layer_ms = speed.layer_ms;
+            }
+            Ok(speed)
+        }
         Kind::Error => Err(format!("{} ({address}): {}", hello.name, wire::error_text(&buf)).into()),
         kind => Err(format!("{} answered a timing with a {kind:?}", hello.name).into()),
     }

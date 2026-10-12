@@ -329,8 +329,7 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
                 // being asked how fast is not a way to be asked for memory.
                 match (Precision::parse(&asked.precision), asked.n_embd <= 1 << 16 && asked.intermediate <= 1 << 20) {
                     (Some(precision), true) => {
-                        let layer_ms = super::plan::bench(asked.n_embd, asked.intermediate, precision);
-                        wire::send(stream, Kind::Benched, &serde_json::json!({ "layer_ms": layer_ms }))?
+                        wire::send(stream, Kind::Benched, &super::plan::bench(asked.n_embd, asked.intermediate, precision))?
                     }
                     _ => wire::send_error(stream, "that is not the shape of a layer")?,
                 }

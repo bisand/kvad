@@ -280,7 +280,10 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
                             spent.one_runs += 1;
                             spent.one_ms += took;
                         }
-                        awake = crate::model::linger(Some(pool));
+                        awake = match stage.keeps_itself_awake() {
+                            true => None,
+                            false => crate::model::linger(Some(pool)),
+                        };
                         ran
                     }
                     _ => Err("rows for a stage that has not been loaded".to_string()),

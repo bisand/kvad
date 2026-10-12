@@ -49,6 +49,18 @@ pub trait Stage: Send {
         None
     }
 
+    /// Whether this stage sees to it that its next pass is not a cold one,
+    /// so that nobody need keep the machine awake for it: see
+    /// [`crate::model::linger`], which is what a stage on the CPU is given.
+    ///
+    /// A stage on a GPU says yes. What goes cold under it is mostly the
+    /// GPU, which it keeps busy itself, and on an M2 Air a core spinning
+    /// beside that made a pass up to twice as slow as the GPU kept busy
+    /// alone.
+    fn keeps_itself_awake(&self) -> bool {
+        false
+    }
+
     /// Where this stage's layers are, for whoever is shown the pipeline.
     fn place(&self) -> Place {
         Place { machine: super::hostname(), address: None, link: None, hop_ms: None, chunk_ms: None }

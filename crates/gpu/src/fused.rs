@@ -416,6 +416,53 @@ pub(crate) mod metal {
         }
     }
 
+    /// Something for a GPU to do that is nothing to do with anybody: a
+    /// little arithmetic into a buffer of its own, on a command queue of
+    /// its own. It shares no buffer, no pool and no command buffer with
+    /// candle, so a thread may run it beside a model. See
+    /// `model::stage`'s `Warm`, which is what it is for.
+    pub(crate) struct Warmer {
+        queue: candle_metal_kernels::metal::CommandQueue,
+        pipe: ComputePipeline,
+        out: Buffer,
+    }
+
+    const WARM: &str = r#"
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void warm(device float *out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+        float x = float(i);
+        for (uint k = 0; k < 64; k++) { x = x * 1.0001f + 1.0f; }
+        out[i] = x;
+    }
+    "#;
+
+    impl Warmer {
+        const THREADS: usize = 4096;
+
+        pub(crate) fn new(device: &Device) -> Option<Warmer> {
+            let Device::Metal(md) = device else { return None };
+            let pipe = build(device, "warm", WARM, None)?.pipe("warm").ok()?;
+            let raw = md.metal_device();
+            let out = raw.new_buffer(Self::THREADS * 4, objc2_metal::MTLResourceOptions::StorageModeShared).ok()?;
+            Some(Warmer { queue: raw.new_command_queue().ok()?, pipe, out })
+        }
+
+        /// One kernel, and wait for it.
+        pub(crate) fn once(&self) -> Option<()> {
+            use objc2_metal::MTLCommandQueue;
+            let commands = candle_metal_kernels::metal::CommandBuffer::new(self.queue.commandBuffer()?);
+            let encoder = commands.compute_command_encoder_no_fence();
+            encoder.set_compute_pipeline_state(&self.pipe);
+            encoder.set_output_buffer(0, Some(&self.out), 0);
+            encoder.dispatch_threads(MTLSize { width: Self::THREADS, height: 1, depth: 1 }, MTLSize { width: 64, height: 1, depth: 1 });
+            encoder.end_encoding();
+            commands.commit();
+            commands.wait_until_completed();
+            Some(())
+        }
+    }
+
     /// The decode kernels: `None` where there is no Metal device, the source
     /// did not build, or `KVAD_GPU_FUSED=0` says not to.
     pub(super) fn kernels(device: &Device) -> Option<&'static Kernels> {
@@ -783,6 +830,15 @@ pub(crate) mod metal {
 #[cfg(not(target_os = "macos"))]
 pub(crate) mod metal {
     use super::*;
+    pub(crate) struct Warmer;
+    impl Warmer {
+        pub(crate) fn new(_: &Device) -> Option<Warmer> {
+            None
+        }
+        pub(crate) fn once(&self) -> Option<()> {
+            None
+        }
+    }
     pub(super) fn add_rms_norm(_: &Tensor, _: &Tensor, _: &Tensor, _: f32) -> candle_core::Result<(Tensor, Tensor)> {
         unreachable!()
     }

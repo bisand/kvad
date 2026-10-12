@@ -1059,7 +1059,46 @@ wrote 506 to 563. A model this small is all hop. One thing in it is not
 explained: this machine's fifteen layers took 2.0 ms a token with the Air
 in the loop and 0.94 ms with the other stage on this machine, so a GPU
 stage that waits between tokens seems to run slower, as a CPU one did
-before it was kept warm. Not chased yet.
+before it was kept warm.
+
+**It is the GPU that goes cold.** `crates/gpu/examples/stage_gaps` times
+one stage a token at a time after a wait, and takes the wait apart.
+Fifteen layers of SmolLM2-135M at q8, milliseconds a token, medians:
+
+| before each token | M5 Pro, 3 ms | 10 ms | M2 Air, 3 ms | 10 ms |
+|---|---|---|---|---|
+| nothing (back to back) | 0.82 | | 1.58 | |
+| the thread sleeps | 3.30 | 3.58 | 5.03 | 5.08 |
+| another thread spins | 1.62 | 2.72 | 1.79 | 2.88 |
+| the GPU is kept busy | 0.85 | 0.86 | 1.73 | 1.72 |
+
+A spinning core, which is the whole cure on the CPU, is part of one here.
+So a `GpuStage` keeps its own device busy between passes: one thread, a
+small kernel of its own over and over on a command queue of its own, until
+the next pass begins or `KVAD_LINGER_MS` has gone by. A worker does not
+also spin a core for such a stage (`Stage::keeps_itself_awake`): on the
+Air the two together were slower than the kernel alone.
+
+The first version ran candle's own ops in that thread and was wrong twice.
+It crashed: candle's Metal backend is not safe for two threads, its pool
+of buffers swept on every readback, and two sweeps release one buffer
+twice. And where it did not crash it helped the M5 and hurt the Air
+(1.9 ms a token became 4.3), most likely because each of its readbacks
+swept away the buffers the next pass was about to reuse. A kernel that
+shares nothing with candle has neither fault.
+
+The crash was not only the keeper's to have. A server that holds layers
+for another machine has a worker's thread on the GPU beside its own
+engine's, since #233. So everything that runs on the device now takes a
+turn (`common::alone`), taken where every pass, image and step already
+has its autorelease pool. Tried with a server writing four replies from
+its own GPU model while it held a stage for another server that was
+writing: no crash. An image or video *load* is not yet inside a turn.
+
+Across the cable again, the same split, medians of seven replies:
+270 to 282 tok/s where it was 161 to 225, and 100 to 108 with
+`KVAD_LINGER_MS=0`. This machine's stage is at 1.1 ms a token and the
+Air's layers at 2.1 to 2.2.
 
 Limits: the Llama family; every machine on its GPU or none; a stage's
 quantised cache is a file of its own a split; a bf16 load is planned as if

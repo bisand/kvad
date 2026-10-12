@@ -7,7 +7,7 @@
 
 use super::Res;
 use crate::Args;
-use kvad::cluster::{key, link, ping, wire, worker as far};
+use kvad::cluster::{discover, key, link, ping, wire, worker as far};
 use std::net::TcpListener;
 
 use super::spec::CLUSTER as USAGE;
@@ -47,9 +47,21 @@ fn show(link: &link::Link) {
 }
 
 fn find(everything: bool) -> Res<()> {
+    // Workers, who say so; then machines on a cable, who need not be.
+    let workers = discover::workers();
+    for worker in &workers {
+        let ours = if worker.build == kvad::cluster::build() { "" } else { ", which is not this build" };
+        println!("worker {} ({}, kvad {}{ours})", worker.name, worker.id, worker.build);
+        for address in &worker.addresses {
+            println!("  {}", kvad::cluster::path::with_port(address, worker.port));
+        }
+    }
     let (asked, found) = link::peers(everything);
     for peer in &found {
         println!("{}\t{}", peer.iface, peer.addr);
+    }
+    if !workers.is_empty() && found.is_empty() {
+        return Ok(());
     }
     eprintln!(
         "asked {}{}",
@@ -113,16 +125,14 @@ fn measure(args: &Args, host: Option<&str>) -> Res<()> {
     })?;
 
     // What the link is, before a single number.
-    let local = stream.local_addr()?;
-    let link = match link::interface_of(&local.ip()) {
-        Some(iface) => link::identify(&iface),
-        None => link::Link { iface: local.ip().to_string(), what: link::What::Unknown, evidence: Vec::new() },
-    };
+    let (local, there) = (stream.local_addr()?, stream.peer_addr()?);
+    let link = link::between(&local.ip(), &there.ip())
+        .unwrap_or_else(|| link::Link { iface: local.ip().to_string(), what: link::What::Unknown, evidence: Vec::new() });
     show(&link);
     let memory = peer.memory.map(|b| format!(", {:.0} GB for a model", b as f64 / 1e9)).unwrap_or_default();
     println!("  peer            {} (kvad {}, {} threads{memory})", peer.name, peer.version, peer.threads);
-    if peer.version != env!("CARGO_PKG_VERSION") {
-        println!("  -> this is kvad {}. The link does not mind; a split model will.", env!("CARGO_PKG_VERSION"));
+    if peer.version != kvad::cluster::build() {
+        println!("  -> this is kvad {}. The link does not mind; a split model will.", kvad::cluster::build());
     }
     println!();
 
@@ -185,7 +195,19 @@ pub fn worker(args: &Args) -> Res<()> {
         None => TcpListener::bind(("::", port)).or_else(|_| TcpListener::bind(("0.0.0.0", port))),
     }
     .map_err(|e| format!("cannot listen on port {port}: {e}"))?;
-    println!("{} is a worker on port {port}; ^C to stop", kvad::cluster::hostname());
+    let (name, id) = (kvad::cluster::hostname(), kvad::cluster::make_id()?);
+    println!("{name} ({id}, kvad {}) is a worker on port {port}; ^C to stop", kvad::cluster::build());
+    // Kept until the worker ends, and withdrawn when it does.
+    let _advert = match discover::advertise(&name, port, &id, &kvad::cluster::build()) {
+        Ok(advert) => {
+            println!("found on the link as `{name}`: --workers {name}");
+            Some(advert)
+        }
+        Err(why) => {
+            println!("{why}");
+            None
+        }
+    };
 
     let started = std::time::Instant::now();
     far::serve(&listener, &key, &mut far::from_disk(), &mut |event| {

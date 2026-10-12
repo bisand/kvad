@@ -625,9 +625,57 @@ f32), 0.99 on Qwen2.5-1.5B at q8, and 1.00 with every layer on the worker.
 That is a third of a millisecond a token, visible at 6 ms a token and gone
 at 20. Prefill is 1.00 everywhere.
 
-Not done, and all of it the second half of this phase: the machine id,
-`_kvad._tcp`, the path probe, and a git revision in `Hello` where the
-package version stands in for one.
+**And the second half**: the machine id, `_kvad._tcp`, the path probe, and
+the commit in `Hello`.
+
+- *A machine is an id.* `kvad worker` makes sixteen hex digits once, keeps
+  them in `machine.id`, and says them in every greeting and every
+  advertisement. It turned out to matter sooner than expected: between two
+  runs an hour apart the Air's own name for itself went from `Mac` to
+  `Andres-MacBook-Air`, because it had joined a network in between.
+- *The build is the commit.* `build.rs` asks git, and `Hello` carries
+  `0.18.2+8f21d2d3a6`, with `-dirty` after it for a tree with changes. A
+  coordinator refuses a worker of another; two dirty builds of one commit
+  compare equal, which is a development rig's own risk.
+- *Discovery* (`discover.rs`). A worker registers `_kvad._tcp` through the
+  system's `dns_sd` calls, so the advertisement ends with the process
+  however the process ends; a coordinator reads what `dns-sd` prints. macOS
+  only so far. `--workers` takes a name or the start of an id, and
+  `kvad cluster find` lists the workers there are.
+- *The path probe* (`path.rs`). Every address a worker was found on is
+  greeted at once and then measured one after another, 32 KB and 2 MB
+  there and back, and the quickest for 32 KB is used. A worker named by its
+  address is measured too. Either way the link is identified and printed.
+- *A worker greets everybody and holds one model.* It answered one
+  connection at a time, which made five addresses five waits and let one
+  address that swallowed its bytes hold up the rest; it now takes each
+  connection on a thread, and what it refuses a second coordinator is a
+  load, at once, by saying it is busy.
+
+Across the rig on 2026-10-12, the worker named and not addressed
+(`--workers andres-macbook-air`, and again by `689fdb39`):
+
+```text
+Andres-MacBook-Air is at 5 address(es):
+  fe80::ca1:57c7:6946:68a8%en13: USB NCM, USB 2.0 High Speed: 480 Mb/s on en13; 2.58 ms for 32 KB there and back, 106.0 ms for 2 MB
+  fe80::144a:8dcc:c1cf:a629%en7: USB 10/100/1000 LAN on en7; 7.20 ms for 32 KB there and back, 341.9 ms for 2 MB
+  fe80::144a:8dcc:c1cf:a629%en0: Wi-Fi on en0; 14.54 ms for 32 KB there and back, 336.2 ms for 2 MB
+  169.254.16.117: USB NCM, USB 2.0 High Speed: 480 Mb/s on en13; 2.49 ms for 32 KB there and back, 105.3 ms for 2 MB
+  10.10.9.61: USB 10/100/1000 LAN on en7; 20.40 ms for 32 KB there and back, 341.4 ms for 2 MB
+  using 169.254.16.117
+```
+
+The cable is found, measured, named for the charging cable it is, and
+chosen over Wi-Fi — which is every piece of *Addressing and discovery*
+doing what it was for. Two things in it are worth a second look. The two
+addresses on the cable differ by a tenth of a millisecond and took turns
+winning, so which is "using" is a coin toss between equals. And the routes
+by this machine's wired LAN end at the Air's Wi-Fi, so their 340 ms for
+2 MB is the Air's radio and not the wire's.
+
+Not done: discovery on Linux, and an account of which of a worker's
+addresses are worth trying at all — a machine with two interfaces on one
+LAN is advertised at every pairing of them.
 
 The run across the rig's cable was tried on 2026-10-12 and at first did not
 get as far as a hidden state, for a reason worth knowing. The Air's

@@ -179,10 +179,15 @@ pub fn read(r: &mut impl Read, most: usize, buf: &mut Vec<u8>) -> io::Result<Kin
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Hello {
     pub protocol: u32,
-    /// The build. Two builds with different kernels can both be right and
-    /// not agree to the bit, so a coordinator will want these equal.
+    /// The build: the version and, where there is one, the commit. Two
+    /// builds with different kernels can both be right and not agree to
+    /// the bit, so a coordinator wants these equal. See [`super::build`].
     #[serde(default)]
     pub version: String,
+    /// The machine, whatever address it answered on: see
+    /// [`super::make_id`]. Empty from one that has never been a worker.
+    #[serde(default)]
+    pub id: String,
     /// The machine's own name for itself.
     #[serde(default)]
     pub name: String,
@@ -204,7 +209,8 @@ impl Hello {
     pub fn ours() -> Hello {
         Hello {
             protocol: PROTOCOL,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: super::build(),
+            id: super::id().unwrap_or_default(),
             name: super::hostname(),
             memory: crate::machine::usable_memory_cached(),
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),

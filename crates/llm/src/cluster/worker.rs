@@ -7,8 +7,12 @@
 //! database; it never sees a prompt, only what a prompt has become some
 //! layers in.
 //!
-//! One coordinator at a time. A stage does one thing at a time, and a
-//! worker with two coordinators would be two models in the memory of one.
+//! One model at a time. A stage does one thing at a time, and a worker
+//! holding layers for two coordinators would be two models in the memory
+//! of one, so the second to ask is told it is busy. Asking is all it is
+//! refused: any number of coordinators may greet a worker and measure the
+//! way to it while it works, which is how one that was found on five
+//! addresses is tried on all five at once.
 //!
 //! When the coordinator goes — hangs up, or stops answering the kernel's
 //! probes — the stage and its caches are dropped and the worker goes back
@@ -91,26 +95,84 @@ fn keepalive(stream: &TcpStream) {
     }
 }
 
-/// Answer coordinators, one after another, for ever.
-pub fn serve(listener: &TcpListener, key: &Key, factory: &mut Factory, said: &mut dyn FnMut(Event)) -> io::Result<()> {
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        let Ok(from) = stream.peer_addr() else { continue };
-        let ended = match serve_one(&mut stream, key, factory, said) {
-            Ok(()) => "done".to_string(),
-            Err(e) => {
-                // As the ping listener does: say why, then take what was
-                // still coming, so the reason is not overtaken by a reset.
-                let _ = wire::send_error(&mut stream, &e.to_string());
-                let _ = stream.shutdown(std::net::Shutdown::Write);
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-                let _ = io::copy(&mut io::Read::take(&stream, 1 << 20), &mut io::sink());
-                e.to_string()
-            }
-        };
-        said(Event::Went(from, ended));
+/// What the connections of one worker share.
+struct Shared<'f, 's> {
+    /// Whether some connection holds a stage.
+    busy: std::sync::atomic::AtomicBool,
+    factory: std::sync::Mutex<&'f mut Factory>,
+    said: std::sync::Mutex<&'s mut (dyn FnMut(Event) + Send)>,
+}
+
+impl Shared<'_, '_> {
+    fn say(&self, event: Event) {
+        if let Ok(mut said) = self.said.lock() {
+            said(event)
+        }
     }
+}
+
+/// The stage a connection holds, and the worker's one place for it: given
+/// back when the connection ends, however it ends.
+struct Held<'h, 'f, 's> {
+    shared: &'h Shared<'f, 's>,
+    stage: Option<Box<dyn Stage>>,
+    ours: bool,
+}
+
+impl Held<'_, '_, '_> {
+    /// Take the worker's place for a stage, unless another connection has it.
+    fn claim(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.ours = self.ours || !self.shared.busy.swap(true, Ordering::SeqCst);
+        self.ours
+    }
+
+    fn release(&mut self) {
+        self.stage = None;
+        if std::mem::take(&mut self.ours) {
+            self.shared.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Held<'_, '_, '_> {
+    fn drop(&mut self) {
+        self.release()
+    }
+}
+
+/// Answer coordinators for ever, each on a thread of its own.
+pub fn serve(listener: &TcpListener, key: &Key, factory: &mut Factory, said: &mut (dyn FnMut(Event) + Send)) -> io::Result<()> {
+    let shared = Shared { busy: false.into(), factory: factory.into(), said: said.into() };
+    std::thread::scope(|threads| {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Ok(from) = stream.peer_addr() else { continue };
+            let shared = &shared;
+            threads.spawn(move || {
+                let ended = match one(&mut stream, key, shared) {
+                    Ok(()) => "done".to_string(),
+                    Err(e) => {
+                        // As the ping listener does: say why, then take what
+                        // was still coming, so the reason is not overtaken
+                        // by a reset.
+                        let _ = wire::send_error(&mut stream, &e.to_string());
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                        let _ = io::copy(&mut io::Read::take(&stream, 1 << 20), &mut io::sink());
+                        e.to_string()
+                    }
+                };
+                shared.say(Event::Went(from, ended));
+            });
+        }
+    });
     Ok(())
+}
+
+/// One coordinator, until it goes: [`serve`] for a single connection.
+pub fn serve_one(stream: &mut TcpStream, key: &Key, factory: &mut Factory, said: &mut (dyn FnMut(Event) + Send)) -> io::Result<()> {
+    one(stream, key, &Shared { busy: false.into(), factory: factory.into(), said: said.into() })
 }
 
 fn other(what: impl Into<String>) -> io::Error {
@@ -139,22 +201,23 @@ fn greet(stream: &mut TcpStream, key: &Key, buf: &mut Vec<u8>) -> io::Result<Hel
     Ok(theirs)
 }
 
-/// One coordinator, until it goes.
-pub fn serve_one(stream: &mut TcpStream, key: &Key, factory: &mut Factory, said: &mut dyn FnMut(Event)) -> io::Result<()> {
+fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(GREETING))?;
     stream.set_write_timeout(Some(GREETING))?;
     let (mut buf, mut out) = (Vec::new(), Vec::new());
     let from = stream.peer_addr()?;
-    said(Event::Came(from, &greet(stream, key, &mut buf)?));
+    shared.say(Event::Came(from, &greet(stream, key, &mut buf)?));
 
     // From here a silence is a coordinator with nothing to say, which is
     // most of a coordinator's life; the kernel's probes say when it is gone.
     stream.set_read_timeout(None)?;
     keepalive(stream);
 
-    let pool = crate::model::pool();
-    let mut stage: Option<Box<dyn Stage>> = None;
+    // Threads for a stage's matmuls, made when there is a stage: a
+    // coordinator that only measures the way here needs none.
+    let mut pool: Option<rayon::ThreadPool> = None;
+    let mut held = Held { shared, stage: None, ours: false };
     loop {
         let (kind, len) = match wire::read_header(stream) {
             Ok(header) => header,
@@ -166,15 +229,15 @@ pub fn serve_one(stream: &mut TcpStream, key: &Key, factory: &mut Factory, said:
                 wire::read_payload(stream, len, &mut buf)?;
                 let rows = Rows::decode(&buf)?;
                 let (seq, pos0, m, n_embd) = (rows.seq, rows.pos0, rows.m, rows.n_embd);
-                let ran = match stage.as_mut() {
-                    None => Err("rows for a stage that has not been loaded".to_string()),
+                let ran = match (held.stage.as_mut(), pool.as_ref()) {
                     // A panic in a kernel is this stage's fault and one
                     // reply's: said, and the worker goes on listening.
-                    Some(stage) => pool.install(|| {
+                    (Some(stage), Some(pool)) => pool.install(|| {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stage.run(seq, pos0 as usize, m as usize, rows.xs)))
                             .map_err(|panic| panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "the stage panicked".into()))
                             .and_then(|ran| ran.map_err(|fault| fault.to_string()))
                     }),
+                    _ => Err("rows for a stage that has not been loaded".to_string()),
                 };
                 match ran {
                     Ok(xs) => {
@@ -187,7 +250,7 @@ pub fn serve_one(stream: &mut TcpStream, key: &Key, factory: &mut Factory, said:
             Kind::Truncate if len <= 1 << 16 => {
                 wire::read_payload(stream, len, &mut buf)?;
                 let asked: Truncate = wire::parse(Kind::Truncate, &buf)?;
-                let got = match stage.as_mut() {
+                let got = match held.stage.as_mut() {
                     Some(stage) => stage.truncate(asked.seq, asked.len).map_err(|fault| fault.to_string()),
                     None => Ok(0),
                 };
@@ -201,13 +264,16 @@ pub fn serve_one(stream: &mut TcpStream, key: &Key, factory: &mut Factory, said:
                 let load: Load = wire::parse(Kind::Load, &buf)?;
                 // The one held goes first: two shards at once is the
                 // memory of two.
-                stage = None;
-                let made = match names_a_model(&load.repo) && load.layers[0] < load.layers[1] {
+                held.stage = None;
+                let named = names_a_model(&load.repo) && load.layers[0] < load.layers[1];
+                let made = match named && held.claim() {
+                    false if named => Err("this worker is holding layers for another coordinator".to_string()),
                     false => Err(format!("`{}`, layers {}..{}: a worker loads a model by its name, and at least one layer of it", load.repo, load.layers[0], load.layers[1])),
                     true => {
                         let mut failed = None;
+                        let mut factory = shared.factory.lock().map_err(|_| other("a load on this worker panicked"))?;
                         let made = factory(&load, &mut |message| {
-                            said(Event::Progress(message));
+                            shared.say(Event::Progress(message));
                             if let Err(e) = wire::send(stream, Kind::Progress, &serde_json::json!({ "message": message })) {
                                 failed.get_or_insert(e);
                             }
@@ -222,16 +288,21 @@ pub fn serve_one(stream: &mut TcpStream, key: &Key, factory: &mut Factory, said:
                     Ok(made) => {
                         let (params, bytes) = made.holds();
                         let ready = Ready { params, bytes };
-                        said(Event::Loaded(&load, &ready));
-                        stage = Some(made);
+                        shared.say(Event::Loaded(&load, &ready));
+                        pool.get_or_insert_with(crate::model::pool);
+                        held.stage = Some(made);
                         wire::send(stream, Kind::Ready, &ready)?;
                     }
-                    Err(why) => wire::send_error(stream, &why)?,
+                    Err(why) => {
+                        // Nothing loaded is nothing held.
+                        held.release();
+                        wire::send_error(stream, &why)?
+                    }
                 }
             }
             Kind::Unload => {
                 wire::skip(stream, len)?;
-                stage = None;
+                held.release();
                 wire::write(stream, Kind::Ack, &[])?;
             }
             // A worker is a place to measure the link to, as well.

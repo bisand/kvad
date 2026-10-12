@@ -17,7 +17,7 @@ use kvad::cluster::remote::RemoteStage;
 use kvad::cluster::session::{self, PipelineSession};
 use kvad::cluster::stage::{Fault, LocalStage, Stage};
 use kvad::cluster::wire::{self, Hello, Kind, Load};
-use kvad::cluster::{ping, worker};
+use kvad::cluster::{path, ping, remote, worker};
 use kvad::model::{CpuSession, Session, Shard, Transformer};
 use kvad::quant::Precision;
 use kvad::weights::Checkpoint;
@@ -324,4 +324,72 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
     let mut session = session::across("tiny", &files, &fixture.spec, Precision::F32, &[at], &split, &key(), &mut |_| {}).unwrap();
     assert_eq!(session.forward(&[1, 2, 3]).unwrap().len(), common::VOCAB);
     assert_eq!(session.label(), "cpu f32 in 2 stages");
+}
+
+/// A worker holds one model, and says so to the second coordinator that
+/// asks — at once, and without making the first wait. What it does not
+/// refuse is a greeting or a measurement, from anybody with the key.
+#[test]
+fn a_worker_holds_one_model_and_greets_everybody() {
+    let fixture = llama("llama", "worker-busy");
+    let at = a_worker(&fixture);
+    let mut first = RemoteStage::open(&at, &key(), &asked(Precision::F32, 1..4), &mut |_| {}).unwrap();
+
+    let why = refusal(&at, &key(), &asked(Precision::F32, 2..4));
+    assert!(why.contains("holding layers for another coordinator"), "{why}");
+    // The way there can still be measured, while the first one works.
+    let way = path::measure(&at, &key()).unwrap();
+    assert!(way.hop_ms > 0.0 && way.chunk_ms > 0.0);
+    assert!(way.line().contains("loopback") && way.line().contains("ms for 32 KB"), "{}", way.line());
+    assert_eq!(first.run(0, 0, 2, vec![0.25; 2 * fixture.spec.n_embd]).unwrap().len(), 2 * fixture.spec.n_embd);
+
+    // When the first has gone, the place is free. Its going is noticed on
+    // the worker's own thread, so the next to ask may be a moment early.
+    drop(first);
+    let again = (0..50).find_map(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        RemoteStage::open(&at, &key(), &asked(Precision::F32, 2..4), &mut |_| {}).ok()
+    });
+    assert!(again.is_some(), "the worker never let go of the first coordinator's place");
+}
+
+/// A worker found on several addresses is tried on all of them, and the
+/// ones that lead nowhere cost a line each and a few seconds between them.
+#[test]
+fn the_quickest_way_to_a_worker_is_one_that_answers() {
+    let fixture = llama("llama", "worker-paths");
+    let at = a_worker(&fixture);
+    let (_, port) = wire::host_port(&at);
+    // The worker, by a second spelling of the same place; a port where
+    // nothing listens; and something that takes a connection and says
+    // nothing.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addresses = vec![
+        "127.0.0.1:1".to_string(),
+        format!("127.0.0.1:{}", silent.local_addr().unwrap().port()),
+        at.clone(),
+        format!("localhost:{port}"),
+    ];
+    let mut lines = Vec::new();
+    let started = std::time::Instant::now();
+    let way = path::quickest(&addresses, "", &key(), &mut |line| lines.push(line.to_string())).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(8), "the dead ends are waited for together");
+    assert!(way.address == at || way.address == format!("localhost:{port}"), "{}", way.address);
+    assert_eq!(lines.len(), 4, "a line for each, the dead ends too: {lines:?}");
+    assert!(lines[0].contains("no worker at 127.0.0.1:1"), "{}", lines[0]);
+    assert!(lines[1].contains("said nothing for 3 seconds"), "{}", lines[1]);
+    assert!(lines[2].contains("ms for 32 KB") && lines[3].contains("ms for 32 KB"), "{lines:?}");
+
+    // An address that somebody else answers on is not a way to the worker
+    // that was asked for.
+    let mut lines = Vec::new();
+    assert!(path::quickest(&[at.clone()], "ffffffffffffffff", &key(), &mut |line| lines.push(line.to_string())).is_err());
+    assert!(lines[0].contains("and not by the worker asked for"), "{}", lines[0]);
+    // And nowhere at all is the error of the last place tried.
+    let why = path::quickest(&["127.0.0.1:1".to_string()], "", &key(), &mut |_| {}).err().unwrap().to_string();
+    assert!(why.contains("no worker at"), "{why}");
+
+    // The greeting says which build and which machine, whoever asks.
+    let (_, hello) = remote::connect(&at, &key()).unwrap();
+    assert_eq!(hello.version, kvad::cluster::build());
 }

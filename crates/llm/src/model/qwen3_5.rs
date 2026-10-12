@@ -102,7 +102,7 @@ pub static ARCH: Architecture = Architecture {
     model_types: &["qwen3_5"],
     about: "Qwen3.5/3.8: gated delta net on three layers in four, gated attention on the fourth",
     configure,
-    load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
+    load: whole,
 };
 
 /// Qwen3-Next, and Qwen3-Coder-Next: the same mixer, with a mixture behind it.
@@ -111,7 +111,7 @@ pub static NEXT: Architecture = Architecture {
     model_types: &["qwen3_next"],
     about: "Qwen3-Next/Coder-Next: the same hybrid, 512 experts and a gated shared one",
     configure,
-    load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
+    load: whole,
 };
 
 // ---------------------------------------------------------------------------
@@ -504,6 +504,17 @@ pub struct Model {
     final_norm: Vec<f32>,
     rope: Rope,
     rope_dim: usize,
+}
+
+/// The whole model or nothing. A linear layer's recurrent state is one more
+/// thing a shard would hold, and nothing about it is in the way; what is
+/// missing is the pass in three pieces, which this architecture has yet to
+/// be given.
+fn whole(src: &dyn Source, spec: Spec, shard: &super::Shard) -> Res<Box<dyn Transformer>> {
+    if !shard.is_whole(&spec) {
+        return Err(format!("the `{}` architecture runs whole and does not split yet", spec.arch).into());
+    }
+    Ok(Box::new(Model::load(src, spec)?))
 }
 
 impl Model {

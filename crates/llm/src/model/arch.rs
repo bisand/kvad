@@ -29,7 +29,7 @@
 //! give the property actually being asked for — architectures are separable,
 //! optional, and cannot reach into each other — and cost nothing.
 
-use super::{Spec, Transformer};
+use super::{Shard, Spec, Transformer};
 use crate::qcache::Source;
 use std::sync::LazyLock;
 
@@ -62,8 +62,10 @@ pub struct Architecture {
     /// [`Spec::config`](Spec) here.
     pub configure: fn(&mut Spec) -> Res<()>,
 
-    /// Build the thing that runs, given somewhere to get weights from.
-    pub load: fn(&dyn Source, Spec) -> Res<Box<dyn Transformer>>,
+    /// Build the thing that runs, given somewhere to get weights from: the
+    /// whole model, or the [`Shard`] of it asked for. An architecture that
+    /// does not split refuses anything less than the whole.
+    pub load: fn(&dyn Source, Spec, &Shard) -> Res<Box<dyn Transformer>>,
 }
 
 /// A handle to one entry in the registry.
@@ -101,8 +103,11 @@ impl Arch {
         (self.0.configure)(spec)
     }
 
-    pub(crate) fn load(self, src: &dyn Source, spec: Spec) -> Res<Box<dyn Transformer>> {
-        (self.0.load)(src, spec)
+    pub(crate) fn load(self, src: &dyn Source, spec: Spec, shard: &Shard) -> Res<Box<dyn Transformer>> {
+        if shard.layers.start > shard.layers.end || shard.layers.end > spec.n_layer {
+            return Err(format!("{shard} is not a part of a model of {} layers", spec.n_layer).into());
+        }
+        (self.0.load)(src, spec, shard)
     }
 
     /// Map a HuggingFace `model_type` (or an `architectures[0]` class name)

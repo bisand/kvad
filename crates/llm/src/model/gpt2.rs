@@ -11,7 +11,7 @@
 //! with position information added once, at the very bottom, by looking up a
 //! learned vector per slot in the context window.
 
-use super::{attend, Architecture, KvCache, Spec, Transformer};
+use super::{attend, Architecture, KvCache, Shard, Spec, Transformer};
 use crate::qcache::{head, Source};
 use crate::quant::Weight;
 use crate::tensor::{gelu_inplace, layer_norm};
@@ -28,7 +28,7 @@ pub static ARCH: Architecture = Architecture {
     model_types: &["gpt2"],
     about: "GPT-2 (2019): learned positions, LayerNorm, GELU, one fused QKV matrix",
     configure: |_| Ok(()),
-    load: |src, spec| Ok(Box::new(Model::load(src, spec)?)),
+    load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
 };
 
 pub struct Block {
@@ -53,6 +53,16 @@ pub struct Block {
 
 pub struct Model {
     spec: Spec,
+    /// Which of the model's layers `blocks` holds, and whether `ends` is
+    /// here. Everything and yes, for a model on one machine.
+    shard: Shard,
+    ends: Option<Ends>,
+    blocks: Vec<Block>,
+}
+
+/// The two ends of the model, which stay together when the blocks between
+/// them are spread out: see [`Shard`].
+struct Ends {
     /// [vocab_size, n_embd] — token embeddings, reused transposed as the
     /// output head. GPT-2 ties those weights: "the vector meaning cat" and
     /// "the direction that predicts cat" are the same thing.
@@ -67,7 +77,6 @@ pub struct Model {
     /// own `nervus` has both, and says so with `tie_word_embeddings: false`.
     lm_head: Option<Weight>,
     lm_head_b: Option<Vec<f32>>,
-    blocks: Vec<Block>,
     lnf_g: Vec<f32>,
     lnf_b: Vec<f32>,
 }
@@ -85,9 +94,23 @@ impl Model {
     /// The embedding tables are deliberately *not* transposed: `wte` is
     /// already `[vocab, n_embd]`, which is both the layout row lookup wants
     /// and the layout the tied output head wants.
+    /// The whole model.
     pub fn load(src: &dyn Source, spec: Spec) -> Res<Self> {
-        let mut blocks = Vec::with_capacity(spec.n_layer);
+        let whole = Shard::whole(&spec);
+        Model::load_shard(src, spec, &whole)
+    }
+
+    /// The part of the model `shard` names, reading that and nothing else.
+    /// What it leaves to the other shards it says it is leaving, so the
+    /// check for weights nobody read keeps meaning what it means.
+    pub fn load_shard(src: &dyn Source, spec: Spec, shard: &Shard) -> Res<Self> {
+        let mut blocks = Vec::with_capacity(shard.layers.len());
         for i in 0..spec.n_layer {
+            // Another shard's layer: known about, and deliberately not read.
+            if !shard.layers.contains(&i) {
+                src.skip_under(&format!("h.{i}."));
+                continue;
+            }
             let p = |s: &str| format!("h.{i}.{s}");
             blocks.push(Block {
                 ln1_g: src.vector(&p("ln_1.weight"))?,
@@ -105,6 +128,13 @@ impl Model {
             });
         }
 
+        if !shard.ends {
+            for name in ["lm_head.weight", "lm_head.bias", "wte.weight", "wpe.weight", "ln_f.weight", "ln_f.bias"] {
+                src.skip(name);
+            }
+            return Ok(Model { shard: shard.clone(), ends: None, blocks, spec });
+        }
+
         let lm_head = head(src, &spec, "lm_head.weight")?;
         // The bias stays optional even in an untied model, because GPT-2 itself
         // has none: `lm_head` there is the embedding table applied backwards,
@@ -118,46 +148,81 @@ impl Model {
         };
 
         Ok(Model {
-            lm_head,
-            lm_head_b,
-            wte: src.matrix("wte.weight")?,
-            wpe: src.matrix("wpe.weight")?,
+            shard: shard.clone(),
+            ends: Some(Ends {
+                lm_head,
+                lm_head_b,
+                wte: src.matrix("wte.weight")?,
+                wpe: src.matrix("wpe.weight")?,
+                lnf_g: src.vector("ln_f.weight")?,
+                lnf_b: src.vector("ln_f.bias")?,
+            }),
             blocks,
-            lnf_g: src.vector("ln_f.weight")?,
-            lnf_b: src.vector("ln_f.bias")?,
             spec,
         })
     }
 }
 
 impl Model {
+    /// The embeddings and the head, on the shard that has them.
+    fn ends(&self) -> &Ends {
+        self.ends.as_ref().unwrap_or_else(|| panic!("{} of this model were asked for its ends, which another shard holds", self.shard))
+    }
+}
+
+impl Ends {
     /// Logits from the final hidden state: the token table read the other
     /// way round, unless the checkpoint brought a head of its own.
     fn head(&self, x: &[f32]) -> Vec<f32> {
         self.lm_head.as_ref().unwrap_or(&self.wte).matvec_bt(x, self.lm_head_b.as_deref())
     }
+}
 
-    /// Every block, over a batch of tokens, leaving the residual stream as
-    /// it is — no output head.
+impl Transformer for Model {
+    fn spec(&self) -> &Spec {
+        &self.spec
+    }
+
+    fn shard(&self) -> Shard {
+        self.shard.clone()
+    }
+
+    fn splits(&self) -> bool {
+        true
+    }
+
+    /// Token embedding plus position embedding, one row per token.
     ///
-    /// Split out because the two callers want different slices of the same
-    /// work: generation needs the last position's logits, scoring needs all
-    /// of them, and the twelve layers in between are identical.
-    fn run_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        let spec = &self.spec;
+    /// The one architecture here where position is added at the door, which
+    /// is why `pos0` is an argument at all: the shard that embeds may hold
+    /// no blocks, and so no cache to count positions with.
+    fn embed(&self, tokens: &[u32], pos0: usize) -> Vec<f32> {
+        let (spec, ends) = (&self.spec, self.ends());
         let (m, e) = (tokens.len(), spec.n_embd);
-        let pos0 = cache.len;
         assert!(pos0 + m <= spec.n_ctx, "context window of {} tokens is full", spec.n_ctx);
-
-        // Token embedding plus position embedding, one row per token.
         let mut xs = vec![0.0f32; m * e];
         for (i, &t) in tokens.iter().enumerate() {
-            let tok = self.wte.row(t as usize);
-            let pos = self.wpe.row(pos0 + i);
+            let tok = ends.wte.row(t as usize);
+            let pos = ends.wpe.row(pos0 + i);
             for j in 0..e {
                 xs[i * e + j] = tok[j] + pos[j];
             }
         }
+        xs
+    }
+
+    /// This shard's blocks, over a batch of rows, leaving the residual
+    /// stream as it is — no embedding before and no output head after.
+    ///
+    /// On its own because the callers want different slices of the same
+    /// work: generation needs the last position's logits, scoring needs all
+    /// of them, a shard in the middle of a model needs neither, and the
+    /// layers in between are identical.
+    fn blocks(&self, xs: &mut [f32], m: usize, cache: &mut KvCache) {
+        let spec = &self.spec;
+        let e = spec.n_embd;
+        let pos0 = cache.len;
+        assert!(pos0 + m <= spec.n_ctx, "context window of {} tokens is full", spec.n_ctx);
 
         let mut hs = vec![0.0f32; m * e];
         for (l, block) in self.blocks.iter().enumerate() {
@@ -200,13 +265,24 @@ impl Model {
         }
 
         cache.len += m;
-        xs
     }
-}
 
-impl Transformer for Model {
-    fn spec(&self) -> &Spec {
-        &self.spec
+    /// Only the last position predicts anything generation needs, so there
+    /// the output head stays a matrix-vector product. Scoring wants every
+    /// position's, which the residual stream already holds: the head over
+    /// `m` rows as one matmul.
+    fn head(&self, xs: &[f32], m: usize, all: bool) -> Vec<f32> {
+        let (e, ends) = (self.spec.n_embd, self.ends());
+        if !all {
+            let last = layer_norm(&xs[(m - 1) * e..m * e], &ends.lnf_g, &ends.lnf_b, self.spec.eps);
+            return ends.head(&last);
+        }
+        let mut normed = vec![0.0f32; m * e];
+        for i in 0..m {
+            normed[i * e..(i + 1) * e]
+                .copy_from_slice(&layer_norm(&xs[i * e..(i + 1) * e], &ends.lnf_g, &ends.lnf_b, self.spec.eps));
+        }
+        ends.lm_head.as_ref().unwrap_or(&ends.wte).matmul_bt(&normed, m, ends.lm_head_b.as_deref())
     }
 
     fn param_count(&self) -> usize {
@@ -221,53 +297,25 @@ impl Transformer for Model {
                 + b.proj_b.len()
                 + 4 * self.spec.n_embd
         });
-        self.wte.param_count()
-            + self.wpe.param_count()
-            + self.lm_head.as_ref().map_or(0, |h| h.param_count())
-            + self.lm_head_b.as_ref().map_or(0, |b| b.len())
-            + self.lnf_g.len()
-            + self.lnf_b.len()
-            + per_block * self.blocks.len()
+        let ends = self.ends.as_ref().map_or(0, |ends| {
+            ends.wte.param_count()
+                + ends.wpe.param_count()
+                + ends.lm_head.as_ref().map_or(0, |h| h.param_count())
+                + ends.lm_head_b.as_ref().map_or(0, |b| b.len())
+                + ends.lnf_g.len()
+                + ends.lnf_b.len()
+        });
+        ends + per_block * self.blocks.len()
     }
 
     fn memory_bytes(&self) -> usize {
         let per_block: usize = self.blocks.first().map_or(0, |b| {
             b.attn_w.bytes() + b.attn_proj_w.bytes() + b.fc_w.bytes() + b.proj_w.bytes()
         });
-        self.wte.bytes()
-            + self.wpe.bytes()
-            + self.lm_head.as_ref().map_or(0, |h| h.bytes())
-            + per_block * self.blocks.len()
-    }
-
-    fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        let (m, e) = (tokens.len(), self.spec.n_embd);
-        let xs = self.run_batch(tokens, cache);
-        // Only the last position predicts anything generation needs, so the
-        // output head stays a matrix-vector product.
-        let last = layer_norm(&xs[(m - 1) * e..m * e], &self.lnf_g, &self.lnf_b, self.spec.eps);
-        self.head(&last)
-    }
-
-    /// Logits for **every** position, not just the last.
-    ///
-    /// The residual stream already holds all of them; what `forward_batch`
-    /// throws away is the output head applied to the other rows. Scoring text
-    /// — perplexity — needs exactly those, and running the head over `m` rows
-    /// as one matmul costs a fraction of the `m` forward passes the default
-    /// implementation would do instead.
-    fn forward_batch_all(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        let (m, e) = (tokens.len(), self.spec.n_embd);
-        let mut xs = self.run_batch(tokens, cache);
-        for i in 0..m {
-            let normed =
-                layer_norm(&xs[i * e..(i + 1) * e], &self.lnf_g, &self.lnf_b, self.spec.eps);
-            xs[i * e..(i + 1) * e].copy_from_slice(&normed);
-        }
-        self.lm_head
-            .as_ref()
-            .unwrap_or(&self.wte)
-            .matmul_bt(&xs, m, self.lm_head_b.as_deref())
+        let ends = self.ends.as_ref().map_or(0, |ends| {
+            ends.wte.bytes() + ends.wpe.bytes() + ends.lm_head.as_ref().map_or(0, |h| h.bytes())
+        });
+        ends + per_block * self.blocks.len()
     }
 
     fn forward(&self, token: u32, cache: &mut KvCache) -> Vec<f32> {
@@ -278,8 +326,9 @@ impl Transformer for Model {
         // Embedding lookup is literally a row index, and position is a second
         // row index added on top. "Meaning" here is just which of 50257 rows
         // of 768 floats you picked.
-        let mut x = self.wte.row(token as usize);
-        for (xi, p) in x.iter_mut().zip(self.wpe.row(pos)) {
+        let ends = self.ends();
+        let mut x = ends.wte.row(token as usize);
+        for (xi, p) in x.iter_mut().zip(ends.wpe.row(pos)) {
             *xi += p;
         }
 
@@ -310,7 +359,7 @@ impl Transformer for Model {
 
         cache.len += 1;
 
-        let x = layer_norm(&x, &self.lnf_g, &self.lnf_b, spec.eps);
-        self.head(&x)
+        let x = layer_norm(&x, &ends.lnf_g, &ends.lnf_b, spec.eps);
+        ends.head(&x)
     }
 }

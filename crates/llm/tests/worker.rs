@@ -255,6 +255,11 @@ impl Stage for Flaky {
     fn holds(&self) -> (usize, usize) {
         self.inner.holds()
     }
+    /// As a worker's would be: so a prompt through it is read as a
+    /// pipeline, every stage at work at once, and fails as one.
+    fn elsewhere(&self) -> bool {
+        true
+    }
 }
 
 /// A pass that fails half way down the pipeline leaves the stages before
@@ -278,6 +283,9 @@ fn a_pass_that_fails_part_way_is_undone_before_the_next() {
     let why = split.forward(&prompt).unwrap_err().to_string();
     assert!(why.contains("a cosmic ray"), "{why}");
     assert_eq!(split.cached(), 8, "the chunk that went through every stage is kept");
+    // By then the first stage had gone on to the chunks after it, which is
+    // what reading a prompt as a pipeline means: it is ahead of the stage
+    // that failed, and has to be brought back.
 
     // Carry on from where it got to, and it is the model again.
     let bits = |xs: &[f32]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -452,4 +460,39 @@ fn a_pipeline_says_where_a_tokens_time_went() {
     let (stages, head) = split.timing();
     assert!(stages.iter().all(|s| s.runs == 0 && s.ms == 0.0) && head == (0, 0.0));
     assert_eq!(stages[1].inside_ms, Some(0.0));
+}
+
+/// A prompt read as a pipeline — each stage on a different chunk at the
+/// same moment — is the prompt read a chunk at a time: every stage still
+/// sees the chunks in order. Long enough here to have every stage busy at
+/// once several times over, on two workers and the coordinator, and every
+/// position's logits compared.
+#[test]
+fn a_prompt_read_by_every_stage_at_once_is_the_same_prompt() {
+    let fixture = llama("qwen3", "worker-piped");
+    for precision in [Precision::F32, Precision::Q8] {
+        let (first, second) = (a_worker(&fixture), a_worker(&fixture));
+        let ends: Arc<dyn Transformer> = Arc::from(fixture.load(precision, &Shard { layers: 0..1, ends: true }));
+        let stages: Vec<Box<dyn Stage>> = vec![Box::new(LocalStage::new(ends.clone())), remote(&first, precision, 1..3), remote(&second, precision, 3..4)];
+        // Four tokens a chunk: a prompt of 50 is thirteen chunks through
+        // three stages.
+        let mut split = PipelineSession::new(ends, stages, precision).unwrap().reading(4);
+        let mut whole = CpuSession::new(fixture.load(precision, &Shard::whole(&fixture.spec)), precision).reading(4);
+        let prompt: Vec<u32> = (0..50u32).map(|i| (i * 13 + 5) % common::VOCAB as u32).collect();
+        let bits = |xs: &[f32]| xs.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+
+        assert_eq!(bits(&split.forward(&prompt).unwrap()), bits(&whole.forward(&prompt).unwrap()), "{precision}: the last position");
+        assert_eq!(split.cached(), 50);
+        let (stages, head) = split.timing();
+        assert_eq!(stages.iter().map(|s| s.runs).collect::<Vec<_>>(), [13, 13, 13], "every chunk through every stage, once");
+        assert_eq!(head.0, 1, "and the head for the last chunk only");
+
+        // One more token, the ordinary way, from where the pipeline left it.
+        assert_eq!(bits(&split.forward(&[7]).unwrap()), bits(&whole.forward(&[7]).unwrap()), "{precision}: a token after it");
+
+        assert_eq!((split.truncate(0).unwrap(), whole.truncate(0).unwrap()), (0, 0));
+        let (ours, theirs) = (split.forward_all(&prompt).unwrap(), whole.forward_all(&prompt).unwrap());
+        assert_eq!(ours.len(), 50 * common::VOCAB);
+        assert_eq!(bits(&ours), bits(&theirs), "{precision}: every position, in order");
+    }
 }

@@ -68,6 +68,8 @@ Where it gets *better* than one machine:
 
 - **Prefill**, once chunks are pipelined: A starts chunk 2 while B runs
   chunk 1. This needs no batching work and fits the existing chunk loop.
+  *Measured: 1.2 to 1.4 times the faster machine alone, on a pair as
+  lopsided as an M5 Pro and an M2 Air over USB 2. See Phase 4.*
 - **Several conversations at once**, after continuous batching (README step
   4): different sequences occupy different stages at the same moment. The wire
   protocol carries a sequence id from day one so that this does not mean a
@@ -875,6 +877,37 @@ quantised cache's identity, per-node memory checks, `plan.rs` and
 `kvad cluster plan`. Tests: a sharded tiny checkpoint where a worker's shard
 provably opens only its own files; and a shard load followed by a whole-model
 load of the same checkpoint, which must not map the shard's cache.
+
+**Pipelined prefill is done**, ahead of the rest of Phase 4, because it
+needs no machine this rig has not got. A prompt of more than one chunk,
+through more than one stage of which one is elsewhere, is read with a
+thread a stage: each takes chunks in order from the stage before and hands
+them on, with room for one chunk between stages. A stage still sees the
+chunks in order, so it is the same arithmetic — thirteen chunks through the
+coordinator and two workers agree with the model whole to the bit, every
+position — and what changes is that stage two need not have finished a
+chunk for stage one to start the next. `KVAD_PIPELINE=0` turns it off.
+
+Across the rig's cable, SmolLM2-135M, a prompt of 1024 tokens, tokens a
+second, five rounds each and each pair run twice; the model whole on the
+M5 Pro did 450 at f32 and 495 at q8 beside them:
+
+| here / on the Air | f32 a chunk at a time | f32 pipelined | q8 a chunk at a time | q8 pipelined |
+|---|---|---|---|---|
+| 20 / 10 | 341 | 557 | 401 | 702 |
+| 15 / 15 | 309 | 449 | 377 | 585 |
+| 10 / 20 | 277 | 343 | 354 | 455 |
+
+A quarter to three quarters faster, and at 20 / 10 the two machines read
+a prompt 1.2 to 1.4 times as fast as the faster of them does alone: the
+first number in this document in which a cluster is quicker than its best
+machine, and not only larger. It is what the arithmetic says it should be.
+A chunk at a time costs each chunk the sum of the stages; pipelined it
+costs the slowest of them, so the split that is best is the one that makes
+the stages equal — more layers on the M5 Pro, which is the faster — and
+10 / 20, which gives the slower machine the longer stage, gains least.
+Placing layers for the prompt and placing them for the reply are therefore
+two different questions, and the planner asks only the second.
 
 **Phase 4 — two real machines.** A model that does not fit on either. Decode
 and prefill against Phase 0's prediction of `Σ stages + hops × RTT`, and an

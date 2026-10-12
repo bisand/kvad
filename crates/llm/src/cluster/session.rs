@@ -136,6 +136,9 @@ impl Session for PipelineSession {
     /// a prompt are nobody's to read.
     fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
         self.mend()?;
+        if self.pipes(tokens) {
+            return self.piped(tokens, false);
+        }
         let PipelineSession { ends, stages, len, chunk, pool, torn, took, ends_took, .. } = self;
         let logits = pool.install(|| -> Result<Vec<f32>, Fault> {
             let mut logits = Vec::new();
@@ -156,6 +159,9 @@ impl Session for PipelineSession {
 
     fn forward_all(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
         self.mend()?;
+        if self.pipes(tokens) {
+            return self.piped(tokens, true);
+        }
         let PipelineSession { ends, stages, len, chunk, pool, torn, took, .. } = self;
         let all = pool.install(|| -> Result<Vec<f32>, Fault> {
             let mut all = Vec::new();
@@ -222,7 +228,124 @@ pub struct Timing {
     pub inside_ms: Option<f64>,
 }
 
+/// A chunk of a prompt on its way down the pipeline: which chunk, where
+/// in the conversation its first row is, how many rows, and the rows.
+type Chunk = (usize, usize, usize, Vec<f32>);
+
 impl PipelineSession {
+    /// Whether a prompt is worth reading as a pipeline: more than one
+    /// chunk of it, more than one stage, and a stage somewhere else to do
+    /// one chunk while this machine does another. With every stage in
+    /// this process they would only be taking turns at the same cores.
+    ///
+    /// `KVAD_PIPELINE=0` reads every prompt a chunk at a time, for telling
+    /// what this is worth.
+    fn pipes(&self, tokens: &[u32]) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("KVAD_PIPELINE").as_deref() == Ok("0"));
+        !off && tokens.len() > self.chunk && self.stages.len() > 1 && self.stages.iter().any(|stage| stage.elsewhere())
+    }
+
+    /// Read a prompt with every stage at work at once.
+    ///
+    /// One token cannot be hurried by a second machine: its rows go through
+    /// the stages one after another, and the others wait. A prompt can. It
+    /// is read in chunks, and a chunk that has left the first stage leaves
+    /// that stage free, so the first stage takes the second chunk while the
+    /// second stage has the first. Each stage has a thread here that takes
+    /// chunks in order from the stage before and hands them on, and with
+    /// stages enough and prompt enough every machine is busy the whole way
+    /// through — which is the one place a cluster is faster than its parts
+    /// in a row, and not only larger.
+    ///
+    /// It is the same arithmetic in the same order as reading the chunks
+    /// one at a time. A stage still sees them in order, each after the one
+    /// before it is in that stage's cache; what changes is only that stage
+    /// two need not have finished a chunk for stage one to start the next.
+    ///
+    /// Between stages there is room for one chunk and no more. A prompt of
+    /// thirty thousand tokens is five hundred chunks, and embedded all at
+    /// once and left in a queue they would be a gigabyte waiting.
+    fn piped(&mut self, tokens: &[u32], all: bool) -> Res<Vec<f32>> {
+        use std::sync::mpsc::sync_channel;
+        let PipelineSession { ends, stages, len, chunk, pool, torn, took, ends_took, .. } = self;
+        let (ends, pool): (&dyn Transformer, &rayon::ThreadPool) = (ends.as_ref(), pool);
+        let parts: Vec<&[u32]> = tokens.chunks(*chunk).collect();
+        let (start, last) = (*len, parts.len() - 1);
+
+        let (read, out, fault) = std::thread::scope(|scope| {
+            let (first, mut from_before) = sync_channel::<Chunk>(1);
+            let mut working = Vec::with_capacity(stages.len());
+            for (stage, took) in stages.iter_mut().zip(took.iter_mut()) {
+                let (to_next, from_this) = sync_channel::<Chunk>(1);
+                let arriving = std::mem::replace(&mut from_before, from_this);
+                working.push(scope.spawn(move || -> Result<(), Fault> {
+                    for (i, pos0, m, xs) in arriving {
+                        let started = std::time::Instant::now();
+                        let xs = match stage.elsewhere() {
+                            // Somebody else's cores: this thread waits on a
+                            // socket, and keeps this machine awake to do it.
+                            true => {
+                                let _awake = crate::model::linger(Some(pool));
+                                stage.run(SEQ, pos0, m, xs)?
+                            }
+                            false => pool.install(|| stage.run(SEQ, pos0, m, xs))?,
+                        };
+                        *took = (took.0 + 1, took.1 + started.elapsed().as_secs_f64() * 1e3);
+                        // Nobody left to hand it to: a later stage failed.
+                        if to_next.send((i, pos0, m, xs)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            // The chunks, embedded as the first stage has room for them.
+            scope.spawn(move || {
+                let mut pos = start;
+                for (i, part) in parts.iter().enumerate() {
+                    if first.send((i, pos, part.len(), ends.embed(part, pos))).is_err() {
+                        break;
+                    }
+                    pos += part.len();
+                }
+            });
+            // And here, what comes out of the last stage: in order, since
+            // every stage kept the order it was given.
+            let (mut read, mut out) = (0, Vec::new());
+            for (i, _, m, xs) in from_before {
+                read += m;
+                if all || i == last {
+                    let started = std::time::Instant::now();
+                    let logits = pool.install(|| ends.head(&xs, m, all));
+                    *ends_took = (ends_took.0 + 1, ends_took.1 + started.elapsed().as_secs_f64() * 1e3);
+                    match all {
+                        true => out.extend(logits),
+                        false => out = logits,
+                    }
+                }
+            }
+            let mut fault: Option<Fault> = None;
+            for stage in working {
+                match stage.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => fault = fault.or(Some(e)),
+                    Err(_) => fault = fault.or(Some("a stage of the pipeline panicked".into())),
+                }
+            }
+            (read, out, fault)
+        });
+
+        // What came out of the last stage is held by every stage. Past it,
+        // the stages before a failure hold chunks the ones after never saw.
+        *len += read;
+        *torn = fault.is_some();
+        match fault {
+            Some(fault) => Err(plain(fault)),
+            None => Ok(out),
+        }
+    }
+
     /// Where the time has gone since this was last asked: each stage's
     /// passes and their milliseconds, and last the output head's.
     ///

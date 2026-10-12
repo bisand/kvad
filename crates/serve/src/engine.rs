@@ -23,11 +23,19 @@ use kvad::service::{Backend, Loader};
 fn across(repo: &str, backend: Backend, progress: &mut dyn FnMut(&str), watch: &kvad::weights::Watcher) -> Option<Result<kvad::service::Model, Box<dyn std::error::Error>>> {
     use kvad::cluster::{key::Key, plan::Mix, session};
     let cluster = crate::cluster::running();
-    let Backend::Cpu(precision) = backend else { return None };
     // An architecture that runs whole and only whole is loaded whole.
     if !crate::cluster::spreads(repo, backend) {
         return None;
     }
+    // On a GPU the layers are the GPU's and the embedding and the head are
+    // the CPU's, with the tokens: at the precision the GPU's weights are
+    // quantised to, or f32 beside dense ones.
+    let precision = match backend {
+        Backend::Cpu(precision) => precision,
+        Backend::Gpu(kvad::service::GpuMode::Q8) => Precision::Q8,
+        Backend::Gpu(kvad::service::GpuMode::Q4) => Precision::Q4,
+        Backend::Gpu(kvad::service::GpuMode::Bf16) => Precision::F32,
+    };
     let name = kvad::weights::model_id(repo);
     let local = kvad::hub::find_local(&name).or_else(|| kvad::hub::find_trained(&name));
     let params = local.and_then(|model| model.params);
@@ -36,6 +44,25 @@ fn across(repo: &str, backend: Backend, progress: &mut dyn FnMut(&str), watch: &
         let mix = Mix::parse(&cluster.place)?;
         let split = cluster.split.as_deref().map(session::parse_split).transpose()?;
         let llm = kvad::runtime::Llm::load_custom(repo, progress, watch, &mut |files, spec, progress| {
+            #[cfg(feature = "gpu")]
+            let (asks, stage, bench) = (
+                id_of(backend),
+                |shard: &kvad::model::Shard, progress: &mut dyn FnMut(&str)| match backend {
+                    Backend::Gpu(mode) => gpu::stage(&name, &files.weights, spec, mode, shard.layers.clone(), progress),
+                    Backend::Cpu(_) => Err("a CPU load makes its own stages".into()),
+                },
+                || match backend {
+                    Backend::Gpu(mode) => gpu::speed(spec.n_embd, spec.intermediate, mode),
+                    Backend::Cpu(_) => Err(String::new()),
+                }
+                // A device that will not be timed is planned for as the
+                // CPU is, and found out at the first token.
+                .unwrap_or_else(|_| kvad::cluster::plan::bench(spec.n_embd, spec.intermediate, precision)),
+            );
+            #[cfg(feature = "gpu")]
+            let runs = matches!(backend, Backend::Gpu(_)).then_some(session::Runs { asks: &asks, stage: &stage, bench: &bench });
+            #[cfg(not(feature = "gpu"))]
+            let runs = None;
             let want = session::Across {
                 repo: &name,
                 files,
@@ -53,12 +80,50 @@ fn across(repo: &str, backend: Backend, progress: &mut dyn FnMut(&str), watch: &
                 // What the server's other models have left, and not what
                 // the machine has: the scheduler said before it asked.
                 memory: crate::cluster::room(),
+                runs,
             };
-            session::across(&want, progress)
+            match (session::placed(&want, progress)?, backend) {
+                (session::Placed::Staged(pipeline), _) => Ok(Box::new(pipeline) as Box<dyn kvad::model::Session>),
+                // Every layer is this machine's: the model whole, loaded
+                // as it would have been with no workers named.
+                #[cfg(feature = "gpu")]
+                (session::Placed::Whole, Backend::Gpu(mode)) => gpu::whole(&name, files, spec, mode, progress),
+                (session::Placed::Whole, _) => {
+                    let model = kvad::qcache::load(&name, files, spec, precision, progress)?;
+                    Ok(Box::new(kvad::model::CpuSession::new(model, precision)))
+                }
+            }
         })?;
         Ok(kvad::service::Model::from(llm))
     };
     Some(load())
+}
+
+/// Layers of a model on this machine's GPU for a coordinator somewhere
+/// else: its own shards of the checkpoint from this disk or the Hub, as a
+/// CPU worker fetches them, and the stage made of them.
+#[cfg(feature = "gpu")]
+pub fn worker_stage(
+    load: &kvad::cluster::wire::Load,
+    mode: kvad::service::GpuMode,
+    progress: &mut dyn FnMut(&str),
+    watch: &kvad::weights::Watcher,
+) -> Result<Box<dyn kvad::cluster::stage::Stage>, kvad::cluster::stage::Fault> {
+    let shard = kvad::model::Shard { layers: load.layers[0]..load.layers[1], ends: false };
+    let files = kvad::weights::fetch_for(&load.repo, &|tensor| shard.wants(tensor), progress, watch).map_err(|e| e.to_string())?;
+    let spec = kvad::model::Spec::from_json(&files.config).map_err(|e| e.to_string())?;
+    progress(&format!("reading {shard} of {} onto the GPU at {}", load.repo, load.precision));
+    gpu::stage(&load.repo, &files.weights, &spec, mode, shard.layers.clone(), progress)
+}
+
+/// How long a layer of this shape takes this machine's GPU, for a
+/// coordinator that is deciding where layers go.
+#[cfg(feature = "gpu")]
+pub fn worker_speed(asked: &kvad::cluster::wire::Bench) -> Option<Result<kvad::cluster::plan::Speed, String>> {
+    match parse(&asked.precision)? {
+        Backend::Gpu(mode) => Some(gpu::speed(asked.n_embd, asked.intermediate, mode)),
+        Backend::Cpu(_) => None,
+    }
 }
 
 /// A loader for whatever this build can run.
@@ -90,7 +155,10 @@ pub fn loader() -> Loader {
                 },
                 Backend::Gpu(mode) if video => gpu::film(repo, mode, progress, watch),
                 Backend::Gpu(mode) if image => gpu::paint(repo, mode, progress, watch),
-                Backend::Gpu(mode) => gpu::load(repo, mode, progress, watch).map(Model::from),
+                Backend::Gpu(mode) => match across(repo, backend, progress, watch) {
+                    Some(loaded) => loaded,
+                    None => gpu::load(repo, mode, progress, watch).map(Model::from),
+                },
             }
         })
     }
@@ -392,6 +460,42 @@ mod gpu {
             GpuMode::Q4 => "q4",
         };
         kvad_gpu::model::parse_quant(name).expect("known quant")
+    }
+
+    /// A run of a model's layers on the GPU: a stage of a model that is
+    /// across several machines.
+    pub fn stage(
+        name: &str,
+        paths: &[std::path::PathBuf],
+        spec: &kvad::model::Spec,
+        mode: GpuMode,
+        layers: std::ops::Range<usize>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Box<dyn kvad::cluster::stage::Stage>, kvad::cluster::stage::Fault> {
+        let dtype = kvad_gpu::model::parse_dtype(DTYPE).expect("known dtype");
+        let (quant, device) = (quant(mode), kvad_gpu::model::pick_device(None).map_err(|e| e.to_string())?);
+        let stage = kvad_gpu::model::stage::GpuStage::load(name, paths, spec.clone(), dtype, quant, device, layers, progress).map_err(|e| e.to_string())?;
+        Ok(Box::new(stage))
+    }
+
+    /// How long a layer this wide takes the GPU at `mode`.
+    pub fn speed(n_embd: usize, intermediate: usize, mode: GpuMode) -> Result<kvad::cluster::plan::Speed, String> {
+        let dtype = kvad_gpu::model::parse_dtype(DTYPE).expect("known dtype");
+        let (quant, device) = (quant(mode), kvad_gpu::model::pick_device(None).map_err(|e| e.to_string())?);
+        kvad_gpu::model::stage::bench(n_embd, intermediate, dtype, quant, device).map_err(|e| e.to_string())
+    }
+
+    /// A language model whole on the GPU, from files already found.
+    pub fn whole(
+        id: &str,
+        files: &kvad::weights::ModelFiles,
+        spec: &kvad::model::Spec,
+        mode: GpuMode,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Box<dyn kvad::model::Session>, Box<dyn std::error::Error>> {
+        let dtype = kvad_gpu::model::parse_dtype(DTYPE).expect("known dtype");
+        let (quant, device) = (quant(mode), kvad_gpu::model::pick_device(None).map_err(|e| e.to_string())?);
+        kvad_gpu::model::session(id, &files.weights, spec, dtype, quant, device, progress)
     }
 
     pub fn paint(

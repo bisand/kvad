@@ -71,7 +71,7 @@ bind = "127.0.0.1:5823"
 [cluster]
 # Other machines to put a model's layers on, each running `kvad worker` or a
 # server with [worker] below turned on. By the name a worker prints when it
-# starts, its id, or an address. A language model loaded at a CPU backend is
+# starts, its id, or an address. A language model is
 # then placed across this machine and them: as many layers as fit on the
 # fastest, then the next. A model that fits here stays here, whole, and is
 # loaded as it always was; a model too large for this machine is what the

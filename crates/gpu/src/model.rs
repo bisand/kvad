@@ -39,6 +39,8 @@ use kvad::model::{Arch, Session, Spec};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+pub mod stage;
+
 
 
 
@@ -94,6 +96,172 @@ pub struct GpuLlama {
 }
 
 
+
+/// The blocks of `layers`, read through `ld` from under `model`: every
+/// layer for the model whole, a run of them for a stage of it.
+fn read_blocks(
+    ld: &Loader,
+    model: &Reader<'_>,
+    spec: &Spec,
+    routed: Option<&(Router, Layout)>,
+    expert_width: usize,
+    load_dtype: DType,
+    layers: std::ops::Range<usize>,
+) -> Res<Vec<Block>> {
+    let load_dev = Device::Cpu;
+    let device = &ld.device;
+    let to_dev = |t: Tensor| -> Res<Tensor> { Ok(t.to_device(device)?) };
+    let (e, hd) = (spec.n_embd, spec.head_dim);
+    let (qd, kvd) = (spec.n_head * hd, spec.kv_dim());
+    // HuggingFace stores `nn.Linear` weights as [out, in]. Who transposes
+    // and when is `Stored`'s business now; this loader only says which way
+    // round the file has it.
+    let load_t = |vb: &Reader<'_>, name: &str, out: usize, inp: usize| -> Res<Proj> {
+        ld.proj(vb, name, out, inp, Stored::OutIn)
+    };
+    let mut blocks = Vec::with_capacity(layers.len());
+    for i in layers {
+        let l = model.pp(format!("layers.{i}"));
+        let attn = l.pp("self_attn");
+        let mlp = l.pp("mlp");
+        blocks.push(Block {
+            attn_norm: to_dev(l.get(e, "input_layernorm.weight")?)?,
+            qkv: ld.proj_cat(
+                &attn,
+                &[("q_proj.weight", qd), ("k_proj.weight", kvd), ("v_proj.weight", kvd)],
+                e,
+                Stored::OutIn,
+            )?,
+            qkv_b: {
+                let parts = [("q_proj.bias", qd), ("k_proj.bias", kvd), ("v_proj.bias", kvd)];
+                let got: Vec<_> = parts.iter().map(|&(name, len)| attn.try_get(len, name)).collect();
+                match got.iter().all(Option::is_none) {
+                    true => None,
+                    // A model with some of the three and not the others
+                    // gets zeros for the others, which is what it adds;
+                    // they are counted as parameters, which they are not.
+                    false => {
+                        let all = got
+                            .into_iter()
+                            .zip(parts)
+                            .map(|(b, (_, len))| b.map_or_else(|| Tensor::zeros(len, load_dtype, &load_dev), Ok))
+                            .collect::<candle_core::Result<Vec<_>>>()?;
+                        Some(to_dev(Tensor::cat(&all, 0)?)?)
+                    }
+                }
+            },
+            o: load_t(&attn, "o_proj.weight", e, qd)?,
+            q_norm: attn.try_get(hd, "q_norm.weight").map(&to_dev).transpose()?,
+            k_norm: attn.try_get(hd, "k_norm.weight").map(&to_dev).transpose()?,
+            mlp_norm: to_dev(l.get(e, "post_attention_layernorm.weight")?)?,
+            mlp: match routed {
+                Some((router, layout)) if layout.is_moe(i, router.n_experts) => Mlp::Moe(
+                    Box::new(Moe::load(ld, &mlp, e, expert_width, router, layout.shared)?),
+                ),
+                _ => Mlp::Dense(Ffn::load(ld, &mlp, e, spec.intermediate)?),
+            },
+        });
+    }
+    Ok(blocks)
+}
+
+/// The same rotation table as `Rope::new`, built once on the device:
+/// cosines and sines, `[n_ctx, head_dim / 2]` each.
+fn rotations(spec: &Spec, device: &Device, compute: DType) -> Res<(Tensor, Tensor)> {
+    let hd = spec.head_dim;
+    let half = hd / 2;
+    let inv: Vec<f32> = (0..half)
+        .map(|i| 1.0 / spec.rope_theta.powf(2.0 * i as f32 / hd as f32))
+        .collect();
+    let inv = Tensor::from_vec(inv, (1, half), device)?;
+    let positions: Vec<f32> = (0..spec.n_ctx).map(|p| p as f32).collect();
+    let positions = Tensor::from_vec(positions, (spec.n_ctx, 1), device)?;
+    let angles = positions.matmul(&inv)?;
+    Ok((angles.cos()?.to_dtype(compute)?, angles.sin()?.to_dtype(compute)?))
+}
+
+/// What a pass is run with besides its rows: the model's shape and its
+/// rotations, and how this device runs a step.
+struct Pass<'a> {
+    spec: &'a Spec,
+    cos: &'a Tensor,
+    sin: &'a Tensor,
+    fuse: bool,
+    dtype: DType,
+    device: &'a Device,
+}
+
+impl Pass<'_> {
+    /// `m` rows at positions from `pos0` through `blocks`, their keys and
+    /// values onto the end of `kv`, a cache a block.
+    ///
+    /// What comes back is the residual stream and the last block's MLP
+    /// output *not yet added to it*: the add and the norm after it are one
+    /// kernel, and the norm is the next layer's, or the model's last, or —
+    /// for a stage of a model — nobody's here, and then it is a plain add.
+    fn through(&self, blocks: &[Block], mut x: Tensor, pos0: usize, m: usize, kv: &mut [KvCache]) -> Res<(Tensor, Option<Tensor>)> {
+        let spec = self.spec;
+        let hd = spec.head_dim;
+        let (n_head, n_kv) = (spec.n_head, spec.n_kv_head);
+        let scale = 1.0 / (hd as f64).sqrt();
+        let cos = self.cos.narrow(0, pos0, m)?.contiguous()?;
+        let sin = self.sin.narrow(0, pos0, m)?.contiguous()?;
+        let mask = match m > 1 {
+            true => Some(causal_mask(m, pos0, self.device, self.dtype)?),
+            false => None,
+        };
+
+        let mut pending: Option<Tensor> = None;
+        for (i, blk) in blocks.iter().enumerate() {
+            let h = match pending.take() {
+                None => crate::grad::rms_norm(&x, &blk.attn_norm, spec.eps)?,
+                Some(f) => {
+                    let (h, sum) = fused::add_rms_norm(&x, &f, &blk.attn_norm, spec.eps)?;
+                    x = sum;
+                    h
+                }
+            };
+
+            // [m, (n_head + 2 n_kv) hd]: the queries, then the keys, then the
+            // values.
+            let qkv = blk.qkv.forward(&h)?;
+            let heads = fused::Heads {
+                n_head,
+                n_kv,
+                head_dim: hd,
+                bias: blk.qkv_b.as_ref(),
+                q_norm: blk.q_norm.as_ref(),
+                k_norm: blk.k_norm.as_ref(),
+                eps: spec.eps,
+            };
+            let (q, k, v) = split(&qkv, &heads, &cos, &sin, &mut kv[i], self.fuse, self.dtype, self.device)?;
+
+            let out = attention(&q, &k, &v, mask.as_ref(), scale)?.to_dtype(self.dtype)?;
+            let out = out.transpose(1, 2)?.reshape((m, n_head * hd))?;
+            let (h, sum) = fused::add_rms_norm(&x, &linear(&out, &blk.o, None)?, &blk.mlp_norm, spec.eps)?;
+            x = sum;
+            pending = Some(blk.mlp.forward(&h, m, spec.n_embd)?);
+        }
+        Ok((x, pending))
+    }
+}
+
+impl Block {
+    fn params(&self) -> usize {
+        let n = |t: &Tensor| t.elem_count();
+        // As on the CPU: the optional vectors are exactly the ones that differ
+        // between Qwen2 and Qwen3, so leaving them out would report the same
+        // count for a model that has them and one that does not.
+        let opt = |t: &Option<Tensor>| t.as_ref().map_or(0, n);
+        self.qkv.params() + self.o.params() + self.mlp.params() + n(&self.attn_norm) + n(&self.mlp_norm) + opt(&self.qkv_b) + opt(&self.q_norm) + opt(&self.k_norm)
+    }
+
+    fn bytes(&self) -> usize {
+        let per = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
+        let opt = |t: &Option<Tensor>| t.as_ref().map_or(0, per);
+        self.qkv.bytes() + self.o.bytes() + self.mlp.bytes() + per(&self.attn_norm) + per(&self.mlp_norm) + opt(&self.qkv_b)
+    }
+}
 
 impl GpuLlama {
     pub fn load(
@@ -151,61 +319,11 @@ impl GpuLlama {
         // Dense tensors (norms, embeddings) still have to make the trip.
         let to_dev = |t: Tensor| -> Res<Tensor> { Ok(t.to_device(&device)?) };
 
-        let (e, hd) = (spec.n_embd, spec.head_dim);
-        let (qd, kvd) = (spec.n_head * hd, spec.kv_dim());
+        let e = spec.n_embd;
         let model = vb.pp("model");
-
-        // HuggingFace stores `nn.Linear` weights as [out, in]. Who transposes
-        // and when is `Stored`'s business now; this loader only says which way
-        // round the file has it.
         let ld = Loader::new(quant, device.clone(), cache);
-        let load_t = |vb: &Reader<'_>, name: &str, out: usize, inp: usize| -> Res<Proj> {
-            ld.proj(vb, name, out, inp, Stored::OutIn)
-        };
 
-        let mut blocks = Vec::with_capacity(spec.n_layer);
-        for i in 0..spec.n_layer {
-            let l = model.pp(format!("layers.{i}"));
-            let attn = l.pp("self_attn");
-            let mlp = l.pp("mlp");
-            blocks.push(Block {
-                attn_norm: to_dev(l.get(e, "input_layernorm.weight")?)?,
-                qkv: ld.proj_cat(
-                    &attn,
-                    &[("q_proj.weight", qd), ("k_proj.weight", kvd), ("v_proj.weight", kvd)],
-                    e,
-                    Stored::OutIn,
-                )?,
-                qkv_b: {
-                    let parts = [("q_proj.bias", qd), ("k_proj.bias", kvd), ("v_proj.bias", kvd)];
-                    let got: Vec<_> = parts.iter().map(|&(name, len)| attn.try_get(len, name)).collect();
-                    match got.iter().all(Option::is_none) {
-                        true => None,
-                        // A model with some of the three and not the others
-                        // gets zeros for the others, which is what it adds;
-                        // they are counted as parameters, which they are not.
-                        false => {
-                            let all = got
-                                .into_iter()
-                                .zip(parts)
-                                .map(|(b, (_, len))| b.map_or_else(|| Tensor::zeros(len, load_dtype, &load_dev), Ok))
-                                .collect::<candle_core::Result<Vec<_>>>()?;
-                            Some(to_dev(Tensor::cat(&all, 0)?)?)
-                        }
-                    }
-                },
-                o: load_t(&attn, "o_proj.weight", e, qd)?,
-                q_norm: attn.try_get(hd, "q_norm.weight").map(&to_dev).transpose()?,
-                k_norm: attn.try_get(hd, "k_norm.weight").map(&to_dev).transpose()?,
-                mlp_norm: to_dev(l.get(e, "post_attention_layernorm.weight")?)?,
-                mlp: match &routed {
-                    Some((router, layout)) if layout.is_moe(i, router.n_experts) => Mlp::Moe(
-                        Box::new(Moe::load(&ld, &mlp, e, expert_width, router, layout.shared)?),
-                    ),
-                    _ => Mlp::Dense(Ffn::load(&ld, &mlp, e, spec.intermediate)?),
-                },
-            });
-        }
+        let blocks = read_blocks(&ld, &model, &spec, routed.as_ref(), expert_width, load_dtype, 0..spec.n_layer)?;
 
         let (embed, head, tied) = embedding(&ld, &vb, &model, "embed_tokens.weight", &spec)?;
 
@@ -218,17 +336,7 @@ impl GpuLlama {
             return Err(unread_error("llama", &left).into());
         }
 
-        // The same rotation table as `Rope::new`, built once on the device.
-        let half = hd / 2;
-        let inv: Vec<f32> = (0..half)
-            .map(|i| 1.0 / spec.rope_theta.powf(2.0 * i as f32 / hd as f32))
-            .collect();
-        let inv = Tensor::from_vec(inv, (1, half), &device)?;
-        let positions: Vec<f32> = (0..spec.n_ctx).map(|p| p as f32).collect();
-        let positions = Tensor::from_vec(positions, (spec.n_ctx, 1), &device)?;
-        let angles = positions.matmul(&inv)?;
-        let cos = angles.cos()?.to_dtype(compute)?;
-        let sin = angles.sin()?.to_dtype(compute)?;
+        let (cos, sin) = rotations(&spec, &device, compute)?;
 
         // Wait for the device before handing the model over. See
         // [`settled`].
@@ -270,56 +378,13 @@ impl GpuLlama {
     fn run(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
         let m = tokens.len();
         let spec = &self.spec;
-        let hd = spec.head_dim;
-        let (n_head, n_kv) = (spec.n_head, spec.n_kv_head);
         let pos0 = self.pos;
-        let scale = 1.0 / (hd as f64).sqrt();
 
         let ids = Tensor::from_slice(tokens, (m,), &self.device)?;
-        let mut x = self.embed.rows(&ids)?.to_dtype(self.dtype)?;
+        let x = self.embed.rows(&ids)?.to_dtype(self.dtype)?;
 
-        let cos = self.cos.narrow(0, pos0, m)?.contiguous()?;
-        let sin = self.sin.narrow(0, pos0, m)?.contiguous()?;
-        let mask = match m > 1 {
-            true => Some(causal_mask(m, pos0, &self.device, self.dtype)?),
-            false => None,
-        };
-
-        // The MLP's output of the layer before, not yet added to `x`: the
-        // add and the norm after it are one kernel, and the norm belongs to
-        // the next layer.
-        let mut pending: Option<Tensor> = None;
-        for (i, blk) in self.blocks.iter().enumerate() {
-            let h = match pending.take() {
-                None => crate::grad::rms_norm(&x, &blk.attn_norm, spec.eps)?,
-                Some(f) => {
-                    let (h, sum) = fused::add_rms_norm(&x, &f, &blk.attn_norm, spec.eps)?;
-                    x = sum;
-                    h
-                }
-            };
-
-            // [m, (n_head + 2 n_kv) hd]: the queries, then the keys, then the
-            // values.
-            let qkv = blk.qkv.forward(&h)?;
-            let heads = fused::Heads {
-                n_head,
-                n_kv,
-                head_dim: hd,
-                bias: blk.qkv_b.as_ref(),
-                q_norm: blk.q_norm.as_ref(),
-                k_norm: blk.k_norm.as_ref(),
-                eps: spec.eps,
-            };
-            let (q, k, v) =
-                split(&qkv, &heads, &cos, &sin, &mut self.kv[i], self.fuse, self.dtype, &self.device)?;
-
-            let out = attention(&q, &k, &v, mask.as_ref(), scale)?.to_dtype(self.dtype)?;
-            let out = out.transpose(1, 2)?.reshape((m, n_head * hd))?;
-            let (h, sum) = fused::add_rms_norm(&x, &linear(&out, &blk.o, None)?, &blk.mlp_norm, spec.eps)?;
-            x = sum;
-            pending = Some(blk.mlp.forward(&h, m, spec.n_embd)?);
-        }
+        let pass = Pass { spec, cos: &self.cos, sin: &self.sin, fuse: self.fuse, dtype: self.dtype, device: &self.device };
+        let (x, pending) = pass.through(&self.blocks, x, pos0, m, &mut self.kv)?;
 
         self.pos += m;
 
@@ -465,24 +530,7 @@ impl GpuLlama {
 
     fn params(&self) -> usize {
         let n = |t: &Tensor| t.elem_count();
-        // As on the CPU: the optional vectors are exactly the ones that differ
-        // between Qwen2 and Qwen3, so leaving them out would report the same
-        // count for a model that has them and one that does not.
-        let opt = |t: &Option<Tensor>| t.as_ref().map_or(0, n);
-        let blocks: usize = self
-            .blocks
-            .iter()
-            .map(|b| {
-                b.qkv.params()
-                    + b.o.params()
-                    + b.mlp.params()
-                    + n(&b.attn_norm)
-                    + n(&b.mlp_norm)
-                    + opt(&b.qkv_b)
-                    + opt(&b.q_norm)
-                    + opt(&b.k_norm)
-            })
-            .sum();
+        let blocks: usize = self.blocks.iter().map(Block::params).sum();
         // A head that is not counted is a head nobody notices is missing. It
         // is a separate parameter exactly when the model does not tie — and how
         // many copies of it *this* backend keeps is a question about
@@ -498,18 +546,7 @@ impl GpuLlama {
 
     fn memory_bytes(&self) -> usize {
         let per = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
-        let opt = |t: &Option<Tensor>| t.as_ref().map_or(0, per);
-        let blocks: usize = self
-            .blocks
-            .iter()
-            .map(|b| {
-                b.qkv.bytes() + b.o.bytes()
-                    + b.mlp.bytes()
-                    + per(&b.attn_norm)
-                    + per(&b.mlp_norm)
-                    + opt(&b.qkv_b)
-            })
-            .sum();
+        let blocks: usize = self.blocks.iter().map(Block::bytes).sum();
         // A tied head is the embedding, not a copy of it.
         let head = if self.tied { 0 } else { self.head.bytes() };
         blocks + self.embed.bytes() + head + per(&self.final_norm)
@@ -1448,19 +1485,21 @@ pub(crate) mod tests {
         let mut t: HashMap<String, Tensor> = HashMap::new();
         t.insert("model.embed_tokens.weight".into(), rand(spec.vocab_size, e));
         t.insert("model.norm.weight".into(), Tensor::ones(e, DType::F32, &d).unwrap());
-        let p = "model.layers.0";
-        t.insert(format!("{p}.input_layernorm.weight"), Tensor::ones(e, DType::F32, &d).unwrap());
-        t.insert(
-            format!("{p}.post_attention_layernorm.weight"),
-            Tensor::ones(e, DType::F32, &d).unwrap(),
-        );
-        t.insert(format!("{p}.self_attn.q_proj.weight"), rand(qd, e));
-        t.insert(format!("{p}.self_attn.k_proj.weight"), rand(kvd, e));
-        t.insert(format!("{p}.self_attn.v_proj.weight"), rand(kvd, e));
-        t.insert(format!("{p}.self_attn.o_proj.weight"), rand(e, qd));
-        t.insert(format!("{p}.mlp.gate_proj.weight"), rand(i, e));
-        t.insert(format!("{p}.mlp.up_proj.weight"), rand(i, e));
-        t.insert(format!("{p}.mlp.down_proj.weight"), rand(e, i));
+        for layer in 0..spec.n_layer {
+            let p = format!("model.layers.{layer}");
+            t.insert(format!("{p}.input_layernorm.weight"), Tensor::ones(e, DType::F32, &d).unwrap());
+            t.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                Tensor::ones(e, DType::F32, &d).unwrap(),
+            );
+            t.insert(format!("{p}.self_attn.q_proj.weight"), rand(qd, e));
+            t.insert(format!("{p}.self_attn.k_proj.weight"), rand(kvd, e));
+            t.insert(format!("{p}.self_attn.v_proj.weight"), rand(kvd, e));
+            t.insert(format!("{p}.self_attn.o_proj.weight"), rand(e, qd));
+            t.insert(format!("{p}.mlp.gate_proj.weight"), rand(i, e));
+            t.insert(format!("{p}.mlp.up_proj.weight"), rand(i, e));
+            t.insert(format!("{p}.mlp.down_proj.weight"), rand(e, i));
+        }
         if own_head {
             t.insert("lm_head.weight".into(), rand(spec.vocab_size, e));
         }
@@ -1549,6 +1588,59 @@ pub(crate) mod tests {
 
         assert_eq!(theirs.len(), ours.len());
         theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+    }
+
+    /// A model run a stage at a time says what it says whole: a prompt read
+    /// in one pass and tokens written after it, with the embedding and the
+    /// head on the CPU and the blocks here in two stages. And a stage that
+    /// is rewound, or handed the wrong position, behaves as a CPU one does.
+    ///
+    /// Not to the bit. The whole model fuses each block's MLP output into
+    /// the next norm and a stage's last block adds it plainly, and the ends
+    /// are another engine's arithmetic.
+    #[test]
+    fn a_model_in_gpu_stages_agrees_with_the_model_whole() {
+        use kvad::cluster::session::PipelineSession;
+        use kvad::cluster::stage::Stage;
+        use kvad::model::Shard;
+        use kvad::quant::Precision;
+
+        let mut spec = tiny_spec();
+        spec.n_layer = 3;
+        let path = write_checkpoint(&spec, true, "llama-stages");
+        let paths = std::slice::from_ref(&path);
+        let mut devices = vec![Device::Cpu];
+        devices.extend(Device::new_metal(0).ok());
+        for device in devices {
+            let mut whole = GpuLlama::load(paths, spec.clone(), DType::F32, None, device.clone(), &Vault::off()).unwrap();
+            let stage = |layers: std::ops::Range<usize>| -> Box<dyn Stage> {
+                Box::new(stage::GpuStage::load("tiny", paths, spec.clone(), DType::F32, None, device.clone(), layers, &mut |_| {}).unwrap())
+            };
+            let ckpt = kvad::weights::Checkpoint::open(paths).unwrap();
+            let src = kvad::qcache::Live::new(&ckpt, Precision::F32);
+            let ends = kvad::model::llama::Model::load_shard(&src, spec.clone(), &Shard { layers: 0..0, ends: true }).unwrap();
+            let mut staged = PipelineSession::new(std::sync::Arc::new(ends), vec![stage(0..1), stage(1..3)], Precision::F32).unwrap();
+
+            let differ = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let (ours, theirs) = (staged.forward(&[1, 2, 3, 4]).unwrap(), whole.forward(&[1, 2, 3, 4]).unwrap());
+            assert!(differ(&ours, &theirs) < 1e-4, "{device:?}: a prompt differs by {}", differ(&ours, &theirs));
+            for token in [5u32, 6, 7] {
+                let (ours, theirs) = (staged.forward(&[token]).unwrap(), whole.forward(&[token]).unwrap());
+                assert!(differ(&ours, &theirs) < 1e-4, "{device:?}: token {token} differs by {}", differ(&ours, &theirs));
+            }
+            // Back to the prompt, and on from there by another road.
+            assert_eq!((staged.truncate(4).unwrap(), whole.truncate(4).unwrap()), (4, 4));
+            let (ours, theirs) = (staged.forward(&[9]).unwrap(), whole.forward(&[9]).unwrap());
+            assert!(differ(&ours, &theirs) < 1e-4, "{device:?}: after a rewind it differs by {}", differ(&ours, &theirs));
+
+            let mut alone = stage(1..3);
+            assert_eq!(alone.shard(), Shard { layers: 1..3, ends: false });
+            let why = alone.run(0, 2, 1, vec![0.0; spec.n_embd]).unwrap_err().to_string();
+            assert!(why.contains("handed position 2 of a conversation it holds 0"), "{why}");
+            let (params, bytes) = alone.holds();
+            assert!(params > 0 && bytes == params * 4, "two blocks in f32: {params} parameters in {bytes} bytes");
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// Decoding a token at a time has to give what one pass over the whole

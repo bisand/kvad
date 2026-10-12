@@ -114,7 +114,7 @@ pub fn connect_within(address: &str, key: &Key, reach: Duration, greeting: Durat
 
 /// Ask the worker at `address` how long a layer of this shape takes it,
 /// written and read: [`super::plan::bench`], run there.
-pub fn bench(address: &str, key: &Key, n_embd: usize, intermediate: usize, precision: crate::quant::Precision) -> Result<super::plan::Speed, Fault> {
+pub fn bench(address: &str, key: &Key, n_embd: usize, intermediate: usize, precision: &str) -> Result<super::plan::Speed, Fault> {
     let (mut stream, hello) = connect(address, key)?;
     wire::send(&mut stream, Kind::Bench, &wire::Bench { n_embd, intermediate, precision: precision.to_string() })?;
     let mut buf = Vec::new();

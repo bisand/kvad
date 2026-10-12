@@ -284,11 +284,11 @@ fn plan(args: &Args, model: Option<&str>) -> Res<()> {
     };
     let nobody = key::Key::from_hex(&"00".repeat(32))?;
     let key = key.as_ref().unwrap_or(&nobody);
-    let (nodes, _) = session::survey(&spec, args.quant, &workers, key, None, &mut |line| eprintln!("{line}"))?;
+    let (nodes, _) = session::survey(&spec, args.quant, &workers, key, None, None, &mut |line| eprintln!("{line}"))?;
     // The files are not wanted, only what is known about the model.
     let files = kvad::weights::ModelFiles { weights: Vec::new(), tokenizer: Default::default(), config: Default::default(), tokenizer_config: None, generation_config: None };
     let mix = args.place.as_deref().map(kvad::cluster::plan::Mix::parse).transpose()?.unwrap_or(kvad::cluster::plan::Mix::REPLY);
-    let want = session::Across { repo: model, files: &files, spec: &spec, precision: args.quant, workers: &workers, split: split.as_deref(), key, params, context, mix, watch: &crate::weights::Watcher::none(), memory: None };
+    let want = session::Across { repo: model, files: &files, spec: &spec, precision: args.quant, workers: &workers, split: split.as_deref(), key, params, context, mix, watch: &crate::weights::Watcher::none(), memory: None, runs: None };
     let plan = session::planned(&want, &nodes)?;
     println!();
     for line in kvad::cluster::plan::table(&nodes, &plan) {

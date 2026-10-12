@@ -992,8 +992,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       on which port. Then every worker the local network says is there, \
                       found by asking, which takes a couple of seconds: its name, its id, \
                       its build and whether that is this one, and the addresses it can be \
-                      reached on.",
-        query: &[],
+                      reached on. And every model loaded across machines now: its \
+                      stages, the machine and the link each is on, and the time each has \
+                      taken, written and read, since the model was loaded.",
+        query: &[("find", false, "`false` to leave the network unasked, for a caller that looks often. The workers found are then null.")],
         body: None, produces: JSON, events: &[],
     },
 

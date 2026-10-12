@@ -342,16 +342,29 @@ fn a_split_that_is_not_one_is_refused_before_anything_is_loaded() {
     let huge = want(&[at.clone()], Some(&split), Some(250_000_000_000_000)).err().expect("refused");
     assert!(huge.contains("is given layers") && huge.contains("for a model"), "{huge}");
 
-    // With no split the layers are placed, and a model that fits on the
-    // machine with the tokens stays there: a worker is a hop, and here a
-    // hop buys nothing. The session that results asks the worker for
-    // nothing and runs in one stage.
+    // With no split the layers are placed. Which machine a model this
+    // small is placed on is a matter of a few microseconds' timing, on a
+    // machine running two hundred other tests, so either answer is taken
+    // and held to itself: whole and said to be, or in stages.
     let mut lines = Vec::new();
     let params = fixture.load(Precision::F32, &Shard::whole(&fixture.spec)).param_count() as u64;
     let placed = session::Across { repo: "tiny", files: &files, spec: &fixture.spec, precision: Precision::F32, workers: &[at], split: None, key: &key(), params: Some(params), context: 64, mix: kvad::cluster::plan::Mix::REPLY };
     let mut session = session::across(&placed, &mut |line| lines.push(line.to_string())).unwrap();
-    assert_eq!(session.label(), "cpu f32", "a model on one machine, and loaded as one");
-    assert!(lines.iter().any(|l| l.starts_with("MACHINE")) && lines.iter().any(|l| l.contains("the workers hold nothing")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("MACHINE")), "{lines:?}");
+    match lines.iter().any(|l| l.contains("the workers hold nothing")) {
+        true => assert_eq!(session.label(), "cpu f32", "a model on one machine, and loaded as one"),
+        false => assert!(session.label().ends_with("stages"), "{}", session.label()),
+    }
+    assert_eq!(session.forward(&[1, 2, 3]).unwrap().len(), common::VOCAB);
+
+    // With nobody to place it on there is one answer, and it is the model
+    // whole: not a pipeline of one stage, which would be the same
+    // arithmetic without what a model whole has.
+    let mut lines = Vec::new();
+    let alone = session::Across { workers: &[], ..placed };
+    let mut session = session::across(&alone, &mut |line| lines.push(line.to_string())).unwrap();
+    assert_eq!(session.label(), "cpu f32");
+    assert!(lines.iter().any(|l| l.contains("the workers hold nothing")), "{lines:?}");
     assert_eq!(session.forward(&[1, 2, 3]).unwrap().len(), common::VOCAB);
     // And with nothing known of its size, nothing is placed.
     let unknown = session::Across { params: None, ..placed };
@@ -495,4 +508,52 @@ fn a_prompt_read_by_every_stage_at_once_is_the_same_prompt() {
         assert_eq!(ours.len(), 50 * common::VOCAB);
         assert_eq!(bits(&ours), bits(&theirs), "{precision}: every position, in order");
     }
+}
+
+/// A model loaded across machines keeps an account of itself where
+/// something that is not running it can read it: each stage, where it is,
+/// and what it has taken, written and read. It is there while the model is
+/// loaded and gone when it is not.
+#[test]
+fn a_model_across_machines_is_shown_while_it_is_loaded() {
+    let fixture = llama("llama", "worker-shown");
+    let at = a_worker(&fixture);
+    let ends: Arc<dyn Transformer> = Arc::from(fixture.load(Precision::F32, &Shard { layers: 0..1, ends: true }));
+    let stages: Vec<Box<dyn Stage>> = vec![Box::new(LocalStage::new(ends.clone())), remote(&at, Precision::F32, 1..4)];
+    let name = format!("shown-{}", std::process::id());
+    let mine = |reports: Vec<session::Report>| reports.into_iter().find(|r| r.repo == name);
+    let mut split = PipelineSession::new(ends, stages, Precision::F32).unwrap().reading(8).shown_as(&name);
+
+    // Loaded, and nothing run: the stages and where they are.
+    let report = mine(session::live()).expect("shown as soon as it is loaded");
+    assert_eq!(report.stages.iter().map(|s| s.layers).collect::<Vec<_>>(), [[0, 1], [1, 4]]);
+    assert_eq!((report.stages[0].here, report.stages[1].here), (true, false));
+    assert_eq!(report.stages[1].place.address.as_deref(), Some(at.as_str()));
+    assert!(report.stages.iter().all(|s| s.bytes > 0 && s.life.one_runs == 0));
+
+    // A prompt of two chunks and sixty tokens after it.
+    let mut logits = split.forward(&[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5]).unwrap();
+    for _ in 0..60 {
+        let next = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32 % 16;
+        logits = split.forward(&[next]).unwrap();
+        // Short of the context: back to the prompt now and then.
+        if split.cached() > 40 {
+            assert_eq!(split.truncate(11).unwrap(), 11);
+        }
+    }
+    let report = mine(session::live()).unwrap();
+    for stage in &report.stages {
+        assert_eq!((stage.life.one_runs, stage.life.many_runs, stage.life.many_tokens), (60, 2, 11));
+        assert!(stage.life.one_ms > 0.0 && stage.life.many_ms > 0.0);
+    }
+    // The worker has been asked, and what it said is beside what this end
+    // had seen when it was asked: inside a round trip, never more than it.
+    let far = report.stages[1].life;
+    assert!(far.asked_one_runs >= 50 && far.asked_one_runs <= 60, "{far:?}");
+    let inside = far.inside_one_ms.expect("asked by now");
+    assert!(inside > 0.0 && inside <= far.asked_one_ms, "{far:?}");
+    assert!(report.stages[0].life.inside_one_ms.is_none(), "a stage here has nothing to be asked");
+
+    drop(split);
+    assert!(mine(session::live()).is_none(), "and gone with the model");
 }

@@ -32,6 +32,7 @@ pub struct RemoteStage {
     stream: TcpStream,
     /// The worker's name for itself and where it was reached, for errors.
     name: String,
+    place: super::stage::Place,
     shard: Shard,
     held: Ready,
     out: Vec<u8>,
@@ -159,7 +160,16 @@ impl RemoteStage {
         };
         stream.set_read_timeout(Some(PATIENCE))?;
         let shard = Shard { layers: load.layers[0]..load.layers[1], ends: false };
-        Ok(RemoteStage { stream, name, shard, held, out: Vec::new(), back: Vec::new() })
+        let place = super::stage::Place { machine: hello.name.clone(), address: Some(address.to_string()), link: None, hop_ms: None, chunk_ms: None };
+        Ok(RemoteStage { stream, name, place, shard, held, out: Vec::new(), back: Vec::new() })
+    }
+
+    /// Say what the way to this worker was found to be, for whoever is
+    /// shown the pipeline: the link, and what it measured.
+    pub fn reached_by(mut self, way: &super::path::Path) -> Self {
+        self.place.link = way.link.as_ref().map(|link| format!("{} on {}", link.title(), link.iface));
+        (self.place.hop_ms, self.place.chunk_ms) = (Some(way.hop_ms), Some(way.chunk_ms));
+        self
     }
 
     /// One frame out and the answer to it, or why there was none.
@@ -212,6 +222,10 @@ impl Stage for RemoteStage {
 
     fn elsewhere(&self) -> bool {
         true
+    }
+
+    fn place(&self) -> super::stage::Place {
+        self.place.clone()
     }
 
     fn inside(&mut self) -> Option<wire::Spent> {

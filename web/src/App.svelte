@@ -14,6 +14,7 @@
   import Training from "./routes/Training.svelte";
   import Datasets from "./routes/Datasets.svelte";
   import Monitoring from "./routes/Monitoring.svelte";
+  import Cluster from "./routes/Cluster.svelte";
   import Playground from "./routes/Playground.svelte";
   import Images from "./routes/Images.svelte";
   import Videos from "./routes/Videos.svelte";
@@ -108,6 +109,8 @@
         <Datasets />
       {:else if page.path === "/monitoring"}
         <Monitoring />
+      {:else if page.path === "/cluster"}
+        <Cluster />
       {:else if page.path === "/api"}
         <Api />
       {:else if page.path === "/settings"}

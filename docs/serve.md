@@ -256,8 +256,11 @@ machine with the same `cluster.key`, which is made in the data directory the
 first time a worker starts there and is copied by hand to the others. Both
 ends have to be the same build, to the commit.
 
-`GET /api/cluster` and `kvad cluster status` say what the two sections came
-to, and which workers the network says are there.
+`GET /api/cluster`, `kvad cluster status` and the Cluster page say what the
+two sections came to, which workers the network says are there, and for
+every model spread out now, which machine holds which layers and where a
+token's time goes: each stage's layers, and for a stage on another machine
+the round trip to it.
 
 What this does not do yet, said plainly:
 

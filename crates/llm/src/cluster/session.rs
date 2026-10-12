@@ -47,6 +47,16 @@ pub struct PipelineSession {
     /// [`PipelineSession::timing`].
     took: Vec<(u64, f64)>,
     ends_took: (u64, f64),
+    /// The same, since the model was loaded and never emptied, and what
+    /// each worker has said of its own time: what [`live`] shows.
+    life: Vec<Life>,
+    /// What the workers have said they spent inside their layers since
+    /// [`PipelineSession::timing`] last asked.
+    inside: Vec<Option<f64>>,
+    /// When the workers were last asked, which is not every token.
+    asked: std::time::Instant,
+    /// Where this pipeline's report is kept for [`live`] to read.
+    board: Option<Arc<std::sync::Mutex<Report>>>,
     /// A pass failed part way down the pipeline, so the stages before the
     /// failure hold rows the ones after it never saw.
     torn: bool,
@@ -75,8 +85,22 @@ impl PipelineSession {
         }
         layers.insert(0, Shard { layers: 0..0, ends: true });
         Shard::check(&layers, spec.n_layer)?;
-        let took = vec![(0, 0.0); stages.len()];
-        Ok(PipelineSession { ends, stages, len: 0, took, ends_took: (0, 0.0), torn: false, chunk: prefill_chunk(), precision, pool: pool() })
+        let (took, life, inside) = (vec![(0, 0.0); stages.len()], vec![Life::default(); stages.len()], vec![None; stages.len()]);
+        Ok(PipelineSession {
+            ends,
+            stages,
+            len: 0,
+            took,
+            ends_took: (0, 0.0),
+            life,
+            inside,
+            asked: std::time::Instant::now(),
+            board: None,
+            torn: false,
+            chunk: prefill_chunk(),
+            precision,
+            pool: pool(),
+        })
     }
 
     /// Every stage in this process: the shards of one model, in any order.
@@ -105,17 +129,19 @@ impl PipelineSession {
 
     /// One pass: `tokens` through the embedding and every stage. What comes
     /// back is the residual stream, for the head to be applied to or not.
-    fn pass(ends: &dyn Transformer, stages: &mut [Box<dyn Stage>], took: &mut [(u64, f64)], len: &mut usize, tokens: &[u32]) -> Result<Vec<f32>, Fault> {
+    fn pass(ends: &dyn Transformer, stages: &mut [Box<dyn Stage>], took: &mut [(u64, f64)], life: &mut [Life], len: &mut usize, tokens: &[u32]) -> Result<Vec<f32>, Fault> {
         let m = tokens.len();
         let mut xs = ends.embed(tokens, *len);
-        for (stage, took) in stages.iter_mut().zip(took.iter_mut()) {
+        for ((stage, took), life) in stages.iter_mut().zip(took.iter_mut()).zip(life.iter_mut()) {
             let started = std::time::Instant::now();
             // While another machine has the rows this one has nothing to
             // do, and would be slow to start again: see `linger`.
             let awake = stage.elsewhere().then(|| crate::model::linger(None)).flatten();
             xs = stage.run(SEQ, *len, m, xs)?;
             drop(awake);
-            *took = (took.0 + 1, took.1 + started.elapsed().as_secs_f64() * 1e3);
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            *took = (took.0 + 1, took.1 + ms);
+            life.saw(m, ms);
         }
         *len += m;
         Ok(xs)
@@ -139,12 +165,12 @@ impl Session for PipelineSession {
         if self.pipes(tokens) {
             return self.piped(tokens, false);
         }
-        let PipelineSession { ends, stages, len, chunk, pool, torn, took, ends_took, .. } = self;
+        let PipelineSession { ends, stages, len, chunk, pool, torn, took, ends_took, life, .. } = self;
         let logits = pool.install(|| -> Result<Vec<f32>, Fault> {
             let mut logits = Vec::new();
             let mut parts = tokens.chunks(*chunk).peekable();
             while let Some(part) = parts.next() {
-                let xs = Self::pass(ends.as_ref(), stages, took, len, part)?;
+                let xs = Self::pass(ends.as_ref(), stages, took, life, len, part)?;
                 if parts.peek().is_none() {
                     let started = std::time::Instant::now();
                     logits = ends.head(&xs, part.len(), false);
@@ -154,6 +180,7 @@ impl Session for PipelineSession {
             Ok(logits)
         });
         *torn = logits.is_err();
+        self.post();
         logits.map_err(plain)
     }
 
@@ -162,16 +189,17 @@ impl Session for PipelineSession {
         if self.pipes(tokens) {
             return self.piped(tokens, true);
         }
-        let PipelineSession { ends, stages, len, chunk, pool, torn, took, .. } = self;
+        let PipelineSession { ends, stages, len, chunk, pool, torn, took, life, .. } = self;
         let all = pool.install(|| -> Result<Vec<f32>, Fault> {
             let mut all = Vec::new();
             for part in tokens.chunks(*chunk) {
-                let xs = Self::pass(ends.as_ref(), stages, took, len, part)?;
+                let xs = Self::pass(ends.as_ref(), stages, took, life, len, part)?;
                 all.extend(ends.head(&xs, part.len(), true));
             }
             Ok(all)
         });
         *torn = all.is_err();
+        self.post();
         all.map_err(plain)
     }
 
@@ -214,6 +242,77 @@ impl Session for PipelineSession {
     fn weight_bytes(&self) -> usize {
         self.held().1
     }
+}
+
+/// What a stage has done since its model was loaded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct Life {
+    /// Passes of one row — tokens written — and their milliseconds as the
+    /// pipeline saw them: layers and round trip both.
+    pub one_runs: u64,
+    pub one_ms: f64,
+    /// Passes of several rows — chunks of a prompt — the tokens in them,
+    /// and their milliseconds.
+    pub many_runs: u64,
+    pub many_tokens: u64,
+    pub many_ms: f64,
+    /// Of each, what a worker says it was inside its layers. `None` for a
+    /// stage here, and for a worker that has not been asked yet.
+    pub inside_one_ms: Option<f64>,
+    pub inside_many_ms: Option<f64>,
+    /// The first three numbers as they stood when the worker was last
+    /// asked. A worker is asked now and then and not every token, so what
+    /// it has said is behind what the pipeline has seen; the hop is the
+    /// difference of two numbers taken at the same moment, and these are
+    /// the ones taken with the worker's.
+    pub asked_one_runs: u64,
+    pub asked_one_ms: f64,
+    pub asked_many_ms: f64,
+}
+
+impl Life {
+    fn saw(&mut self, rows: usize, ms: f64) {
+        match rows {
+            1 => (self.one_runs, self.one_ms) = (self.one_runs + 1, self.one_ms + ms),
+            _ => (self.many_runs, self.many_tokens, self.many_ms) = (self.many_runs + 1, self.many_tokens + rows as u64, self.many_ms + ms),
+        }
+    }
+}
+
+/// One stage of a model that is loaded across machines.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Staged {
+    /// The layers, first and one past the last.
+    pub layers: [usize; 2],
+    /// Whether they are on the machine that is showing this.
+    pub here: bool,
+    #[serde(flatten)]
+    pub place: super::stage::Place,
+    pub params: usize,
+    pub bytes: usize,
+    #[serde(flatten)]
+    pub life: Life,
+}
+
+/// A model loaded across machines, as it is now.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Report {
+    pub repo: String,
+    pub precision: String,
+    /// Positions of the conversation every stage holds.
+    pub positions: usize,
+    pub stages: Vec<Staged>,
+}
+
+/// Every pipeline in this process that asked to be shown.
+static BOARDS: std::sync::Mutex<Vec<std::sync::Weak<std::sync::Mutex<Report>>>> = std::sync::Mutex::new(Vec::new());
+
+/// The models loaded across machines in this process, as they are now: a
+/// pipeline's own account of itself, kept where something that is not the
+/// thread running it can read it.
+pub fn live() -> Vec<Report> {
+    let Ok(boards) = BOARDS.lock() else { return Vec::new() };
+    boards.iter().filter_map(|shown| shown.upgrade()).filter_map(|shown| shown.lock().ok().map(|report| report.clone())).collect()
 }
 
 /// Where a pipeline's time went, a stage at a time.
@@ -268,7 +367,7 @@ impl PipelineSession {
     /// once and left in a queue they would be a gigabyte waiting.
     fn piped(&mut self, tokens: &[u32], all: bool) -> Res<Vec<f32>> {
         use std::sync::mpsc::sync_channel;
-        let PipelineSession { ends, stages, len, chunk, pool, torn, took, ends_took, .. } = self;
+        let PipelineSession { ends, stages, len, chunk, pool, torn, took, ends_took, life, .. } = self;
         let (ends, pool): (&dyn Transformer, &rayon::ThreadPool) = (ends.as_ref(), pool);
         let parts: Vec<&[u32]> = tokens.chunks(*chunk).collect();
         let (start, last) = (*len, parts.len() - 1);
@@ -276,7 +375,7 @@ impl PipelineSession {
         let (read, out, fault) = std::thread::scope(|scope| {
             let (first, mut from_before) = sync_channel::<Chunk>(1);
             let mut working = Vec::with_capacity(stages.len());
-            for (stage, took) in stages.iter_mut().zip(took.iter_mut()) {
+            for ((stage, took), life) in stages.iter_mut().zip(took.iter_mut()).zip(life.iter_mut()) {
                 let (to_next, from_this) = sync_channel::<Chunk>(1);
                 let arriving = std::mem::replace(&mut from_before, from_this);
                 working.push(scope.spawn(move || -> Result<(), Fault> {
@@ -291,7 +390,9 @@ impl PipelineSession {
                             }
                             false => pool.install(|| stage.run(SEQ, pos0, m, xs))?,
                         };
-                        *took = (took.0 + 1, took.1 + started.elapsed().as_secs_f64() * 1e3);
+                        let ms = started.elapsed().as_secs_f64() * 1e3;
+                        *took = (took.0 + 1, took.1 + ms);
+                        life.saw(m, ms);
                         // Nobody left to hand it to: a later stage failed.
                         if to_next.send((i, pos0, m, xs)).is_err() {
                             break;
@@ -340,6 +441,7 @@ impl PipelineSession {
         // the stages before a failure hold chunks the ones after never saw.
         *len += read;
         *torn = fault.is_some();
+        self.post();
         match fault {
             Some(fault) => Err(plain(fault)),
             None => Ok(out),
@@ -355,16 +457,81 @@ impl PipelineSession {
     /// can say alone: the pipeline sees a round trip, and the worker sees
     /// its layers.
     pub fn timing(&mut self) -> (Vec<Timing>, (u64, f64)) {
+        self.ask();
         let stages = self
             .stages
-            .iter_mut()
+            .iter()
             .zip(self.took.iter_mut())
-            .map(|(stage, took)| {
+            .zip(self.inside.iter_mut())
+            .map(|((stage, took), inside)| {
                 let (runs, ms) = std::mem::take(took);
-                Timing { shard: stage.shard(), runs, ms, inside_ms: stage.inside().map(|spent| spent.ms) }
+                // Taken, and so nothing to say until it is asked again.
+                Timing { shard: stage.shard(), runs, ms, inside_ms: inside.take() }
             })
             .collect();
         (stages, std::mem::take(&mut self.ends_took))
+    }
+
+    /// Ask every worker what it has spent inside its layers since it was
+    /// last asked. A round trip each, which is why it is not every token.
+    fn ask(&mut self) {
+        self.asked = std::time::Instant::now();
+        for ((stage, life), inside) in self.stages.iter_mut().zip(self.life.iter_mut()).zip(self.inside.iter_mut()) {
+            if let Some(spent) = stage.inside() {
+                *inside = Some(inside.unwrap_or(0.0) + spent.ms);
+                life.inside_one_ms = Some(life.inside_one_ms.unwrap_or(0.0) + spent.one_ms);
+                life.inside_many_ms = Some(life.inside_many_ms.unwrap_or(0.0) + spent.ms - spent.one_ms);
+                (life.asked_one_runs, life.asked_one_ms, life.asked_many_ms) = (life.one_runs, life.one_ms, life.many_ms);
+            }
+        }
+    }
+
+    /// Have this pipeline's stages and their times shown to whoever asks
+    /// [`live`], under the model's name, for as long as it is loaded.
+    pub fn shown_as(mut self, repo: &str) -> Self {
+        let board = Arc::new(std::sync::Mutex::new(self.report(repo)));
+        if let Ok(mut boards) = BOARDS.lock() {
+            boards.retain(|shown| shown.strong_count() > 0);
+            boards.push(Arc::downgrade(&board));
+        }
+        self.board = Some(board);
+        self
+    }
+
+    /// Bring what is shown up to date. After every pass, with what this
+    /// machine saw; and with what the workers say, every couple of seconds.
+    fn post(&mut self) {
+        let Some(board) = self.board.clone() else { return };
+        // Every couple of seconds, and the first time there is anything
+        // to ask about: a short reply should not end with nothing known.
+        // And every fifty tokens, so that a reply shorter than that wait
+        // is known about as well: one round trip in fifty.
+        let due = self.stages.iter().zip(&self.life).any(|(stage, life)| {
+            stage.elsewhere() && (life.inside_one_ms.is_none() || life.one_runs >= life.asked_one_runs + 50)
+        });
+        if due || self.asked.elapsed() > std::time::Duration::from_secs(2) {
+            self.ask();
+        }
+        let Ok(mut shown) = board.lock() else { return };
+        let repo = std::mem::take(&mut shown.repo);
+        *shown = self.report(&repo);
+    }
+
+    fn report(&self, repo: &str) -> Report {
+        Report {
+            repo: repo.to_string(),
+            precision: self.precision.to_string(),
+            positions: self.len,
+            stages: self
+                .stages
+                .iter()
+                .zip(&self.life)
+                .map(|(stage, life)| {
+                    let (shard, (params, bytes)) = (stage.shard(), stage.holds());
+                    Staged { layers: [shard.layers.start, shard.layers.end], here: !stage.elsewhere(), place: stage.place(), params, bytes, life: *life }
+                })
+                .collect(),
+        }
     }
 
     /// Put the stages back in step after a pass that failed part way.
@@ -603,7 +770,7 @@ fn staged(want: &Across, plan: &plan::Plan, ways: &[path::Path], progress: &mut 
     for (way, share) in ways.iter().zip(&plan.shares[1..]).filter(|(_, share)| !share.layers.is_empty()) {
         progress(&format!("asking {} for layers {}..{}", way.hello.name, share.layers.start, share.layers.end));
         let load = Load { repo: want.repo.to_string(), precision: want.precision.to_string(), layers: [share.layers.start, share.layers.end] };
-        stages.push(Box::new(RemoteStage::open(&way.address, want.key, &load, progress).map_err(plain)?));
+        stages.push(Box::new(RemoteStage::open(&way.address, want.key, &load, progress).map_err(plain)?.reached_by(way)));
     }
-    PipelineSession::new(ends, stages, want.precision)
+    Ok(PipelineSession::new(ends, stages, want.precision)?.shown_as(want.repo))
 }

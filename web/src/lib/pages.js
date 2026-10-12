@@ -90,6 +90,13 @@ export const PAGES = [
     icon: "M22 12h-4l-3 9L9 3l-3 9H2",
   },
   {
+    path: "/cluster",
+    label: "Cluster",
+    phase: null,
+    blurb: "One model across several machines: who holds which layers, and where a token's time goes.",
+    icon: "M4 4h6v6H4zM14 4h6v6h-6zM9 14h6v6H9zM7 10v2h10v-2M12 12v2",
+  },
+  {
     path: "/api",
     label: "API",
     phase: null,

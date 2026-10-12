@@ -7,7 +7,7 @@
 
 use crate::api::{blocking, Fail};
 use crate::auth::{Admin, State};
-use axum::extract::State as St;
+use axum::extract::{Query, State as St};
 use axum::routing::get;
 use axum::{Json, Router};
 use kvad::cluster::{discover, key, wire, worker};
@@ -122,8 +122,19 @@ pub struct Overview {
     /// neither be a worker nor use one.
     has_key: bool,
     /// The workers the link says are there, whoever named them: found by
-    /// asking, which takes a couple of seconds.
-    found: Vec<Found>,
+    /// asking, which takes a couple of seconds. `None` when not asked.
+    found: Option<Vec<Found>>,
+    /// The models loaded across machines now: each stage, where it is,
+    /// and where its time has gone since the model was loaded.
+    models: Vec<kvad::cluster::session::Report>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct Asking {
+    /// Whether to ask the network who is a worker. Yes unless told not
+    /// to: a page that looks every few seconds has no use for an answer
+    /// that takes three.
+    find: Option<bool>,
 }
 
 #[derive(serde::Serialize)]
@@ -143,11 +154,15 @@ pub struct Found {
 
 /// `GET /api/cluster`: what this server's part in a cluster is, and who
 /// else on the link says they are a worker.
-pub async fn overview(_: Admin, St(_): St<State>) -> Result<Json<Overview>, Fail> {
+pub async fn overview(_: Admin, St(_): St<State>, Query(asking): Query<Asking>) -> Result<Json<Overview>, Fail> {
     let running = running();
     let (ours, named) = (running.worker.as_ref().map(|w| w.id.clone()), running.workers.clone());
+    let find = asking.find.unwrap_or(true);
     let found = blocking(move || {
-        Ok(discover::workers()
+        if !find {
+            return Ok(None);
+        }
+        Ok(Some(discover::workers()
             .into_iter()
             .map(|w| Found {
                 same_build: w.build == kvad::cluster::build(),
@@ -159,7 +174,7 @@ pub async fn overview(_: Admin, St(_): St<State>) -> Result<Json<Overview>, Fail
                 port: w.port,
                 addresses: w.addresses,
             })
-            .collect())
+            .collect()))
     })
     .await?;
     Ok(Json(Overview {
@@ -168,5 +183,6 @@ pub async fn overview(_: Admin, St(_): St<State>) -> Result<Json<Overview>, Fail
         has_key: key::path().is_file() || std::env::var(key::ENV).is_ok_and(|k| !k.trim().is_empty()),
         running,
         found,
+        models: kvad::cluster::session::live(),
     }))
 }

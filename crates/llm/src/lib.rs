@@ -42,6 +42,8 @@ pub use serde_json;
 pub mod chat;
 pub mod checkpoint;
 pub mod client;
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod crawl;
 pub mod daemon;
 pub mod dit;

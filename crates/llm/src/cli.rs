@@ -16,6 +16,7 @@
 //! * [`api`] — the commands only a server can answer: conversations, jobs,
 //!   datasets, evals, benchmarks, metrics, accounts, and `kvad api` for any
 //!   route at all.
+//! * [`cluster`] — `kvad cluster`: measuring the links between machines.
 //! * [`out`] — tables, questions and progress lines.
 //! * [`spec`] — every command, word and flag in one table, which the next
 //!   two read.
@@ -23,6 +24,8 @@
 //! * [`complete`] — Tab completion: the shells' scripts, and what they ask.
 
 pub mod api;
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod complete;
 pub mod help;
 pub mod models;

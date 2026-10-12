@@ -71,6 +71,17 @@ const CRAWL: &[Flag] = &[
     sw("--same-host", "follow links anywhere on the host, not only under the address's own directory"),
 ];
 
+/// `kvad cluster`'s usage. Here and not beside the command, which a build
+/// without the `cluster` feature does not have.
+pub const CLUSTER: &str = "usage: kvad cluster find [--all]        who is on the other end of each cable
+       kvad cluster listen [--port N]   be the far end of a measurement
+       kvad cluster ping [HOST]         measure the link to a machine that is listening
+       kvad cluster link IFACE          say what one interface's link is
+
+With no HOST, `ping` measures the one machine `find` finds, if it finds one.";
+
+const CLUSTER_PORT: Flag = f("--port", "N", Kind::Text, "the port to listen on, or to reach (default 7420)");
+
 const LORA: Flag = f("--lora", "NAME[:SCALE]", Kind::Lora, "apply a LoRA, at SCALE if given (default 1); as often as you like");
 
 // ---------------------------------------------------------------------------
@@ -731,6 +742,46 @@ pub const COMMANDS: &[Command] = &[
         notes: "",
         examples: &["kvad metrics", "kvad metrics requests --limit 20", "kvad metrics usage --days 30"],
     },
+    Command {
+        name: "cluster",
+        group: Group::Measure,
+        args: "[find|listen|ping|link]",
+        about: "measure the link between two machines, and say what it is",
+        server: false,
+        routed: false,
+        words: &[Kind::Text],
+        subs: &[
+            Sub { name: "find", args: "", about: "who is on the other end of each cable", words: &[], flags: &[&[sw("--all", "ask Wi-Fi and the LAN too, not only cables")]] },
+            Sub { name: "listen", args: "", about: "be the far end of a measurement", words: &[], flags: &[&[CLUSTER_PORT]] },
+            Sub {
+                name: "ping",
+                args: "[HOST]",
+                about: "measure the link to a machine that is listening",
+                words: &[Kind::Text],
+                flags: &[&[
+                    CLUSTER_PORT,
+                    f("--rounds", "N", Kind::Text, "rounds that count, after one that does not (default 7)"),
+                    f("--sizes", "LIST", Kind::Text, "frame sizes to send, such as 16k,32k,2m"),
+                    f("--stream-mb", "N", Kind::Text, "megabytes sent one way, for the ceiling (default 64)"),
+                ]],
+            },
+            Sub { name: "link", args: "IFACE", about: "say what one interface's link is", words: &[Kind::Text], flags: &[] },
+        ],
+        flags: &[],
+        usage: Some(CLUSTER),
+        notes: "The first step towards one model across several machines; docs/cluster-plan.md\n\
+                is the whole of it. What is here measures a link the way a split model will\n\
+                use it: a frame out and the same frame back, which is what handing a machine\n\
+                its layers' input and waiting for their output costs before any layer runs.\n\
+                32 KB is a decode step of a 70B model and 2 MB a chunk of its prompt.\n\n\
+                It says what the link is before it prints a number. A USB-C charging cable\n\
+                between two Macs carries USB 2: it takes addresses, answers and carries SSH,\n\
+                at a hundredth of what the ports can do, and looks like Thunderbolt to\n\
+                everything but this.\n\n\
+                `listen` sends back what it is sent to anybody who can reach its port. It\n\
+                loads nothing and reads nothing, and is not meant to be left running.",
+        examples: &["kvad cluster listen", "kvad cluster find", "kvad cluster ping", "kvad cluster ping 'fe80::1c%en12' --sizes 16k,32k,64k"],
+    },
     // -- accounts ----------------------------------------------------------
     Command {
         name: "auth",
@@ -1035,7 +1086,7 @@ mod tests {
     #[test]
     fn the_table_holds_every_command_and_only_those() {
         for command in COMMANDS {
-            let handled = matches!(command.name, "arch" | "crawl" | "service" | "serve" | "help" | "completions");
+            let handled = matches!(command.name, "arch" | "crawl" | "service" | "cluster" | "serve" | "help" | "completions");
             assert!(handled || crate::cli::known(command.name), "`{}` is in the table and nothing runs it", command.name);
             assert_eq!(command.server, crate::cli::remote_only(command.name), "`{}`: does it need a server?", command.name);
             // The parser gathers words only for the commands it knows take
@@ -1066,7 +1117,7 @@ mod tests {
     /// A subcommand in the table is one its command's source matches on.
     #[test]
     fn every_subcommand_is_one_the_source_matches() {
-        let sources = [include_str!("api.rs"), include_str!("models.rs"), include_str!("service.rs"), include_str!("complete.rs"), include_str!("../main.rs")];
+        let sources = [include_str!("api.rs"), include_str!("models.rs"), include_str!("service.rs"), include_str!("cluster.rs"), include_str!("complete.rs"), include_str!("../main.rs")];
         for command in COMMANDS {
             for sub in command.subs {
                 let arm = format!("\"{}\"", sub.name);

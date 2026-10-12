@@ -10,11 +10,14 @@ description = "Transformer inference from scratch: GPT-2, Llama-family and DeepS
 # Architectures are modules, and each one is optional: a build with a feature
 # off does not contain that code, and `kvad arch` prints what this binary has.
 # See `src/model/arch.rs` for why these are Cargo features and not dylibs.
-default = ["arch-gpt2", "arch-llama", "arch-deepseek", "arch-qwen3-5"]
+default = ["arch-gpt2", "arch-llama", "arch-deepseek", "arch-qwen3-5", "cluster"]
 arch-gpt2 = []
 arch-llama = []
 arch-deepseek = []
 arch-qwen3-5 = []
+# One model across several machines: `src/cluster/`, and `kvad cluster`.
+# See docs/cluster-plan.md.
+cluster = []
 
 [dependencies]
 hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }

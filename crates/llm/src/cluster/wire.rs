@@ -84,6 +84,11 @@ pub enum Kind {
     /// before anything is loaded.
     Bench = 16,
     Benched = 17,
+    /// How long the stage has spent in its layers since it was last asked:
+    /// answered by a [`Kind::Spent`], JSON [`Spent`]. What is left of a
+    /// round trip when this is taken out of it is the hop.
+    Spend = 18,
+    Spent = 19,
 }
 
 impl Kind {
@@ -106,6 +111,8 @@ impl Kind {
             15 => Kind::Unload,
             16 => Kind::Bench,
             17 => Kind::Benched,
+            18 => Kind::Spend,
+            19 => Kind::Spent,
             _ => return None,
         })
     }
@@ -273,6 +280,14 @@ pub struct Load {
 pub struct Ready {
     pub params: usize,
     pub bytes: usize,
+}
+
+/// Passes a stage has run, and the milliseconds it was inside its layers
+/// for them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Spent {
+    pub runs: u64,
+    pub ms: f64,
 }
 
 /// The shape of a layer to time: see [`super::plan::bench`].
@@ -480,10 +495,10 @@ mod tests {
         assert_eq!(read(&mut Cursor::new(wire), 1 << 16, &mut buf).unwrap(), Kind::Load);
         assert_eq!(parse::<Load>(Kind::Load, &buf).unwrap(), load);
         assert!(parse::<Ready>(Kind::Ready, &buf).is_err());
-        for byte in 1..=17u8 {
+        for byte in 1..=19u8 {
             assert_eq!(Kind::from_u8(byte).map(|k| k as u8), Some(byte));
         }
-        assert_eq!(Kind::from_u8(18), None);
+        assert_eq!(Kind::from_u8(20), None);
     }
 
     #[test]

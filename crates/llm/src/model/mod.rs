@@ -1005,6 +1005,63 @@ pub fn prefill_chunk() -> usize {
     std::env::var("KVAD_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0).unwrap_or(64)
 }
 
+/// A machine kept awake for work that is on its way: see [`linger`].
+/// Dropping it says the wait is over.
+pub struct Lingering(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Lingering {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// How long a machine is kept awake for a token that has not come yet, in
+/// milliseconds: half a second, unless `KVAD_LINGER_MS` says otherwise.
+/// `0` turns it off.
+pub fn linger_ms() -> u64 {
+    static ONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| std::env::var("KVAD_LINGER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500))
+}
+
+/// Keep this machine awake until the answer is dropped, or for
+/// [`linger_ms`], whichever is first: one thread of `pool`, or of the pool
+/// this is called from, spinning.
+///
+/// A stage of a split model works in bursts. A token's rows arrive, its
+/// layers run, and then nothing until the token has been round the other
+/// machines — and a machine that has done nothing for a few tens of
+/// milliseconds does its next burst several times slower. Measured on an
+/// M2 MacBook Air: thirty layers that take 6.4 ms back to back take 23 ms
+/// after a tenth of a second idle, and an M5 Pro is the same shape at 4.6
+/// and 11.3. It is not the pool waking, which one thread shows as well as
+/// fourteen; it is not the process's priority or its scheduling class. It
+/// is the processor, which has stepped down and steps back up slowly, and
+/// what keeps it up is having something to do.
+///
+/// So between one token and the next, one thread has something to do. One
+/// is enough — it measured as well as all of them — and one core spinning
+/// for the length of a reply is what a model run whole costs on every core
+/// anyway. The limit is for the token that never comes: a reply that has
+/// ended is half a second of one core, and then quiet.
+pub fn linger(pool: Option<&rayon::ThreadPool>) -> Option<Lingering> {
+    let limit = std::time::Duration::from_millis(linger_ms());
+    if limit.is_zero() {
+        return None;
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (flag, started) = (stop.clone(), std::time::Instant::now());
+    let spin = move || {
+        while !flag.load(std::sync::atomic::Ordering::Acquire) && started.elapsed() < limit {
+            std::hint::spin_loop();
+        }
+    };
+    match pool {
+        Some(pool) => pool.spawn(spin),
+        None => rayon::spawn(spin),
+    }
+    Some(Lingering(stop))
+}
+
 /// The threads a session's matmuls run on: [`threads`] of them.
 pub fn pool() -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
@@ -1013,6 +1070,7 @@ pub fn pool() -> rayon::ThreadPool {
         .build()
         .expect("building a thread pool")
 }
+
 
 impl CpuSession {
     /// Read a prompt `chunk` tokens a pass rather than the usual 64. For
@@ -1312,6 +1370,21 @@ mod tests {
 
         assert_eq!(cache.truncate(5), 5);
         assert_eq!(cache.state(1), &[2.5; 6], "nothing was dropped, so nothing was reset");
+    }
+
+    /// Lingering ends when it is told to and, untold, when its time is up;
+    /// and it takes one thread, so the work it waits for has the others.
+    #[test]
+    fn a_machine_is_kept_awake_until_the_work_comes_and_no_longer() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let awake = linger(Some(&pool)).expect("on unless turned off");
+        let started = std::time::Instant::now();
+        // The other thread is free while one spins.
+        assert_eq!(pool.install(|| 6 * 7), 42);
+        drop(awake);
+        // Both are free again at once, long before the limit.
+        pool.broadcast(|_| ());
+        assert!(started.elapsed() < std::time::Duration::from_millis(linger_ms().max(400) - 100), "{:?}", started.elapsed());
     }
 
     #[test]

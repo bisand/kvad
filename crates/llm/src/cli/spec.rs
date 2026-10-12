@@ -772,6 +772,7 @@ pub const COMMANDS: &[Command] = &[
                     f("--rounds", "N", Kind::Text, "rounds that count, after one that does not (default 7)"),
                     f("--sizes", "LIST", Kind::Text, "frame sizes to send, such as 16k,32k,2m"),
                     f("--stream-mb", "N", Kind::Text, "megabytes sent one way, for the ceiling (default 64)"),
+                    f("--gap", "MS", Kind::Text, "leave the link idle this long before each frame, as a model's tokens do"),
                 ]],
             },
             Sub { name: "link", args: "IFACE", about: "say what one interface's link is", words: &[Kind::Text], flags: &[] },

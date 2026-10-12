@@ -725,6 +725,73 @@ of them back to back. Phase 4 owes an account of the difference, and this
 is where it starts; `kvad cluster ping` wants a mode that leaves a gap
 between frames before the second guess can be told from the first.
 
+**The account, the same day.** It was the first guess, and not as guessed.
+
+`examples/hops.rs` takes a token apart: what each stage took as the
+pipeline saw it, and how much of a worker's round trip the worker says it
+spent inside its own layers (a `Spend` frame; `PipelineSession::timing`).
+SmolLM2-135M at q8 over the cable:
+
+| layers on the Air | round trip | inside its layers | a layer there | the hop |
+|---|---|---|---|---|
+| 5 | 5.92 ms | 4.87 ms | 0.975 ms | 1.04 ms |
+| 15 | 6.40 ms | 5.55 ms | 0.370 ms | 0.84 ms |
+| 30 | 7.45 ms | 6.65 ms | 0.222 ms | 0.80 ms |
+
+The hop is what the ping said it was. The time is in the Air's layers,
+which cost four times as much each when there are five of them as when
+there are thirty — the less of a token a machine does, the slower it does
+it. Leaving the Air idle for a set time before each token, with all thirty
+layers on it, shows what that is:
+
+| idle before each token | thirty layers at q8, on the Air | on the M5 Pro |
+|---|---|---|
+| none | 6.4 ms | 4.6 ms |
+| 20 ms | 16.4 ms | 6.6 ms |
+| 100 ms | 23.0 ms | 11.3 ms |
+| 400 ms | 23.5 ms | 11.4 ms |
+
+A machine that has done nothing for a tenth of a second does its next
+burst of work at something like a third of its speed, for the first
+twenty-odd milliseconds of it: at f32, where the Air's thirty layers are
+17 ms of work, they took 35.6 after the same idle, the same eighteen
+milliseconds lost. What it is not, each by taking it away: not the thread
+pool waking (one thread on the worker loses as much as eight), not the
+process's priority (zsh nices a job put in the background, which cost a
+tenth and was not the cause), and not its scheduling class (asking for
+user-interactive changed nothing to three figures). It is the processor,
+stepped down and slow to step up, and both machines do it.
+
+This matters more than the cable did. A layer split is a set of machines
+each idle while the others work, so *every stage of every cluster* starts
+each token cold, and a 70B across four machines at 100 ms a token would
+lose eighteen milliseconds a machine to it. `Σ stages + hops × RTT` is
+right about machines that are awake.
+
+So they are kept awake (`model::linger`). Between one token's rows and
+the next a worker spins one thread, and so does a coordinator while
+another machine has the rows; one thread measured as well as all of them.
+It stops when the rows come, or after half a second for the token that
+never does (`KVAD_LINGER_MS`; 0 turns it off). The same rig, decode in
+milliseconds a token, off and on, beside the plan's sum from each machine's
+own rate and a 0.8 ms round trip:
+
+| here / on the Air | f32 off | f32 on | sum | q8 off | q8 on | sum |
+|---|---|---|---|---|---|---|
+| 25 / 5 | 15.3 | 9.1 | 9.1 | 11.3 | 6.7 | 6.5 |
+| 15 / 15 | 14.2 | 13.1 | 12.6 | 9.5 | 7.1 | 6.8 |
+| 5 / 25 | 19.2 | 16.8 | 16.1 | 8.5 | 7.7 | 7.0 |
+| 0 / 30 | 20.8 | 18.9 | 18.2 | 8.6 | 7.5 | 7.6 |
+
+Within 0.7 ms of the sum everywhere, where it was up to 6 ms over. The
+price is a core at full power on every machine of the cluster for as long
+as a reply lasts, which is what a model run whole costs on all of them.
+
+Still open: whether a burst much longer than these warms itself up part
+way through, which a large model's stages would be; what this does on a
+machine that is not a Mac; and that `kvad cluster plan` still times a
+layer warm and says nothing of a machine that has the linger turned off.
+
 **Phase 2 — a worker on loopback.** `worker.rs`, `RemoteStage`, the handshake
 and the key, `kvad worker`, `--workers`, and `--split`, because without it a
 small model never leaves the coordinator. Also the machine id, `_kvad._tcp`

@@ -219,12 +219,17 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
     // coordinator that only measures the way here needs none.
     let mut pool: Option<rayon::ThreadPool> = None;
     let mut held = Held { shared, stage: None, ours: false };
+    let mut spent = wire::Spent::default();
+    // This machine, kept awake between one token's rows and the next.
+    let mut awake: Option<crate::model::Lingering> = None;
     loop {
         let (kind, len) = match wire::read_header(stream) {
             Ok(header) => header,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        // Whatever has arrived, the wait for it is over.
+        drop(awake.take());
         match kind {
             Kind::Forward if len <= MOST_ROWS => {
                 wire::read_payload(stream, len, &mut buf)?;
@@ -233,11 +238,18 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
                 let ran = match (held.stage.as_mut(), pool.as_ref()) {
                     // A panic in a kernel is this stage's fault and one
                     // reply's: said, and the worker goes on listening.
-                    (Some(stage), Some(pool)) => pool.install(|| {
+                    (Some(stage), Some(pool)) => {
+                        let started = std::time::Instant::now();
+                        let ran = pool.install(|| {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stage.run(seq, pos0 as usize, m as usize, rows.xs)))
                             .map_err(|panic| panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "the stage panicked".into()))
                             .and_then(|ran| ran.map_err(|fault| fault.to_string()))
-                    }),
+                        });
+                        spent.runs += 1;
+                        spent.ms += started.elapsed().as_secs_f64() * 1e3;
+                        awake = crate::model::linger(Some(pool));
+                        ran
+                    }
                     _ => Err("rows for a stage that has not been loaded".to_string()),
                 };
                 match ran {
@@ -305,6 +317,10 @@ fn one(stream: &mut TcpStream, key: &Key, shared: &Shared) -> io::Result<()> {
                 wire::skip(stream, len)?;
                 held.release();
                 wire::write(stream, Kind::Ack, &[])?;
+            }
+            Kind::Spend => {
+                wire::skip(stream, len)?;
+                wire::send(stream, Kind::Spent, &std::mem::take(&mut spent))?;
             }
             Kind::Bench if len <= 1 << 16 => {
                 wire::read_payload(stream, len, &mut buf)?;

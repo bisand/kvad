@@ -102,6 +102,8 @@ struct Args {
     /// `cluster` only: the frame sizes to sweep, megabytes to send one
     /// way, and whether `find` asks every interface.
     sizes: Option<String>,
+    /// `cluster ping`: milliseconds to leave the link idle before each frame.
+    gap: Option<f64>,
     /// `run` and `chat`: the machines to spread a model over, and which
     /// layers each holds.
     workers: Option<String>,
@@ -212,6 +214,7 @@ impl Default for Args {
             window: None,
             rounds: None,
             sizes: None,
+            gap: None,
             workers: None,
             split: None,
             context: None,
@@ -431,6 +434,7 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--window" => a.window = Some(num() as usize),
             "--rounds" => a.rounds = Some(num() as usize),
             "--sizes" => a.sizes = Some(value.clone()),
+            "--gap" => a.gap = Some(num()),
             "--workers" => a.workers = Some(value.clone()),
             "--split" => a.split = Some(value.clone()),
             "--context" => a.context = Some(num() as usize),

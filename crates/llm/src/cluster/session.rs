@@ -42,6 +42,11 @@ pub struct PipelineSession {
     stages: Vec<Box<dyn Stage>>,
     /// Positions every stage holds.
     len: usize,
+    /// Passes each stage has run and the milliseconds they took as seen
+    /// from here, and the same for the two ends: see
+    /// [`PipelineSession::timing`].
+    took: Vec<(u64, f64)>,
+    ends_took: (u64, f64),
     /// A pass failed part way down the pipeline, so the stages before the
     /// failure hold rows the ones after it never saw.
     torn: bool,
@@ -70,7 +75,8 @@ impl PipelineSession {
         }
         layers.insert(0, Shard { layers: 0..0, ends: true });
         Shard::check(&layers, spec.n_layer)?;
-        Ok(PipelineSession { ends, stages, len: 0, torn: false, chunk: prefill_chunk(), precision, pool: pool() })
+        let took = vec![(0, 0.0); stages.len()];
+        Ok(PipelineSession { ends, stages, len: 0, took, ends_took: (0, 0.0), torn: false, chunk: prefill_chunk(), precision, pool: pool() })
     }
 
     /// Every stage in this process: the shards of one model, in any order.
@@ -99,11 +105,17 @@ impl PipelineSession {
 
     /// One pass: `tokens` through the embedding and every stage. What comes
     /// back is the residual stream, for the head to be applied to or not.
-    fn pass(ends: &dyn Transformer, stages: &mut [Box<dyn Stage>], len: &mut usize, tokens: &[u32]) -> Result<Vec<f32>, Fault> {
+    fn pass(ends: &dyn Transformer, stages: &mut [Box<dyn Stage>], took: &mut [(u64, f64)], len: &mut usize, tokens: &[u32]) -> Result<Vec<f32>, Fault> {
         let m = tokens.len();
         let mut xs = ends.embed(tokens, *len);
-        for stage in stages.iter_mut() {
+        for (stage, took) in stages.iter_mut().zip(took.iter_mut()) {
+            let started = std::time::Instant::now();
+            // While another machine has the rows this one has nothing to
+            // do, and would be slow to start again: see `linger`.
+            let awake = stage.elsewhere().then(|| crate::model::linger(None)).flatten();
             xs = stage.run(SEQ, *len, m, xs)?;
+            drop(awake);
+            *took = (took.0 + 1, took.1 + started.elapsed().as_secs_f64() * 1e3);
         }
         *len += m;
         Ok(xs)
@@ -124,14 +136,16 @@ impl Session for PipelineSession {
     /// a prompt are nobody's to read.
     fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
         self.mend()?;
-        let PipelineSession { ends, stages, len, chunk, pool, torn, .. } = self;
+        let PipelineSession { ends, stages, len, chunk, pool, torn, took, ends_took, .. } = self;
         let logits = pool.install(|| -> Result<Vec<f32>, Fault> {
             let mut logits = Vec::new();
             let mut parts = tokens.chunks(*chunk).peekable();
             while let Some(part) = parts.next() {
-                let xs = Self::pass(ends.as_ref(), stages, len, part)?;
+                let xs = Self::pass(ends.as_ref(), stages, took, len, part)?;
                 if parts.peek().is_none() {
+                    let started = std::time::Instant::now();
                     logits = ends.head(&xs, part.len(), false);
+                    *ends_took = (ends_took.0 + 1, ends_took.1 + started.elapsed().as_secs_f64() * 1e3);
                 }
             }
             Ok(logits)
@@ -142,11 +156,11 @@ impl Session for PipelineSession {
 
     fn forward_all(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
         self.mend()?;
-        let PipelineSession { ends, stages, len, chunk, pool, torn, .. } = self;
+        let PipelineSession { ends, stages, len, chunk, pool, torn, took, .. } = self;
         let all = pool.install(|| -> Result<Vec<f32>, Fault> {
             let mut all = Vec::new();
             for part in tokens.chunks(*chunk) {
-                let xs = Self::pass(ends.as_ref(), stages, len, part)?;
+                let xs = Self::pass(ends.as_ref(), stages, took, len, part)?;
                 all.extend(ends.head(&xs, part.len(), true));
             }
             Ok(all)
@@ -196,7 +210,40 @@ impl Session for PipelineSession {
     }
 }
 
+/// Where a pipeline's time went, a stage at a time.
+#[derive(Clone, Debug)]
+pub struct Timing {
+    pub shard: Shard,
+    /// Passes, and the milliseconds they took as the pipeline saw them.
+    pub runs: u64,
+    pub ms: f64,
+    /// For a stage on another machine: the milliseconds of those that the
+    /// machine says it was inside its layers. The rest was the hop.
+    pub inside_ms: Option<f64>,
+}
+
 impl PipelineSession {
+    /// Where the time has gone since this was last asked: each stage's
+    /// passes and their milliseconds, and last the output head's.
+    ///
+    /// A token through a split model costs each stage's layers and, for a
+    /// stage on another machine, a round trip. Which of those a slow token
+    /// was slow in is the first thing to know about it, and neither end
+    /// can say alone: the pipeline sees a round trip, and the worker sees
+    /// its layers.
+    pub fn timing(&mut self) -> (Vec<Timing>, (u64, f64)) {
+        let stages = self
+            .stages
+            .iter_mut()
+            .zip(self.took.iter_mut())
+            .map(|(stage, took)| {
+                let (runs, ms) = std::mem::take(took);
+                Timing { shard: stage.shard(), runs, ms, inside_ms: stage.inside().map(|spent| spent.ms) }
+            })
+            .collect();
+        (stages, std::mem::take(&mut self.ends_took))
+    }
+
     /// Put the stages back in step after a pass that failed part way.
     ///
     /// The stages before the failure ran the pass's rows and the ones
@@ -375,6 +422,12 @@ fn checked(want: &Across) -> Res<()> {
 /// every machine's share is held to its memory before anything is loaded,
 /// and the plan is said.
 pub fn across(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<Box<dyn Session>> {
+    Ok(Box::new(pipeline(want, progress)?))
+}
+
+/// [`across`], as the pipeline it is: for a caller that wants to ask it
+/// where its time went.
+pub fn pipeline(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<PipelineSession> {
     checked(want)?;
     let (nodes, ways) = survey(want.spec, want.precision, want.workers, want.key, progress)?;
     let plan = planned(want, &nodes)?;
@@ -397,5 +450,5 @@ pub fn across(want: &Across, progress: &mut dyn FnMut(&str)) -> Res<Box<dyn Sess
         let load = Load { repo: want.repo.to_string(), precision: want.precision.to_string(), layers: [share.layers.start, share.layers.end] };
         stages.push(Box::new(RemoteStage::open(&way.address, want.key, &load, progress).map_err(plain)?));
     }
-    Ok(Box::new(PipelineSession::new(ends, stages, want.precision)?))
+    PipelineSession::new(ends, stages, want.precision)
 }

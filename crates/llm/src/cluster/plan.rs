@@ -153,15 +153,18 @@ pub fn place(nodes: &[Node], sizes: &Sizes) -> Result<Plan, String> {
 
     // Fastest first. A tie goes to the machine named first, and the
     // coordinator is named first of all: a layer here costs no hop.
-    let mut order: Vec<usize> = (0..nodes.len()).collect();
-    order.sort_by(|&a, &b| nodes[a].layer_ms.total_cmp(&nodes[b].layer_ms).then(a.cmp(&b)));
-
-    let mut counts = vec![0; nodes.len()];
-    let mut left = sizes.n_layer;
-    for i in order {
-        counts[i] = room(i).min(left);
-        left -= counts[i];
-    }
+    let mut fastest: Vec<usize> = (0..nodes.len()).collect();
+    fastest.sort_by(|&a, &b| nodes[a].layer_ms.total_cmp(&nodes[b].layer_ms).then(a.cmp(&b)));
+    let filled = |order: &[usize]| {
+        let mut counts = vec![0; nodes.len()];
+        let mut left = sizes.n_layer;
+        for &i in order {
+            counts[i] = room(i).min(left);
+            left -= counts[i];
+        }
+        (counts, left)
+    };
+    let (counts, left) = filled(&fastest);
     if left > 0 {
         let held: u64 = nodes.iter().map(|n| n.memory).sum();
         return Err(format!(
@@ -172,7 +175,19 @@ pub fn place(nodes: &[Node], sizes: &Sizes) -> Result<Plan, String> {
             sizes.n_layer
         ));
     }
-    Ok(laid_out(nodes, sizes, &counts))
+    // A faster machine is only worth its round trip if its layers save
+    // more than the trip costs. So the same filling with this machine
+    // first is tried beside it, and the quicker token wins: a worker that
+    // is a hair faster does not take a model off the machine it fits on.
+    let by_speed = laid_out(nodes, sizes, &counts);
+    let here_first: Vec<usize> = std::iter::once(0).chain(fastest.iter().copied().filter(|&i| i != 0)).collect();
+    match filled(&here_first) {
+        (counts, 0) => {
+            let from_here = laid_out(nodes, sizes, &counts);
+            Ok(if from_here.ms_per_token <= by_speed.ms_per_token { from_here } else { by_speed })
+        }
+        _ => Ok(by_speed),
+    }
 }
 
 /// A split made by hand, held to the same memory: the plan it is, or which
@@ -309,6 +324,13 @@ mod tests {
         // With a slower studio the order turns over: here fills first.
         let nodes = [node("here", 48, 1.0, 0.0), node("studio", 64, 1.5, 0.3), node("mini", 16, 2.0, 0.3)];
         assert_eq!(runs(&place(&nodes, &seventy()).unwrap()), [0..47, 47..80, 80..80]);
+        // A machine a little faster is not worth a round trip to it: the
+        // token is quicker with every layer it can hold kept here.
+        let nodes = [node("here", 96, 1.0, 0.0), node("twin", 96, 0.999, 0.3)];
+        assert_eq!(runs(&place(&nodes, &seventy()).unwrap()), [0..80, 80..80]);
+        // One a great deal faster is, hop and all.
+        let nodes = [node("here", 96, 1.0, 0.0), node("studio", 96, 0.5, 0.3)];
+        assert_eq!(runs(&place(&nodes, &seventy()).unwrap()), [0..0, 0..80]);
         // And a tie goes to the machine with the tokens.
         let nodes = [node("here", 48, 1.0, 0.0), node("twin", 48, 1.0, 0.3)];
         assert_eq!(runs(&place(&nodes, &seventy()).unwrap()), [0..47, 47..80]);

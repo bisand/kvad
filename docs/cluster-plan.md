@@ -985,7 +985,7 @@ The hop is the difference of two numbers and they have to be from the same
 moment: the board keeps the coordinator's counts as they stood when the
 worker was asked, beside the worker's answer.
 
-**A load, a machine at a time** (PR after #229). Every machine's share is
+**A load, a machine at a time** (#230). Every machine's share is
 now loaded at once: this one's in one thread, each worker's `Load` in
 another, and the pipeline is made when the last of them is ready. Before,
 they went in turn, and a model across three machines waited for the sum of

@@ -39,7 +39,7 @@ pub struct RemoteStage {
 }
 
 /// The coordinator's half of the handshake in [`super::key`].
-fn greet(stream: &mut TcpStream, key: &Key, at: &str) -> Result<Hello, Fault> {
+fn greet(stream: &mut TcpStream, key: &Key, at: &str, waited: Duration) -> Result<Hello, Fault> {
     let ours = Hello { nonce: key::nonce()?, ..Hello::ours() };
     ours.send(stream)?;
     let mut buf = Vec::new();
@@ -50,7 +50,7 @@ fn greet(stream: &mut TcpStream, key: &Key, at: &str) -> Result<Hello, Fault> {
         // took the call and never spoke.
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => format!(
             "{at} took the connection and said nothing for {} seconds.\nA firewall on that machine that has not been told to allow kvad looks exactly like this:\nlook for its question on that machine's screen.",
-            GREETING.as_secs()
+            waited.as_secs()
         ),
         _ => format!("{at}: {e}"),
     })?;
@@ -80,29 +80,43 @@ fn greet(stream: &mut TcpStream, key: &Key, at: &str) -> Result<Hello, Fault> {
     Ok(theirs)
 }
 
-impl RemoteStage {
-    /// Reach the worker at `address`, show each other the key, and have it
-    /// load `layers` of `repo`. Returns when the stage is ready to run,
-    /// which for a model the worker has to fetch or quantise is a while;
-    /// what it says in the meantime goes to `progress`.
-    pub fn open(address: &str, key: &Key, load: &Load, progress: &mut dyn FnMut(&str)) -> Result<RemoteStage, Fault> {
-        let (host, port) = wire::host_port(address);
-        let mut last: Fault = format!("{host} names no address").into();
-        let mut stream = None;
-        for addr in (host.as_str(), port).to_socket_addrs().map_err(|e| format!("{address}: {e}"))? {
-            match TcpStream::connect_timeout(&addr, CONNECT) {
-                Ok(connected) => {
-                    stream = Some(connected);
-                    break;
-                }
-                Err(e) => last = format!("no worker at {address}: {e}\nOn that machine: kvad worker").into(),
+/// Reach the worker at `address` and show each other the key. What comes
+/// back is a connection a worker will take frames on, and who it is.
+pub fn connect(address: &str, key: &Key) -> Result<(TcpStream, Hello), Fault> {
+    connect_within(address, key, CONNECT, GREETING)
+}
+
+/// [`connect`], giving up sooner: for an address that is one of several
+/// and may well lead nowhere.
+pub fn connect_within(address: &str, key: &Key, reach: Duration, greeting: Duration) -> Result<(TcpStream, Hello), Fault> {
+    let (host, port) = wire::host_port(address);
+    let mut last: Fault = format!("{host} names no address").into();
+    let mut stream = None;
+    for addr in (host.as_str(), port).to_socket_addrs().map_err(|e| format!("{address}: {e}"))? {
+        match TcpStream::connect_timeout(&addr, reach) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
             }
+            Err(e) => last = format!("no worker at {address}: {e}\nOn that machine: kvad worker").into(),
         }
-        let Some(mut stream) = stream else { return Err(last) };
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(GREETING))?;
-        stream.set_write_timeout(Some(PATIENCE))?;
-        let hello = greet(&mut stream, key, address)?;
+    }
+    let Some(mut stream) = stream else { return Err(last) };
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(greeting))?;
+    stream.set_write_timeout(Some(PATIENCE))?;
+    let hello = greet(&mut stream, key, address, greeting)?;
+    stream.set_read_timeout(Some(PATIENCE))?;
+    Ok((stream, hello))
+}
+
+impl RemoteStage {
+    /// [`connect`], and then have the worker load `layers` of `repo`.
+    /// Returns when the stage is ready to run, which for a model the worker
+    /// has to fetch or quantise is a while; what it says in the meantime
+    /// goes to `progress`.
+    pub fn open(address: &str, key: &Key, load: &Load, progress: &mut dyn FnMut(&str)) -> Result<RemoteStage, Fault> {
+        let (mut stream, hello) = connect(address, key)?;
         let name = format!("{} ({address})", hello.name);
 
         // A load is as long as it is: a download, or the quantising of

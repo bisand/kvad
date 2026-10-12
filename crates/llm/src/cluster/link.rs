@@ -234,6 +234,20 @@ fn classify(iface: &str, seen: &Seen) -> Link {
     Link { iface: iface.into(), what, evidence }
 }
 
+/// The link a connection is on, from its two ends. `None` where this
+/// machine cannot say which of its interfaces the connection left by.
+///
+/// A connection to one of this machine's own addresses never leaves it,
+/// whichever interface the address belongs to: the kernel hands the
+/// packets straight back. Named for the interface, that would be a cable
+/// measured at memory's speed.
+pub fn between(local: &IpAddr, peer: &IpAddr) -> Option<Link> {
+    if peer.is_loopback() || interface_of(peer).is_some() {
+        return Some(Link { iface: "lo0".into(), what: What::Loopback, evidence: Vec::new() });
+    }
+    interface_of(local).map(|iface| identify(&iface))
+}
+
 /// Name the physical link behind an interface of this machine, and keep
 /// what was looked at.
 pub fn identify(iface: &str) -> Link {

@@ -17,6 +17,7 @@
 //! stage, `head`. The test that holds it to that compares bits.
 
 use super::key::Key;
+use super::{discover, path};
 use super::remote::RemoteStage;
 use super::stage::{Fault, LocalStage, Stage};
 use super::wire::Load;
@@ -226,6 +227,41 @@ impl PipelineSession {
     }
 }
 
+/// The way to one worker of `--workers`: found by its name or its id and
+/// reached by whichever of its addresses measures quickest, or reached at
+/// the address given. Either way the path is measured and said, so that
+/// what a model's hidden states crossed is on the record.
+fn way_to(worker: &str, found: &[discover::Found], key: &Key, progress: &mut dyn FnMut(&str)) -> Res<path::Path> {
+    if !discover::is_a_name(worker) {
+        progress(&format!("the way to {worker}:"));
+        return path::quickest(&[worker.to_string()], "", key, progress).map_err(plain);
+    }
+    let named: Vec<&discover::Found> = found.iter().filter(|f| f.answers_to(worker)).collect();
+    let there = match named.as_slice() {
+        [one] => *one,
+        [] => {
+            let seen = match found.is_empty() {
+                true => "Nobody on the link says they are one".to_string(),
+                false => format!("The workers on the link are {}", found.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ")),
+            };
+            return Err(format!("no worker called `{worker}` was found. {seen}.\nIs `kvad worker` running there? A worker can also be named by its address.").into());
+        }
+        several => {
+            let ids: Vec<String> = several.iter().map(|f| format!("{} ({})", f.name, f.id)).collect();
+            return Err(format!("`{worker}` is {} workers: {}. Name one by its id.", several.len(), ids.join(", ")).into());
+        }
+    };
+    // Said before any address is tried, since no address would get past it.
+    if there.build != super::build() {
+        return Err(format!("{} is kvad {} and this is kvad {}; a split model wants one build on every machine", there.name, there.build, super::build()).into());
+    }
+    progress(&format!("{} is at {} address(es):", there.name, there.addresses.len()));
+    let addresses: Vec<String> = there.addresses.iter().map(|a| path::with_port(a, there.port)).collect();
+    let way = path::quickest(&addresses, &there.id, key, progress).map_err(plain)?;
+    progress(&format!("  using {}", way.address));
+    Ok(way)
+}
+
 /// `0..12,12..24` as layer ranges: what `--split` takes.
 pub fn parse_split(text: &str) -> Res<Vec<std::ops::Range<usize>>> {
     let range = |word: &str| -> Option<std::ops::Range<usize>> {
@@ -276,10 +312,20 @@ pub fn across(
     if !shards[0].layers.is_empty() {
         stages.push(Box::new(LocalStage::new(ends.clone())));
     }
+    // Asked once, and only if somebody was named rather than addressed:
+    // an answer to multicast is waited for, and that is a couple of seconds.
+    let found = match workers.iter().any(|w| discover::is_a_name(w)) {
+        true => {
+            progress("asking who on the link is a worker");
+            discover::workers()
+        }
+        false => Vec::new(),
+    };
     for (worker, shard) in workers.iter().zip(&shards[1..]) {
-        progress(&format!("asking {worker} for {shard}"));
+        let way = way_to(worker, &found, key, progress)?;
+        progress(&format!("asking {} for {shard}", way.hello.name));
         let load = Load { repo: repo.to_string(), precision: precision.to_string(), layers: [shard.layers.start, shard.layers.end] };
-        stages.push(Box::new(RemoteStage::open(worker, key, &load, progress).map_err(plain)?));
+        stages.push(Box::new(RemoteStage::open(&way.address, key, &load, progress).map_err(plain)?));
     }
     Ok(Box::new(PipelineSession::new(ends, stages, precision)?))
 }

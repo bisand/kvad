@@ -82,7 +82,7 @@ With no HOST, `ping` measures the one machine `find` finds, if it finds one.";
 
 /// `run` and `chat`, for a model spread over several machines.
 const ACROSS: &[Flag] = &[
-    f("--workers", "HOST[,HOST]", Kind::Text, "spread the model over these machines, each running `kvad worker`"),
+    f("--workers", "NAME[,NAME]", Kind::Text, "spread the model over these machines, each running `kvad worker`: by name, id or address"),
     f("--split", "A..B,C..D", Kind::Text, "the layers each machine holds: this one first, then each worker"),
 ];
 
@@ -810,12 +810,18 @@ pub const COMMANDS: &[Command] = &[
                 \x20 kvad run --model MODEL --workers THIS-MACHINE --split 0..12,12..24\n\n\
                 which keeps layers 0 to 11 itself and asks this one for 12 to 23. The\n\
                 worker fetches the model if it has not got it.\n\n\
+                THIS-MACHINE is the name the worker prints when it starts, the id beside\n\
+                it, or an address. By name or id it is found on the network, every way to\n\
+                it is measured, and the quickest is used and said: a machine on a cable\n\
+                and on Wi-Fi is two ways, and they are not the same speed. `kvad cluster\n\
+                find` lists the workers there are.\n\n\
                 It answers only a machine that holds the same cluster key. The first start\n\
                 makes one, keeps it in the data directory as cluster.key and prints it;\n\
                 copy that file to the other machines, or give them the key in\n\
                 KVAD_CLUSTER_KEY. What crosses between machines is not encrypted.\n\n\
-                Both ends have to be the same version of kvad, and the split is by hand:\n\
-                nothing yet works out which machine should hold what.",
+                Both ends have to be the same build of kvad, to the commit, and the split\n\
+                is by hand: nothing yet works out which machine should hold what. Finding\n\
+                a worker by name is written for macOS; elsewhere, give its address.",
         examples: &["kvad worker", "kvad worker --port 7421"],
     },
     // -- accounts ----------------------------------------------------------

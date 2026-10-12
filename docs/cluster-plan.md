@@ -212,7 +212,9 @@ Then a new module, `crates/llm/src/cluster/`, behind a `cluster` feature:
 
 | file | what it is |
 |---|---|
-| `wire.rs` | The framing. `u32 length, u8 kind, payload`. Control messages are JSON (`serde_json` is already here); tensors are a fixed header — `seq, pos0, m, n_embd` — and little-endian f32. `std::net`, `TCP_NODELAY`, no async: the `kvad` crate has no tokio and does not need one. Hand-written, because 200 lines of framing is something this repository can teach and gRPC is something it would have to apologise for. |
+| `wire.rs` | The framing. `u32 length, u8 kind, payload`. Control messages are JSON (`serde_json` is already here); tensors are a fixed header — `seq, pos0, m, n_embd` — and little-endian f32. `std::net`, `TCP_NODELAY`, no async: the `kvad` crate has no tokio and does not need one. Hand-written, because 200 lines of framing is something this repository can teach and gRPC is something it would have to apologise for. **Written**, with `Hello`, `Error`, the tensor frames and the four kinds a measurement uses. |
+| `ping.rs` | The listener that sends frames straight back and the sweep made against it: `kvad cluster listen` and `kvad cluster ping`. **Written.** |
+| `link.rs` | What a link is, from the registry and not from the socket, and who is on each cable: `kvad cluster link` and `kvad cluster find`. **Written.** |
 | `stage.rs` | `trait Stage { fn run(&mut self, seq, pos0, m, xs) -> Res<Vec<f32>>; fn truncate(..); }`, with `LocalStage` (a `Transformer` shard plus its cache and pool) and `RemoteStage` (a socket). |
 | `session.rs` | `PipelineSession: Session`. Embeds, walks its stages in order, applies the head. This is the only thing `Llm` ever sees. |
 | `worker.rs` | `serve(listener, key, factory)`: accept a coordinator, answer `Hello`, build a stage on `Load`, run `Forward` frames until told otherwise. The `factory` comes from the binary, as `Engine::spawn`'s loader does, so a GPU-capable binary makes GPU stages. |
@@ -224,6 +226,12 @@ precision, shard), `Progress`, `Ready`, `Forward`/`Hidden`, `Truncate`,
 `Unload`, `Ping`, `Error`. A coordinator refuses a worker whose revision
 differs from its own: two builds with different kernels can both be right and
 still not agree to the bit, and that is a bug report nobody can act on.
+
+As written so far, `Hello` carries the protocol version, the package version,
+the machine's name, its usable memory, its thread count and its
+architectures. The package version stands in for the git revision until
+Phase 2, which is the phase that refuses on it; `kvad cluster ping` only says
+when the two differ.
 
 ### The worker, and "if Kvad is already installed"
 
@@ -392,6 +400,13 @@ chips differing is of no interest to TCP.
   1 ms this plan expects of Thunderbolt and the 17 of gigabit, so pipelined
   prefill cannot be judged on this cable at all.
 
+  Measured again on 2026-10-12 with `kvad cluster ping`, the same pair and
+  the same kind of cable, ten rounds: 2.61 ms at 32 KB and 106.1 ms at 2 MB,
+  fitted to 0.86 ms empty and 318 Mb/s, 315 Mb/s one way. Three runs of each
+  tool in turn put `kvad cluster ping` and the script within 4% of each
+  other at 32 KB and at 2 MB. At 1 KB the script is 0.1 to 0.2 ms the
+  slower, on a hop of 0.7 ms, which is Python's own share of it.
+
   One thing worth knowing before trusting a run. The first sweep after the
   Air woke and the cable came back reported 22.6 ms at 32 KB — a median, not
   a stray sample, and above its own 128 KB row, which is impossible. It has
@@ -399,6 +414,17 @@ chips differing is of no interest to TCP.
   link wants more warm-up than the one round the tool discards; until that is
   understood, a number from the first sweep after a reconnect should be
   thrown away rather than recorded.
+
+  It reproduced on 2026-10-12, and not after a reconnect: 34.4 ms at 32 KB
+  from `kvad cluster ping` and 37.8 ms from the script in the run straight
+  after it, each a median of seven with its minimum where it belongs at
+  2.5 ms, and 1 KB and 2 MB untouched in both. Then gone, for the sixteen runs after it.
+  So it is a stretch of some twenty seconds on the link or on one of the
+  machines, not something either tool does, and it began just after a file
+  was copied to the Air over the same cable. Still not understood. What
+  catches it is the last column of the table — a median thirteen times its
+  own minimum — and the line under the table that says such a run is worth
+  repeating rather than quoting.
 
 - With the right cable, System Settings → Network → Thunderbolt Bridge shows
   a self-assigned `169.254.x.x` address on each side. The firewall may ask
@@ -477,8 +503,29 @@ on. The numbers that replace the table wait for the cable; nothing between
 here and Phase 4 is blocked on them. What must not happen is the table being
 filled in from whichever link is to hand.
 
-`scripts/bench-link.py` is the stopgap that needs no engine and nothing
-installed on either machine: `--find` to locate a peer over a cable,
+The first half is done: `kvad cluster listen` on one end, and on the other
+`kvad cluster find` for who is on each cable, `kvad cluster ping` to measure
+— with no address it measures the one machine `find` finds — and
+`kvad cluster link IFACE` for the identification alone. `ping` works out
+which interface its connection left by and identifies that, so a link is
+named even when it was reached by a hostname. The Thunderbolt branch of the
+identification is written from this document's description of what a
+Thunderbolt link looks like and has never seen one; the day there is a
+cable, check what it prints against the three checks by hand before trusting
+it. The listener sends back what it is sent, up to 64 MB a frame, to anybody
+who can reach its port: it has no key, because it has nothing to give, and
+it is not the worker.
+
+The tool has a floor of its own, and Thunderbolt is fast enough to stand on
+it. Over loopback on the M5 Pro, where no link is crossed, a 32 KB round trip
+is 0.09 ms and a 2 MB one 1.3 ms: the frame is copied through the kernel
+four times and nothing else happens. The 2 MB figure is what this plan
+expects of Thunderbolt itself. Over the charging cable it is one part in
+eighty and does not matter; over the real cable it has to be measured beside
+every number and said with it, or the table will record the tool.
+
+`scripts/bench-link.py` was the stopgap, and still is for a machine with no
+kvad on it. It needs no engine and nothing installed on either machine: `--find` to locate a peer over a cable,
 `--listen` on one end and `--connect` on the other, a sweep from 1 KB to
 8 MB interleaved across rounds so that no size records one stretch of a
 busy machine, and the link identified before any number is printed. It

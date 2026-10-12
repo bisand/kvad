@@ -99,6 +99,11 @@ struct Args {
     k: Option<usize>,
     window: Option<usize>,
     rounds: Option<usize>,
+    /// `cluster` only: the frame sizes to sweep, megabytes to send one
+    /// way, and whether `find` asks every interface.
+    sizes: Option<String>,
+    stream_mb: Option<usize>,
+    all: bool,
     tokens: Option<usize>,
     model: Option<String>,
     prompt: Option<String>,
@@ -200,6 +205,9 @@ impl Default for Args {
             k: None,
             window: None,
             rounds: None,
+            sizes: None,
+            stream_mb: None,
+            all: false,
             tokens: None,
             model: None,
             prompt: None,
@@ -257,7 +265,7 @@ impl Default for Args {
 const POSITIONAL: &[&str] = &[
     "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload", "cancel",
     "tokenize", "service", "conversations", "jobs", "datasets", "tune", "evals", "bench", "metrics",
-    "auth", "users", "sessions", "keys", "api", "images", "videos",
+    "auth", "users", "sessions", "keys", "api", "images", "videos", "cluster",
 ];
 
 /// Flags that stand alone, and the short spellings some of them have.
@@ -278,6 +286,7 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--silent" => a.silent = true,
         "--epilogue" => a.epilogue = true,
         "--dev" => a.dev = true,
+        "--all" => a.all = true,
         _ => return false,
     }
     true
@@ -412,6 +421,8 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--k" => a.k = Some(num() as usize),
             "--window" => a.window = Some(num() as usize),
             "--rounds" => a.rounds = Some(num() as usize),
+            "--sizes" => a.sizes = Some(value.clone()),
+            "--stream-mb" => a.stream_mb = Some(num() as usize),
             "--tokens" => a.tokens = Some(num() as usize),
             // In the table and not in this match: the test in `cli::spec`
             // that holds the two together has been broken.
@@ -584,6 +595,10 @@ fn real_main() -> Res<()> {
         "arch" => return arch(),
         "crawl" => return crawl_site(args),
         "service" => return cli::service::run(&args),
+        #[cfg(feature = "cluster")]
+        "cluster" => return cli::cluster::run(&args),
+        #[cfg(not(feature = "cluster"))]
+        "cluster" => return Err("this build was made without the `cluster` feature.".into()),
         _ => {}
     }
 

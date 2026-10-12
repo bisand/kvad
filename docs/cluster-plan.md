@@ -626,11 +626,11 @@ That is a third of a millisecond a token, visible at 6 ms a token and gone
 at 20. Prefill is 1.00 everywhere.
 
 Not done, and all of it the second half of this phase: the machine id,
-`_kvad._tcp`, the path probe, a git revision in `Hello` where the package
-version stands in for one — and the run across the rig's cable.
+`_kvad._tcp`, the path probe, and a git revision in `Hello` where the
+package version stands in for one.
 
-That last one was tried on 2026-10-12 and did not get as far as a hidden
-state, for a reason worth more than the run would have been. The Air's
+The run across the rig's cable was tried on 2026-10-12 and at first did not
+get as far as a hidden state, for a reason worth knowing. The Air's
 firewall is on. It had been told to allow the binary that `kvad cluster
 ping` was measured with, by the path that one was copied to, and the worker
 was copied to another. macOS then *completes the TCP connection* and holds
@@ -641,6 +641,40 @@ waited out its five-minute patience and said `Resource temporarily
 unavailable`. It now waits ten seconds for a greeting and says what this
 looks like and where to look. Discovery will meet the same wall, and should
 say the same thing.
+
+With the firewall told, the same day: **a hidden state left a machine.**
+SmolLM2-135M, layers 0 to 14 on the M5 Pro and 15 to 29 on the M2 Air, over
+the charging cable (USB 2 NCM, identified as such), wrote the text the model
+whole writes. `examples/split.rs` then held every logit of a 256-token
+prefill and 48 decoded tokens to the whole model's for four splits at f32
+and at q8, and all eight agree to the bit — across two machines, two chips
+and two thread counts, which is the answer to whether a split model is the
+same model when the halves are not on the same processor. Both have `i8mm`;
+a pair where one does not is still unasked.
+
+And the first number that does not fit. Decode, milliseconds a token, five
+rounds, medians, against the model whole on each machine (8.3 on the M5
+Pro and 19.2 on the Air at f32; 6.5 and 6.6 at q8) and a round trip of
+0.8 ms for a frame this size:
+
+| layers here / on the Air | f32 measured | Σ + round trip | q8 measured | Σ + round trip |
+|---|---|---|---|---|
+| 25 / 5 | 15.5 | 10.9 | 11.8 | 7.3 |
+| 15 / 15 | 15.9 | 14.6 | 9.3 | 7.4 |
+| 5 / 25 | 21.2 | 18.2 | 9.7 | 7.4 |
+| 0 / 30 | 22.4 | 20.0 | 9.3 | 7.4 |
+
+Every row is slower than `Σ stages + hops × RTT` says, by 1.3 to 4.6 ms, and
+by most where the Air has least to do: five layers there cost 4.5 ms more
+than they should at either precision, and at q8 giving the Air *more*
+layers made the token faster. So a hop on this rig costs something the
+ping does not see, and it grows when a machine sits idle between frames.
+Two guesses, neither tested: the Air's cores and its thread pool going to
+sleep between one token's work and the next, or the USB link answering a
+lone frame after ten idle milliseconds more slowly than it answers a sweep
+of them back to back. Phase 4 owes an account of the difference, and this
+is where it starts; `kvad cluster ping` wants a mode that leaves a gap
+between frames before the second guess can be told from the first.
 
 **Phase 2 — a worker on loopback.** `worker.rs`, `RemoteStage`, the handshake
 and the key, `kvad worker`, `--workers`, and `--split`, because without it a
@@ -689,7 +723,9 @@ at which a cluster stops being only about memory.
   test compares bits and passes for GPT-2, the Llama family and DeepSeek V2
   and V3 at every precision. Across two machines it is the same question
   again with a different answer possible — two CPUs, and kernels chosen by
-  what each has — and Phase 2 asks it.
+  what each has — and Phase 2 asked it of an M5 Pro and an M2 over the
+  rig's cable: yes, at f32 and q8, for the Llama family. A pair without the
+  same kernels is still open.
 - Should the coordinator hold layers at all when it is also running
   `kvad-serve`, a database and a browser? Probably yes, fewer of them — the
   planner's headroom figure is where that is expressed.

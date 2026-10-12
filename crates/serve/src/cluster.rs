@@ -184,6 +184,9 @@ impl Stage for Lodging {
     fn elsewhere(&self) -> bool {
         self.stage.elsewhere()
     }
+    fn keeps_itself_awake(&self) -> bool {
+        self.stage.keeps_itself_awake()
+    }
 }
 
 pub fn running() -> Running {

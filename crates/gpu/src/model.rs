@@ -930,6 +930,20 @@ pub fn session(
     device: Device,
     progress: &mut dyn FnMut(&str),
 ) -> Res<Box<dyn Session>> {
+    // A turn at the device for the whole load: the weights go up as they
+    // are read, and a stage held for another machine may be running.
+    crate::common::alone(|| read_session(repo, paths, spec, dtype, quant, device, progress))
+}
+
+fn read_session(
+    repo: &str,
+    paths: &[std::path::PathBuf],
+    spec: &Spec,
+    dtype: DType,
+    quant: Option<GgmlDType>,
+    device: Device,
+    progress: &mut dyn FnMut(&str),
+) -> Res<Box<dyn Session>> {
     let arch = &spec.arch;
     if !supports(*arch) {
         return Err(format!(
@@ -1641,6 +1655,32 @@ pub(crate) mod tests {
             assert!(params > 0 && bytes == params * 4, "two blocks in f32: {params} parameters in {bytes} bytes");
         }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A turn at the device is one thread's at a time, and a thread that
+    /// has it keeps it through whatever it calls: a pass inside a load, a
+    /// pool inside a pool.
+    #[test]
+    fn a_turn_at_the_device_is_one_threads_and_kept_through_what_it_calls() {
+        use crate::common::{alone, pooled};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        assert_eq!(alone(|| pooled(|| alone(|| 7))), 7, "a turn inside a turn is the same turn");
+
+        let (inside, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..50 {
+                        pooled(|| {
+                            most.fetch_max(inside.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                            std::thread::yield_now();
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                });
+            }
+        });
+        assert_eq!(most.load(Ordering::SeqCst), 1, "two threads were at the device at once");
     }
 
     /// Decoding a token at a time has to give what one pass over the whole

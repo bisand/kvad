@@ -16,7 +16,7 @@
 //! its output is added plainly and the sum is what crosses.
 
 use super::{read_blocks, rotations, settled, Block, Pass};
-use crate::common::{check_block, kv_store, pooled, report_failures, KvCache, Loader, Reader};
+use crate::common::{alone, check_block, kv_store, pool_only, pooled, report_failures, KvCache, Loader, Reader};
 use crate::fused;
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
@@ -50,6 +50,91 @@ pub struct GpuStage {
     /// A cache a conversation. A list and not a map: there are a handful.
     held: Vec<Held>,
     fuse: bool,
+    /// The device kept busy between one pass and the next: see [`Warm`].
+    warm: Option<Warm>,
+}
+
+/// A GPU kept awake for a token that is on its way.
+///
+/// A stage works in bursts: a token's rows arrive, its layers run, and
+/// then nothing until the token has been round the other machines. A GPU
+/// that has had nothing to do for three milliseconds does its next burst
+/// two and a half times slower, and after ten, four times: fifteen layers
+/// of SmolLM2-135M on an M5 Pro take 0.85 ms back to back, 2.1 ms after
+/// 3 ms idle and 3.7 ms after 10. A spinning CPU thread, which is what
+/// keeps a CPU stage quick, recovers some of it and not most: it is the
+/// GPU that has stepped down. `examples/stage_gaps` measures all of it.
+///
+/// So between passes a thread gives the device something small to do,
+/// over and over, until the next pass begins or [`kvad::model::linger_ms`]
+/// has gone by: the limit is for the token that never comes. What it runs
+/// is [`fused::metal::Warmer`], which touches nothing of candle's. That
+/// matters twice. candle's Metal backend is not safe for two threads, and
+/// a thread running candle's own ops beside a model is a segfault waiting.
+/// And each of candle's readbacks sweeps its pool of buffers, so a thread
+/// doing them between passes threw away the buffers the next pass was
+/// about to reuse.
+struct Warm {
+    state: std::sync::Arc<Resting>,
+    thread: std::thread::Thread,
+}
+
+struct Resting {
+    /// Between passes, since when.
+    since: std::sync::Mutex<Option<std::time::Instant>>,
+    gone: std::sync::atomic::AtomicBool,
+}
+
+impl Warm {
+    fn start(device: &Device) -> Option<Warm> {
+        let limit = std::time::Duration::from_millis(kvad::model::linger_ms());
+        if limit.is_zero() || !device.is_metal() {
+            return None;
+        }
+        let state = std::sync::Arc::new(Resting { since: std::sync::Mutex::new(None), gone: false.into() });
+        let (theirs, device) = (state.clone(), device.clone());
+        let thread = std::thread::Builder::new()
+            .name("kvad-gpu-warm".into())
+            .spawn(move || {
+                let Some(warmer) = fused::metal::Warmer::new(&device) else { return };
+                while !theirs.gone.load(std::sync::atomic::Ordering::Acquire) {
+                    let resting = theirs.since.lock().map(|since| since.is_some_and(|since| since.elapsed() < limit)).unwrap_or(false);
+                    match resting {
+                        // Waited for, so that one is done before the next
+                        // is asked for; in a pool, as Metal on a thread of
+                        // its own has to be.
+                        true if pool_only(|| warmer.once()).is_some() => {}
+                        true => return,
+                        // A pass is running, or no token came: until told.
+                        false => std::thread::park(),
+                    }
+                }
+            })
+            .ok()?;
+        Some(Warm { state, thread: thread.thread().clone() })
+    }
+
+    /// A pass is over, and the wait for the next has begun.
+    fn rest(&self) {
+        if let Ok(mut since) = self.state.since.lock() {
+            *since = Some(std::time::Instant::now());
+        }
+        self.thread.unpark();
+    }
+
+    /// A pass is beginning: the device is the model's.
+    fn work(&self) {
+        if let Ok(mut since) = self.state.since.lock() {
+            *since = None;
+        }
+    }
+}
+
+impl Drop for Warm {
+    fn drop(&mut self) {
+        self.state.gone.store(true, std::sync::atomic::Ordering::Release);
+        self.thread.unpark();
+    }
 }
 
 /// Whether a model of this architecture can be held a stage at a time on
@@ -69,6 +154,22 @@ impl GpuStage {
     /// worker may have only some of them.
     #[allow(clippy::too_many_arguments)]
     pub fn load(
+        repo: &str,
+        paths: &[std::path::PathBuf],
+        spec: Spec,
+        dtype: DType,
+        quant: Option<GgmlDType>,
+        device: Device,
+        layers: Range<usize>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Res<Self> {
+        // A turn at the device for the whole of it: the weights go up as
+        // they are read.
+        alone(|| Self::read(repo, paths, spec, dtype, quant, device, layers, progress))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read(
         repo: &str,
         paths: &[std::path::PathBuf],
         spec: Spec,
@@ -121,7 +222,7 @@ impl GpuStage {
 
         let (cos, sin) = rotations(&spec, &device, load_dtype)?;
         settled(&device)?;
-        Ok(GpuStage { fuse: fused::available(&device), held: Vec::new(), blocks, cos, sin, device, dtype: load_dtype, quant, layers, spec })
+        Ok(GpuStage { fuse: fused::available(&device), held: Vec::new(), warm: Warm::start(&device), blocks, cos, sin, device, dtype: load_dtype, quant, layers, spec })
     }
 
     fn held(&mut self, seq: u64) -> usize {
@@ -166,11 +267,17 @@ impl Stage for GpuStage {
         if pos0 + m > self.spec.n_ctx {
             return Err(format!("{shard}: position {} is past this model's {}", pos0 + m, self.spec.n_ctx).into());
         }
+        if let Some(warm) = &self.warm {
+            warm.work();
+        }
         // A pool a pass: this runs on whatever thread a pipeline or a
         // worker gives it, and none of them has one. See `pooled`.
         match pooled(|| self.pass(at, pos0, m, xs)) {
             Ok(out) => {
                 self.held[at].pos += m;
+                if let Some(warm) = &self.warm {
+                    warm.rest();
+                }
                 Ok(out)
             }
             Err(why) => {
@@ -195,6 +302,10 @@ impl Stage for GpuStage {
     fn holds(&self) -> (usize, usize) {
         (self.blocks.iter().map(Block::params).sum(), self.blocks.iter().map(Block::bytes).sum())
     }
+
+    fn keeps_itself_awake(&self) -> bool {
+        self.device.is_metal()
+    }
 }
 
 /// How long one layer of a model this shape takes this device: three
@@ -207,6 +318,10 @@ impl Stage for GpuStage {
 /// the rows up to the device and back — is a third of the answer and not
 /// all of it; the planner is told a layer's time and multiplies.
 pub fn bench(n_embd: usize, intermediate: usize, dtype: DType, quant: Option<GgmlDType>, device: Device) -> Res<kvad::cluster::plan::Speed> {
+    alone(|| timed(n_embd, intermediate, dtype, quant, device))
+}
+
+fn timed(n_embd: usize, intermediate: usize, dtype: DType, quant: Option<GgmlDType>, device: Device) -> Res<kvad::cluster::plan::Speed> {
     const BLOCKS: usize = 3;
     let chunk = kvad::model::prefill_chunk();
     // Heads sixty-four wide where the model's width allows, as most are.
@@ -255,7 +370,7 @@ pub fn bench(n_embd: usize, intermediate: usize, dtype: DType, quant: Option<Ggm
     drop(ld);
     let (cos, sin) = rotations(&spec, &device, load_dtype)?;
     settled(&device)?;
-    let mut stage = GpuStage { fuse: fused::available(&device), held: Vec::new(), blocks, cos, sin, device, dtype: load_dtype, quant, layers: 0..BLOCKS, spec };
+    let mut stage = GpuStage { fuse: fused::available(&device), held: Vec::new(), warm: None, blocks, cos, sin, device, dtype: load_dtype, quant, layers: 0..BLOCKS, spec };
 
     let time = |stage: &mut GpuStage, pos0: usize, m: usize| -> Res<f64> {
         let rows = vec![0.01f32; m * n_embd];

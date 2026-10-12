@@ -1113,12 +1113,68 @@ pub(crate) fn settle(device: &Device) -> candle_core::Result<()> {
 /// image. So every `Session::forward` has a pool, every image
 /// (`lora::painting`), and every video and each of its steps
 /// (`ltx_sample`). `examples/pool_drift` measures it.
+///
+/// And every pool is a turn at the device: see [`alone`].
 pub fn pooled<T>(work: impl FnOnce() -> T) -> T {
+    alone(|| {
+        #[cfg(target_os = "macos")]
+        return objc2::rc::autoreleasepool(|_| work());
+        #[cfg(not(target_os = "macos"))]
+        work()
+    })
+}
+
+/// An autorelease pool and no turn at the device: for Metal work that
+/// goes nowhere near candle, which is the only work that may run beside
+/// a model.
+pub(crate) fn pool_only<T>(work: impl FnOnce() -> T) -> T {
     #[cfg(target_os = "macos")]
     return objc2::rc::autoreleasepool(|_| work());
     #[cfg(not(target_os = "macos"))]
     work()
 }
+
+/// One thread at the device at a time.
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// Whether this thread has the turn already: a pass inside a pass.
+    static HAS_TURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Gives the turn back when the outermost holder is done, however it ends.
+struct Turn;
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        HAS_TURN.with(|has| has.set(false));
+    }
+}
+
+/// Run `work` with the device to this thread alone.
+///
+/// candle's Metal backend is not safe for two threads at once. Its pool of
+/// buffers is swept on every readback, and two threads sweeping it release
+/// the same buffer twice: a segfault in `drop_unused_buffers`, found when a
+/// thread kept the GPU warm beside the one running a model. While a
+/// process had one model and one thread, nothing could meet. A server that
+/// holds layers for another machine has a worker's thread beside its own
+/// engine's, and a stage keeps a thread of its own between tokens
+/// (`model::stage`'s `Warm`).
+///
+/// So everything that runs on the device takes a turn, and since every
+/// pass, image and step already has a [`pooled`], that is where the turn
+/// is taken. A thread that has it keeps it through whatever it calls.
+pub fn alone<T>(work: impl FnOnce() -> T) -> T {
+    if HAS_TURN.with(|has| has.get()) {
+        return work();
+    }
+    let _held = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    HAS_TURN.with(|has| has.set(true));
+    let _turn = Turn;
+    work()
+}
+
 
 /// [`settle`]'s first half: waits for everything queued on `device`, on
 /// Metal by a one-byte readback, which keeps a command buffer that failed

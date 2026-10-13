@@ -847,13 +847,26 @@ mod tests {
     /// half the function's, and `complete` refuses it. Whole, it passes.
     #[test]
     fn the_check_sees_a_gradient_that_stops() {
-        let x = randn(&[6, 5], &Device::Cpu);
+        // The same numbers every run, and not a draw. Along a random
+        // direction a slope falls near zero by chance, which is why
+        // `Slopes::apart` measures against the typical slope: and a slope
+        // near zero is one a cut cannot be told from, since half of nothing
+        // is nothing. With `x` drawn afresh each run this test met such a
+        // slope once in forty, and failed a build that had not touched it.
+        let x: Vec<f32> = (0..30).map(|i| 0.5 + (i as f32 * 0.37).sin()).collect();
+        let x = Tensor::from_vec(x, (6, 5), &Device::Cpu).unwrap();
         let whole = |x: &Tensor| x.sqr()?.sum_all();
         let cut = |x: &Tensor| (x * x.detach())?.sum_all();
-        let Slopes { by_backward: b, measured: m, .. } = directional(&whole, &x, 1e-2, 1).unwrap();
-        assert!((b - m).abs() < 1e-3 * m.abs(), "whole: {b} against {m}");
-        let Slopes { by_backward: b, measured: m, .. } = directional(&cut, &x, 1e-2, 1).unwrap();
-        assert!((2.0 * b - m).abs() < 1e-3 * m.abs(), "cut: {b} should be half of {m}");
+        // Both directions the checks below are made along, the one asked
+        // for here and `complete`'s own, have a slope worth the name.
+        for seed in [1, 0x5eed] {
+            let s = directional(&whole, &x, 1e-2, seed).unwrap();
+            assert!(s.measured.abs() > 0.2 * s.typical, "seed {seed}: a slope of {} where {} is typical tells nothing", s.measured, s.typical);
+        }
+        let Slopes { by_backward: b, measured: m, typical } = directional(&whole, &x, 1e-2, 1).unwrap();
+        assert!((b - m).abs() < 1e-3 * typical.max(m.abs()), "whole: {b} against {m}");
+        let Slopes { by_backward: b, measured: m, typical } = directional(&cut, &x, 1e-2, 1).unwrap();
+        assert!((2.0 * b - m).abs() < 1e-3 * (2.0 * typical).max(m.abs()), "cut: {b} should be half of {m}");
         assert!(complete(&whole, &x, 1e-2, 1e-2).is_ok());
         let e = complete(&cut, &x, 1e-2, 1e-2).unwrap_err().to_string();
         assert!(e.contains("incomplete"), "{e}");

@@ -774,20 +774,15 @@ impl Session for GpuLlama {
     fn forward(&mut self, tokens: &[u32]) -> Res<Vec<f32>> {
         // Chunked so that a long prompt does not allocate an attention matrix
         // of `[heads, m, m]` all at once — and, on Metal, so that every chunk
-        // but one is a width [`fused`] will take.
-        //
-        // The odd-sized chunk goes first rather than last. A prompt is almost
-        // never a multiple of `PREFILL_CHUNK`, so one chunk is always ragged,
-        // and the last chunk is the expensive one: it attends to the whole
-        // prompt. Reading the remainder first leaves that chunk — and every
-        // chunk after the first — exactly `PREFILL_CHUNK` wide.
+        // but one is a width [`fused`] will take. Where the cuts fall is
+        // [`next_pass`]'s to say.
         let mut logits = Vec::new();
-        let (ragged, whole) = tokens.split_at(tokens.len() % PREFILL_CHUNK);
-        for part in std::iter::once(ragged).chain(whole.chunks(PREFILL_CHUNK)) {
-            if !part.is_empty() {
-                // A pool a call, so a pool a token: see `pooled`.
-                logits = crate::common::pooled(|| self.run(part))?;
-            }
+        let mut left = tokens;
+        while !left.is_empty() {
+            let (part, rest) = left.split_at(next_pass(left.len()));
+            // A pool a call, so a pool a token: see `pooled`.
+            logits = crate::common::pooled(|| self.run(part))?;
+            left = rest;
         }
         Ok(logits)
     }
@@ -796,13 +791,9 @@ impl Session for GpuLlama {
         self.pos
     }
 
-    /// The odd-sized chunk first and whole ones after: as `forward` cuts,
-    /// for the reason it gives.
+    /// As `forward` cuts: see [`next_pass`].
     fn prefill_pass(&self, left: usize) -> usize {
-        match left % PREFILL_CHUNK {
-            0 => left.min(PREFILL_CHUNK),
-            ragged => ragged,
-        }
+        next_pass(left)
     }
 
     fn truncate(&mut self, len: usize) -> Res<usize> {
@@ -872,6 +863,29 @@ impl Session for GpuLlama {
 
     fn weight_bytes(&self) -> usize {
         self.memory_bytes()
+    }
+}
+
+/// How many of `left` prompt tokens the next pass reads.
+///
+/// The odd tokens first, then whole tiles. The fused attention kernel takes
+/// a pass whose width is a multiple of [`QUERY_TILE`] and no other, and a
+/// pass it refuses runs written out, at about half the speed. A prompt is
+/// almost never a whole number of tiles, so some of it has to go that way:
+/// what is left over after the tiles, which is under 32 tokens, and not —
+/// as it was — whatever was left over after the chunks, which for any
+/// prompt shorter than a chunk was the whole prompt. Five hundred tokens of
+/// SmolLM2-135M at q8 took 44.5 ms where 512 took 23.7; read as 20 and
+/// then 480, they take what 480 should.
+///
+/// First rather than last, because the last pass is the expensive one: it
+/// attends to the whole prompt. And of the tiles, the odd-sized run of them
+/// before the whole chunks, for the same reason.
+fn next_pass(left: usize) -> usize {
+    match (left % QUERY_TILE, left % PREFILL_CHUNK) {
+        (0, 0) => left.min(PREFILL_CHUNK),
+        (0, tiles) => tiles,
+        (odd, _) => odd,
     }
 }
 
@@ -1655,6 +1669,37 @@ pub(crate) mod tests {
             assert!(params > 0 && bytes == params * 4, "two blocks in f32: {params} parameters in {bytes} bytes");
         }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A prompt is cut into its odd tokens and then whole tiles: every pass
+    /// after the first is a width the fused attention kernel takes, the
+    /// first is under a tile unless the prompt is tiles exactly, and the
+    /// last is a whole chunk wherever there is one to be had.
+    #[test]
+    fn a_prompt_is_read_as_its_odd_tokens_and_then_whole_tiles() {
+        let cuts = |mut left: usize| {
+            let mut passes = Vec::new();
+            while left > 0 {
+                passes.push(next_pass(left));
+                left -= passes[passes.len() - 1];
+            }
+            passes
+        };
+        assert_eq!(cuts(500), [20, 480]);
+        assert_eq!(cuts(512), [512]);
+        assert_eq!(cuts(31), [31]);
+        assert_eq!(cuts(1), [1]);
+        assert_eq!(cuts(1100), [12, 64, 512, 512]);
+        for n in 1..=2000 {
+            let passes = cuts(n);
+            assert_eq!(passes.iter().sum::<usize>(), n);
+            assert!(passes.iter().all(|p| (1..=PREFILL_CHUNK).contains(p)), "{n}: {passes:?}");
+            assert!(passes[1..].iter().all(|p| p % QUERY_TILE == 0), "{n}: only the first pass may be refused the kernel: {passes:?}");
+            assert!(passes[0] < QUERY_TILE || passes[0] % QUERY_TILE == 0, "{n}: {passes:?}");
+            if n >= PREFILL_CHUNK {
+                assert_eq!(passes[passes.len() - 1], PREFILL_CHUNK, "{n}: {passes:?}");
+            }
+        }
     }
 
     /// A turn at the device is one thread's at a time, and a thread that

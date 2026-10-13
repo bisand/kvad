@@ -174,7 +174,6 @@ fn main() -> Res<()> {
         // The stages by themselves first: the prompt's rows in one pass,
         // and its last row again against the cache, layer by layer of depth.
         {
-            use kvad::model::Transformer;
             let e = spec.n_embd;
             let mut rows = ends.embed(&prompt, 0);
             let m = prompt.len();

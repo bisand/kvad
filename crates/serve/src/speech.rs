@@ -27,9 +27,7 @@
 //!
 //! `temperature` is OpenAI's: 0, or none, is greedy with the fallback to
 //! warmer temperatures for a window that fails, and anything above is the
-//! one temperature tried. `kvad transcribe --temperature 0` on the CPU here
-//! is greedy and nothing else; it is the one setting the two read
-//! differently.
+//! one temperature tried. `kvad transcribe --local` reads it the same way.
 
 use crate::api::{blocking_or, Fail};
 use crate::auth::{Identity, State};
@@ -126,10 +124,10 @@ impl Asked {
 
 async fn listen(who: Identity, headers: &HeaderMap, state: State, body: &[u8], task: Task) -> Result<Response, Fail> {
     let asked = Asked::read(&Fields::read(headers, body)?, task)?;
-    let resident = crate::openai::resident_for(&state, asked.model.as_deref(), Kind::Speech).await?;
 
-    // Decoded before it is queued, so that a file that is not a recording is
-    // a 400 now and not a failure after a wait.
+    // Decoded before the model is found, which may mean loaded: a file that
+    // is not a recording is a 400 now, and not after gigabytes of Whisper
+    // have been read in to listen to it.
     let ffmpeg = crate::videos::ffmpeg();
     let (name, bytes) = asked.file;
     let audio = blocking_or(move || {
@@ -149,6 +147,7 @@ async fn listen(who: Identity, headers: &HeaderMap, state: State, body: &[u8], t
     if audio.is_empty() {
         return Err(Fail::bad("file has no sound in it"));
     }
+    let resident = crate::openai::resident_for(&state, asked.model.as_deref(), Kind::Speech).await?;
 
     let (_, mut heard) = state.engine.transcribe(who.id, Entry::Request, &resident.key, audio, asked.request)?;
     if asked.stream {

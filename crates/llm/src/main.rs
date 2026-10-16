@@ -794,7 +794,10 @@ fn transcribe(args: Args) -> Res<()> {
         task,
         timestamps,
         prompt: args.prompt.clone(),
-        temperature: args.temperature_given.then_some(args.temperature),
+        // OpenAI's meaning, as the server reads it: 0 is where the fallback
+        // starts, not a temperature to keep to. The same command line is the
+        // same transcript whichever process answers it.
+        temperature: args.temperature_given.then_some(args.temperature).filter(|&t| t > 0.0),
         seed: args.seed_given.then_some(args.seed),
         ..Request::default()
     };

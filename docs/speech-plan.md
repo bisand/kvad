@@ -199,9 +199,11 @@ running, as `run` and `chat` do, and `--local` keeps it in the process.
   out again was not, because serde_json's parser can come back a digit short
   on an `avg_logprob`.
 - **`temperature` is OpenAI's.** 0, or none, is greedy with the fallback to
-  warmer temperatures; above 0, the one temperature tried. Locally
-  `--temperature 0` is greedy with no fallback: the one setting the two read
-  differently.
+  warmer temperatures; above 0, the one temperature tried. `kvad transcribe
+  --local` reads it the same way, so the same command line is the same
+  transcript in either process. Greedy with no fallback at all is the
+  engine's `Request { temperature: Some(0.0) }`, which the reference test
+  uses and no command line asks for.
 - **A hang-up stops it** after the window under way, as a video stops after
   its step: on a 340-second recording with small at q8, 11 seconds after the
   client left.

@@ -115,7 +115,7 @@ const TRANSCRIBE: &[Flag] = &[
         "what to write",
     ),
     f("--prompt", "T", Kind::Text, "text to read the recording as following: names, spelling, style"),
-    f("--temperature", "F", Kind::Text, "decode at this temperature only (default: 0, warmer for a window that fails)"),
+    f("--temperature", "F", Kind::Text, "above 0, decode at this temperature only (default, and 0: greedy, warmer for a window that fails)"),
     f("--out", "FILE", Kind::File, "where to write it (default: the terminal)"),
     QUANT,
 ];

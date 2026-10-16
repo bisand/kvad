@@ -29,7 +29,9 @@
 //! text-to-image that has no arithmetic in it — the request, the result, a PNG
 //! written by hand — because the models themselves are convolution stacks and
 //! live in `kvad-gpu` (`docs/image-plan.md` says why). [`video`] is the same
-//! for video: frames and sound, and an MP4 written by hand.
+//! for video: frames and sound, and an MP4 written by hand. [`speech`] is
+//! the other way round: speech to text with Whisper, which *is* matmuls and
+//! LayerNorm, so it runs here on the CPU, FFT and all.
 
 /// The `serde_json` this crate was built against.
 ///
@@ -62,6 +64,7 @@ pub mod residency;
 pub mod retrieve;
 pub mod runtime;
 pub mod service;
+pub mod speech;
 pub mod simd;
 pub mod sampler;
 pub mod spec;

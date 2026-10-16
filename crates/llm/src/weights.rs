@@ -938,11 +938,13 @@ impl Checkpoint {
         let (rows, cols) = match view.shape() {
             [n] => (1, *n),
             [r, c] => (*r, *c),
-            // A depthwise convolution's filters. PyTorch stores a `Conv1d`
-            // with `groups = channels` as `[channels, 1, kernel]`: one filter
-            // per channel and no mixing, so the middle axis is the input
-            // channels *per group*, which is one. It carries nothing.
-            [r, 1, c] => (*r, *c),
+            // A `Conv1d`'s filters, `[out, in, kernel]`, read as the matrix a
+            // convolution written as a matmul multiplies by: one row per
+            // output channel, `in × kernel` wide. Whisper's encoder starts
+            // with two. A depthwise convolution (`groups = channels`) is the
+            // case with `in = 1`: one filter per channel and no mixing, which
+            // is Qwen3-Next's.
+            [r, i, k] => (*r, i * k),
             other => {
                 return Err(format!("tensor `{name}` has shape {other:?}, which this cannot read")
                     .into())

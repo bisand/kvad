@@ -268,6 +268,31 @@ pub fn gelu_inplace(x: &mut [f32]) {
     }
 }
 
+/// GELU exactly: `x Φ(x)`, with the Gaussian CDF written through `erf`.
+///
+/// Whisper was trained with this one rather than [`gelu_inplace`]'s tanh
+/// approximation, and the two differ by up to about 5e-4 — small, and twenty
+/// blocks of it is a different model.
+pub fn gelu_erf_inplace(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        let t = *v as f64;
+        *v = (0.5 * t * (1.0 + erf(t / std::f64::consts::SQRT_2))) as f32;
+    }
+}
+
+/// The error function, `2/√π ∫₀ˣ e^{-t²} dt`.
+///
+/// Rust's standard library has none on stable. This is Abramowitz and Stegun
+/// 7.1.26, a rational approximation good to 1.5e-7 everywhere — below what
+/// an f32 result can hold for most of its range.
+pub fn erf(x: f64) -> f64 {
+    let s = x.signum();
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let poly = t * (0.254_829_592 + t * (-0.284_496_736 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    s * (1.0 - poly * (-x * x).exp())
+}
+
 /// Softmax, in place, with the max subtracted first for numerical stability.
 pub fn softmax_inplace(x: &mut [f32]) {
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -536,6 +561,14 @@ mod tests {
         softmax_inplace(&mut y);
         assert!((y.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         assert!(y[2] > y[1] && y[1] > y[0]);
+    }
+
+    #[test]
+    fn erf_is_good_to_its_published_error() {
+        // Values from tables of the error function.
+        for (x, want) in [(0.0, 0.0), (0.5, 0.520_499_877_8), (1.0, 0.842_700_792_9), (2.0, 0.995_322_265_0), (-1.0, -0.842_700_792_9)] {
+            assert!((erf(x) - want).abs() < 2e-7, "erf({x}) = {} not {want}", erf(x));
+        }
     }
 
     #[test]

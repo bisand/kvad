@@ -344,6 +344,8 @@ pub struct Transcriber {
     /// rayon's slow path at every call, and a decoder step is dozens of
     /// them. See [`crate::model::threads`].
     pub pool: rayon::ThreadPool,
+    /// What its matrices were loaded at, for a server's account of it.
+    pub precision: crate::quant::Precision,
 }
 
 impl Transcriber {
@@ -477,7 +479,8 @@ impl Transcriber {
         };
         if let Some(code) = &language {
             if t.multilingual && t.language(code).is_none() {
-                return Err(format!("`{code}` is not a language this model knows").into());
+                // The asker's to change, and a server answers it as such.
+                return Err(Box::new(crate::image::Refused(format!("`{code}` is not a language this model knows"))));
             }
         }
 

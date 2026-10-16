@@ -67,6 +67,7 @@ mod retrieval;
 mod scheduler;
 mod secret;
 mod settings;
+mod speech;
 mod storage;
 mod watching;
 mod training;

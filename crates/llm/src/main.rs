@@ -677,7 +677,6 @@ fn real_main() -> Res<()> {
     match args.command.as_str() {
         "arch" => return arch(),
         "crawl" => return crawl_site(args),
-        "transcribe" => return transcribe(args),
         "service" => return cli::service::run(&args),
         #[cfg(feature = "cluster")]
         "cluster" => return cli::cluster::run(&args),
@@ -711,6 +710,7 @@ fn real_main() -> Res<()> {
                 "cache" => cache(args),
                 "run" => run(args),
                 "chat" => chat(args),
+                "transcribe" => transcribe(args),
                 other if cli::remote_only(other) => cli::no_server(other),
                 other => cli::help::unknown_command(other),
             };
@@ -767,7 +767,8 @@ fn arch() -> Res<()> {
 // Model management
 // ---------------------------------------------------------------------------
 
-/// `kvad transcribe` — a recording to text, with a Whisper, here.
+/// `kvad transcribe` — a recording to text, with a Whisper, here: with
+/// `--local`, or with no server running. A server's is `cli::models::transcribe`.
 ///
 /// As plain text to the terminal, each stretch is printed as its window is
 /// done, which for an hour of audio is the difference between watching it

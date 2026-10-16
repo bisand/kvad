@@ -225,6 +225,8 @@ impl App {
             | Evt::Painted(_)
             | Evt::Filming(_)
             | Evt::Filmed(_)
+            | Evt::Transcribing(_)
+            | Evt::Transcribed(_)
             | Evt::Refused(_)
             // One conversation at a time here: nothing is sent to run beside
             // another, so nothing answers under an id.

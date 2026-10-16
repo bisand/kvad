@@ -103,7 +103,8 @@ pub struct Loaded {
     /// number is this times the tokens actually held — see
     /// [`Resident::cached_tokens`].
     pub kv_bytes_per_token: usize,
-    /// `chat`, `image` or `video`: which requests this model can answer.
+    /// `chat`, `image`, `video` or `speech`: which requests this model can
+    /// answer.
     pub kind: Kind,
     /// For an image model, what a request that leaves a knob out gets.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,20 +115,22 @@ pub struct Loaded {
 }
 
 /// What a model is for. Language models chat, image pipelines paint, video
-/// pipelines film; and a request for one sent to another is refused before
-/// it is queued.
+/// pipelines film, Whispers listen; and a request for one sent to another is
+/// refused before it is queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Chat,
     Image,
     Video,
+    Speech,
 }
 
 impl Kind {
     /// The kind of a model on disk, from the pipeline it is, if it is one.
     pub fn of_pipeline(pipeline: Option<&str>) -> Kind {
         match pipeline {
+            Some(kvad::speech::PIPELINE) => Kind::Speech,
             Some(p) if kvad::video::is_video_pipeline(p) => Kind::Video,
             Some(_) => Kind::Image,
             None => Kind::Chat,
@@ -252,6 +255,17 @@ pub enum Stroke {
     Refused(String),
 }
 
+/// Where a transcription has got to, or the transcript.
+#[derive(Debug, Clone)]
+pub enum Heard {
+    Window(kvad::speech::Progress),
+    Done(Box<kvad::speech::Transcript>),
+    Failed(String),
+    /// Asked for what the model cannot do, found once it tried: a language
+    /// it does not know.
+    Refused(String),
+}
+
 /// Where a video has got to, or the video.
 #[derive(Debug, Clone)]
 pub enum Reel {
@@ -300,6 +314,7 @@ pub enum Work {
     Completion,
     Image,
     Video,
+    Transcription,
 }
 
 /// Whether a generation may be turned away for want of room.
@@ -422,6 +437,7 @@ enum Job {
     },
     Paint { ticket: Ticket, on: Key, request: kvad::image::ImageRequest, out: tokio_mpsc::Sender<Stroke> },
     Film { ticket: Ticket, on: Key, request: kvad::video::VideoRequest, out: tokio_mpsc::Sender<Reel> },
+    Transcribe { ticket: Ticket, on: Key, audio: Vec<f32>, request: kvad::speech::Request, out: tokio_mpsc::Sender<Heard> },
 }
 
 impl Job {
@@ -430,7 +446,8 @@ impl Job {
             Job::Chat { ticket, .. }
             | Job::Complete { ticket, .. }
             | Job::Paint { ticket, .. }
-            | Job::Film { ticket, .. } => Some(ticket),
+            | Job::Film { ticket, .. }
+            | Job::Transcribe { ticket, .. } => Some(ticket),
             _ => None,
         }
     }
@@ -457,6 +474,9 @@ impl Job {
             }
             Job::Film { out, .. } => {
                 let _ = out.try_send(Reel::Failed(CANCELLED.into()));
+            }
+            Job::Transcribe { out, .. } => {
+                let _ = out.try_send(Heard::Failed(CANCELLED.into()));
             }
             _ => {}
         }
@@ -1275,6 +1295,28 @@ impl Scheduler {
         Ok((id, rx))
     }
 
+    /// Write down what is said in `audio`, 16 kHz mono samples, on `on`, as
+    /// [`Scheduler::paint`] makes an image: a [`Heard::Window`] for every 30
+    /// seconds of it, then the transcript.
+    pub fn transcribe(
+        &self,
+        who: Owner,
+        entry: Entry,
+        on: &Key,
+        audio: Vec<f32>,
+        request: kvad::speech::Request,
+    ) -> Result<(u64, tokio_mpsc::Receiver<Heard>), Refused> {
+        let (out, rx) = tokio_mpsc::channel(8);
+        let id = self.generate(who, entry, Work::Transcription, on, |ticket| Job::Transcribe {
+            ticket,
+            on: on.clone(),
+            audio,
+            request,
+            out,
+        })?;
+        Ok((id, rx))
+    }
+
     /// Score a text the model did not write.
     pub async fn score(
         &self,
@@ -1488,6 +1530,27 @@ fn run(queue: Closing, loaders: Loaders, budget: Budget, shared: Shared) {
                 shared.finish(ticket.id);
                 Box::new(move || drop(out))
             }
+
+            Job::Transcribe { ticket, on, audio, request, out } => {
+                match slots.iter().find(|s| s.key == on) {
+                    // Nobody is waiting for it any more.
+                    _ if out.is_closed() => {}
+                    _ if ticket.stop.load(Ordering::Relaxed) => {
+                        let _ = out.blocking_send(Heard::Failed(CANCELLED.into()));
+                    }
+                    Some(slot) => {
+                        shared.begin(ticket.id, &slot.engine.cancel);
+                        slot.engine.send(Cmd::Transcribe { audio, request });
+                        drain_transcribe(&slot.engine.rx, &out, &ticket.stop, &slot.engine.cancel);
+                        touch(&on, clock, None);
+                    }
+                    None => {
+                        let _ = out.blocking_send(Heard::Failed(missing(&on)));
+                    }
+                }
+                shared.finish(ticket.id);
+                Box::new(move || drop(out))
+            }
         };
 
         shared.busy.store(false, Ordering::Relaxed);
@@ -1582,6 +1645,7 @@ fn drain_load(rx: &Receiver<Evt>, progress: &tokio_mpsc::Sender<Progress>) -> Re
                 kv_bytes_per_token,
                 image,
                 video,
+                speech,
             }) => {
                 return Ok(Loaded {
                     repo,
@@ -1594,6 +1658,7 @@ fn drain_load(rx: &Receiver<Evt>, progress: &tokio_mpsc::Sender<Progress>) -> Re
                     n_ctx,
                     kv_bytes_per_token,
                     kind: match (&image, &video) {
+                        _ if speech => Kind::Speech,
                         (Some(_), _) => Kind::Image,
                         (_, Some(_)) => Kind::Video,
                         _ => Kind::Chat,
@@ -1845,6 +1910,37 @@ impl Stream {
     }
 }
 
+/// Forward a transcription's windows, then the transcript, as
+/// [`drain_film`] does a video's, and for its reason: a window of a large
+/// Whisper on the CPU is tens of seconds, and the engine checks its flag only
+/// between them.
+fn drain_transcribe(rx: &Receiver<Evt>, out: &tokio_mpsc::Sender<Heard>, stop: &AtomicBool, cancel: &AtomicBool) {
+    loop {
+        let heard = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if out.is_closed() || stop.load(Ordering::Relaxed) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                continue;
+            }
+            Ok(Evt::Transcribing(p)) => Heard::Window(p),
+            Ok(Evt::Transcribed(t)) => Heard::Done(t),
+            Ok(Evt::Error(e)) => Heard::Failed(e),
+            Ok(Evt::Refused(e)) => Heard::Refused(e),
+            Ok(Evt::Status(message)) => Heard::Failed(message),
+            Ok(_) => continue,
+            Err(_) => Heard::Failed("the engine thread has stopped".into()),
+        };
+        let last = !matches!(heard, Heard::Window(_));
+        if out.blocking_send(heard).is_err() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if last {
+            return;
+        }
+    }
+}
+
 /// Forward a video's progress, then the video, as [`drain_paint`] does an
 /// image's.
 ///
@@ -1948,10 +2044,11 @@ mod tests {
     const F32: Backend = Backend::Cpu(Precision::F32);
 
     #[test]
-    fn a_pipeline_is_an_image_or_a_video_model_by_its_name() {
+    fn a_pipeline_is_an_image_a_video_or_a_speech_model_by_its_name() {
         assert_eq!(Kind::of_pipeline(None), Kind::Chat);
         assert_eq!(Kind::of_pipeline(Some("FluxPipeline")), Kind::Image);
         assert_eq!(Kind::of_pipeline(Some(kvad::video::LTX_PIPELINE)), Kind::Video);
+        assert_eq!(Kind::of_pipeline(Some(kvad::speech::PIPELINE)), Kind::Speech);
     }
 
     fn roomy() -> Budget {

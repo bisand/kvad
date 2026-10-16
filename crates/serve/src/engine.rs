@@ -134,7 +134,9 @@ pub fn loader() -> Loader {
         Box::new(move |repo, backend, progress, watch| {
             // A DiT trained by nervus draws on the CPU at any backend, and
             // the CPU loader is the one that knows it; see `kvad::dit`.
-            if kvad::dit::is_one(repo) || kvad::dit::is_clips(repo) {
+            // A Whisper is the CPU loader's too: it loads there at a CPU
+            // backend, and says which to ask for at a GPU one.
+            if kvad::dit::is_one(repo) || kvad::dit::is_clips(repo) || kvad::speech::is_whisper(repo) {
                 return cpu(repo, backend, progress, watch);
             }
             // An image pipeline is not a language model at any precision,
@@ -274,11 +276,12 @@ pub fn parse(id: &str) -> Option<Backend> {
 }
 
 /// Whether this build can load a pipeline of this class: an image
-/// pipeline's, or a video pipeline's.
+/// pipeline's, a video pipeline's, or Whisper's.
 ///
-/// A DiT trained by nervus is one in every build: it draws on the CPU.
+/// A DiT trained by nervus is one in every build: it draws on the CPU. So is
+/// a Whisper, which listens on it.
 pub fn implements(pipeline: &str) -> bool {
-    if pipeline == kvad::dit::PIPELINE || pipeline == kvad::dit::CLIP_PIPELINE {
+    if [kvad::dit::PIPELINE, kvad::dit::CLIP_PIPELINE, kvad::speech::PIPELINE].contains(&pipeline) {
         return true;
     }
     #[cfg(feature = "gpu")]
@@ -290,9 +293,9 @@ pub fn implements(pipeline: &str) -> bool {
 /// The pipelines this build implements, for a message.
 pub fn pipelines() -> String {
     #[cfg(feature = "gpu")]
-    return kvad_gpu::image::PIPELINES.iter().chain(&kvad_gpu::video::ltx::PIPELINES).chain(&[kvad::dit::PIPELINE, kvad::dit::CLIP_PIPELINE]).copied().collect::<Vec<_>>().join(", ");
+    return kvad_gpu::image::PIPELINES.iter().chain(&kvad_gpu::video::ltx::PIPELINES).chain(&[kvad::dit::PIPELINE, kvad::dit::CLIP_PIPELINE, kvad::speech::PIPELINE]).copied().collect::<Vec<_>>().join(", ");
     #[cfg(not(feature = "gpu"))]
-    format!("{}, {}", kvad::dit::PIPELINE, kvad::dit::CLIP_PIPELINE)
+    format!("{}, {}, {}", kvad::dit::PIPELINE, kvad::dit::CLIP_PIPELINE, kvad::speech::PIPELINE)
 }
 
 /// The backend a pipeline gets when nobody has said which.
@@ -306,8 +309,13 @@ pub fn pipelines() -> String {
 /// and leave room for nothing else.
 ///
 /// LTX-2.5 runs at q8 or not at all: its DiT is 42 GB in bf16.
+///
+/// A Whisper gets f32, as `kvad transcribe` does: what it was checked against
+/// transformers at, so that the server and the command line write the same
+/// transcript. The largest is 6 GB at f32.
 pub fn preferred_pipeline(pipeline: &str) -> Backend {
     match pipeline {
+        kvad::speech::PIPELINE => Backend::Cpu(kvad::quant::Precision::F32),
         // Drawn on the CPU in f32 whatever it is asked, so the backend that
         // says so is the one it gets.
         kvad::dit::PIPELINE | kvad::dit::CLIP_PIPELINE => Backend::Cpu(kvad::quant::Precision::F32),
@@ -330,6 +338,15 @@ pub fn pipeline_weight_bytes(repo: &str, backend: Backend) -> Option<u64> {
     }
     if kvad::dit::is_clips(repo) {
         return kvad::dit::clip_weight_bytes(repo);
+    }
+    // At the precision a CPU backend names; a GPU one is refused at the load,
+    // and is charged what the CPU's default would take until then.
+    if kvad::speech::is_whisper(repo) {
+        let precision = match backend {
+            Backend::Cpu(p) => p,
+            Backend::Gpu(_) => Precision::F32,
+        };
+        return kvad::speech::weight_bytes(repo, precision);
     }
     #[cfg(feature = "gpu")]
     if let Backend::Gpu(mode) = backend {

@@ -72,12 +72,13 @@ pub async fn models(_: Identity, St(state): St<State>) -> Result<Json<serde_json
                     Kind::Chat => "chat",
                     Kind::Image => "image",
                     Kind::Video => "video",
+                    Kind::Speech => "speech",
                 };
                 (m.id.clone(), trained, takes_tools(&m), kind)
             }
         };
         // A language model is one this build has an architecture for; an
-        // image or video model is one whose pipeline it implements.
+        // image, video or speech model is one whose pipeline it implements.
         let runs = |m: &kvad::hub::LocalModel| {
             m.complete
                 && match kvad::hub::pipeline(m) {
@@ -573,6 +574,7 @@ fn noun(kind: Kind) -> &'static str {
         Kind::Chat => "language",
         Kind::Image => "image",
         Kind::Video => "video",
+        Kind::Speech => "speech",
     }
 }
 
@@ -581,7 +583,8 @@ fn wrong_kind(name: &str, is: Kind) -> Fail {
     Fail::bad(match is {
         Kind::Image => format!("{name} makes images; ask it at /v1/images/generations"),
         Kind::Video => format!("{name} makes videos; ask it at /v1/videos"),
-        Kind::Chat => format!("{name} is a language model; it answers /v1/chat/completions, not image or video requests"),
+        Kind::Speech => format!("{name} transcribes speech; ask it at /v1/audio/transcriptions"),
+        Kind::Chat => format!("{name} is a language model; it answers /v1/chat/completions, not image, video or speech requests"),
     })
 }
 

@@ -28,11 +28,12 @@
 //! [`Loader`] that can. A build with no GPU crate in it passes
 //! [`cpu_loader`], and asking that one for a GPU says what to do instead.
 //!
-//! # Two kinds of model
+//! # Kinds of model
 //!
 //! A loader hands back a [`Model`]: a language model, an image pipeline
-//! ([`crate::image::Painter`]) or a video pipeline
-//! ([`crate::video::Director`]). They are peers, not modes of one another.
+//! ([`crate::image::Painter`]), a video pipeline
+//! ([`crate::video::Director`]) or a Whisper
+//! ([`crate::speech::Transcriber`]). They are peers, not modes of one another.
 //! [`Llm`] knows nothing about images and a painter knows nothing about
 //! tokens; what they share is this thread, the load and unload around them,
 //! and the channel their progress goes down. Asking one for the other's work
@@ -124,6 +125,10 @@ pub enum Cmd {
     /// Make a video, reporting its progress as [`Evt::Filming`] and ending
     /// with [`Evt::Filmed`]. Only a video model can.
     Film(VideoRequest),
+    /// Write down what is said in a recording, 16 kHz mono samples,
+    /// reporting each 30-second window as [`Evt::Transcribing`] and ending
+    /// with [`Evt::Transcribed`]. Only a Whisper can.
+    Transcribe { audio: Vec<f32>, request: crate::speech::Request },
 }
 
 /// What a [`Loader`] hands back.
@@ -131,6 +136,7 @@ pub enum Model {
     Text(Llm),
     Image(Box<dyn Painter>),
     Video(Box<dyn Director>),
+    Speech(Box<crate::speech::Transcriber>),
 }
 
 impl From<Llm> for Model {
@@ -278,6 +284,9 @@ pub enum Evt {
         image: Option<Defaults>,
         /// For a video model, the same; `None` for any other.
         video: Option<crate::video::Defaults>,
+        /// A Whisper, which has no knobs to report and is told apart by
+        /// this alone.
+        speech: bool,
     },
     /// No model is loaded any more, and what was loaded is named.
     Unloaded(String),
@@ -300,6 +309,9 @@ pub enum Evt {
     /// Boxed, because a video is the frames themselves, and every other
     /// event would otherwise be sent at its size.
     Filmed(Box<Filmed>),
+    /// A window of a recording, done, and the stretches of text it added.
+    Transcribing(crate::speech::Progress),
+    Transcribed(Box<crate::speech::Transcript>),
     Error(String),
     /// Something a generation sent with [`Cmd::Beside`] has to say — a
     /// token, its end, its failure — with the id it was sent under.
@@ -331,12 +343,22 @@ pub fn cpu_loader() -> Loader {
     Box::new(|repo, backend, progress, watch| match backend {
         _ if crate::dit::is_one(repo) => Ok(Model::Image(Box::new(crate::dit::Drawer::load(repo, progress)?))),
         _ if crate::dit::is_clips(repo) => Ok(Model::Video(Box::new(crate::dit::Filmer::load(repo, progress)?))),
+        Backend::Cpu(precision) if crate::speech::is_whisper(repo) => {
+            Ok(Model::Speech(Box::new(crate::speech::Transcriber::load(repo, precision, progress, watch)?)))
+        }
+        // Before the GPU's refusal below, which would send somebody to the
+        // build when the answer is the backend.
+        Backend::Gpu(_) if crate::speech::is_whisper(repo) => Err(WHISPER_ON_CPU.into()),
         Backend::Cpu(precision) => Llm::load_watched(repo, precision, progress, watch).map(Model::from),
         Backend::Gpu(_) => {
             Err("this build has no GPU backend; pick a CPU precision instead".into())
         }
     })
 }
+
+/// What a Whisper asked for at a GPU backend is told.
+const WHISPER_ON_CPU: &str =
+    "Whisper runs on the CPU only for now; load it at a cpu backend (cpu-f32, cpu-q8 or cpu-q4)";
 
 pub struct Engine {
     tx: Sender<Cmd>,
@@ -409,13 +431,25 @@ enum Held {
     Text(Loaded),
     Image { repo: String, painter: Box<dyn Painter> },
     Video { repo: String, director: Box<dyn Director> },
+    Speech { repo: String, transcriber: Box<crate::speech::Transcriber> },
 }
 
 impl Held {
     fn repo(&self) -> &str {
         match self {
             Held::Text(s) => &s.llm.repo,
-            Held::Image { repo, .. } | Held::Video { repo, .. } => repo,
+            Held::Image { repo, .. } | Held::Video { repo, .. } | Held::Speech { repo, .. } => repo,
+        }
+    }
+
+    /// What this model says when asked to `what` and it cannot: where to
+    /// ask it instead.
+    fn cannot(&self, what: &str) -> String {
+        match self {
+            Held::Text(s) => format!("{} is a language model; it cannot {what}", s.llm.repo),
+            Held::Image { repo, .. } => format!("{repo} makes images; ask it at /v1/images/generations"),
+            Held::Video { repo, .. } => format!("{repo} makes videos; ask it at /v1/videos"),
+            Held::Speech { repo, .. } => format!("{repo} transcribes speech; ask it at /v1/audio/transcriptions"),
         }
     }
 
@@ -430,6 +464,10 @@ impl Held {
             Held::Video { repo, .. } => Err(format!(
                 "{repo} makes videos from text; it cannot chat, complete, tokenize or score. \
                  Ask it for a video instead (POST /v1/videos)."
+            )),
+            Held::Speech { repo, .. } => Err(format!(
+                "{repo} transcribes speech; it cannot chat, complete, tokenize or score. \
+                 Send it a recording instead (POST /v1/audio/transcriptions)."
             )),
         }
     }
@@ -573,6 +611,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                             kv_bytes_per_token: 0,
                             image: Some(painter.defaults()),
                             video: None,
+                            speech: false,
                         });
                         // Not made the active model: that is what `kvad run`
                         // talks to when it is not told, and it cannot talk
@@ -593,9 +632,30 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                             kv_bytes_per_token: 0,
                             image: None,
                             video: Some(director.defaults()),
+                            speech: false,
                         });
                         // Not the active model either, for the same reason.
                         session = Some(Held::Video { repo, director });
+                        let _ = tx.send(Evt::Local(hub::local_models()));
+                    }
+                    Ok(Model::Speech(transcriber)) => {
+                        let _ = tx.send(Evt::Loaded {
+                            repo: repo.clone(),
+                            summary: transcriber.summary(),
+                            params: transcriber.model.params(),
+                            instruct: false,
+                            tools: false,
+                            backend: transcriber.backend(),
+                            weight_bytes: transcriber.model.weight_bytes(),
+                            n_ctx: 0,
+                            kv_bytes_per_token: 0,
+                            image: None,
+                            video: None,
+                            speech: true,
+                        });
+                        // Not the active model either: `kvad run` cannot
+                        // talk to it.
+                        session = Some(Held::Speech { repo, transcriber });
                         let _ = tx.send(Evt::Local(hub::local_models()));
                     }
                     Ok(Model::Text(llm)) => {
@@ -614,6 +674,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                             ),
                             image: None,
                             video: None,
+                            speech: false,
                         });
                         let _ = hub::State::set_active(&repo);
                         let d = Sampling::default();
@@ -731,12 +792,8 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                         continue;
                     }
                     Some(Held::Image { painter, .. }) => painter,
-                    Some(Held::Text(s)) => {
-                        fail(format!("{} is a language model; it cannot make images", s.llm.repo).into());
-                        continue;
-                    }
-                    Some(Held::Video { repo, .. }) => {
-                        fail(format!("{repo} makes videos; ask it at /v1/videos").into());
+                    Some(other) => {
+                        fail(other.cannot("make images").into());
                         continue;
                     }
                 };
@@ -766,12 +823,8 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                         continue;
                     }
                     Some(Held::Video { director, .. }) => director,
-                    Some(Held::Text(s)) => {
-                        fail(format!("{} is a language model; it cannot make videos", s.llm.repo).into());
-                        continue;
-                    }
-                    Some(Held::Image { repo, .. }) => {
-                        fail(format!("{repo} makes images; ask it at /v1/images/generations").into());
+                    Some(other) => {
+                        fail(other.cannot("make videos").into());
                         continue;
                     }
                 };
@@ -786,6 +839,37 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                         let _ = tx.send(Evt::Filmed(Box::new(f)));
                     }
                     Err(e) => fail(e),
+                }
+            }
+
+            Cmd::Transcribe { audio, request } => {
+                let transcriber = match session.as_mut() {
+                    None => {
+                        say("no model loaded");
+                        continue;
+                    }
+                    Some(Held::Speech { transcriber, .. }) => transcriber,
+                    Some(other) => {
+                        fail(other.cannot("transcribe speech").into());
+                        continue;
+                    }
+                };
+                cancel.store(false, Ordering::Relaxed);
+                let tx2 = tx.clone();
+                let cancel2 = Arc::clone(&cancel);
+                let heard = transcriber.transcribe(&audio, &request, &mut |p| {
+                    tx2.send(Evt::Transcribing(p.clone())).is_ok() && !cancel2.load(Ordering::Relaxed)
+                });
+                match heard {
+                    Ok(t) => {
+                        let _ = tx.send(Evt::Transcribed(Box::new(t)));
+                    }
+                    Err(e) => match e.downcast_ref::<crate::image::Refused>() {
+                        Some(r) => {
+                            let _ = tx.send(Evt::Refused(r.0.clone()));
+                        }
+                        None => fail(e),
+                    },
                 }
             }
         }

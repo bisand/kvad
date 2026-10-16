@@ -365,6 +365,54 @@ pub enum Body<'a> {
     Text(String),
     /// A file as it is: a picture going into a dataset.
     Bytes(Vec<u8>),
+    /// `multipart/form-data`: a recording and the fields beside it, which is
+    /// the only way OpenAI's audio endpoints take one.
+    Form(Vec<Part>),
+}
+
+/// One field of a [`Body::Form`]: text, or a file with its name.
+pub struct Part {
+    pub name: String,
+    pub filename: Option<String>,
+    pub data: Vec<u8>,
+}
+
+impl Part {
+    pub fn text(name: &str, value: impl ToString) -> Part {
+        Part { name: name.into(), filename: None, data: value.to_string().into_bytes() }
+    }
+
+    pub fn file(name: &str, filename: &str, data: Vec<u8>) -> Part {
+        Part { name: name.into(), filename: Some(filename.into()), data }
+    }
+}
+
+/// A form's bytes, and the boundary between its parts (RFC 7578).
+///
+/// The boundary is chosen so that it is in none of the parts, which a file
+/// could otherwise contain by chance and cut itself short at.
+pub fn form(parts: &[Part]) -> (Vec<u8>, String) {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let mut boundary = format!("kvad-{stamp:x}");
+    while parts.iter().any(|p| p.data.windows(boundary.len()).any(|w| w == boundary.as_bytes())) {
+        boundary.push('x');
+    }
+    let mut body = Vec::new();
+    for p in parts {
+        // A quote or a line break in a name would end the header early.
+        let quoted = |s: &str| s.replace(['"', '\r', '\n'], "_");
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"", quoted(&p.name)).as_bytes());
+        match &p.filename {
+            Some(f) => body.extend_from_slice(
+                format!("; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n", quoted(f)).as_bytes(),
+            ),
+            None => body.extend_from_slice(b"\r\n\r\n"),
+        }
+        body.extend_from_slice(&p.data);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (body, boundary)
 }
 
 impl Remote {
@@ -517,6 +565,10 @@ impl Remote {
                 .agent
                 .run(req.header("content-type", "text/plain; charset=utf-8").body(text.into_bytes())?),
             Some(Body::Bytes(bytes)) => self.agent.run(req.header("content-type", "application/octet-stream").body(bytes)?),
+            Some(Body::Form(parts)) => {
+                let (bytes, boundary) = form(&parts);
+                self.agent.run(req.header("content-type", format!("multipart/form-data; boundary={boundary}")).body(bytes)?)
+            }
         };
         sent.map_err(|e| match e {
             ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -533,6 +585,20 @@ impl Remote {
     pub fn call(&self, method: &str, path: &str, body: Option<Body>) -> Res<Value> {
         let response = self.send(method, path, body, "application/json")?;
         Ok(read_reply(response, path)?.0)
+    }
+
+    /// A request whose answer is a document to keep as it was sent: a
+    /// transcript, whose formats are the server's to write. JSON read and
+    /// written out again is not the same bytes — a float can come back a
+    /// digit shorter — and `kvad transcribe` promises the same file from a
+    /// server as from this process.
+    pub fn call_text(&self, method: &str, path: &str, body: Option<Body>) -> Res<String> {
+        let mut response = self.send(method, path, body, "*/*")?;
+        if response.status().as_u16() >= 400 {
+            read_reply(response, path)?;
+            return Err(format!("{path} failed").into());
+        }
+        Ok(response.body_mut().with_config().limit(256 * 1024 * 1024).read_to_string()?)
     }
 
     /// The same, keeping the session cookie a sign-in sets.
@@ -891,6 +957,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("get", "/v1/videos/{id}/events", "kvad videos make, kvad videos watch"),
     ("delete", "/v1/videos/{id}", "kvad videos rm"),
     ("get", "/v1/videos/{id}/content", "kvad videos get, kvad videos make"),
+    ("post", "/v1/audio/transcriptions", "kvad transcribe"),
+    ("post", "/v1/audio/translations", "kvad transcribe --translate"),
 ];
 
 /// Routes that deliberately have no command, and why not.

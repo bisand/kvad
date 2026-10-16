@@ -1018,7 +1018,7 @@ pub fn picture_from_file(ffmpeg: &std::path::Path, path: &std::path::Path, crf: 
 
 /// What `ffmpeg` writes to its standard output when run with `args`, fed
 /// `input` on its standard input if there is any.
-fn ffmpeg_out(ffmpeg: &std::path::Path, args: &[&str], input: Option<Vec<u8>>) -> Res<Vec<u8>> {
+pub(crate) fn ffmpeg_out(ffmpeg: &std::path::Path, args: &[&str], input: Option<Vec<u8>>) -> Res<Vec<u8>> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     let mut child = Command::new(ffmpeg)

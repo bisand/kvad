@@ -97,6 +97,29 @@ const ACROSS: &[Flag] = &[
 
 const CLUSTER_PORT: Flag = f("--port", "N", Kind::Text, "the port to listen on, or to reach (default 7420)");
 
+const TRANSCRIBE: &[Flag] = &[
+    f("--model", "MODEL", Kind::Model(Want::Any), "the Whisper to use: a Hub repo id or a directory"),
+    f("--language", "CODE", Kind::Text, "what is spoken, as no or en (default: the model's own, or detected); auto detects"),
+    sw("--translate", "write it down in English, whatever is spoken"),
+    sw("--timestamps", "time each stretch of text (on for srt, vtt and verbose_json)"),
+    f(
+        "--format",
+        "F",
+        Kind::Choice(&[
+            ("text", "the words (default)"),
+            ("json", "{\"text\": …}"),
+            ("verbose_json", "the words, the language, and every segment with its times"),
+            ("srt", "subtitles"),
+            ("vtt", "subtitles for the web"),
+        ]),
+        "what to write",
+    ),
+    f("--prompt", "T", Kind::Text, "text to read the recording as following: names, spelling, style"),
+    f("--temperature", "F", Kind::Text, "decode at this temperature only (default: 0, warmer for a window that fails)"),
+    f("--out", "FILE", Kind::File, "where to write it (default: the terminal)"),
+    QUANT,
+];
+
 const LORA: Flag = f("--lora", "NAME[:SCALE]", Kind::Lora, "apply a LoRA, at SCALE if given (default 1); as often as you like");
 
 // ---------------------------------------------------------------------------
@@ -336,6 +359,30 @@ pub const COMMANDS: &[Command] = &[
             "kvad videos make \"waves break against a lighthouse at dusk\" --seconds 3",
             "kvad videos make \"a paper boat in the rain\" --image boat.png --out boat.mp4",
             "kvad videos watch 63",
+        ],
+    },
+    Command {
+        name: "transcribe",
+        group: Group::Make,
+        args: "FILE --model MODEL",
+        about: "write down what is said in a recording, with a Whisper",
+        server: false,
+        routed: false,
+        words: &[Kind::File],
+        subs: &[],
+        flags: &[TRANSCRIBE],
+        usage: None,
+        notes: "Any Whisper on the Hub in transformers' layout: openai/whisper-*, the distilled\n\
+                ones, and fine-tunes such as NbAiLab/nb-whisper-* for Norwegian. A WAV file is\n\
+                read here; anything else (MP3, M4A, FLAC, the sound of a video) takes ffmpeg.\n\n\
+                NB-Whisper ignores --translate; it was taught to write English when asked for\n\
+                --language en, and Nynorsk for --language nn.\n\n\
+                Long recordings are read 30 seconds at a time. As text, each stretch is printed\n\
+                as soon as it is done. It runs in this process, on the CPU, for now.",
+        examples: &[
+            "kvad transcribe intervju.mp3 --model NbAiLab/nb-whisper-small",
+            "kvad transcribe talk.wav --model openai/whisper-small --format srt --out talk.srt",
+            "kvad transcribe nyheter.m4a --model NbAiLab/nb-whisper-large --quant q8 --language en",
         ],
     },
     // -- train your own ----------------------------------------------------
@@ -1157,7 +1204,7 @@ mod tests {
     #[test]
     fn the_table_holds_every_command_and_only_those() {
         for command in COMMANDS {
-            let handled = matches!(command.name, "arch" | "crawl" | "service" | "cluster" | "worker" | "serve" | "help" | "completions");
+            let handled = matches!(command.name, "arch" | "crawl" | "transcribe" | "service" | "cluster" | "worker" | "serve" | "help" | "completions");
             assert!(handled || crate::cli::known(command.name), "`{}` is in the table and nothing runs it", command.name);
             assert_eq!(command.server, crate::cli::remote_only(command.name), "`{}`: does it need a server?", command.name);
             // The parser gathers words only for the commands it knows take

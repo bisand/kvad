@@ -128,6 +128,7 @@ struct Args {
     /// Whether `--seed` was given: an image with no seed asked for gets a
     /// fresh one, where a completion gets 7.
     seed_given: bool,
+    temperature_given: bool,
     /// `images make` only: how hard to follow the prompt, and what to avoid.
     guidance: Option<f32>,
     negative: Option<String>,
@@ -184,6 +185,12 @@ struct Args {
     warmup: Option<usize>,
     decay_to: Option<f32>,
     clip: Option<f32>,
+    /// `transcribe`: what is spoken, how to write it down, and whether to
+    /// translate it and time it.
+    language: Option<String>,
+    format: Option<String>,
+    translate: bool,
+    timestamps: bool,
 }
 
 impl Default for Args {
@@ -233,6 +240,7 @@ impl Default for Args {
             top_p: 0.95,
             seed: 7,
             seed_given: false,
+            temperature_given: false,
             guidance: None,
             negative: None,
             loras: Vec::new(),
@@ -272,6 +280,10 @@ impl Default for Args {
             warmup: None,
             decay_to: None,
             clip: None,
+            language: None,
+            format: None,
+            translate: false,
+            timestamps: false,
         }
     }
 }
@@ -280,7 +292,7 @@ impl Default for Args {
 const POSITIONAL: &[&str] = &[
     "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload", "cancel",
     "tokenize", "service", "conversations", "jobs", "datasets", "tune", "evals", "bench", "metrics",
-    "auth", "users", "sessions", "keys", "api", "images", "videos", "cluster",
+    "auth", "users", "sessions", "keys", "api", "images", "videos", "cluster", "transcribe",
 ];
 
 /// Flags that stand alone, and the short spellings some of them have.
@@ -302,6 +314,8 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--epilogue" => a.epilogue = true,
         "--dev" => a.dev = true,
         "--all" => a.all = true,
+        "--translate" => a.translate = true,
+        "--timestamps" => a.timestamps = true,
         _ => return false,
     }
     true
@@ -366,7 +380,10 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--prompt" => a.prompt = Some(value.clone()),
             "--system" => a.system = Some(value.clone()),
             "--max-tokens" => a.max_tokens = Some(num() as usize),
-            "--temperature" => a.temperature = num() as f32,
+            "--temperature" => {
+                a.temperature = num() as f32;
+                a.temperature_given = true;
+            }
             "--top-k" => a.top_k = num() as usize,
             "--top-p" => a.top_p = num() as f32,
             "--seed" => {
@@ -444,6 +461,8 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--place" => a.place = Some(value.clone()),
             "--stream-mb" => a.stream_mb = Some(num() as usize),
             "--tokens" => a.tokens = Some(num() as usize),
+            "--language" => a.language = Some(value.clone()),
+            "--format" => a.format = Some(value.clone()),
             // In the table and not in this match: the test in `cli::spec`
             // that holds the two together has been broken.
             _ => cli::help::bad_flag(&a.command, &format!("{flag} is not an option of `kvad {}`.", a.command), &flag),
@@ -658,6 +677,7 @@ fn real_main() -> Res<()> {
     match args.command.as_str() {
         "arch" => return arch(),
         "crawl" => return crawl_site(args),
+        "transcribe" => return transcribe(args),
         "service" => return cli::service::run(&args),
         #[cfg(feature = "cluster")]
         "cluster" => return cli::cluster::run(&args),
@@ -746,6 +766,83 @@ fn arch() -> Res<()> {
 // ---------------------------------------------------------------------------
 // Model management
 // ---------------------------------------------------------------------------
+
+/// `kvad transcribe` — a recording to text, with a Whisper, here.
+///
+/// As plain text to the terminal, each stretch is printed as its window is
+/// done, which for an hour of audio is the difference between watching it
+/// work and wondering whether it does. Every other format is one document,
+/// and is written once at the end.
+fn transcribe(args: Args) -> Res<()> {
+    use kvad::speech::{self, Format, Request, Task, Transcriber};
+    let Some(file) = args.target.clone() else {
+        eprintln!("usage: kvad transcribe FILE --model MODEL [--language CODE] [--format text|json|verbose_json|srt|vtt]");
+        std::process::exit(2);
+    };
+    let Some(model) = args.model.clone() else {
+        return Err("which Whisper? --model NbAiLab/nb-whisper-small, say, or openai/whisper-small".into());
+    };
+    let format = match args.format.as_deref() {
+        None => Format::Text,
+        Some(f) => Format::parse(f).ok_or_else(|| format!("--format expects text, json, verbose_json, srt or vtt, got `{f}`"))?,
+    };
+    let timestamps = args.timestamps || matches!(format, Format::Srt | Format::Vtt | Format::VerboseJson);
+    let task = if args.translate { Task::Translate } else { Task::Transcribe };
+    let req = Request {
+        language: args.language.clone(),
+        task,
+        timestamps,
+        prompt: args.prompt.clone(),
+        temperature: args.temperature_given.then_some(args.temperature),
+        seed: args.seed_given.then_some(args.seed),
+        ..Request::default()
+    };
+
+    let path: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let ffmpeg = kvad::video::ffmpeg_on(&path);
+    let audio = speech::audio::load(std::path::Path::new(&file), ffmpeg.as_deref())?;
+    let seconds = audio.len() as f32 / speech::mel::SAMPLE_RATE as f32;
+    eprintln!("{file}: {seconds:.1} s");
+
+    let started = std::time::Instant::now();
+    let t = Transcriber::load(&model, args.quant, &mut |m| eprintln!("{m}"), &weights::Watcher::none())?;
+    eprintln!("{} (loaded in {:.1} s)", t.summary(), started.elapsed().as_secs_f32());
+
+    let streaming = format == Format::Text && args.out.is_none();
+    let started = std::time::Instant::now();
+    let done = t.transcribe(&audio, &req, &mut |p| {
+        if streaming {
+            let mut out = std::io::stdout().lock();
+            for s in &p.segments {
+                let _ = match timestamps {
+                    true => writeln!(out, "[{} → {}] {}", speech::transcribe::clock(s.start, "."), speech::transcribe::clock(s.end, "."), s.text.trim()),
+                    false => writeln!(out, "{}", s.text.trim()),
+                };
+            }
+            let _ = out.flush();
+        } else {
+            eprint!("\r{:.0} of {:.0} s", p.done, p.total);
+        }
+        true
+    })?;
+    if !streaming {
+        eprintln!();
+    }
+    let took = started.elapsed().as_secs_f32();
+    eprintln!("{} in {took:.1} s: {:.1}× real time, language {}", file, seconds / took.max(1e-3), done.language);
+
+    if !streaming {
+        let text = done.render(format, task);
+        match &args.out {
+            Some(out) => {
+                std::fs::write(out, &text)?;
+                eprintln!("wrote {out}");
+            }
+            None => print!("{text}"),
+        }
+    }
+    Ok(())
+}
 
 /// `kvad crawl` — the other way to get something to train on.
 ///

@@ -146,7 +146,7 @@ in order:
 | [5. `kvad-serve`](docs/serve.md) | The HTTP server and web UI: reasoning output, tool calls, model residency, the default backend, benchmarks, the playground, the CLI as a client, testing. |
 | [Where to go next](docs/roadmap.md) | The roadmap, one track per job, and what to read alongside. |
 
-Design notes for individual features — GGUF, images, video, LoRA, the cluster,
+Design notes for individual features — GGUF, images, video, speech, LoRA, the cluster,
 the UI — sit next to them in [`docs/`](docs) as `*-plan.md`,
 [tune.md](docs/tune.md) covers training a LoRA for an image model, and
 [releasing.md](docs/releasing.md) covers cutting a release.

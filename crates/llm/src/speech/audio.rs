@@ -27,23 +27,51 @@ pub fn load(path: &Path, ffmpeg: Option<&Path>) -> Res<Vec<f32>> {
     if is_wav(&bytes) {
         return from_wav(&bytes).map_err(|e| format!("{}: {e}", path.display()).into());
     }
-    with_ffmpeg(ffmpeg, path)
+    with_ffmpeg(ffmpeg, path, None)
 }
 
 /// Samples from the bytes of an upload, which may be any format `ffmpeg`
 /// reads. A WAV is read in memory; anything else is written to a temporary
 /// file for `ffmpeg` to open, because some containers (MP4 above all) keep
 /// their index at the end and cannot be read from a pipe.
+///
+/// These are somebody else's bytes, so `ffmpeg` is held to [`UPLOADED`]:
+/// formats that are a recording, and none that is a list of other files to
+/// open. An HLS playlist naming `/srv/kvad/videos/12.mp4` is a valid input to
+/// `ffmpeg`, and without the list it reads that file — on the server, for
+/// whoever sent the playlist — and the transcript of it goes back to them.
 pub fn from_bytes(bytes: &[u8], name_hint: &str, ffmpeg: Option<&Path>) -> Res<Vec<f32>> {
     if is_wav(bytes) {
         return from_wav(bytes);
     }
     let ext = Path::new(name_hint).extension().and_then(|e| e.to_str()).filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric()));
     let path = std::env::temp_dir().join(format!("kvad-audio-{}-{}.{}", std::process::id(), unique(), ext.unwrap_or("bin")));
-    std::fs::write(&path, bytes)?;
-    let out = with_ffmpeg(ffmpeg, &path);
+    write_new(&path, bytes)?;
+    let out = with_ffmpeg(ffmpeg, &path, Some(UPLOADED));
     let _ = std::fs::remove_file(&path);
     out
+}
+
+/// The demuxers an upload may be read by: containers and codecs that hold
+/// sound, by `ffmpeg`'s names for them (`mov` is MP4 and M4A, `matroska`
+/// is WebM, `asf` is WMA). Not `hls`, `dash`, `concat` or anything else
+/// whose contents are the names of other files.
+pub const UPLOADED: &str = "aac,ac3,aiff,amr,ape,asf,au,avi,caf,eac3,flac,matroska,webm,mov,mp4,m4a,3gp,mp3,mpeg,mpegts,ogg,w64,wav,wv";
+
+/// Write `bytes` to a file that did not exist, and only to one that did not.
+///
+/// The name in the temporary directory is guessable, and on a machine where
+/// that directory is shared, somebody else can put a link there under it
+/// first; `create_new` refuses rather than writing through it. Readable by
+/// this user only, for the time it exists.
+fn write_new(path: &Path, bytes: &[u8]) -> Res<()> {
+    use std::io::Write;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    open.open(path)?.write_all(bytes)?;
+    Ok(())
 }
 
 fn unique() -> u64 {
@@ -56,8 +84,9 @@ fn is_wav(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
 }
 
-/// Ask `ffmpeg` for 16 kHz mono 32-bit float, little-endian, on its stdout.
-fn with_ffmpeg(ffmpeg: Option<&Path>, path: &Path) -> Res<Vec<f32>> {
+/// Ask `ffmpeg` for 16 kHz mono 32-bit float, little-endian, on its stdout,
+/// reading `path` by one of `formats` if they are given.
+fn with_ffmpeg(ffmpeg: Option<&Path>, path: &Path, formats: Option<&str>) -> Res<Vec<f32>> {
     let Some(ffmpeg) = ffmpeg else {
         return Err(format!(
             "{} is not a WAV file, and reading anything else takes ffmpeg, which is not installed. \
@@ -68,8 +97,12 @@ fn with_ffmpeg(ffmpeg: Option<&Path>, path: &Path) -> Res<Vec<f32>> {
     };
     let input = path.to_str().ok_or("an audio file's path that is not UTF-8")?;
     let rate = SAMPLE_RATE.to_string();
-    let out = crate::video::ffmpeg_out(ffmpeg, &["-i", input, "-vn", "-f", "f32le", "-ac", "1", "-ar", &rate, "pipe:1"], None)
-        .map_err(|e| format!("ffmpeg could not read {}: {e}", path.display()))?;
+    let mut args = Vec::new();
+    if let Some(formats) = formats {
+        args.extend(["-format_whitelist", formats]);
+    }
+    args.extend(["-i", input, "-vn", "-f", "f32le", "-ac", "1", "-ar", &rate, "pipe:1"]);
+    let out = crate::video::ffmpeg_out(ffmpeg, &args, None).map_err(|e| format!("ffmpeg could not read {}: {e}", path.display()))?;
     Ok(out.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
 
@@ -227,6 +260,34 @@ mod tests {
     fn stereo_is_averaged_to_mono() {
         let got = from_wav(&wav(&[16384, 0, -16384, -16384], 2, 16_000)).unwrap();
         assert_eq!(got, vec![0.25, -0.5]);
+    }
+
+    /// A playlist naming a recording on this machine is refused, where the
+    /// recording itself is read. Skipped where there is no `ffmpeg`.
+    #[test]
+    fn an_upload_cannot_name_a_file_on_this_machine() {
+        let path: Vec<std::path::PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+        let Some(ffmpeg) = crate::video::ffmpeg_on(&path) else {
+            eprintln!("no ffmpeg here: skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kvad-upload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mp3 = dir.join("secret.mp3");
+        let made = std::process::Command::new(&ffmpeg)
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+            .arg(&mp3)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let mp3_bytes = std::fs::read(&mp3).unwrap();
+        let read = from_bytes(&mp3_bytes, "talk.mp3", Some(&ffmpeg)).unwrap();
+        assert!(read.len() > 15_000, "{} samples of a second at 16 kHz", read.len());
+
+        let playlist = format!("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:1,\n{}\n#EXT-X-ENDLIST\n", mp3.display());
+        let refused = from_bytes(playlist.as_bytes(), "x.m3u8", Some(&ffmpeg));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(refused.is_err(), "a playlist was read: {} samples", refused.unwrap().len());
     }
 
     #[test]

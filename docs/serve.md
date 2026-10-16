@@ -32,7 +32,11 @@ prompt, fast from its distilled model, guided from its dev model, or by DFR,
 the reference's production pipeline, which also makes 48 and 96 fps and, with
 its spatial epilogue, sizes its second stage cannot hold whole, and decoded
 by its diffusion decoder or, when asked, its convolutional one
-(`docs/video-plan.md`). Four authentication modes (`none`, `local`, `basic`,
+(`docs/video-plan.md`). `/v1/audio/transcriptions` and
+`/v1/audio/translations` are OpenAI's speech endpoints, for any Whisper, on
+the CPU; a form with the recording in, the transcript out in any of OpenAI's
+five formats, the same bytes `kvad transcribe --local` writes, and nothing
+kept (`docs/speech-plan.md`). Four authentication modes (`none`, `local`, `basic`,
 `oidc`), roles, API keys. SQLite for everything the filesystem cannot answer.
 `docs/ui-plan.md` is the plan it was built from, and each phase in it records
 what that phase measured and which of its open questions closed.
@@ -370,8 +374,8 @@ sharing a spelling — `None`, from an `Option<Arch>`, meant both "the picker is
 asking what this build likes in general" and "somebody named a repo this
 machine has never seen" — and the second was quietly getting the first's
 answer. So a model about to be downloaded for the first time was being offered
-the GPU on no evidence at all, which for a `whisper` or a `gemma` is a default
-that cannot load.
+the GPU on no evidence at all, which for a `gemma` is a default that cannot
+load. (So it was for a `whisper`, which now loads, and on the CPU only.)
 
 Separating them made the honest answer `cpu-q8`, and the honest answer was
 annoying: every model's first load on the slow backend, then the right one

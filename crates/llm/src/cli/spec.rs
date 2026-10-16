@@ -115,7 +115,7 @@ const TRANSCRIBE: &[Flag] = &[
         "what to write",
     ),
     f("--prompt", "T", Kind::Text, "text to read the recording as following: names, spelling, style"),
-    f("--temperature", "F", Kind::Text, "decode at this temperature only (default: 0, warmer for a window that fails)"),
+    f("--temperature", "F", Kind::Text, "above 0, decode at this temperature only (default, and 0: greedy, warmer for a window that fails)"),
     f("--out", "FILE", Kind::File, "where to write it (default: the terminal)"),
     QUANT,
 ];
@@ -367,7 +367,7 @@ pub const COMMANDS: &[Command] = &[
         args: "FILE --model MODEL",
         about: "write down what is said in a recording, with a Whisper",
         server: false,
-        routed: false,
+        routed: true,
         words: &[Kind::File],
         subs: &[],
         flags: &[TRANSCRIBE],
@@ -378,7 +378,10 @@ pub const COMMANDS: &[Command] = &[
                 NB-Whisper ignores --translate; it was taught to write English when asked for\n\
                 --language en, and Nynorsk for --language nn.\n\n\
                 Long recordings are read 30 seconds at a time. As text, each stretch is printed\n\
-                as soon as it is done. It runs in this process, on the CPU, for now.",
+                as soon as it is done.\n\n\
+                With a server running, the recording is sent to it, and its Whisper writes it\n\
+                down: at cpu-f32 unless --quant says otherwise. --local runs it in this process.\n\
+                Either way it runs on the CPU, for now.",
         examples: &[
             "kvad transcribe intervju.mp3 --model NbAiLab/nb-whisper-small",
             "kvad transcribe talk.wav --model openai/whisper-small --format srt --out talk.srt",

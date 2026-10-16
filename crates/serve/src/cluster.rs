@@ -68,7 +68,7 @@ pub fn room() -> Option<u64> {
 /// At a GPU backend the same, where this build has one and the model is of
 /// the family whose blocks the GPU holds a stage at a time.
 pub fn spreads(repo: &str, backend: Backend) -> bool {
-    if running().workers.is_empty() || kvad::dit::is_one(repo) || kvad::dit::is_clips(repo) {
+    if running().workers.is_empty() || kvad::dit::is_one(repo) || kvad::dit::is_clips(repo) || kvad::speech::is_whisper(repo) {
         return false;
     }
     let name = kvad::weights::model_id(repo);

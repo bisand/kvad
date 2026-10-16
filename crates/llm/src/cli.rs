@@ -123,6 +123,7 @@ pub fn remote(remote: &Remote, args: &Args) -> Res<()> {
         "tokenize" => models::tokenize(remote, args),
         "run" => models::run(remote, args),
         "chat" => models::chat(remote, args),
+        "transcribe" => models::transcribe(remote, args),
         "train" => models::train(remote, args),
         "conversations" => api::conversations(remote, args),
         "images" => api::images(remote, args),
@@ -196,7 +197,7 @@ mod tests {
     const METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
 
     /// The client's calls that take the method as their first argument.
-    const TAKES_A_METHOD: &[&str] = &["call", "call_for_cookie", "stream"];
+    const TAKES_A_METHOD: &[&str] = &["call", "call_for_cookie", "call_text", "stream"];
 
     /// The client's calls that are a GET under another name.
     const GETS: &[&str] = &["download"];
@@ -293,7 +294,7 @@ mod tests {
     fn every_command_the_table_names_exists() {
         let known: BTreeSet<&str> = [
             "ls", "ps", "search", "info", "pull", "use", "rm", "cache", "load", "unload", "cancel",
-            "queue", "tokenize", "run", "chat", "train", "service", "conversations", "images", "videos", "jobs",
+            "queue", "tokenize", "run", "chat", "train", "transcribe", "service", "conversations", "images", "videos", "jobs",
             "datasets", "tune", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api", "cluster",
         ]
         .into();

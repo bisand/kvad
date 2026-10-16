@@ -63,7 +63,7 @@ pub struct Model {
     /// at all.
     pub mixture: bool,
     /// `chat` for a language model, `image` for a text-to-image pipeline,
-    /// `video` for a text-to-video one.
+    /// `video` for a text-to-video one, `speech` for a Whisper.
     pub kind: crate::scheduler::Kind,
     /// The diffusers pipeline an image or video model is, by its
     /// `model_index.json` or, for LTX, its files.
@@ -1037,11 +1037,18 @@ mod tests {
         // It names the model's own `model_type` and the list the loader
         // dispatches on, rather than a sentence kept here about which
         // architectures existed when it was written.
-        let strange = describe(&local("a/b", Some("whisper"), true), false);
+        let strange = describe(&local("a/b", Some("bert"), true), false);
         assert!(!strange.runnable);
         let why = strange.blocker.unwrap();
-        assert!(why.contains("`whisper`"), "{why}");
+        assert!(why.contains("`bert`"), "{why}");
         assert!(why.contains("llama") && why.contains("gpt2"), "{why}");
+
+        // A Whisper is not one of those architectures, and is not refused
+        // for it: it is a speech model, which listens rather than chats.
+        let whisper = describe(&local("a/b", Some("whisper"), true), false);
+        assert_eq!(whisper.kind, crate::scheduler::Kind::Speech);
+        assert_eq!(whisper.pipeline.as_deref(), Some(kvad::speech::PIPELINE));
+        assert!(!whisper.blocker.unwrap_or_default().contains("not an architecture"));
 
         let nothing = describe(&local("a/b", None, true), false);
         assert!(nothing.blocker.unwrap().contains("no config.json"));

@@ -659,10 +659,13 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 }
 
 /// A request's fields, whichever way it was sent: JSON's own values, or a
-/// form's as strings. A form's files are in `files`, by field name.
+/// form's as strings. A form's files are in `files`, by field name, and the
+/// names they were sent under in `filenames`: a recording's says what it is
+/// to `ffmpeg`.
 pub(crate) struct Fields {
     pub(crate) map: Map<String, Value>,
     pub(crate) files: Vec<(String, Vec<u8>)>,
+    pub(crate) filenames: Vec<(String, String)>,
 }
 
 impl Fields {
@@ -671,9 +674,13 @@ impl Fields {
         if kind.to_ascii_lowercase().starts_with("multipart/form-data") {
             let mut map = Map::new();
             let mut files = Vec::new();
+            let mut filenames = Vec::new();
             for part in form(body, kind)? {
                 match part.filename {
-                    Some(_) => files.push((part.name, part.data)),
+                    Some(filename) => {
+                        filenames.push((part.name.clone(), filename));
+                        files.push((part.name, part.data));
+                    }
                     None => {
                         let text = String::from_utf8(part.data)
                             .map_err(|_| Fail::bad(format!("the form field {} is not text", part.name)))?;
@@ -681,10 +688,10 @@ impl Fields {
                     }
                 }
             }
-            return Ok(Fields { map, files });
+            return Ok(Fields { map, files, filenames });
         }
         match serde_json::from_slice(body) {
-            Ok(Value::Object(map)) => Ok(Fields { map, files: Vec::new() }),
+            Ok(Value::Object(map)) => Ok(Fields { map, files: Vec::new(), filenames: Vec::new() }),
             Ok(_) => Err(Fail::bad("the request body is not a JSON object")),
             Err(e) => Err(Fail::bad(format!("the request body is not JSON or a form: {e}"))),
         }

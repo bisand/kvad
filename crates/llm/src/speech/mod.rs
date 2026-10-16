@@ -36,6 +36,23 @@ use std::path::PathBuf;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// What a Whisper is called where an image model's diffusers pipeline
+/// would be: transformers' class for it. A server sorts the models on its
+/// disk by that name, and this one has no `model_index.json` to give it one,
+/// so it is known by its `config.json`'s `model_type` instead
+/// ([`crate::hub::pipeline`]).
+pub const PIPELINE: &str = "WhisperForConditionalGeneration";
+
+/// What `repo`'s weights will take once loaded at `precision`, from its
+/// `config.json` in the cache: `None` for anything that is not a Whisper
+/// there. Asked before the load, to decide whether it fits.
+pub fn weight_bytes(repo: &str, precision: Precision) -> Option<u64> {
+    let config = crate::weights::local_file(repo, "config.json")?;
+    let config = whisper::Config::from_json(&crate::weights::read_json(&config).ok()?).ok()?;
+    let (matrices, floats) = config.params();
+    Some(precision.weight_bytes(matrices as u64) + 4 * floats as u64)
+}
+
 /// Whether `repo` is a Whisper, asking the disk only: a directory, or a repo
 /// whose `config.json` is in the Hub cache.
 pub fn is_whisper(repo: &str) -> bool {
@@ -93,7 +110,12 @@ impl Transcriber {
             config.encoder_layers, config.decoder_layers, config.d, config.n_mels
         ));
         let model = whisper::Whisper::load(config, &files.weights, precision)?;
-        Ok(Transcriber { model, tokenizer, tokens, pool: crate::model::pool() })
+        Ok(Transcriber { model, tokenizer, tokens, pool: crate::model::pool(), precision })
+    }
+
+    /// Where it runs, as a language model's session says it: `cpu f32`.
+    pub fn backend(&self) -> String {
+        format!("cpu {}", self.precision)
     }
 
     pub fn summary(&self) -> String {

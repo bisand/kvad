@@ -961,6 +961,10 @@ pub fn model_file(model_dir: &Path, name: &str) -> Option<PathBuf> {
 /// denoiser's file instead; see [`crate::video::LTX_PIPELINE`].
 ///
 /// A GGUF is its base's pipeline, when the base is here to say.
+///
+/// A Whisper is not a pipeline either, and has no index; but it is not a
+/// language model, and this is where a server asks what a model is for. So
+/// its `model_type` names it [`crate::speech::PIPELINE`].
 pub fn pipeline(model: &LocalModel) -> Option<String> {
     match &model.gguf {
         // LTX-2.5 is known by its DiT's file, which a GGUF of that DiT is
@@ -969,6 +973,7 @@ pub fn pipeline(model: &LocalModel) -> Option<String> {
         Some(g) => pipeline_in(&repo_dir(g.base.as_deref()?)),
         None => match &model.single {
             Some(c) => Some(c.kind.pipeline().to_string()),
+            None if model.model_type.as_deref() == Some("whisper") => Some(crate::speech::PIPELINE.to_string()),
             None => pipeline_in(&model.path),
         },
     }
@@ -1713,6 +1718,8 @@ mod tests {
         assert_eq!(remote_arch("Qwen/Qwen3-0.6B"), Arch::from_model_type("qwen3"));
         assert_eq!(remote_arch("openai-community/gpt2"), Arch::from_model_type("gpt2"));
         // No such repo, and no such architecture: both are "assume nothing".
+        // A Whisper runs here, but as speech and not as a language model,
+        // so it has no architecture in the registry either.
         assert!(remote_arch("nobody/has-this-model-at-all-9f3c").is_none());
         assert!(remote_arch("openai/whisper-tiny").is_none());
     }

@@ -895,7 +895,7 @@ mod tests {
 
     fn fields(v: serde_json::Value) -> Fields {
         match v {
-            serde_json::Value::Object(map) => Fields { map, files: Vec::new() },
+            serde_json::Value::Object(map) => Fields { map, files: Vec::new(), filenames: Vec::new() },
             _ => unreachable!(),
         }
     }

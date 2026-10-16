@@ -1,7 +1,8 @@
 # Plan: speech to text
 
 Written 2026-10-16 for [#11](https://github.com/bisand/kvad/issues/11), with
-the first half of it built: the engine and `kvad transcribe`. Every shape
+both halves of it built: the engine and `kvad transcribe`, then the server's
+endpoints (*On the server*). Every shape
 below was read off a `config.json` or a safetensors header on this machine,
 and every rule of the decoding loop off openai-whisper's `decoding.py` and
 `transcribe.py`. Every stage was then checked against transformers running the
@@ -169,20 +170,50 @@ The work runs on its own rayon pool, a window at a time. Without the pool,
 every parallel loop in a decoder step takes rayon's cold path, as the text
 engine's did before 2026-09-19, and tiny ran at half its speed.
 
+## On the server
+
+`POST /v1/audio/transcriptions` and `/v1/audio/translations`, in
+`crates/serve/src/speech.rs`. OpenAI's form: `file`, `model`, `language`,
+`prompt`, `response_format` and `temperature`, and beside them `seed`,
+`timestamps` and `stream`. `kvad transcribe` sends to them when a server is
+running, as `run` and `chat` do, and `--local` keeps it in the process.
+
+- **A fourth kind of model.** `hub::pipeline` sorts a model on the disk by
+  what it is for, and a Whisper has no `model_index.json` to say. So its
+  `model_type` names it `WhisperForConditionalGeneration`
+  (`speech::PIPELINE`), and the server's `Kind::Speech` follows from that as
+  `Kind::Video` follows from LTX's files: `/v1/models` and `/api/models` say
+  `speech`, `resident_for` refuses it a chat and a chat model a recording,
+  and the engine holds a `Held::Speech` beside the other three.
+- **The CPU, at f32 unless asked.** A load with no backend named is
+  `cpu-f32`, what `kvad transcribe` loads, so the two write the same
+  transcript. A GPU backend is refused with the backends that work.
+- **Admission from the config.** What a Whisper's weights will take is
+  counted from `config.json` (`whisper::Config::params`) at the precision
+  asked for, before anything is loaded. On nb-whisper-tiny at f32 and
+  nb-whisper-small at q8 it came to the byte what the loaded model reports.
+- **The same bytes.** On `king.mp3` with nb-whisper-tiny, all five formats
+  from `curl`, from `kvad transcribe` routed to the server and from
+  `kvad transcribe --local` are identical files, and so is small at q8.
+  The client writes the server's answer as it came: JSON parsed and written
+  out again was not, because serde_json's parser can come back a digit short
+  on an `avg_logprob`.
+- **`temperature` is OpenAI's.** 0, or none, is greedy with the fallback to
+  warmer temperatures; above 0, the one temperature tried. `kvad transcribe
+  --local` reads it the same way, so the same command line is the same
+  transcript in either process. Greedy with no fallback at all is the
+  engine's `Request { temperature: Some(0.0) }`, which the reference test
+  uses and no command line asks for.
+- **A hang-up stops it** after the window under way, as a video stops after
+  its step: on a 340-second recording with small at q8, 11 seconds after the
+  client left.
+- **Nothing is kept**, neither the recording nor the transcript.
+
 ## What is next
 
-1. **`/v1/audio/transcriptions` and `/v1/audio/translations`** in
-   `kvad-serve`. This needs:
-   - a `Kind` and the `Cmd`/`Evt`/`Work` arms for it;
-   - detection by `model_type: whisper`, since `hub::pipeline` takes every
-     non-pipeline for a chat model;
-   - multipart upload through the hand-written `videos::form`;
-   - the five response formats, which `Transcript::render` already writes;
-   - `kvad transcribe` routed to a running server, as `run` and `chat` are.
-
-   `speech::audio::from_bytes` is there for the upload.
-2. **The GPU.** Large at 2× real time is usable for a file and not for a
+1. **The GPU.** Large at 2× real time is usable for a file and not for a
    meeting. On Metal the encoder is one large prefill, which is what
    kvad-gpu does best.
-3. **Beam search**, and the gzip test, if a measured word error rate says
+2. **Beam search**, and the gzip test, if a measured word error rate says
    they are worth it.
+3. **The web UI**: a page to drop a recording on.

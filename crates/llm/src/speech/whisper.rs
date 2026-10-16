@@ -106,6 +106,18 @@ impl Config {
         })
     }
 
+    /// The weights [`Whisper::weight_bytes`] will count, before there are
+    /// any: those in matrices loaded at the precision asked for, and those
+    /// kept as f32 whatever it is — the convolutions and both position
+    /// tables. LayerNorms and biases are left out there and here.
+    pub fn params(&self) -> (usize, usize) {
+        let d = self.d;
+        let encoder = self.encoder_layers * (4 * d * d + 2 * d * self.encoder_ffn);
+        let decoder = self.decoder_layers * (8 * d * d + 2 * d * self.decoder_ffn);
+        let floats = 3 * d * self.n_mels + 3 * d * d + (self.audio_ctx + self.text_ctx) * d;
+        (encoder + decoder + self.vocab * d, floats)
+    }
+
     /// Whether this checkpoint is a Whisper, by its `config.json` alone.
     pub fn is_whisper(config: &Path) -> bool {
         crate::weights::read_json(config).ok().and_then(|v| v.get("model_type")?.as_str().map(|t| t == "whisper")).unwrap_or(false)
@@ -572,6 +584,29 @@ mod tests {
         for (x, y) in a.iter().zip(&b) {
             assert!((x - y).abs() < 1e-5, "{x} vs {y}");
         }
+    }
+
+    /// Whisper tiny's shape, from its `config.json`, comes to the 37.7
+    /// million weights the loaded model counts (`kvad transcribe` prints
+    /// them), without the 60 thousand in its norms and biases.
+    #[test]
+    fn the_config_says_what_the_weights_will_weigh() {
+        let c = Config {
+            n_mels: 80,
+            d: 384,
+            encoder_layers: 4,
+            encoder_heads: 6,
+            encoder_ffn: 1536,
+            decoder_layers: 4,
+            decoder_heads: 6,
+            decoder_ffn: 1536,
+            audio_ctx: 1500,
+            text_ctx: 448,
+            vocab: 51865,
+        };
+        let (matrices, floats) = c.params();
+        assert_eq!(matrices + floats, 37_713_792);
+        assert_eq!(floats, 92_160 + 442_368 + 748_032);
     }
 
     #[test]

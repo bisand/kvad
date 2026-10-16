@@ -20,7 +20,7 @@ use std::io::{BufRead, Write};
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// The commands with a local twin, which run here when no server answers.
-pub const LOCAL_TOO: &[&str] = &["ls", "search", "info", "pull", "use", "rm", "cache", "run", "chat", "train"];
+pub const LOCAL_TOO: &[&str] = &["ls", "search", "info", "pull", "use", "rm", "cache", "run", "chat", "train", "transcribe"];
 
 /// `kvad ls`.
 pub fn ls(remote: &Remote, args: &Args) -> Res<()> {
@@ -119,8 +119,12 @@ pub fn ps(remote: &Remote, args: &Args) -> Res<()> {
             .iter()
             .map(|r| {
                 let mut notes = Vec::new();
-                if r["instruct"] == false {
-                    notes.push("base model");
+                // Base or instruction-tuned is a language model's question;
+                // for anything else, what it is for is the note.
+                match r["kind"].as_str() {
+                    Some("chat") | None if r["instruct"] == false => notes.push("base model"),
+                    Some(kind @ ("image" | "video" | "speech")) => notes.push(kind),
+                    _ => {}
                 }
                 if r["tools"] == true {
                     notes.push("tools");
@@ -456,13 +460,17 @@ fn load_named(remote: &Remote, repo: &str, backend: Option<String>, raw: bool) -
                 if !raw {
                     eprintln!("loaded {} on {}", out::s(&data["repo"]), out::s(&data["backend"]));
                     eprintln!("  {}", out::s(&data["summary"]));
-                    eprintln!(
-                        "  {:.1}M parameters · weights {} · context {} · {}",
-                        data["params"].as_f64().unwrap_or(0.0) / 1e6,
-                        out::bytes(&data["weight_bytes"]),
-                        out::s(&data["n_ctx"]),
-                        if data["instruct"] == true { "instruction-tuned" } else { "base model (completion only)" }
-                    );
+                    let params = data["params"].as_f64().unwrap_or(0.0) / 1e6;
+                    match data["kind"].as_str() {
+                        Some("chat") | None => eprintln!(
+                            "  {params:.1}M parameters · weights {} · context {} · {}",
+                            out::bytes(&data["weight_bytes"]),
+                            out::s(&data["n_ctx"]),
+                            if data["instruct"] == true { "instruction-tuned" } else { "base model (completion only)" }
+                        ),
+                        // A context and a template are a language model's.
+                        Some(kind) => eprintln!("  {params:.1}M parameters · weights {} · {kind}", out::bytes(&data["weight_bytes"])),
+                    }
                 }
                 return Ok(data);
             }
@@ -1009,4 +1017,123 @@ fn options(remote: &Remote, args: &Args) -> Res<()> {
         println!("a run is going now, and a second would be refused until it ends");
     }
     Ok(())
+}
+
+/// `kvad transcribe`, by the server's Whisper.
+///
+/// As plain text to the terminal it streams, a line per stretch as each 30
+/// seconds is done, as the local command prints them. Every other format is
+/// asked for whole and written as the server wrote it, which is
+/// [`kvad::speech::Transcript::render`]'s bytes either way.
+pub fn transcribe(remote: &Remote, args: &Args) -> Res<()> {
+    use kvad::client::Part;
+    use kvad::speech::Format;
+    let Some(file) = args.target.clone() else {
+        eprintln!("usage: kvad transcribe FILE --model MODEL [--language CODE] [--format text|json|verbose_json|srt|vtt]");
+        std::process::exit(2);
+    };
+    if args.model.is_none() {
+        return Err("which Whisper? --model NbAiLab/nb-whisper-small, say, or openai/whisper-small".into());
+    }
+    let format = match args.format.as_deref() {
+        // `--json` is what the server sent, and its fullest answer.
+        None if args.json => Format::VerboseJson,
+        None => Format::Text,
+        Some(f) => Format::parse(f).ok_or_else(|| format!("--format expects text, json, verbose_json, srt or vtt, got `{f}`"))?,
+    };
+    let path = std::path::Path::new(&file);
+    let bytes = std::fs::read(path).map_err(|e| format!("{file}: {e}"))?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("audio").to_string();
+
+    let model = ready(remote, args)?;
+    let mut parts = vec![
+        Part::file("file", &name, bytes),
+        Part::text("model", out::s(&model["id"])),
+        Part::text("response_format", format_name(format)),
+    ];
+    if let Some(l) = &args.language {
+        parts.push(Part::text("language", l));
+    }
+    if let Some(p) = &args.prompt {
+        parts.push(Part::text("prompt", p));
+    }
+    if args.temperature_given {
+        parts.push(Part::text("temperature", args.temperature));
+    }
+    if args.seed_given {
+        parts.push(Part::text("seed", args.seed));
+    }
+    if args.timestamps {
+        parts.push(Part::text("timestamps", true));
+    }
+
+    let started = std::time::Instant::now();
+    let streaming = format == Format::Text && args.out.is_none() && !args.json;
+    if !streaming {
+        let body = Some(Body::Form(parts));
+        let text = match args.translate {
+            true => remote.call_text("post", "/v1/audio/translations", body)?,
+            false => remote.call_text("post", "/v1/audio/transcriptions", body)?,
+        };
+        eprintln!("{file} in {:.1} s", started.elapsed().as_secs_f32());
+        match &args.out {
+            Some(out) => {
+                std::fs::write(out, &text)?;
+                eprintln!("wrote {out}");
+            }
+            None => print!("{text}"),
+        }
+        return Ok(());
+    }
+
+    parts.push(Part::text("stream", true));
+    let body = Some(Body::Form(parts));
+    let events = match args.translate {
+        true => remote.stream("post", "/v1/audio/translations", body)?,
+        false => remote.stream("post", "/v1/audio/transcriptions", body)?,
+    };
+    let mut stdout = std::io::stdout().lock();
+    for event in events {
+        let event = event?;
+        let data = event.json()?;
+        match event.name.as_str() {
+            "transcript.text.delta" => {
+                for s in out::items(&data["kvad"]["segments"]) {
+                    let text = s["text"].as_str().unwrap_or("").trim();
+                    let _ = match args.timestamps {
+                        true => {
+                            let at = |k: &str| kvad::speech::transcribe::clock(s[k].as_f64().unwrap_or(0.0) as f32, ".");
+                            writeln!(stdout, "[{} → {}] {text}", at("start"), at("end"))
+                        }
+                        false => writeln!(stdout, "{text}"),
+                    };
+                }
+                let _ = stdout.flush();
+            }
+            "transcript.text.done" => {
+                let seconds = data["kvad"]["duration"].as_f64().unwrap_or(0.0) as f32;
+                let took = started.elapsed().as_secs_f32();
+                eprintln!(
+                    "{file} in {took:.1} s: {:.1}× real time, language {}",
+                    seconds / took.max(1e-3),
+                    out::s(&data["kvad"]["language"])
+                );
+            }
+            "error" => return Err(out::s(&data["error"]).into()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// What a format is called in a request.
+fn format_name(f: kvad::speech::Format) -> &'static str {
+    use kvad::speech::Format;
+    match f {
+        Format::Json => "json",
+        Format::Text => "text",
+        Format::VerboseJson => "verbose_json",
+        Format::Srt => "srt",
+        Format::Vtt => "vtt",
+    }
 }

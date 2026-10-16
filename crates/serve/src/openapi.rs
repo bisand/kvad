@@ -643,6 +643,66 @@ pub const ENDPOINTS: &[Endpoint] = &[
         ],
     },
 
+    // -- Speech -------------------------------------------------------------
+    Endpoint {
+        method: "post", path: "/v1/audio/transcriptions", tag: "Speech", access: Access::SignedIn,
+        summary: "Write down what is said in a recording (OpenAI-compatible)",
+        description: "OpenAI's form: `file`, the recording, and `model`, a Whisper — \
+                      `openai/whisper-*`, the distilled ones, NbAiLab/nb-whisper-* — named \
+                      as any other model is, and loaded if it is not in memory and fits. \
+                      `language` (`no`, `en`; `auto` detects), `prompt`, `temperature` and \
+                      `response_format`: `json` (the default), `text`, `srt`, `vtt` or \
+                      `verbose_json`, with every segment's times. A WAV is read as it is; \
+                      anything else (MP3, M4A, FLAC, OGG, a video's sound) takes the \
+                      server's `ffmpeg`, `[videos] ffmpeg`. 200 MiB at most.\n\n\
+                      `temperature` 0, or none, is greedy, and a 30-second window that \
+                      fails — repeats itself, or is unsure of every word — is decoded \
+                      again warmer; above 0 it is the only temperature tried.\n\n\
+                      kvad's own: `seed`, and `timestamps: true`, which decodes with \
+                      timestamp tokens whatever the format (`srt`, `vtt` and \
+                      `verbose_json` always do). They change the words a Whisper writes, \
+                      not only how they are laid out.\n\n\
+                      `stream: true` answers with events, a delta as each 30 seconds is \
+                      done. Nothing is kept: neither the recording nor its transcript. \
+                      A Whisper runs on the CPU only, so a load names a cpu backend; with \
+                      none named it is `cpu-f32`.",
+        query: &[],
+        body: Some(Body {
+            content_type: "multipart/form-data",
+            description: "`file` and `model?`, with `language?`, `prompt?`, `response_format?`, \
+                          `temperature?`, `seed?`, `timestamps?` and `stream?`.",
+        }),
+        produces: "application/json, text/plain, application/x-subrip, text/vtt, or text/event-stream",
+        events: &[
+            ("transcript.text.delta", "`{type, delta}` after each 30-second window, and under \
+                                       `kvad` how far it has got (`done` and `total`, in seconds) \
+                                       and the window's `segments`, each `{start, end, text}`."),
+            ("transcript.text.done", "`{type, text}`, the whole of it, and under `kvad` the \
+                                      `language` and the recording's `duration`; the stream ends."),
+            ("error", "`{error}`: it failed; the stream ends."),
+        ],
+    },
+    Endpoint {
+        method: "post", path: "/v1/audio/translations", tag: "Speech", access: Access::SignedIn,
+        summary: "Write down a recording in English (OpenAI-compatible)",
+        description: "As `/v1/audio/transcriptions`, in English whatever is spoken. \
+                      `language` is taken here too, as the language the recording is in. \
+                      A fine-tune may not have kept the task: NB-Whisper writes Norwegian \
+                      when asked to translate, and English for `language=en` on the other \
+                      endpoint.",
+        query: &[],
+        body: Some(Body {
+            content_type: "multipart/form-data",
+            description: "As `/v1/audio/transcriptions`.",
+        }),
+        produces: "application/json, text/plain, application/x-subrip, text/vtt, or text/event-stream",
+        events: &[
+            ("transcript.text.delta", "As `/v1/audio/transcriptions`."),
+            ("transcript.text.done", "As `/v1/audio/transcriptions`."),
+            ("error", "`{error}`: it failed; the stream ends."),
+        ],
+    },
+
     // -- Playground ---------------------------------------------------------
     Endpoint {
         method: "post", path: "/api/playground/complete", tag: "Playground",
@@ -1207,6 +1267,7 @@ const TAGS: &[(&str, &str)] = &[
     ("Chat", "Generating, and the conversations kept around it."),
     ("Images", "Text to image, and the pictures kept afterwards."),
     ("Videos", "Text to video, as jobs that run on the server, and the videos kept afterwards."),
+    ("Speech", "Speech to text, with a Whisper."),
     ("Playground", "The model without the conversation: raw completion, the \
                     tokeniser, and the choice behind each token."),
     ("Training", "Starting runs on this machine's own cores."),
@@ -1304,6 +1365,7 @@ mod tests {
         ("bench.rs", include_str!("bench.rs")),
         ("images.rs", include_str!("images.rs")),
         ("videos.rs", include_str!("videos.rs")),
+        ("speech.rs", include_str!("speech.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("storage.rs", include_str!("storage.rs")),
         ("cluster.rs", include_str!("cluster.rs")),

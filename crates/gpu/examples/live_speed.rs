@@ -15,6 +15,13 @@
 //! 3. Greedy one-token steps write the rest, the partial, until the end of
 //!    text.
 //!
+//! The plan first had the partials timed, with timestamps, as a file's
+//! windows are. They are held back: Whisper leaves out a segment that runs
+//! into the end of its window, as it learnt to in training, and the
+//! segment being spoken always does. `--plain` decodes them with
+//! `<|notimestamps|>` instead, which writes up to the end of the audio,
+//! and `--both` takes each backend through the two in every round.
+//!
 //! A word is settled once two updates in a row agree on it and on every
 //! word before it (LocalAgreement-2, from whisper_streaming). Words are
 //! compared, not timestamps: those move a step or two between guesses
@@ -25,7 +32,9 @@
 //!
 //! When the window holds more than [`CUT`] seconds, it is finished where a
 //! settled segment ends and the next begins, and the next window starts
-//! there with what was settled after it kept. A window that reaches 30 s
+//! there with what was settled after it kept. A plain window has no
+//! timestamps, so one timed decode of it finds them (`plain_cut`), and the
+//! update it comes before pays for it. A window that reaches 30 s
 //! with nowhere to cut begins again at the newest 30 s, and the run counts
 //! it as forced. When the recording ends, the last update's words are all
 //! settled, as a phone hanging up would have them.

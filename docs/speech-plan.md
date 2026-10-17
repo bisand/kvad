@@ -445,33 +445,99 @@ that is resent after a reconnect is placed and not doubled.
 
 **Decoding before the window is full.** Whisper hears 30 seconds at a time,
 and its encoder takes the full 30 whether or not they hold sound. So the
-live loop decodes the window again as it grows:
+live loop decodes the window again as it grows. Measured by `live_speed`
+(below), it is:
 
 1. About once a second, run the window from its start: the audio so far,
    padded to 30 s as always. Hand the decoder the tokens already settled as
-   its prompt, so that only the new tail is decoded one step at a time.
-2. A token is *settled* once two runs in a row agree on it, along with
-   everything before it. That is LocalAgreement-2, from Macháček et al.'s
-   whisper_streaming (2023). Settled tokens go down as deltas and never
-   change. The rest goes down as the partial.
-3. When the window nears 30 s, or a pause is heard, the segment is finished
-   at the last settled timestamp, and the next window starts there, as the
-   file path's windows already do (`#247`).
+   its prompt, so that only the new tail is decoded one step at a time. The
+   tail is decoded *plain*, with `<|notimestamps|>`. Whisper leaves out a
+   segment that runs into the end of its window, as it learnt to in
+   training, and the segment being spoken always does. Timed, the partial
+   is often empty while someone speaks: on tiny, for 16 s in a row.
+2. A word is *settled* once two runs in a row agree on it, along with every
+   word before it. That is LocalAgreement-2, from Macháček et al.'s
+   whisper_streaming (2023). Settled words go down as deltas and never
+   change. The rest goes down as the partial. Words are compared, not
+   tokens with timestamps: those move a step or two between runs whose
+   words do not, and compared, they never settle.
+3. When the window holds more than 20 s, it is finished where a settled
+   segment ends and the next begins, and the next window starts there with
+   what was settled after the cut kept, as the file path's windows are cut
+   (`#247`). The plain tail has no timestamps, so one timed decode of the
+   window finds them, and its words are matched to the settled ones. A
+   lone closing timestamp is not a cut: the model closes a segment early
+   when it has not heard the next one, and a window started there hears
+   the end of it again.
 4. The rules that already hold stay in force: UTF-8 kept whole (`#245`),
    loops caught (`#246`, `#247`), a hang-up stops the work after the step
-   under way.
+   under way. The example stops a tail that writes eight tokens it has
+   already written, which is a stand-in for that.
 
-**The budget, from the numbers above.** On large at gpu-q8, a window is
-heard in 0.3 s, and a step takes 6.7 ms. One update then costs 0.3 s of
-encoder, the settled prefix fed in as one batch, and a handful of new
-steps: roughly 0.35 to 0.5 s, so updating once a second keeps the GPU under
-half busy. A word should first show as a partial about one update after it
-is spoken, and settle one update later, so 1 to 2 s behind the voice.
-Small and tiny cost less. The CPU at large cannot keep up, as its window
-time of 8 to 12 s says, so the server offers a smaller model, or a slower
-cadence, rather than fall ever further behind. The real numbers come from a
-`live_speed` example, measured as `transcribe_speed` is: time from a word's
-audio to its partial, and to its settling, per model and backend.
+**What it costs, measured.** `cargo run --release -p kvad-gpu --example
+live_speed` plays all 85 seconds of `king.mp3` in at real time on an M5 Pro,
+with an update due every second. It runs each set of backends in its own
+process, interleaved in rounds: three for large, two for the others. The
+range is over the rounds. "Shown" is how long after a word was spoken it
+first showed, unchanged from then on, as a partial. "Settled" is when it
+went down as a delta. Each is the median, then the 90th percentile, over
+every word. "Spoken" is where the same backend's timed transcript of the
+whole file puts the end of the word. Whisper's segment times are a second
+or two out at worst, so read these to about a second.
+
+| model | backend | an update (min, median, max) | busy | shown | settled | keeps up |
+|---|---|---|---|---|---|---|
+| large | gpu-q8 | 0.35, 0.45, 1.4 s | 46–47% | 1.5–1.6, 3.9–4.0 s | 2.5–2.6, 5.0–5.1 s | yes |
+| | gpu-f16 | 0.31, 0.43, 1.8 s | 46% | 1.6, 3.9–4.0 s | 2.6, 5.1–5.2 s | yes |
+| | cpu-q8 | 7.5, 18–20, 22.5 s | 96–97% | 31–51, 46–64 s | 33–51, 46–64 s | **no** |
+| **small** | **gpu-q8** | 0.10, 0.13, 0.40 s | 14% | **0.4–0.5, 1.7–1.8 s** | **1.4–1.5, 2.7–2.8 s** | yes |
+| | gpu-f16 | 0.09, 0.13, 0.45 s | 14–15% | 0.5, 1.8–1.9 s | 1.4–1.5, 2.8 s | yes |
+| | cpu-q8 | 1.5, 1.8, 4.2 s | 84–88% | 4.9–5.3, 10–14 s | 7.8–8.4, 14–18 s | no |
+| tiny | gpu-q8 | 0.04, 0.06, 0.17 s | 7% | 0.7–0.9, 1.8–2.9 s | 1.7–1.9, 2.8–3.9 s | yes |
+| | gpu-f16 | 0.04, 0.06, 0.20 s | 6–7% | 1.1–1.5, 3.9–6.7 s | 2.1–2.4, 4.9–7.7 s | yes |
+| | cpu-q8 | 0.26, 0.30, 1.0 s | 36% | 0.9, 2.4–2.5 s | 1.8–1.9, 3.4–3.5 s | yes |
+
+`gpu-f16` is what a server's `gpu-bf16` loads a Whisper at (`DENSE`).
+
+- **The budget held. The lag did not, on large.** An update on large at
+  gpu-q8 is 0.45 s: 25 ms of spectrogram on the host, 370 ms of encoder and
+  prompt (about 120 tokens), and 7 new steps at 6.6 ms. That is inside the
+  estimate's 0.35 to 0.5 s, and the GPU is busy under half the time. Within
+  a sentence, a word shows about a second after it is spoken, and settles
+  a second later, as estimated. But large writes nothing of a new sentence
+  until it is nearly finished. "Det er ikke alltid så lett å si hvor vi er
+  fra", which the file transcript puts at 23.8 to 28.7 s, first shows at
+  28.4 s, whole. That is the 4 s at the 90th percentile. A guess at why:
+  NB-Whisper was trained largely on subtitles, which come a sentence at a
+  time.
+- **Small is the model for live.** It shows a word in half a second at the
+  median, under 2 s at the 90th percentile, and settles it a second after
+  that, with the GPU busy a seventh of the time. Of the 132 words it
+  settles, 129 are the file transcript's, in order. Large's are 126 to 127
+  of 132. Tiny is quicker still, but its text is worse: 78 to 82 of its
+  110 to 121 words are the file's, and tiny's file transcript itself goes
+  wrong at the end of the recording.
+- **The CPU keeps up with tiny only.** Small on the CPU manages an update
+  every 2.5 s or so, with words 5 s behind. Large manages 7 updates in 85 s,
+  each needing 8 s for the encoder alone, and ends 25 to 42 s behind. So a
+  server without a GPU offers tiny for live.
+- **Timed partials are worse everywhere**, which is why step 1 is plain.
+  On gpu-q8, large shows words at 1.6–1.7 s and 4.2–5.4 s, against plain's
+  1.5–1.6 s and 3.9–4.0 s. Small's 90th percentile goes from 1.8 s to
+  2.2–2.9 s, and to 9.5 s in one round at f16. Tiny's window filled 48
+  times with nothing settled to cut at, and it settled 68 words, 31 of
+  them the file's.
+- **The cut costs an update.** The timed decode that finds the cut takes
+  0.76 s on large at q8 and 1.0 s at f16. With the update it comes before,
+  that is the 1.4 and 1.8 s at the top of the range, and the next update,
+  falling due meanwhile, is skipped. Here it hears the window again. The
+  endpoint can reuse the update's encoder output instead, which should save
+  the 0.37 s of hearing. That is not measured.
+- **Idling between updates costs little.** Taken back to back (`--fast`),
+  large's median update at gpu-q8 is 0.42–0.45 s, against 0.44–0.46 s at
+  one a second. Most of that is the spectrogram on the host, 14 ms back to
+  back and 24 ms after a second's idle: the CPU coming back cold, not the
+  GPU.
 
 **When the Mac falls behind.** Audio is never dropped. Partials are: when an
 update is still running as the next is due, the next is skipped, and a
@@ -496,7 +562,8 @@ device paired for transcription is scoped to this endpoint and the file one
 **Tests.** A recording played into the WebSocket at real time gives, once
 settled, the same text the file endpoint gives for the same audio. Not
 bit-for-bit, since the windows fall differently; the check is a word error
-rate between them, with the bound set from the first measurement. Settled
+rate between them, with the bound set from the first measurement
+(`live_speed` matched 126 to 129 of 132 words, small and large). Settled
 text never changes after it is sent. A link cut mid-sentence and resumed
 gives the same transcript as one never cut. A slow decoder (an injected
 delay) skips partials but never audio. And the same session runs over the
@@ -514,6 +581,7 @@ another mid-sentence.
 3. **The web UI** is built: the Transcribe page. It streams, and writes
    the subtitle files itself from the segments, byte for byte the server's.
 4. **Live transcription** over a WebSocket, words back while speaking, as
-   *Live, from the phone* above lays out. First `live_speed`, to see what
-   the cadence can be on each backend. Then the endpoint, which the Transcribe
-   page can use with the browser's microphone before any phone exists.
+   *Live, from the phone* above lays out. `live_speed` has measured the
+   cadence (small at gpu-q8, once a second). Next is the endpoint, which the
+   Transcribe page can use with the browser's microphone before any phone
+   exists.

@@ -1,0 +1,686 @@
+// Kvad on the iPhone: the window, the tab bar, and the screens.
+// docs/phone-plan.md has the design brief; this is Phase 1 of it.
+
+import { Theme } from "theme.slint";
+import {
+    Pressable, Icon, PrimaryButton, TextButton, RoundButton, Separator, Card,
+    SectionHeader, SectionFooter, Row, Field, LargeTitle, EmptyState, TabItem,
+} from "parts.slint";
+import { AboutSlint, Spinner } from "std-widgets.slint";
+
+export struct Bubble {
+    mine: bool,
+    text: string,
+    streaming: bool,
+}
+
+// One model, as the Models screen lists it: grouped by kind, with the
+// first and last of each group known so the card's corners fall right.
+export struct ModelRow {
+    id: string,
+    name: string,
+    owner: string,
+    kind: string,
+    resident: bool,
+    first: bool,
+    last: bool,
+}
+
+component ConnectScreen inherits Rectangle {
+    in property <length> top-inset;
+    in-out property <string> url;
+    in-out property <string> key;
+    in property <bool> busy;
+    in property <string> error;
+    callback connect(string, string);
+
+    Flickable {
+        VerticalLayout {
+            alignment: start;
+            padding-top: root.top-inset + 56px;
+            padding-left: Theme.margin;
+            padding-right: Theme.margin;
+            padding-bottom: 32px;
+            spacing: 8px;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 88px;
+                    height: 88px;
+                    border-radius: 22px;
+                    background: Theme.ink;
+                    Icon {
+                        source: @image-url("icons/mark.svg");
+                        tint: #f0b35a;
+                        width: 54px;
+                        height: 54px;
+                    }
+                }
+            }
+            Rectangle { height: 12px; }
+            Text {
+                text: "Kvad";
+                color: Theme.label;
+                font-size: Theme.large-title * 1rem;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "Your models, on your Mac, from your phone.";
+                color: Theme.secondary;
+                font-size: Theme.body * 1rem;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+            Rectangle { height: 28px; }
+            Card {
+                Field {
+                    label: "Server";
+                    placeholder: "192.168.1.20:5823";
+                    text <=> root.url;
+                    enabled: !root.busy;
+                }
+                Separator { }
+                Field {
+                    label: "Key";
+                    placeholder: "Not needed on your own Mac";
+                    input-type: InputType.password;
+                    text <=> root.key;
+                    enabled: !root.busy;
+                    accepted => { root.connect(root.url, root.key); }
+                }
+            }
+            HorizontalLayout {
+                padding-left: Theme.margin;
+                padding-right: Theme.margin;
+                SectionFooter {
+                    text: "The address kvad-serve listens on. A key is only needed when the server asks for one. It is kept in memory, and never written to the phone.";
+                }
+            }
+            Rectangle { height: 16px; }
+            PrimaryButton {
+                text: root.busy ? "Connecting…" : "Connect";
+                busy: root.busy;
+                enabled: !root.busy && root.url != "";
+                clicked => { root.connect(root.url, root.key); }
+            }
+            if root.error != "": Text {
+                text: root.error;
+                color: Theme.danger;
+                font-size: Theme.subheadline * 1rem;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+component Message inherits HorizontalLayout {
+    in property <Bubble> bubble;
+    padding-left: root.bubble.mine ? 56px : Theme.margin;
+    padding-right: Theme.margin;
+    padding-top: 6px;
+    padding-bottom: 6px;
+    alignment: root.bubble.mine ? LayoutAlignment.end : LayoutAlignment.stretch;
+    spacing: 10px;
+    if !root.bubble.mine: Rectangle {
+        width: 28px;
+        height: 28px;
+        border-radius: 14px;
+        background: Theme.ink;
+        Icon {
+            source: @image-url("icons/mark.svg");
+            tint: #f0b35a;
+            width: 17px;
+            height: 17px;
+        }
+    }
+    if root.bubble.mine: Rectangle {
+        background: Theme.accent;
+        border-radius: 19px;
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            padding-top: 9px;
+            padding-bottom: 9px;
+            Text {
+                text: root.bubble.text;
+                color: Theme.on-accent;
+                font-size: Theme.body * 1rem;
+                wrap: word-wrap;
+            }
+        }
+    }
+    // Kvad's side has no bubble: a reply is read, not glanced at, and gets
+    // the width of the screen.
+    if !root.bubble.mine: VerticalLayout {
+        horizontal-stretch: 1;
+        padding-top: 3px;
+        Text {
+            text: root.bubble.text == "" && root.bubble.streaming ? "…" : root.bubble.text + (root.bubble.streaming ? " ●" : "");
+            color: Theme.label;
+            font-size: Theme.body * 1rem;
+            wrap: word-wrap;
+        }
+    }
+}
+
+component ChatScreen inherits Rectangle {
+    in property <[Bubble]> bubbles;
+    in property <string> model;
+    in property <string> model-name;
+    in property <bool> replying;
+    in property <string> error;
+    in-out property <string> draft;
+    callback send(string);
+    callback stop();
+    callback pick-model();
+    callback new-chat();
+
+    VerticalLayout {
+        // The navigation bar: the model is the title, and tapping it chooses.
+        Rectangle {
+            height: Theme.touch;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                Rectangle { width: Theme.touch; }
+                Pressable {
+                    horizontal-stretch: 1;
+                    clicked => { root.pick-model(); }
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        Text {
+                            text: root.model == "" ? "Choose a model" : root.model-name;
+                            color: Theme.label;
+                            font-size: Theme.body * 1rem;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Icon {
+                            source: @image-url("icons/chevron-down.svg");
+                            tint: Theme.secondary;
+                            width: 14px;
+                            height: 14px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                    }
+                }
+                Pressable {
+                    width: Theme.touch;
+                    enabled: !root.replying && root.bubbles.length > 0;
+                    clicked => { root.new-chat(); }
+                    Icon {
+                        source: @image-url("icons/plus.svg");
+                        tint: Theme.accent;
+                    }
+                }
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            if root.bubbles.length == 0: EmptyState {
+                icon: @image-url("icons/chat.svg");
+                title: "Ask anything";
+                text: root.model == "" ? "Choose a model at the top to begin." : "It runs on your Mac. Nothing you write leaves the machines you own.";
+            }
+            list := Flickable {
+                // Stay with the newest words while they arrive, unless the
+                // reader has scrolled up to read something older.
+                property <bool> follow: true;
+                content-height: column.preferred-height;
+                changed content-height => {
+                    if self.follow {
+                        self.content-y = min(0px, self.height - self.content-height);
+                    }
+                }
+                flicked => {
+                    self.follow = self.content-y <= self.height - self.content-height + 24px;
+                }
+                column := VerticalLayout {
+                    alignment: start;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    for b in root.bubbles: Message {
+                        bubble: b;
+                    }
+                    if root.error != "": HorizontalLayout {
+                        padding-left: Theme.margin;
+                        padding-right: Theme.margin;
+                        Text {
+                            text: root.error;
+                            color: Theme.danger;
+                            font-size: Theme.subheadline * 1rem;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+        // The composer, on the bar's material, with a hairline above it.
+        Rectangle {
+            background: Theme.bar;
+            Rectangle {
+                y: 0;
+                height: 1phx;
+                background: Theme.separator;
+            }
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 10px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 8px;
+                Rectangle {
+                    horizontal-stretch: 1;
+                    min-height: 38px;
+                    max-height: 132px;
+                    border-radius: 19px;
+                    background: Theme.surface;
+                    border-width: 1phx;
+                    border-color: Theme.separator;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        Rectangle {
+                            input := TextInput {
+                                text <=> root.draft;
+                                color: Theme.label;
+                                font-size: Theme.body * 1rem;
+                                single-line: false;
+                                wrap: word-wrap;
+                                selection-background-color: Theme.accent.with-alpha(0.35);
+                            }
+                            if input.text == "": Text {
+                                x: 0;
+                                y: 0;
+                                width: parent.width;
+                                text: "Message";
+                                color: Theme.tertiary;
+                                font-size: Theme.body * 1rem;
+                            }
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: end;
+                    padding-bottom: 2px;
+                    if !root.replying: RoundButton {
+                        icon: @image-url("icons/send.svg");
+                        enabled: root.draft != "" && root.model != "";
+                        clicked => {
+                            list.follow = true;
+                            root.send(root.draft);
+                        }
+                    }
+                    if root.replying: RoundButton {
+                        icon: @image-url("icons/stop.svg");
+                        background: Theme.fill;
+                        tint: Theme.label;
+                        clicked => { root.stop(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component ModelsScreen inherits Rectangle {
+    in property <length> top-inset;
+    in property <[ModelRow]> models;
+    in property <string> server-line;
+    in property <bool> loading;
+    callback refresh();
+
+    Flickable {
+        VerticalLayout {
+            alignment: start;
+            padding-bottom: 24px;
+            LargeTitle {
+                title: "Models";
+                subtitle: root.server-line;
+                if root.loading: Spinner {
+                    indeterminate: true;
+                    width: 22px;
+                    height: 22px;
+                }
+                if !root.loading: TextButton {
+                    text: "Refresh";
+                    clicked => { root.refresh(); }
+                }
+            }
+            if root.models.length == 0 && !root.loading: EmptyState {
+                icon: @image-url("icons/stack.svg");
+                title: "No models yet";
+                text: "Pull one on the Mac with kvad pull, or from the web UI.";
+            }
+            for m in root.models: VerticalLayout {
+                if m.first: Rectangle { height: 18px; }
+                if m.first: SectionHeader {
+                    text: m.kind == "chat" ? "CHAT" : m.kind == "speech" ? "SPEECH" : m.kind == "image" ? "IMAGES" : m.kind == "video" ? "VIDEO" : m.kind == "embedding" ? "EMBEDDING" : "OTHER";
+                }
+                if m.first: Rectangle { height: 6px; }
+                HorizontalLayout {
+                    padding-left: Theme.margin;
+                    padding-right: Theme.margin;
+                    Rectangle {
+                        background: Theme.surface;
+                        border-top-left-radius: m.first ? Theme.card-corner : 0;
+                        border-top-right-radius: m.first ? Theme.card-corner : 0;
+                        border-bottom-left-radius: m.last ? Theme.card-corner : 0;
+                        border-bottom-right-radius: m.last ? Theme.card-corner : 0;
+                        clip: true;
+                        VerticalLayout {
+                            Row {
+                                title: m.name;
+                                detail: m.owner;
+                                value: m.resident ? "In memory" : "";
+                                dot: m.resident;
+                            }
+                            if !m.last: Separator { inset: Theme.margin; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component MoreScreen inherits Rectangle {
+    in property <string> server;
+    in property <string> version;
+    in property <string> who;
+    callback disconnect();
+
+    Flickable {
+        VerticalLayout {
+            alignment: start;
+            padding-bottom: 32px;
+            spacing: 6px;
+            LargeTitle { title: "More"; }
+            SectionHeader { text: "SERVER"; }
+            HorizontalLayout {
+                padding-left: Theme.margin;
+                padding-right: Theme.margin;
+                Card {
+                    Row { title: "Address"; value: root.server; }
+                    Separator { }
+                    Row { title: "Version"; value: root.version; }
+                    Separator { }
+                    Row { title: "Signed in as"; value: root.who; }
+                    Separator { }
+                    Row {
+                        title: "Disconnect";
+                        title-color: Theme.danger;
+                        clicked => { root.disconnect(); }
+                    }
+                }
+            }
+            Rectangle { height: 18px; }
+            SectionHeader { text: "ON THE MAC"; }
+            HorizontalLayout {
+                padding-left: Theme.margin;
+                padding-right: Theme.margin;
+                Card {
+                    Row { title: "Jobs and queue"; value: "Soon"; enabled: false; }
+                    Separator { }
+                    Row { title: "Training and tuning"; value: "Soon"; enabled: false; }
+                    Separator { }
+                    Row { title: "Evals and benchmarks"; value: "Soon"; enabled: false; }
+                    Separator { }
+                    Row { title: "Datasets"; value: "Soon"; enabled: false; }
+                    Separator { }
+                    Row { title: "Monitoring"; value: "Soon"; enabled: false; }
+                    Separator { }
+                    Row { title: "Cluster"; value: "Soon"; enabled: false; }
+                }
+            }
+            Rectangle { height: 18px; }
+            SectionHeader { text: "ABOUT"; }
+            HorizontalLayout {
+                padding-left: Theme.margin;
+                padding-right: Theme.margin;
+                Card {
+                    Row { title: "Kvad for iPhone"; value: "0.1.0"; }
+                    Separator { }
+                    HorizontalLayout {
+                        padding: 12px;
+                        height: 120px;
+                        AboutSlint { }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The model sheet, risen from the bottom over a dimmed screen.
+component ModelSheet inherits Rectangle {
+    in property <[ModelRow]> models;
+    in property <string> chosen;
+    in property <length> bottom-inset;
+    callback choose(string);
+    callback close();
+
+    background: #00000066;
+    TouchArea { clicked => { root.close(); } }
+    sheet := Rectangle {
+        y: parent.height - self.height;
+        height: min(parent.height * 0.7, body.preferred-height);
+        background: Theme.background;
+        border-top-left-radius: 14px;
+        border-top-right-radius: 14px;
+        clip: true;
+        TouchArea { }
+        body := VerticalLayout {
+            padding-bottom: root.bottom-inset + 12px;
+            HorizontalLayout {
+                alignment: center;
+                padding-top: 6px;
+                Rectangle {
+                    width: 36px;
+                    height: 5px;
+                    border-radius: 2.5px;
+                    background: Theme.tertiary;
+                }
+            }
+            HorizontalLayout {
+                padding-left: Theme.margin;
+                padding-right: 8px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                Text {
+                    text: "Chat models";
+                    color: Theme.label;
+                    font-size: Theme.title3 * 1rem;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                TextButton {
+                    text: "Done";
+                    bold: true;
+                    clicked => { root.close(); }
+                }
+            }
+            Flickable {
+                content-height: options.preferred-height;
+                min-height: min(options.preferred-height, 420px);
+                options := VerticalLayout {
+                    padding-left: Theme.margin;
+                    padding-right: Theme.margin;
+                    Card {
+                        for m[i] in root.models: VerticalLayout {
+                            if m.kind == "chat": Row {
+                                title: m.name;
+                                detail: m.resident ? m.owner + " · in memory" : m.owner;
+                                checked: m.id == root.chosen;
+                                clicked => { root.choose(m.id); }
+                            }
+                            if m.kind == "chat" && !m.last: Separator { }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Kvad";
+    // An iPhone's size in points, for running on the Mac while designing.
+    preferred-width: 393px;
+    preferred-height: 852px;
+    background: Theme.background;
+
+    in-out property <bool> connected;
+    in-out property <bool> connecting;
+    in-out property <string> server-url: "127.0.0.1:5823";
+    in-out property <string> api-key;
+    in-out property <string> connect-error;
+    in-out property <string> server-version;
+    in-out property <string> server-who;
+    in-out property <int> tab: 0;
+
+    in-out property <[Bubble]> bubbles;
+    in-out property <string> model;
+    // What the chat's title shows: the model's name without its owner.
+    in-out property <string> model-name;
+    in-out property <bool> replying;
+    in-out property <string> chat-error;
+    in-out property <string> draft;
+    in-out property <bool> picking-model;
+
+    in-out property <[ModelRow]> models;
+    in-out property <bool> models-loading;
+
+    callback connect(string, string);
+    callback disconnect();
+    callback send(string);
+    callback stop();
+    callback new-chat();
+    callback refresh-models();
+    callback choose-model(string);
+
+    property <length> top: self.safe-area-insets.top;
+    property <length> bottom: self.safe-area-insets.bottom;
+    // When the keyboard is up, it covers the tab bar and the content ends at
+    // its top edge.
+    property <length> keyboard: self.virtual-keyboard-size.height;
+
+    if !root.connected: ConnectScreen {
+        top-inset: root.top;
+        url <=> root.server-url;
+        key <=> root.api-key;
+        busy: root.connecting;
+        error: root.connect-error;
+        connect(u, k) => { root.connect(u, k); }
+    }
+
+    if root.connected: VerticalLayout {
+        padding-top: root.top;
+        padding-bottom: root.keyboard > 0 ? root.keyboard : 0;
+        Rectangle {
+            vertical-stretch: 1;
+            if root.tab == 0: ChatScreen {
+                bubbles: root.bubbles;
+                model: root.model;
+                model-name: root.model-name;
+                replying: root.replying;
+                error: root.chat-error;
+                draft <=> root.draft;
+                send(t) => { root.send(t); }
+                stop => { root.stop(); }
+                new-chat => { root.new-chat(); }
+                pick-model => {
+                    root.picking-model = true;
+                    root.refresh-models();
+                }
+            }
+            if root.tab == 1: EmptyState {
+                icon: @image-url("icons/wave.svg");
+                title: "Speak";
+                text: "Talk, and watch the words appear as your Mac hears them.";
+                badge: "Coming soon";
+            }
+            if root.tab == 2: EmptyState {
+                icon: @image-url("icons/spark.svg");
+                title: "Create";
+                text: "Images and video, made on your Mac and kept on it.";
+                badge: "Coming soon";
+            }
+            if root.tab == 3: ModelsScreen {
+                models: root.models;
+                server-line: root.server-version;
+                loading: root.models-loading;
+                refresh => { root.refresh-models(); }
+            }
+            if root.tab == 4: MoreScreen {
+                server: root.server-url;
+                version: root.server-version;
+                who: root.server-who;
+                disconnect => { root.disconnect(); }
+            }
+        }
+        if root.keyboard == 0: Rectangle {
+            background: Theme.bar;
+            height: 49px + root.bottom;
+            Rectangle {
+                y: 0;
+                height: 1phx;
+                background: Theme.separator;
+            }
+            HorizontalLayout {
+                padding-bottom: root.bottom;
+                TabItem {
+                    icon: @image-url("icons/chat.svg");
+                    label: "Chat";
+                    selected: root.tab == 0;
+                    clicked => { root.tab = 0; }
+                }
+                TabItem {
+                    icon: @image-url("icons/wave.svg");
+                    label: "Speak";
+                    selected: root.tab == 1;
+                    clicked => { root.tab = 1; }
+                }
+                TabItem {
+                    icon: @image-url("icons/spark.svg");
+                    label: "Create";
+                    selected: root.tab == 2;
+                    clicked => { root.tab = 2; }
+                }
+                TabItem {
+                    icon: @image-url("icons/stack.svg");
+                    label: "Models";
+                    selected: root.tab == 3;
+                    clicked => {
+                        root.tab = 3;
+                        root.refresh-models();
+                    }
+                }
+                TabItem {
+                    icon: @image-url("icons/more.svg");
+                    label: "More";
+                    selected: root.tab == 4;
+                    clicked => { root.tab = 4; }
+                }
+            }
+        }
+    }
+
+    if root.picking-model: ModelSheet {
+        models: root.models;
+        chosen: root.model;
+        bottom-inset: root.bottom;
+        choose(id) => {
+            root.choose-model(id);
+            root.picking-model = false;
+        }
+        close => { root.picking-model = false; }
+    }
+}

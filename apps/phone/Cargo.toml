@@ -1,0 +1,31 @@
+[package]
+name = "kvad-phone"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# Kvad's own code here is MIT. Slint is taken under its royalty-free
+# licence, which asks for the attribution the About screen gives.
+license = "MIT"
+
+# Its own workspace, as tools/relay-probe has: Slint and Skia stay out of
+# Kvad's builds and its CI. See docs/phone-plan.md.
+[workspace]
+
+[[bin]]
+name = "kvad-phone"
+path = "src/main.rs"
+
+[dependencies]
+# winit and Skia are what Slint runs on iOS; the same pair runs on the Mac,
+# which is where the UI is iterated on before the simulator.
+slint = { version = "1.18.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility"] }
+# The CLI's client is on ureq too (crates/llm/src/client.rs); one HTTP stack
+# for both, until the shared part becomes a kvad-client crate.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
+serde_json = "1.0.151"
+
+[build-dependencies]
+slint-build = "1.18.1"
+
+[profile.release]
+opt-level = 3

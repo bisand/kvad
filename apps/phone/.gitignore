@@ -1,0 +1,3 @@
+/target
+/ios/*.xcodeproj
+/ios/Info.plist

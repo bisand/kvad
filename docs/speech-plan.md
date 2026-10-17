@@ -185,13 +185,18 @@ running, as `run` and `chat` do, and `--local` keeps it in the process.
   `Kind::Video` follows from LTX's files: `/v1/models` and `/api/models` say
   `speech`, `resident_for` refuses it a chat and a chat model a recording,
   and the engine holds a `Held::Speech` beside the other three.
-- **The CPU, at f32 unless asked.** A load with no backend named is
-  `cpu-f32`, what `kvad transcribe` loads, so the two write the same
-  transcript. A GPU backend is refused with the backends that work.
+- **The GPU at q8 unless asked**, since *On the GPU* below; the CPU at f32
+  on a machine without one. It was `cpu-f32`, what `kvad transcribe --local`
+  loads, so that the two wrote the same transcript, and a GPU backend was
+  refused. On large that agreement cost 11 to 17 times the time. Asked for
+  `cpu-f32` (`--backend cpu-f32`, or `--quant f32`), the server and
+  `--local` still write the same bytes.
 - **Admission from the config.** What a Whisper's weights will take is
   counted from `config.json` (`whisper::Config::params`) at the precision
   asked for, before anything is loaded. On nb-whisper-tiny at f32 and
   nb-whisper-small at q8 it came to the byte what the loaded model reports.
+  On the GPU it is `kvad_gpu::speech::weight_bytes`, held to the byte by
+  `the_estimate_is_what_loads` at f16 and q8.
 - **The same bytes.** On `king.mp3` with nb-whisper-tiny, all five formats
   from `curl`, from `kvad transcribe` routed to the server and from
   `kvad transcribe --local` are identical files, and so is small at q8.
@@ -209,11 +214,149 @@ running, as `run` and `chat` do, and `--local` keeps it in the process.
   client left.
 - **Nothing is kept**, neither the recording nor the transcript.
 
+## On the GPU
+
+`crates/gpu/src/speech.rs`, in candle on Metal: the same model, block for
+block, and none of the rest. `Transcriber` drives a `speech::Model`:
+
+- `hear`: a window's spectrogram to what the decoder reads of it;
+- `said`: an empty text cache;
+- `decode`: tokens to the next-token scores at the rows asked for.
+
+`whisper::Cpu` is one Model, and kvad-gpu's `GpuWhisper` the other. The
+spectrogram, the tokenizer, the rules and the walk through a recording are
+host code, and they are here once. The two caches cross the boundary as
+`Heard` and `Said`, which only the model that made them opens. `decode`
+answers in scores rather than hidden states, because a GPU's hidden state
+would otherwise come to the host only to go back for the output head: a
+second wait a token.
+
+- **The encoder** is one 1500-row batch with no mask. Its attention is
+  MLX's fused kernel, and at q8 its projections run on the M5's matrix
+  units, as an image model's do. A language model cannot use those, because
+  they have no one-row kernel, and nothing in the encoder is one row. Nor
+  are the cross-attention's key and value projections, which read the
+  encoder's output once a window.
+- **The decoder** keeps its own key and value cache (kvad-gpu's
+  `KvCache`) and reads the window's cross keys and values unchanged.
+  - A prompt of more than one token is the one case where the fused
+    kernel's causal mask is wrong (`model::fused` says why). So a masked
+    prompt is written out, with its scores and softmax in f32. Single steps
+    and the cross-attention are fused.
+  - Around q8 both caches are kept in f16, as a quantised language model's
+    are. The cross keys and values are read whole at every step: at large,
+    in f32, that was 490 MB a token beside 850 MB of weights. f16 took a
+    step from 7.6 to 6.7 ms and changed no token.
+- **The residual stream is f32** whatever the matrices are, and so are the
+  norms and the two position tables, read from the checkpoint unrounded.
+  This is not where two bytes lose their accuracy: with the stream in two
+  bytes, or the attention in f32, the gaps below barely move.
+- **Dense means f16, not bf16** (`kvad_gpu::speech::DENSE`). A server's
+  `gpu-bf16` loads a Whisper in f16 and says `metal f16`, as SDXL runs in
+  f16 whatever it is asked. Whisper was trained in f16 and its numbers stay
+  well inside f16's range, so bf16's extra range buys nothing. Its three
+  fewer mantissa bits put it four to thirteen times further from
+  transformers at every stage below, except tiny's encoder, where it is
+  twice.
+
+### Against transformers
+
+kvad-gpu's `speech::tests::whisper_agrees_with_transformers` is the CPU's
+test at each precision the GPU loads at (`KVAD_WHISPER_GPU=f32,bf16,f16,q8`),
+on the same fixtures. Both tests now go through `speech::reference`, which
+holds the stages and the tokens. Each cell is the largest gap, then whether
+the greedy tokens are transformers' own, plain and timed:
+
+| | precision | encoder | logits | plain | timed |
+|---|---|---|---|---|---|
+| nb-whisper-tiny | f32 | 2.4e-4 | 3.6e-5 | same | same |
+| | bf16 | 0.29 | 0.29 | same | same |
+| | f16 | 0.16 | 0.048 | from token 38 | same |
+| | q8 | 1.4 | 0.66 | same | same |
+| | q4 | 10 | 13 | (not decoded: the scores are noise) | |
+| nb-whisper-small | f32 | 4.8e-3 | 1.0e-4 | same | same |
+| | bf16 | 4.4 | 0.26 | same | from token 32 |
+| | f16 | 1.1 | 0.024 | same | from token 32 |
+| | q8 | 3.1 | 0.21 | from token 20 | from token 22 |
+| | q4 | 22 | 4.1 | from token 20 | from token 21 |
+| nb-whisper-large | f32 | 9.9e-4 | 3.1e-5 | same | same |
+| | bf16 | 6.3 | 0.084 | from token 36 | same |
+| | f16 | 0.50 | 0.013 | same | same |
+| | q8 | 7.1 | 0.093 | same | same |
+| | q4 | 13 | 1.3 | same | same |
+
+The reference's largest magnitudes are 16.8, 32.9 and 18.3 for the
+encoder, and 29, 67 and 32 for the logits. On the CPU at q8
+(`KVAD_WHISPER_PRECISION=q8`) the same test gives 3.6, 5.5 and 9.9 for the
+encoder and 0.66, 0.25 and 0.091 for the logits. Its tokens are the GPU's
+q8 tokens in every cell: small's plain from token 20 and timed from token
+22, and the rest the same.
+
+- **f32 on the GPU is transformers'**, token for token, on all three, and
+  as close at every stage as the CPU. That is the check that the model is
+  right.
+- **What differs at two bytes or at q8 is a near tie**, and the CPU's own
+  q8 lands on the same ones. On small, q8 drops the comma in "sørlendinger,
+  og" at token 20, and the CPU at q8 drops the same comma at the same
+  token. f16 and bf16 put one timestamp a step (20 ms) late. tiny at f16
+  writes "innvandrert" for "innvandrere", and large at bf16 writes
+  "innvandret".
+- **q4** is unusable on tiny, where its encoder is 10 off of 17, and on
+  small it shares q8's comma. On large it matches transformers token for
+  token. It is offered as the server offers it for everything, and not
+  chosen for anyone.
+
+### How fast
+
+nb-whisper-large on all 85 seconds of `king.mp3`, `--timestamps`, fallback
+included, on an M5 Pro. Every row's transcript is the same text. Runs come
+from `cargo run --release -p kvad-gpu --example transcribe_speed`, each set
+of backends in its own process, interleaved in rounds; the range is over
+the rounds:
+
+| backend | wall time | × real time | a window heard | a decoder step |
+|---|---|---|---|---|
+| cpu f32 | 48.1–51.5 s | 1.7–1.8× | 11.1–12.3 s | 45 ms |
+| cpu q8 | 33.1–33.5 s | 2.5–2.6× | 8.0 s | 27–29 ms |
+| metal f32 | 6.5–6.7 s | 12.7–13.3× | 0.58–0.60 s | 17–18 ms |
+| metal f16 (`gpu-bf16`) | 4.23 s | 20.2× | 0.27–0.28 s | 12.2–12.3 ms |
+| **metal q8** (`gpu-q8`) | **2.91–2.92 s** | **29×** | 0.30 s | 6.7 ms |
+
+gpu-q8 is 11× cpu-q8 and 17× cpu-f32. "A window heard" is the encoder and
+every block's cross keys and values; three windows were heard, and 261
+one-token steps taken, in every row. bf16 runs at f16's speed (4.4–4.8 s in
+the first, crowded attempt below). The CPU's numbers here are a little under
+the table above, which was `kvad transcribe` on another day.
+
+- **A window's encoder is 0.3 s on the GPU.** The two convolutions, 32
+  blocks over 1500 frames and every block's cross keys and values take
+  270–300 ms at f16 or q8, and about 590 at f32. On the CPU the encoder is
+  most of a window.
+- **The decoder is now most of the time**: 261 one-token steps, at 6.7 ms
+  each at q8, 12.3 at f16 and 17 at f32, 60 to 80% of a run. That is above
+  what the bytes cost. At q8 a step reads about 850 MB of weights and 250 MB
+  of cross keys and values, about 4 ms at 280 GB/s. The likeliest place for
+  the rest is the hundreds of small kernels in 32 blocks of LayerNorm,
+  residual adds and GELU, unfused. The text models' fused kernels
+  (`fused.rs`) are RMSNorm and SiLU, so they do not apply. That is a guess
+  until it is ablated, and it is the next thing to take apart.
+- **The GPU does not go cold between steps.** The host's share of a step is
+  the rules and the sampler, about 0.3 ms. Idling the GPU a further 1 ms
+  before every step made a step 0.15 ms slower, and 3 ms made it 0.5 ms
+  slower. The keeper a split model needs (`model::stage`'s `Warm`) would buy
+  well under 1% here.
+- **One process holding six of them is not a measurement.** The first
+  attempt loaded all six backends, 24.6 GB in one process. Its third round
+  of q8 took 12.5 s where the first took 3.8, and the CPU's f32 went from
+  48.7 to 61.9 s. Split into a process for the GPU and one for the CPU, no
+  row drifts by more than a few percent.
+
 ## What is next
 
-1. **The GPU.** Large at 2× real time is usable for a file and not for a
-   meeting. On Metal the encoder is one large prefill, which is what
-   kvad-gpu does best.
+1. **The decoder's step.** At q8 a step is about 6.7 ms against about 4 ms
+   of bytes. Ablate it first, to find where the rest is. A fused LayerNorm
+   with its residual add, and the GELU fused into the first MLP matrix, are
+   the likely candidates.
 2. **Beam search**, and the gzip test, if a measured word error rate says
    they are worth it.
 3. **The web UI**: a page to drop a recording on.

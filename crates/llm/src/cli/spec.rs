@@ -118,6 +118,7 @@ const TRANSCRIBE: &[Flag] = &[
     f("--temperature", "F", Kind::Text, "above 0, decode at this temperature only (default, and 0: greedy, warmer for a window that fails)"),
     f("--out", "FILE", Kind::File, "where to write it (default: the terminal)"),
     QUANT,
+    BACKEND,
 ];
 
 const LORA: Flag = f("--lora", "NAME[:SCALE]", Kind::Lora, "apply a LoRA, at SCALE if given (default 1); as often as you like");
@@ -380,12 +381,13 @@ pub const COMMANDS: &[Command] = &[
                 Long recordings are read 30 seconds at a time. As text, each stretch is printed\n\
                 as soon as it is done.\n\n\
                 With a server running, the recording is sent to it, and its Whisper writes it\n\
-                down: at cpu-f32 unless --quant says otherwise. --local runs it in this process.\n\
-                Either way it runs on the CPU, for now.",
+                down: on its GPU at gpu-q8 where it has one, unless --backend or --quant says\n\
+                otherwise. --local runs it in this process, on the CPU, at f32 unless --quant\n\
+                says otherwise.",
         examples: &[
             "kvad transcribe intervju.mp3 --model NbAiLab/nb-whisper-small",
             "kvad transcribe talk.wav --model openai/whisper-small --format srt --out talk.srt",
-            "kvad transcribe nyheter.m4a --model NbAiLab/nb-whisper-large --quant q8 --language en",
+            "kvad transcribe nyheter.m4a --model NbAiLab/nb-whisper-large --backend gpu-q8 --language en",
         ],
     },
     // -- train your own ----------------------------------------------------

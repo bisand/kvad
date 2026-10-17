@@ -134,10 +134,16 @@ pub fn loader() -> Loader {
         Box::new(move |repo, backend, progress, watch| {
             // A DiT trained by nervus draws on the CPU at any backend, and
             // the CPU loader is the one that knows it; see `kvad::dit`.
-            // A Whisper is the CPU loader's too: it loads there at a CPU
-            // backend, and says which to ask for at a GPU one.
-            if kvad::dit::is_one(repo) || kvad::dit::is_clips(repo) || kvad::speech::is_whisper(repo) {
+            if kvad::dit::is_one(repo) || kvad::dit::is_clips(repo) {
                 return cpu(repo, backend, progress, watch);
+            }
+            // A Whisper runs on either, by one decoding loop
+            // (`kvad::speech::Model`).
+            if kvad::speech::is_whisper(repo) {
+                return match backend {
+                    Backend::Cpu(_) => cpu(repo, backend, progress, watch),
+                    Backend::Gpu(mode) => gpu::listen(repo, mode, progress, watch),
+                };
             }
             // An image pipeline is not a language model at any precision,
             // and has no CPU implementation at all; see docs/image-plan.md.
@@ -310,11 +316,15 @@ pub fn pipelines() -> String {
 ///
 /// LTX-2.5 runs at q8 or not at all: its DiT is 42 GB in bf16.
 ///
-/// A Whisper gets f32, as `kvad transcribe` does: what it was checked against
-/// transformers at, so that the server and the command line write the same
-/// transcript. The largest is 6 GB at f32.
+/// A Whisper gets the GPU at q8 where there is one. On nb-whisper-large and
+/// the 85 seconds of `king.mp3` that is 11× the CPU at q8 and 17× at f32
+/// (docs/speech-plan.md), and its tokens are transformers' f32 ones as the
+/// CPU's q8 are: the same on tiny and large, and on small the same comma
+/// lost. Without a GPU it gets f32 on the CPU, which is what
+/// `kvad transcribe --local` loads.
 pub fn preferred_pipeline(pipeline: &str) -> Backend {
     match pipeline {
+        kvad::speech::PIPELINE if gpu_here() => Backend::Gpu(kvad::service::GpuMode::Q8),
         kvad::speech::PIPELINE => Backend::Cpu(kvad::quant::Precision::F32),
         // Drawn on the CPU in f32 whatever it is asked, so the backend that
         // says so is the one it gets.
@@ -322,6 +332,18 @@ pub fn preferred_pipeline(pipeline: &str) -> Backend {
         "QwenImagePipeline" | "FluxPipeline" | kvad::video::LTX_PIPELINE => Backend::Gpu(kvad::service::GpuMode::Q8),
         _ => Backend::Gpu(kvad::service::GpuMode::Bf16),
     }
+}
+
+/// Whether this build has a GPU backend and this machine a GPU it can use:
+/// asked once, of candle.
+fn gpu_here() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        static HERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *HERE.get_or_init(|| kvad_gpu::model::pick_device(None).is_ok_and(|d| d.is_metal() || d.is_cuda()))
+    }
+    #[cfg(not(feature = "gpu"))]
+    false
 }
 
 /// What an image or video pipeline on this disk will take at `backend`, or
@@ -339,14 +361,17 @@ pub fn pipeline_weight_bytes(repo: &str, backend: Backend) -> Option<u64> {
     if kvad::dit::is_clips(repo) {
         return kvad::dit::clip_weight_bytes(repo);
     }
-    // At the precision a CPU backend names; a GPU one is refused at the load,
-    // and is charged what the CPU's default would take until then.
+    // At the precision a CPU backend names, or as the GPU holds it.
     if kvad::speech::is_whisper(repo) {
-        let precision = match backend {
-            Backend::Cpu(p) => p,
-            Backend::Gpu(_) => Precision::F32,
+        return match backend {
+            Backend::Cpu(p) => kvad::speech::weight_bytes(repo, p),
+            #[cfg(feature = "gpu")]
+            Backend::Gpu(mode) => kvad::speech::local_config(repo).map(|c| kvad_gpu::speech::weight_bytes(&c, kvad_gpu::speech::DENSE, gpu::quant(mode))),
+            // Refused at the load in a build without one; charged what the
+            // CPU's default would take until then.
+            #[cfg(not(feature = "gpu"))]
+            Backend::Gpu(_) => kvad::speech::weight_bytes(repo, Precision::F32),
         };
-        return kvad::speech::weight_bytes(repo, precision);
     }
     #[cfg(feature = "gpu")]
     if let Backend::Gpu(mode) = backend {
@@ -522,6 +547,17 @@ mod gpu {
         watch: &Watcher,
     ) -> Result<Model, Box<dyn std::error::Error>> {
         Ok(Model::Image(kvad_gpu::image::load(repo, quant(mode), progress, watch)?))
+    }
+
+    /// A Whisper on the GPU: dense in `kvad_gpu::speech::DENSE` at
+    /// `gpu-bf16`, which says why it is not bf16.
+    pub fn listen(
+        repo: &str,
+        mode: GpuMode,
+        progress: &mut dyn FnMut(&str),
+        watch: &Watcher,
+    ) -> Result<Model, Box<dyn std::error::Error>> {
+        Ok(Model::Speech(Box::new(kvad_gpu::speech::load(repo, kvad_gpu::speech::DENSE, quant(mode), progress, watch)?)))
     }
 
     pub fn film(

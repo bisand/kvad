@@ -51,7 +51,7 @@
 //! and a window caught in a loop runs into the limit regardless.
 
 use super::mel::{self, HOP, N_FRAMES, SAMPLE_RATE};
-use super::whisper::{AudioCache, TextCache, Whisper};
+use super::{Heard, Model};
 use crate::sampler::Sampler;
 use tokenizers::Tokenizer;
 
@@ -336,22 +336,24 @@ fn log_sum_exp(x: &[f32]) -> f32 {
 
 /// A loaded Whisper with what it takes to drive it.
 pub struct Transcriber {
-    pub model: Whisper,
+    /// On the CPU or a GPU: see [`Model`].
+    pub model: Box<dyn Model>,
     pub tokenizer: Tokenizer,
     pub tokens: Tokens,
-    /// The threads its matmuls run on. Work is handed to it whole, a window
-    /// at a time: a parallel loop started from a thread outside a pool takes
-    /// rayon's slow path at every call, and a decoder step is dozens of
-    /// them. See [`crate::model::threads`].
-    pub pool: rayon::ThreadPool,
-    /// What its matrices were loaded at, for a server's account of it.
-    pub precision: crate::quant::Precision,
 }
 
 impl Transcriber {
-    /// `work`, on this transcriber's threads.
-    fn on_pool<T: Send>(&self, work: impl FnOnce() -> Res<T> + Send) -> Res<T> {
-        self.pool.install(|| work().map_err(|e| e.to_string())).map_err(Into::into)
+    /// `work`, where the model's work runs best ([`Model::within`]): on the
+    /// CPU, its own threads, handed a window at a time.
+    pub(crate) fn on_pool<T: Send>(&self, work: impl FnOnce() -> Res<T> + Send) -> Res<T> {
+        let mut work = Some(work);
+        let mut out: Option<Result<T, String>> = None;
+        self.model.within(&mut || {
+            if let Some(w) = work.take() {
+                out = Some(w().map_err(|e| e.to_string()));
+            }
+        });
+        out.ok_or("the model ran nothing it was given")?.map_err(Into::into)
     }
 
     /// The tokens a window's prompt is made of, after any context.
@@ -370,10 +372,9 @@ impl Transcriber {
 
     /// The language spoken in a window, by the model's first step: given
     /// only `<|startoftranscript|>`, which language token is likeliest?
-    pub fn detect(&self, audio: &AudioCache) -> Res<(String, f32)> {
-        let mut cache = TextCache::new(self.model.config.decoder_layers);
-        let h = self.model.decode(&[self.tokens.sot], &mut cache, audio)?;
-        let logits = self.model.logits(&h);
+    pub fn detect(&self, audio: &Heard) -> Res<(String, f32)> {
+        let mut said = self.model.said();
+        let logits = self.model.decode(&[self.tokens.sot], &mut said, audio, &[0])?.remove(0);
         let ids: Vec<f32> = self.tokens.languages.iter().map(|&(_, i)| logits[i as usize]).collect();
         let lp = log_softmax(&ids);
         let (best, p) = lp.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b });
@@ -381,9 +382,9 @@ impl Transcriber {
     }
 
     /// Decode one window at one temperature.
-    fn window(&self, audio: &AudioCache, context: &[u32], start: &[u32], temperature: f32, sampler: &mut Sampler) -> Res<Window> {
+    fn window(&self, audio: &Heard, context: &[u32], start: &[u32], temperature: f32, sampler: &mut Sampler) -> Res<Window> {
         let t = &self.tokens;
-        let ctx = self.model.config.text_ctx;
+        let ctx = self.model.config().text_ctx;
         let mut prompt = Vec::new();
         if !context.is_empty() {
             prompt.push(t.sot_prev);
@@ -395,18 +396,22 @@ impl Transcriber {
         let sot_at = prompt.len();
         prompt.extend_from_slice(start);
 
-        let d = self.model.config.d;
-        let mut cache = TextCache::new(self.model.config.decoder_layers);
-        let h = self.model.decode(&prompt, &mut cache, audio)?;
-        let no_speech_prob = match t.no_speech {
-            Some(ns) => {
-                let mut l = self.model.logits(&h[sot_at * d..(sot_at + 1) * d]);
+        let mut said = self.model.said();
+        // The scores at `<|startoftranscript|>` say whether there is speech
+        // at all, and those at the end of the prompt what it begins with.
+        let rows = match t.no_speech {
+            Some(_) => vec![sot_at, prompt.len() - 1],
+            None => vec![prompt.len() - 1],
+        };
+        let mut scores = self.model.decode(&prompt, &mut said, audio, &rows)?;
+        let mut logits = scores.pop().expect("a row asked for");
+        let no_speech_prob = match (t.no_speech, scores.pop()) {
+            (Some(ns), Some(mut l)) => {
                 crate::tensor::softmax_inplace(&mut l);
                 l[ns as usize]
             }
-            None => 0.0,
+            _ => 0.0,
         };
-        let mut logits = self.model.logits(&h[(prompt.len() - 1) * d..]);
 
         let rules = Rules { tokens: t, timestamps: !start.contains(&t.no_timestamps) };
         sampler.temperature = temperature;
@@ -423,17 +428,17 @@ impl Transcriber {
                 break;
             }
             out.push(next);
-            if cache.len() >= ctx {
+            if prompt.len() + out.len() > ctx {
                 break;
             }
-            logits = self.model.logits(&self.model.decode(&[next], &mut cache, audio)?);
+            logits = self.model.decode(&[next], &mut said, audio, &[0])?.remove(0);
         }
         Ok(Window { avg_logprob: sum_logprob / (out.len() + 1) as f32, tokens: out, no_speech_prob, temperature, ended })
     }
 
     /// One window, tried warmer until it comes out well or there are no
     /// temperatures left.
-    fn window_with_fallback(&self, audio: &AudioCache, context: &[u32], start: &[u32], req: &Request, sampler: &mut Sampler) -> Res<Window> {
+    fn window_with_fallback(&self, audio: &Heard, context: &[u32], start: &[u32], req: &Request, sampler: &mut Sampler) -> Res<Window> {
         let temps: Vec<f32> = match req.temperature {
             Some(t) => vec![t],
             None => TEMPERATURES.to_vec(),
@@ -465,7 +470,7 @@ impl Transcriber {
     /// `progress` is told after each window, and stops the transcription by
     /// returning `false`.
     pub fn transcribe(&self, audio: &[f32], req: &Request, progress: &mut dyn FnMut(&Progress) -> bool) -> Res<Transcript> {
-        let n_mels = self.model.config.n_mels;
+        let n_mels = self.model.config().n_mels;
         let mel = self.on_pool(|| Ok(mel::log_mel(audio, mel::N_SAMPLES, n_mels)))?;
         let content = audio.len() / HOP;
         let duration = audio.len() as f32 / SAMPLE_RATE as f32;
@@ -499,7 +504,7 @@ impl Transcriber {
             let offset = (seek * HOP) as f32 / SAMPLE_RATE as f32;
             let size = (content - seek).min(N_FRAMES);
             let window_len = (size * HOP) as f32 / SAMPLE_RATE as f32;
-            let heard = self.on_pool(|| Ok(self.model.listen(&self.model.encode(&mel::window(&mel, seek)))))?;
+            let heard = self.on_pool(|| self.model.hear(&mel::window(&mel, seek)))?;
 
             let code = match &language {
                 Some(c) => c.clone(),

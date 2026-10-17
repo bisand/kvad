@@ -1,4 +1,5 @@
-//! Speech to text: Whisper, on the CPU, written out.
+//! Speech to text: Whisper, on the CPU, written out, and the loop that
+//! drives kvad-gpu's Whisper on Metal too.
 //!
 //! The one encoder-decoder in this crate, and a peer of the text path rather
 //! than one of its architectures: it is not a [`Transformer`]
@@ -22,9 +23,15 @@
 //! Every Whisper on the Hub in transformers' layout loads: OpenAI's own
 //! (`openai/whisper-*`), the distilled ones, and fine-tunes of them such as
 //! the National Library of Norway's NB-Whisper (`NbAiLab/nb-whisper-*`).
+//!
+//! The loop drives a [`Model`], and [`whisper::Cpu`] is one. kvad-gpu has
+//! the other, on Metal (`kvad_gpu::speech`): the spectrogram, the tokens,
+//! the rules and the walk through a recording are the same arithmetic on the
+//! host whichever answers, so they are here once.
 
 pub mod audio;
 pub mod mel;
+pub mod reference;
 pub mod transcribe;
 pub mod whisper;
 
@@ -32,9 +39,104 @@ pub use transcribe::{Format, Progress, Request, Segment, Task, Transcriber, Tran
 
 use crate::quant::Precision;
 use crate::weights::{fetch_file, Watcher};
+use std::any::Any;
 use std::path::PathBuf;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// A Whisper, as the decoding loop sees one: a window of spectrogram in,
+/// next-token scores out.
+///
+/// Three questions and no more, because that is all the loop asks: what
+/// the decoder will read of this window ([`Model::hear`]), an empty text
+/// cache to begin a pass with ([`Model::said`]), and the scores after some
+/// tokens ([`Model::decode`]). What each keeps between calls is its own
+/// business: host vectors on the CPU, tensors on a GPU. So the two caches
+/// cross this boundary as [`Heard`] and [`Said`], which hold whatever the
+/// model put in them and which only it opens.
+///
+/// `decode` answers in scores rather than hidden states, at the rows
+/// asked for. A GPU's hidden state would otherwise come to the host only to
+/// go back for the output head, a second wait a token for nothing.
+pub trait Model: Send + Sync {
+    fn config(&self) -> &whisper::Config;
+
+    /// One window of spectrogram, `[3000][n_mels]` time-major as
+    /// [`mel::window`] lays it out, through the encoder and every decoder
+    /// block's cross-attention keys and values.
+    fn hear(&self, window: &[f32]) -> Res<Heard>;
+
+    /// A text cache with nothing in it.
+    fn said(&self) -> Said;
+
+    /// Run `tokens` through the decoder after what `said` holds, keeping
+    /// them there, and return the scores for the next token after each row
+    /// of `tokens` that `rows` names, in that order.
+    fn decode(&self, tokens: &[u32], said: &mut Said, heard: &Heard, rows: &[usize]) -> Res<Vec<Vec<f32>>>;
+
+    /// Run `work` where this model's work runs best: the CPU's on its own
+    /// threads (see [`transcribe::Transcriber`]), a GPU's as it comes.
+    fn within(&self, work: &mut (dyn FnMut() + Send));
+
+    /// Weights in the matrices, convolutions and position tables; norms and
+    /// biases left out, as [`whisper::Config::params`] leaves them.
+    fn params(&self) -> usize;
+    /// What those take where they are held, counted the same way.
+    fn weight_bytes(&self) -> usize;
+    /// Where it runs, as a language model's session says it: `cpu f32`,
+    /// `metal q8`.
+    fn backend(&self) -> String;
+}
+
+/// A model shared: what a test holds to look inside one while a
+/// [`Transcriber`] drives it.
+impl<M: Model> Model for std::sync::Arc<M> {
+    fn config(&self) -> &whisper::Config {
+        (**self).config()
+    }
+    fn hear(&self, window: &[f32]) -> Res<Heard> {
+        (**self).hear(window)
+    }
+    fn said(&self) -> Said {
+        (**self).said()
+    }
+    fn decode(&self, tokens: &[u32], said: &mut Said, heard: &Heard, rows: &[usize]) -> Res<Vec<Vec<f32>>> {
+        (**self).decode(tokens, said, heard, rows)
+    }
+    fn within(&self, work: &mut (dyn FnMut() + Send)) {
+        (**self).within(work)
+    }
+    fn params(&self) -> usize {
+        (**self).params()
+    }
+    fn weight_bytes(&self) -> usize {
+        (**self).weight_bytes()
+    }
+    fn backend(&self) -> String {
+        (**self).backend()
+    }
+}
+
+/// What a [`Model`] made of a window for its decoder to read: the
+/// cross-attention's keys and values. Opened by that model only.
+pub struct Heard(pub Box<dyn Any + Send + Sync>);
+
+/// A [`Model`]'s decoder cache for one pass over one window. Opened by that
+/// model only.
+pub struct Said(pub Box<dyn Any + Send + Sync>);
+
+impl Heard {
+    /// What `T` this holds, or an error saying it is another model's.
+    pub fn get<T: 'static>(&self) -> Res<&T> {
+        self.0.downcast_ref().ok_or_else(|| "a window heard by another model".into())
+    }
+}
+
+impl Said {
+    pub fn get_mut<T: 'static>(&mut self) -> Res<&mut T> {
+        self.0.downcast_mut().ok_or_else(|| "a text cache from another model".into())
+    }
+}
 
 /// What a Whisper is called where an image model's diffusers pipeline
 /// would be: transformers' class for it. A server sorts the models on its
@@ -47,10 +149,15 @@ pub const PIPELINE: &str = "WhisperForConditionalGeneration";
 /// `config.json` in the cache: `None` for anything that is not a Whisper
 /// there. Asked before the load, to decide whether it fits.
 pub fn weight_bytes(repo: &str, precision: Precision) -> Option<u64> {
-    let config = crate::weights::local_file(repo, "config.json")?;
-    let config = whisper::Config::from_json(&crate::weights::read_json(&config).ok()?).ok()?;
-    let (matrices, floats) = config.params();
+    let (matrices, floats) = local_config(repo)?.params();
     Some(precision.weight_bytes(matrices as u64) + 4 * floats as u64)
+}
+
+/// `repo`'s shape, from its `config.json` in the cache: `None` for anything
+/// that is not a Whisper there.
+pub fn local_config(repo: &str) -> Option<whisper::Config> {
+    let config = crate::weights::local_file(repo, "config.json")?;
+    whisper::Config::from_json(&crate::weights::read_json(&config).ok()?).ok()
 }
 
 /// Whether `repo` is a Whisper, asking the disk only: a directory, or a repo
@@ -97,8 +204,23 @@ impl Files {
 }
 
 impl Transcriber {
-    /// A Whisper from `repo`, its matrices at `precision`.
+    /// A Whisper from `repo`, on the CPU, its matrices at `precision`.
     pub fn load(repo: &str, precision: Precision, progress: &mut dyn FnMut(&str), watch: &Watcher) -> Res<Transcriber> {
+        Transcriber::load_with(repo, progress, watch, &mut |config, files, progress| {
+            progress(&format!("at {precision}, on the CPU"));
+            Ok(Box::new(whisper::Cpu::load(config, &files.weights, precision)?))
+        })
+    }
+
+    /// A Whisper from `repo`, its model made by `model` from its config and
+    /// files: what a GPU's loader uses, with everything around the model
+    /// read here as for the CPU.
+    pub fn load_with(
+        repo: &str,
+        progress: &mut dyn FnMut(&str),
+        watch: &Watcher,
+        model: &mut dyn FnMut(whisper::Config, &Files, &mut dyn FnMut(&str)) -> Res<Box<dyn Model>>,
+    ) -> Res<Transcriber> {
         let files = Files::fetch(repo, watch)?;
         let config_json = crate::weights::read_json(&files.config)?;
         let config = whisper::Config::from_json(&config_json).map_err(|e| format!("{repo}: {e}"))?;
@@ -106,20 +228,20 @@ impl Transcriber {
         let tokenizer = tokenizers::Tokenizer::from_file(&files.tokenizer).map_err(|e| e.to_string())?;
         let tokens = transcribe::Tokens::read(&tokenizer, &config_json, generation.as_ref())?;
         progress(&format!(
-            "loading {repo}: {} + {} blocks, d={}, {} mel bands, at {precision}",
+            "loading {repo}: {} + {} blocks, d={}, {} mel bands",
             config.encoder_layers, config.decoder_layers, config.d, config.n_mels
         ));
-        let model = whisper::Whisper::load(config, &files.weights, precision)?;
-        Ok(Transcriber { model, tokenizer, tokens, pool: crate::model::pool(), precision })
+        let model = model(config, &files, progress)?;
+        Ok(Transcriber { model, tokenizer, tokens })
     }
 
     /// Where it runs, as a language model's session says it: `cpu f32`.
     pub fn backend(&self) -> String {
-        format!("cpu {}", self.precision)
+        self.model.backend()
     }
 
     pub fn summary(&self) -> String {
-        let c = &self.model.config;
+        let c = self.model.config();
         format!(
             "whisper: {}M params, {} encoder + {} decoder blocks, d={}, {} mel bands",
             self.model.params() / 1_000_000,
@@ -136,74 +258,39 @@ mod tests {
     use super::*;
 
     /// Against `scripts/whisper-fixtures.py`: transformers' own numbers for
-    /// one WAV, stage by stage, so that a difference says where it starts.
+    /// one WAV, stage by stage ([`reference`]), on the CPU at f32.
     ///
     /// ```text
     /// KVAD_WHISPER_FIXTURES=/tmp/whisper-fx cargo test --release -p kvad speech::tests -- --ignored --nocapture
     /// ```
     ///
     /// The model is read from the cache only; the script will have put it
-    /// there.
+    /// there. `KVAD_WHISPER_PRECISION=q8` (or q4) quantises it first, and
+    /// then the stages are only reported, against a looser bound; the
+    /// tokens are held to the same. kvad-gpu's `speech::tests` is the same
+    /// on Metal.
     #[test]
     #[ignore]
     fn whisper_agrees_with_transformers() {
         let dir = PathBuf::from(std::env::var("KVAD_WHISPER_FIXTURES").expect("KVAD_WHISPER_FIXTURES is not set"));
-        let meta = crate::weights::read_json(&dir.join("tokens.json")).unwrap();
-        let repo = meta["model"].as_str().unwrap();
-        crate::weights::local_file(repo, "config.json").unwrap_or_else(|| panic!("{repo} is not in the cache"));
-        let fx = crate::weights::Checkpoint::open(&[dir.join("whisper.safetensors")]).unwrap();
-        let ids = |k: &str| -> Vec<u32> { meta[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect() };
-        let gap = |a: &[f32], b: &[f32]| -> (f32, f32) {
-            assert_eq!(a.len(), b.len());
-            let max = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
-            let scale = b.iter().map(|v| v.abs()).fold(0.0, f32::max);
-            (max, scale)
+        let fx = reference::Fixtures::open(&dir).unwrap();
+        let repo = fx.repo().unwrap();
+        // The model is made here and shared with the transcriber, so that
+        // the encoder, which only its own type shows, can be asked for too.
+        let precision = std::env::var("KVAD_WHISPER_PRECISION").ok().map_or(Precision::F32, |p| Precision::parse(&p).expect("f32, q8 or q4"));
+        let mut made = None;
+        let t = Transcriber::load_with(&repo, &mut |m| eprintln!("{m}"), &Watcher::none(), &mut |config, files, _| {
+            let model = std::sync::Arc::new(whisper::Cpu::load(config, &files.weights, precision)?);
+            made = Some(model.clone());
+            Ok(Box::new(model))
+        })
+        .unwrap();
+        let model = made.unwrap();
+        let encode = |window: &[f32]| -> Res<Vec<f32>> { Ok(model.whisper.encode(window)) };
+        let tol = match precision {
+            Precision::F32 => reference::Tolerance { encoder: 2e-3, logits: 2e-3 },
+            _ => reference::Tolerance { encoder: 0.75, logits: 0.1 },
         };
-
-        let t = Transcriber::load(repo, Precision::F32, &mut |m| eprintln!("{m}"), &Watcher::none()).unwrap();
-        let audio = audio::from_wav(&std::fs::read(dir.join("audio.wav")).unwrap()).unwrap();
-        let audio = &audio[..audio.len().min(mel::N_SAMPLES)];
-
-        // The spectrogram, against transformers' [n_mels, 3000].
-        let ours = mel::log_mel(audio, mel::N_SAMPLES - audio.len(), t.model.config.n_mels);
-        let theirs = fx.get("mel").unwrap();
-        let (max, _) = gap(&ours.concat(), &theirs.data);
-        eprintln!("mel: max gap {max:.2e}");
-        assert!(max < 1e-4, "the spectrogram is {max} from transformers'");
-
-        // The encoder, from transformers' spectrogram so that only the
-        // encoder is being compared.
-        let n_mels = t.model.config.n_mels;
-        let mut window = vec![0.0f32; mel::N_FRAMES * n_mels];
-        for m in 0..n_mels {
-            for f in 0..mel::N_FRAMES {
-                window[f * n_mels + m] = theirs.data[m * mel::N_FRAMES + f];
-            }
-        }
-        let encoded = t.model.encode(&window);
-        let (max, scale) = gap(&encoded, &fx.get("encoded").unwrap().data);
-        eprintln!("encoder: max gap {max:.2e} on values up to {scale:.1}");
-        assert!(max < 2e-3 * scale.max(1.0), "the encoder is {max} from transformers'");
-
-        // The decoder's first scores after the prompt.
-        let heard = t.model.listen(&encoded);
-        let mut cache = whisper::TextCache::new(t.model.config.decoder_layers);
-        let prompt = ids("prompt");
-        let h = t.model.decode(&prompt, &mut cache, &heard).unwrap();
-        let logits = t.model.logits(&h[(prompt.len() - 1) * t.model.config.d..]);
-        let (max, scale) = gap(&logits, &fx.get("logits").unwrap().data);
-        eprintln!("decoder: max gap {max:.2e} on logits up to {scale:.1}");
-        assert!(max < 2e-3 * scale.max(1.0), "the decoder is {max} from transformers'");
-
-        // Greedy tokens, with timestamps and without, for the one window.
-        let language = meta["language"].as_str().unwrap().to_string();
-        for (timestamps, key) in [(false, "plain"), (true, "timed")] {
-            let req = Request { language: Some(language.clone()), timestamps, temperature: Some(0.0), ..Request::default() };
-            let got = t.transcribe(audio, &req, &mut |_| true).unwrap();
-            let ours: Vec<u32> = got.segments.iter().flat_map(|s| s.tokens.iter().copied()).collect();
-            let want = ids(key);
-            eprintln!("{key}: {}", got.text);
-            assert_eq!(ours, want, "{key} tokens differ from transformers'");
-        }
+        reference::compare(&fx, &t, &encode, tol).unwrap();
     }
 }

@@ -26,6 +26,9 @@
 //! [`uncached`] reads weight files past the page cache, which a model more
 //! than half the machine's memory needs (the module says why).
 //!
+//! [`speech`] is Whisper, the CPU engine's encoder-decoder on Metal, driven
+//! by the same decoding loop as the CPU's (`kvad::speech::Model`).
+//!
 //! [`image`] is the other thing this crate does, and the one thing in the
 //! engine with no CPU version: text-to-image pipelines, which are convolution
 //! stacks and so live where the convolutions are. They are not sessions —
@@ -55,5 +58,6 @@ mod mpp_neighbourhood;
 pub mod prof;
 pub mod qwen3_5;
 pub mod qcache;
+pub mod speech;
 mod uncached;
 pub mod video;

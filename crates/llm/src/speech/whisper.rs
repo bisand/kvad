@@ -498,6 +498,61 @@ impl Whisper {
     }
 }
 
+/// The model as the decoding loop drives it ([`super::Model`]): on the CPU,
+/// on threads of its own.
+///
+/// The threads are why this is not [`Whisper`] itself. Work is handed to
+/// them whole, a window at a time: a parallel loop started from a thread
+/// outside a pool takes rayon's slow path at every call, and a decoder step
+/// is dozens of them. See [`crate::model::threads`].
+pub struct Cpu {
+    pub whisper: Whisper,
+    pool: rayon::ThreadPool,
+    precision: Precision,
+}
+
+impl Cpu {
+    pub fn load(config: Config, files: &[std::path::PathBuf], precision: Precision) -> Res<Cpu> {
+        Ok(Cpu { whisper: Whisper::load(config, files, precision)?, pool: crate::model::pool(), precision })
+    }
+}
+
+impl super::Model for Cpu {
+    fn config(&self) -> &Config {
+        &self.whisper.config
+    }
+
+    fn hear(&self, window: &[f32]) -> Res<super::Heard> {
+        Ok(super::Heard(Box::new(self.whisper.listen(&self.whisper.encode(window)))))
+    }
+
+    fn said(&self) -> super::Said {
+        super::Said(Box::new(TextCache::new(self.whisper.config.decoder_layers)))
+    }
+
+    fn decode(&self, tokens: &[u32], said: &mut super::Said, heard: &super::Heard, rows: &[usize]) -> Res<Vec<Vec<f32>>> {
+        let d = self.whisper.config.d;
+        let h = self.whisper.decode(tokens, said.get_mut()?, heard.get()?)?;
+        Ok(rows.iter().map(|&r| self.whisper.logits(&h[r * d..(r + 1) * d])).collect())
+    }
+
+    fn within(&self, work: &mut (dyn FnMut() + Send)) {
+        self.pool.install(work)
+    }
+
+    fn params(&self) -> usize {
+        self.whisper.params()
+    }
+
+    fn weight_bytes(&self) -> usize {
+        self.whisper.weight_bytes()
+    }
+
+    fn backend(&self) -> String {
+        format!("cpu {}", self.precision)
+    }
+}
+
 fn add(x: &mut [f32], y: &[f32]) {
     x.iter_mut().zip(y).for_each(|(a, b)| *a += b);
 }

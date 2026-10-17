@@ -55,6 +55,13 @@ export const PAGES = [
     icon: "M3 6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM17 10l4-2.5v9L17 14",
   },
   {
+    path: "/transcribe",
+    label: "Transcribe",
+    phase: null,
+    blurb: "Speech to text: a recording in, what is said in it out as it is heard, and subtitles to save.",
+    icon: "M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM19 11a7 7 0 0 1-14 0M12 18v3M8 21h8",
+  },
+  {
     path: "/training",
     label: "Training",
     phase: null,

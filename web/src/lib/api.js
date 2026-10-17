@@ -72,7 +72,8 @@ export const health = () => api("/api/health");
  * `event:` line is "message", which is what /v1/chat/completions sends.
  *
  * @param {string} path
- * @param {object} [body] omitted for a GET
+ * @param {object | FormData} [body] omitted for a GET; a form goes as it
+ *   is, under the content type the browser writes with its boundary
  * @param {Record<string, (data: string) => void>} on
  * @param {AbortSignal} [signal]
  * @param {"POST"|"GET"} [method]
@@ -80,13 +81,14 @@ export const health = () => api("/api/health");
  *   once the stream is open, for a caller that wants its headers
  */
 export async function sse(path, body, on, signal, method = "POST", opened) {
+  const form = body instanceof FormData;
   const response = await fetch(path, {
     method,
     headers:
-      method === "GET"
+      method === "GET" || form
         ? { accept: "text/event-stream" }
         : { "content-type": "application/json", accept: "text/event-stream" },
-    body: method === "GET" ? undefined : JSON.stringify(body),
+    body: method === "GET" ? undefined : form ? body : JSON.stringify(body),
     signal,
   });
   if (!response.ok || !response.body) {

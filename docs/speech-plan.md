@@ -390,6 +390,107 @@ the table above, which was `kvad transcribe` on another day.
   48.7 to 61.9 s. Split into a process for the GPU and one for the CPU, no
   row drifts by more than a few percent.
 
+## Live, from the phone
+
+Planned 2026-10-17, not built. The owner's ask: record on the phone, and see
+the words come back on the phone *while speaking*, over a return channel,
+not as one transcript once the recording is done. Today's `stream: true`
+cannot do that. The whole file is uploaded first, and then a delta comes
+back for each 30-second window. Getting there takes audio streaming in,
+text streaming out, and a decoding loop that writes words before their
+window is complete. The phone reaches the Mac through the tunnel in
+`docs/relay-plan.md`. This section is what runs at either end of it.
+
+**One session, two directions.** The phone opens one WebSocket to the
+server. Audio goes up it as it is recorded; events come down it as they are
+decoded. Through the tunnel it is one QUIC stream whose two directions are
+independent, so a slow upload never holds back the return channel, and the
+reverse. Over the LAN, a direct path and the relay alike, it is the same
+session, and a change of path mid-session is QUIC's business, not this
+one's.
+
+**The shape: OpenAI's Realtime API, transcription only.** The house rule is
+OpenAI's shapes, so `GET /v1/realtime?intent=transcription` (upgraded to a
+WebSocket), a session update choosing the model and language, audio
+appended in chunks, and transcript deltas and completions coming back. The
+exact event names are taken from OpenAI's reference when this is built, and
+tested against their SDK, as the other endpoints were. Two additions,
+marked as Kvad's own:
+
+- *Binary audio frames.* Realtime sends audio as base64 inside JSON, a third
+  more bytes for nothing on a phone's uplink. A binary frame is taken as raw
+  audio.
+- *A replaceable partial.* Beside the append-only deltas, an event carrying
+  the current guess at the words not yet settled. Each one replaces the
+  last.
+
+**Audio.** 16 kHz mono PCM, 16-bit, little-endian: what Whisper eats, so the
+server resamples nothing. That is 256 kbit/s, which a phone's uplink and the
+relay both carry. Opus would cut it to a tenth, but would mean an Opus
+decoder, written here or taken as a dependency. It waits until a measured
+uplink says it is needed. Every chunk carries its sample offset, so audio
+that is resent after a reconnect is placed and not doubled.
+
+**Decoding before the window is full.** Whisper hears 30 seconds at a time,
+and its encoder takes the full 30 whether or not they hold sound. So the
+live loop decodes the window again as it grows:
+
+1. About once a second, run the window from its start: the audio so far,
+   padded to 30 s as always. Hand the decoder the tokens already settled as
+   its prompt, so that only the new tail is decoded one step at a time.
+2. A token is *settled* once two runs in a row agree on it, along with
+   everything before it. That is LocalAgreement-2, from Macháček et al.'s
+   whisper_streaming (2023). Settled tokens go down as deltas and never
+   change. The rest goes down as the partial.
+3. When the window nears 30 s, or a pause is heard, the segment is finished
+   at the last settled timestamp, and the next window starts there, as the
+   file path's windows already do (`#247`).
+4. The rules that already hold stay in force: UTF-8 kept whole (`#245`),
+   loops caught (`#246`, `#247`), a hang-up stops the work after the step
+   under way.
+
+**The budget, from the numbers above.** On large at gpu-q8, a window is
+heard in 0.3 s, and a step takes 6.7 ms. One update then costs 0.3 s of
+encoder, the settled prefix fed in as one batch, and a handful of new
+steps: roughly 0.35 to 0.5 s, so updating once a second keeps the GPU under
+half busy. A word should first show as a partial about one update after it
+is spoken, and settle one update later, so 1 to 2 s behind the voice.
+Small and tiny cost less. The CPU at large cannot keep up, as its window
+time of 8 to 12 s says, so the server offers a smaller model, or a slower
+cadence, rather than fall ever further behind. The real numbers come from a
+`live_speed` example, measured as `transcribe_speed` is: time from a word's
+audio to its partial, and to its settling, per model and backend.
+
+**When the Mac falls behind.** Audio is never dropped. Partials are: when an
+update is still running as the next is due, the next is skipped, and a
+`lag` field on each event says how far behind the voice the text is, so the
+phone can show it.
+
+**When the link drops.** The phone keeps the whole recording on the phone,
+whatever happens to the link, in storage only the app can read (iOS Data
+Protection class Complete, or Android's app-private files). The server holds
+the session for a minute after the link goes. On reconnect, the phone names
+the session and the last offset that was settled, and resends from there.
+After that minute, or with the Mac asleep, the phone has a file, and the
+existing `POST /v1/audio/transcriptions` takes it as it does today. The
+live path never loses anything that the file path would have kept.
+
+**Nothing is kept, still.** The server keeps the audio in memory for as long
+as the window needs it and the session lives, and writes none of it to
+disk. The transcript goes down the return channel and nowhere else. A
+device paired for transcription is scoped to this endpoint and the file one
+(`docs/relay-plan.md`, *Least privilege for devices*).
+
+**Tests.** A recording played into the WebSocket at real time gives, once
+settled, the same text the file endpoint gives for the same audio. Not
+bit-for-bit, since the windows fall differently; the check is a word error
+rate between them, with the bound set from the first measurement. Settled
+text never changes after it is sent. A link cut mid-sentence and resumed
+gives the same transcript as one never cut. A slow decoder (an injected
+delay) skips partials but never audio. And the same session runs over the
+tunnel's three paths, relayed, direct and LAN, with a change from one to
+another mid-sentence.
+
 ## What is next
 
 1. **The decoder's step.** At q8 a step is about 6.7 ms against about 4 ms
@@ -400,3 +501,7 @@ the table above, which was `kvad transcribe` on another day.
    they are worth it.
 3. **The web UI** is built: the Transcribe page. It streams, and writes
    the subtitle files itself from the segments, byte for byte the server's.
+4. **Live transcription** over a WebSocket, words back while speaking, as
+   *Live, from the phone* above lays out. First `live_speed`, to see what
+   the cadence can be on each backend. Then the endpoint, which the Transcribe
+   page can use with the browser's microphone before any phone exists.

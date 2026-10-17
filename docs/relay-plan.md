@@ -47,9 +47,10 @@ and timing. Self-hosting moves even that metadata onto the owner's own server.
 
 **The Mac is the easy end.** It is stationary, usually behind a router its
 owner controls, and the one that has to be reachable. The phone only ever
-dials out. Where the Mac's router answers PCP, NAT-PMP or UPnP, or the Mac has
-a global IPv6 address, the phone can often reach it directly without punching
-anything. Phase 0 should find out how often that is true.
+dials out. Where the Mac has a global IPv6 address, the phone can often reach
+it directly without punching anything. Phase 0 should find out how often that
+is true. Kvad never asks the router to open a port (see *No ports opened in
+the router*).
 
 **The seams already exist in Kvad.**
 
@@ -111,9 +112,10 @@ connection is open. In order of preference:
    country. The Mac advertises its node id over mDNS, and a paired device
    that sees its Mac's id on the LAN dials it there. No relay is involved,
    and this works with the internet down.
-2. **The Mac can be dialled.** The Mac has a global IPv6 address, or its
-   router mapped a port for it by PCP, NAT-PMP or UPnP, or the owner
-   forwarded one by hand. The phone dials it from anywhere.
+2. **The Mac can be dialled.** The Mac has a global IPv6 address that its
+   router's firewall lets through, or the owner forwarded a port by hand.
+   The phone dials it from anywhere. Kvad does not create this path. It only
+   uses one that already exists.
 3. **Hole punched.** Both ends are behind NAT. The relay's address
    observation tells each side where the other's packets come from, and both
    send at once.
@@ -164,7 +166,8 @@ presents it.
 
 **No relay at all.** An owner who runs no server still gets the tunnel on
 the LAN, and gets it from outside too when the Mac can be dialled at a
-stable address: IPv6, a forwarded port, or a mapped port behind dynamic DNS.
+stable address: IPv6, or a port they forwarded themselves, behind dynamic
+DNS if need be.
 Without a relay they give up the fallback and the rendezvous. If the Mac's
 public address changes, the phone has no way to learn the new one, and hole
 punching needs a third party to observe addresses. So the relay is optional
@@ -179,17 +182,25 @@ would be the direct path with extra steps.
 relays = ["https://relay.example.org"]
 direct = "auto"   # "auto": every path; "lan": LAN only, else relay; "off": relay only
 port = 5824       # the UDP port for direct QUIC; fixed so it can be forwarded by hand
-map_port = true   # ask the router for a mapping by PCP, NAT-PMP or UPnP
 ```
 
 `direct = "off"` is for debugging and for an owner who wants the Mac to
 answer no packet from the internet that did not come through the relay.
 `"lan"` keeps the LAN path and refuses direct connections from outside.
-`map_port` is on by default because a mapped port is what makes path 2 work
-for most home routers. What it exposes is one UDP port that drops every
-handshake not bound to a paired key before reading any HTTP. The mapping is
-released when the server stops. Whether that default is right is an open
-question for Phase 0.
+
+**No ports opened in the router.** Kvad never asks the router for a port
+mapping: no PCP, no NAT-PMP, no UPnP. There is no setting to turn it on.
+The owner's router configuration is theirs, and a program that opens holes
+in it without asking every time is one they cannot audit. That costs part of
+path 2: a Mac behind an IPv4 NAT is dialled directly only if the owner
+forwarded `port` themselves. Hole punching (path 3) is unaffected. It opens
+nothing in the router's configuration. It uses the short-lived entry the NAT
+creates for any outgoing packet, the same one every video call uses, which
+expires when the traffic stops.
+
+The transport library must be held to this too. iroh maps ports by default,
+so the iroh-backed `Tunnel` turns that off, and a Phase 1 test checks that
+no PCP, NAT-PMP or UPnP request ever leaves the machine.
 
 **Seeing which path.** `kvad remote status` and the device list in the web
 UI show each connected device's current path (`lan`, `direct`, `punched`,
@@ -249,6 +260,109 @@ key together. The web UI shows the same list next to sessions and keys.
 
 Kvad's own authentication still applies inside the tunnel. A paired device is
 a way to *reach* the server, not a way around signing in.
+
+## Security
+
+People who run models locally for privacy also think about security. Every
+choice here is made for the safest default, and no setting makes the
+cryptography weaker. Where safety costs a path, the path is the one that
+goes.
+
+**Who might attack, and what they get.**
+
+| Who | What they can see or do | What stops the rest |
+|---|---|---|
+| The relay's operator, or someone who took over the server | Ciphertext, node and device ids, IP addresses, timing and volume. They can drop or delay traffic. | Encryption is end to end and bound to keys the relay never holds. The relay keeps nothing worth stealing. Self-hosting keeps even the metadata with the owner. A connection that goes direct shows the relay less. |
+| Someone on the path: hotel Wi-Fi, an ISP, a carrier | The same as the relay. They can block UDP. | Both ends are pinned, so a man in the middle cannot complete a handshake. Blocked UDP falls back to the relay. |
+| A scanner on the internet hitting the Mac's UDP port | At most one TLS alert. Never the node's key. | See *An unauthenticated surface of zero* below. The port exists only while `direct` is not `"off"`, and Kvad never opens one in the router. |
+| Someone who got hold of a pairing link | One try. | The token is single use and lives ten minutes. A link also needs the PAKE code, which only the Mac's screen shows. A QR code read off the Mac's own screen never travels at all. |
+| Someone on the same LAN | That a Kvad remote is present. | The mDNS record carries no stable id (see below). Pinning stops them from posing as the Mac. |
+| Whoever has a lost or stolen phone | What the device was allowed to do, until it is revoked. | The device's key is kept where the OS makes it hardest to export, and the app locks. The device's key is scoped to what it was paired for. `kvad devices rm` revokes the pin and the key together, from the Mac. |
+| An adversary who records traffic today to decrypt it later on a quantum computer | Nothing, if the key exchange holds. | Every connection uses the hybrid X25519MLKEM768 exchange, peer QUIC and relay HTTPS alike. Ed25519 signatures are not post-quantum, but they only authenticate at connection time, so a recording gives nothing to break later. |
+| A compromised dependency | Potentially everything. | Few dependencies, pinned by `Cargo.lock`. iroh is built without its default features, so its port mapper is not even compiled in. Audits in CI (below). |
+
+**An unauthenticated surface of zero.** Nothing on the Mac answers an
+unpaired key with anything but a refusal, and nothing is parsed before the
+handshake has proved who is calling.
+
+- *A knock before the handshake.* The ALPN that a connection must offer
+  carries a value from pairing, and it changes with each pairing. When the
+  first packet shows a different ALPN, the Mac sends nothing back. When the
+  first packet does not show the ALPN, rustls refuses a wrong one while it
+  reads the ClientHello. That is one alert, sent before a ServerHello, so the
+  node's key is never sent to a stranger. (The ClientHello usually spans two
+  packets, because the post-quantum key share is large. That is why the
+  first packet often cannot show the ALPN. `tools/relay-probe` found this
+  out.) The knock hides the Mac from scanners, not from someone on the
+  path: QUIC's first packets can be decrypted by anyone who sees them, so a
+  watched connection gives the knock away. Against that observer, the
+  pinning holds.
+- *Refused at the handshake.* A key that is not in `devices` is rejected in
+  the hook that runs as the handshake completes. Its HTTP is never read.
+- *Backoff.* An address whose handshake was refused is ignored for a while
+  afterwards. Only a few connections are served at once, a few more than a
+  household of devices could need.
+- *No 0-RTT.* Data sent in 0-RTT can be replayed by anyone who recorded it,
+  so the tunnel never accepts it, whatever it would save in latency.
+
+**No fallback to anything weaker.** There is no classical key exchange
+between two Kvad peers, no plain HTTP to a relay other than on loopback, and
+no protocol version below the minimum. An attacker cannot steer a peer
+towards a fallback that does not exist. A version mismatch is refused, as
+*Failure* says, and the refusal names both versions.
+
+**Keys.**
+
+- `remote.key` on the Mac: owner-only file in an owner-only directory, made
+  with those permissions from the start, never on argv, never logged, and
+  refused if anyone else can read it or write to its directory. Keeping it
+  in the macOS Keychain instead is worth doing once the CLI and the server
+  can both reach it without a prompt.
+- On the phone: the Secure Enclave cannot hold an Ed25519 key, and
+  Android's hardware keystore can only on recent versions. Where the
+  hardware cannot hold it, the device key is wrapped by a key the hardware
+  does hold (P-256 in the Secure Enclave, or a Keystore key). It is kept to
+  this device only, never synced and never backed up.
+- Rotation: `kvad remote rotate` makes a new node key and moves every pin
+  over on the next connection of each device, so that a key that might have
+  leaked can be retired without pairing again.
+
+**Least privilege for devices.** Pairing asks what the device is for, and
+its API key gets that scope. A phone paired for transcription can transcribe
+and nothing else. Account and device management (creating users, minting
+keys, pairing further devices) is not reachable through the tunnel unless
+the owner turns it on for that device. A lost phone is then a lost
+microphone, not a lost admin account.
+
+**The LAN record.** `_kvad-remote._udp` does not carry the node id in TXT.
+It carries a short tag derived from a secret shared at pairing and the
+current hour. A paired device recognises its Mac; a stranger sees only that
+some Kvad is there, and cannot follow the Mac from one network to another.
+
+**The relay.**
+
+- It binds what its config names and nothing else. Metrics and health go on
+  loopback unless the config says otherwise. (`iroh-relay --dev` binds every
+  interface, metrics port included, so the default has to be stated, not
+  inherited.)
+- Rate limits per IP and per node from day one, not "once somebody runs a
+  shared one": a relay on the internet is attacked whether it is shared or
+  not.
+- Logs carry no addresses by default and no content ever, since the relay
+  has none.
+- The image is distroless and runs as a non-root user on a read-only
+  filesystem. It needs no capabilities beyond binding its ports.
+
+**Logs everywhere.** No token, key, pairing code or knock value is ever
+written to a log or a terminal other than where the owner asked for it,
+such as the QR code. Ids are shown short.
+
+**In CI.** `cargo deny` for licences and advisories, `cargo audit` on the
+lockfile, and a test that builds the tunnel and fails if `portmapper` (or
+any UPnP crate) appears in the tree. Phase 1 adds tests for the refusal
+paths: an unknown key, a wrong knock, an old protocol version, a 0-RTT
+attempt, and a classical-only ClientHello. Each must be refused, and none
+may be answered with the node's key.
 
 ## The transport: build on iroh, or write it
 
@@ -342,12 +456,32 @@ small VPS gives failover for free, and the client tries them in order.
 **Phase 0: measure the problem.** Before any server code: on the owner's own
 networks, how often is a direct path possible? Home broadband, a Norwegian
 mobile network, a corporate guest Wi-Fi, a hotel. For each: which of the four
-paths is reached; does the Mac's router map a port (PCP, NAT-PMP, UPnP); does
-the phone get public IPv6; does hole punching succeed; how long a connection
-that opened on the relay takes to go direct; what latency the relay adds over
-the direct path; and whether a streaming reply survives the phone moving from
-Wi-Fi to mobile data. A scratch tool built on iroh is enough. The table this
-produces replaces every guess above, including the `map_port` default.
+paths is reached, with port mapping off; does the phone get public IPv6, and
+does the Mac's router let inbound IPv6 through; does hole punching succeed;
+how long a connection that opened on the relay takes to go direct; what
+latency the relay adds over the direct path; and whether a streaming reply
+survives the phone moving from Wi-Fi to mobile data. A scratch tool built on
+iroh is enough: `tools/relay-probe`. The table this produces replaces every
+guess above.
+
+*So far, on one machine (2026-10-17, iroh 1.3.0, an M5 Mac with Tailscale
+running, a local `iroh-relay --dev`).* These runs test the tool and the
+mechanisms, not networks. The field rows are still to do.
+
+| Run | Opened on | Then | Median RTT |
+|---|---|---|---|
+| No relay; ticket with direct addresses | the tailnet address (100.64/10) | LAN after 0.25 s | 0.4 ms on the LAN |
+| Relay only (no UDP socket at all) | relay | stays on the relay | 0.4 ms |
+| Relay, ticket with no direct addresses | relay | the tailnet address after 0.25 s | 0.9 ms |
+| As above, relay killed 3 s in | relay | carried on direct for 9 more seconds with no ping lost | 0.9 ms |
+| An unpaired key | refused at the handshake | — | — |
+| A wrong knock | one TLS alert (120, no application protocol) | — | — |
+
+Found on the way: with a post-quantum key share the ClientHello spans two
+packets, so a knock checked on the first packet alone would refuse every
+honest client (see *Security*). And iroh's path choice is not "LAN first":
+in one run it stayed on the tailnet address at 0.9 ms with the LAN beside
+it. Kvad's own `PathSelector` decides that, per the open question below.
 
 **Phase 1: a tunnel on one machine.** `trait Tunnel` with the current path as
 a watchable value, an iroh-backed implementation, `kvad-serve` accepting a
@@ -357,7 +491,10 @@ loopback and pass unchanged, once with `direct = "off"` through a local relay
 and once direct with no relay configured. Then a connection that opens on the
 relay and goes direct, after which the relay is killed and the stream carries
 on. Then the reverse: the direct path is blocked mid-stream and the reply
-finishes over the relay with no token lost.
+finishes over the relay with no token lost. And through all of it, no port
+mapping request leaves the machine. A WebSocket opened through the tunnel
+streams both ways at once, and its events back are not held up by an upload
+filling the other direction.
 
 **Phase 2: identity, pairing and the LAN.** `remote.key`, `kvad remote
 pair`, the link format with its hints, token lifetime, the PAKE, the
@@ -381,10 +518,30 @@ device list, and the CLI over a real relay from a real phone network.
 modules, Fly. Each target gets a short page on kvad.eu and a CI job that at
 least builds it.
 
-**Phase 6: the reason for all of it.** A phone client, and a transcription
-endpoint for it to call. The second is its own plan: a Whisper-family
-architecture as a plugin and `POST /v1/audio/transcriptions` in OpenAI's
-shape. This plan only makes sure the first can reach the second.
+**Phase 6: the reason for all of it.** A phone client that records and sees
+the words come back while it records. The file endpoint,
+`POST /v1/audio/transcriptions`, is built (`docs/speech-plan.md`). The live
+one is planned there, under *Live, from the phone*: a WebSocket with audio
+going up and settled words and a replaceable partial coming down, about 1
+to 2 s behind the voice on large at gpu-q8.
+
+What it asks of this plan:
+
+- *WebSocket upgrades through the tunnel.* The tunnel carries HTTP, so it
+  carries an upgrade. Phase 1 tests it, since a tunnel that buffers whole
+  requests would pass every other API test and break this one.
+- *A return channel that nothing holds back.* The session is one QUIC
+  stream with two independent directions. The phone's audio upload, which
+  can fill a slow uplink, must not delay the small events coming back.
+  Phase 1 measures that: an event's latency with an upload saturating the
+  link, on the relay and direct.
+- *Surviving a change of path.* A sentence that starts on the Wi-Fi and ends
+  on 5G must arrive whole. QUIC carries the connection across, and the
+  session's resume (sample offsets, a minute's grace) covers the case where
+  it does not.
+- *Recording never depends on the link.* The phone records to its own
+  storage first and streams from there. With no path at all, or the Mac
+  asleep, it keeps the file and sends it later through the file endpoint.
 
 ## Open questions
 
@@ -395,18 +552,15 @@ shape. This plan only makes sure the first can reach the second.
 - ~~Should a Mac be able to act as its own relay when it is reachable?~~
   Answered under *No relay at all*: a Mac that can be dialled is reached
   directly, and relaying through itself would add nothing.
-- Is `map_port = true` the right default, or should mapping a port on the
-  owner's router be something they turn on? Phase 0's table decides how much
-  path 2 is worth.
+- ~~Should Kvad map a port on the owner's router?~~ No, decided 2026-10-17;
+  see *No ports opened in the router*.
 - Should the phone prefer the LAN path even when a direct internet path is
   faster? That happens rarely, for example on a busy Wi-Fi with good 5G
   beside it. Measured RTT is the obvious tiebreak, but LAN-first keeps
   working when the internet goes down.
-- What does the phone do while the Mac is asleep: record and sync later, or
-  refuse? "Sync later" turns a networking problem into a queue, which is the
-  easier problem.
-- Does the relay need rate limits per node from day one, or only once
-  somebody runs a shared one?
+- ~~What does the phone do while the Mac is asleep?~~ Records, and sends the
+  file later: see Phase 6.
+- ~~Does the relay need rate limits from day one?~~ Yes; see *Security*.
 
 ## What it buys
 

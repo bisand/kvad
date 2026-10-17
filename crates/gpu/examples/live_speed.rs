@@ -38,7 +38,7 @@
 //! to see what the idling costs. Run:
 //!
 //!     cargo run --release -p kvad-gpu --example live_speed -- \
-//!         NbAiLab/nb-whisper-large king.wav gpu-q8,gpu-bf16 3
+//!         NbAiLab/nb-whisper-large king.wav gpu-q8,gpu-f16 3
 //!
 //! The model is read from the cache. Each run reports its updates' wall
 //! time, the share of the time the backend was busy (its duty), how many
@@ -146,9 +146,12 @@ struct Cost {
     prompt: usize,
     steps: usize,
     stepping: f64,
+    /// A plain window's timed decode, to find where to cut it.
+    cutting: f64,
 }
 
-/// One update's guess: the window's tokens after its start tokens.
+/// One update's guess: the window's tokens after its start tokens, timed
+/// or plain as `start` says.
 fn update(tr: &Transcriber, window: &[f32], context: &[u32], start: &[u32], settled: &[u32]) -> Res<(Vec<u32>, Cost)> {
     let t0 = Instant::now();
     let m = &*tr.model;
@@ -164,7 +167,7 @@ fn update(tr: &Transcriber, window: &[f32], context: &[u32], start: &[u32], sett
     }
     prompt.extend_from_slice(start);
     prompt.extend_from_slice(settled);
-    let rules = Rules { tokens: t, timestamps: true };
+    let rules = Rules { tokens: t, timestamps: !start.contains(&t.no_timestamps) };
     let limit = (ctx / 2).min(ctx - prompt.len());
     let mut out = settled.to_vec();
     let (mut steps, mut stepping, mut heard_and_prompt) = (0, Duration::ZERO, 0.0);
@@ -196,8 +199,60 @@ fn update(tr: &Transcriber, window: &[f32], context: &[u32], start: &[u32], sett
         }
         Ok(())
     })?;
-    let cost = Cost { wall: t0.elapsed().as_secs_f64(), mel: mel_s, heard_and_prompt, prompt: prompt.len(), steps, stepping: stepping.as_secs_f64() };
+    let cost = Cost { wall: t0.elapsed().as_secs_f64(), mel: mel_s, heard_and_prompt, prompt: prompt.len(), steps, stepping: stepping.as_secs_f64(), cutting: 0.0 };
     Ok((out, cost))
+}
+
+/// Each word of `ids` as compared ([`plain`]), with where its last token
+/// ends; a word is a token beginning with a space and those after it that
+/// do not. Words of no letters, as a dash, are left out.
+fn word_ends(tr: &Transcriber, ids: &[u32]) -> Vec<(String, usize)> {
+    let space = |i: u32| tr.tokenizer.id_to_token(i).is_some_and(|p| p.starts_with('Ġ'));
+    let mut out = Vec::new();
+    let mut begin = 0;
+    for k in 0..ids.len() {
+        if ids.get(k + 1).is_none_or(|&n| space(n) || n >= tr.tokens.eot) {
+            let word = plain(&tr.text(&ids[begin..=k]).unwrap_or_default());
+            if !word.is_empty() {
+                out.push((word, k + 1));
+            }
+            begin = k + 1;
+        }
+    }
+    out
+}
+
+/// Where a plain window can be finished: one timed decode of it, and the
+/// end of its last segment that is followed by another and whose words
+/// are all settled, as how many of the settled tokens it takes and how far
+/// into the window it ends.
+fn plain_cut(tr: &Transcriber, window: &[f32], context: &[u32], timed: &[u32], settled: &[u32]) -> Res<Option<(usize, f32)>> {
+    let t = &tr.tokens;
+    let is_ts = |i: u32| i >= t.timestamp_begin;
+    let (guess, _) = update(tr, window, context, timed, &[])?;
+    let text: Vec<u32> = guess.iter().copied().filter(|&i| !is_ts(i)).collect();
+    let heard = word_ends(tr, &text);
+    let have = word_ends(tr, settled);
+    let pairs = align(&heard.iter().map(|w| w.0.as_str()).collect::<Vec<_>>(), &have.iter().map(|w| w.0.as_str()).collect::<Vec<_>>());
+    // Segment ends, two timestamps side by side, as how many text tokens
+    // come before each.
+    let mut ends = Vec::new();
+    let mut n = 0;
+    for i in 0..guess.len() {
+        if !is_ts(guess[i]) {
+            n += 1;
+        } else if i >= 1 && !is_ts(guess[i - 1]) && guess.get(i + 1).is_some_and(|&x| is_ts(x)) {
+            ends.push((n, (guess[i] - t.timestamp_begin) as f32 * TIME_STEP));
+        }
+    }
+    for &(n, at) in ends.iter().rev() {
+        // The segment's last word, among the settled ones.
+        let Some(last) = heard.iter().rposition(|w| w.1 <= n) else { continue };
+        if let Some(&(_, j)) = pairs.iter().find(|&&(i, _)| i == last) {
+            return Ok(Some((have[j].1, at)));
+        }
+    }
+    Ok(None)
 }
 
 /// A settled token, as the phone would have been sent it.
@@ -220,13 +275,17 @@ struct Run {
     sent: Vec<Sent>,
 }
 
-fn live(tr: &Transcriber, samples: &[f32], cadence: f64, fast: bool, trace: bool) -> Res<Run> {
+fn live(tr: &Transcriber, samples: &[f32], cadence: f64, fast: bool, plain: bool, trace: bool) -> Res<Run> {
     let t = &tr.tokens;
     let is_ts = |i: u32| i >= t.timestamp_begin;
     let language = t.default_language.as_deref().and_then(|c| t.language(c)).or_else(|| t.language("no")).unwrap_or(0);
     let mut start = vec![t.sot];
     if t.multilingual {
         start.extend([language, t.transcribe]);
+    }
+    let timed = start.clone();
+    if plain {
+        start.push(t.no_timestamps);
     }
     let duration = samples.len() as f64 / SAMPLE_RATE as f64;
     let mut clock = Clock { start: Instant::now(), fast: fast.then_some(0.0) };
@@ -251,7 +310,25 @@ fn live(tr: &Transcriber, samples: &[f32], cadence: f64, fast: bool, trace: bool
         // started there hears the end of it again. What was settled after
         // the cut is kept, its timestamps moved to the new start.
         let cut_at = |s: &[u32]| (2..s.len()).rev().find(|&i| is_ts(s[i]) && is_ts(s[i - 1]) && !is_ts(s[i - 2]));
-        if seconds(have - from) > CUT {
+        let mut cutting = 0.0;
+        if plain && seconds(have - from) > CUT {
+            // A plain window has no timestamps to cut at: one timed decode
+            // finds them, and it is paid for in this update.
+            let t0 = Instant::now();
+            let at = plain_cut(tr, &samples[from..have], &context, &timed, &settled)?;
+            cutting = t0.elapsed().as_secs_f64();
+            if let Some((i, at)) = at {
+                context.extend_from_slice(&settled[..i]);
+                settled.drain(..i);
+                from += (at * SAMPLE_RATE as f32) as usize;
+                last.drain(..i.min(last.len()));
+                shown.drain(..i.min(shown.len()));
+                run.cuts += 1;
+                if trace {
+                    println!("  cut at {:.2} s", seconds(from));
+                }
+            }
+        } else if seconds(have - from) > CUT {
             if let Some(i) = cut_at(&settled) {
                 let step = settled[i - 1] - t.timestamp_begin;
                 let back = |x: u32| if is_ts(x) { x.saturating_sub(step).max(t.timestamp_begin) } else { x };
@@ -278,7 +355,9 @@ fn live(tr: &Transcriber, samples: &[f32], cadence: f64, fast: bool, trace: bool
             run.forced += 1;
         }
 
-        let (guess, cost) = update(tr, &samples[from..have], &context, &start, &settled)?;
+        let (guess, mut cost) = update(tr, &samples[from..have], &context, &start, &settled)?;
+        cost.cutting = cutting;
+        cost.wall += cutting;
         clock.spent(cost.wall);
         let now = clock.now();
         run.busy += cost.wall;
@@ -405,10 +484,16 @@ fn main() -> Res<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let fast = args.iter().any(|a| a == "--fast");
     let trace = args.iter().any(|a| a == "--trace");
+    // Partials timed, as the plan first had them, or plain; `--both` takes
+    // each backend through both in every round.
+    let modes: Vec<bool> = match (args.iter().any(|a| a == "--both"), args.iter().any(|a| a == "--plain")) {
+        (true, _) => vec![false, true],
+        (false, plain) => vec![plain],
+    };
     let cadence: f64 = args.iter().find_map(|a| a.strip_prefix("--cadence=")).map_or(Ok(1.0), str::parse)?;
     let args: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [repo, wav, backends, rounds] = args[..] else {
-        return Err("usage: live_speed REPO WAV BACKEND,BACKEND,… ROUNDS [--cadence=SECONDS] [--fast]".into());
+        return Err("usage: live_speed REPO WAV BACKEND,BACKEND,… ROUNDS [--cadence=SECONDS] [--plain | --both] [--fast] [--trace]".into());
     };
     let samples = audio::from_wav(&std::fs::read(wav)?)?;
     let seconds = samples.len() as f64 / SAMPLE_RATE as f64;
@@ -431,22 +516,26 @@ fn main() -> Res<()> {
     }
     println!("{seconds:.1} s of audio, an update due every {cadence} s{}", if fast { ", back to back (--fast)" } else { "" });
     println!("columns: min/median/p90/max; a word's lag is from where the file's timed transcript puts its end to the update that sent it");
-    let mut texts: Vec<Option<String>> = vec![None; backends.len()];
+    let runs: Vec<(usize, bool, String)> =
+        (0..backends.len()).flat_map(|n| modes.iter().map(move |&p| (n, p))).map(|(n, p)| (n, p, format!("{} {}", backends[n], if p { "plain" } else { "timed" }))).collect();
+    let mut texts: Vec<Option<String>> = vec![None; runs.len()];
     for round in 1..=rounds {
-        for (n, (b, tr)) in backends.iter().zip(&loaded).enumerate() {
-            let run = live(tr, &samples, cadence, fast, trace)?;
+        for (k, (n, plain, b)) in runs.iter().enumerate() {
+            let (n, tr) = (*n, &loaded[*n]);
+            let run = live(tr, &samples, cadence, fast, *plain, trace)?;
             let walls: Vec<f64> = run.costs.iter().map(|c| c.wall).collect();
             let avg = |f: fn(&Cost) -> f64| run.costs.iter().map(f).sum::<f64>() / run.costs.len() as f64;
             let steps: usize = run.costs.iter().map(|c| c.steps).sum();
             let stepping: f64 = run.costs.iter().map(|c| c.stepping).sum();
             let prompt = run.costs.iter().map(|c| c.prompt).sum::<usize>() / run.costs.len();
+            let cutting: Vec<f64> = run.costs.iter().map(|c| c.cutting).filter(|&c| c > 0.0).collect();
             let ws = sent_words(tr, &run.sent);
             let reference = &spoken[n];
             let pairs = align(&ws.iter().map(|w| w.0.as_str()).collect::<Vec<_>>(), &reference.iter().map(|w| w.0.as_str()).collect::<Vec<_>>());
             let shown: Vec<f64> = pairs.iter().map(|&(i, j)| ws[i].1 - reference[j].1 as f64).collect();
             let settled: Vec<f64> = pairs.iter().map(|&(i, j)| ws[i].2 - reference[j].1 as f64).collect();
             println!(
-                "round {round} {b:9} {} updates, wall {} s, duty {:3.0}%, {} skipped, {} cuts{}, ends {:.2} s after the audio",
+                "round {round} {b:15} {} updates, wall {} s, duty {:3.0}%, {} skipped, {} cuts{}, ends {:.2} s after the audio",
                 run.costs.len(),
                 spread(walls),
                 100.0 * run.busy / (seconds + run.end),
@@ -456,21 +545,25 @@ fn main() -> Res<()> {
                 run.end,
             );
             println!(
-                "         {b:9} per update: mel {:.0} ms, heard+prompt {:.0} ms ({prompt} tokens), {:.1} steps at {:.1} ms | {} words, {} as the file's, lag shown {} s, settled {} s",
+                "         {b:15} per update: mel {:.0} ms, heard+prompt {:.0} ms ({prompt} tokens), {:.1} steps at {:.1} ms{} | {} words, {} as the file's, lag shown {} s, settled {} s",
                 1000.0 * avg(|c| c.mel),
                 1000.0 * avg(|c| c.heard_and_prompt),
                 steps as f64 / run.costs.len() as f64,
                 1000.0 * stepping / steps.max(1) as f64,
+                match cutting.len() {
+                    0 => String::new(),
+                    n => format!(", {n} timed decodes to cut at {:.0} ms", 1000.0 * cutting.iter().sum::<f64>() / n as f64),
+                },
                 ws.len(),
                 pairs.len(),
                 spread(shown),
                 spread(settled),
             );
             let ids: Vec<u32> = run.sent.iter().map(|s| s.id).collect();
-            texts[n].get_or_insert(tr.text(&ids)?);
+            texts[k].get_or_insert(tr.text(&ids)?);
         }
     }
-    for (b, text) in backends.iter().zip(texts) {
+    for ((_, _, b), text) in runs.iter().zip(texts) {
         println!("{b}: {}", text.unwrap_or_default().trim());
     }
     Ok(())

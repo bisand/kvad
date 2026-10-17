@@ -18,6 +18,7 @@
   import Playground from "./routes/Playground.svelte";
   import Images from "./routes/Images.svelte";
   import Videos from "./routes/Videos.svelte";
+  import Transcribe from "./routes/Transcribe.svelte";
   import Evals from "./routes/Evals.svelte";
   import Benchmarks from "./routes/Benchmarks.svelte";
   import Api from "./routes/Api.svelte";
@@ -99,6 +100,8 @@
         <Images />
       {:else if page.path === "/videos"}
         <Videos />
+      {:else if page.path === "/transcribe"}
+        <Transcribe />
       {:else if page.path === "/evals"}
         <Evals />
       {:else if page.path === "/benchmarks"}

@@ -216,4 +216,5 @@ running, as `run` and `chat` do, and `--local` keeps it in the process.
    kvad-gpu does best.
 2. **Beam search**, and the gzip test, if a measured word error rate says
    they are worth it.
-3. **The web UI**: a page to drop a recording on.
+3. **The web UI** is built: the Transcribe page. It streams, and writes
+   the subtitle files itself from the segments, byte for byte the server's.

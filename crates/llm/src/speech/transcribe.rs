@@ -162,6 +162,10 @@ pub struct Tokens {
     /// Whether the prompt carries a language and a task at all: the
     /// English-only checkpoints (`*.en`) have neither.
     pub multilingual: bool,
+    /// What each token does to a character being written: see [`utf8`].
+    /// Empty for a tokenizer that is not byte-level, which turns the rule
+    /// off.
+    pub utf8: Vec<[u8; 4]>,
 }
 
 impl Tokens {
@@ -206,6 +210,7 @@ impl Tokens {
             default_language,
             max_initial_timestamp: gen("max_initial_timestamp_index").and_then(|v| v.as_u64()).map_or(50, |v| v as usize),
             multilingual,
+            utf8: utf8(tok),
         };
         // What openai-whisper suppresses besides the checkpoint's list: the
         // tokens that only ever belong in a prompt.
@@ -257,6 +262,18 @@ impl Rules<'_> {
         for &i in &t.suppress {
             if let Some(l) = logits.get_mut(i as usize) {
                 *l = f32::NEG_INFINITY;
+            }
+        }
+        if !t.utf8.is_empty() {
+            // Owed by what has been written so far, in this window.
+            let owed = sampled.iter().fold(0, |owed, &i| match t.utf8.get(i as usize).map(|s| s[owed as usize]) {
+                Some(next) if next != BROKEN => next,
+                _ => 0,
+            });
+            for (l, steps) in logits.iter_mut().zip(&t.utf8) {
+                if steps[owed as usize] == BROKEN {
+                    *l = f32::NEG_INFINITY;
+                }
             }
         }
         let tb = t.timestamp_begin as usize;
@@ -332,6 +349,86 @@ fn log_sum_exp(x: &[f32]) -> f32 {
         return max;
     }
     max + x.iter().map(|v| (v - max).exp()).sum::<f32>().ln()
+}
+
+/// A token that cannot come next: see [`utf8`].
+const BROKEN: u8 = u8::MAX;
+
+/// For every token, and for each number of bytes a character being written
+/// still owes (0 to 3), how many it owes after that token, or [`BROKEN`]
+/// where the token cannot come next.
+///
+/// Whisper writes bytes, not characters. Its vocabulary is GPT-2's
+/// byte-level BPE, and a character outside ASCII is two to four bytes that
+/// need not be in one token: `ø` is C3 B8, and the model may write `Ã` (C3)
+/// and then `¸` (B8) as two. Nothing makes the bytes it writes UTF-8. A
+/// hallucinating window does write `å` (C3 A5) and then a lone B8, which is
+/// no character, and the transcript shows `�`. Or it writes C3, a timestamp,
+/// and B8 in the next segment, and both segments show one.
+///
+/// So the decoder is held to UTF-8, as the [`Rules`] hold it to timestamps
+/// that pair up: a continuation byte only where one is owed, a new character
+/// only where none is, and no end of text and no timestamp in the middle of
+/// a character. Text that was UTF-8 already is decoded exactly as it was,
+/// since nothing it chose is ruled out. Overlong forms and surrogates are
+/// not checked for: a model does not write them by accident, and they would
+/// come out as `�` and no worse.
+pub fn utf8(tok: &Tokenizer) -> Vec<[u8; 4]> {
+    if !matches!(tok.get_decoder(), Some(tokenizers::DecoderWrapper::ByteLevel(_))) {
+        return Vec::new();
+    }
+    let unbyte = unbyte();
+    let step = |bytes: &[u8], mut owed: u8| -> u8 {
+        for &b in bytes {
+            match (b, owed) {
+                (0x80..=0xBF, 0) => return BROKEN,
+                (0x80..=0xBF, _) => owed -= 1,
+                (_, 1..) => return BROKEN,
+                (0x00..=0x7F, _) => {}
+                (0xC2..=0xDF, _) => owed = 1,
+                (0xE0..=0xEF, _) => owed = 2,
+                (0xF0..=0xF4, _) => owed = 3,
+                _ => return BROKEN,
+            }
+        }
+        owed
+    };
+    (0..tok.get_vocab_size(true) as u32)
+        .map(|id| {
+            // A token that is not bytes — end of text, a timestamp, a
+            // language — leaves nothing owed, and so cannot come mid-character.
+            let bytes: Option<Vec<u8>> = tok.id_to_token(id).and_then(|t| t.chars().map(|c| unbyte.get(&c).copied()).collect());
+            match bytes {
+                Some(b) if tok.get_added_vocabulary().simple_id_to_token(id).is_none() => [0, 1, 2, 3].map(|owed| step(&b, owed)),
+                _ => [0, BROKEN, BROKEN, BROKEN],
+            }
+        })
+        .collect()
+}
+
+/// GPT-2's byte-level alphabet, read backwards: the character a vocabulary
+/// writes for each byte, to the byte.
+///
+/// Printable bytes stand for themselves (`!`–`~`, `¡`–`¬`, `®`–`ÿ`), and the
+/// other 68 — controls, the space, the soft hyphen — are written as the
+/// characters from U+0100 up, in byte order, so that a space is `Ġ`.
+fn unbyte() -> &'static std::collections::HashMap<char, u8> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<char, u8>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let printable = |b: u8| matches!(b, b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF);
+        let mut table = std::collections::HashMap::new();
+        let mut next = 256u32;
+        for b in 0..=255u8 {
+            let c = if printable(b) {
+                char::from(b)
+            } else {
+                next += 1;
+                char::from_u32(next - 1).expect("U+0100 to U+0143")
+            };
+            table.insert(c, b);
+        }
+        table
+    })
 }
 
 /// A loaded Whisper with what it takes to drive it.
@@ -720,6 +817,7 @@ mod tests {
             default_language: None,
             max_initial_timestamp: 2,
             multilingual: true,
+            utf8: Vec::new(),
         }
     }
 
@@ -762,6 +860,73 @@ mod tests {
         let mut l = vec![0.0f32; 30];
         rules.apply(&mut l, &[]);
         assert_eq!(allowed(&l), vec![1, 2, 4, 5, 6, 7, 8, 9, 15, 17, 18, 19]);
+    }
+
+    /// In the miniature vocabulary, token 4 is the lead byte C3 and token 5
+    /// the continuation B8, so 4 then 5 is `ø`; everything else is ASCII or
+    /// not bytes at all.
+    fn with_bytes() -> Tokens {
+        let mut t = tokens();
+        t.utf8 = (0..30).map(|i| match i {
+            4 => [1, BROKEN, BROKEN, BROKEN],
+            5 => [BROKEN, 0, 1, 2],
+            _ => [0, BROKEN, BROKEN, BROKEN],
+        }).collect();
+        t
+    }
+
+    #[test]
+    fn a_character_begun_is_finished_before_anything_else() {
+        let t = with_bytes();
+        for timestamps in [false, true] {
+            let rules = Rules { tokens: &t, timestamps };
+            // After the lead byte only its continuation may come: not text,
+            // not the end, not a timestamp.
+            let mut l = vec![0.0f32; 30];
+            rules.apply(&mut l, &[20, 4]);
+            assert_eq!(allowed(&l), vec![5], "timestamps {timestamps}");
+            // And once it is whole, a continuation is never the first byte
+            // of anything, while what else may come is the other rules'
+            // business again.
+            let mut l = vec![0.0f32; 30];
+            rules.apply(&mut l, &[20, 4, 5]);
+            assert!(!allowed(&l).contains(&5) && !allowed(&l).is_empty(), "{:?}", allowed(&l));
+        }
+    }
+
+    /// NB-Whisper's own vocabulary, where it is on this machine (it is never
+    /// downloaded here).
+    #[test]
+    fn the_table_knows_whispers_bytes() {
+        let Some(path) = crate::weights::local_file("NbAiLab/nb-whisper-tiny", "tokenizer.json") else {
+            eprintln!("NbAiLab/nb-whisper-tiny is not on this machine: skipped");
+            return;
+        };
+        let tok = Tokenizer::from_file(path).unwrap();
+        let table = utf8(&tok);
+        assert_eq!(table.len(), tok.get_vocab_size(true));
+        let id = |s: &str| tok.token_to_id(s).unwrap() as usize;
+        // `Ã` begins `ø` and owes one byte; `¸` is that byte, and nothing
+        // else; `Ã¥` is a whole `å`.
+        assert_eq!(table[id("Ã")][0], 1);
+        assert_eq!(table[id("¸")][0], BROKEN);
+        assert_eq!(table[id("¸")][1], 0);
+        assert_eq!(table[id("Ã¥")][0], 0);
+        assert_eq!(table[id("Ġs")][0], 0);
+        assert_eq!(table[id("Ġs")][1], BROKEN);
+        for special in ["<|endoftext|>", "<|0.00|>", "<|30.00|>", "<|no|>"] {
+            assert_eq!(table[id(special)], [0, BROKEN, BROKEN, BROKEN], "{special}");
+        }
+        // Every token of ordinary text is allowed where a character is not
+        // half written, so text that was UTF-8 is decoded as it was.
+        let text = " Nordmenn er sørlendinger, trøndere – og «folk» fra Ålesund. 1 000 €!";
+        let ids = tok.encode(text, false).unwrap().get_ids().to_vec();
+        let owed = ids.iter().fold(0u8, |owed, &i| {
+            let next = table[i as usize][owed as usize];
+            assert_ne!(next, BROKEN, "token {i} after {owed} owed");
+            next
+        });
+        assert_eq!(owed, 0);
     }
 
     #[test]

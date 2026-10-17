@@ -153,6 +153,16 @@ ways in the third, for the reason under *Known differences*.
   in this crate. Instead, a window that runs into the 224-token limit without
   ending counts as failed, which is how the repetition loop shows up.
   Log-probability below -1 is checked as in the reference.
+- **A window that never ends is skipped.** When it runs into the limit at
+  every temperature, openai-whisper writes down its last try anyway. Here
+  nothing of it is written, as for silence, and the next window starts 30
+  seconds on. On 24 minutes of kitchen microphone, large at gpu-q8 had one
+  such window, over noise: 224 tokens of spaces and stray letters at each
+  of the six temperatures, at an average log-probability of -0.03 to -0.14,
+  confident throughout. A gzip test would not have helped: every try had
+  already failed, and the line that came out was the last of them. It was
+  the only window the rule skipped. Speech before the loop in such a window
+  is lost with it.
 - **Greedy only.** No beam search. NB-Whisper's card recommends 5 beams for
   accuracy.
 - **NB-Whisper and `--translate`.** The model ignores the translate task, and

@@ -68,6 +68,10 @@ const LOGPROB_THRESHOLD: f32 = -1.0;
 /// Above this probability of `<|nospeech|>`, with a low log-probability as
 /// well, a window is taken to be silence and skipped.
 const NO_SPEECH_THRESHOLD: f32 = 0.6;
+/// Above this share of repeated 4-grams, a window that ran into the token
+/// limit is a loop rather than speech too dense to fit. Speech measured 0.01
+/// to 0.07, loops and pages of spaces 0.72 to 1.
+const REPEATED_THRESHOLD: f32 = 0.5;
 
 /// What to do with the speech.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -239,14 +243,35 @@ struct Window {
 }
 
 impl Window {
-    /// Whether none of it is written down, as fallback left it: silence, or
-    /// a window that ran into the token limit at every temperature it was
-    /// tried at. openai-whisper keeps the second, and its last try over
-    /// noise is a page of spaces and stray letters.
-    fn skipped(&self) -> bool {
-        let silence = self.no_speech_prob > NO_SPEECH_THRESHOLD && self.avg_logprob < LOGPROB_THRESHOLD;
-        silence || !self.ended
+    /// Whether it ran into the token limit going round in circles: this
+    /// crate's gzip test. Speech dense enough to fill the limit is not a
+    /// loop, and is kept.
+    fn looped(&self, eot: u32) -> bool {
+        !self.ended && repeated(&self.tokens, eot) > REPEATED_THRESHOLD
     }
+
+    /// Whether none of it is written down, as fallback left it: silence, or
+    /// a loop at every temperature it was tried at. openai-whisper keeps the
+    /// second, and its last try over noise is a page of spaces and stray
+    /// letters.
+    fn skipped(&self, eot: u32) -> bool {
+        let silence = self.no_speech_prob > NO_SPEECH_THRESHOLD && self.avg_logprob < LOGPROB_THRESHOLD;
+        silence || self.looped(eot)
+    }
+}
+
+/// The share of the text's 4-grams in `tokens` that were written earlier in
+/// them: what a compressor would find to point back to. Timestamps and
+/// special tokens are not text, and a window of nothing else repeats all
+/// of it.
+fn repeated(tokens: &[u32], eot: u32) -> f32 {
+    let text: Vec<u32> = tokens.iter().copied().filter(|&i| i < eot).collect();
+    if text.len() < 4 {
+        return 1.0;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let again = text.windows(4).filter(|g| !seen.insert(*g)).count();
+    again as f32 / (text.len() - 3) as f32
 }
 
 /// The rules about what the next token may be, given what has been produced.
@@ -556,10 +581,10 @@ impl Transcriber {
             let w = self.on_pool(|| self.window(audio, context, start, temp, sampler))?;
             let unsure = w.avg_logprob < LOGPROB_THRESHOLD;
             // Silence is allowed to be unsure, and to ramble: it is skipped
-            // below, not retried. So is a window that rambles at every
+            // below, not retried. So is a window that loops at every
             // temperature.
             let silent = w.no_speech_prob > NO_SPEECH_THRESHOLD;
-            let good = (w.ended && !unsure) || (silent && unsure);
+            let good = (!w.looped(self.tokens.eot) && !unsure) || (silent && unsure);
             last = Some(w);
             if good {
                 break;
@@ -628,7 +653,7 @@ impl Transcriber {
             let context_now = if req.no_context { &[][..] } else { &context[reset_at..] };
             let w = self.window_with_fallback(&heard, context_now, &start, req, &mut sampler)?;
 
-            if w.skipped() {
+            if w.skipped(t.eot) {
                 seek += size;
                 if !progress(&Progress { done: ((seek * HOP) as f32 / SAMPLE_RATE as f32).min(duration), total: duration, segments: Vec::new() }) {
                     return Err("stopped".into());
@@ -942,18 +967,43 @@ mod tests {
     }
 
     #[test]
-    fn silence_and_a_window_that_never_ends_are_skipped() {
-        let w = |ended, avg_logprob, no_speech_prob| Window { tokens: vec![], avg_logprob, no_speech_prob, temperature: 1.0, ended };
-        // Speech, and speech that fallback could not make sure of, are kept.
-        assert!(!w(true, -0.3, 0.0).skipped());
-        assert!(!w(true, -1.5, 0.0).skipped());
-        // A likely `<|nospeech|>` alone is not enough.
-        assert!(!w(true, -0.3, 0.9).skipped());
-        // Silence, which may ramble too.
-        assert!(w(true, -1.5, 0.9).skipped());
-        assert!(w(false, -1.5, 0.9).skipped());
-        // A page of spaces, written with confidence, up to the limit.
-        assert!(w(false, -0.03, 0.0).skipped());
+    fn silence_and_loops_are_skipped_and_dense_speech_is_not() {
+        const EOT: u32 = 50257;
+        let w = |tokens: Vec<u32>, ended, avg_logprob, no_speech_prob| Window { tokens, avg_logprob, no_speech_prob, temperature: 0.0, ended };
+        // 224 tokens of words that do not come round again, with a
+        // timestamp pair every 20: speech too dense for the limit.
+        let mut x = 7u32;
+        let mut dense: Vec<u32> = (0..224).map(|i| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            if i % 20 == 19 { EOT + 100 + i } else { 300 + (x >> 8) % 20_000 }
+        }).collect();
+        assert!(repeated(&dense, EOT) < 0.05, "{}", repeated(&dense, EOT));
+        assert!(!w(dense.clone(), false, -0.25, 0.0).looped(EOT));
+        assert!(!w(dense.clone(), false, -0.25, 0.0).skipped(EOT));
+        // The same words ending in a phrase said over and over.
+        dense.truncate(40);
+        let mut circling = dense.clone();
+        while circling.len() < 224 {
+            circling.extend([1000, 2000, 3000, 4000, 5000, 6000, 13]);
+        }
+        circling.truncate(224);
+        assert!(w(circling, false, -0.1, 0.0).skipped(EOT));
+        // A page of spaces and stray letters, with confidence, as written
+        // over a kitchen's noise.
+        let page: Vec<u32> = (0..224).map(|i| if i % 9 == 4 { [258, 275, 256, 385][i % 4] } else { 220 }).collect();
+        assert!(w(page, false, -0.03, 0.0).skipped(EOT));
+        // Nothing but a special token, over and over: no text at all.
+        assert!(w(vec![EOT + 31; 224], false, -3.25, 0.0).skipped(EOT));
+        // A window that ended is kept, however it repeats itself; fallback
+        // has had its say on how sure it is.
+        let ja = [1000, 13, 1000, 13, 1000, 13, 1000, 13, 1000, 13].to_vec();
+        assert!(!w(ja.clone(), true, -0.3, 0.0).skipped(EOT));
+        assert!(!w(ja, true, -1.5, 0.0).skipped(EOT));
+        // A likely `<|nospeech|>` alone is not enough, and with an unsure
+        // window it is silence, which may ramble too.
+        assert!(!w(vec![1000], true, -0.3, 0.9).skipped(EOT));
+        assert!(w(vec![1000], true, -1.5, 0.9).skipped(EOT));
+        assert!(w(vec![1000; 224], false, -1.5, 0.9).skipped(EOT));
     }
 
     #[test]

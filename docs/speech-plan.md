@@ -161,6 +161,18 @@ ways in the third, for the reason under *Known differences*.
     writing one special token over and over on pink noise measured 1.
   - Running into the limit alone used to count as failure. Speech that
     filled the limit was then tried at every temperature, and kept at 1.0.
+  - Real radio does not come near the threshold. Three NRK podcast
+    episodes, 2 h 17 min in all (Abels tårn with listeners phoning in,
+    P3morgen, and the first hour of Lørdagsrådet with its music), large at
+    gpu-q8, plain and timed: 275 windows each way, none decoded again, none
+    at the limit, none skipped. Of the windows with 60 tokens or more, the
+    highest score was 0.099, the show's introduction with its name said
+    twice, and the next 0.075. (A window of a few words scores high, and
+    ends, so it is never asked.)
+  - Radio fills a window more than a speech does. With timestamps, a window
+    held 147 to 158 tokens at the median and 212 at most, where `king.mp3`
+    holds about 87. Speech that fills the limit is not rare in the way
+    hallucination is.
 - **A loop that never ends is skipped.** When a window loops at every
   temperature, openai-whisper writes down its last try anyway. Here nothing
   of it is written, as for silence, and the next window starts 30 seconds

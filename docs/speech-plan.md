@@ -148,21 +148,35 @@ ways in the third, for the reason under *Known differences*.
   clip looked like in training, and what transformers does for a clip under
   30 seconds. On `king.mp3` this changed tiny's last window from repetition
   into the right sentence once fallback ran.
-- **No gzip test.** openai-whisper decodes a window again when its text
-  compresses better than 2.4:1, a sign of repetition. There is no compressor
-  in this crate. Instead, a window that runs into the 224-token limit without
-  ending counts as failed, which is how the repetition loop shows up.
+- **Repeated 4-grams for the gzip test.** openai-whisper decodes a window
+  again when its text compresses better than 2.4:1, a sign of repetition.
+  There is no compressor in this crate. Instead, a window fails when it runs
+  into the 224-token limit and more than half of its text's 4-grams were
+  written earlier in it, which is what a compressor would point back to.
   Log-probability below -1 is checked as in the reference.
-- **A window that never ends is skipped.** When it runs into the limit at
-  every temperature, openai-whisper writes down its last try anyway. Here
-  nothing of it is written, as for silence, and the next window starts 30
-  seconds on. On 24 minutes of kitchen microphone, large at gpu-q8 had one
-  such window, over noise: 224 tokens of spaces and stray letters at each
-  of the six temperatures, at an average log-probability of -0.03 to -0.14,
-  confident throughout. A gzip test would not have helped: every try had
-  already failed, and the line that came out was the last of them. It was
-  the only window the rule skipped. Speech before the loop in such a window
-  is lost with it.
+  - The two are far apart. Speech measured 0.01 to 0.07, including NB-Whisper
+    large on `king.mp3` played 2 to 3 times as fast, where a window fills
+    the limit. The kitchen's page of spaces and stray letters measured 0.72,
+    taken from its text tokenized again, as the audio was not kept. Tiny
+    writing one special token over and over on pink noise measured 1.
+  - Running into the limit alone used to count as failure. Speech that
+    filled the limit was then tried at every temperature, and kept at 1.0.
+- **A loop that never ends is skipped.** When a window loops at every
+  temperature, openai-whisper writes down its last try anyway. Here nothing
+  of it is written, as for silence, and the next window starts 30 seconds
+  on. On 24 minutes of kitchen microphone, large at gpu-q8 had one such
+  window, over noise: 224 tokens of spaces and stray letters at each of the
+  six temperatures, at an average log-probability of -0.03 to -0.14,
+  confident throughout. It was the only window skipped. Speech before the
+  loop in such a window is lost with it.
+  - On `king.mp3` at 2.6 times the speed, the first window fills the limit
+    with speech. Skipping every window that never ended, as #246 first did,
+    left only the last sentence. Now the window is kept at temperature 0, and
+    the next starts at its last timestamp.
+- **NB-Whisper never says `<|nospeech|>`.** On 30 seconds of pink noise, and
+  of digital silence, its probability is 0.00 on large, where
+  openai/whisper-tiny gives 0.97 and 0.93. So silence is never skipped as
+  silence on NB-Whisper, and a loop is the only window that is.
 - **Greedy only.** No beam search. NB-Whisper's card recommends 5 beams for
   accuracy.
 - **NB-Whisper and `--translate`.** The model ignores the translate task, and

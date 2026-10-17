@@ -238,6 +238,17 @@ struct Window {
     ended: bool,
 }
 
+impl Window {
+    /// Whether none of it is written down, as fallback left it: silence, or
+    /// a window that ran into the token limit at every temperature it was
+    /// tried at. openai-whisper keeps the second, and its last try over
+    /// noise is a page of spaces and stray letters.
+    fn skipped(&self) -> bool {
+        let silence = self.no_speech_prob > NO_SPEECH_THRESHOLD && self.avg_logprob < LOGPROB_THRESHOLD;
+        silence || !self.ended
+    }
+}
+
 /// The rules about what the next token may be, given what has been produced.
 pub struct Rules<'a> {
     pub tokens: &'a Tokens,
@@ -545,7 +556,8 @@ impl Transcriber {
             let w = self.on_pool(|| self.window(audio, context, start, temp, sampler))?;
             let unsure = w.avg_logprob < LOGPROB_THRESHOLD;
             // Silence is allowed to be unsure, and to ramble: it is skipped
-            // below, not retried.
+            // below, not retried. So is a window that rambles at every
+            // temperature.
             let silent = w.no_speech_prob > NO_SPEECH_THRESHOLD;
             let good = (w.ended && !unsure) || (silent && unsure);
             last = Some(w);
@@ -616,7 +628,7 @@ impl Transcriber {
             let context_now = if req.no_context { &[][..] } else { &context[reset_at..] };
             let w = self.window_with_fallback(&heard, context_now, &start, req, &mut sampler)?;
 
-            if w.no_speech_prob > NO_SPEECH_THRESHOLD && w.avg_logprob < LOGPROB_THRESHOLD {
+            if w.skipped() {
                 seek += size;
                 if !progress(&Progress { done: ((seek * HOP) as f32 / SAMPLE_RATE as f32).min(duration), total: duration, segments: Vec::new() }) {
                     return Err("stopped".into());
@@ -927,6 +939,21 @@ mod tests {
             next
         });
         assert_eq!(owed, 0);
+    }
+
+    #[test]
+    fn silence_and_a_window_that_never_ends_are_skipped() {
+        let w = |ended, avg_logprob, no_speech_prob| Window { tokens: vec![], avg_logprob, no_speech_prob, temperature: 1.0, ended };
+        // Speech, and speech that fallback could not make sure of, are kept.
+        assert!(!w(true, -0.3, 0.0).skipped());
+        assert!(!w(true, -1.5, 0.0).skipped());
+        // A likely `<|nospeech|>` alone is not enough.
+        assert!(!w(true, -0.3, 0.9).skipped());
+        // Silence, which may ramble too.
+        assert!(w(true, -1.5, 0.9).skipped());
+        assert!(w(false, -1.5, 0.9).skipped());
+        // A page of spaces, written with confidence, up to the limit.
+        assert!(w(false, -0.03, 0.0).skipped());
     }
 
     #[test]

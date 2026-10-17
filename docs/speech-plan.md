@@ -126,6 +126,21 @@ ways in the third, for the reason under *Known differences*.
 
 ## Known differences from the reference
 
+- **Held to UTF-8.** Whisper writes bytes. A character outside ASCII is
+  two to four of them, which need not be in one token, and nothing in the
+  model makes what it writes UTF-8. A hallucinating window can write `å`
+  and then a lone continuation byte, or end a segment halfway through `ø`.
+  The reference prints `�`. Here, the decoder rules out any token that
+  cannot continue the bytes written so far, and rules out end-of-text and
+  timestamps in the middle of a character (`transcribe::utf8`).
+  - Text that was already UTF-8 comes out as it did, since nothing it chose
+    is ruled out. On NB-Whisper tiny, small and large, the tokens are still
+    transformers' own.
+  - What `avg_logprob` reports moves a little, because it is taken after the
+    rules, as in openai-whisper, and the rules now remove some impossible
+    tokens' share.
+  - On a 79-second `say -v Nora` recording, tiny's two `�` are gone. One
+    window that had come out as noise is now the sentence that was read.
 - **The last window's padding.** openai-whisper, and transformers in long
   form, pad the last window's *spectrogram* with zeros. A zero there is
   `log10 = -4`, which is not what silence looks like. Here the *audio* is

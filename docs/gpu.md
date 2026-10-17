@@ -311,6 +311,33 @@ keeps none of them: 576 floats a position against the 2048 `kv_dim()`
 describes. The server was reporting **7.1x** the memory it was using, on the
 one architecture whose entire argument is that it uses less.
 
+## Speech, which is half a prefill
+
+```bash
+kvad transcribe king.mp3 --model NbAiLab/nb-whisper-large --backend gpu-q8
+```
+
+[`speech.rs`](../crates/gpu/src/speech.rs) is Whisper, the CPU engine's
+[`whisper.rs`](../crates/llm/src/speech/whisper.rs) again, block for block.
+The decoding loop is not in this crate at all. `kvad::speech::Transcriber`
+drives a `kvad::speech::Model`, and this is the second one: the
+spectrogram, the prompt, the timestamp rules and the walk through a long
+recording are the same host code whichever model answers.
+
+The encoder is one 1500-row batch, a prefill with no mask: the fused
+attention kernel, and at q8 its projections go to the M5's matrix units
+(`Loader::accelerated`), as an image model's do. A language model may not do
+that, because `Proj::Blocks` has no one-row kernel. The encoder never has one
+row, and neither have the cross-attention's key and value projections, made
+once a window. Everything else in the decoder is loaded the ordinary way.
+
+Dense, it runs in f16 rather than bf16 (`speech::DENSE`). Whisper was trained
+in f16, and against transformers' f32, bf16 is four to thirteen times
+further off than f16 at nearly every stage. On nb-whisper-large that is
+enough to change a word, where f16 changes none. The numbers, and the speed
+against the CPU (gpu-q8 is 11× cpu-q8 on large), are in
+[`docs/speech-plan.md`](speech-plan.md#on-the-gpu).
+
 ## Pictures, which are not tokens
 
 ```bash

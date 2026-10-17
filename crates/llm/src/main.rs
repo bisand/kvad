@@ -808,8 +808,20 @@ fn transcribe(args: Args) -> Res<()> {
     let seconds = audio.len() as f32 / speech::mel::SAMPLE_RATE as f32;
     eprintln!("{file}: {seconds:.1} s");
 
+    // This process has the CPU only: the GPU's Whisper is in kvad-gpu,
+    // which a server links and this binary does not.
+    let precision = match args.backend.as_deref() {
+        None => args.quant,
+        Some(b) => match b.strip_prefix("cpu-").and_then(kvad::quant::Precision::parse) {
+            Some(p) => p,
+            None if b.starts_with("gpu-") => {
+                return Err(format!("--backend {b} runs on a server's GPU, and this process has none: start the service (`kvad service start`) and leave out --local").into())
+            }
+            None => return Err(format!("--backend expects cpu-f32, cpu-q8, cpu-q4 or a server's gpu-…, got `{b}`").into()),
+        },
+    };
     let started = std::time::Instant::now();
-    let t = Transcriber::load(&model, args.quant, &mut |m| eprintln!("{m}"), &weights::Watcher::none())?;
+    let t = Transcriber::load(&model, precision, &mut |m| eprintln!("{m}"), &weights::Watcher::none())?;
     eprintln!("{} (loaded in {:.1} s)", t.summary(), started.elapsed().as_secs_f32());
 
     let streaming = format == Format::Text && args.out.is_none();

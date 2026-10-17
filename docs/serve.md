@@ -34,9 +34,10 @@ its spatial epilogue, sizes its second stage cannot hold whole, and decoded
 by its diffusion decoder or, when asked, its convolutional one
 (`docs/video-plan.md`). `/v1/audio/transcriptions` and
 `/v1/audio/translations` are OpenAI's speech endpoints, for any Whisper, on
-the CPU; a form with the recording in, the transcript out in any of OpenAI's
-five formats, the same bytes `kvad transcribe --local` writes, and nothing
-kept (`docs/speech-plan.md`). Four authentication modes (`none`, `local`, `basic`,
+the GPU or the CPU; a form with the recording in, the transcript out in any
+of OpenAI's five formats, at a CPU backend the same bytes
+`kvad transcribe --local` writes, and nothing kept (`docs/speech-plan.md`).
+Four authentication modes (`none`, `local`, `basic`,
 `oidc`), roles, API keys. SQLite for everything the filesystem cannot answer.
 `docs/ui-plan.md` is the plan it was built from, and each phase in it records
 what that phase measured and which of its open questions closed.

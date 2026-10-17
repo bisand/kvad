@@ -77,6 +77,15 @@ impl Linear {
         Ok(Linear { w, b: Some(cx.get(&r, out, "bias")?), out, slot })
     }
 
+    /// What its matrix holds, and in how many bytes; the bias is not counted.
+    pub(crate) fn params(&self) -> usize {
+        self.w.params()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.w.bytes()
+    }
+
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let y = self.frozen(x)?;
         match &self.slot {

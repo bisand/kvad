@@ -346,8 +346,8 @@ pub fn cpu_loader() -> Loader {
         Backend::Cpu(precision) if crate::speech::is_whisper(repo) => {
             Ok(Model::Speech(Box::new(crate::speech::Transcriber::load(repo, precision, progress, watch)?)))
         }
-        // Before the GPU's refusal below, which would send somebody to the
-        // build when the answer is the backend.
+        // Before the GPU's refusal below, which would not say that a CPU
+        // backend is there for it.
         Backend::Gpu(_) if crate::speech::is_whisper(repo) => Err(WHISPER_ON_CPU.into()),
         Backend::Cpu(precision) => Llm::load_watched(repo, precision, progress, watch).map(Model::from),
         Backend::Gpu(_) => {
@@ -356,9 +356,9 @@ pub fn cpu_loader() -> Loader {
     })
 }
 
-/// What a Whisper asked for at a GPU backend is told.
+/// What a Whisper asked for at a GPU backend is told by a build with none.
 const WHISPER_ON_CPU: &str =
-    "Whisper runs on the CPU only for now; load it at a cpu backend (cpu-f32, cpu-q8 or cpu-q4)";
+    "this build has no GPU backend; load the Whisper at a cpu backend (cpu-f32, cpu-q8 or cpu-q4)";
 
 pub struct Engine {
     tx: Sender<Cmd>,

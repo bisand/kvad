@@ -5,6 +5,7 @@ import { Theme } from "theme.slint";
 import {
     Pressable, Icon, PrimaryButton, TextButton, RoundButton, Separator, Card,
     SectionHeader, SectionFooter, Row, Field, LargeTitle, EmptyState, TabItem,
+    Scroller, Typing,
 } from "parts.slint";
 import { AboutSlint, Spinner } from "std-widgets.slint";
 
@@ -38,6 +39,8 @@ export struct ProbeRow {
 
 component ConnectScreen inherits Rectangle {
     in property <length> top-inset;
+    // The keyboard's height: what is under it can be scrolled up to.
+    in property <length> bottom-inset;
     in-out property <string> url;
     in-out property <string> key;
     in property <bool> busy;
@@ -48,7 +51,11 @@ component ConnectScreen inherits Rectangle {
     callback open-probe();
     callback paste-link();
 
-    Flickable {
+    Scroller {
+        y: 0;
+        height: root.height - root.bottom-inset;
+        began => { url-field.blur(); key-field.blur(); }
+        tapped => { url-field.blur(); key-field.blur(); }
         VerticalLayout {
             alignment: start;
             padding-top: root.top-inset + 56px;
@@ -88,14 +95,14 @@ component ConnectScreen inherits Rectangle {
             }
             Rectangle { height: 28px; }
             Card {
-                Field {
+                url-field := Field {
                     label: "Server";
                     placeholder: "192.168.1.20:5823 or kvad://…";
                     text <=> root.url;
                     enabled: !root.busy;
                 }
                 Separator { }
-                Field {
+                key-field := Field {
                     label: "Key";
                     placeholder: "Not needed on your own Mac";
                     input-type: InputType.password;
@@ -182,7 +189,10 @@ component Message inherits HorizontalLayout {
             padding-right: 14px;
             padding-top: 9px;
             padding-bottom: 9px;
-            Text {
+            min-height: mine.measured + 18px;
+            mine := Text {
+                // See the reply's below.
+                property <length> measured: self.preferred-height;
                 text: root.bubble.text;
                 color: Theme.on-accent;
                 font-size: Theme.body * 1rem;
@@ -195,7 +205,13 @@ component Message inherits HorizontalLayout {
     if !root.bubble.mine: VerticalLayout {
         horizontal-stretch: 1;
         padding-top: 3px;
-        Text {
+        // The text's height at the width it is given, passed up as a plain
+        // number: the list above asks for its height in a way that measures
+        // the text at another width, and a long reply came out a quarter of
+        // its height, so the list would not scroll to the end of it.
+        min-height: reply.measured + 3px;
+        reply := Text {
+            property <length> measured: self.preferred-height;
             text: root.bubble.text == "" && root.bubble.streaming ? "…" : root.bubble.text + (root.bubble.streaming ? " ●" : "");
             color: Theme.label;
             font-size: Theme.body * 1rem;
@@ -265,19 +281,12 @@ component ChatScreen inherits Rectangle {
                 title: "Ask anything";
                 text: root.model == "" ? "Choose a model at the top to begin." : "It runs on your Mac. Nothing you write leaves the machines you own.";
             }
-            list := Flickable {
+            list := Scroller {
                 // Stay with the newest words while they arrive, unless the
                 // reader has scrolled up to read something older.
-                property <bool> follow: true;
-                content-height: column.preferred-height;
-                changed content-height => {
-                    if self.follow {
-                        self.content-y = min(0px, self.height - self.content-height);
-                    }
-                }
-                flicked => {
-                    self.follow = self.content-y <= self.height - self.content-height + 24px;
-                }
+                keep-end: true;
+                began => { input.clear-focus(); }
+                tapped => { input.clear-focus(); }
                 column := VerticalLayout {
                     alignment: start;
                     padding-top: 8px;
@@ -328,6 +337,7 @@ component ChatScreen inherits Rectangle {
                         Rectangle {
                             input := TextInput {
                                 text <=> root.draft;
+                                changed has-focus => { Typing.active = self.has-focus; }
                                 color: Theme.label;
                                 font-size: Theme.body * 1rem;
                                 single-line: false;
@@ -352,7 +362,7 @@ component ChatScreen inherits Rectangle {
                         icon: @image-url("icons/send.svg");
                         enabled: root.draft != "" && root.model != "";
                         clicked => {
-                            list.follow = true;
+                            list.at-end = true;
                             root.send(root.draft);
                         }
                     }
@@ -375,7 +385,7 @@ component ModelsScreen inherits Rectangle {
     in property <bool> loading;
     callback refresh();
 
-    Flickable {
+    Scroller {
         VerticalLayout {
             alignment: start;
             padding-bottom: 24px;
@@ -439,7 +449,7 @@ component MoreScreen inherits Rectangle {
     callback open-probe();
     callback unpair();
 
-    Flickable {
+    Scroller {
         VerticalLayout {
             alignment: start;
             padding-bottom: 32px;
@@ -619,8 +629,10 @@ component NetworkTestScreen inherits Rectangle {
                 }
             }
         }
-        Flickable {
+        Scroller {
             vertical-stretch: 1;
+            began => { input.clear-focus(); }
+            tapped => { input.clear-focus(); }
             VerticalLayout {
                 alignment: start;
                 padding-top: 8px;
@@ -641,6 +653,7 @@ component NetworkTestScreen inherits Rectangle {
                                 height: max(3 * 1rem, input.preferred-height);
                                 input := TextInput {
                                     text <=> root.ticket;
+                                    changed has-focus => { Typing.active = self.has-focus; }
                                     color: Theme.label;
                                     font-family: "Menlo";
                                     font-size: Theme.footnote * 1rem;
@@ -915,8 +928,8 @@ component ModelSheet inherits Rectangle {
                     clicked => { root.close(); }
                 }
             }
-            Flickable {
-                content-height: options.preferred-height;
+            Scroller {
+                preferred-height: options.preferred-height;
                 min-height: min(options.preferred-height, 420px);
                 options := VerticalLayout {
                     padding-left: Theme.margin;
@@ -1005,11 +1018,17 @@ export component AppWindow inherits Window {
     property <length> top: self.safe-area-insets.top;
     property <length> bottom: self.safe-area-insets.bottom;
     // When the keyboard is up, it covers the tab bar and the content ends at
-    // its top edge.
-    property <length> keyboard: self.virtual-keyboard-size.height;
+    // its top edge. How much of the window it covers, not its size: Slint
+    // follows the keyboard's frame as it slides, and a keyboard that has slid
+    // away keeps its size below the window, which kept the tab bar hidden
+    // with nothing to bring it back. And none at all with no field focused:
+    // see Typing.
+    property <length> keyboard: Typing.active && self.virtual-keyboard-size.height > 0
+        ? max(0px, self.height - self.virtual-keyboard-position.y) : 0px;
 
     if !root.connected: ConnectScreen {
         top-inset: root.top;
+        bottom-inset: root.keyboard;
         url <=> root.server-url;
         key <=> root.api-key;
         busy: root.connecting;

@@ -5,6 +5,14 @@
 import { Theme } from "theme.slint";
 import { Spinner } from "std-widgets.slint";
 
+// Whether a text field holds the keyboard. Every field sets it as it gains
+// and loses focus. A keyboard let go of while it is still sliding in sends
+// iOS no word of leaving, and Slint goes on reporting it at full height; with
+// no field focused there is no keyboard, whatever Slint was last told.
+export global Typing {
+    in-out property <bool> active;
+}
+
 // Anything that can be pressed: it dims while held, as UIKit's controls do.
 export component Pressable inherits Rectangle {
     callback clicked;
@@ -215,6 +223,8 @@ export component Field inherits Rectangle {
     in-out property <string> text <=> input.text;
     in property <bool> enabled: true;
     height: Theme.touch;
+    // Lets the keyboard go, for a tap or a drag outside the field.
+    public function blur() { input.clear-focus(); }
     HorizontalLayout {
         padding-left: Theme.margin;
         padding-right: Theme.margin;
@@ -235,6 +245,7 @@ export component Field inherits Rectangle {
                 single-line: true;
                 input-type: root.input-type;
                 enabled: root.enabled;
+                changed has-focus => { Typing.active = self.has-focus; }
                 selection-background-color: Theme.accent.with-alpha(0.35);
                 accepted => { root.accepted(); }
             }
@@ -370,4 +381,177 @@ export component TabItem inherits Rectangle {
     TouchArea {
         clicked => { root.clicked(); }
     }
+}
+
+// A scrolling view that moves the way UIScrollView does, which Flickable does
+// not: the content keeps going when let go and slows down, and past either
+// end it stretches under the finger and springs back. It bounces even when
+// everything fits, as iOS lists do.
+//
+// The SwipeGestureHandler holds a press back for 100 ms, as UIKit does, and
+// takes it from the content only once it moves 8 points up or down: a tap
+// still reaches the button under it.
+export component Scroller inherits Rectangle {
+    // How far the content is moved, as Flickable's content-y: 0 at the top,
+    // negative further down, and past 0 or end-offset while it stretches.
+    in-out property <length> offset;
+    // Stay with the end as the content grows, while the reader is there: a
+    // chat's newest words.
+    in property <bool> keep-end;
+    in-out property <bool> at-end: true;
+    out property <length> content-height: content.preferred-height;
+    out property <length> end-offset: min(0px, root.height - root.content-height);
+    out property <bool> moving: gesture.swiping || root.coasting;
+    // A drag starts: the keyboard goes, as with keyboardDismissMode onDrag.
+    callback began();
+    // A tap that nothing in the content took.
+    callback tapped();
+
+    // In points a second, positive while the content moves down.
+    property <float> velocity;
+    property <bool> coasting;
+    // Where a drag began, the finger's and the content's unstretched one.
+    property <length> base;
+    property <length> start;
+    property <length> last-y;
+    property <float> last-ms;
+
+    clip: true;
+
+    changed end-offset => {
+        if !root.moving {
+            if root.keep-end && root.at-end {
+                root.offset = root.end-offset;
+            } else if root.offset < root.end-offset {
+                root.offset = root.end-offset;
+            }
+        }
+    }
+
+    // UIKit's rubber band: the further past the end, the less it gives.
+    pure function rubber(x: length) -> length {
+        return (1 - 1 / (x / root.height * 0.55 + 1)) * root.height;
+    }
+    pure function unrubber(y: length) -> length {
+        return root.height / 0.55 * (y / max(1px, root.height - y));
+    }
+    pure function stretch(raw: length) -> length {
+        if raw > 0px {
+            return root.rubber(raw);
+        }
+        if raw < root.end-offset {
+            return root.end-offset - root.rubber(root.end-offset - raw);
+        }
+        return raw;
+    }
+    pure function unstretch(shown: length) -> length {
+        if shown > 0px {
+            return root.unrubber(shown);
+        }
+        if shown < root.end-offset {
+            return root.end-offset - root.unrubber(root.end-offset - shown);
+        }
+        return shown;
+    }
+
+    function rest() {
+        root.coasting = false;
+        root.velocity = 0;
+        root.at-end = root.offset <= root.end-offset + 24px;
+    }
+
+    function release(v: float) {
+        root.velocity = v;
+        root.last-ms = animation-tick() / 1ms;
+        root.coasting = true;
+    }
+
+    // One frame of the coast: inside, slow down at UIKit's normal rate of
+    // 0.998 a millisecond; past an end, a critically damped spring of 0.4 s
+    // pulls it back.
+    function step() {
+        let now = animation-tick() / 1ms;
+        let dt = max(0.001, min(0.05, (now - root.last-ms) / 1000));
+        root.last-ms = now;
+        let edge = root.offset > 0px ? 0px : root.end-offset;
+        if root.offset > 0px || root.offset < root.end-offset {
+            let x = (root.offset - edge) / 1px;
+            root.velocity += (-246.7 * x - 31.4 * root.velocity) * dt;
+            root.offset += root.velocity * dt * 1px;
+            let now-x = (root.offset - edge) / 1px;
+            if now-x * x <= 0 || (abs(now-x) < 0.5 && abs(root.velocity) < 10) {
+                root.offset = edge;
+                root.rest();
+            }
+        } else {
+            root.velocity *= pow(0.998, dt * 1000);
+            root.offset += root.velocity * dt * 1px;
+            if abs(root.velocity) < 8 {
+                root.rest();
+            }
+        }
+    }
+
+    Timer {
+        interval: 16ms;
+        running: root.coasting;
+        triggered => { root.step(); }
+    }
+
+    gesture := SwipeGestureHandler {
+        handle-swipe-up: true;
+        handle-swipe-down: true;
+        // A finger down stops a coast where it is, as on iOS; past an end it
+        // springs back regardless.
+        changed pressed-position => {
+            if root.coasting && root.offset <= 0px && root.offset >= root.end-offset {
+                root.rest();
+            }
+        }
+        moved => {
+            if !self.swiping {
+                return;
+            }
+            let y = self.current-position.y;
+            let now = animation-tick() / 1ms;
+            if root.base == -1px {
+                root.coasting = false;
+                root.base = y;
+                root.start = root.unstretch(root.offset);
+                root.velocity = 0;
+                root.last-y = y;
+                root.last-ms = now;
+                root.began();
+            }
+            let dt = now - root.last-ms;
+            if dt > 0 {
+                let v = (y - root.last-y) / 1px / dt * 1000;
+                root.velocity = 0.75 * v + 0.25 * root.velocity;
+                root.last-y = y;
+                root.last-ms = now;
+            }
+            root.offset = root.stretch(root.start + (y - root.base));
+        }
+        // A finger that stopped before it lifted throws nothing.
+        swiped => {
+            root.base = -1px;
+            root.release(animation-tick() / 1ms - root.last-ms > 80 ? 0 : root.velocity);
+        }
+        cancelled => {
+            root.base = -1px;
+            root.release(0);
+        }
+        TouchArea {
+            clicked => { root.tapped(); }
+        }
+        content := VerticalLayout {
+            width: root.width;
+            y: root.offset;
+            height: self.preferred-height;
+            alignment: LayoutAlignment.start;
+            @children
+        }
+    }
+
+    init => { root.base = -1px; }
 }

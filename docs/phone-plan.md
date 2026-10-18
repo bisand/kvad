@@ -247,6 +247,27 @@ The team now goes in an uncommitted `ios/Team.local.xcconfig`, included by
 Xcode's window was thrown away by the next generate. The README has the
 steps from a fresh Mac to the app on the phone.
 
+Found on the phone the same day, and fixed: after a message was sent the
+app was stuck, with no tab bar and no way back to More; a long reply would
+not scroll; nothing let the keyboard go; and lists stopped dead at their
+ends. Four causes:
+
+- Slint reports the keyboard's size, which a keyboard that has slid away
+  keeps. The window now measures how much of it the keyboard covers, and
+  counts none while no field has focus (`Typing`): a keyboard let go of
+  while still sliding in sends no word of leaving at all.
+- A list asked its wrapped text for its height at another width than the
+  text's own, and a long reply came out a quarter of its height, too short
+  for Flickable to scroll. A message now passes its text's height up as
+  its minimum.
+- Nothing cleared a field's focus. A tap outside it or a drag of the list
+  now does, as `keyboardDismissMode` onDrag does on iOS.
+- Flickable has no rubber band. `Scroller` (parts.slint), on Slint's
+  SwipeGestureHandler, moves as UIScrollView does: it coasts at UIKit's
+  0.998 a millisecond, stretches past either end under the finger and
+  springs back, bounces when everything fits, and still lets a tap reach
+  the row under it. It replaced every Flickable in the app.
+
 Not yet done:
 
 - *Pairing on mobile data alone*, through the relay with the link's voucher

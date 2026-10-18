@@ -1,7 +1,9 @@
 <script>
   // Speech to text: a recording in, what is said in it out, a segment at a
-  // time as the Whisper hears it.
+  // time as the Whisper hears it; or the microphone, written down while
+  // somebody speaks.
   import { transcribe, LANGUAGES, clock } from "../lib/transcribe.svelte.js";
+  import { live } from "../lib/live.svelte.js";
   import { models, humanBytes } from "../lib/models.svelte.js";
   import { navigate } from "../lib/router.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
@@ -10,6 +12,7 @@
   const FILE = "M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z";
   const COPY = "M8 8h12v12H8zM4 16V4h12";
   const DOWNLOAD = "M12 3v12M7 10l5 5 5-5M5 21h14";
+  const MIC = "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2M12 19v3";
 
   $effect(() => {
     models.refresh();
@@ -51,6 +54,18 @@
   );
   const languageName = (code) => LANGUAGES.find((l) => l.code === code)?.name ?? code;
   const saved = $derived(t.segments.length > 0 && !t.running);
+
+  const l = $derived(live);
+  const liveWhere = $derived(
+    l.phase === "loading"
+      ? `Loading ${l.chosen?.id}${models.busy ? ` — ${models.busy.message}` : ""}`
+      : l.phase === "opening"
+        ? "Asking for the microphone"
+        : l.phase === "stopping"
+          ? "Settling the last words"
+          : `Listening · ${at(l.sent)} · ${l.lag < 1 ? "under a second" : `${l.lag.toFixed(1)} s`} behind`,
+  );
+  const busy = $derived(t.running || l.running);
 </script>
 
 <div class="flex flex-col gap-6">
@@ -65,6 +80,100 @@
     </div>
   {/if}
 
+  <div role="tablist" class="tabs tabs-box w-fit">
+    <button role="tab" class="tab" class:tab-active={t.mode === "file"} disabled={busy} onclick={() => (t.mode = "file")}>
+      <Icon path={FILE} size={14} class="me-1.5" /> A recording
+    </button>
+    <button role="tab" class="tab" class:tab-active={t.mode === "microphone"} disabled={busy} onclick={() => (t.mode = "microphone")}>
+      <Icon path={MIC} size={14} class="me-1.5" /> The microphone
+    </button>
+  </div>
+
+  {#if t.mode === "microphone"}
+  <div class="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
+    <section class="flex flex-col gap-3">
+      <label class="flex flex-col gap-1">
+        <span class="text-sm opacity-70">Model</span>
+        <select class="select w-full" bind:value={() => l.chosen?.id, (id) => (l.model = id)} disabled={l.running}>
+          {#each l.choices as c (c.id)}
+            <option value={c.id}>{c.label}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="flex flex-col gap-1">
+        <span class="text-sm opacity-70">Language spoken</span>
+        <select class="select w-full" bind:value={l.language} disabled={l.running}>
+          <option value="">Model's own</option>
+          <option value="auto">Detect it</option>
+          {#each LANGUAGES as x (x.code)}
+            <option value={x.code}>{x.name}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="flex flex-col gap-1">
+        <span class="text-sm opacity-70">Prompt</span>
+        <textarea
+          class="textarea h-16 w-full"
+          bind:value={l.prompt}
+          disabled={l.running}
+          placeholder="Optional: names and spellings to expect — Grieg, Kygo, Bodø"
+        ></textarea>
+      </label>
+      <p class="text-xs opacity-60">
+        The words come back while you speak. Grey is the Whisper's guess so far; a word turns
+        black once two guesses in a row agree on it, and does not change after. A small Whisper
+        on the GPU keeps up best: it shows a word about half a second after it is said. The
+        sound goes to the server as you speak, and none of it is kept there.
+      </p>
+      <div class="flex items-center gap-2">
+        {#if l.running}
+          <button class="btn" onclick={() => l.stop()} disabled={l.phase === "stopping"}>
+            {#if l.phase !== "listening"}<span class="loading loading-spinner loading-xs"></span>{/if}
+            Stop
+          </button>
+        {:else}
+          <button class="btn btn-primary" onclick={() => l.start()} disabled={!l.chosen}>
+            <Icon path={MIC} size={16} /> Start listening
+          </button>
+        {/if}
+      </div>
+    </section>
+
+    <section class="bg-base-200 rounded-box flex min-h-80 flex-col gap-3 p-4">
+      {#if l.running}
+        <p class="flex items-center gap-2 text-sm opacity-70">
+          {#if l.phase === "listening"}<span class="status status-error animate-pulse"></span>{/if}
+          {liveWhere}
+        </p>
+      {:else if l.error}
+        <div role="alert" class="alert alert-error alert-soft">
+          <Icon path={WARN} />
+          <span>{l.error}</span>
+        </div>
+      {:else if l.settled}
+        <p class="text-xs opacity-70">
+          {at(l.sent)}{#if l.language_heard}{" "}of {languageName(l.language_heard)}{/if}, heard live
+        </p>
+      {/if}
+
+      {#if l.settled || l.partial}
+        <p class="max-h-[32rem] overflow-y-auto leading-relaxed">
+          <span>{l.settled.trimStart()}</span><span class="opacity-50">{l.settled ? l.partial : l.partial.trimStart()}</span>
+        </p>
+      {:else if !l.running && !l.error}
+        <p class="m-auto text-sm opacity-60">What you say appears here as you say it.</p>
+      {/if}
+
+      {#if l.settled && !l.running}
+        <div class="mt-auto flex flex-wrap items-center gap-1 pt-2">
+          <button class="btn btn-sm" onclick={() => l.copy()}>
+            <Icon path={COPY} size={14} /> Copy text
+          </button>
+        </div>
+      {/if}
+    </section>
+  </div>
+  {:else}
   <div class="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
     <!-- What to listen to. -->
     <section class="flex flex-col gap-3">
@@ -223,4 +332,5 @@
       {/if}
     </section>
   </div>
+  {/if}
 </div>

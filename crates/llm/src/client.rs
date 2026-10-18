@@ -1072,6 +1072,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
     (
         "get",
+        "/v1/realtime",
+        "a WebSocket, for the web UI's microphone and the phone. `kvad transcribe --live -` \
+         runs the same live session in this process, on audio from stdin",
+    ),
+    (
+        "get",
         "/api/remote/voucher",
         "fetched by the client itself, whatever the command, once a paired device's relay voucher is half \
          spent; see `Remote::renew`",

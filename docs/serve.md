@@ -37,6 +37,10 @@ by its diffusion decoder or, when asked, its convolutional one
 the GPU or the CPU; a form with the recording in, the transcript out in any
 of OpenAI's five formats, at a CPU backend the same bytes
 `kvad transcribe --local` writes, and nothing kept (`docs/speech-plan.md`).
+`/v1/realtime?intent=transcription` is OpenAI's Realtime WebSocket for a
+transcription session: audio up while somebody speaks, settled words and a
+replaceable partial down, about half a second behind the voice on a small
+Whisper at gpu-q8; the Transcribe page's microphone uses it.
 Four authentication modes (`none`, `local`, `basic`,
 `oidc`), roles, API keys. SQLite for everything the filesystem cannot answer.
 `docs/ui-plan.md` is the plan it was built from, and each phase in it records

@@ -709,6 +709,46 @@ pub const ENDPOINTS: &[Endpoint] = &[
         ],
     },
 
+    Endpoint {
+        method: "get", path: "/v1/realtime", tag: "Speech", access: Access::SignedIn,
+        summary: "Transcribe live, over a WebSocket (OpenAI Realtime, transcription only)",
+        description: "Upgraded to a WebSocket: audio goes up as it is recorded, and words \
+                      come down while somebody is speaking. OpenAI's Realtime events for a \
+                      transcription session. In: `session.update`, `{session: {type: \
+                      \"transcription\", audio: {input: {format: {type: \"audio/pcm\", rate}, \
+                      transcription: {model, language, prompt}}}}}`, before the first audio; \
+                      `input_audio_buffer.append`, `{audio}`, base64 of 16-bit little-endian \
+                      mono PCM; and `input_audio_buffer.commit`, the end of a turn. The clean \
+                      end is a commit, its `completed`, then the client's close.\n\n\
+                      kvad's own: a binary frame is audio, the same PCM without the base64; \
+                      the rate is 16 kHz unless the session names another (8 to 48 kHz, \
+                      resampled); and a replaceable partial beside the settled deltas. About \
+                      once a second the window is decoded again; a word is settled once two \
+                      updates agree on it, and never changes after. An update still running \
+                      when the next is due skips it: audio is never dropped. A session cookie \
+                      needs an `Origin` that is this server. Nothing is kept.",
+        query: &[
+            ("intent", false, "`transcription`, the only kind of session there is."),
+            ("model", false, "A Whisper, as `session.update` would name it; loaded if it fits."),
+        ],
+        body: None,
+        produces: "a WebSocket of JSON events",
+        events: &[
+            ("session.created", "`{session}`, on connecting: the format and transcription it will use."),
+            ("session.updated", "`{session}`, after a `session.update`."),
+            ("conversation.item.input_audio_transcription.delta", "`{item_id, content_index, delta}`: \
+                text settled, to be added to what came before; and under `kvad` how many seconds \
+                the update had `heard`, and the `lag` behind the audio received."),
+            ("kvad.transcription.partial", "`{item_id, text, kvad}`: the guess at the words after \
+                the settled ones. Each replaces the last."),
+            ("input_audio_buffer.committed", "`{item_id, previous_item_id}`, after a commit."),
+            ("conversation.item.input_audio_transcription.completed", "`{item_id, content_index, \
+                transcript}`: the turn's whole text, and under `kvad` its `language`."),
+            ("error", "`{error: {type, code, message}}`. A `server_error` or a refused model \
+                ends the session."),
+        ],
+    },
+
     // -- Playground ---------------------------------------------------------
     Endpoint {
         method: "post", path: "/api/playground/complete", tag: "Playground",
@@ -1405,6 +1445,7 @@ mod tests {
         ("images.rs", include_str!("images.rs")),
         ("videos.rs", include_str!("videos.rs")),
         ("speech.rs", include_str!("speech.rs")),
+        ("realtime.rs", include_str!("realtime.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("storage.rs", include_str!("storage.rs")),
         ("cluster.rs", include_str!("cluster.rs")),

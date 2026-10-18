@@ -19,9 +19,11 @@
 //! 4. [`transcribe`] — the decoding loop: the prompt, the rules about what
 //!    may be said, the walk through a long recording, and the formats a
 //!    transcript is written out in.
-//! 5. [`align`] — when each word was said, from where the decoder's
+//! 5. [`live`] — the same loop over audio that is still arriving: a window
+//!    decoded again as it grows, and words settled once two runs agree.
+//! 6. [`align`] — when each word was said, from where the decoder's
 //!    cross-attention looks.
-//! 6. [`score`] — how wrong a "who spoke when" is: the diarization error
+//! 7. [`score`] — how wrong a "who spoke when" is: the diarization error
 //!    rates, and the Hungarian algorithm they map speakers with.
 //!
 //! Every Whisper on the Hub in transformers' layout loads: OpenAI's own
@@ -35,12 +37,14 @@
 
 pub mod align;
 pub mod audio;
+pub mod live;
 pub mod mel;
 pub mod reference;
 pub mod score;
 pub mod transcribe;
 pub mod whisper;
 
+pub use live::{Live, Update};
 pub use transcribe::{Format, Progress, Request, Segment, Task, Transcriber, Transcript};
 
 use crate::quant::Precision;

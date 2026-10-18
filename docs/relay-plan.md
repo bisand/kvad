@@ -719,10 +719,11 @@ least builds it.
 **Phase 6: the reason for all of it.** A phone client that records and sees
 the words come back while it records. The app is its own plan,
 `docs/phone-plan.md`: a Slint app in Rust, a client for all of Kvad. The file endpoint,
-`POST /v1/audio/transcriptions`, is built (`docs/speech-plan.md`). The live
-one is planned there, under *Live, from the phone*: a WebSocket with audio
-going up and settled words and a replaceable partial coming down, about 1
-to 2 s behind the voice on large at gpu-q8.
+`POST /v1/audio/transcriptions`, is built (`docs/speech-plan.md`). So is
+the live one, `/v1/realtime`, under *Live, from the phone*: a WebSocket with
+audio going up and settled words and a replaceable partial coming down, a
+word shown about 0.4 s and settled about 1.6 s after it is spoken on small
+at gpu-q8.
 
 What it asks of this plan:
 

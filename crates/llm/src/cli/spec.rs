@@ -118,6 +118,7 @@ const TRANSCRIBE: &[Flag] = &[
     f("--prompt", "T", Kind::Text, "text to read the recording as following: names, spelling, style"),
     f("--temperature", "F", Kind::Text, "above 0, decode at this temperature only (default, and 0: greedy, warmer for a window that fails)"),
     f("--out", "FILE", Kind::File, "where to write it (default: the terminal)"),
+    sw("--live", "with FILE `-`: raw 16 kHz mono f32 from stdin, written down as it comes, in this process"),
     QUANT,
     BACKEND,
 ];
@@ -384,11 +385,16 @@ pub const COMMANDS: &[Command] = &[
                 With a server running, the recording is sent to it, and its Whisper writes it\n\
                 down: on its GPU at gpu-q8 where it has one, unless --backend or --quant says\n\
                 otherwise. --local runs it in this process, on the CPU, at f32 unless --quant\n\
-                says otherwise.",
+                says otherwise.\n\n\
+                --live - reads raw audio from stdin, 16 kHz mono f32 little-endian, and writes\n\
+                the words down while it comes: settled text to stdout, the guess at the rest\n\
+                dimmed after it on a terminal. It runs in this process; on the CPU only tiny\n\
+                keeps up with speech.",
         examples: &[
             "kvad transcribe intervju.mp3 --model NbAiLab/nb-whisper-small",
             "kvad transcribe talk.wav --model openai/whisper-small --format srt --out talk.srt",
             "kvad transcribe nyheter.m4a --model NbAiLab/nb-whisper-large --backend gpu-q8 --language en",
+            "ffmpeg -i talk.mp3 -f f32le -ac 1 -ar 16000 - | kvad transcribe --live - --model NbAiLab/nb-whisper-tiny --quant q8",
         ],
     },
     // -- train your own ----------------------------------------------------

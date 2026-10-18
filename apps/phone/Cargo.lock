@@ -3194,14 +3194,23 @@ dependencies = [
 name = "kvad-phone"
 version = "0.1.0"
 dependencies = [
+ "kvad-phone-core",
+ "relay-probe",
+ "slint",
+ "slint-build",
+ "tokio",
+]
+
+[[package]]
+name = "kvad-phone-core"
+version = "0.1.0"
+dependencies = [
  "iroh",
  "kvad-tunnel",
  "libc",
  "relay-probe",
  "security-framework",
  "serde_json",
- "slint",
- "slint-build",
  "tokio",
  "ureq",
 ]

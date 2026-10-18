@@ -1,9 +1,9 @@
 //! What the app asks for and what it is told: one command in, events out,
 //! each a JSON object with one key, its name (`messages.json` lists them).
 //!
-//! Every command that waits on the network runs on a thread of its own, as
-//! the Slint app's callbacks did, so `handle` returns at once. Its answers
-//! come through `emit`, from whichever thread has them.
+//! Every command that waits on the network runs on a thread of its own, so
+//! `handle` returns at once. Its answers come through `emit`, from whichever
+//! thread has them.
 //!
 //! A server is an address on the LAN, reached over plain HTTP, or a paired
 //! `kvad://` server, reached through the tunnel of docs/relay-plan.md from

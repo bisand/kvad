@@ -29,18 +29,10 @@ The Swift side's tests decode every event in `messages.json`:
 cd apps/phone/ios && xcodegen generate && xcodebuild test -project Kvad.xcodeproj -scheme Kvad -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -derivedDataPath ../target/xcode
 ```
 
-The Slint UI the app had first (`src/`, `ui/`) still runs on the Mac with
-`cargo run`, until it is deleted; the iOS project no longer builds it.
+## While designing
 
-## On the Mac, while designing
-
-```bash
-cargo run --manifest-path apps/phone/Cargo.toml
-```
-
-It opens a window at an iPhone's size in points. Type is smaller than on the
-phone, because the Mac has no Dynamic Type to set 1rem. The simulator is the
-check that counts.
+In Xcode, with `ios/Kvad.xcodeproj` open, on the simulator. The simulator
+is the check that counts, and the phone after it.
 
 ## In the iOS Simulator
 
@@ -210,6 +202,5 @@ mapping that expires; and Wi-Fi on at home, for the LAN case.
 
 ## Licences
 
-Kvad's code here is MIT. The iPhone app ships no Slint. The Slint UI that
-still runs on the Mac uses Slint under its royalty-free licence, whose
-attribution is its More tab's About section (`AboutSlint`).
+Kvad's code here is MIT. The app ships no third-party UI code: SwiftUI and
+UIKit are the system's.

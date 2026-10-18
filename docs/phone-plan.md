@@ -16,24 +16,25 @@ phone, and well made.
 
 ## The choices
 
-**Slint 1.18, Rust only.** Slint renders natively, through winit and Skia,
-with no web view. Its UI is a declarative `.slint` markup compiled into the
-binary, and everything else is Rust. Slint's iOS support covers what makes
-an app feel at home: the safe area, the software keyboard's frame, Dynamic
-Type's font size and the system's dark mode. It also takes part in UIKit's
-scene lifecycle, which iOS 27 requires. Chosen by the owner over Dioxus,
-whose iOS UI is a web view, and Tauri, whose UI would have been the Svelte
-web UI.
+**SwiftUI over a Rust core.** The screens are SwiftUI, so scrolling, the
+keyboard, the tab bar and text are UIKit's own. Everything under them is
+Rust: the client, pairing, the tunnel, the Keychain and the Network test,
+in `apps/phone/core`. Swift calls it through three C functions, with one
+JSON message each way. [phone-swiftui-plan.md](phone-swiftui-plan.md) has
+the boundary and why it is drawn there.
 
-Slint is licensed GPL-3.0, or under its royalty-free licence, which asks
-for attribution: an "About Slint" mention in the app or its listing. The
-app takes the royalty-free licence and says so in its About screen. Kvad
-stays MIT.
+The app began on Slint 1.18, Rust only, which the owner chose over Dioxus
+(whose iOS UI is a web view) and Tauri (whose UI would have been the Svelte
+web UI). A day on a real phone showed how much UIKit gives every app that
+Slint, which draws every pixel itself, had to rebuild by hand: momentum and
+bounce, the keyboard's frame, wrapped text's height. That list is in
+phone-swiftui-plan.md, under *Why the move*.
 
-**Its own workspace.** `apps/phone/` holds the app, with a `[workspace]` of
-its own, as `tools/relay-probe` does. Slint and its renderer never enter
-Kvad's builds or its CI time. Only the Xcode project is iOS-specific. The
-Rust is not, so Android can follow later through Slint's Android backend.
+**Its own workspace.** `apps/phone/` is a Cargo workspace of its own, as
+`tools/relay-probe` is, so that the core's iroh and the iOS targets never
+enter Kvad's builds or its CI time. The core has no UI and no iOS-only
+code beyond the Keychain, so an Android app can call the same messages
+over JNI later, with a UI in Kotlin.
 
 **Not the CLI's client, yet.** `crates/llm/src/client.rs` is the CLI's
 client of a server, but it lives in the engine crate, among tokenizers and
@@ -47,22 +48,29 @@ cannot drift apart on the protocol.
 
 ```
 apps/phone/
-  Cargo.toml          its own workspace; slint, ureq, serde_json
-  build.rs            compiles ui/*.slint
-  src/main.rs         starts the UI, wires callbacks to the client
-  src/api.rs          the HTTP client: health, models, chat as a stream
-  ui/app.slint        the window, the tab bar, the screens
-  ui/theme.slint      colours and type, light and dark, after Apple's HIG
-  ios/project.yml     XcodeGen: bundle, Info.plist, scene manifest
-  ios/build.sh        Xcode's build phase: cargo for the right target
+  Cargo.toml          its own workspace, of the core alone
+  core/               the Rust: a static library for Xcode
+    kvad_core.h       the three C functions
+    src/lib.rs        the C functions: commands in, events out
+    src/session.rs    connect, pair, chat, unpair, opened links
+    src/api.rs        the HTTP client: health, models, chat as a stream
+    src/pairings.rs   the paired servers and the device key
+    src/secrets.rs    the one Keychain item they are kept in
+    src/probe.rs      the Network test, on relay-probe's dialler
+    tests/messages.rs the core driven by its messages alone
+  messages.json       every message, which both sides' tests read
+  ios/project.yml     XcodeGen: the app and its test target
+  ios/build.sh        Xcode's first build phase: cargo for the right target
+  ios/Kvad/           the SwiftUI app
+  ios/KvadTests/      every event in messages.json decodes
 ```
 
-- **Threads.** The UI runs on the main thread, as UIKit requires. Each
-  request runs on a worker thread, and its results go back with
-  `slint::Weak::upgrade_in_event_loop`. No async runtime is needed until the
-  tunnel brings iroh, and with it tokio.
+- **Threads.** SwiftUI runs on the main thread. The core runs each command
+  that waits on the network on a thread of its own, holds the tunnel's
+  tokio runtime, and calls back on whichever thread has the answer; Swift
+  moves each event onto the main actor before the model changes.
 - **The transport is pluggable.** `ureq` 3 takes its connection from a
-  `Transport`. Plain TCP and TLS come first. The tunnel from
+  `Transport`. Plain TCP and TLS came first. The tunnel from
   `docs/relay-plan.md` is a second `Transport`, so that the screens never
   know how the bytes travel.
 
@@ -81,8 +89,8 @@ not.
   sizes that follow Dynamic Type, light and dark from the system setting,
   and semantic colours (label, secondary label, grouped background,
   separator) rather than fixed greys. One accent colour, Kvad's.
-- **The phone's geometry.** Content inside `safe-area-insets`, the composer
-  riding on top of the keyboard (`virtual-keyboard-position`), and touch
+- **The phone's geometry.** Content inside the safe area, the composer
+  riding on top of the keyboard (SwiftUI's own keyboard avoidance), and touch
   targets of at least 44 points.
 - **Motion that means something:** a pressed state on every control, short
   transitions between screens, and a streaming caret while a reply is being
@@ -208,7 +216,7 @@ Tested in the iOS 26.5 simulator against a scratch kvad-serve:
   delegate's `scene:openURLContexts:` and
   `scene:willConnectToSession:options:` to Slint's `SlintWindowSceneDelegate`
   through the Objective-C runtime (`class_addMethod`), which implements
-  neither. An opened link that parses as a server or a pairing link goes in
+  neither. (The SwiftUI app has `.onOpenURL` and `scenePhase` instead.) An opened link that parses as a server or a pairing link goes in
   the Server field with a line saying which server it is; it is never
   acted on until *Connect*. While connected, the chat says a link was opened.
 - **Back in the foreground** (`sceneDidBecomeActive:`), the app tells the
@@ -269,11 +277,9 @@ settled.
 
 ## Open questions
 
-- Keychain access: through the `security-framework` crate, the usual one
-  for Apple's Security framework from Rust, or a small `objc2` binding of
-  our own. Phase 1 decides, by what it costs in the tree.
 - Is one binary for iPhone and iPad enough, or does the iPad want a sidebar
-  layout of its own? Slint can do both from one `.slint` tree.
+  layout of its own? SwiftUI's `NavigationSplitView` can do both from one
+  app.
 - Push notifications for long jobs (a video finished) need Apple's push
   service, which is a third party between the Mac and the phone. Is a local
   notification, when the app is next opened, enough?

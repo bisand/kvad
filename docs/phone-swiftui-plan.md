@@ -150,6 +150,9 @@ The About screen's Slint attribution goes too. Kvad stays MIT.
 3. **Slint out.** Delete the Slint UI, update phone-plan.md and the README,
    and close [#271](https://github.com/bisand/kvad/pull/271) unmerged. Its
    findings are written down above.
+   *Done, 2026-10-18:* `src/`, `ui/` and `build.rs` are gone, and with
+   them Slint, winit and Skia from the lockfile; `apps/phone` is a
+   workspace of the core alone.
 4. **On the phone.** In the simulator first, then on the iPhone 14 Pro Max:
    - scrolling and the keyboard, against the list of what went wrong;
    - pairing from the Camera;

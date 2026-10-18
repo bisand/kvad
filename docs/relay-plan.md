@@ -735,7 +735,7 @@ least builds it.
 
 **Phase 6: the reason for all of it.** A phone client that records and sees
 the words come back while it records. The app is its own plan,
-`docs/phone-plan.md`: a Slint app in Rust, a client for all of Kvad. The file endpoint,
+`docs/phone-plan.md`: SwiftUI over a Rust core, a client for all of Kvad. The file endpoint,
 `POST /v1/audio/transcriptions`, is built (`docs/speech-plan.md`). So is
 the live one, `/v1/realtime`, under *Live, from the phone*: a WebSocket with
 audio going up and settled words and a replaceable partial coming down, a

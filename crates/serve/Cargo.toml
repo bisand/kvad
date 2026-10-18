@@ -49,3 +49,8 @@ toml = "1.1.6"
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+# The scripted stand-in for a Whisper, which `/v1/realtime`'s tests play
+# into a session with no model downloaded.
+kvad = { path = "../llm", features = ["script"] }

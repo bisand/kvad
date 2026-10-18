@@ -720,26 +720,49 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       once a second the window is decoded again; a word is settled once two \
                       updates agree on it, and never changes after. An update still running \
                       when the next is due skips it: audio is never dropped. A session cookie \
-                      needs an `Origin` that is this server. Nothing is kept.",
+                      needs an `Origin` that is this server.\n\n\
+                      When the link drops, without a close, the session is held for 60 s, in \
+                      memory only. Every piece of audio has a sample offset at the session's \
+                      rate: `kvad: {offset}` on `input_audio_buffer.append`, and for binary \
+                      frames a `kvad.input_audio_buffer.offset`, `{offset}`, before them; audio \
+                      without one follows on. What the session has already is passed over, and \
+                      audio after a gap is refused (`audio_gap`). A reconnect names the session \
+                      (`resume`) and the `kvad.offset` of the last settled event it has \
+                      (`offset`): it is the same session, every settled event from there on \
+                      comes again with its `event_id`, and the client sends its audio on from \
+                      the `kvad.offset` its `session.created` gives. A reconnect takes a session \
+                      off a socket the server still thinks open. After the minute, or for \
+                      another's session, `error` `session_not_found`: send the recording to \
+                      `POST /v1/audio/transcriptions`. Nothing is kept beyond that.",
         query: &[
             ("intent", false, "`transcription`, the only kind of session there is."),
             ("model", false, "A Whisper, as `session.update` would name it; loaded if it fits."),
+            ("resume", false, "A session to go on with, by the `session.id` its `session.created` \
+                gave: held for 60 s after its socket went, for the account and device that began it."),
+            ("offset", false, "With `resume`: the `kvad.offset` of the last settled event the \
+                client has. Every settled event from that sample on is sent again; 0 by default."),
         ],
         body: None,
         produces: "a WebSocket of JSON events",
         events: &[
-            ("session.created", "`{session}`, on connecting: the format and transcription it will use."),
+            ("session.created", "`{session}`, on connecting: its `id`, for a reconnect, and the \
+                format and transcription it will use. On a reconnect, with `kvad: {resumed, offset, \
+                item_id, transcript}`: the samples the server has, the item under way and its text \
+                settled so far; the settled events from the `offset` asked for follow."),
             ("session.updated", "`{session}`, after a `session.update`."),
             ("conversation.item.input_audio_transcription.delta", "`{item_id, content_index, delta}`: \
                 text settled, to be added to what came before; and under `kvad` how many seconds \
-                the update had `heard`, and the `lag` behind the audio received."),
+                the update had `heard`, as the sample `offset` too, and the `lag` behind the audio \
+                received."),
             ("kvad.transcription.partial", "`{item_id, text, kvad}`: the guess at the words after \
                 the settled ones. Each replaces the last."),
             ("input_audio_buffer.committed", "`{item_id, previous_item_id}`, after a commit."),
             ("conversation.item.input_audio_transcription.completed", "`{item_id, content_index, \
                 transcript}`: the turn's whole text, and under `kvad` its `language`."),
             ("error", "`{error: {type, code, message}}`. A `server_error` or a refused model \
-                ends the session."),
+                ends the session; so does `session_not_found`, for a `resume` not held, and \
+                `session_taken`, on the socket a reconnect took the session from. `audio_gap` \
+                refuses audio placed past what the session has."),
         ],
     },
 

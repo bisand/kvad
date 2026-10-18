@@ -102,6 +102,14 @@ impl Server {
         self.tunnel.as_ref()?.path().map(|p| p.to_string())
     }
 
+    /// Says the phone's network may have changed; see
+    /// `kvad_tunnel::Client::network_changed`.
+    pub fn network_changed(&self) {
+        if let Some(t) = &self.tunnel {
+            t.network_changed();
+        }
+    }
+
     /// A fresh relay voucher for this phone, from a server it is paired with.
     pub fn voucher(&self) -> Res<String> {
         let v = self.get("/api/remote/voucher")?;

@@ -199,12 +199,34 @@ Tested in the iOS 26.5 simulator against a scratch kvad-serve:
 - Unpaired from the phone: the Mac closed its connection, and the app then
   says it is not paired.
 
+*Added, 2026-10-18: links and the foreground.*
+
+- **The Camera pairs.** The app registers the `kvad` URL scheme, so the
+  system Camera, scanning the QR code from `kvad remote pair`, offers to open
+  the link in Kvad; so does tapping one. Rather than a scanner of our own
+  (AVFoundation, and the camera permission with it), the app adds the scene
+  delegate's `scene:openURLContexts:` and
+  `scene:willConnectToSession:options:` to Slint's `SlintWindowSceneDelegate`
+  through the Objective-C runtime (`class_addMethod`), which implements
+  neither. An opened link that parses as a server or a pairing link goes in
+  the Server field with a line saying which server it is; it is never
+  acted on until *Connect*. While connected, the chat says a link was opened.
+- **Back in the foreground** (`sceneDidBecomeActive:`), the app tells the
+  tunnel the network may have changed (kvad-tunnel's `network_changed`,
+  iroh's `network_change`).
+
+Tested in the simulator with `simctl openurl`: a link opened while the app
+ran, and one that launched it, each filled the field; Connect then paired on
+the LAN. A link opened while connected showed in the chat; a malformed one
+was refused. The relay refused this scratch server's vouchers, since
+`relay.kvad.eu`'s allow list no longer has its key, so that pairing was
+on the LAN only.
+
 Not yet done:
 
-- *The camera.* Scanning the QR code needs AVFoundation, or the system's
-  Camera opening a `kvad://` URL in the app.
-- *Telling iroh about network changes* (`NWPathMonitor`).
-- *A run on a real iPhone over mobile data.*
+- *A network change while in the foreground* (`NWPathMonitor`). iroh notices
+  on its own, more slowly; coming back from the background is covered.
+- *A run on a real iPhone over mobile data*, with the real Camera.
 
 **Phase 5: the rest.** The More tab, screen by screen, ordered by what the
 owner reaches for from a phone.

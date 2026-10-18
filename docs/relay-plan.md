@@ -720,6 +720,10 @@ Built so far:
 - *The phone's part* (2026-10-18): Kvad for iPhone pairs with a pasted link
   and talks through the tunnel, on the LAN or through `relay.kvad.eu`, with
   its keys in the Keychain (`docs/phone-plan.md`, Phase 4).
+- *The QR code, from the phone* (2026-10-18): the app registers `kvad://`,
+  so the iPhone's own Camera opens the code from `kvad remote pair` in Kvad,
+  which fills in the Server field and waits for *Connect*. Coming back to
+  the foreground tells the tunnel to look for paths again.
 
 **Phase 5: packaging.** Helm, systemd, `install.sh --relay`, Terraform
 modules, Fly. Each target gets a short page on kvad.eu and a CI job that at

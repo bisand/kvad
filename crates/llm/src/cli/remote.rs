@@ -75,7 +75,7 @@ fn pair(args: &Args) -> Res<()> {
         return Ok(());
     }
     println!("{}", qr(link)?);
-    println!("Scan that with Kvad on the phone, or on another machine run:\n");
+    println!("Scan that with the iPhone's Camera, which opens it in Kvad, or on another machine run:\n");
     println!("    kvad remote join '{link}'\n");
     println!(
         "Good once, for {minutes} minutes. The device will act as {} on {}.",

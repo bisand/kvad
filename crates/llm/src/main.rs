@@ -188,11 +188,12 @@ struct Args {
     decay_to: Option<f32>,
     clip: Option<f32>,
     /// `transcribe`: what is spoken, how to write it down, and whether to
-    /// translate it and time it.
+    /// translate it and time it, and each word.
     language: Option<String>,
     format: Option<String>,
     translate: bool,
     timestamps: bool,
+    word_times: bool,
 }
 
 impl Default for Args {
@@ -287,6 +288,7 @@ impl Default for Args {
             format: None,
             translate: false,
             timestamps: false,
+            word_times: false,
         }
     }
 }
@@ -320,6 +322,7 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--all" => a.all = true,
         "--translate" => a.translate = true,
         "--timestamps" => a.timestamps = true,
+        "--words" => a.word_times = true,
         _ => return false,
     }
     true
@@ -788,10 +791,7 @@ fn transcribe(args: Args) -> Res<()> {
     let Some(model) = args.model.clone() else {
         return Err("which Whisper? --model NbAiLab/nb-whisper-small, say, or openai/whisper-small".into());
     };
-    let format = match args.format.as_deref() {
-        None => Format::Text,
-        Some(f) => Format::parse(f).ok_or_else(|| format!("--format expects text, json, verbose_json, srt or vtt, got `{f}`"))?,
-    };
+    let format = speech_format(&args, Format::Text)?;
     let timestamps = args.timestamps || matches!(format, Format::Srt | Format::Vtt | Format::VerboseJson);
     let task = if args.translate { Task::Translate } else { Task::Transcribe };
     let req = Request {
@@ -804,6 +804,7 @@ fn transcribe(args: Args) -> Res<()> {
         // same transcript whichever process answers it.
         temperature: args.temperature_given.then_some(args.temperature).filter(|&t| t > 0.0),
         seed: args.seed_given.then_some(args.seed),
+        words: args.word_times,
         ..Request::default()
     };
 
@@ -863,6 +864,24 @@ fn transcribe(args: Args) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// What `kvad transcribe` writes: `--format`, or `plain` without one.
+/// `--words` is written in `verbose_json` only, the one format with room for
+/// them, and is that format when no other is named.
+pub(crate) fn speech_format(args: &Args, plain: kvad::speech::Format) -> Res<kvad::speech::Format> {
+    use kvad::speech::Format;
+    match args.format.as_deref() {
+        None if args.word_times => Ok(Format::VerboseJson),
+        None => Ok(plain),
+        Some(f) => {
+            let format = Format::parse(f).ok_or_else(|| format!("--format expects text, json, verbose_json, srt or vtt, got `{f}`"))?;
+            if args.word_times && format != Format::VerboseJson {
+                return Err(format!("--words are written in verbose_json, not {f}: leave out --format, or name that one").into());
+            }
+            Ok(format)
+        }
+    }
 }
 
 /// `kvad crawl` — the other way to get something to train on.

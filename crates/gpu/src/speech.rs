@@ -26,6 +26,12 @@
 //!   window's.
 //!   Its projections are loaded the ordinary way, with the one-row kernels a
 //!   decode step wants.
+//! - **Words with times** ([`kvad::speech::align`]) want the cross-attention
+//!   weights of a few heads, which the fused kernel never lets out. So for
+//!   that pass, in each layer that holds one of those heads, the
+//!   cross-attention is written out, `softmax(q kᵀ · scale)` in f32 and
+//!   then times the values, and the pass stops after the last such layer:
+//!   it needs no scores.
 //!
 //! # Precision
 //!
@@ -409,6 +415,47 @@ impl GpuWhisper {
     /// `tokens` through the decoder after what `cache` holds, and the
     /// next-token scores after each of `rows`, on the host.
     pub(crate) fn step(&self, tokens: &[u32], cache: &mut [crate::common::KvCache], cross: &Cross, rows: &[usize]) -> Res<Vec<Vec<f32>>> {
+        let x = self.blocks(tokens, cache, cross, self.decoder.len(), &[], &mut [])?;
+        let x = self.ln_text.forward(&x, self.dtype)?.squeeze(0)?;
+        let at = Tensor::new(rows.iter().map(|&r| r as u32).collect::<Vec<_>>(), &self.device)?;
+        let h = x.index_select(&at, 0)?;
+        let logits = match (&self.head, &self.tokens) {
+            (Some(head), _) => head.forward(&h)?,
+            (None, Embed::Dense(table)) => h.matmul(&table.t()?)?,
+            (None, Embed::Quant(_)) => unreachable!("a quantised table has its head"),
+        };
+        let out = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        crate::common::report_failures(&self.device)?;
+        Ok(out)
+    }
+
+    /// The cross-attention weights of `heads`, `(layer, head)`, for
+    /// `tokens` from an empty cache, `[head][token][frame]` on the host.
+    pub fn attention(&self, tokens: &[u32], cross: &Cross, heads: &[(usize, usize)]) -> Res<Vec<f32>> {
+        let mut cache: Vec<crate::common::KvCache> = (0..self.decoder.len()).map(|_| crate::common::KvCache::new(2).stored_as(self.store)).collect();
+        let upto = heads.iter().map(|&(l, _)| l + 1).max().unwrap_or(0);
+        let mut weights = vec![None; heads.len()];
+        self.blocks(tokens, &mut cache, cross, upto, heads, &mut weights)?;
+        let weights: Vec<Tensor> = weights.into_iter().map(|w| w.ok_or("an alignment head past the decoder's layers")).collect::<Result<_, _>>()?;
+        let out = Tensor::stack(&weights, 0)?.flatten_all()?.to_vec1::<f32>()?;
+        crate::common::report_failures(&self.device)?;
+        Ok(out)
+    }
+
+    /// The first `upto` decoder blocks over `tokens`, after what `cache`
+    /// holds: the residual stream they leave, `[1, m, d]`. In a layer that
+    /// holds one of `heads`, the cross-attention is written out in f32 and
+    /// its weights for each of those heads, `[m, frames]`, put in `weights`
+    /// at that head's place.
+    fn blocks(
+        &self,
+        tokens: &[u32],
+        cache: &mut [crate::common::KvCache],
+        cross: &Cross,
+        upto: usize,
+        heads: &[(usize, usize)],
+        weights: &mut [Option<Tensor>],
+    ) -> Res<Tensor> {
         let c = &self.config;
         let (m, pos0) = (tokens.len(), cache[0].len());
         if pos0 + m > c.text_ctx {
@@ -422,37 +469,37 @@ impl GpuWhisper {
         let mut x = (x + self.text_pos.narrow(0, pos0, m)?)?.unsqueeze(0)?;
         let dt = self.dtype;
 
-        let heads = c.decoder_heads;
-        let scale = 1.0 / ((c.d / heads) as f64).sqrt();
+        let n_heads = c.decoder_heads;
+        let scale = 1.0 / ((c.d / n_heads) as f64).sqrt();
         let mask = match m {
             1 => None,
             _ => Some(crate::common::causal_mask(m, pos0, &self.device, DType::F32)?),
         };
-        for (l, (b, kv)) in self.decoder.iter().zip(cache.iter_mut()).enumerate() {
+        for (l, (b, kv)) in self.decoder.iter().zip(cache.iter_mut()).enumerate().take(upto) {
             let h = b.ln1.forward(&x, dt)?;
-            let q = split(&self.lin(&b.attn.q, &h)?, heads)?;
-            let (k, v) = kv.push(&split(&self.lin(&b.attn.k, &h)?, heads)?, &split(&self.lin(&b.attn.v, &h)?, heads)?)?;
+            let q = split(&self.lin(&b.attn.q, &h)?, n_heads)?;
+            let (k, v) = kv.push(&split(&self.lin(&b.attn.k, &h)?, n_heads)?, &split(&self.lin(&b.attn.v, &h)?, n_heads)?)?;
             let a = attend(&q, &k, &v, mask.as_ref(), scale)?;
             x = (x + b.attn.o.forward_in(&join(&a)?, DType::F32)?)?;
 
             let h = b.ln_cross.forward(&x, dt)?;
-            let q = split(&self.lin(&b.cross.q, &h)?, heads)?;
-            let a = attend(&q, &cross.k[l], &cross.v[l], None, scale)?;
+            let q = split(&self.lin(&b.cross.q, &h)?, n_heads)?;
+            let a = match heads.iter().any(|&(hl, _)| hl == l) {
+                false => attend(&q, &cross.k[l], &cross.v[l], None, scale)?,
+                true => {
+                    let f = |t: &Tensor| t.to_dtype(DType::F32);
+                    let p = crate::grad::softmax_last_dim(&(f(&q)?.matmul(&f(&cross.k[l].transpose(2, 3)?.contiguous()?)?)? * scale)?)?;
+                    for (k, &(_, head)) in heads.iter().enumerate().filter(|&(_, &(hl, _))| hl == l) {
+                        weights[k] = Some(p.get(0)?.get(head)?);
+                    }
+                    p.matmul(&f(&cross.v[l].contiguous()?)?)?.to_dtype(q.dtype())?
+                }
+            };
             x = (x + b.cross.o.forward_in(&join(&a)?, DType::F32)?)?;
 
             x = (&x + b.mlp.forward(&b.ln2.forward(&x, dt)?, dt)?)?;
         }
-        let x = self.ln_text.forward(&x, dt)?.squeeze(0)?;
-        let at = Tensor::new(rows.iter().map(|&r| r as u32).collect::<Vec<_>>(), &self.device)?;
-        let h = x.index_select(&at, 0)?;
-        let logits = match (&self.head, &self.tokens) {
-            (Some(head), _) => head.forward(&h)?,
-            (None, Embed::Dense(table)) => h.matmul(&table.t()?)?,
-            (None, Embed::Quant(_)) => unreachable!("a quantised table has its head"),
-        };
-        let out = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        crate::common::report_failures(&self.device)?;
-        Ok(out)
+        Ok(x)
     }
 
     /// A projection, answered in the compute dtype: a quantised matrix
@@ -526,6 +573,11 @@ impl kvad::speech::Model for GpuWhisper {
         let cross: &Cross = heard.get()?;
         // A pool a step, as a language model's decode has one a token.
         crate::common::pooled(|| self.step(tokens, cache, cross, rows))
+    }
+
+    fn attention(&self, tokens: &[u32], heard: &Heard, heads: &[(usize, usize)]) -> Res<Vec<f32>> {
+        let cross: &Cross = heard.get()?;
+        crate::common::pooled(|| self.attention(tokens, cross, heads))
     }
 
     fn within(&self, work: &mut (dyn FnMut() + Send)) {
@@ -613,10 +665,10 @@ mod tests {
                 crate::common::pooled(|| Ok(model.encode(window)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?))
             };
             let tol = match (dtype, quant) {
-                (DType::F32, None) => Tolerance { encoder: 2e-3, logits: 2e-3 },
+                (DType::F32, None) => Tolerance { encoder: 2e-3, logits: 2e-3, frames: 1 },
                 // Not the measure of right: the tokens are. A bound that
                 // catches a stage gone to noise.
-                _ => Tolerance { encoder: 0.75, logits: 0.1 },
+                _ => Tolerance { encoder: 0.75, logits: 0.1, frames: usize::MAX },
             };
             if let Err(e) = compare(&fx, &t, &encode, tol) {
                 eprintln!("{name}: {e}");

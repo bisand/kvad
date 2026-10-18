@@ -102,6 +102,7 @@ const TRANSCRIBE: &[Flag] = &[
     f("--language", "CODE", Kind::Text, "what is spoken, as no or en (default: the model's own, or detected); auto detects"),
     sw("--translate", "write it down in English, whatever is spoken"),
     sw("--timestamps", "time each stretch of text (on for srt, vtt and verbose_json)"),
+    sw("--words", "time every word as well, in verbose_json (its default with this)"),
     f(
         "--format",
         "F",

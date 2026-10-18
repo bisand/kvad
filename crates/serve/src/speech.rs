@@ -8,6 +8,10 @@
 //! [`kvad::speech::Transcript::render`]'s, so the server and `kvad
 //! transcribe --local` write the same bytes for the same recording.
 //!
+//! `timestamp_granularities[]=word`, with `verbose_json`, times every word
+//! as well ([`kvad::speech::align`]): a `words` array beside `segments`, as
+//! OpenAI's. It costs one more pass of the decoder over each window's text.
+//!
 //! What OpenAI has no field for: `seed`, and `timestamps`, which asks for
 //! timestamp tokens whatever the format. They change what is written, not
 //! only how it is laid out — a Whisper decodes a window differently when it
@@ -102,6 +106,17 @@ impl Asked {
             }
         }
         let timed = matches!(format, Format::Srt | Format::Vtt | Format::VerboseJson);
+        let mut words = false;
+        for g in f.texts(&["timestamp_granularities[]", "timestamp_granularities"]) {
+            match g.as_str() {
+                "word" => words = true,
+                "segment" => {}
+                other => return Err(Fail::bad(format!("timestamp_granularities are word and segment, not {other}"))),
+            }
+        }
+        if words && format != Format::VerboseJson {
+            return Err(Fail::bad("word timestamps are written in verbose_json: set response_format to it"));
+        }
         let request = Request {
             language: f.text(&["language"]).map(|l| l.trim().to_ascii_lowercase()),
             task,
@@ -110,6 +125,7 @@ impl Asked {
             // 0 is where OpenAI's fallback starts; see the module docs.
             temperature: temperature.filter(|&t| t > 0.0),
             seed: f.number(&["seed"])?,
+            words,
             ..Request::default()
         };
         Ok(Asked {
@@ -181,7 +197,7 @@ fn streamed(mut heard: tokio::sync::mpsc::Receiver<Heard>) -> impl IntoResponse 
                         "kvad": {
                             "done": p.done,
                             "total": p.total,
-                            "segments": p.segments.iter().map(|s| json!({ "start": s.start, "end": s.end, "text": s.text })).collect::<Vec<_>>(),
+                            "segments": p.segments.iter().map(segment).collect::<Vec<_>>(),
                         },
                     });
                     (sse("transcript.text.delta", &delta), false)
@@ -202,6 +218,15 @@ fn streamed(mut heard: tokio::sync::mpsc::Receiver<Heard>) -> impl IntoResponse 
         }
     });
     stream(rx)
+}
+
+/// A segment in a delta, with its words when they were asked for.
+fn segment(s: &kvad::speech::Segment) -> serde_json::Value {
+    let mut v = json!({ "start": s.start, "end": s.end, "text": s.text });
+    if !s.words.is_empty() {
+        v["words"] = s.words.iter().map(|w| json!({ "word": w.word.trim(), "start": w.start, "end": w.end })).collect::<Vec<_>>().into();
+    }
+    v
 }
 
 #[cfg(test)]
@@ -271,6 +296,22 @@ mod tests {
         // 0 is OpenAI's start of the fallback, not a temperature to keep to.
         let zero = Asked::read(&form(&[("file", Some("a.wav"), b"x"), ("temperature", None, b"0")]), Task::Transcribe).unwrap();
         assert_eq!(zero.request.temperature, None);
+    }
+
+    /// OpenAI's `timestamp_granularities[]`, a part a value, or JSON's
+    /// list: `word` times every word, and only `verbose_json` has room for
+    /// them.
+    #[test]
+    fn word_timestamps_are_asked_for_as_openai_asks() {
+        let words = |parts: &[(&str, Option<&str>, &[u8])]| Asked::read(&form(parts), Task::Transcribe).map(|a| a.request.words);
+        let file: (&str, Option<&str>, &[u8]) = ("file", Some("a.wav"), b"x");
+        let verbose: (&str, Option<&str>, &[u8]) = ("response_format", None, b"verbose_json");
+        assert_eq!(words(&[file, verbose]).unwrap(), false);
+        assert_eq!(words(&[file, verbose, ("timestamp_granularities[]", None, b"word")]).unwrap(), true);
+        assert_eq!(words(&[file, verbose, ("timestamp_granularities[]", None, b"segment"), ("timestamp_granularities[]", None, b"word")]).unwrap(), true);
+        assert_eq!(words(&[file, verbose, ("timestamp_granularities[]", None, b"segment")]).unwrap(), false);
+        assert!(words(&[file, ("timestamp_granularities[]", None, b"word")]).unwrap_err().1.contains("verbose_json"));
+        assert!(words(&[file, verbose, ("timestamp_granularities[]", None, b"letter")]).unwrap_err().1.contains("letter"));
     }
 
     #[test]

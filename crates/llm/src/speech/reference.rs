@@ -2,7 +2,8 @@
 //!
 //! `scripts/whisper-fixtures.py` runs transformers on one WAV and writes what
 //! each stage made of it: the spectrogram, the encoder's output, the scores
-//! after the prompt, and the greedy tokens with and without timestamps.
+//! after the prompt, the greedy tokens with and without timestamps, and the
+//! alignment heads' attention with the frame each token starts at.
 //! [`compare`] runs a [`Transcriber`] on the same audio and says how far each
 //! stage is from those, so that a difference says where it starts.
 //!
@@ -11,18 +12,21 @@
 //! has, plus the encoder's output, which only the model's own type can show
 //! and so is asked for by the caller.
 
-use super::{audio, mel, Model, Request, Transcriber};
+use super::{align, audio, mel, Model, Request, Transcriber};
 use std::path::Path;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// What a model is allowed to differ from transformers' f32 by, as a
 /// fraction of the largest number in the reference: the encoder's output and
-/// the scores after the prompt. The tokens may not differ at all.
+/// the scores after the prompt; and the frames a token's start may be from
+/// `timing.py`'s over transformers' attention. The tokens may not differ at
+/// all.
 #[derive(Debug, Clone, Copy)]
 pub struct Tolerance {
     pub encoder: f32,
     pub logits: f32,
+    pub frames: usize,
 }
 
 /// How far each stage was: the largest difference, and the largest number in
@@ -32,6 +36,10 @@ pub struct Gaps {
     pub mel: f32,
     pub encoder: (f32, f32),
     pub logits: (f32, f32),
+    /// The alignment heads' weights, and the most frames any token's start
+    /// is from the reference's.
+    pub attention: (f32, f32),
+    pub frames: usize,
 }
 
 /// The fixtures in `dir`: which model they were made with, the audio, and
@@ -134,6 +142,55 @@ pub fn compare(fx: &Fixtures, t: &Transcriber, encode: &(dyn Fn(&[f32]) -> Res<V
     gaps.logits = (max, scale);
     if max >= tol.logits * scale.max(1.0) {
         return Err(format!("the decoder is {max} from transformers'").into());
+    }
+
+    // Words with times: the alignment heads' weights over the plain text,
+    // and the frame each token starts at by them. In fixtures that have
+    // them; older ones were made before words were.
+    let rows = fx.ids("align_rows");
+    if rows.is_empty() {
+        eprintln!("attention: these fixtures have none; make them again for words");
+    } else {
+        let heads: Vec<(usize, usize)> = fx.meta["heads"]
+            .as_array()
+            .ok_or("tokens.json has align_rows and no heads")?
+            .iter()
+            .filter_map(|p| Some((p[0].as_u64()? as usize, p[1].as_u64()? as usize)))
+            .collect();
+        let weights = t.on_pool(|| {
+            let heard = model.hear(&window)?;
+            model.attention(&rows, &heard, &heads)
+        })?;
+        let (max, scale) = gap(&weights, &fx.numbers.get("attention")?.data);
+        eprintln!("attention: max gap {max:.2e} on weights up to {scale:.2}");
+        gaps.attention = (max, scale);
+        let text = fx.ids("plain").len();
+        let sot = rows.len() - text - 2;
+        let frames = weights.len() / (heads.len() * rows.len());
+        let ours = align::token_frames(&weights, heads.len(), rows.len(), frames, audio.len() / mel::HOP / 2, sot);
+        let theirs = fx.ids("token_starts");
+        let worst = ours.iter().zip(&theirs).map(|(&a, &b)| (a as i64 - b as i64).unsigned_abs() as usize).max().unwrap_or(0);
+        let late = ours.iter().zip(&theirs).filter(|(&a, &b)| a.abs_diff(b as usize) > 1).count();
+        // transformers' own token timestamps end each token where the next
+        // starts here; its first token ends at frame 0 by construction
+        // (`align`'s module comment), so that one is left out.
+        let ends = fx.ids("token_ends");
+        let off: Vec<String> =
+            ends.iter().enumerate().skip(1).filter(|&(k, &e)| ours.get(k + 1).is_some_and(|&s| s.abs_diff(e as usize) > 1)).map(|(k, &e)| format!("{k}: {} against {e}", ours[k + 1])).collect();
+        eprintln!(
+            "token starts: {} tokens, most {worst} frames from timing.py's, {late} more than a frame; against transformers' own ends, {} of {} more than a frame{}",
+            ours.len(),
+            off.len(),
+            ends.len().saturating_sub(1),
+            if off.is_empty() { String::new() } else { format!(" ({})", off.join(", ")) }
+        );
+        if ours.len() != theirs.len() {
+            return Err(format!("{} token starts against timing.py's {}", ours.len(), theirs.len()).into());
+        }
+        gaps.frames = worst;
+        if worst > tol.frames {
+            return Err(format!("a token starts {worst} frames from where timing.py has it").into());
+        }
     }
 
     // Greedy tokens, with timestamps and without, for the one window: both

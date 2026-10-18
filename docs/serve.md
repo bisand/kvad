@@ -591,7 +591,10 @@ without pairing, from `kvad remote id` on each.
   no further.
 - **A device's key is that device's.** It works only through the tunnel,
   from the device it was made for, and acts as `user` unless the device was
-  paired with `kvad remote pair --admin`, whatever its account is. A device
+  paired with `kvad remote pair --admin`, whatever its account is. So does
+  every key made through the device (`kvad keys add NAME --remote …`, for a
+  program behind `kvad tunnel`), and unpairing the device revokes them all:
+  asking for a key is not a way out of the device's limits. A device
   cannot pair other devices unless it has `admin`. A connection without the knock gets no
   answer at all, or one TLS alert sent before the server's key would be.
 - **Post-quantum.** X25519MLKEM768 is the only key exchange, to the device and

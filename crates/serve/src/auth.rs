@@ -458,7 +458,7 @@ impl FromRequestParts<State> for Identity {
         let via = parts.extensions.get::<axum::extract::ConnectInfo<crate::remote::Tunnelled>>().map(|c| c.0 .0);
         let who = tokio::task::spawn_blocking(move || {
             let mut who = auth.identify(&presented, &db)?;
-            // A device's key is that device's, and only through the tunnel:
+            // A device's keys are that device's, and only through the tunnel:
             // presented from anywhere else it is a key somebody copied.
             if let Presented::Bearer(token) = &presented {
                 if let Ok(Some(device)) = crate::devices::by_token(&db, token) {

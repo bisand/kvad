@@ -40,12 +40,13 @@ use std::sync::{Arc, RwLock};
 type Res<T> = Result<T, String>;
 
 const USAGE: &str = "\
-usage: kvad-relay --hostname NAME --bind IP --allow FILE --cache DIR [--staging]
+usage: kvad-relay --hostname NAME[,NAME...] --bind IP --allow FILE --cache DIR [--staging]
                   [--https-port 443] [--quic-port 7842] [--http-port 80]
        kvad-relay --dev --allow FILE";
 
 struct Opts {
-    hostname: Option<String>,
+    /// The names the relay answers to, all on one certificate.
+    hostnames: Vec<String>,
     bind: Option<IpAddr>,
     allow: PathBuf,
     cache: Option<PathBuf>,
@@ -61,7 +62,7 @@ struct Opts {
 
 fn parse() -> Res<Opts> {
     let mut o = Opts {
-        hostname: None,
+        hostnames: Vec::new(),
         bind: None,
         allow: PathBuf::new(),
         cache: None,
@@ -75,7 +76,9 @@ fn parse() -> Res<Opts> {
     while let Some(a) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{a} needs a value\n{USAGE}"));
         match a.as_str() {
-            "--hostname" => o.hostname = Some(value()?),
+            "--hostname" => {
+                o.hostnames.extend(value()?.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_string))
+            }
             "--bind" => o.bind = Some(value()?.parse().map_err(|_| "--bind takes an IP address")?),
             "--allow" => o.allow = PathBuf::from(value()?),
             "--cache" => o.cache = Some(PathBuf::from(value()?)),
@@ -90,7 +93,7 @@ fn parse() -> Res<Opts> {
     if o.allow.as_os_str().is_empty() {
         return Err(format!("--allow is required: a relay serves only the keys it is told about\n{USAGE}"));
     }
-    if !o.dev && (o.hostname.is_none() || o.bind.is_none() || o.cache.is_none()) {
+    if !o.dev && (o.hostnames.is_empty() || o.bind.is_none() || o.cache.is_none()) {
         return Err(format!("--hostname, --bind and --cache are required outside --dev\n{USAGE}"));
     }
     Ok(o)
@@ -180,12 +183,12 @@ async fn config(o: &Opts, allow: Arc<Allow>) -> Res<ServerConfig> {
         c.relay = Some(relay);
         return Ok(c);
     }
-    let (hostname, bind, cache) = (o.hostname.clone().unwrap(), o.bind.unwrap(), o.cache.clone().unwrap());
+    let (bind, cache) = (o.bind.unwrap(), o.cache.clone().unwrap());
     let builder = rustls::ServerConfig::builder_with_provider(crypto())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| e.to_string())?
         .with_no_client_auth();
-    let acme = AcmeConfig::letsencrypt(!o.staging).domains(vec![hostname]).cache_path(cache);
+    let acme = AcmeConfig::letsencrypt(!o.staging).domains(o.hostnames.clone()).cache_path(cache);
     let tls = TlsConfig::new(SocketAddr::new(bind, o.https_port), CertConfig::LetsEncrypt { acme_config: acme, server_config_builder: builder });
     // Plain HTTP only where nothing outside the machine can reach it.
     let mut relay = RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, o.http_port)));

@@ -68,6 +68,11 @@ runs the relay as an ordinary pod beside it:
   capabilities at all.
 - The certificate is kept on a 16 MiB PersistentVolumeClaim.
 
+`RELAY_HOSTNAME` may name several, comma-separated: they share one
+certificate, and the route matches any of them. Every name must resolve to
+the host before a deploy, or Let's Encrypt refuses the certificate for all
+of them.
+
 Only 7842/udp needs opening in the firewall; 443 is already Traefik's.
 
 ```bash
@@ -75,7 +80,7 @@ ufw allow in on eth0 to 217.170.199.230 port 7842 proto udp comment 'kvad-relay 
 ```
 
 ```bash
-RELAY_MANIFEST=deploy/k8s-traefik.yaml RELAY_HOSTNAME=relay2.kvad.eu RELAY_ADDRESS=217.170.199.230 deploy/deploy.sh root@tst01 deploy/allow.local -i ~/.ssh/id_tst01_networco_bogentech_no
+RELAY_MANIFEST=deploy/k8s-traefik.yaml RELAY_HOSTNAME=relay.kvad.eu,relay2.kvad.eu RELAY_ADDRESS=217.170.199.230 deploy/deploy.sh root@tst01 deploy/allow.local -i ~/.ssh/id_tst01_networco_bogentech_no
 ```
 
 ## Before deploying anywhere: does traffic arrive?

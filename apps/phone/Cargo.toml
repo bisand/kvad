@@ -1,36 +1,9 @@
-[package]
-name = "kvad-phone"
-version = "0.1.0"
-edition = "2021"
-publish = false
-# Kvad's own code here is MIT. Slint is taken under its royalty-free
-# licence, which asks for the attribution the About screen gives.
-license = "MIT"
-
-# Its own workspace, as tools/relay-probe has: Slint and Skia stay out of
-# Kvad's builds and its CI. See docs/phone-plan.md. `core` is the Rust the
-# SwiftUI app will call (docs/phone-swiftui-plan.md); this Slint app runs on
-# it until the SwiftUI one replaces it.
+# Kvad for iPhone's Rust: the core the SwiftUI app calls (core/,
+# docs/phone-swiftui-plan.md). Its own workspace, as tools/relay-probe has:
+# the tunnel's iroh and the iOS targets stay out of Kvad's builds.
 [workspace]
 members = ["core"]
-
-[[bin]]
-name = "kvad-phone"
-path = "src/main.rs"
-
-[dependencies]
-# winit and Skia are what Slint runs on iOS; the same pair runs on the Mac,
-# which is where the UI is iterated on before the simulator.
-slint = { version = "1.18.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility"] }
-# Connecting, pairing, the chat and the Keychain.
-kvad-phone-core = { path = "core" }
-# The Network test screen runs the relay probe's dialler: the same code as
-# `relay-probe dial`, from tools/relay-probe's library.
-relay-probe = { path = "../../tools/relay-probe" }
-tokio = { version = "1.44", features = ["rt-multi-thread", "time", "sync"] }
-
-[build-dependencies]
-slint-build = "1.18.1"
+resolver = "2"
 
 [profile.release]
 opt-level = 3

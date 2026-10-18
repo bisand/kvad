@@ -11,8 +11,7 @@ license = "MIT"
 # (docs/phone-swiftui-plan.md). A member of apps/phone's workspace.
 
 [lib]
-# A static library for Xcode to link, and a Rust one for the tests and,
-# until it goes, the Slint app.
+# A static library for Xcode to link, and a Rust one for the tests.
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]

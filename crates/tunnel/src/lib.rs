@@ -1073,6 +1073,13 @@ impl Client {
         selected(&self.conn)
     }
 
+    /// Waits until the connection is gone, whichever end or whatever in
+    /// between ended it, and says why: what a client that outlives one
+    /// connection waits on to make the next.
+    pub async fn closed(&self) -> String {
+        self.conn.closed().await.to_string()
+    }
+
     pub async fn close(&self) {
         self.conn.close(0u32.into(), b"");
         self.endpoint.close().await;

@@ -17,6 +17,8 @@
 //!   datasets, evals, benchmarks, metrics, accounts, and `kvad api` for any
 //!   route at all.
 //! * [`cluster`] — `kvad cluster`: measuring the links between machines.
+//! * [`remote`] and [`tunnel`] — pairing with a server reached through the
+//!   tunnel, and a local port that forwards to one.
 //! * [`out`] — tables, questions and progress lines.
 //! * [`spec`] — every command, word and flag in one table, which the next
 //!   two read.
@@ -33,6 +35,7 @@ pub mod out;
 pub mod remote;
 pub mod service;
 pub mod spec;
+pub mod tunnel;
 
 use crate::Args;
 use kvad::client::{self, Remote, Target};

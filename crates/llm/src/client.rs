@@ -362,6 +362,24 @@ pub fn device_id() -> Result<(String, bool), String> {
     Ok((key.id().to_string(), made))
 }
 
+/// A `kvad://` server's whole address. `kvad://<node id>` alone is a paired
+/// server's name: its address is the one kept when this device was paired.
+pub fn tunnel_address(url: &str) -> Result<kvad_tunnel::Address, String> {
+    let url = url.trim();
+    let url = match url.contains('?') {
+        true => url.to_string(),
+        false => credential(url.trim_end_matches('/'))
+            .and_then(|c| c.address)
+            .ok_or_else(|| format!("{url} is not a server this device is paired with: give its whole address, with k= in it"))?,
+    };
+    url.parse()
+}
+
+/// The `kvad://` servers this device is paired with, by name.
+pub fn paired() -> Vec<String> {
+    read_credentials().into_iter().filter(|(name, v)| name.starts_with("kvad://") && v["address"].is_string()).map(|(name, _)| name).collect()
+}
+
 /// What a request came back with when it was not a success.
 #[derive(Debug)]
 pub struct Failure {
@@ -496,15 +514,7 @@ impl Remote {
     /// A server by its `kvad://` address, through the tunnel: dialled now, as
     /// this machine's device key, and held until this remote is dropped.
     fn tunnelled(url: &str, why: Why) -> Result<Remote, String> {
-        // `kvad://<node id>` alone is a paired server's name: its address is
-        // the one kept when this device was paired.
-        let url = match url.contains('?') {
-            true => url.to_string(),
-            false => credential(url.trim_end_matches('/'))
-                .and_then(|c| c.address)
-                .ok_or_else(|| format!("{url} is not a server this device is paired with: give its whole address, with k= in it"))?,
-        };
-        let address: kvad_tunnel::Address = url.parse()?;
+        let address = tunnel_address(url)?;
         let base = address.label();
         let kept = credential(&base);
         let voucher = kept.as_ref().and_then(|c| c.voucher.as_deref()).and_then(|v| v.parse::<kvad_tunnel::Voucher>().ok());
@@ -1079,8 +1089,8 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
     (
         "get",
         "/api/remote/voucher",
-        "fetched by the client itself, whatever the command, once a paired device's relay voucher is half \
-         spent; see `Remote::renew`",
+        "fetched by the client itself, whatever the command, and by `kvad tunnel`, once a paired device's \
+         relay voucher is half spent; see `Remote::renew`",
     ),
     (
         "get",

@@ -1167,6 +1167,32 @@ pub const ENDPOINTS: &[Endpoint] = &[
         summary: "Revoke an API key",
         description: "", query: &[], body: None, produces: JSON, events: &[],
     },
+    Endpoint {
+        method: "get", path: "/api/remote", tag: "Accounts", access: Access::SignedIn,
+        summary: "Whether this server can be reached through the tunnel",
+        description: "`{ enabled, server, allowed }`: the `kvad://` name, and how many devices the tunnel lets in.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "post", path: "/api/remote/pair", tag: "Accounts", access: Access::SignedIn,
+        summary: "Open a pairing slot for a device of yours",
+        description: "A single-use link that lives ten minutes; `kvad remote join` with it pairs the device to your \
+                      account. A device acts as `user` unless `admin` is asked, which only an administrator \
+                      may. A paired device cannot open a slot unless it was paired with `admin`.",
+        query: &[], body: json_body("`{ admin }`, optional."), produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/devices", tag: "Accounts", access: Access::SignedIn,
+        summary: "Your paired devices",
+        description: "`?all=true` lists every account's, for an administrator.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "delete", path: "/api/devices/{id}", tag: "Accounts", access: Access::SignedIn,
+        summary: "Unpair a device",
+        description: "Revokes its key and closes its connection through the tunnel.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
 ];
 
 impl Access {

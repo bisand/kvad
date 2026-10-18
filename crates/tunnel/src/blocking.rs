@@ -8,6 +8,14 @@
 //! port anywhere on the machine: nothing else on it can use the connection.
 
 use super::{Address, Client, Key, Path, Res};
+
+/// One pairing request to `to`, as the key in `key` (made on first use),
+/// and the server's answer.
+pub fn pair(key: &FsPath, to: &Address, request: &[u8]) -> Res<Vec<u8>> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("starting the tunnel: {e}"))?;
+    let (key, _) = Key::load(key)?;
+    runtime.block_on(Client::pair(&key, to, request))
+}
 use std::os::unix::net::UnixStream;
 use std::path::Path as FsPath;
 

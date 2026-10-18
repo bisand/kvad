@@ -1849,7 +1849,7 @@ fn fetch(remote: &Remote, video: &Value, path: &str) -> Res<()> {
 
 /// This machine's name, for naming the key a sign-in makes: "kvad CLI on
 /// laptop" is a line somebody can recognise on the Account page and revoke.
-fn hostname() -> String {
+pub fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is as long as we say it is.
     let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
@@ -1883,6 +1883,7 @@ fn keep_key(remote: &Remote, signed_in: &Remote, user: &str) -> Res<()> {
         key: token.to_string(),
         id: made["key"]["id"].as_i64(),
         user: Some(user.to_string()),
+        address: remote.dial_address(),
     };
     let path = client::remember(&remote.base, &credential)?;
     println!("signed in to {} as {user}", remote.base);
@@ -1938,7 +1939,7 @@ pub fn auth(remote: &Remote, args: &Args) -> Res<()> {
                 };
                 let path = client::remember(
                     &remote.base,
-                    &client::Credential { key, id: None, user: Some(name.to_string()) },
+                    &client::Credential { key, id: None, user: Some(name.to_string()), address: remote.dial_address() },
                 )?;
                 println!("signed in to {} as {name}\n  key kept in {}, readable by you only", remote.base, path.display());
                 return Ok(());

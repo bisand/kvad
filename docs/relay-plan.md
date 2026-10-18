@@ -594,6 +594,58 @@ through a relay; an expired token; a used token, including one first used on
 the other path; a wrong code; a revoked device; a device paired to one
 account cannot act as another.
 
+*Built, 2026-10-18 (pairing by QR code or link, without the PAKE).*
+
+- **The pairing lane.** The tunnel's allow list is a live `Allowed`. While
+  a slot is open, the handshake lets an unknown key in to one request and
+  one answer, with a hello that says so, and no HTTP. Removing a device
+  closes its live connection.
+- **Slots.** kvad-serve keeps them in memory only: a 256-bit token that lives
+  ten minutes and is burnt on first use, right or wrong. Presenting it again
+  is told "already used". A good pairing adds a row to `devices` (migration
+  022) and makes an API key for the device.
+- **What a device's key may do.** It works only through the tunnel and only
+  from its own node, checked against the `ConnectInfo` the tunnel's listener
+  attaches to each request. It acts as `user` unless the slot granted
+  `admin`, and a device without `admin` cannot open a slot.
+- **Commands.** `kvad remote pair` shows the link and a QR code in the
+  terminal, `kvad remote join LINK` pairs and keeps the key with the
+  server's whole address, and `kvad devices` lists and removes devices. The
+  server's TCP port is how the first account pairs its first device.
+- **Fewer refusals turned into a wait.** A refused handshake now starts a
+  backoff only on the third within a minute, so that a device that tried
+  before its slot was open gets its retry.
+
+Tested:
+
+- *The tunnel* (`crates/tunnel/tests/tunnel.rs`): an unknown key refused
+  with no slot open; reaching only the pairing lane while one is; refused
+  as "not paired" by a normal connect; told "already paired" once let in;
+  and a removed device cut off mid-reply.
+- *Slots and devices* (`remote.rs`, `devices.rs`): a good pairing, a used
+  token, an unknown token, an expired one, a refused token burnt too, the
+  lane closing as slots expire, admin granted only when asked, and other
+  protocol versions refused.
+- *Auth* (`auth/tests.rs`): a device's key accepted from its own node and
+  lowered to `user`; refused on the TCP port and from another device.
+- *By hand*, with two identities against a scratch server in local auth
+  mode: unpaired and refused; `pair` (a 31-line QR code), `join`, then
+  commands by `kvad://<node id>` alone; an admin account's device held to
+  `user`; the spent link refused to a second device; the device's key
+  refused on the TCP port; a device refused a slot; `devices rm`, and the
+  device refused at once.
+
+Not yet done:
+
+- *The PAKE and the six-digit code.* A link that travels anywhere but the
+  server's own screen is as good as a password for its ten minutes.
+- *The `_kvad-remote._udp` record.*
+- *Pairing through the relay.* The relay's allow list is a file
+  (`tools/kvad-relay/deploy/allow.local`), so a newly paired device gets
+  through the relay only once its id is added there. Phase 3 is the relay
+  learning a node's devices from the node.
+- *The web UI's pairing screen and device list*, which is Phase 4.
+
 **Phase 3: `kvad-relay`.** The crate, its config, access control, health,
 metrics, the self-test. Docker image and Compose file first. Tests: two
 processes that can only reach each other through it; two that can punch

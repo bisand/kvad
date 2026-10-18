@@ -1041,6 +1041,7 @@ mod against_a_real_model {
             started: std::time::Instant::now(),
             load_on_request: false,
             settings: Default::default(),
+            remote: None,
         };
         let (progress, _ignored) = tokio::sync::mpsc::channel(8);
         let repo = dir.to_string_lossy().into_owned();
@@ -1052,7 +1053,7 @@ mod against_a_real_model {
             let state = state.clone();
             let body: Generations = serde_json::from_value(json!({ "model": model, "prompt": "a cat" })).unwrap();
             async move {
-                let who = Identity { id: None, name: "local".into(), role: crate::auth::Role::Admin };
+                let who = Identity { id: None, name: "local".into(), role: crate::auth::Role::Admin, device: None };
                 match generations(who, HeaderMap::new(), St(state), Json(body)).await {
                     Ok(_) => panic!("a language model answered an image request"),
                     Err(Fail(status, why, _)) => (status, why),

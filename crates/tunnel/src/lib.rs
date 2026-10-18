@@ -29,7 +29,7 @@
 //! sign-in, which applies to a tunnelled request exactly as to any other; see
 //! `kvad-serve`'s `config::Remote`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{ErrorKind, Read, Write as _};
@@ -39,7 +39,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -61,8 +61,11 @@ const ALPN_PREFIX: &str = "kvad-tunnel/1/";
 /// with a command or two open, and then some.
 const MAX_LIVE: usize = 32;
 
-/// How long an address whose handshake was refused is ignored afterwards.
-const BACKOFF: Duration = Duration::from_secs(30);
+/// An address refused this many times within [`BACKOFF`] is ignored until
+/// the window has passed: a device that tried before its pairing was open
+/// gets its retry, and something trying keys does not get many.
+const REFUSALS: u32 = 3;
+const BACKOFF: Duration = Duration::from_secs(60);
 
 /// How long a client waits for a connection before saying so.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -71,6 +74,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// device in. A client waits for it, so that a refusal is an error at
 /// connect rather than a silence later, and a different version is named.
 const HELLO: &str = "kvad-tunnel/1";
+
+/// What a server says first to a key it does not know, while a pairing is
+/// open: the connection is for one pairing request and its answer, and for
+/// nothing else, HTTP least of all.
+const PAIRING_HELLO: &str = "kvad-tunnel/1 pairing";
+
+/// How large a pairing request or answer may be.
+const PAIRING_LIMIT: usize = 16 * 1024;
+
+/// How long a pairing connection may take, start to finish.
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many pairing connections a server holds at once.
+const MAX_PAIRING: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Identities and secrets on disk
@@ -304,6 +321,40 @@ impl FromStr for Address {
     }
 }
 
+/// A pairing link: a server's [`Address`] and a single-use pairing token,
+/// `kvad://<node id>?k=…&relay=…&addr=…&pair=<token>`.
+///
+/// It is shown on the server's own screen, as a QR code or as text, and is
+/// worth as much as a password for the few minutes it lives: whoever presents
+/// the token first is paired. (A link sent somewhere less trusted wants the
+/// code and the PAKE of `docs/relay-plan.md`, which are not built yet.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairLink {
+    pub address: Address,
+    pub token: String,
+}
+
+impl fmt::Display for PairLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}&pair={}", self.address, self.token)
+    }
+}
+
+impl FromStr for PairLink {
+    type Err = String;
+    fn from_str(s: &str) -> Res<PairLink> {
+        let s = s.trim();
+        let (rest, token) = match s.rsplit_once("&pair=").or_else(|| s.rsplit_once("?pair=")) {
+            Some((rest, token)) => (rest, token),
+            None => return Err("that is a server's address, not a pairing link: it has no pair= token".into()),
+        };
+        if token.len() < 32 || token.len() > 128 || !token.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+            return Err("the link's pairing token is not one a server makes".into());
+        }
+        Ok(PairLink { address: rest.parse()?, token: token.to_string() })
+    }
+}
+
 /// A relay must be HTTPS. Plain HTTP only to this machine, for tests.
 fn relay_url(s: &str) -> Res<RelayUrl> {
     if let Some(rest) = s.strip_prefix("http://") {
@@ -382,14 +433,78 @@ fn crypto() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(p)
 }
 
+/// The devices a server lets in, shared between its tunnel and whatever
+/// keeps the list (kvad-serve's `devices` table, and `[remote] allow`), so
+/// that a device paired or removed is let in or shut out at once.
+///
+/// While a pairing is open, a key not on the list is let in too, but only to
+/// the pairing lane: one request, one answer, then the connection is closed.
+#[derive(Clone, Default, Debug)]
+pub struct Allowed(Arc<AllowedInner>);
+
+#[derive(Default, Debug)]
+struct AllowedInner {
+    ids: RwLock<HashSet<NodeId>>,
+    pairing: AtomicUsize,
+}
+
+impl Allowed {
+    pub fn new(ids: impl IntoIterator<Item = NodeId>) -> Allowed {
+        let a = Allowed::default();
+        a.set(ids);
+        a
+    }
+
+    pub fn set(&self, ids: impl IntoIterator<Item = NodeId>) {
+        *self.0.ids.write().unwrap() = ids.into_iter().collect();
+    }
+
+    pub fn insert(&self, id: NodeId) {
+        self.0.ids.write().unwrap().insert(id);
+    }
+
+    /// Takes a device off the list. Its live connection, if it has one, is
+    /// closed within a quarter of a second.
+    pub fn remove(&self, id: &NodeId) -> bool {
+        self.0.ids.write().unwrap().remove(id)
+    }
+
+    pub fn contains(&self, id: &NodeId) -> bool {
+        self.0.ids.read().unwrap().contains(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.ids.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Says that a pairing slot is open, so that an unknown key may reach the
+    /// pairing lane. Each call is undone by one [`Allowed::close_pairing`].
+    pub fn open_pairing(&self) {
+        self.0.pairing.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn close_pairing(&self) {
+        let _ = self.0.pairing.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+    }
+
+    pub fn pairing(&self) -> bool {
+        self.0.pairing.load(Ordering::SeqCst) > 0
+    }
+}
+
 /// Refuses every peer not on the list, once the handshake has proved which
-/// key it holds and before any stream.
+/// key it holds and before any stream; an unknown one gets in only while a
+/// pairing is open, and then only to the pairing lane.
 #[derive(Debug)]
-struct Allow(Arc<Vec<NodeId>>);
+struct Allow(Allowed);
 
 impl EndpointHooks for Allow {
     fn after_handshake<'a>(&'a self, conn: &'a Connection) -> impl std::future::Future<Output = AfterHandshakeOutcome> + Send + 'a {
-        let ok = self.0.contains(&NodeId(conn.remote_id()));
+        let ok = self.0.contains(&NodeId(conn.remote_id())) || self.0.pairing();
         async move {
             match ok {
                 true => AfterHandshakeOutcome::accept(),
@@ -483,9 +598,24 @@ pub struct ServerConfig {
     /// The UDP port for direct connections; fixed, so that it can be
     /// forwarded by hand. 0 picks one.
     pub port: u16,
-    /// The devices that may connect. Phase 2's pairing will keep these in
-    /// kvad-serve's database; until then they are written in the config.
-    pub allow: Vec<NodeId>,
+    /// The devices that may connect, kept up to date by the caller.
+    pub allowed: Allowed,
+}
+
+/// A pairing request from a key the server does not know, delivered by
+/// [`Server::take_pairings`]. Whoever answers it decides whether the device
+/// is paired; the tunnel only carries the bytes.
+pub struct Pairing {
+    /// The key that asked, proved by the handshake.
+    pub device: NodeId,
+    pub request: Vec<u8>,
+    reply: tokio::sync::oneshot::Sender<Vec<u8>>,
+}
+
+impl Pairing {
+    pub fn answer(self, reply: Vec<u8>) {
+        let _ = self.reply.send(reply);
+    }
 }
 
 /// A server's side of the tunnel.
@@ -493,20 +623,18 @@ pub struct Server {
     endpoint: Endpoint,
     address: Address,
     streams: tokio::sync::mpsc::Receiver<(NodeId, Stream)>,
+    pairings: Option<tokio::sync::mpsc::Receiver<Pairing>>,
     accepting: tokio::task::JoinHandle<()>,
 }
 
 impl Server {
     pub async fn start(cfg: &ServerConfig) -> Res<Server> {
-        if cfg.allow.is_empty() {
-            return Err("[remote] allow is empty, so no device could connect: add the id `kvad remote id` prints on each".into());
-        }
         let (key, _) = Key::load(&cfg.key)?;
         let node = key.id();
         let knock = knock(&cfg.knock)?;
         let alpn = alpn(&knock);
-        let allow = Arc::new(cfg.allow.clone());
-        let endpoint = endpoint(key.secret, &cfg.relays, vec![alpn.clone()], cfg.direct, cfg.port, Some(Allow(allow))).await?;
+        let allow = Allow(cfg.allowed.clone());
+        let endpoint = endpoint(key.secret, &cfg.relays, vec![alpn.clone()], cfg.direct, cfg.port, Some(allow)).await?;
         if !cfg.relays.is_empty() && tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await.is_err() {
             tracing::warn!("no relay answered within 10 s; the address carries direct addresses only until one does");
         }
@@ -516,8 +644,16 @@ impl Server {
         };
         let address = Address { node, knock, relays: cfg.relays.clone(), addrs };
         let (tx, streams) = tokio::sync::mpsc::channel(64);
-        let accepting = tokio::spawn(accept_loop(endpoint.clone(), alpn, tx));
-        Ok(Server { endpoint, address, streams, accepting })
+        let (pair_tx, pairings) = tokio::sync::mpsc::channel(MAX_PAIRING);
+        let accepting = tokio::spawn(accept_loop(endpoint.clone(), alpn, cfg.allowed.clone(), tx, pair_tx));
+        Ok(Server { endpoint, address, streams, pairings: Some(pairings), accepting })
+    }
+
+    /// The pairing requests that unknown keys send while a pairing is open.
+    /// Taken once, by whoever decides them; a request nobody is taking is
+    /// answered with a refusal.
+    pub fn take_pairings(&mut self) -> Option<tokio::sync::mpsc::Receiver<Pairing>> {
+        self.pairings.take()
     }
 
     /// What a client dials.
@@ -579,9 +715,16 @@ impl axum::serve::Listener for Server {
     }
 }
 
-async fn accept_loop(endpoint: Endpoint, alpn: Vec<u8>, tx: tokio::sync::mpsc::Sender<(NodeId, Stream)>) {
+async fn accept_loop(
+    endpoint: Endpoint,
+    alpn: Vec<u8>,
+    allowed: Allowed,
+    tx: tokio::sync::mpsc::Sender<(NodeId, Stream)>,
+    pairings: tokio::sync::mpsc::Sender<Pairing>,
+) {
     let live = Arc::new(AtomicUsize::new(0));
-    let refused: Arc<Mutex<HashMap<IpAddr, Instant>>> = Arc::default();
+    let pairing_live = Arc::new(AtomicUsize::new(0));
+    let refused: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>> = Arc::default();
     while let Some(incoming) = endpoint.accept().await {
         let ip = match incoming.remote_addr() {
             IncomingAddr::Ip(a) => Some(a.ip().to_canonical()),
@@ -592,31 +735,51 @@ async fn accept_loop(endpoint: Endpoint, alpn: Vec<u8>, tx: tokio::sync::mpsc::S
         // with the post-quantum key share, rustls refuses a wrong ALPN while
         // reading the ClientHello, before the server's key would be sent.
         let wrong = incoming.decrypt().and_then(|d| d.alpns()).is_some_and(|mut it| !it.any(|a| a.is_ok_and(|a| a[..] == alpn[..])));
-        let backing_off = ip.is_some_and(|ip| refused.lock().unwrap().get(&ip).is_some_and(|t| t.elapsed() < BACKOFF));
+        let backing_off = ip.is_some_and(|ip| refused.lock().unwrap().get(&ip).is_some_and(|(n, since)| *n >= REFUSALS && since.elapsed() < BACKOFF));
         if wrong || backing_off || live.load(Ordering::SeqCst) >= MAX_LIVE {
             incoming.ignore();
             continue;
         }
-        let (live, refused, tx) = (live.clone(), refused.clone(), tx.clone());
+        let (live, pairing_live, refused, tx, pairings, allowed) =
+            (live.clone(), pairing_live.clone(), refused.clone(), tx.clone(), pairings.clone(), allowed.clone());
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
                     if let Some(ip) = ip {
-                        refused.lock().unwrap().insert(ip, Instant::now());
+                        refuse(&refused, ip);
                     }
                     tracing::info!("remote: refused a connection: {e}");
                     return;
                 }
             };
-            live.fetch_add(1, Ordering::SeqCst);
             let peer = NodeId(conn.remote_id());
+            if !allowed.contains(&peer) {
+                // Let in by the hook only because a pairing is open.
+                if pairing_live.fetch_add(1, Ordering::SeqCst) >= MAX_PAIRING {
+                    conn.close(429u32.into(), b"");
+                } else {
+                    tracing::info!("remote: {} asks to pair", peer.short());
+                    let outcome = tokio::time::timeout(PAIRING_TIMEOUT, pair_lane(&conn, peer, &pairings)).await;
+                    if !matches!(outcome, Ok(Ok(()))) {
+                        if let Some(ip) = ip {
+                            refuse(&refused, ip);
+                        }
+                    }
+                    // Long enough for the answer to arrive before the close.
+                    let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+                    conn.close(0u32.into(), b"");
+                }
+                pairing_live.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            live.fetch_add(1, Ordering::SeqCst);
             tracing::info!("remote: {} connected", peer.short());
             if let Ok(mut hello) = conn.open_uni().await {
                 let _ = hello.write_all(format!("{HELLO}\n").as_bytes()).await;
                 let _ = hello.finish();
             }
-            let watching = tokio::spawn(watch(conn.clone(), peer));
+            let watching = tokio::spawn(watch(conn.clone(), peer, allowed));
             loop {
                 match conn.accept_bi().await {
                     Ok((send, recv)) => {
@@ -634,10 +797,45 @@ async fn accept_loop(endpoint: Endpoint, alpn: Vec<u8>, tx: tokio::sync::mpsc::S
     }
 }
 
-/// Says in the log which path a device is on, whenever it changes.
-async fn watch(conn: Connection, peer: NodeId) {
+/// Counts a refusal from `ip`, in a window that starts with the first.
+fn refuse(refused: &Mutex<HashMap<IpAddr, (u32, Instant)>>, ip: IpAddr) {
+    let mut all = refused.lock().unwrap();
+    let entry = all.entry(ip).or_insert((0, Instant::now()));
+    if entry.1.elapsed() >= BACKOFF {
+        *entry = (0, Instant::now());
+    }
+    entry.0 += 1;
+}
+
+/// One pairing request from a key the server does not know, and its answer:
+/// all an unpaired device can ever do.
+async fn pair_lane(conn: &Connection, peer: NodeId, pairings: &tokio::sync::mpsc::Sender<Pairing>) -> Res<()> {
+    let mut hello = conn.open_uni().await.map_err(|e| e.to_string())?;
+    hello.write_all(format!("{PAIRING_HELLO}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+    let _ = hello.finish();
+    let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| e.to_string())?;
+    let request = recv.read_to_end(PAIRING_LIMIT).await.map_err(|e| e.to_string())?;
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let refusal = br#"{"error":"this server is not taking pairings now"}"#.to_vec();
+    let answer = match pairings.try_send(Pairing { device: peer, request, reply }) {
+        Ok(()) => answer.await.unwrap_or(refusal),
+        Err(_) => refusal,
+    };
+    send.write_all(&answer).await.map_err(|e| e.to_string())?;
+    send.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Says in the log which path a device is on, whenever it changes, and
+/// closes the connection once the device is no longer allowed.
+async fn watch(conn: Connection, peer: NodeId, allowed: Allowed) {
     let mut last = None;
     loop {
+        if !allowed.contains(&peer) {
+            tracing::info!("remote: {} removed, closing its connection", peer.short());
+            conn.close(403u32.into(), b"revoked");
+            return;
+        }
         let now = selected(&conn);
         if now != last {
             if let Some(path) = &now {
@@ -661,39 +859,42 @@ pub struct Client {
 
 impl Client {
     /// Dials `to` as `key`, and checks that the far end holds the key the
-    /// address names.
+    /// address names and has let this device in.
     pub async fn connect(key: &Key, to: &Address) -> Res<Client> {
-        // No ALPN of its own: a client accepts nothing.
-        let endpoint = endpoint(key.secret.clone(), &to.relays, Vec::new(), Direct::Auto, 0, None).await?;
-        let addr = to.endpoint_addr()?;
-        let conn = match tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, &to.alpn())).await {
-            Err(_) => {
-                return Err(format!(
-                    "{} did not answer within {} s: it may be off or asleep, or the address may be out of date",
-                    to.label(),
-                    CONNECT_TIMEOUT.as_secs()
-                ))
+        let (endpoint, conn, hello) = dial(key, to).await?;
+        match hello.as_str() {
+            HELLO => Ok(Client { endpoint, conn }),
+            PAIRING_HELLO => {
+                endpoint.close().await;
+                Err(format!("this device is not paired with {}: `kvad remote join` with a pairing link from it", to.label()))
             }
-            Ok(Err(e)) => return Err(format!("could not reach {}: {e}", to.label())),
-            Ok(Ok(c)) => c,
-        };
-        if NodeId(conn.remote_id()) != to.node {
-            return Err(format!("reached a key other than {}'s", to.label()));
-        }
-        let hello = tokio::time::timeout(CONNECT_TIMEOUT, async {
-            let mut s = conn.accept_uni().await.map_err(|e| refused(&e.to_string()))?;
-            let said = s.read_to_end(64).await.map_err(|e| refused(&e.to_string()))?;
-            Ok::<_, String>(String::from_utf8_lossy(&said).trim().to_string())
-        });
-        match hello.await {
-            Err(_) => return Err(format!("{} let the connection in but said nothing", to.label())),
-            Ok(Err(e)) => return Err(e),
-            Ok(Ok(said)) if said != HELLO => {
-                return Err(format!("{} speaks {said}, and this kvad speaks {HELLO}", to.label()));
+            other => {
+                endpoint.close().await;
+                Err(format!("{} speaks {other}, and this kvad speaks {HELLO}", to.label()))
             }
-            Ok(Ok(_)) => {}
         }
-        Ok(Client { endpoint, conn })
+    }
+
+    /// Sends one pairing request to `to` as `key`, which the server does not
+    /// know yet, and returns its answer. The server lets an unknown key this
+    /// far only while one of its pairings is open.
+    pub async fn pair(key: &Key, to: &Address, request: &[u8]) -> Res<Vec<u8>> {
+        let (endpoint, conn, hello) = dial(key, to).await?;
+        let answer = async {
+            match hello.as_str() {
+                PAIRING_HELLO => {}
+                HELLO => return Err(format!("this device is already paired with {}", to.label())),
+                other => return Err(format!("{} speaks {other}, and this kvad speaks {HELLO}", to.label())),
+            }
+            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| refused(&e.to_string()))?;
+            send.write_all(request).await.map_err(|e| e.to_string())?;
+            send.finish().map_err(|e| e.to_string())?;
+            recv.read_to_end(PAIRING_LIMIT).await.map_err(|e| format!("the pairing broke off: {e}"))
+        }
+        .await;
+        conn.close(0u32.into(), b"");
+        endpoint.close().await;
+        answer
     }
 
     /// A new stream, for one HTTP connection. The server refuses streams from
@@ -714,9 +915,40 @@ impl Client {
     }
 }
 
+/// Connects, checks the far end's key, and reads what it says first.
+async fn dial(key: &Key, to: &Address) -> Res<(Endpoint, Connection, String)> {
+    // No ALPN of its own: a client accepts nothing.
+    let endpoint = endpoint(key.secret.clone(), &to.relays, Vec::new(), Direct::Auto, 0, None).await?;
+    let addr = to.endpoint_addr()?;
+    let conn = match tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, &to.alpn())).await {
+        Err(_) => {
+            return Err(format!(
+                "{} did not answer within {} s: it may be off or asleep, or the address may be out of date",
+                to.label(),
+                CONNECT_TIMEOUT.as_secs()
+            ))
+        }
+        Ok(Err(e)) => return Err(format!("could not reach {}: {e}", to.label())),
+        Ok(Ok(c)) => c,
+    };
+    if NodeId(conn.remote_id()) != to.node {
+        return Err(format!("reached a key other than {}'s", to.label()));
+    }
+    let hello = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let mut s = conn.accept_uni().await.map_err(|e| refused(&e.to_string()))?;
+        let said = s.read_to_end(64).await.map_err(|e| refused(&e.to_string()))?;
+        Ok::<_, String>(String::from_utf8_lossy(&said).trim().to_string())
+    });
+    match hello.await {
+        Err(_) => Err(format!("{} let the connection in but said nothing", to.label())),
+        Ok(Err(e)) => Err(e),
+        Ok(Ok(said)) => Ok((endpoint, conn, said)),
+    }
+}
+
 fn refused(e: &str) -> String {
     match e.contains("403") || e.contains("rejected") {
-        true => "the server refused this device: add its id (`kvad remote id`) to the server's [remote] allow".into(),
+        true => "the server refused this device: pair it (`kvad remote pair` on the server, `kvad remote join` here), or add its id to the server's [remote] allow".into(),
         false => format!("the tunnel closed: {e}"),
     }
 }
@@ -754,6 +986,16 @@ mod tests {
         assert!(format!("kvad://{n}?k={k}&nope=1&relay=https://r.example").parse::<Address>().is_err(), "unknown key");
         assert!(format!("http://{n}?k={k}&relay=https://r.example").parse::<Address>().is_err(), "scheme");
         assert!(format!("kvad://{n}?k={k}&relay=https://r.example").parse::<Address>().is_ok());
+    }
+
+    #[test]
+    fn a_pairing_link_is_an_address_and_a_token() {
+        let address = Address { node: node(), knock: "0123456789abcdef0123456789abcdef".into(), relays: vec!["https://relay.kvad.eu".into()], addrs: Vec::new() };
+        let link = PairLink { address: address.clone(), token: "a".repeat(64) };
+        let back: PairLink = link.to_string().parse().unwrap();
+        assert_eq!(back, link);
+        assert!(address.to_string().parse::<PairLink>().unwrap_err().contains("not a pairing link"));
+        assert!(format!("{address}&pair=short").parse::<PairLink>().is_err());
     }
 
     #[test]

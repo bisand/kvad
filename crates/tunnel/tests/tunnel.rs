@@ -2,7 +2,7 @@
 //! [`Server`], reached through [`blocking::Tunnel`] as the CLI reaches it,
 //! directly, through a relay in this process, and across the relay's loss.
 
-use kvad_tunnel::{blocking, Address, Direct, Key, NodeId, Path, Server, ServerConfig};
+use kvad_tunnel::{blocking, Address, Allowed, Direct, Key, NodeId, Path, Server, ServerConfig};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -63,11 +63,30 @@ async fn relay() -> (iroh_relay::server::Server, String) {
 
 /// A server for `allow`, serving the router, and its address.
 fn serve(rt: &tokio::runtime::Runtime, dir: &Scratch, relays: Vec<String>, direct: Direct, allow: Vec<NodeId>) -> Address {
-    let cfg = ServerConfig { key: dir.path("remote.key"), knock: dir.path("remote.knock"), relays, direct, port: 0, allow };
-    let server = rt.block_on(Server::start(&cfg)).unwrap();
+    serve_with(rt, dir, relays, direct, Allowed::new(allow), |_| {}).0
+}
+
+/// The same, with the list shared, and the pairing requests handed to
+/// `pairs` on a task of their own.
+fn serve_with(
+    rt: &tokio::runtime::Runtime,
+    dir: &Scratch,
+    relays: Vec<String>,
+    direct: Direct,
+    allowed: Allowed,
+    pairs: impl Fn(kvad_tunnel::Pairing) + Send + 'static,
+) -> (Address, Allowed) {
+    let cfg = ServerConfig { key: dir.path("remote.key"), knock: dir.path("remote.knock"), relays, direct, port: 0, allowed: allowed.clone() };
+    let mut server = rt.block_on(Server::start(&cfg)).unwrap();
     let address = server.address().clone();
+    let mut pairings = server.take_pairings().unwrap();
+    rt.spawn(async move {
+        while let Some(p) = pairings.recv().await {
+            pairs(p);
+        }
+    });
     rt.spawn(async move { axum::serve(server, router()).await });
-    address
+    (address, allowed)
 }
 
 fn client_key(dir: &Scratch) -> (PathBuf, NodeId) {
@@ -177,6 +196,53 @@ fn a_reply_carries_on_when_the_relay_goes() {
     assert!(reply.contains("line 1\n") && reply.contains("line 40\n"), "the reply broke off: {reply}");
     // And a new request after it, with no relay left at all.
     assert!(get(&tunnel, "/hello").unwrap().ends_with("hi"));
+}
+
+#[test]
+fn an_unknown_key_reaches_only_the_pairing_lane_and_only_while_it_is_open() {
+    let dir = Scratch::new("pairing");
+    let rt = runtime();
+    let (key, id) = client_key(&dir);
+    let (address, allowed) = serve_with(&rt, &dir, Vec::new(), Direct::Auto, Allowed::default(), |p| {
+        let answer = format!("{{\"device\":\"{}\",\"asked\":{}}}", p.device, String::from_utf8_lossy(&p.request));
+        p.answer(answer.into_bytes());
+    });
+    // Closed: refused at the handshake, as any unknown key is.
+    let e = blocking::pair(&key, &address, b"\"hello\"").unwrap_err();
+    assert!(e.contains("refused"), "{e}");
+
+    allowed.open_pairing();
+    let answer = String::from_utf8(blocking::pair(&key, &address, b"\"hello\"").unwrap()).unwrap();
+    assert_eq!(answer, format!("{{\"device\":\"{id}\",\"asked\":\"hello\"}}"), "the answer names the key the handshake proved");
+    // Open, but still not paired: the lane is all it can reach.
+    let e = blocking::Tunnel::connect(&key, &address).map(|_| ()).unwrap_err();
+    assert!(e.contains("not paired"), "{e}");
+
+    // Paired: a tunnel now, and no second pairing.
+    allowed.insert(id);
+    let tunnel = blocking::Tunnel::connect(&key, &address).unwrap();
+    assert!(get(&tunnel, "/hello").unwrap().ends_with("hi"));
+    let e = blocking::pair(&key, &address, b"\"again\"").unwrap_err();
+    assert!(e.contains("already paired"), "{e}");
+}
+
+#[test]
+fn a_removed_device_is_cut_off_mid_reply() {
+    let dir = Scratch::new("revoked");
+    let rt = runtime();
+    let (key, id) = client_key(&dir);
+    let (address, allowed) = serve_with(&rt, &dir, Vec::new(), Direct::Auto, Allowed::new([id]), |_| {});
+    let tunnel = std::sync::Arc::new(blocking::Tunnel::connect(&key, &address).unwrap());
+    let reading = std::thread::spawn({
+        let tunnel = tunnel.clone();
+        move || get(&tunnel, "/slow")
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(allowed.remove(&id));
+    let reply = reading.join().unwrap();
+    assert!(reply.as_ref().map_or(true, |r| !r.contains("line 40\n")), "a removed device read the whole reply: {reply:?}");
+    let e = blocking::Tunnel::connect(&key, &address).map(|_| ()).unwrap_err();
+    assert!(e.contains("refused"), "{e}");
 }
 
 /// The plan's rule, held to in the lockfile: nothing that asks a router for

@@ -50,6 +50,7 @@ mod config;
 mod conversations;
 mod datasets;
 mod db;
+mod devices;
 mod engine;
 mod evals;
 mod images;
@@ -63,6 +64,7 @@ mod oidc;
 mod openai;
 mod openapi;
 mod playground;
+mod remote;
 mod retrieval;
 mod scheduler;
 mod secret;
@@ -251,6 +253,21 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
     let scheduler = std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader, budget).bounded(cfg.server.queue.unwrap_or(scheduler::DEFAULT_LIMIT)).sharing(cfg.server.queue_per_account.unwrap_or(scheduler::DEFAULT_SHARE)).pacing(cfg.server.generations_per_minute.unwrap_or(0)).batching(cfg.server.batch.unwrap_or(scheduler::DEFAULT_BATCH)));
     // The layers a worker holds for others come out of the same budget.
     cluster::host(scheduler.clone());
+    // The tunnel, a second way into the same router, and the pairings it
+    // carries; see `config::Remote` and `remote`.
+    let (tunnel, remote) = match cfg.remote.enabled {
+        true => {
+            let wanted = cfg.remote.tunnel(&data_dir)?;
+            let mut server = kvad_tunnel::Server::start(&wanted).await.map_err(|e| format!("[remote]: {e}"))?;
+            let remote = std::sync::Arc::new(remote::Remote::new(cfg.remote.ids()?, server.address().clone(), wanted.allowed.clone()));
+            remote.reload(&db)?;
+            if let Some(pairings) = server.take_pairings() {
+                tokio::spawn(remote.clone().serve_pairings(db.clone(), pairings));
+            }
+            (Some(server), Some(remote))
+        }
+        false => (None, None),
+    };
     let state = auth::State {
         auth: auth::provider(cfg.auth.mode, &cfg.auth.oidc)?.into(),
         engine: scheduler.clone(),
@@ -261,6 +278,7 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
         started: std::time::Instant::now(),
         load_on_request: cfg.server.load_on_request,
         settings: std::sync::Arc::clone(&settings),
+        remote: remote.clone(),
         db,
     };
 
@@ -316,11 +334,6 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
         format!("could not bind {}: {e}", cfg.server.bind)
     })?;
     let bound = listener.local_addr()?;
-    // The tunnel, a second way into the same router; see `config::Remote`.
-    let tunnel = match cfg.remote.enabled {
-        true => Some(kvad_tunnel::Server::start(&cfg.remote.tunnel(&data_dir)?).await.map_err(|e| format!("[remote]: {e}"))?),
-        false => None,
-    };
 
     // Through `tracing` as well as stdout, so that the log tail on the
     // Monitoring page starts with something rather than with nothing.
@@ -357,7 +370,8 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
             "off" => "relay only".to_string(),
             _ => format!("direct on udp {}", cfg.remote.port),
         };
-        let devices = match cfg.remote.allow.len() {
+        let devices = match remote.as_ref().map_or(0, |r| r.allowed.len()) {
+            0 => "no devices yet: kvad remote pair".to_string(),
             1 => "1 device".to_string(),
             n => format!("{n} devices"),
         };
@@ -420,7 +434,10 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
     match tunnel {
         Some(tunnel) => {
             let closer = tunnel.closer();
-            let remote = axum::serve(tunnel, app).with_graceful_shutdown(until(stopped));
+            // With the device each request came from, which a device's key
+            // is checked against; see `remote::Tunnelled`.
+            let remote = axum::serve(tunnel, app.into_make_service_with_connect_info::<remote::Tunnelled>())
+                .with_graceful_shutdown(until(stopped));
             let (http, remote) = tokio::join!(async { http.await }, async { remote.await });
             // Before a restart binds the UDP port again.
             closer.close().await;

@@ -72,17 +72,22 @@ pub struct Identity {
     pub id: Option<i64>,
     pub name: String,
     pub role: Role,
+    /// The paired device the request came from, when it presented a
+    /// device's key; see `devices`. Its role is already lowered to what the
+    /// pairing granted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<i64>,
 }
 
 impl Identity {
     /// The identity every request has when there is no authentication: the
     /// person at the keyboard, who is the only one who can reach loopback.
     fn local_operator() -> Self {
-        Identity { id: None, name: "local".into(), role: Role::Admin }
+        Identity { id: None, name: "local".into(), role: Role::Admin, device: None }
     }
 
     fn of(user: &users::User) -> Self {
-        Identity { id: Some(user.id), name: user.name.clone(), role: Role::parse(&user.role) }
+        Identity { id: Some(user.id), name: user.name.clone(), role: Role::parse(&user.role), device: None }
     }
 
     pub fn is_admin(&self) -> bool {
@@ -391,6 +396,8 @@ pub struct State {
     pub load_on_request: bool,
     /// What the server was started with, and the way to restart it.
     pub settings: std::sync::Arc<crate::settings::Running>,
+    /// The tunnel and its pairings, with `[remote]` on.
+    pub remote: Option<std::sync::Arc<crate::remote::Remote>>,
 }
 
 /// An error a rejected request turns into: a status and a short reason.
@@ -432,9 +439,28 @@ impl FromRequestParts<State> for Identity {
         }
 
         let (auth, db) = (state.auth.clone(), state.db.clone());
-        let who = tokio::task::spawn_blocking(move || auth.identify(&presented, &db))
-            .await
-            .map_err(|_| Denied(StatusCode::INTERNAL_SERVER_ERROR, None))?;
+        let via = parts.extensions.get::<axum::extract::ConnectInfo<crate::remote::Tunnelled>>().map(|c| c.0 .0);
+        let who = tokio::task::spawn_blocking(move || {
+            let mut who = auth.identify(&presented, &db)?;
+            // A device's key is that device's, and only through the tunnel:
+            // presented from anywhere else it is a key somebody copied.
+            if let Presented::Bearer(token) = &presented {
+                if let Ok(Some(device)) = crate::devices::by_token(&db, token) {
+                    if via.map(|n| n.to_string()) != Some(device.node.clone()) {
+                        tracing::warn!("a key of device \"{}\" was presented by something other than that device", device.name);
+                        return None;
+                    }
+                    if !device.admin {
+                        who.role = Role::User;
+                    }
+                    who.device = Some(device.id);
+                    crate::devices::touch(&db, device.id);
+                }
+            }
+            Some(who)
+        })
+        .await
+        .map_err(|_| Denied(StatusCode::INTERNAL_SERVER_ERROR, None))?;
 
         who.ok_or_else(|| Denied(StatusCode::UNAUTHORIZED, state.auth.challenge()))
     }

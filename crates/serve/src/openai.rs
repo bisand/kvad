@@ -1230,13 +1230,14 @@ mod against_a_real_model {
             started: std::time::Instant::now(),
             load_on_request: false,
             settings: Default::default(),
+            remote: None,
         };
         let (progress, _ignored) = tokio::sync::mpsc::channel(8);
         let repo = dir.to_string_lossy().into_owned();
         state.engine.load(repo, Backend::Cpu(Precision::F32), progress).await.unwrap();
 
         let ask = || async {
-            let who = Identity { id: None, name: "local".into(), role: crate::auth::Role::Admin };
+            let who = Identity { id: None, name: "local".into(), role: crate::auth::Role::Admin, device: None };
             let body: Completions = serde_json::from_value(json!({
                 "messages": [{ "role": "user", "content": "the cat?" }],
                 "temperature": 0,

@@ -234,6 +234,10 @@ pub struct Credential {
     /// Whose it is, for `kvad auth status` to say without asking.
     #[serde(default)]
     pub user: Option<String>,
+    /// For a `kvad://` server: its whole address, knock and hints, so that
+    /// `--remote kvad://<node id>` is enough once a device is paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 /// `credentials.json` in the config directory. Beside `kvad.toml` rather
@@ -488,6 +492,14 @@ impl Remote {
     /// A server by its `kvad://` address, through the tunnel: dialled now, as
     /// this machine's device key, and held until this remote is dropped.
     fn tunnelled(url: &str, why: Why) -> Result<Remote, String> {
+        // `kvad://<node id>` alone is a paired server's name: its address is
+        // the one kept when this device was paired.
+        let url = match url.contains('?') {
+            true => url.to_string(),
+            false => credential(url.trim_end_matches('/'))
+                .and_then(|c| c.address)
+                .ok_or_else(|| format!("{url} is not a server this device is paired with: give its whole address, with k= in it"))?,
+        };
         let address: kvad_tunnel::Address = url.parse()?;
         let tunnel = std::sync::Arc::new(kvad_tunnel::blocking::Tunnel::connect(&device_key_path(), &address)?);
         let base = address.label();
@@ -509,6 +521,12 @@ impl Remote {
         let mut other = self.clone();
         other.auth = auth;
         other
+    }
+
+    /// A `kvad://` server's whole address, knock and hints, to keep with its
+    /// key.
+    pub fn dial_address(&self) -> Option<String> {
+        Some(self.tunnel.as_ref()?.address().to_string())
     }
 
     /// The path the tunnel is on, for a `kvad://` server.
@@ -936,6 +954,10 @@ impl<R: BufRead> Iterator for Events<R> {
 /// here.
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("get", "/api/health", "kvad service status"),
+    ("get", "/api/remote", "kvad remote status"),
+    ("post", "/api/remote/pair", "kvad remote pair"),
+    ("get", "/api/devices", "kvad devices"),
+    ("delete", "/api/devices/{id}", "kvad devices rm"),
     ("get", "/api/openapi.json", "kvad api"),
     ("get", "/api/models", "kvad ls, kvad ps, kvad cache"),
     ("delete", "/api/models", "kvad rm"),

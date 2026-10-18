@@ -94,6 +94,8 @@ struct Args {
     force: bool,
     /// `kvad auth login --key`: paste a key rather than sign in.
     key: bool,
+    /// `kvad remote pair --admin`: the device acts as an administrator.
+    admin: bool,
     /// `kvad users edit --password`: set a new one.
     password: bool,
     k: Option<usize>,
@@ -218,6 +220,7 @@ impl Default for Args {
             raw: false,
             force: false,
             key: false,
+            admin: false,
             password: false,
             k: None,
             window: None,
@@ -292,7 +295,7 @@ impl Default for Args {
 const POSITIONAL: &[&str] = &[
     "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload", "cancel",
     "tokenize", "service", "conversations", "jobs", "datasets", "tune", "evals", "bench", "metrics",
-    "auth", "users", "sessions", "keys", "api", "images", "videos", "cluster", "transcribe", "remote",
+    "auth", "users", "sessions", "keys", "api", "images", "videos", "cluster", "transcribe", "remote", "devices",
 ];
 
 /// Flags that stand alone, and the short spellings some of them have.
@@ -309,6 +312,7 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--raw" => a.raw = true,
         "--force" => a.force = true,
         "--key" => a.key = true,
+        "--admin" => a.admin = true,
         "--password" => a.password = true,
         "--silent" => a.silent = true,
         "--epilogue" => a.epilogue = true,

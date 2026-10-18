@@ -197,8 +197,9 @@ pub struct Remote {
     /// The UDP port for direct connections, fixed so that it can be
     /// forwarded by hand. Kvad never asks the router to open it.
     pub port: u16,
-    /// The devices that may connect: each the id `kvad remote id` prints on
-    /// it. Phase 2's pairing will keep these in the database instead.
+    /// Devices let in besides the paired ones (`kvad devices`): each the id
+    /// `kvad remote id` prints on it. Pairing is the usual way; this is for a
+    /// device that is to be let in without an account's key.
     pub allow: Vec<String>,
 }
 
@@ -223,10 +224,7 @@ impl Remote {
             }
             other => return Err(format!("remote.direct = \"{other}\": use \"auto\" or \"off\"")),
         };
-        let allow = self.allow.iter().map(|id| id.parse()).collect::<Result<Vec<_>, _>>().map_err(|e| format!("remote.allow: {e}"))?;
-        if allow.is_empty() {
-            return Err("remote.allow is empty, so no device could connect: add the id `kvad remote id` prints on each".into());
-        }
+        let allowed = kvad_tunnel::Allowed::new(self.ids()?);
         if self.relays.is_empty() && direct == kvad_tunnel::Direct::Off {
             return Err("remote.direct = \"off\" needs remote.relays: with neither, nothing could reach this server".into());
         }
@@ -236,8 +234,13 @@ impl Remote {
             relays: self.relays.clone(),
             direct,
             port: self.port,
-            allow,
+            allowed,
         })
+    }
+
+    /// `allow`, read: devices let in whatever the `devices` table says.
+    pub fn ids(&self) -> Result<Vec<kvad_tunnel::NodeId>, String> {
+        self.allow.iter().map(|id| id.parse()).collect::<Result<Vec<_>, _>>().map_err(|e| format!("remote.allow: {e}"))
     }
 }
 
@@ -552,7 +555,7 @@ mod tests {
         let t = ok(&format!("[remote]\n{base}")).unwrap();
         assert_eq!((t.port, t.direct), (REMOTE_PORT, kvad_tunnel::Direct::Auto));
         assert_eq!(t.key, dir.join("remote.key"));
-        assert!(ok("[remote]\n").unwrap_err().contains("allow is empty"));
+        assert!(ok("[remote]\n").is_ok(), "no allow is fine: devices are paired");
         assert!(ok("[remote]\nallow = [\"nope\"]\n").unwrap_err().contains("not a node id"));
         assert!(ok(&format!("[remote]\n{base}direct = \"lan\"\n")).unwrap_err().contains("not built yet"));
         assert!(ok(&format!("[remote]\n{base}direct = \"sometimes\"\n")).is_err());

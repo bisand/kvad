@@ -716,6 +716,12 @@ Built so far: `kvad tunnel` (`crates/llm/src/cli/tunnel.rs`), a port on
 `127.0.0.1` that forwards each connection through the tunnel, with
 `--with-key` to add the device's key, off by default; see `docs/serve.md`.
 
+*The web UI's half built, 2026-10-18.* Settings has a Devices section: the
+pairing link as a QR code and text with its countdown, the device list
+(everyone's, with owners, for an administrator), and unpairing. The QR code
+is encoded in `web/src/lib/qr.js` rather than by a package. Not yet done:
+the run from a real phone network.
+
 **Phase 5: packaging.** Helm, systemd, `install.sh --relay`, Terraform
 modules, Fly. Each target gets a short page on kvad.eu and a CI job that at
 least builds it.

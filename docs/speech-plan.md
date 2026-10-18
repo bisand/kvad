@@ -585,3 +585,5 @@ another mid-sentence.
    cadence (small at gpu-q8, once a second). Next is the endpoint, which the
    Transcribe page can use with the browser's microphone before any phone
    exists.
+5. **Speakers**, "who spoke when", and word timestamps before them: planned
+   in [the diarization plan](diarization-plan.md).

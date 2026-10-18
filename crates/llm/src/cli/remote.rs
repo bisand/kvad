@@ -103,7 +103,7 @@ fn join(link: &str, args: &Args) -> Res<()> {
     let link: kvad_tunnel::PairLink = link.parse()?;
     let name = args.name.clone().unwrap_or_else(super::api::hostname);
     let request = json!({ "v": 1, "token": link.token, "name": name }).to_string();
-    let answer = kvad_tunnel::blocking::pair(&client::device_key_path(), &link.address, request.as_bytes())?;
+    let answer = kvad_tunnel::blocking::pair(&client::device_key_path(), &link.address, request.as_bytes(), link.voucher.as_ref())?;
     let answer: Value = serde_json::from_slice(&answer).map_err(|_| "the server's answer was not one a kvad gives")?;
     if let Some(e) = answer["error"].as_str() {
         return Err(e.into());
@@ -115,6 +115,7 @@ fn join(link: &str, args: &Args) -> Res<()> {
         id: None,
         user: answer["account"].as_str().map(str::to_string),
         address: Some(link.address.to_string()),
+        voucher: answer["voucher"].as_str().map(str::to_string),
     };
     let path = client::remember(&label, &credential)?;
     println!("paired with {label} as \"{}\", acting as {} of {}", out::s(&answer["name"]), out::s(&answer["role"]), out::s(&answer["account"]));

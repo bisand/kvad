@@ -605,8 +605,10 @@ without pairing, from `kvad remote id` on each.
   on the device can use the connection.
 
 The relay sees which keys talk, when, and how much, but not what. Run your own
-(`tools/kvad-relay/deploy/README.md`); it serves only the keys on its own
-allow list.
+(`tools/kvad-relay/deploy/README.md`). It serves the servers on its own allow
+list, and the devices they vouch for: a paired device carries a voucher its
+server signed, renewed on its own through the tunnel, so the relay needs no
+list of devices and nothing changes when one moves to another network.
 
 ## Testing
 

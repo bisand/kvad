@@ -162,7 +162,10 @@ progress over SSE. Loading and pulling models with their progress.
 **Phase 4: the tunnel.** Pairing by QR code: the camera through a small
 `objc2` binding to AVFoundation's code scanner. Then iroh as a `Transport`,
 the keys in the Keychain, and the path shown in the connection's status
-(`lan`, `direct`, `relay`).
+(`lan`, `direct`, `relay`). When iOS reports a network change (`NWPathMonitor`), the app tells the
+endpoint at once (`network_change`), so that a phone moving from Wi-Fi to 5G
+finds its paths again in milliseconds rather than when iroh notices. The
+relay voucher kept with the device key renews itself through the tunnel.
 
 **Phase 5: the rest.** The More tab, screen by screen, ordered by what the
 owner reaches for from a phone.

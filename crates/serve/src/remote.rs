@@ -60,6 +60,8 @@ pub struct Remote {
     /// `[remote] allow`, which stays allowed whatever the table says.
     configured: Vec<kvad_tunnel::NodeId>,
     address: kvad_tunnel::Address,
+    /// The node key, for the vouchers that get devices through relays.
+    issuer: kvad_tunnel::Issuer,
     /// Open slots by their token's fingerprint; the token itself is never kept.
     slots: Mutex<HashMap<String, Slot>>,
     burnt: Mutex<HashMap<String, Instant>>,
@@ -84,8 +86,14 @@ impl std::fmt::Display for Refusal {
 }
 
 impl Remote {
-    pub fn new(configured: Vec<kvad_tunnel::NodeId>, address: kvad_tunnel::Address, allowed: kvad_tunnel::Allowed) -> Remote {
-        Remote { allowed, configured, address, slots: Mutex::default(), burnt: Mutex::default() }
+    pub fn new(configured: Vec<kvad_tunnel::NodeId>, address: kvad_tunnel::Address, allowed: kvad_tunnel::Allowed, issuer: kvad_tunnel::Issuer) -> Remote {
+        Remote { allowed, configured, address, issuer, slots: Mutex::default(), burnt: Mutex::default() }
+    }
+
+    /// A voucher for a paired device: what gets it through the relays that
+    /// serve this server, from wherever it is.
+    pub fn voucher(&self, device: kvad_tunnel::NodeId) -> kvad_tunnel::Voucher {
+        self.issuer.issue(Some(device), kvad_tunnel::VOUCHER_LIFE)
     }
 
     pub fn address(&self) -> &kvad_tunnel::Address {
@@ -167,6 +175,7 @@ impl Remote {
         match devices::pair(db, &node.to_string(), &request.name, slot.user, slot.admin) {
             Ok((device, key)) => {
                 self.allowed.insert(node);
+                let voucher = self.voucher(node);
                 tracing::info!("remote: paired {} as \"{}\" for {}", node.short(), device.name, device.owner);
                 json!({
                     "paired": device.id,
@@ -174,6 +183,7 @@ impl Remote {
                     "account": device.owner,
                     "role": if device.admin { "admin" } else { "user" },
                     "key": key,
+                    "voucher": voucher.to_string(),
                 })
             }
             Err(e) => json!({ "error": e.to_string() }),
@@ -230,13 +240,28 @@ pub async fn pair(who: Identity, St(state): St<State>, body: Option<Json<PairAsk
         return Err(Fail(StatusCode::FORBIDDEN, "only an administrator can pair a device as one".into(), None));
     }
     let token = remote.open(user, ask.admin);
-    let link = kvad_tunnel::PairLink { address: remote.address().clone(), token };
+    // For any device, for the slot's life: a device that is not on the LAN
+    // pairs through the relay with it.
+    let voucher = remote.issuer.issue(None, SLOT_LIFE);
+    let link = kvad_tunnel::PairLink { address: remote.address().clone(), token, voucher: Some(voucher) };
     Ok(Json(json!({
         "link": link.to_string(),
         "server": remote.address().label(),
         "expires_in": SLOT_LIFE.as_secs(),
         "role": if ask.admin { "admin" } else { "user" },
     })))
+}
+
+/// `GET /api/remote/voucher`: a fresh voucher for the device asking, which
+/// the CLI fetches on its own when the one it holds is half spent.
+pub async fn voucher(who: Identity, St(state): St<State>) -> Result<Json<serde_json::Value>, Fail> {
+    let remote = remote(&state)?;
+    let id = who.device.ok_or_else(|| Fail::bad("a voucher is for a paired device, and this request did not come from one"))?;
+    let db = state.db.clone();
+    let device = blocking(move || devices::get(&db, id)).await?.ok_or_else(|| Fail::missing("no such device"))?;
+    let node = device.node.parse().map_err(|_| Fail::bad("the device's node id is not one"))?;
+    let v = remote.voucher(node);
+    Ok(Json(json!({ "voucher": v.to_string(), "expires_in": v.left().as_secs() })))
 }
 
 /// `GET /api/remote`: whether the tunnel is on, and as what.
@@ -294,7 +319,7 @@ mod tests {
     fn remote() -> Remote {
         let (key, _) = kvad_tunnel::Key::load(&std::env::temp_dir().join(format!("kvad-remote-test-{}/k", std::process::id()))).unwrap();
         let address = kvad_tunnel::Address { node: key.id(), knock: "0".repeat(32), relays: vec!["https://relay.kvad.eu".into()], addrs: Vec::new() };
-        Remote::new(Vec::new(), address, kvad_tunnel::Allowed::default())
+        Remote::new(Vec::new(), address, kvad_tunnel::Allowed::default(), key.issuer())
     }
 
     fn node(n: u8) -> kvad_tunnel::NodeId {
@@ -317,6 +342,9 @@ mod tests {
         assert_eq!(answer["role"], "user", "{answer}");
         assert_eq!(answer["account"], "ada");
         assert!(answer["key"].as_str().is_some_and(|k| k.len() == 64));
+        let voucher: kvad_tunnel::Voucher = answer["voucher"].as_str().unwrap().parse().unwrap();
+        assert!(voucher.check(&node(1), |n| *n == r.address().node).is_ok(), "the device gets a voucher for itself");
+        assert!(voucher.check(&node(2), |n| *n == r.address().node).is_err());
         assert!(r.allowed.contains(&node(1)));
         assert!(!r.allowed.pairing(), "the slot is spent, and the lane closed with it");
     }

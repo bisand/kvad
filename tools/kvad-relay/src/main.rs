@@ -13,8 +13,11 @@
 //! What it does and does not do:
 //!
 //! - *Only the keys in `--allow`* (one endpoint id a line, `#` comments) may
-//!   use it; every other is refused before it can send a byte through. It is
-//!   not an open relay. The file is read again on SIGHUP.
+//!   use it, and the devices those keys vouch for: a device shows a voucher
+//!   its server signed (`kvad_tunnel::Voucher`), for that device and not yet
+//!   expired. Every other key is refused before it can send a byte through.
+//!   It is not an open relay. The file is read again on SIGHUP. List the
+//!   servers; their devices need no listing.
 //! - *TLS from Let's Encrypt*, by the TLS-ALPN challenge on 443, so port 80
 //!   need not be open: the plain-HTTP side listens on loopback only.
 //! - *X25519MLKEM768 first, X25519 second.* The second is there because Let's
@@ -143,10 +146,25 @@ struct Gate(Arc<Allow>);
 
 impl AccessControl for Gate {
     async fn on_connect(&self, request: &ClientRequest) -> Access {
-        if self.0.ids.read().unwrap().contains(&request.endpoint_id()) {
-            Access::Allow
-        } else {
-            Access::Deny { reason: None }
+        let ids = self.0.ids.read().unwrap();
+        if ids.contains(&request.endpoint_id()) {
+            return Access::Allow;
+        }
+        // A device on no list here, with a voucher from a server that is:
+        // what lets a server's devices through without the server telling
+        // the relay anything, wherever either of them has moved to.
+        let Some(token) = request.auth_token() else { return Access::Deny { reason: None } };
+        let Ok(voucher) = token.parse::<kvad_tunnel::Voucher>() else { return Access::Deny { reason: None } };
+        let Ok(device) = request.endpoint_id().to_string().parse::<kvad_tunnel::NodeId>() else {
+            return Access::Deny { reason: None };
+        };
+        let trusted = |n: &kvad_tunnel::NodeId| ids.iter().any(|id| id.to_string() == n.to_string());
+        match voucher.check(&device, trusted) {
+            Ok(()) => Access::Allow,
+            Err(why) => {
+                eprintln!("kvad-relay: refused {}: voucher {why}", device.short());
+                Access::Deny { reason: None }
+            }
         }
     }
 }

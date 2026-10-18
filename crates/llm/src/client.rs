@@ -238,6 +238,10 @@ pub struct Credential {
     /// `--remote kvad://<node id>` is enough once a device is paired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// For a paired device: the server's voucher that gets it through the
+    /// server's relays (`kvad_tunnel::Voucher`), renewed as it is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voucher: Option<String>,
 }
 
 /// `credentials.json` in the config directory. Beside `kvad.toml` rather
@@ -501,11 +505,13 @@ impl Remote {
                 .ok_or_else(|| format!("{url} is not a server this device is paired with: give its whole address, with k= in it"))?,
         };
         let address: kvad_tunnel::Address = url.parse()?;
-        let tunnel = std::sync::Arc::new(kvad_tunnel::blocking::Tunnel::connect(&device_key_path(), &address)?);
         let base = address.label();
+        let kept = credential(&base);
+        let voucher = kept.as_ref().and_then(|c| c.voucher.as_deref()).and_then(|v| v.parse::<kvad_tunnel::Voucher>().ok());
+        let tunnel = std::sync::Arc::new(kvad_tunnel::blocking::Tunnel::connect(&device_key_path(), &address, voucher.as_ref())?);
         let auth = match std::env::var(KEY_VAR).ok().filter(|k| !k.trim().is_empty()) {
             Some(key) => Auth::Bearer(key.trim().to_string()),
-            None => credential(&base).map_or(Auth::None, |c| Auth::Bearer(c.key)),
+            None => kept.as_ref().map_or(Auth::None, |c| Auth::Bearer(c.key.clone())),
         };
         let tunnel = Some(tunnel);
         let agent = agent(&tunnel, ureq::Agent::config_builder()
@@ -513,7 +519,23 @@ impl Remote {
             .http_status_as_error(false)
             .proxy(None)
             .build());
-        Ok(Remote { base, why, auth, agent, http: TUNNELLED.into(), tunnel })
+        let remote = Remote { base, why, auth, agent, http: TUNNELLED.into(), tunnel };
+        if let (Some(kept), Some(v)) = (kept, voucher) {
+            if v.left() < kvad_tunnel::VOUCHER_LIFE / 2 {
+                remote.renew(kept);
+            }
+        }
+        Ok(remote)
+    }
+
+    /// Swaps a half-spent relay voucher for a fresh one, while the tunnel is
+    /// up to ask for it. Best effort: a device whose voucher runs out still
+    /// reaches its server on the LAN, and gets a new one there.
+    fn renew(&self, mut kept: Credential) {
+        let Ok(answer) = self.get("/api/remote/voucher") else { return };
+        let Some(fresh) = answer["voucher"].as_str() else { return };
+        kept.voucher = Some(fresh.to_string());
+        let _ = remember(&self.base, &kept);
     }
 
     /// The same server, proving itself a different way.
@@ -1048,6 +1070,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 
 /// Routes that deliberately have no command, and why not.
 pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
+    (
+        "get",
+        "/api/remote/voucher",
+        "fetched by the client itself, whatever the command, once a paired device's relay voucher is half \
+         spent; see `Remote::renew`",
+    ),
     (
         "get",
         "/api/auth/oidc/start",

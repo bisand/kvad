@@ -259,7 +259,7 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
         true => {
             let wanted = cfg.remote.tunnel(&data_dir)?;
             let mut server = kvad_tunnel::Server::start(&wanted).await.map_err(|e| format!("[remote]: {e}"))?;
-            let remote = std::sync::Arc::new(remote::Remote::new(cfg.remote.ids()?, server.address().clone(), wanted.allowed.clone()));
+            let remote = std::sync::Arc::new(remote::Remote::new(cfg.remote.ids()?, server.address().clone(), wanted.allowed.clone(), server.issuer()));
             remote.reload(&db)?;
             if let Some(pairings) = server.take_pairings() {
                 tokio::spawn(remote.clone().serve_pairings(db.clone(), pairings));

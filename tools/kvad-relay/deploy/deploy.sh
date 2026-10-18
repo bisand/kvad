@@ -18,11 +18,16 @@ cp target/x86_64-unknown-linux-musl/release/kvad-relay deploy/kvad-relay
 docker build -q --platform linux/amd64 -t "kvad-relay:$tag" deploy
 rm deploy/kvad-relay
 
+# RELAY_HOSTNAME may name several, comma-separated: one certificate for all,
+# and a Traefik route that matches any of them.
+names=${RELAY_HOSTNAME:-relay.kvad.eu}
+sni=$(printf '%s' "$names" | tr ',' '\n' | sed 's/.*/HostSNI(`&`)/' | paste -sd '|' - | sed 's/|/ || /g')
+
 # The allow list goes into the ConfigMap, indented under `allow: |`.
 keys=$(mktemp)
 trap 'rm -f "$keys"' EXIT
 grep -v '^[[:space:]]*$' "$allow" | sed 's/^/    /' > "$keys"
-manifest=$(sed -e "s/IMAGE_TAG/$tag/" -e "s/RELAY_HOSTNAME/${RELAY_HOSTNAME:-relay.kvad.eu}/g" -e "s/RELAY_ADDRESS/${RELAY_ADDRESS:-}/g" "${RELAY_MANIFEST:-deploy/k8s.yaml}" \
+manifest=$(sed -e "s/IMAGE_TAG/$tag/" -e "s/RELAY_SNI_MATCH/$sni/" -e "s/RELAY_HOSTNAME/$names/g" -e "s/RELAY_ADDRESS/${RELAY_ADDRESS:-}/g" "${RELAY_MANIFEST:-deploy/k8s.yaml}" \
     | sed -e '/^    ALLOWED_KEYS$/{' -e "r $keys" -e 'd' -e '}')
 
 docker save "kvad-relay:$tag" | ssh "$@" "$host" 'k3s ctr images import -'

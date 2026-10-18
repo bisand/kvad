@@ -140,7 +140,7 @@ spec:
   entryPoints:
     - websecure
   routes:
-    - match: HostSNI(`RELAY_HOSTNAME`)
+    - match: RELAY_SNI_MATCH
       services:
         - name: kvad-relay
           port: 8443

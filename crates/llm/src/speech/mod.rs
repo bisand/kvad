@@ -19,6 +19,8 @@
 //! 4. [`transcribe`] — the decoding loop: the prompt, the rules about what
 //!    may be said, the walk through a long recording, and the formats a
 //!    transcript is written out in.
+//! 5. [`score`] — how wrong a "who spoke when" is: the diarization error
+//!    rates, and the Hungarian algorithm they map speakers with.
 //!
 //! Every Whisper on the Hub in transformers' layout loads: OpenAI's own
 //! (`openai/whisper-*`), the distilled ones, and fine-tunes of them such as
@@ -32,6 +34,7 @@
 pub mod audio;
 pub mod mel;
 pub mod reference;
+pub mod score;
 pub mod transcribe;
 pub mod whisper;
 

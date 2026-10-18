@@ -1,0 +1,528 @@
+{
+ "made_by": "scripts/der-fixtures.py",
+ "pyannote.metrics": "4.2.0",
+ "meeteval": "0.4.3",
+ "cases": [
+  {
+   "name": "by-hand",
+   "reference": "SPEAKER fx 1 0.000 10.000 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 8.000 12.000 <NA> <NA> B <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.000 9.000 <NA> <NA> x <NA> <NA>\nSPEAKER fx 1 9.000 11.000 <NA> <NA> y <NA> <NA>\nSPEAKER fx 1 20.000 2.000 <NA> <NA> z <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 18.181818181818183,
+     "jer": 9.166666666666668,
+     "total": 22.0,
+     "missed": 2.0,
+     "false_alarm": 2.0,
+     "confusion": 0.0
+    },
+    "fair": {
+     "der": 16.25,
+     "jer": 7.575757575757574,
+     "total": 20.0,
+     "missed": 1.5,
+     "false_alarm": 1.75,
+     "confusion": 0.0
+    },
+    "forgiving": {
+     "der": 10.294117647058822,
+     "jer": 0.0,
+     "total": 17.0,
+     "missed": 0.0,
+     "false_alarm": 1.75,
+     "confusion": 0.0
+    }
+   }
+  },
+  {
+   "name": "dialogue-perfect",
+   "reference": "SPEAKER fx 1 0.500 4.969 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 5.719 4.149 <NA> <NA> B <NA> <NA>\nSPEAKER fx 1 10.168 1.099 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 11.467 2.917 <NA> <NA> B <NA> <NA>\nSPEAKER fx 1 14.734 0.354 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 15.338 2.302 <NA> <NA> B <NA> <NA>\nSPEAKER fx 1 17.940 6.468 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 24.608 2.007 <NA> <NA> B <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.500 4.969 <NA> <NA> s1 <NA> <NA>\nSPEAKER fx 1 5.719 4.149 <NA> <NA> s0 <NA> <NA>\nSPEAKER fx 1 10.168 1.099 <NA> <NA> s1 <NA> <NA>\nSPEAKER fx 1 11.467 2.917 <NA> <NA> s0 <NA> <NA>\nSPEAKER fx 1 14.734 0.354 <NA> <NA> s1 <NA> <NA>\nSPEAKER fx 1 15.338 2.302 <NA> <NA> s0 <NA> <NA>\nSPEAKER fx 1 17.940 6.468 <NA> <NA> s1 <NA> <NA>\nSPEAKER fx 1 24.608 2.007 <NA> <NA> s0 <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 0.0,
+     "jer": 0.0,
+     "total": 24.265000000000004,
+     "missed": 0.0,
+     "false_alarm": 0.0,
+     "confusion": 0.0
+    },
+    "fair": {
+     "der": 0.0,
+     "jer": 0.0,
+     "total": 20.411000000000005,
+     "missed": 0.0,
+     "false_alarm": 0.0,
+     "confusion": 0.0
+    },
+    "forgiving": {
+     "der": 0.0,
+     "jer": 0.0,
+     "total": 20.411000000000005,
+     "missed": 0.0,
+     "false_alarm": 0.0,
+     "confusion": 0.0
+    }
+   },
+   "words": {
+    "reference": "A:hei A:og A:velkommen A:til A:møtet A:i A:dag A:skal A:vi A:snakke A:om A:budsjettet A:for A:neste A:år B:takk B:jeg B:har B:sett B:på B:tallene B:og B:de B:ser B:bedre B:ut B:enn B:i B:fjor A:det A:er A:godt A:å A:høre B:men B:vi B:må B:fortsatt B:kutte B:litt B:i B:reisekostnadene A:ja B:kan B:vi B:ta B:det B:opp B:med B:styret B:på B:torsdag A:det A:tror A:jeg A:er A:lurt A:jeg A:sender A:en A:innkalling A:i A:ettermiddag A:så A:får A:alle A:lest A:saken A:før A:møtet B:flott B:da B:gjør B:vi B:det B:slik",
+    "hypothesis": "s1:hei s1:og s1:velkommen s1:til s1:møtet s1:i s1:dag s1:skal s1:vi s1:snakke s1:om s1:budsjettet s1:for s1:neste s1:år s0:takk s0:jeg s0:har s0:sett s0:på s0:tallene s0:og s0:de s0:ser s0:bedre s0:ut s0:enn s0:i s0:fjor s1:det s1:er s1:godt s1:å s1:høre s0:men s0:vi s0:må s0:fortsatt s0:kutte s0:litt s0:i s0:reisekostnadene s1:ja s0:kan s0:vi s0:ta s0:det s0:opp s0:med s0:styret s0:på s0:torsdag s1:det s1:tror s1:jeg s1:er s1:lurt s1:jeg s1:sender s1:en s1:innkalling s1:i s1:ettermiddag s1:så s1:får s1:alle s1:lest s1:saken s1:før s1:møtet s0:flott s0:da s0:gjør s0:vi s0:det s0:slik",
+    "cpwer_errors": 0,
+    "cpwer_length": 76,
+    "wder": 0.0
+   }
+  },
+  {
+   "name": "dialogue-mistaken",
+   "reference": "SPEAKER fx 1 0.500 4.969 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 5.719 4.149 <NA> <NA> B <NA> <NA>\nSPEAKER fx 1 10.168 1.099 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 11.467 2.917 <NA> <NA> B <NA> <NA>\nSPEAKER fx 1 14.734 0.354 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 15.338 2.302 <NA> <NA> B <NA> <NA>\nSPEAKER fx 1 17.940 6.468 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 24.608 2.007 <NA> <NA> B <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.533 4.894 <NA> <NA> s1 <NA> <NA>\nSPEAKER fx 1 5.750 3.961 <NA> <NA> s0 <NA> <NA>\nSPEAKER fx 1 10.068 1.198 <NA> <NA> s1 <NA> <NA>\nSPEAKER fx 1 11.509 2.912 <NA> <NA> s0 <NA> <NA>\nSPEAKER fx 1 15.398 2.264 <NA> <NA> s0 <NA> <NA>\nSPEAKER fx 1 17.801 6.535 <NA> <NA> s1 <NA> <NA>\nSPEAKER fx 1 24.647 2.059 <NA> <NA> s0 <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 5.027817844632172,
+     "jer": 4.900088211934659,
+     "total": 24.265000000000004,
+     "missed": 0.8309999999999992,
+     "false_alarm": 0.38899999999999757,
+     "confusion": 0.0
+    },
+    "fair": {
+     "der": 0.0,
+     "jer": 0.0,
+     "total": 20.411000000000005,
+     "missed": 0.0,
+     "false_alarm": 0.0,
+     "confusion": 0.0
+    },
+    "forgiving": {
+     "der": 0.0,
+     "jer": 0.0,
+     "total": 20.411000000000005,
+     "missed": 0.0,
+     "false_alarm": 0.0,
+     "confusion": 0.0
+    }
+   },
+   "words": {
+    "reference": "A:hei A:og A:velkommen A:til A:møtet A:i A:dag A:skal A:vi A:snakke A:om A:budsjettet A:for A:neste A:år B:takk B:jeg B:har B:sett B:på B:tallene B:og B:de B:ser B:bedre B:ut B:enn B:i B:fjor A:det A:er A:godt A:å A:høre B:men B:vi B:må B:fortsatt B:kutte B:litt B:i B:reisekostnadene A:ja B:kan B:vi B:ta B:det B:opp B:med B:styret B:på B:torsdag A:det A:tror A:jeg A:er A:lurt A:jeg A:sender A:en A:innkalling A:i A:ettermiddag A:så A:får A:alle A:lest A:saken A:før A:møtet B:flott B:da B:gjør B:vi B:det B:slik",
+    "hypothesis": "h0:hei h0:og h0:sakenx h0:til h0:møtet h0:dag h0:skal h0:vi h0:snakke h0:om h0:budsjettet h0:for h0:neste h1:år h1:takk h1:jeg h1:erx h1:sett h1:tallene h1:og h1:de h1:ser h1:ut h1:enn h1:i h1:fjor h1:på h0:det h0:er h0:godt h0:å h0:høre h1:men h1:må h1:fortsatt h1:kutte h1:litt h1:i h0:reisekostnadene h0:menx h1:kan h1:vi h1:ta h1:det h1:opp h1:måx h1:styret h1:på h1:torsdag h0:det h1:tror h1:jeg h1:godt h0:er h0:lurt h0:sender h0:en h0:innkalling h0:i h0:ettermiddag h0:så h0:får h0:lest h0:saken h0:før h0:møtet h1:flott h1:da h1:dagx h1:det h1:slik",
+    "cpwer_errors": 22,
+    "cpwer_length": 76,
+    "wder": 5.797101449275362
+   }
+  },
+  {
+   "name": "meeting-0",
+   "reference": "SPEAKER fx 1 1.798 7.489 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 10.123 3.324 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 14.080 2.762 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 17.687 3.318 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 21.757 0.430 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 21.853 2.227 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 23.065 3.791 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 27.282 2.351 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 29.787 0.353 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 31.158 8.770 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 40.510 1.659 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 41.846 3.213 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 45.690 1.390 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 47.972 1.996 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 50.793 0.334 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 51.524 0.366 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 52.078 4.788 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 57.439 3.542 <NA> <NA> S1 <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 1.932 7.066 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 10.078 3.498 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 14.343 2.426 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 17.550 3.533 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 22.172 2.345 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 23.079 3.958 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 27.324 1.844 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 29.611 0.846 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 31.244 8.446 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 42.115 2.947 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 45.733 1.186 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 47.713 2.315 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 51.194 0.544 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 52.228 4.351 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 57.744 3.111 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 0.504 1.773 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 28.099 1.613 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 27.479 0.595 <NA> <NA> spk1 <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 21.570734890505353,
+     "jer": 20.05498990366802,
+     "total": 52.103,
+     "missed": 5.240000000000009,
+     "false_alarm": 5.533999999999998,
+     "confusion": 0.4649999999999963
+    },
+    "fair": {
+     "der": 10.42747358309316,
+     "jer": 10.178119167200451,
+     "total": 41.63999999999999,
+     "missed": 0.9799999999999969,
+     "false_alarm": 3.146999999999999,
+     "confusion": 0.2149999999999963
+    },
+    "forgiving": {
+     "der": 10.691947796109314,
+     "jer": 10.43113620574017,
+     "total": 40.60999999999999,
+     "missed": 0.9799999999999969,
+     "false_alarm": 3.146999999999999,
+     "confusion": 0.2149999999999963
+    }
+   },
+   "words": {
+    "reference": "S0:opp S0:ja S0:i S0:styret S0:kan S0:det S0:hei S0:styret S0:ja S0:nei S0:opp S0:så S0:på S0:tallene S1:opp S1:budsjettet S1:hei S1:ja S1:tallene S1:takk S0:ja S0:dag S0:budsjettet S0:vi S0:godt S1:på S1:det S1:ta S1:takk S1:opp S1:kan S0:styret S1:med S1:er S1:i S1:møtet S0:opp S0:møtet S0:i S0:dag S0:nei S0:styret S0:må S1:godt S1:kan S1:budsjettet S1:kan S0:men S1:styret S1:styret S1:må S1:men S1:tallene S1:må S1:så S1:det S1:takk S1:tallene S1:takk S1:ja S1:det S1:takk S1:vi S1:godt S1:takk S0:men S0:men S0:hei S1:ta S1:dag S1:dag S1:men S1:opp S1:kan S0:hei S0:ja S1:budsjettet S1:styret S1:på S0:styret S1:må S0:i S0:er S0:nei S0:og S0:med S0:takk S0:opp S0:møtet S0:opp S1:styret S1:med S1:styret S1:så S1:men S1:dag S1:budsjettet",
+    "hypothesis": "h1:opp h1:ja h1:i h1:styret h1:kan h1:det h1:hei h1:styret h1:ja h1:nei h1:erx h1:så h1:er h1:på h1:tallene h0:opp h0:budsjettet h0:hei h0:ja h0:tallene h0:takk h1:ja h1:dag h1:budsjettet h1:neix h1:godt h0:på h0:det h0:ta h0:takk h0:opp h1:kan h0:styret h0:nei h1:med h0:er h0:i h0:møtet h1:opp h1:møtet h1:i h1:dag h1:nei h1:må h0:godt h0:kan h0:budsjettet h1:kan h1:men h0:detx h0:detx h0:må h0:men h0:tallene h0:må h1:budsjettetx h0:det h0:takk h0:tallene h0:takk h0:ja h0:det h0:budsjettetx h0:vi h0:godt h0:tallenex h0:men h1:men h0:ta h0:dag h0:dag h0:men h0:opp h1:hei h1:ja h1:budsjettet h0:styret h0:på h1:styret h0:må h1:i h1:dagx h1:nei h1:møtet h1:og h1:med h1:takk h1:opp h1:møtet h1:opp h0:styret h0:med h0:må h0:styret h0:så h0:men h0:dag h0:budsjettet",
+    "cpwer_errors": 24,
+    "cpwer_length": 97,
+    "wder": 7.446808510638298
+   }
+  },
+  {
+   "name": "meeting-1",
+   "reference": "SPEAKER fx 1 0.883 0.565 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 2.226 10.383 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 12.786 14.395 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 27.950 3.625 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 32.721 6.657 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 40.251 1.559 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 42.447 0.878 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 44.183 5.352 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 50.077 3.936 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 54.488 4.571 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 59.928 0.804 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 59.886 11.053 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 69.506 1.382 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 71.319 1.410 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 73.526 4.868 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 78.171 3.393 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 82.378 1.429 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 84.527 1.410 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 86.128 2.254 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 89.482 1.119 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 90.932 0.889 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 92.898 0.714 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 93.876 7.431 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 101.674 0.315 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 102.141 1.018 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 103.972 3.742 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 108.726 0.398 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 110.208 1.965 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 110.870 3.101 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 114.599 20.000 <NA> <NA> S1 <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.791 0.447 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 2.446 10.019 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 12.845 14.554 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 27.846 3.818 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 33.098 6.175 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 40.558 1.649 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 42.367 0.975 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 44.156 5.416 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 50.332 3.427 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 54.345 4.665 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 60.091 0.292 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 59.861 11.308 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 69.525 1.416 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 71.112 1.854 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 73.509 4.924 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 78.075 3.368 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 82.148 1.776 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 84.689 1.398 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 85.919 1.993 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 89.809 0.825 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 90.681 1.155 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 92.989 0.887 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 93.818 7.403 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 101.275 0.963 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 102.064 1.438 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 103.745 3.803 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 108.792 0.405 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 110.194 2.312 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 111.058 3.132 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 114.441 20.226 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 71.035 1.258 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 103.278 1.567 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 15.089 1.257 <NA> <NA> spk2 <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 33.46902566823643,
+     "jer": 48.58874879975761,
+     "total": 120.61599999999999,
+     "missed": 4.156000000000038,
+     "false_alarm": 9.645000000000046,
+     "confusion": 26.56799999999997
+    },
+    "fair": {
+     "der": 25.164467319376183,
+     "jer": 44.253137969999514,
+     "total": 103.36400000000002,
+     "missed": 0.5890000000000128,
+     "false_alarm": 3.2299999999999773,
+     "confusion": 22.19200000000001
+    },
+    "forgiving": {
+     "der": 24.376672770812792,
+     "jer": 44.44718743404505,
+     "total": 99.38600000000001,
+     "missed": 0.4900000000000162,
+     "false_alarm": 3.2299999999999773,
+     "confusion": 20.50700000000001
+    }
+   },
+   "words": {
+    "reference": "S1:vi S0:vi S0:i S0:nei S0:kan S0:på S0:budsjettet S0:opp S0:men S0:det S0:styret S0:med S0:budsjettet S0:godt S0:med S0:kan S0:vi S0:styret S0:er S0:det S0:møtet S2:med S2:opp S2:nei S2:tallene S2:er S2:nei S2:takk S2:med S2:takk S2:tallene S2:og S2:så S2:på S2:så S2:og S2:saken S2:dag S2:kan S2:med S2:det S2:ta S2:møtet S2:dag S2:nei S2:på S2:takk S2:og S2:men S1:kan S1:kan S1:saken S1:med S1:godt S1:med S1:og S2:tallene S2:men S2:styret S2:det S2:nei S2:møtet S2:med S2:takk S2:tallene S2:vi S2:må S2:budsjettet S2:ja S1:hei S1:er S1:det S0:tallene S1:dag S1:med S1:dag S1:takk S1:takk S1:takk S1:møtet S1:takk S1:kan S1:i S2:ja S2:på S2:budsjettet S2:opp S2:dag S2:det S2:tallene S0:men S0:så S0:vi S0:dag S0:og S0:ta S0:møtet S0:så S0:med S2:godt S1:takk S1:takk S1:det S1:dag S1:på S1:kan S1:vi S1:takk S1:takk S1:og S1:i S1:er S1:og S1:nei S1:kan S1:ja S1:nei S1:ja S1:møtet S1:møtet S1:det S1:saken S0:i S0:på S1:nei S1:det S0:godt S0:ta S0:på S0:nei S0:ta S0:møtet S0:ta S0:vi S0:må S2:men S2:opp S2:på S2:må S2:takk S2:med S1:det S1:må S2:takk S2:dag S1:med S1:opp S1:i S1:opp S2:det S2:ja S1:tallene S0:ta S1:møtet S1:er S1:opp S1:på S1:vi S1:er S1:ta S1:er S1:med S1:er S1:budsjettet S1:må S1:ta S1:saken S2:så S0:møtet S0:men S2:saken S2:vi S2:og S2:møtet S2:kan S2:med S2:takk S0:dag S1:på S1:dag S1:tallene S0:opp S0:dag S0:så S0:så S0:takk S0:nei S1:godt S1:budsjettet S1:opp S1:tallene S1:er S1:nei S1:vi S1:men S1:er S1:ja S1:saken S1:takk S1:møtet S1:saken S1:takk S1:nei S1:med S1:er S1:takk S1:dag S1:budsjettet S1:vi S1:må S1:kan S1:vi S1:styret S1:men S1:hei S1:så S1:godt S1:og S1:og S1:og S1:i S1:nei S1:ja S1:dag S1:med S1:er S1:så",
+    "hypothesis": "h1:vi h0:vi h2:ogx h2:nei h2:kan h2:saken h2:på h2:budsjettet h2:opp h2:men h2:godtx h2:styret h2:budsjettet h2:godt h2:med h2:kan h2:vi h2:styret h2:er h2:det h2:møtet h0:med h0:opp h0:tallene h0:er h0:takk h0:takk h0:styretx h0:og h0:så h0:på h0:så h0:og h0:oppx h0:dag h0:kan h0:med h0:ta h0:møtet h0:dag h0:nei h0:på h0:takk h0:og h0:men h0:kan h1:kan h1:saken h1:med h1:godt h1:med h0:og h0:tallene h0:men h0:styret h0:det h0:nei h0:møtet h0:med h0:takk h0:tallene h0:vi h0:dag h0:må h0:budsjettet h1:møtetx h1:hei h1:er h1:sakenx h2:tallene h2:dag h1:med h1:dag h1:det h1:takk h1:takk h1:takk h1:nei h1:møtet h1:takk h1:kan h0:i h0:ja h0:på h0:budsjettet h0:opp h0:dag h0:det h0:tallene h2:så h2:vi h2:detx h2:medx h2:ta h2:møtet h2:så h2:med h0:godt h1:påx h1:takk h1:det h1:dag h1:på h1:kan h1:vi h1:takk h1:takk h1:og h1:i h1:er h1:og h2:nei h1:kan h1:ja h1:nei h1:ja h1:møtet h1:det h0:saken h0:i h1:på h1:nei h1:med h1:det h2:godt h2:ta h2:på h2:nei h2:ta h2:møtet h2:ta h2:vi h2:ja h0:må h0:men h0:opp h0:på h0:må h0:takk h0:med h1:det h0:takk h0:dag h0:med h1:opp h1:i h1:opp h0:det h0:ja h1:tallene h2:ta h1:møtet h1:er h1:opp h1:på h2:vi h1:er h1:ta h1:er h1:med h1:er h1:budsjettet h1:må h1:ta h1:saken h0:møtetx h2:møtet h0:men h0:saken h0:vi h0:og h0:møtet h0:kan h0:med h0:takk h0:dag h1:på h1:dag h1:menx h2:opp h2:dag h2:så h2:tallenex h2:oppx h0:nei h2:godt h1:opp h1:menx h1:nei h1:vi h1:men h1:er h1:ja h1:saken h1:takk h1:møtet h1:godt h1:saken h1:takk h1:nei h1:med h1:er h1:takk h1:dag h1:budsjettet h1:vi h1:må h1:vi h1:så h1:styret h1:men h1:hei h1:så h1:godt h1:og h1:og h1:styretx h1:i h1:nei h1:saken h1:ja h1:dag h1:med h1:er h1:så",
+    "cpwer_errors": 61,
+    "cpwer_length": 227,
+    "wder": 7.8341013824884795
+   }
+  },
+  {
+   "name": "meeting-2",
+   "reference": "SPEAKER fx 1 0.392 0.500 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 0.374 2.400 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 3.762 2.546 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 6.682 2.533 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 9.564 5.541 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 15.545 3.617 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 17.773 6.615 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 24.979 1.748 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 27.372 2.363 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 28.639 10.905 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 39.855 3.886 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 43.386 4.823 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 48.776 1.238 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 50.257 3.328 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 54.038 2.342 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 57.366 3.979 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 62.535 1.850 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 65.108 3.542 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 68.956 3.185 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 72.657 4.513 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 77.611 2.247 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 80.300 3.552 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 84.789 3.266 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 89.195 7.942 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 97.241 5.901 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 104.261 2.834 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 106.608 10.978 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 117.653 1.760 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 120.155 3.172 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 124.095 0.300 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 123.720 1.393 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 125.731 2.902 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 129.689 8.508 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 138.752 3.367 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 142.972 2.894 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 146.167 1.651 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 148.743 3.086 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 152.114 1.019 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 154.285 15.639 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 170.152 3.778 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 173.521 5.523 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 178.143 1.798 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 179.503 6.213 <NA> <NA> S1 <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.499 0.503 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 0.000 2.772 <NA> <NA> spk_split <NA> <NA>\nSPEAKER fx 1 3.512 2.829 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 6.446 2.901 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 9.266 5.609 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 15.408 3.750 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 17.816 6.291 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 24.683 2.221 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 27.286 2.544 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 28.771 10.390 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 39.742 4.032 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 43.441 4.696 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 48.721 0.925 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 50.387 3.235 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 53.848 2.615 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 57.427 3.889 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 62.452 2.137 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 64.794 3.745 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 69.029 3.327 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 72.159 5.081 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 77.539 1.997 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 84.961 3.125 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 89.002 7.880 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 97.508 5.640 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 104.206 2.983 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 106.632 10.679 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 118.037 1.230 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 120.551 2.980 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 124.080 0.201 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 123.511 1.655 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 125.943 2.702 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 129.934 7.992 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 139.068 2.819 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 142.623 3.243 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 146.270 1.579 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 149.050 2.773 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 153.853 16.094 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 170.345 3.530 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 173.532 5.279 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 178.318 1.636 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 179.547 5.868 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 112.632 1.082 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 108.625 1.394 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 22.592 0.662 <NA> <NA> spk3 <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 13.528686681037827,
+     "jer": 16.427659345814682,
+     "total": 171.177,
+     "missed": 11.711000000000068,
+     "false_alarm": 9.049000000000053,
+     "confusion": 2.3979999999999997
+    },
+    "fair": {
+     "der": 6.6724272376657305,
+     "jer": 10.705909296785032,
+     "total": 142.34700000000004,
+     "missed": 4.447000000000038,
+     "false_alarm": 3.669000000000002,
+     "confusion": 1.3820000000000001
+    },
+    "forgiving": {
+     "der": 6.85405015334659,
+     "jer": 11.24084827679955,
+     "total": 138.57500000000005,
+     "missed": 4.447000000000038,
+     "false_alarm": 3.669000000000002,
+     "confusion": 1.3820000000000001
+    }
+   },
+   "words": {
+    "reference": "S2:ja S3:på S3:på S3:med S3:det S0:i S0:og S0:møtet S0:dag S0:og S2:og S2:nei S2:så S2:budsjettet S2:saken S1:det S1:saken S1:nei S1:nei S1:på S1:så S1:må S1:men S1:opp S1:kan S1:ta S3:møtet S3:må S3:på S3:er S3:godt S3:dag S3:møtet S2:det S2:opp S2:med S2:vi S2:ja S2:godt S2:kan S2:saken S2:hei S2:godt S2:nei S2:det S2:nei S1:kan S1:med S1:budsjettet S2:er S2:takk S2:er S2:nei S0:kan S0:det S0:tallene S0:ta S0:må S0:i S0:styret S0:med S0:godt S0:saken S0:opp S0:er S0:ta S0:må S0:ja S0:og S0:saken S0:opp S0:men S0:dag S0:på S2:kan S2:i S2:må S2:dag S2:vi S2:møtet S2:på S1:tallene S1:ta S1:ja S1:i S1:ja S1:saken S1:tallene S1:så S1:opp S3:dag S3:nei S1:i S1:styret S1:møtet S1:så S1:takk S1:vi S2:opp S2:på S2:styret S2:på S1:dag S1:så S1:dag S1:vi S1:vi S1:ta S1:er S2:vi S2:så S2:ta S1:så S1:kan S1:møtet S1:men S1:så S1:ta S1:budsjettet S0:det S0:budsjettet S0:tallene S0:nei S0:dag S0:godt S2:godt S2:dag S2:styret S2:dag S2:hei S2:saken S2:i S2:vi S2:men S1:kan S1:saken S1:med S1:det S3:i S3:må S3:ja S3:kan S3:er S3:kan S3:på S2:dag S2:men S2:det S2:og S2:godt S2:tallene S1:saken S1:kan S1:så S1:og S1:kan S1:det S1:dag S1:er S1:hei S1:og S1:på S1:nei S1:styret S1:på S1:så S2:med S2:dag S2:tallene S2:i S2:er S2:nei S2:budsjettet S2:saken S2:på S2:nei S2:ja S1:styret S1:takk S1:med S1:opp S1:kan S2:er S2:må S2:godt S2:ja S2:ja S2:møtet S2:vi S2:ta S2:hei S2:dag S2:må S2:så S2:godt S2:ja S2:men S2:med S2:men S2:ja S2:ta S2:vi S2:men S1:nei S1:møtet S1:vi S3:godt S3:møtet S3:må S3:er S3:og S3:med S0:ja S3:ja S3:takk S0:styret S0:det S0:må S0:så S0:takk S2:godt S2:så S2:styret S2:budsjettet S2:møtet S2:ja S2:men S2:med S2:i S2:på S2:saken S2:vi S2:og S2:men S2:nei S2:det S2:hei S3:styret S3:ta S3:det S3:kan S3:nei S3:vi S2:nei S2:tallene S2:dag S2:er S2:ja S1:med S1:og S1:men S0:ta S0:men S0:nei S0:på S0:må S0:det S2:på S2:må S1:opp S1:godt S1:ja S1:i S1:men S1:må S1:på S1:men S1:og S1:og S1:saken S1:takk S1:må S1:takk S1:men S1:må S1:møtet S1:møtet S1:nei S1:ta S1:ja S1:i S1:takk S1:dag S1:på S1:i S1:ja S1:budsjettet S1:godt S1:godt S1:men S3:saken S3:hei S3:må S3:er S3:kan S3:med S3:møtet S2:i S2:på S2:ja S2:og S2:tallene S2:kan S2:styret S2:det S2:vi S2:ja S2:og S0:takk S0:tallene S0:takk S1:opp S1:dag S1:møtet S1:på S1:ta S1:må S1:ta S1:med S1:med S1:må S1:møtet S1:så",
+    "hypothesis": "h3:ja h3:budsjettetx h1:på h1:med h2:det h0:tallenex h0:og h0:møtet h0:dag h0:og h3:og h3:nei h3:så h3:budsjettet h0:saken h2:det h2:saken h2:nei h2:nei h2:på h2:så h2:neix h2:men h2:opp h2:kan h2:ta h1:møtet h1:må h1:på h1:er h1:godt h1:dag h2:møtet h1:det h3:opp h3:med h3:ja h3:godt h3:kan h3:saken h3:hei h3:godt h3:nei h3:det h3:erx h2:kan h2:med h2:neix h2:er h3:takk h3:er h1:nei h3:kan h0:det h0:tax h0:ta h0:budsjettetx h0:i h0:styret h0:med h0:godt h0:saken h0:opp h0:er h0:må h0:ja h0:og h0:saken h0:opp h0:tallenex h0:dag h0:jax h3:kan h3:i h3:må h3:dag h3:vi h3:på h2:budsjettetx h2:ja h2:i h2:ja h2:saken h2:tallene h2:så h2:opp h3:dag h1:heix h2:i h2:styret h2:møtet h2:så h2:takk h2:oppx h3:opp h3:på h3:styret h1:dag h2:så h2:dag h2:godtx h2:vi h2:ta h2:er h3:vi h3:så h3:ta h3:så h2:kan h2:møtet h2:men h2:så h2:ta h2:budsjettet h2:det h0:budsjettet h0:tallene h0:sakenx h0:dag h0:godt h0:tallene h3:dagx h3:dag h3:styret h3:dag h3:jax h3:saken h3:i h3:vi h3:takk h3:men h2:kan h2:sakenx h2:med h2:det h1:i h1:må h1:ja h1:er h1:kan h0:på h3:dag h3:men h3:det h3:og h3:godt h3:tallene h2:saken h2:kan h2:så h2:og h2:kan h2:det h2:dag h2:er h2:hei h2:og h2:på h2:nei h2:styret h2:på h1:så h2:med h3:dag h3:medx h3:godtx h3:er h3:nei h3:budsjettet h3:saken h3:med h3:på h3:med h3:nei h3:ja h2:styret h2:budsjettetx h2:med h2:opp h1:kan h3:er h3:må h3:godt h3:ja h3:detx h3:møtet h3:vi h3:ta h3:hei h3:dag h3:må h3:så h3:godt h3:ja h3:men h3:men h3:ja h3:ta h3:vi h3:men h2:nei h2:vi h3:godt h1:møtet h1:må h1:er h1:vix h1:med h0:ja h0:med h1:ja h1:oppx h0:styret h0:det h0:må h0:budsjettetx h0:takk h3:godt h3:så h2:styret h3:møtet h3:ja h3:men h3:med h3:i h3:på h3:saken h3:vi h3:og h3:men h3:påx h3:det h3:sakenx h1:styret h1:ta h1:det h1:kan h1:nei h1:vi h1:nei h3:tallene h3:dag h3:er h3:ja h1:med h2:og h2:tallenex h0:ta h0:men h0:nei h0:må h1:det h3:på h1:må h2:opp h2:godt h2:ja h2:i h2:men h2:må h2:på h2:men h2:og h2:og h2:saken h2:takk h2:må h2:takk h2:men h2:er h2:oppx h2:møtet h2:møtet h2:nei h2:ta h1:ja h2:i h2:takk h2:dag h2:takk h2:på h2:i h2:ja h2:budsjettet h2:godt h2:godt h2:men h1:saken h1:hei h1:må h1:er h1:kan h1:med h1:møtet h3:i h3:på h3:oppx h3:og h3:tallene h3:kan h3:styret h3:det h3:vi h3:ja h0:takk h0:tallene h0:takk h2:opp h2:dag h2:møtet h2:på h2:tax h2:takk h2:må h2:ta h2:med h2:med h2:opp h2:må h2:møtet h2:så",
+    "cpwer_errors": 86,
+    "cpwer_length": 323,
+    "wder": 7.371794871794871
+   }
+  },
+  {
+   "name": "meeting-3",
+   "reference": "SPEAKER fx 1 0.295 4.270 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 5.516 0.479 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 6.467 1.280 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 8.857 5.577 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 13.068 1.521 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 15.081 0.681 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 16.001 8.355 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 24.473 0.732 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 24.944 1.664 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 27.025 5.167 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 32.669 2.197 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 35.151 1.103 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 37.016 10.765 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 47.578 2.167 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 50.297 7.745 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 59.158 5.522 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 64.754 2.553 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 67.606 1.395 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 69.863 4.508 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 75.028 2.609 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 77.843 1.283 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 80.269 2.270 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 82.881 3.834 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 85.522 10.931 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 97.248 0.690 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 98.739 6.304 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 106.031 14.116 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 119.389 2.608 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 120.857 2.823 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 124.208 6.076 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 131.060 0.980 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 132.115 2.239 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 132.900 3.348 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 136.921 0.484 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 137.717 2.222 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 140.515 0.301 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 141.601 5.195 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 145.899 1.574 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 148.345 2.275 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 150.071 1.350 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 151.818 1.634 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 152.443 2.110 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 154.629 10.961 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 166.710 6.199 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 172.609 14.393 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 187.079 9.275 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 197.498 2.911 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 201.417 1.910 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 203.984 4.925 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 207.786 1.314 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 209.700 4.396 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 214.536 0.585 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 214.067 5.752 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 220.119 10.629 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 229.967 5.609 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 236.222 0.767 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 236.304 14.016 <NA> <NA> S3 <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.358 4.332 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 5.569 0.248 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 6.004 2.061 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 9.487 5.158 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 12.648 2.192 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 14.894 0.846 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 15.053 9.210 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 23.852 1.547 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 25.691 1.068 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 27.487 4.126 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 32.761 2.785 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 34.970 1.479 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 37.399 10.285 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 47.545 2.472 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 49.903 8.944 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 58.903 5.931 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 65.160 2.242 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 67.219 1.566 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 69.698 4.610 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 75.467 2.144 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 77.556 1.547 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 80.112 2.525 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 82.671 3.523 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 85.803 9.924 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 97.119 0.681 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 98.247 6.877 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 106.130 13.744 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 118.943 3.091 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 120.537 3.278 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 124.661 5.802 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 131.857 2.787 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 132.401 4.175 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 137.515 3.006 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 141.429 5.307 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 145.910 1.026 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 150.068 1.266 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 151.672 1.871 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 152.462 2.791 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 155.407 9.725 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 166.657 6.367 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 172.388 15.084 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 187.298 9.050 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 197.804 2.031 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 201.721 1.667 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 204.068 4.766 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 207.218 1.918 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 210.198 3.525 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 214.570 0.779 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 214.104 6.138 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 219.633 11.037 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 229.816 5.838 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 236.074 0.924 <NA> <NA> spk4 <NA> <NA>\nSPEAKER fx 1 59.660 0.912 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 212.867 1.230 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 118.805 1.552 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 37.545 1.044 <NA> <NA> spk_extra <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 20.40540030765487,
+     "jer": 20.95404248715714,
+     "total": 238.57900000000004,
+     "missed": 27.550999999999977,
+     "false_alarm": 19.02599999999999,
+     "confusion": 2.1059999999999572
+    },
+    "fair": {
+     "der": 12.807115063924401,
+     "jer": 13.422268248972422,
+     "total": 197.8900000000001,
+     "missed": 18.608000000000033,
+     "false_alarm": 6.244999999999976,
+     "confusion": 0.49099999999999966
+    },
+    "forgiving": {
+     "der": 13.141694770087248,
+     "jer": 13.584357150888737,
+     "total": 186.8100000000001,
+     "missed": 18.07200000000003,
+     "false_alarm": 6.009999999999977,
+     "confusion": 0.4679999999999893
+    }
+   },
+   "words": {
+    "reference": "S0:kan S0:ta S0:møtet S0:det S0:på S0:det S0:og S0:møtet S4:budsjettet S1:vi S1:kan S0:ja S0:er S0:og S0:og S0:takk S0:så S0:må S0:det S0:så S0:ta S0:på S3:og S3:er S3:så S4:med S3:tallene S3:tallene S3:tallene S3:hei S3:og S3:budsjettet S3:møtet S3:hei S3:hei S3:nei S3:på S3:opp S3:men S3:så S3:godt S3:dag S0:opp S3:må S3:må S3:ja S4:saken S4:ja S4:saken S4:hei S4:kan S4:på S4:styret S4:tallene S4:må S4:med S1:må S1:tallene S1:styret S1:tallene S0:med S0:budsjettet S4:møtet S4:godt S4:er S4:med S4:takk S4:kan S4:er S4:styret S4:er S4:saken S4:kan S4:dag S4:med S4:tallene S4:tallene S4:og S4:opp S4:på S4:godt S4:hei S4:ta S3:det S3:vi S3:takk S3:men S0:så S0:så S0:godt S0:så S0:ja S0:det S0:tallene S0:saken S0:tallene S0:med S0:nei S0:med S0:styret S0:møtet S0:takk S2:det S2:budsjettet S2:saken S2:er S2:ja S2:det S2:takk S2:vi S2:vi S2:ja S2:budsjettet S0:godt S0:og S0:på S0:så S0:er S3:dag S3:kan S2:styret S2:ja S2:opp S2:og S2:så S2:styret S2:må S2:dag S2:med S3:det S3:nei S3:ta S3:nei S3:dag S2:kan S2:hei S4:men S4:opp S4:er S4:er S1:vi S1:budsjettet S1:ja S1:er S1:og S1:opp S1:med S2:opp S2:saken S2:møtet S2:takk S2:opp S2:men S2:det S2:hei S2:og S2:må S2:tallene S2:vi S2:dag S2:dag S2:og S2:saken S2:møtet S2:dag S2:hei S2:er S2:hei S1:saken S3:opp S3:nei S3:dag S3:er S3:ja S3:nei S3:tallene S3:opp S3:budsjettet S3:med S3:styret S3:kan S2:så S2:møtet S2:og S2:så S2:ja S2:saken S2:møtet S2:møtet S2:vi S2:må S2:møtet S2:hei S2:vi S2:i S2:hei S2:så S2:og S2:så S2:kan S2:budsjettet S2:nei S2:takk S2:godt S2:er S2:styret S2:ta S2:men S2:men S0:styret S0:tallene S0:budsjettet S0:i S0:og S2:må S2:er S2:ja S2:ta S2:ja S0:på S0:takk S0:i S0:er S0:saken S0:opp S0:hei S0:hei S0:hei S0:men S0:i S0:tallene S4:i S3:saken S3:på S3:på S3:budsjettet S1:må S1:i S1:men S1:kan S1:med S1:med S3:dag S1:saken S1:styret S1:men S1:nei S3:så S1:det S1:må S1:opp S1:ja S1:tallene S1:nei S1:er S1:takk S1:takk S1:og S2:ta S2:i S2:i S4:med S4:styret S4:ja S4:det S2:vi S2:må S1:takk S1:og S1:det S2:saken S2:kan S2:og S2:styret S4:godt S4:i S4:vi S4:tallene S4:godt S4:men S4:er S4:og S4:på S4:vi S4:nei S4:dag S4:styret S4:godt S4:møtet S4:vi S4:så S4:er S4:takk S4:med S4:må S1:vi S1:i S1:saken S1:hei S1:takk S1:kan S1:takk S1:dag S1:på S1:kan S1:hei S1:på S2:opp S2:i S2:med S2:i S2:og S2:i S2:møtet S2:kan S2:budsjettet S2:så S2:budsjettet S2:godt S2:møtet S2:godt S2:ja S2:opp S2:men S2:opp S2:saken S2:tallene S2:opp S2:ta S2:i S2:styret S2:må S2:hei S2:i S2:ja S0:i S0:budsjettet S0:kan S0:nei S0:vi S0:så S0:er S0:vi S0:og S0:så S0:kan S0:er S0:saken S0:møtet S0:det S0:men S0:det S0:tallene S4:styret S4:møtet S4:budsjettet S4:er S4:kan S1:møtet S1:ta S1:i S0:tallene S0:nei S0:det S0:budsjettet S0:styret S0:vi S0:må S0:må S0:takk S2:saken S2:så S0:i S0:vi S0:det S0:vi S0:dag S0:ja S0:må S0:men S4:kan S1:det S1:nei S1:ja S1:må S1:tallene S1:godt S1:dag S1:møtet S1:med S1:takk S1:styret S0:ta S0:kan S0:ja S0:tallene S0:så S0:i S0:i S0:opp S0:og S0:er S0:hei S0:nei S0:ta S0:opp S0:må S0:ta S0:med S0:saken S0:ja S0:er S0:og S2:nei S2:hei S2:må S2:vi S2:med S2:opp S2:er S2:hei S2:må S2:ta S2:og S0:på S3:kan S3:med S3:er S3:godt S3:saken S3:på S3:saken S3:godt S3:nei S3:er S3:og S3:må S3:kan S3:takk S3:på S3:opp S3:takk S3:møtet S3:men S3:opp S3:hei S3:vi S3:hei S3:hei S3:ta S3:styret S3:kan S3:dag",
+    "hypothesis": "h4:kan h4:ta h4:detx h4:det h4:på h4:det h3:og h4:møtet h3:budsjettet h3:vi h0:kan h0:godt h4:oppx h4:er h4:og h4:og h4:takk h4:så h4:må h4:det h4:styretx h4:ta h4:på h2:og h3:så h3:med h3:tallene h2:tallene h2:tallene h2:hei h2:og h2:budsjettet h2:jax h2:hei h2:hei h2:nei h2:på h2:men h2:måx h2:godt h2:dag h4:opp h2:må h2:må h2:ja h3:måx h3:ja h3:saken h3:hei h3:sakenx h3:styret h3:tallene h3:må h3:med h0:må h0:tallene h0:vix h0:måx h4:med h0:budsjettet h1:møtet h3:godt h3:er h3:med h3:takk h3:dag h3:kan h3:styret h3:er h3:saken h3:kan h3:dag h3:jax h3:tallene h3:tallene h3:og h3:opp h3:på h3:hei h3:ta h2:det h2:vi h2:takk h2:men h4:så h4:godt h4:så h4:ja h4:det h4:tallene h4:hei h4:saken h4:tallene h4:med h4:kan h2:nei h4:med h4:styret h4:møtet h4:heix h1:budsjettet h1:saken h1:er h2:ja h1:det h1:tax h1:vi h1:ja h1:erx h4:godt h4:og h4:på h4:så h4:er h1:dag h2:kan h1:styret h1:så h1:ja h1:opp h1:kan h1:og h1:så h1:heix h1:opp h1:må h4:med h2:det h2:nei h2:ta h2:nei h2:dag h1:kan h1:møtetx h1:takk h3:påx h3:opp h3:er h0:er h0:vi h0:budsjettet h0:ja h0:er h0:og h0:opp h3:med h1:opp h1:saken h1:møtet h1:takk h1:opp h1:men h1:det h1:hei h1:og h1:må h1:tallene h1:vi h1:dag h1:dag h1:budsjettetx h1:saken h1:opp h1:møtet h1:ja h1:dag h1:hei h1:er h1:hei h1:saken h2:opp h2:tallene h2:nei h1:dag h2:er h2:ja h2:budsjettetx h2:tallene h2:opp h2:budsjettet h2:med h2:styret h2:kan h1:og h1:så h1:ja h1:saken h1:møtet h1:møtet h1:vi h1:må h1:påx h1:hei h1:vi h1:i h1:hei h1:så h1:og h1:så h1:budsjettet h1:nei h1:takk h1:godt h1:detx h1:styret h1:ta h1:men h4:men h4:styret h4:tallene h4:detx h4:i h4:og h1:må h1:er h1:ja h1:ta h1:ja h4:på h4:takk h4:i h4:er h4:opp h4:hei h4:hei h4:neix h4:i h3:i h3:tallene h2:saken h2:på h2:på h3:såx h0:må h0:i h0:men h4:kan h0:med h2:med h2:dag h3:saken h0:styret h0:ix h0:nei h2:så h0:det h0:må h0:opp h0:ja h0:tallene h0:nei h0:er h0:må h0:takk h0:takk h2:og h1:ta h1:i h3:styret h3:det h1:vi h0:må h0:takk h0:og h0:det h2:saken h1:kan h1:og h1:styret h4:godt h3:i h3:vi h3:tallene h3:godt h3:men h3:er h3:på h3:vi h3:nei h3:dag h3:styret h3:kanx h3:møtet h3:så h3:nei h3:takk h3:med h3:må h2:vi h0:i h0:tax h0:hei h0:kan h0:takk h0:dag h0:på h2:kan h0:hei h0:på h0:opp h1:budsjettetx h1:i h1:og h1:i h1:møtet h1:kan h1:budsjettet h1:så h1:opp h1:budsjettet h1:takk h1:godt h1:møtet h1:godt h1:opp h1:men h1:opp h1:saken h1:tallene h4:opp h1:ta h1:i h1:styret h1:tax h1:hei h1:i h1:ja h4:i h4:budsjettet h4:kan h4:nei h4:møtetx h4:så h4:er h4:vi h4:og h4:så h4:kan h4:er h4:saken h4:møtet h4:det h4:møtet h4:men h4:det h0:tallene h3:styret h3:møtet h3:budsjettet h3:er h0:neix h0:møtet h0:ogx h2:tax h4:tallene h4:nei h4:det h4:budsjettet h4:styret h4:vi h4:må h4:må h3:takk h3:saken h1:ogx h4:i h4:vi h4:det h4:vi h4:vix h4:ja h4:må h4:men h3:kan h0:nei h0:ja h0:må h0:medx h0:godt h0:dag h0:møtet h0:med h0:så h0:takk h0:styret h4:ta h4:kan h4:ja h4:tallene h4:så h4:i h4:i h0:erx h4:og h4:er h4:hei h4:nei h4:ta h4:opp h4:ogx h4:ta h4:med h4:saken h4:ja h4:det h3:er h4:og h1:nei h1:hei h1:må h1:med h1:opp h1:tallenex h1:hei h1:ta h1:og h4:på h2:kan h2:med h2:er h2:godt h2:saken h2:på h2:saken h2:godt h2:nei h2:er h2:og h2:må h2:kan h2:takk h2:på h2:opp h2:takk h2:det h2:møtet h2:men h2:heix h2:hei h2:vi h2:nei h2:hei h2:hei h2:ta h2:kan h2:dag",
+    "cpwer_errors": 138,
+    "cpwer_length": 453,
+    "wder": 8.624708624708624
+   }
+  },
+  {
+   "name": "meeting-4",
+   "reference": "SPEAKER fx 1 0.219 1.035 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 1.514 5.453 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 6.688 4.149 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 10.403 5.284 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 16.001 1.418 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 17.633 0.420 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 17.432 0.759 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 19.133 7.999 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 27.974 2.064 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 31.162 2.309 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 33.079 3.605 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 36.745 0.614 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 38.001 5.113 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 44.134 1.182 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 45.457 1.160 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 47.530 1.051 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 49.718 5.541 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 54.197 0.640 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 55.515 4.137 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 59.939 17.068 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 77.990 5.448 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 83.214 15.625 <NA> <NA> S1 <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 1.641 5.029 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 10.322 5.088 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 16.326 1.094 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 17.363 0.768 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 17.456 0.992 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 18.993 8.080 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 28.005 1.713 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 31.031 2.110 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 33.172 3.801 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 36.943 0.447 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 38.148 5.140 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 44.174 1.254 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 45.159 1.597 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 47.314 1.486 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 49.468 5.593 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 55.400 4.180 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 60.106 16.661 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 78.073 5.044 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 83.383 15.548 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 90.779 0.445 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 91.037 0.441 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 40.726 0.511 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 32.675 1.334 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 33.824 1.853 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 92.488 0.297 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 35.743 1.034 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 61.788 0.964 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 46.209 0.957 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 76.474 1.045 <NA> <NA> spk0 <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 21.8172339639855,
+     "jer": 15.36899687099757,
+     "total": 92.07399999999998,
+     "missed": 8.406999999999991,
+     "false_alarm": 10.839000000000006,
+     "confusion": 0.8420000000000112
+    },
+    "fair": {
+     "der": 13.498027549634612,
+     "jer": 7.046730778761883,
+     "total": 77.31500000000003,
+     "missed": 3.7830000000000013,
+     "false_alarm": 6.653000000000002,
+     "confusion": 0.0
+    },
+    "forgiving": {
+     "der": 13.365353410787304,
+     "jer": 6.929769309435028,
+     "total": 77.03500000000003,
+     "missed": 3.6430000000000007,
+     "false_alarm": 6.653000000000002,
+     "confusion": 0.0
+    }
+   },
+   "words": {
+    "reference": "S1:så S1:så S0:ta S0:takk S0:opp S0:godt S0:er S0:og S0:i S0:kan S0:på S0:ta S1:så S1:vi S1:saken S1:og S1:styret S1:hei S1:er S1:møtet S2:kan S2:hei S2:styret S2:er S2:takk S2:så S2:saken S2:møtet S2:på S2:vi S1:ta S1:hei S2:med S1:i S0:er S0:nei S0:hei S0:nei S0:på S0:kan S0:hei S0:så S0:så S0:styret S0:tallene S0:det S0:det S0:dag S0:vi S2:så S2:med S2:er S2:nei S0:ja S0:vi S0:dag S0:hei S1:styret S1:møtet S1:kan S1:tallene S1:møtet S1:men S1:ja S2:møtet S1:men S1:hei S1:men S1:så S1:ta S1:så S1:ta S1:ja S1:budsjettet S1:i S0:ja S0:budsjettet S1:møtet S1:opp S2:i S2:opp S1:hei S1:styret S1:budsjettet S1:i S1:takk S1:budsjettet S1:hei S1:møtet S1:men S1:kan S1:saken S0:dag S2:saken S2:takk S2:godt S2:vi S2:vi S2:møtet S2:i S2:takk S0:må S0:så S0:dag S0:kan S0:det S0:takk S0:er S0:ja S0:takk S0:budsjettet S0:dag S0:med S0:hei S0:ta S0:er S0:kan S0:men S0:møtet S0:vi S0:så S0:så S0:så S0:opp S0:kan S0:møtet S0:det S0:styret S0:takk S0:det S0:tallene S0:opp S0:takk S0:tallene S0:dag S2:og S2:kan S2:er S2:i S2:godt S2:det S2:med S2:godt S2:tallene S2:vi S1:dag S1:opp S1:godt S1:med S1:så S1:ja S1:møtet S1:godt S1:er S1:men S1:på S1:må S1:tallene S1:dag S1:kan S1:på S1:og S1:så S1:med S1:vi S1:er S1:dag S1:er S1:vi S1:tallene S1:på S1:opp S1:takk S1:styret S1:dag S1:godt",
+    "hypothesis": "h0:så h0:så h2:detx h2:takk h2:opp h2:godt h2:er h2:og h2:i h2:kan h2:på h2:ta h0:så h0:vi h0:saken h1:vix h0:hei h0:er h0:møtet h1:kan h1:hei h1:styret h1:er h1:takk h1:så h1:saken h1:møtet h1:på h1:vi h1:ta h0:hei h1:godtx h0:i h2:er h2:nei h2:hei h2:nei h2:på h2:kan h2:hei h2:så h2:så h2:styret h2:tallene h2:det h2:det h2:dag h2:vi h1:så h1:med h1:er h0:nei h2:ja h2:vi h2:dag h2:hei h0:styret h0:møtet h0:kan h0:tallene h0:møtet h0:ja h1:møtet h0:men h0:hei h0:men h0:så h0:ta h0:så h0:ta h0:ja h0:budsjettet h0:i h2:ja h2:medx h0:møtet h2:opp h1:i h1:opp h0:hei h0:styret h0:budsjettet h1:i h0:takk h0:budsjettet h0:hei h0:møtet h0:sakenx h0:kan h0:saken h1:dag h1:saken h1:takk h1:og h1:godt h1:vi h1:vi h2:møtet h1:i h1:takk h2:må h2:så h2:erx h2:kan h2:det h2:takk h2:er h2:ja h2:takk h2:budsjettet h2:dag h2:med h2:erx h2:ta h2:møtetx h2:kan h2:ix h2:møtet h2:vi h2:så h2:så h2:så h2:opp h2:kan h2:møtet h2:kanx h2:styret h2:takk h2:det h2:tallene h2:opp h2:takk h2:tallene h2:dag h0:menx h1:kan h1:er h1:medx h1:godt h1:det h1:med h1:godt h1:møtet h1:tallene h1:vi h0:dag h0:opp h0:med h0:så h2:ja h0:møtet h0:godt h0:er h0:ogx h0:på h0:må h0:tallene h0:dag h0:kan h0:på h0:dagx h0:med h0:vi h0:er h0:dag h0:er h0:vi h0:tallene h0:på h0:opp h0:takk h0:styret h0:dag h0:godt",
+    "cpwer_errors": 35,
+    "cpwer_length": 176,
+    "wder": 5.232558139534884
+   }
+  },
+  {
+   "name": "meeting-5",
+   "reference": "SPEAKER fx 1 0.675 0.321 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 1.304 1.282 <NA> <NA> S5 <NA> <NA>\nSPEAKER fx 1 2.908 2.001 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 5.193 3.901 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 9.350 1.453 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 9.531 2.310 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 12.985 3.128 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 16.612 5.600 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 23.006 4.364 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 27.652 1.385 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 29.281 5.393 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 33.285 0.824 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 35.090 13.690 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 48.878 3.869 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 53.529 3.151 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 56.793 1.703 <NA> <NA> S5 <NA> <NA>\nSPEAKER fx 1 59.599 11.157 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 71.020 0.813 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 72.598 1.879 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 74.658 1.308 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 76.861 0.659 <NA> <NA> S5 <NA> <NA>\nSPEAKER fx 1 78.681 14.545 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 94.229 0.919 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 95.844 3.131 <NA> <NA> S5 <NA> <NA>\nSPEAKER fx 1 99.928 1.952 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 102.660 0.778 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 104.191 3.629 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 108.239 0.440 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 108.897 1.038 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 110.904 8.538 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 119.654 3.420 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 124.029 2.511 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 127.418 2.053 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 130.059 4.449 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 134.743 5.287 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 140.877 1.359 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 143.196 2.251 <NA> <NA> S5 <NA> <NA>\nSPEAKER fx 1 146.602 4.017 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 150.847 0.437 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 150.238 2.443 <NA> <NA> S5 <NA> <NA>\nSPEAKER fx 1 152.732 1.957 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 155.440 6.840 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 160.964 2.435 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 164.307 2.264 <NA> <NA> S5 <NA> <NA>\nSPEAKER fx 1 166.910 3.880 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 171.099 0.401 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 171.998 1.612 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 172.535 1.129 <NA> <NA> S3 <NA> <NA>\nSPEAKER fx 1 174.140 3.340 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 176.274 1.783 <NA> <NA> S4 <NA> <NA>\nSPEAKER fx 1 178.111 8.042 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 186.965 6.839 <NA> <NA> S5 <NA> <NA>\nSPEAKER fx 1 194.537 2.374 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 197.377 2.946 <NA> <NA> S3 <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.886 0.222 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 1.300 1.282 <NA> <NA> spk_split <NA> <NA>\nSPEAKER fx 1 2.730 2.110 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 5.267 3.856 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 9.289 1.482 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 9.152 2.844 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 12.885 3.119 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 16.865 5.867 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 22.790 4.723 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 27.865 0.880 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 29.647 5.026 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 33.705 0.565 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 35.174 13.722 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 48.868 3.936 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 53.467 3.137 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 56.918 1.668 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 59.770 11.199 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 71.244 0.411 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 72.481 1.986 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 74.910 1.307 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 76.769 0.989 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 78.600 14.442 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 94.026 1.057 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 95.858 3.249 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 102.271 1.162 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 104.243 3.649 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 107.965 0.666 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 108.828 1.438 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 110.523 9.346 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 119.640 3.366 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 124.001 2.347 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 127.611 2.160 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 134.803 5.048 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 140.901 1.371 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 143.293 1.892 <NA> <NA> spk_split <NA> <NA>\nSPEAKER fx 1 146.762 4.059 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 150.928 0.195 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 149.962 3.051 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 152.606 2.046 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 155.371 6.702 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 160.958 2.428 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 164.350 2.298 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 167.158 3.641 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 171.525 0.236 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 172.245 1.468 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 174.391 3.016 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 176.596 1.576 <NA> <NA> spk5 <NA> <NA>\nSPEAKER fx 1 178.080 8.022 <NA> <NA> spk3 <NA> <NA>\nSPEAKER fx 1 187.139 6.453 <NA> <NA> spk1 <NA> <NA>\nSPEAKER fx 1 194.454 2.374 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 197.130 2.992 <NA> <NA> spk2 <NA> <NA>\nSPEAKER fx 1 39.188 1.028 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 73.114 1.969 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 90.675 0.286 <NA> <NA> spk0 <NA> <NA>\nSPEAKER fx 1 139.468 2.962 <NA> <NA> spk_extra <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 23.868771968978393,
+     "jer": 32.43117910209444,
+     "total": 179.23000000000008,
+     "missed": 14.583000000000066,
+     "false_alarm": 13.678999999999942,
+     "confusion": 14.517999999999976
+    },
+    "fair": {
+     "der": 14.44658397349102,
+     "jer": 25.769799879394238,
+     "total": 146.96900000000002,
+     "missed": 6.392000000000014,
+     "false_alarm": 4.847000000000023,
+     "confusion": 9.992999999999983
+    },
+    "forgiving": {
+     "der": 13.563517637267688,
+     "jer": 25.069360599626194,
+     "total": 140.58300000000006,
+     "missed": 5.575000000000021,
+     "false_alarm": 4.847000000000023,
+     "confusion": 8.645999999999995
+    }
+   },
+   "words": {
+    "reference": "S4:nei S5:i S5:kan S4:det S4:vi S4:vi S4:må S3:ta S3:møtet S3:kan S3:hei S3:i S3:saken S3:dag S0:må S0:må S1:det S1:så S1:med S1:ja S2:må S2:ta S2:er S2:så S2:hei S2:på S0:på S0:nei S0:dag S0:godt S0:takk S0:med S0:ja S0:kan S0:dag S0:men S0:møtet S4:hei S4:ja S4:med S4:med S4:men S4:takk S4:men S4:budsjettet S3:budsjettet S3:ta S4:med S4:men S4:må S4:ja S4:kan S4:godt S4:i S4:og S4:på S4:på S3:dag S0:vi S0:men S0:med S0:og S0:saken S0:budsjettet S0:møtet S0:nei S0:styret S0:ja S0:så S0:nei S0:nei S0:i S0:må S0:kan S0:saken S0:budsjettet S0:på S0:ja S0:men S0:styret S0:med S0:det S0:dag S0:ja S0:nei S4:er S4:er S4:med S4:styret S4:kan S4:nei S4:i S2:godt S2:det S2:kan S2:det S2:ta S2:hei S5:møtet S5:det S5:ta S0:må S0:i S0:og S0:tallene S0:på S0:nei S0:men S0:må S0:på S0:det S0:og S0:møtet S0:med S0:ja S0:så S0:godt S0:og S0:på S0:så S0:kan S0:kan S0:må S4:saken S2:må S2:tallene S2:nei S3:er S3:styret S5:nei S0:men S0:ta S0:opp S0:godt S0:det S0:med S0:i S0:så S0:møtet S0:opp S0:er S0:og S0:men S0:saken S0:ta S0:må S0:må S0:med S0:saken S0:på S0:må S0:tallene S0:ja S0:i S0:tallene S0:i S0:takk S0:hei S0:dag S3:ta S5:ja S5:kan S5:dag S5:med S5:saken S5:så S2:med S2:ta S2:på S0:så S2:er S2:ta S2:så S2:men S2:men S2:er S2:møtet S4:godt S1:men S1:godt S4:saken S4:må S4:er S4:møtet S4:men S4:men S4:det S4:takk S4:saken S4:vi S4:men S4:opp S4:i S4:saken S4:så S4:i S4:så S3:må S3:men S3:kan S3:ja S3:ja S3:og S4:i S4:må S4:kan S4:ta S4:saken S2:budsjettet S2:ja S2:møtet S2:i S4:ta S4:det S4:godt S4:dag S4:vi S4:opp S4:styret S4:saken S3:og S3:på S3:det S3:med S3:styret S3:i S3:møtet S3:saken S3:er S3:takk S0:så S0:med S5:må S5:saken S5:med S5:takk S1:og S1:budsjettet S1:i S1:dag S1:på S1:i S1:må S1:dag S0:tallene S5:ja S5:så S5:ja S5:men S2:men S2:kan S2:godt S4:og S4:godt S4:dag S4:med S4:i S4:takk S4:møtet S4:tallene S4:kan S4:det S4:hei S4:men S4:kan S3:i S3:godt S3:opp S3:i S5:saken S5:ja S5:opp S5:godt S4:takk S4:godt S4:i S4:saken S4:med S4:ja S4:tallene S0:kan S1:dag S1:og S1:nei S3:ta S3:takk S0:dag S0:må S0:så S0:møtet S0:med S0:dag S4:styret S4:med S4:hei S2:dag S2:styret S2:nei S2:budsjettet S2:godt S2:det S2:må S2:saken S2:men S2:så S2:budsjettet S2:må S2:kan S2:må S2:på S2:er S5:kan S5:dag S5:kan S5:må S5:godt S5:budsjettet S5:det S5:må S5:ja S5:kan S5:ta S5:er S5:må S1:saken S1:saken S1:i S1:hei S3:det S3:vi S3:vi S3:hei S3:med",
+    "hypothesis": "h2:måx h1:i h1:kan h2:det h2:vi h2:vi h2:må h5:ta h5:møtet h5:kan h5:hei h5:i h5:saken h5:dag h2:må h4:må h3:det h3:opp h3:så h3:med h3:ja h0:må h0:ta h0:er h0:så h0:hei h4:på h4:nei h4:dag h4:godt h4:takk h4:med h4:ja h4:kan h4:dag h5:men h4:møtet h2:hei h2:ja h2:med h2:med h2:men h2:takk h2:men h2:budsjettet h5:budsjettet h1:ta h2:med h2:med h2:men h2:må h2:ja h2:kan h2:neix h2:i h2:og h2:på h2:på h5:dag h5:så h0:vi h4:men h4:med h4:og h4:saken h4:budsjettet h4:møtet h4:nei h4:styret h4:måx h4:så h4:nei h4:nei h4:i h4:må h4:kan h4:saken h4:budsjettet h4:takkx h4:ja h4:men h4:styret h4:med h4:det h4:dag h4:ja h4:det h1:måx h2:er h2:er h2:med h2:styret h2:saken h2:måx h2:nei h2:i h0:godt h0:det h0:kan h0:tax h0:ta h0:hei h1:møtet h1:det h1:ta h4:må h4:i h4:tallene h4:på h4:nei h4:men h4:må h4:det h4:og h4:med h4:ja h4:kanx h4:detx h4:og h4:på h4:så h4:kan h4:kan h4:må h2:saken h0:medx h0:tallene h0:nei h5:er h5:styret h1:nei h4:ta h4:opp h4:godt h4:det h4:med h4:i h4:så h4:møtet h4:opp h4:er h4:og h4:men h4:saken h4:ta h4:må h4:må h4:med h4:takk h4:budsjettetx h4:på h4:må h4:ja h4:i h4:tallene h4:i h4:takk h4:hei h0:vix h0:og h1:kan h1:dag h1:med h1:saken h1:så h0:med h0:ta h4:så h5:er h0:ta h0:så h0:men h0:men h0:er h0:møtet h4:godt h3:men h3:men h4:godt h4:er h2:saken h2:må h2:så h2:er h2:møtet h2:men h2:men h2:det h2:saken h2:måx h2:men h2:opp h2:i h2:saken h2:så h2:i h5:så h5:må h5:men h5:kan h5:ja h5:ja h5:og h2:i h2:må h2:kan h2:ta h2:saken h4:budsjettet h0:ja h0:møtet h0:i h2:ta h2:det h2:godt h2:dag h2:vi h2:opp h2:og h2:styret h2:saken h5:og h5:det h5:med h5:styret h5:i h5:møtet h5:saken h5:er h5:takk h4:så h4:med h1:må h1:saken h1:med h1:og h3:og h3:budsjettet h1:i h3:dag h3:på h3:i h3:dag h2:tallene h1:påx h1:så h1:ja h1:godtx h1:i h0:men h0:kan h0:godt h5:og h2:godt h2:dag h2:med h2:i h2:takk h2:møtet h2:tallene h2:såx h2:det h2:hei h2:men h2:kan h5:i h5:godt h5:opp h5:i h0:saken h0:styret h1:opp h1:godt h2:takk h2:godt h2:i h2:saken h2:med h2:ja h2:tallene h1:kan h3:dag h3:og h3:nei h0:takk h4:dag h4:må h4:så h4:møtet h4:med h4:dag h3:styret h2:med h2:hei h1:dag h0:styret h0:nei h0:budsjettet h0:godt h0:det h0:må h0:saken h0:men h0:så h0:budsjettet h0:må h0:kan h0:må h0:er h0:godt h2:kan h2:i h1:dag h1:neix h1:må h1:godt h1:det h1:må h1:ja h1:kan h1:ta h1:er h1:må h3:saken h3:saken h3:i h3:hei h5:vix h5:vi h5:hei h5:med",
+    "cpwer_errors": 80,
+    "cpwer_length": 333,
+    "wder": 6.896551724137931
+   }
+  },
+  {
+   "name": "empty-hypothesis",
+   "reference": "SPEAKER fx 1 0.900 0.422 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 1.384 6.128 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 6.654 0.545 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 7.413 8.605 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 16.845 3.413 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 19.422 0.685 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 21.154 0.982 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 23.202 0.597 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 24.431 3.163 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 27.127 3.301 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 31.276 2.444 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 33.970 0.492 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 33.491 2.625 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 36.221 0.466 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 36.999 3.563 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 40.892 2.085 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 44.132 3.160 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 48.160 8.853 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 57.970 0.613 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 59.442 10.717 <NA> <NA> S2 <NA> <NA>\n",
+   "hypothesis": "",
+   "scores": {
+    "full": {
+     "der": 100.0,
+     "jer": 100.0,
+     "total": 62.85900000000001,
+     "missed": 62.85900000000001,
+     "false_alarm": 0.0,
+     "confusion": 0.0
+    },
+    "fair": {
+     "der": 100.0,
+     "jer": 100.0,
+     "total": 49.28200000000001,
+     "missed": 49.28200000000001,
+     "false_alarm": 0.0,
+     "confusion": 0.0
+    },
+    "forgiving": {
+     "der": 100.0,
+     "jer": 100.0,
+     "total": 48.82200000000001,
+     "missed": 48.82200000000001,
+     "false_alarm": 0.0,
+     "confusion": 0.0
+    }
+   }
+  },
+  {
+   "name": "one-speaker-for-all",
+   "reference": "SPEAKER fx 1 0.900 0.422 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 1.384 6.128 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 6.654 0.545 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 7.413 8.605 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 16.845 3.413 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 19.422 0.685 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 21.154 0.982 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 23.202 0.597 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 24.431 3.163 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 27.127 3.301 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 31.276 2.444 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 33.970 0.492 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 33.491 2.625 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 36.221 0.466 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 36.999 3.563 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 40.892 2.085 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 44.132 3.160 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 48.160 8.853 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 57.970 0.613 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 59.442 10.717 <NA> <NA> S2 <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.000 61.000 <NA> <NA> x <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 78.32132232456766,
+     "jer": 87.18907103825137,
+     "total": 62.85900000000001,
+     "missed": 11.676000000000004,
+     "false_alarm": 9.816999999999993,
+     "confusion": 27.739000000000004
+    },
+    "fair": {
+     "der": 69.80439105555779,
+     "jer": 85.6317049916293,
+     "total": 49.28200000000001,
+     "missed": 9.139000000000005,
+     "false_alarm": 4.257999999999994,
+     "confusion": 21.004
+    },
+    "forgiving": {
+     "der": 69.61206013682356,
+     "jer": 85.59084769041529,
+     "total": 48.82200000000001,
+     "missed": 8.909000000000006,
+     "false_alarm": 4.257999999999994,
+     "confusion": 20.819000000000003
+    }
+   }
+  },
+  {
+   "name": "a-speaker-a-turn",
+   "reference": "SPEAKER fx 1 0.900 0.422 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 1.384 6.128 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 6.654 0.545 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 7.413 8.605 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 16.845 3.413 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 19.422 0.685 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 21.154 0.982 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 23.202 0.597 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 24.431 3.163 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 27.127 3.301 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 31.276 2.444 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 33.970 0.492 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 33.491 2.625 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 36.221 0.466 <NA> <NA> S2 <NA> <NA>\nSPEAKER fx 1 36.999 3.563 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 40.892 2.085 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 44.132 3.160 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 48.160 8.853 <NA> <NA> S1 <NA> <NA>\nSPEAKER fx 1 57.970 0.613 <NA> <NA> S0 <NA> <NA>\nSPEAKER fx 1 59.442 10.717 <NA> <NA> S2 <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.950 0.322 <NA> <NA> t0 <NA> <NA>\nSPEAKER fx 1 1.434 6.028 <NA> <NA> t1 <NA> <NA>\nSPEAKER fx 1 6.704 0.445 <NA> <NA> t2 <NA> <NA>\nSPEAKER fx 1 7.463 8.505 <NA> <NA> t3 <NA> <NA>\nSPEAKER fx 1 16.895 3.313 <NA> <NA> t4 <NA> <NA>\nSPEAKER fx 1 19.472 0.585 <NA> <NA> t5 <NA> <NA>\nSPEAKER fx 1 21.204 0.882 <NA> <NA> t6 <NA> <NA>\nSPEAKER fx 1 23.252 0.497 <NA> <NA> t7 <NA> <NA>\nSPEAKER fx 1 24.481 3.063 <NA> <NA> t8 <NA> <NA>\nSPEAKER fx 1 27.177 3.201 <NA> <NA> t9 <NA> <NA>\nSPEAKER fx 1 31.326 2.344 <NA> <NA> t10 <NA> <NA>\nSPEAKER fx 1 34.020 0.392 <NA> <NA> t11 <NA> <NA>\nSPEAKER fx 1 33.541 2.525 <NA> <NA> t12 <NA> <NA>\nSPEAKER fx 1 36.271 0.366 <NA> <NA> t13 <NA> <NA>\nSPEAKER fx 1 37.049 3.463 <NA> <NA> t14 <NA> <NA>\nSPEAKER fx 1 40.942 1.985 <NA> <NA> t15 <NA> <NA>\nSPEAKER fx 1 44.182 3.060 <NA> <NA> t16 <NA> <NA>\nSPEAKER fx 1 48.210 8.753 <NA> <NA> t17 <NA> <NA>\nSPEAKER fx 1 58.020 0.513 <NA> <NA> t18 <NA> <NA>\nSPEAKER fx 1 59.492 10.617 <NA> <NA> t19 <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 55.65471929238455,
+     "jer": 54.765787390044686,
+     "total": 62.85900000000001,
+     "missed": 2.0000000000000093,
+     "false_alarm": 0.0,
+     "confusion": 32.984
+    },
+    "fair": {
+     "der": 46.07361714216143,
+     "jer": 44.95117626771214,
+     "total": 49.28200000000001,
+     "missed": 0.0,
+     "false_alarm": 0.0,
+     "confusion": 22.706000000000003
+    },
+    "forgiving": {
+     "der": 45.56552373929786,
+     "jer": 44.33655585065437,
+     "total": 48.82200000000001,
+     "missed": 0.0,
+     "false_alarm": 0.0,
+     "confusion": 22.246000000000006
+    }
+   }
+  },
+  {
+   "name": "shorter-than-collar",
+   "reference": "SPEAKER fx 1 1.000 0.300 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 1.400 0.200 <NA> <NA> B <NA> <NA>\nSPEAKER fx 1 2.000 4.000 <NA> <NA> A <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 1.100 0.400 <NA> <NA> x <NA> <NA>\nSPEAKER fx 1 1.500 0.700 <NA> <NA> y <NA> <NA>\nSPEAKER fx 1 2.200 4.200 <NA> <NA> x <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 28.888888888888903,
+     "jer": 52.933673469387756,
+     "total": 4.5,
+     "missed": 0.10000000000000009,
+     "false_alarm": 0.9000000000000004,
+     "confusion": 0.30000000000000027
+    },
+    "fair": {
+     "der": 4.285714285714296,
+     "jer": 4.1095890410959,
+     "total": 3.5,
+     "missed": 0.0,
+     "false_alarm": 0.15000000000000036,
+     "confusion": 0.0
+    },
+    "forgiving": {
+     "der": 4.285714285714296,
+     "jer": 4.1095890410959,
+     "total": 3.5,
+     "missed": 0.0,
+     "false_alarm": 0.15000000000000036,
+     "confusion": 0.0
+    }
+   }
+  },
+  {
+   "name": "hypothesis-past-reference",
+   "reference": "SPEAKER fx 1 5.000 4.000 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 9.500 2.500 <NA> <NA> B <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.000 9.200 <NA> <NA> x <NA> <NA>\nSPEAKER fx 1 9.200 5.800 <NA> <NA> y <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 130.76923076923077,
+     "jer": 56.70914542728636,
+     "total": 6.5,
+     "missed": 0.0,
+     "false_alarm": 8.5,
+     "confusion": 0.0
+    },
+    "fair": {
+     "der": 136.36363636363635,
+     "jer": 57.73524720893142,
+     "total": 5.5,
+     "missed": 0.0,
+     "false_alarm": 7.5,
+     "confusion": 0.0
+    },
+    "forgiving": {
+     "der": 136.36363636363635,
+     "jer": 57.73524720893142,
+     "total": 5.5,
+     "missed": 0.0,
+     "false_alarm": 7.5,
+     "confusion": 0.0
+    }
+   }
+  },
+  {
+   "name": "three-at-once",
+   "reference": "SPEAKER fx 1 0.000 6.000 <NA> <NA> A <NA> <NA>\nSPEAKER fx 1 2.000 6.000 <NA> <NA> B <NA> <NA>\nSPEAKER fx 1 3.000 2.000 <NA> <NA> C <NA> <NA>\nSPEAKER fx 1 9.000 3.000 <NA> <NA> A <NA> <NA>\n",
+   "hypothesis": "SPEAKER fx 1 0.000 7.000 <NA> <NA> x <NA> <NA>\nSPEAKER fx 1 2.500 6.000 <NA> <NA> y <NA> <NA>\nSPEAKER fx 1 9.200 2.600 <NA> <NA> x <NA> <NA>\n",
+   "scores": {
+    "full": {
+     "der": 25.882352941176475,
+     "jer": 43.128205128205124,
+     "total": 17.0,
+     "missed": 2.9000000000000004,
+     "false_alarm": 1.5,
+     "confusion": 0.0
+    },
+    "fair": {
+     "der": 22.916666666666664,
+     "jer": 40.703177822853284,
+     "total": 12.0,
+     "missed": 1.75,
+     "false_alarm": 1.0,
+     "confusion": 0.0
+    },
+    "forgiving": {
+     "der": 18.181818181818183,
+     "jer": 15.037593984962406,
+     "total": 5.5,
+     "missed": 0.0,
+     "false_alarm": 1.0,
+     "confusion": 0.0
+    }
+   }
+  }
+ ]
+}

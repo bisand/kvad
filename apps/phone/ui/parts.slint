@@ -31,6 +31,8 @@ export component Icon inherits Image {
 export component PrimaryButton inherits Pressable {
     in property <string> text;
     in property <bool> busy;
+    // The label's colour, for a button on another background than the accent.
+    in property <color> ink: Theme.on-accent;
     height: 50px;
     border-radius: 14px;
     background: Theme.accent;
@@ -45,7 +47,7 @@ export component PrimaryButton inherits Pressable {
         }
         Text {
             text: root.text;
-            color: Theme.on-accent;
+            color: root.ink;
             font-size: Theme.body * 1rem;
             font-weight: 600;
             vertical-alignment: center;

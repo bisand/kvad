@@ -10,6 +10,8 @@
 //! never to a file.
 
 mod api;
+mod ios;
+mod probe;
 
 use api::{Model, Server, Turn};
 use slint::{Model as _, ModelRc, SharedString, VecModel};
@@ -190,6 +192,8 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    probe::wire(&ui);
+
     #[cfg(debug_assertions)]
     script::at_launch(&ui);
 
@@ -201,11 +205,23 @@ fn main() -> Result<(), slint::PlatformError> {
 /// `KVAD_PHONE_CONNECT` is a server to connect to at launch,
 /// `KVAD_PHONE_TAB` the tab to open (0 to 4), `KVAD_PHONE_MODEL` the chat
 /// model, and `KVAD_PHONE_SAY` a message to send once connected.
+/// `KVAD_PHONE_PROBE` opens the Network test, and when it is a ticket, runs
+/// it, as long as `KVAD_PHONE_PROBE_LENGTH` (0 to 2: 30 s, 1 min, 5 min) says.
 #[cfg(debug_assertions)]
 mod script {
     use super::*;
 
     pub fn at_launch(ui: &AppWindow) {
+        if let Ok(probe) = std::env::var("KVAD_PHONE_PROBE") {
+            ui.invoke_open_probe();
+            if let Some(length) = std::env::var("KVAD_PHONE_PROBE_LENGTH").ok().and_then(|l| l.parse().ok()) {
+                ui.set_probe_length(length);
+            }
+            if probe.starts_with("kvadprobe:") {
+                ui.set_probe_ticket(probe.into());
+                ui.invoke_probe_start();
+            }
+        }
         if let Ok(url) = std::env::var("KVAD_PHONE_CONNECT") {
             ui.set_server_url(url.as_str().into());
             ui.invoke_connect(url.into(), "".into());

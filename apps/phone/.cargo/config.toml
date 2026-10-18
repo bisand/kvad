@@ -1,0 +1,7 @@
+# The iOS version cargo links for when it builds on its own, as Xcode's
+# build phase (ios/build.sh) does with ios/project.yml's deploymentTarget.
+# Without it rustc links for iOS 10, older than Skia's prebuilt objects
+# (iOS 12), and a device build fails on ___chkstk_darwin. Xcode's own
+# setting wins when it builds, since this does not force.
+[env]
+IPHONEOS_DEPLOYMENT_TARGET = "17.0"

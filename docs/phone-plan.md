@@ -169,7 +169,11 @@ owner reaches for from a phone.
 
 **Phase 6: on a real iPhone.** Signing with the owner's Apple developer
 team, then TestFlight. A real phone on Wi-Fi and on mobile data is also
-where `tools/relay-probe`'s field rows get their phone column.
+where `tools/relay-probe`'s field rows get their phone column: the Network
+test under More (and on the Connect screen) is the probe's dialler, built
+from its library, ahead of Phase 4 so that the run need not wait for it. Its
+key is a file in the app's container until the Keychain question below is
+settled.
 
 ## Open questions
 

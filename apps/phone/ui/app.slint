@@ -26,6 +26,16 @@ export struct ModelRow {
     last: bool,
 }
 
+// One path of a network test's table, its times in ms, as the probe's
+// command prints them.
+export struct ProbeRow {
+    path: string,
+    pings: string,
+    median: string,
+    p90: string,
+    max: string,
+}
+
 component ConnectScreen inherits Rectangle {
     in property <length> top-inset;
     in-out property <string> url;
@@ -33,6 +43,7 @@ component ConnectScreen inherits Rectangle {
     in property <bool> busy;
     in property <string> error;
     callback connect(string, string);
+    callback open-probe();
 
     Flickable {
         VerticalLayout {
@@ -110,6 +121,16 @@ component ConnectScreen inherits Rectangle {
                 font-size: Theme.subheadline * 1rem;
                 horizontal-alignment: center;
                 wrap: word-wrap;
+            }
+            // The network test needs no server: on mobile data there is
+            // none to connect to until the relay is in.
+            Rectangle { height: 24px; }
+            HorizontalLayout {
+                alignment: center;
+                TextButton {
+                    text: "Network test";
+                    clicked => { root.open-probe(); }
+                }
             }
         }
     }
@@ -395,6 +416,7 @@ component MoreScreen inherits Rectangle {
     in property <string> version;
     in property <string> who;
     callback disconnect();
+    callback open-probe();
 
     Flickable {
         VerticalLayout {
@@ -440,6 +462,26 @@ component MoreScreen inherits Rectangle {
                 }
             }
             Rectangle { height: 18px; }
+            SectionHeader { text: "REMOTE ACCESS"; }
+            HorizontalLayout {
+                padding-left: Theme.margin;
+                padding-right: Theme.margin;
+                Card {
+                    Row {
+                        title: "Network test";
+                        chevron: true;
+                        clicked => { root.open-probe(); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                padding-left: Theme.margin * 2;
+                padding-right: Theme.margin * 2;
+                SectionFooter {
+                    text: "Which path this phone reaches your Mac by, through Kvad's relay or directly, and how fast.";
+                }
+            }
+            Rectangle { height: 18px; }
             SectionHeader { text: "ABOUT"; }
             HorizontalLayout {
                 padding-left: Theme.margin;
@@ -451,6 +493,343 @@ component MoreScreen inherits Rectangle {
                         padding: 12px;
                         height: 120px;
                         AboutSlint { }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Three choices side by side, as UISegmentedControl draws them.
+component Segments inherits Rectangle {
+    in property <[string]> options;
+    in-out property <int> current;
+    in property <bool> enabled: true;
+    height: 32px;
+    border-radius: 9px;
+    background: Theme.fill;
+    opacity: root.enabled ? 1.0 : 0.5;
+    HorizontalLayout {
+        padding: 2px;
+        for o[i] in root.options: Rectangle {
+            horizontal-stretch: 1;
+            border-radius: 7px;
+            background: i == root.current ? Theme.surface : transparent;
+            drop-shadow-blur: i == root.current ? 4px : 0;
+            drop-shadow-color: #0000001f;
+            Text {
+                text: o;
+                color: Theme.label;
+                font-size: Theme.footnote * 1rem;
+                font-weight: i == root.current ? 600 : 400;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea {
+                enabled: root.enabled;
+                clicked => { root.current = i; }
+            }
+        }
+    }
+}
+
+// A cell of the network test's table: a number, right-aligned.
+component Cell inherits Text {
+    width: 56px;
+    color: Theme.label;
+    font-size: Theme.subheadline * 1rem;
+    horizontal-alignment: right;
+}
+
+// `relay-probe dial`, run from the phone: docs/relay-plan.md's Phase 0.
+component NetworkTestScreen inherits Rectangle {
+    in property <length> top-inset;
+    in property <length> bottom-inset;
+    in property <string> id;
+    in-out property <string> ticket;
+    in-out property <int> length;
+    in property <bool> running;
+    in property <string> status;
+    in property <string> error;
+    in property <string> path;
+    in property <string> last;
+    in property <float> elapsed;
+    in property <float> secs;
+    in property <[ProbeRow]> rows;
+    in property <string> totals;
+    // The lines the command would print, one a line.
+    in property <string> log;
+    callback paste();
+    callback copy-id();
+    // Not `start`, which would hide the layouts' `alignment: start`.
+    callback start-test();
+    callback stop();
+    callback close();
+
+    background: Theme.background;
+    TouchArea { }
+    VerticalLayout {
+        padding-top: root.top-inset;
+        // The navigation bar.
+        Rectangle {
+            height: Theme.touch;
+            Text {
+                text: "Network test";
+                color: Theme.label;
+                font-size: Theme.body * 1rem;
+                font-weight: 600;
+            }
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                alignment: end;
+                TextButton {
+                    text: "Done";
+                    bold: true;
+                    clicked => { root.close(); }
+                }
+            }
+        }
+        Flickable {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: start;
+                padding-top: 8px;
+                padding-bottom: root.bottom-inset + 32px;
+                spacing: 6px;
+
+                SectionHeader { text: "TICKET"; }
+                HorizontalLayout {
+                    padding-left: Theme.margin;
+                    padding-right: Theme.margin;
+                    Card {
+                        HorizontalLayout {
+                            padding-left: Theme.margin;
+                            padding-right: Theme.margin;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            Rectangle {
+                                height: max(3 * 1rem, input.preferred-height);
+                                input := TextInput {
+                                    text <=> root.ticket;
+                                    color: Theme.label;
+                                    font-family: "Menlo";
+                                    font-size: Theme.footnote * 1rem;
+                                    single-line: false;
+                                    wrap: char-wrap;
+                                    enabled: !root.running;
+                                    selection-background-color: Theme.accent.with-alpha(0.35);
+                                }
+                                if input.text == "": Text {
+                                    x: 0;
+                                    y: 0;
+                                    width: parent.width;
+                                    text: "kvadprobe:1:…, from relay-probe listen on the Mac";
+                                    color: Theme.tertiary;
+                                    font-size: Theme.subheadline * 1rem;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        Separator { }
+                        Row {
+                            title: "Paste from the Mac";
+                            title-color: Theme.accent;
+                            enabled: !root.running;
+                            clicked => { root.paste(); }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    padding-left: Theme.margin * 2;
+                    padding-right: Theme.margin * 2;
+                    SectionFooter {
+                        text: "On the Mac, relay-probe listen --allow with this phone's id (below) and --relay https://relay2.kvad.eu, then copy its ticket. For mobile data, turn Wi-Fi off here first.";
+                    }
+                }
+
+                Rectangle { height: 12px; }
+                HorizontalLayout {
+                    padding-left: Theme.margin;
+                    padding-right: Theme.margin;
+                    Segments {
+                        options: ["30 s", "1 min", "5 min"];
+                        current <=> root.length;
+                        enabled: !root.running;
+                    }
+                }
+                Rectangle { height: 6px; }
+                HorizontalLayout {
+                    padding-left: Theme.margin;
+                    padding-right: Theme.margin;
+                    if !root.running: PrimaryButton {
+                        horizontal-stretch: 1;
+                        text: "Start";
+                        enabled: root.ticket != "" && root.id != "";
+                        clicked => { root.start-test(); }
+                    }
+                    if root.running: PrimaryButton {
+                        horizontal-stretch: 1;
+                        text: "Stop";
+                        background: Theme.danger;
+                        ink: #ffffff;
+                        clicked => { root.stop(); }
+                    }
+                }
+                if root.error != "": HorizontalLayout {
+                    padding-left: Theme.margin * 2;
+                    padding-right: Theme.margin * 2;
+                    Text {
+                        text: root.error;
+                        color: Theme.danger;
+                        font-size: Theme.subheadline * 1rem;
+                        wrap: word-wrap;
+                    }
+                }
+
+                if root.running || root.path != "" || root.status != "": VerticalLayout {
+                    spacing: 6px;
+                    Rectangle { height: 12px; }
+                    SectionHeader { text: root.running ? "NOW" : "LAST RUN"; }
+                    HorizontalLayout {
+                        padding-left: Theme.margin;
+                        padding-right: Theme.margin;
+                        Card {
+                            if root.status != "": Row {
+                                title: root.status;
+                                title-color: Theme.secondary;
+                            }
+                            if root.status != "": Separator { }
+                            Row { title: "Path"; value: root.path == "" ? "—" : root.path; dot: root.running && root.path != ""; }
+                            Separator { }
+                            Row { title: "Last ping"; value: root.last == "" ? "—" : root.last; }
+                            Separator { }
+                            Row { title: "Time"; value: Math.round(root.elapsed) + " s of " + Math.round(root.secs) + " s"; }
+                            Rectangle {
+                                height: 3px;
+                                Rectangle {
+                                    x: 0;
+                                    width: root.secs > 0 ? parent.width * min(1, root.elapsed / root.secs) : 0;
+                                    background: Theme.accent;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.rows.length > 0: VerticalLayout {
+                    spacing: 6px;
+                    Rectangle { height: 12px; }
+                    SectionHeader { text: "PATHS (MS)"; }
+                    HorizontalLayout {
+                        padding-left: Theme.margin;
+                        padding-right: Theme.margin;
+                        Card {
+                            HorizontalLayout {
+                                padding-left: Theme.margin;
+                                padding-right: Theme.margin;
+                                padding-top: 10px;
+                                padding-bottom: 4px;
+                                spacing: 4px;
+                                Text { text: "path"; horizontal-stretch: 1; color: Theme.secondary; font-size: Theme.footnote * 1rem; }
+                                Cell { text: "pings"; color: Theme.secondary; font-size: Theme.footnote * 1rem; width: 44px; }
+                                Cell { text: "median"; color: Theme.secondary; font-size: Theme.footnote * 1rem; }
+                                Cell { text: "p90"; color: Theme.secondary; font-size: Theme.footnote * 1rem; }
+                                Cell { text: "max"; color: Theme.secondary; font-size: Theme.footnote * 1rem; }
+                            }
+                            for r in root.rows: HorizontalLayout {
+                                padding-left: Theme.margin;
+                                padding-right: Theme.margin;
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 4px;
+                                Text { text: r.path; horizontal-stretch: 1; color: Theme.label; font-size: Theme.subheadline * 1rem; font-weight: 600; }
+                                Cell { text: r.pings; width: 44px; }
+                                Cell { text: r.median; }
+                                Cell { text: r.p90; }
+                                Cell { text: r.max; }
+                            }
+                            Rectangle { height: 6px; }
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-left: Theme.margin * 2;
+                        padding-right: Theme.margin * 2;
+                        SectionFooter { text: root.totals; }
+                    }
+                }
+
+                if root.log != "": VerticalLayout {
+                    spacing: 6px;
+                    Rectangle { height: 12px; }
+                    SectionHeader { text: "LOG"; }
+                    HorizontalLayout {
+                        padding-left: Theme.margin;
+                        padding-right: Theme.margin;
+                        Card {
+                            HorizontalLayout {
+                                padding: 12px;
+                                // A TextInput, not Texts: its preferred height
+                                // counts the wrapped lines, and it can be
+                                // selected and copied.
+                                Rectangle {
+                                    height: log.preferred-height;
+                                    log := TextInput {
+                                        text: root.log;
+                                        read-only: true;
+                                        single-line: false;
+                                        wrap: word-wrap;
+                                        color: Theme.label;
+                                        font-family: "Menlo";
+                                        font-size: Theme.caption * 1rem;
+                                        selection-background-color: Theme.accent.with-alpha(0.35);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Once, before the first run: the relay must know this id.
+                Rectangle { height: 12px; }
+                SectionHeader { text: "THIS PHONE"; }
+                HorizontalLayout {
+                    padding-left: Theme.margin;
+                    padding-right: Theme.margin;
+                    Card {
+                        VerticalLayout {
+                            padding-left: Theme.margin;
+                            padding-right: Theme.margin;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            spacing: 2px;
+                            Text {
+                                text: "Probe id";
+                                color: Theme.label;
+                                font-size: Theme.body * 1rem;
+                            }
+                            Text {
+                                text: root.id == "" ? "…" : root.id;
+                                color: Theme.secondary;
+                                font-family: "Menlo";
+                                font-size: Theme.footnote * 1rem;
+                                wrap: char-wrap;
+                            }
+                        }
+                        Separator { }
+                        Row {
+                            title: "Copy id";
+                            title-color: Theme.accent;
+                            enabled: root.id != "";
+                            clicked => { root.copy-id(); }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    padding-left: Theme.margin * 2;
+                    padding-right: Theme.margin * 2;
+                    SectionFooter {
+                        text: "The relay serves only the ids on its allow list. Add this one, once, and deploy the relay again.";
                     }
                 }
             }
@@ -558,6 +937,22 @@ export component AppWindow inherits Window {
     in-out property <[ModelRow]> models;
     in-out property <bool> models-loading;
 
+    in-out property <bool> probe-open;
+    in-out property <string> probe-id;
+    in-out property <string> probe-ticket;
+    // Which of the lengths a run is: 30 s, 1 min, 5 min.
+    in-out property <int> probe-length: 1;
+    in-out property <bool> probe-running;
+    in-out property <string> probe-status;
+    in-out property <string> probe-error;
+    in-out property <string> probe-path;
+    in-out property <string> probe-last;
+    in-out property <float> probe-elapsed;
+    in-out property <float> probe-secs;
+    in-out property <[ProbeRow]> probe-rows;
+    in-out property <string> probe-totals;
+    in-out property <string> probe-log;
+
     callback connect(string, string);
     callback disconnect();
     callback send(string);
@@ -565,6 +960,11 @@ export component AppWindow inherits Window {
     callback new-chat();
     callback refresh-models();
     callback choose-model(string);
+    callback open-probe();
+    callback probe-paste();
+    callback probe-copy-id();
+    callback probe-start();
+    callback probe-stop();
 
     property <length> top: self.safe-area-insets.top;
     property <length> bottom: self.safe-area-insets.bottom;
@@ -579,6 +979,7 @@ export component AppWindow inherits Window {
         busy: root.connecting;
         error: root.connect-error;
         connect(u, k) => { root.connect(u, k); }
+        open-probe => { root.open-probe(); }
     }
 
     if root.connected: VerticalLayout {
@@ -624,6 +1025,7 @@ export component AppWindow inherits Window {
                 version: root.server-version;
                 who: root.server-who;
                 disconnect => { root.disconnect(); }
+                open-probe => { root.open-probe(); }
             }
         }
         if root.keyboard == 0: Rectangle {
@@ -682,5 +1084,28 @@ export component AppWindow inherits Window {
             root.picking-model = false;
         }
         close => { root.picking-model = false; }
+    }
+
+    if root.probe-open: NetworkTestScreen {
+        top-inset: root.top;
+        bottom-inset: root.keyboard > 0 ? root.keyboard : root.bottom;
+        id: root.probe-id;
+        ticket <=> root.probe-ticket;
+        length <=> root.probe-length;
+        running: root.probe-running;
+        status: root.probe-status;
+        error: root.probe-error;
+        path: root.probe-path;
+        last: root.probe-last;
+        elapsed: root.probe-elapsed;
+        secs: root.probe-secs;
+        rows: root.probe-rows;
+        totals: root.probe-totals;
+        log: root.probe-log;
+        paste => { root.probe-paste(); }
+        copy-id => { root.probe-copy-id(); }
+        start-test => { root.probe-start(); }
+        stop => { root.probe-stop(); }
+        close => { root.probe-open = false; }
     }
 }

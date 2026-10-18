@@ -608,6 +608,44 @@ without pairing, from `kvad remote id` on each.
   tunnel, handed to the CLI as one end of a Unix socket pair, so nothing else
   on the device can use the connection.
 
+### Any HTTP client: `kvad tunnel`
+
+A program that only speaks HTTP to a port, such as OpenCode, curl or the
+openai SDK, reaches the server through `kvad tunnel` on the device:
+
+```bash
+kvad tunnel --remote kvad://9ce63fe0…      # 127.0.0.1:5824 unless --port N
+```
+
+It listens on `127.0.0.1` only and forwards each TCP connection as one stream
+through the tunnel, byte for byte, so the program is pointed at
+`http://127.0.0.1:5824/v1` and is otherwise unchanged. It says which path the
+tunnel is on (`lan`, `direct` or `relay`) when it starts and whenever that
+changes, connects again when the tunnel drops, and renews the relay voucher as
+the CLI does. With one server paired, `--remote` can be left out.
+
+The port is the trade-off. The CLI's own connections are socket pairs nothing
+else can reach; a port can be reached by every program on the device and by
+every other user of it, and through it they all reach the server as this
+device. The server still wants a key with every request, so by default each
+program sends one of its own, made with `kvad keys add NAME`, which can be
+revoked without touching the others. A request without one is answered 401.
+
+`kvad tunnel --with-key` adds the device's own key to every request instead,
+replacing any the program sent, so nothing needs a key at all. It also means
+that anything able to reach the port acts as this device, with its rights,
+for as long as the command runs. It is never on by default, and it prints a
+warning when it starts. Use it on a machine that is yours alone. With it on:
+
+- A request a browser sent from a web page is refused before it reaches the
+  server: one with an `Origin` other than the port's own, a `Sec-Fetch-Site`
+  other than `same-origin` or `none`, or a `Host` that is not the port (what a
+  page sends after pointing its own name at 127.0.0.1). A page can make
+  requests to loopback, and without this it would make them as the device.
+- Each request gets a connection of its own (`Connection: close`, except for
+  a WebSocket's upgrade), so every request that reaches the server is one
+  whose head the forwarder has read and given the key.
+
 The relay sees which keys talk, when, and how much, but not what. Run your own
 (`tools/kvad-relay/deploy/README.md`). It serves the servers on its own allow
 list, and the devices they vouch for: a paired device carries a voucher its

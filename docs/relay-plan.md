@@ -712,6 +712,10 @@ rate limits per node rather than per connection.
 **Phase 4: the client side.** `kvad tunnel`, the web UI's pairing screen and
 device list, and the CLI over a real relay from a real phone network.
 
+Built so far: `kvad tunnel` (`crates/llm/src/cli/tunnel.rs`), a port on
+`127.0.0.1` that forwards each connection through the tunnel, with
+`--with-key` to add the device's key, off by default; see `docs/serve.md`.
+
 **Phase 5: packaging.** Helm, systemd, `install.sh --relay`, Terraform
 modules, Fly. Each target gets a short page on kvad.eu and a CI job that at
 least builds it.

@@ -96,6 +96,8 @@ struct Args {
     key: bool,
     /// `kvad remote pair --admin`: the device acts as an administrator.
     admin: bool,
+    /// `kvad tunnel --with-key`: add the device's key to every request.
+    with_key: bool,
     /// `kvad users edit --password`: set a new one.
     password: bool,
     k: Option<usize>,
@@ -224,6 +226,7 @@ impl Default for Args {
             force: false,
             key: false,
             admin: false,
+            with_key: false,
             password: false,
             k: None,
             window: None,
@@ -318,6 +321,7 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--force" => a.force = true,
         "--key" => a.key = true,
         "--admin" => a.admin = true,
+        "--with-key" => a.with_key = true,
         "--password" => a.password = true,
         "--silent" => a.silent = true,
         "--epilogue" => a.epilogue = true,
@@ -702,6 +706,7 @@ fn real_main() -> Res<()> {
         "crawl" => return crawl_site(args),
         "service" => return cli::service::run(&args),
         "remote" => return cli::remote::run(&args),
+        "tunnel" => return cli::tunnel::run(&args),
         #[cfg(feature = "cluster")]
         "cluster" => return cli::cluster::run(&args),
         #[cfg(feature = "cluster")]

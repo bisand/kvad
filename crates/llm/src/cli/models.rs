@@ -1035,12 +1035,8 @@ pub fn transcribe(remote: &Remote, args: &Args) -> Res<()> {
     if args.model.is_none() {
         return Err("which Whisper? --model NbAiLab/nb-whisper-small, say, or openai/whisper-small".into());
     }
-    let format = match args.format.as_deref() {
-        // `--json` is what the server sent, and its fullest answer.
-        None if args.json => Format::VerboseJson,
-        None => Format::Text,
-        Some(f) => Format::parse(f).ok_or_else(|| format!("--format expects text, json, verbose_json, srt or vtt, got `{f}`"))?,
-    };
+    // `--json` is what the server sent, and its fullest answer.
+    let format = crate::speech_format(args, if args.json { Format::VerboseJson } else { Format::Text })?;
     let path = std::path::Path::new(&file);
     let bytes = std::fs::read(path).map_err(|e| format!("{file}: {e}"))?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("audio").to_string();
@@ -1065,6 +1061,9 @@ pub fn transcribe(remote: &Remote, args: &Args) -> Res<()> {
     }
     if args.timestamps {
         parts.push(Part::text("timestamps", true));
+    }
+    if args.word_times {
+        parts.push(Part::text("timestamp_granularities[]", "word"));
     }
 
     let started = std::time::Instant::now();

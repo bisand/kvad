@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use iroh::endpoint::{
     presets, AfterHandshakeOutcome, Connection, EndpointHooks, IncomingAddr, PortmapperConfig, RecvStream, SendStream,
 };
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub mod blocking;
@@ -118,6 +118,11 @@ impl Key {
 
     pub fn id(&self) -> NodeId {
         NodeId(self.secret.public())
+    }
+
+    /// Vouchers signed with this key.
+    pub fn issuer(&self) -> Issuer {
+        Issuer(Arc::new(self.secret.clone()))
     }
 }
 
@@ -242,6 +247,130 @@ fn hex(b: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Vouchers
+// ---------------------------------------------------------------------------
+
+/// How long a paired device's voucher is good for. A device renews it
+/// through the tunnel once less than half is left, so one in use never runs
+/// out; one that is not, and was unpaired, stops at the relay within this.
+pub const VOUCHER_LIFE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// The longest a voucher for any device may live: the one a pairing link
+/// carries, so that a device can pair through the relay. Past this a relay
+/// refuses it, however it was signed.
+pub const ANY_DEVICE_LIFE: Duration = Duration::from_secs(15 * 60);
+
+/// A server's word that a device may use the relays that trust the server:
+/// what a device shows a relay, which has no list of devices of its own.
+///
+/// Signed with the server's node key, so a relay needs only the node ids it
+/// serves to check one, keeps no state, and cannot be told anything by a
+/// device that the server did not say. `kv1.<node>.<device or *>.<expires,
+/// unix seconds>.<signature>`; `*` is any device, and only for a pairing
+/// link's few minutes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Voucher {
+    pub node: NodeId,
+    pub device: Option<NodeId>,
+    pub expires: u64,
+    signature: [u8; 64],
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+impl Voucher {
+    fn message(node: &NodeId, device: Option<&NodeId>, expires: u64) -> Vec<u8> {
+        let device = device.map_or("*".to_string(), |d| d.to_string());
+        format!("kvad-voucher/1\n{node}\n{device}\n{expires}\n").into_bytes()
+    }
+
+    /// Whether this voucher lets `device` in, for a relay that trusts the
+    /// nodes `trusted` says it does.
+    pub fn check(&self, device: &NodeId, trusted: impl Fn(&NodeId) -> bool) -> Res<()> {
+        let now = unix_now();
+        if !trusted(&self.node) {
+            return Err(format!("signed by {}, which this relay does not serve", self.node.short()));
+        }
+        if self.expires <= now {
+            return Err("expired".into());
+        }
+        match &self.device {
+            Some(d) if d != device => return Err("for another device".into()),
+            None if self.expires > now + ANY_DEVICE_LIFE.as_secs() => {
+                return Err("for any device and for too long".into());
+            }
+            _ => {}
+        }
+        let message = Voucher::message(&self.node, self.device.as_ref(), self.expires);
+        let signature = iroh::Signature::from_bytes(&self.signature);
+        self.node.0.verify(&message, &signature).map_err(|_| "not signed by the node it names".to_string())
+    }
+
+    /// How long until it expires.
+    pub fn left(&self) -> Duration {
+        Duration::from_secs(self.expires.saturating_sub(unix_now()))
+    }
+}
+
+impl fmt::Display for Voucher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let device = self.device.map_or("*".to_string(), |d| d.to_string());
+        write!(f, "kv1.{}.{device}.{}.{}", self.node, self.expires, hex(&self.signature))
+    }
+}
+
+impl FromStr for Voucher {
+    type Err = String;
+    fn from_str(s: &str) -> Res<Voucher> {
+        let bad = || "not a voucher".to_string();
+        let [version, node, device, expires, signature] = s.trim().split('.').collect::<Vec<_>>()[..] else { return Err(bad()) };
+        if version != "kv1" || signature.len() != 128 || !signature.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(bad());
+        }
+        let mut sig = [0u8; 64];
+        for (i, b) in sig.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&signature[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+        }
+        Ok(Voucher {
+            node: node.parse()?,
+            device: match device {
+                "*" => None,
+                d => Some(d.parse()?),
+            },
+            expires: expires.parse().map_err(|_| bad())?,
+            signature: sig,
+        })
+    }
+}
+
+/// What a server signs vouchers with: its node key, kept out of every log.
+#[derive(Clone)]
+pub struct Issuer(Arc<SecretKey>);
+
+impl Issuer {
+    /// A voucher for `device`, or for any device with `None`, good for
+    /// `life` (at most [`ANY_DEVICE_LIFE`] for any device).
+    pub fn issue(&self, device: Option<NodeId>, life: Duration) -> Voucher {
+        let life = match device {
+            None => life.min(ANY_DEVICE_LIFE),
+            Some(_) => life,
+        };
+        let node = NodeId(self.0.public());
+        let expires = unix_now() + life.as_secs();
+        let signature = self.0.sign(&Voucher::message(&node, device.as_ref(), expires)).to_bytes();
+        Voucher { node, device, expires, signature }
+    }
+}
+
+impl fmt::Debug for Issuer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Issuer({})", NodeId(self.0.public()).short())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Addresses and paths
 // ---------------------------------------------------------------------------
 
@@ -332,11 +461,18 @@ impl FromStr for Address {
 pub struct PairLink {
     pub address: Address,
     pub token: String,
+    /// A voucher for any device, good for the link's few minutes, so that a
+    /// device can pair through the relay as well as on the LAN.
+    pub voucher: Option<Voucher>,
 }
 
 impl fmt::Display for PairLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}&pair={}", self.address, self.token)
+        write!(f, "{}", self.address)?;
+        if let Some(v) = &self.voucher {
+            write!(f, "&rv={v}")?;
+        }
+        write!(f, "&pair={}", self.token)
     }
 }
 
@@ -351,7 +487,11 @@ impl FromStr for PairLink {
         if token.len() < 32 || token.len() > 128 || !token.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
             return Err("the link's pairing token is not one a server makes".into());
         }
-        Ok(PairLink { address: rest.parse()?, token: token.to_string() })
+        let (rest, voucher) = match rest.rsplit_once("&rv=") {
+            Some((rest, v)) => (rest, Some(v.parse()?)),
+            None => (rest, None),
+        };
+        Ok(PairLink { address: rest.parse()?, token: token.to_string(), voucher })
     }
 }
 
@@ -524,11 +664,22 @@ pub enum Direct {
     Off,
 }
 
-async fn endpoint(secret: SecretKey, relays: &[String], alpns: Vec<Vec<u8>>, direct: Direct, port: u16, allow: Option<Allow>) -> Res<Endpoint> {
+async fn endpoint(
+    secret: SecretKey,
+    relays: &[String],
+    alpns: Vec<Vec<u8>>,
+    direct: Direct,
+    port: u16,
+    allow: Option<Allow>,
+    voucher: Option<&Voucher>,
+) -> Res<Endpoint> {
     let relays = relays.iter().map(|r| relay_url(r)).collect::<Res<Vec<_>>>()?;
-    let mode = match relays.is_empty() {
-        true => RelayMode::Disabled,
-        false => RelayMode::custom(relays),
+    let mode = match (relays.is_empty(), voucher) {
+        (true, _) => RelayMode::Disabled,
+        (false, None) => RelayMode::custom(relays),
+        // Shown to every relay as it is connected to: what lets in a device
+        // the relay has no list of.
+        (false, Some(v)) => RelayMode::Custom(RelayMap::from_iter(relays).with_auth_token(v.to_string())),
     };
     if direct == Direct::Off && matches!(mode, RelayMode::Disabled) {
         return Err("direct = \"off\" needs a relay: with neither, nothing can reach this machine".into());
@@ -625,6 +776,7 @@ pub struct Server {
     streams: tokio::sync::mpsc::Receiver<(NodeId, Stream)>,
     pairings: Option<tokio::sync::mpsc::Receiver<Pairing>>,
     accepting: tokio::task::JoinHandle<()>,
+    issuer: Issuer,
 }
 
 impl Server {
@@ -634,7 +786,8 @@ impl Server {
         let knock = knock(&cfg.knock)?;
         let alpn = alpn(&knock);
         let allow = Allow(cfg.allowed.clone());
-        let endpoint = endpoint(key.secret, &cfg.relays, vec![alpn.clone()], cfg.direct, cfg.port, Some(allow)).await?;
+        let issuer = Issuer(Arc::new(key.secret.clone()));
+        let endpoint = endpoint(key.secret, &cfg.relays, vec![alpn.clone()], cfg.direct, cfg.port, Some(allow), None).await?;
         if !cfg.relays.is_empty() && tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await.is_err() {
             tracing::warn!("no relay answered within 10 s; the address carries direct addresses only until one does");
         }
@@ -646,7 +799,7 @@ impl Server {
         let (tx, streams) = tokio::sync::mpsc::channel(64);
         let (pair_tx, pairings) = tokio::sync::mpsc::channel(MAX_PAIRING);
         let accepting = tokio::spawn(accept_loop(endpoint.clone(), alpn, cfg.allowed.clone(), tx, pair_tx));
-        Ok(Server { endpoint, address, streams, pairings: Some(pairings), accepting })
+        Ok(Server { endpoint, address, streams, pairings: Some(pairings), accepting, issuer })
     }
 
     /// The pairing requests that unknown keys send while a pairing is open.
@@ -654,6 +807,11 @@ impl Server {
     /// answered with a refusal.
     pub fn take_pairings(&mut self) -> Option<tokio::sync::mpsc::Receiver<Pairing>> {
         self.pairings.take()
+    }
+
+    /// What this server signs vouchers with.
+    pub fn issuer(&self) -> Issuer {
+        self.issuer.clone()
     }
 
     /// What a client dials.
@@ -861,7 +1019,13 @@ impl Client {
     /// Dials `to` as `key`, and checks that the far end holds the key the
     /// address names and has let this device in.
     pub async fn connect(key: &Key, to: &Address) -> Res<Client> {
-        let (endpoint, conn, hello) = dial(key, to).await?;
+        Client::connect_vouched(key, to, None).await
+    }
+
+    /// The same, showing the relays `voucher`: how a paired device that is
+    /// on no relay's list gets through one.
+    pub async fn connect_vouched(key: &Key, to: &Address, voucher: Option<&Voucher>) -> Res<Client> {
+        let (endpoint, conn, hello) = dial(key, to, voucher).await?;
         match hello.as_str() {
             HELLO => Ok(Client { endpoint, conn }),
             PAIRING_HELLO => {
@@ -878,8 +1042,8 @@ impl Client {
     /// Sends one pairing request to `to` as `key`, which the server does not
     /// know yet, and returns its answer. The server lets an unknown key this
     /// far only while one of its pairings is open.
-    pub async fn pair(key: &Key, to: &Address, request: &[u8]) -> Res<Vec<u8>> {
-        let (endpoint, conn, hello) = dial(key, to).await?;
+    pub async fn pair(key: &Key, to: &Address, request: &[u8], voucher: Option<&Voucher>) -> Res<Vec<u8>> {
+        let (endpoint, conn, hello) = dial(key, to, voucher).await?;
         let answer = async {
             match hello.as_str() {
                 PAIRING_HELLO => {}
@@ -916,17 +1080,28 @@ impl Client {
 }
 
 /// Connects, checks the far end's key, and reads what it says first.
-async fn dial(key: &Key, to: &Address) -> Res<(Endpoint, Connection, String)> {
+async fn dial(key: &Key, to: &Address, voucher: Option<&Voucher>) -> Res<(Endpoint, Connection, String)> {
     // No ALPN of its own: a client accepts nothing.
-    let endpoint = endpoint(key.secret.clone(), &to.relays, Vec::new(), Direct::Auto, 0, None).await?;
+    let endpoint = endpoint(key.secret.clone(), &to.relays, Vec::new(), Direct::Auto, 0, None, voucher).await?;
     let addr = to.endpoint_addr()?;
     let conn = match tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, &to.alpn())).await {
         Err(_) => {
+            // A relay that turned this device away says so, which is the
+            // more useful thing to tell somebody than that nothing answered.
+            let denied = iroh::Watcher::get(&mut endpoint.home_relay_status()).iter().find_map(|r| r.auth_denied_reason().map(|why| (r.url().to_string(), why.to_string())));
+            if let Some((relay, _)) = denied {
+                return Err(format!(
+                    "{} refused this device: it has no voucher from {}, or it has expired. Pair again, or reach the \
+                     server once on its LAN to renew it",
+                    relay.trim_end_matches('/'),
+                    to.label()
+                ));
+            }
             return Err(format!(
                 "{} did not answer within {} s: it may be off or asleep, or the address may be out of date",
                 to.label(),
                 CONNECT_TIMEOUT.as_secs()
-            ))
+            ));
         }
         Ok(Err(e)) => return Err(format!("could not reach {}: {e}", to.label())),
         Ok(Ok(c)) => c,
@@ -989,11 +1164,40 @@ mod tests {
     }
 
     #[test]
+    fn a_voucher_lets_in_the_device_it_names_while_it_lives() {
+        let issuer = Issuer(Arc::new(SecretKey::from_bytes(&[7; 32])));
+        let (phone, other) = (Key { secret: SecretKey::from_bytes(&[8; 32]) }.id(), Key { secret: SecretKey::from_bytes(&[9; 32]) }.id());
+        let trusts = |n: &NodeId| *n == node();
+        let v = issuer.issue(Some(phone), VOUCHER_LIFE);
+        let back: Voucher = v.to_string().parse().unwrap();
+        assert_eq!(back, v);
+        assert!(back.check(&phone, trusts).is_ok());
+        assert!(back.check(&other, trusts).unwrap_err().contains("another device"));
+        assert!(back.check(&phone, |_| false).unwrap_err().contains("does not serve"));
+        let mut forged = back.clone();
+        forged.expires += 1;
+        assert!(forged.check(&phone, trusts).unwrap_err().contains("not signed"));
+        let mut old = issuer.issue(Some(phone), Duration::ZERO);
+        old.expires = 1;
+        assert!(old.check(&phone, trusts).unwrap_err().contains("expired"));
+        // Any device, but only for a pairing's few minutes.
+        let any = issuer.issue(None, VOUCHER_LIFE);
+        assert!(any.left() <= ANY_DEVICE_LIFE);
+        assert!(any.check(&other, trusts).is_ok());
+        let mut long = any.clone();
+        long.expires += 3600;
+        assert!(long.check(&other, trusts).unwrap_err().contains("too long"));
+    }
+
+    #[test]
     fn a_pairing_link_is_an_address_and_a_token() {
         let address = Address { node: node(), knock: "0123456789abcdef0123456789abcdef".into(), relays: vec!["https://relay.kvad.eu".into()], addrs: Vec::new() };
-        let link = PairLink { address: address.clone(), token: "a".repeat(64) };
+        let issuer = Issuer(Arc::new(SecretKey::from_bytes(&[7; 32])));
+        let link = PairLink { address: address.clone(), token: "a".repeat(64), voucher: Some(issuer.issue(None, ANY_DEVICE_LIFE)) };
         let back: PairLink = link.to_string().parse().unwrap();
         assert_eq!(back, link);
+        let bare = PairLink { voucher: None, ..link };
+        assert_eq!(bare.to_string().parse::<PairLink>().unwrap(), bare);
         assert!(address.to_string().parse::<PairLink>().unwrap_err().contains("not a pairing link"));
         assert!(format!("{address}&pair=short").parse::<PairLink>().is_err());
     }

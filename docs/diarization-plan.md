@@ -1,6 +1,8 @@
 # Plan: who spoke when
 
-Written 2026-10-18, research and plan only: nothing here is built. It
+Written 2026-10-18 as research and a plan; steps 1 and 2 of *The order
+it is built in* are built (`speech::score`, `speech::align`), the rest not
+yet. It
 follows [the speech plan](speech-plan.md), whose Whisper, CPU and Metal,
 file and live, it extends.
 
@@ -177,6 +179,72 @@ the live loop's plain tail gets word times (*Live labels*).
   small, 76 of 76 on large.
 - `transcribe_speed` gains a `--words` column: the cost of the alignment
   pass per window and over the whole file, at every backend.
+
+### As built, and what it measured
+
+`crates/llm/src/speech/align.rs` is the arithmetic above, steps 1 to 8;
+`Model::attention` is the fourth question, on the CPU
+(`Whisper::attention`) and the GPU (`GpuWhisper::attention`, the alignment
+layers' cross-attention written out in f32, the pass stopped after the last
+of them). One clean-up is left out on purpose: openai-whisper also moves a
+segment's times to its words'; here a segment keeps the times it was
+decoded with, so a transcript is the same with words or without.
+
+**transformers is not quite `timing.py`.** Its `token_timestamps[k]` is
+when token `k` *ends*, which is when `k + 1` starts in `timing.py`. It
+drops the `<|notimestamps|>` row as well as the prompt's, so its first
+token ends at frame 0, and it standardises over the generated rows only.
+And the pipeline's `return_timestamps="word"` decodes *with* timestamp
+tokens, so the probe's numbers came from a timed decode.
+`scripts/whisper-fixtures.py` therefore writes three things: the alignment
+heads' attention, the token starts by `timing.py`'s arithmetic over that
+attention (`token_starts`, its median filter and DTW written out as
+there), and transformers' own `token_ends`, with the attention mask passed
+so that it knows where the recording stops. The test holds kvad to the
+first two and reports the third.
+
+On the dialogue, one window, in f32:
+
+| model | attention, largest gap | token starts from `timing.py`'s | transformers' own ends, more than a frame out |
+|---|---|---|---|
+| tiny, CPU and GPU | 7e-6 / 4e-6 | 0 frames, all 136 | 1 of 134 (the second token, 5 frames: its first is pinned at 0) |
+| small, CPU and GPU | 7e-6 | 0 frames, all 141 | 4 of 139, 2 frames each |
+| large, CPU and GPU | 5e-6 | 0 frames, all 134 | 3 of 132, 2 frames each |
+
+On the GPU at the other precisions, the most any token start moved from
+`timing.py`'s: f16 1, 0, 0 frames (tiny, small, large); q8 1, 1, 1; bf16
+15, 3, 1; q4 8 on large. bf16 is what the server's `gpu-bf16` is not: it
+loads f16 (`speech.rs`'s `DENSE`).
+
+Words given the right speaker on `scripts/dialogue.py`'s recording, by
+`crates/gpu/examples/word_turns.rs` (the probe's rule, matching by fewest
+edits instead of difflib), the same at cpu-f32, gpu-f16 and gpu-q8:
+
+| | by word times | by whole segments | the probe, by word times |
+|---|---|---|---|
+| tiny | 73 of 73 | 38 of 73 (one segment) | 72 of 74 |
+| small | 75 of 75 | 61 of 75 | 74 of 75 |
+| large | 76 of 76 | 70 of 76 | 76 of 76 |
+
+Small wrote no "Ja." this time, so its one-word turn was not tested.
+
+What it costs, nb-whisper-large on the 85 s of `king.wav`, three windows,
+two rounds each, a backend a process, with and without `--words`:
+
+| backend | an alignment pass | of the run | the run, without and with |
+|---|---|---|---|
+| gpu-q8 | 66–67 ms | 4.6–4.7% | 4.2 s, 4.2–4.3 s |
+| gpu-bf16 (f16) | 37–39 ms | 1.8–1.9% | 5.5–6.5 s, 6.1 s |
+| gpu-f32 | 52–57 ms | 2.1–2.2% | 8.4–8.6 s, 7.5–7.8 s |
+| cpu-f32 | 0.7–0.9 s | 2.7–3.6% | 61–93 s, 60–95 s |
+| cpu-q8 | 1.8–1.9 s | 4.5–8.1% | 34–43 s, 66–129 s |
+
+The GPU rows are a few percent, as guessed. The CPU rows were taken with
+the machine's load average near 28 from other builds, and a q8 step ran
+from 30 to 206 ms within one process: they say the pass is a prompt's
+cost, and nothing finer, until taken again on a quiet machine. q8's pass
+being slower than f32's is in that noise or is the prompt-shaped matmul
+at q8; it is not yet known which.
 
 ## Speakers, offline: the pipeline
 
@@ -696,14 +764,28 @@ committed: a test or an example reads a directory it is pointed at.
 - **Published Norwegian results: none found**, for any of these models.
   The tables here would be the first.
 
-**The scorer is written here.** DER is a frame count at 10 ms after an
-optimal one-to-one mapping, which is the Hungarian algorithm on a matrix
-of a few speakers a side: a hundred lines in a test helper, with no
-dependency. `scripts/der-fixtures.py` scores the same reference and
-hypothesis RTTM files with `pyannote.metrics` (MIT) and writes its
-numbers, and a test holds the Rust scorer to them to 0.01 points on every
-fixture. `md-eval.pl`, NIST's scorer, is the historical reference, and is
-not needed when pyannote.metrics agrees with it.
+**The scorer is written here.** DER is time counted after an optimal
+one-to-one mapping, which is the Hungarian algorithm on a matrix of a few
+speakers a side, with no dependency. `scripts/der-fixtures.py` scores the
+same reference and hypothesis RTTM files with `pyannote.metrics` (MIT) and
+writes its numbers, and a test holds the Rust scorer to them to 0.01 points
+on every fixture. `md-eval.pl`, NIST's scorer, is the historical reference,
+and is not needed when pyannote.metrics agrees with it.
+
+As built (`crates/llm/src/speech/score.rs`): the time is exact, between
+every boundary on either side, not a frame count at 10 ms as first planned,
+because frames move each boundary by up to 5 ms, which on the 27 s dialogue
+is about 0.3 points, thirty times the bound. pyannote's choices are kept
+where they change a number: the scored stretch runs from the first turn of
+either side to the last; speakers map by shared time, and a pair sharing
+none is not mapped; JER uses DER's mapping and ignores a hypothesis speaker
+with nothing to map to (DIHARD's `dscore` does neither). cpWER is held to
+`meeteval` (MIT), the CHiME scorer. No package scores WDER, so the fixture
+script writes Shafey et al.'s definition a second time; which words pair
+depends on how an alignment breaks ties, and both take a substitution
+before a deletion before an insertion. On the 15 fixtures (hand-made, the
+dialogue, six random meetings with overlap, edge cases) the largest gap to
+pyannote is 3·10⁻¹⁴ at all three protocols.
 
 **Tests never download.** Every test that needs a model finds it with
 `crate::weights::local_file` and skips, saying so, when it is not in the
@@ -728,12 +810,17 @@ measured.
    helper, the Hungarian algorithm it needs, `scripts/der-fixtures.py`
    and `scripts/dialogue.py`. *Done* when the Rust scorer agrees with
    `pyannote.metrics` to 0.01 points on every fixture, at all three
-   protocols.
+   protocols. **Built**: `speech::score`; agrees to 3·10⁻¹⁴, and
+   `dialogue.py` with no script remakes the probe's turns to the
+   millisecond.
 2. **Words with times**, on the CPU, then the GPU: the `attention`
    question, the alignment on the host, `timestamp_granularities[]=word`,
    `--words`. *Done* as in *Words with times*: within a frame of
    transformers in f32, the probe's word attribution or better on the
-   dialogue, and the cost in `transcribe_speed`.
+   dialogue, and the cost in `transcribe_speed`. **Built**: 0 frames from
+   `timing.py` over transformers' attention in f32 on both backends and
+   all three sizes, every matched word on the right speaker, and a pass
+   that is 2–5% of a GPU run (*As built, and what it measured*).
 3. **Reading pickled checkpoints** without running them (`weights.rs`).
    *Done* when the fixture checkpoint and segmentation-3.0's file read
    tensor for tensor as torch reads them, and a pickle that asks for any

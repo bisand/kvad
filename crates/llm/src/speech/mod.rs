@@ -21,6 +21,10 @@
 //!    transcript is written out in.
 //! 5. [`live`] — the same loop over audio that is still arriving: a window
 //!    decoded again as it grows, and words settled once two runs agree.
+//! 6. [`align`] — when each word was said, from where the decoder's
+//!    cross-attention looks.
+//! 7. [`score`] — how wrong a "who spoke when" is: the diarization error
+//!    rates, and the Hungarian algorithm they map speakers with.
 //!
 //! Every Whisper on the Hub in transformers' layout loads: OpenAI's own
 //! (`openai/whisper-*`), the distilled ones, and fine-tunes of them such as
@@ -31,10 +35,12 @@
 //! the rules and the walk through a recording are the same arithmetic on the
 //! host whichever answers, so they are here once.
 
+pub mod align;
 pub mod audio;
 pub mod live;
 pub mod mel;
 pub mod reference;
+pub mod score;
 pub mod transcribe;
 pub mod whisper;
 
@@ -51,10 +57,11 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 /// A Whisper, as the decoding loop sees one: a window of spectrogram in,
 /// next-token scores out.
 ///
-/// Three questions and no more, because that is all the loop asks: what
+/// Four questions and no more, because that is all the loop asks: what
 /// the decoder will read of this window ([`Model::hear`]), an empty text
-/// cache to begin a pass with ([`Model::said`]), and the scores after some
-/// tokens ([`Model::decode`]). What each keeps between calls is its own
+/// cache to begin a pass with ([`Model::said`]), the scores after some
+/// tokens ([`Model::decode`]), and, for words with times, where some of the
+/// decoder's heads looked ([`Model::attention`]). What each keeps between calls is its own
 /// business: host vectors on the CPU, tensors on a GPU. So the two caches
 /// cross this boundary as [`Heard`] and [`Said`], which hold whatever the
 /// model put in them and which only it opens.
@@ -77,6 +84,13 @@ pub trait Model: Send + Sync {
     /// them there, and return the scores for the next token after each row
     /// of `tokens` that `rows` names, in that order.
     fn decode(&self, tokens: &[u32], said: &mut Said, heard: &Heard, rows: &[usize]) -> Res<Vec<Vec<f32>>>;
+
+    /// The cross-attention weights of `heads`, each `(layer, head)`, for
+    /// `tokens` decoded from an empty cache against `heard`:
+    /// `[head][token][frame]`, softmaxed, in f32, over all of a window's
+    /// frames. What [`align`] times words by. No scores: nothing after the
+    /// last layer with one of `heads` need run.
+    fn attention(&self, tokens: &[u32], heard: &Heard, heads: &[(usize, usize)]) -> Res<Vec<f32>>;
 
     /// Run `work` where this model's work runs best: the CPU's on its own
     /// threads (see [`transcribe::Transcriber`]), a GPU's as it comes.
@@ -106,6 +120,9 @@ impl<M: Model> Model for std::sync::Arc<M> {
     }
     fn decode(&self, tokens: &[u32], said: &mut Said, heard: &Heard, rows: &[usize]) -> Res<Vec<Vec<f32>>> {
         (**self).decode(tokens, said, heard, rows)
+    }
+    fn attention(&self, tokens: &[u32], heard: &Heard, heads: &[(usize, usize)]) -> Res<Vec<f32>> {
+        (**self).attention(tokens, heard, heads)
     }
     fn within(&self, work: &mut (dyn FnMut() + Send)) {
         (**self).within(work)
@@ -231,6 +248,9 @@ impl Transcriber {
         let generation = files.generation.as_deref().map(crate::weights::read_json).transpose()?;
         let tokenizer = tokenizers::Tokenizer::from_file(&files.tokenizer).map_err(|e| e.to_string())?;
         let tokens = transcribe::Tokens::read(&tokenizer, &config_json, generation.as_ref())?;
+        if tokens.heads_guessed {
+            progress(&format!("{repo} names no alignment heads: words are timed by every head of the decoder's second half, and less well"));
+        }
         progress(&format!(
             "loading {repo}: {} + {} blocks, d={}, {} mel bands",
             config.encoder_layers, config.decoder_layers, config.d, config.n_mels
@@ -292,8 +312,8 @@ mod tests {
         let model = made.unwrap();
         let encode = |window: &[f32]| -> Res<Vec<f32>> { Ok(model.whisper.encode(window)) };
         let tol = match precision {
-            Precision::F32 => reference::Tolerance { encoder: 2e-3, logits: 2e-3 },
-            _ => reference::Tolerance { encoder: 0.75, logits: 0.1 },
+            Precision::F32 => reference::Tolerance { encoder: 2e-3, logits: 2e-3, frames: 1 },
+            _ => reference::Tolerance { encoder: 0.75, logits: 0.1, frames: usize::MAX },
         };
         reference::compare(&fx, &t, &encode, tol).unwrap();
     }

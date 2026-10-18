@@ -1884,6 +1884,7 @@ fn keep_key(remote: &Remote, signed_in: &Remote, user: &str) -> Res<()> {
         id: made["key"]["id"].as_i64(),
         user: Some(user.to_string()),
         address: remote.dial_address(),
+        voucher: client::credential(&remote.base).and_then(|c| c.voucher),
     };
     let path = client::remember(&remote.base, &credential)?;
     println!("signed in to {} as {user}", remote.base);
@@ -1939,7 +1940,13 @@ pub fn auth(remote: &Remote, args: &Args) -> Res<()> {
                 };
                 let path = client::remember(
                     &remote.base,
-                    &client::Credential { key, id: None, user: Some(name.to_string()), address: remote.dial_address() },
+                    &client::Credential {
+                        key,
+                        id: None,
+                        user: Some(name.to_string()),
+                        address: remote.dial_address(),
+                        voucher: client::credential(&remote.base).and_then(|c| c.voucher),
+                    },
                 )?;
                 println!("signed in to {} as {name}\n  key kept in {}, readable by you only", remote.base, path.display());
                 return Ok(());

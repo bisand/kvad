@@ -417,11 +417,10 @@ client behind. That last one is the diagnosis that TURN and STUN never gave.
 | Homelab app stores | NixOS module, Unraid and TrueNAS apps, Coolify template | Later, by demand. |
 | Edge (Workers and the like) | Not in v1 | No UDP and no long-lived raw sockets. A relay-only WebSocket variant is possible but is a second implementation. Said here so nobody is surprised. |
 
-**Relays are not open to the world.** A relay serves only node ids it has
-been told about: the Mac registers with a relay secret from `kvad.toml`, and
-the relay forwards only to and from registered nodes and devices they paired.
-A public relay that anyone can use is a bill and an abuse report waiting to
-happen.
+**Relays are not open to the world.** A relay serves only the servers' node
+ids on its list, and the devices those servers vouch for (see Phase 3's
+*vouchers*). A public relay that anyone can use is a bill and an abuse report
+waiting to happen.
 
 **More than one relay.** `[remote].relays` is a list. A home server plus a
 small VPS gives failover for free, and the client tries them in order.
@@ -651,6 +650,64 @@ metrics, the self-test. Docker image and Compose file first. Tests: two
 processes that can only reach each other through it; two that can punch
 through it and then keep talking after it stops; and a third that is
 refused.
+
+*Built, 2026-10-18 (who the relay serves, wherever they are).* The crate,
+its TLS and its Docker image came first, in Phase 0. What Phase 3 adds is
+the relay letting a server's devices through without anybody keeping a list
+of them.
+
+- **Vouchers, not lists.** A voucher is a string a server signs with its
+  node key: "this device may use the relays that serve me, until then".
+  `kv1.<node>.<device>.<expires>.<signature>`, in `kvad_tunnel::Voucher`.
+  A device shows it to a relay as the relay connection's auth token.
+  kvad-relay lets in the node ids on its list, and any device with a valid
+  voucher from one of them.
+- **Statelessness.** The relay learns nothing and keeps nothing. Restarting
+  it, running several, and devices or servers moving to other networks
+  change nothing.
+- **What a voucher's lifetime means.** A device gets one when it pairs,
+  good for thirty days, and asks for a fresh one through the tunnel
+  (`GET /api/remote/voucher`) on its own once half is spent. Unpairing
+  shuts a device out of its server at once, as before. Its voucher still
+  gets it onto the relay until it runs out, where it can reach nothing that
+  would let it in.
+- **Pairing through the relay.** A pairing link carries a voucher for any
+  device, good for the slot's ten minutes and no more: a relay refuses an
+  any-device voucher that lives longer than fifteen. A phone on mobile data
+  can pair from the QR code on the Mac's screen.
+
+Why not have devices report to the relay when their network changes: they
+already do, in effect. Every device and server holds a connection to its
+relay, keyed by its node id. A machine that moves reconnects under the same
+key, and anything dialling it by that key reaches it through the relay
+again, then finds a direct path again by exchanging its new addresses. What
+an address's `addr=` hints say only saves a round trip, and stale ones cost
+nothing. The one thing worth adding is on the phone: telling the endpoint as
+soon as iOS reports a network change (`Endpoint::network_change`, from
+`NWPathMonitor`), so that it reacts at once rather than when it notices
+(`docs/phone-plan.md`, Phase 4).
+
+Tested:
+
+- *Vouchers* (`kvad-tunnel`): one for the device it names, while it lives;
+  refused for another device, from a node the relay does not serve, after a
+  forged expiry, or once expired; any-device ones capped at fifteen
+  minutes.
+- *A relay in the test process, with kvad-relay's rule*: a device on no list
+  gets through with a voucher, a newcomer reaches the pairing lane with a
+  link's, and nothing gets through without one.
+- *Through `relay.kvad.eu`, by hand*:
+  - A scratch server with `direct = "off"` was on the relay's list, and the
+    phone's key was not.
+  - The phone paired through the relay with the link's voucher, and ran
+    commands through it with its own.
+  - With its voucher taken away, the relay refused it, and the error says
+    so.
+  - Given a nearly spent voucher, the next command swapped it for a fresh
+    thirty-day one.
+
+Not yet done: the relay's health and metrics endpoints, its self-test, and
+rate limits per node rather than per connection.
 
 **Phase 4: the client side.** `kvad tunnel`, the web UI's pairing screen and
 device list, and the CLI over a real relay from a real phone network.

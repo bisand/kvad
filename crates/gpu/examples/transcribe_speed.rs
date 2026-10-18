@@ -10,11 +10,12 @@
 //!         NbAiLab/nb-whisper-large king.wav cpu-f32,cpu-q8,gpu-f16,gpu-q8 3
 //!
 //! The model is read from the cache. `--plain` leaves timestamps off; they
-//! are on by default, as for the table in `docs/speech-plan.md`.
+//! are on by default, as for the table in `docs/speech-plan.md`. `--words`
+//! times every word as well (`kvad::speech::align`).
 //!
 //! Each run is broken down as well: the windows heard (encoder and
-//! cross-attention keys and values), the prompts, the one-token steps, and
-//! the rest, which is the host's.
+//! cross-attention keys and values), the prompts, the one-token steps, the
+//! alignment passes for word times, and the rest, which is the host's.
 use kvad::quant::Precision;
 use kvad::speech::whisper::Config;
 use kvad::speech::{audio, mel, Heard, Model, Request, Said, Transcriber};
@@ -34,6 +35,8 @@ struct Spent {
     prompting: Duration,
     steps: usize,
     stepping: Duration,
+    alignments: usize,
+    aligning: Duration,
 }
 
 /// A model, timed.
@@ -70,6 +73,14 @@ impl<M: Model> Model for Timed<M> {
             1 => (s.steps += 1, s.stepping += t.elapsed()),
             _ => (s.prompts += 1, s.prompting += t.elapsed()),
         };
+        out
+    }
+    fn attention(&self, tokens: &[u32], heard: &Heard, heads: &[(usize, usize)]) -> Res<Vec<f32>> {
+        let t = Instant::now();
+        let out = self.model.attention(tokens, heard, heads);
+        let mut s = self.spent.lock().unwrap();
+        s.alignments += 1;
+        s.aligning += t.elapsed();
         out
     }
     fn within(&self, work: &mut (dyn FnMut() + Send)) {
@@ -113,9 +124,10 @@ fn load(repo: &str, backend: &str, spent: &Arc<Mutex<Spent>>) -> Res<Transcriber
 fn main() -> Res<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let plain = args.iter().any(|a| a == "--plain");
+    let words = args.iter().any(|a| a == "--words");
     let args: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [repo, wav, backends, rounds] = args[..] else {
-        return Err("usage: transcribe_speed REPO WAV BACKEND,BACKEND,… ROUNDS [--plain]".into());
+        return Err("usage: transcribe_speed REPO WAV BACKEND,BACKEND,… ROUNDS [--plain] [--words]".into());
     };
     let samples = audio::from_wav(&std::fs::read(wav)?)?;
     let seconds = samples.len() as f32 / mel::SAMPLE_RATE as f32;
@@ -129,7 +141,7 @@ fn main() -> Res<()> {
         println!("{b}: {} loaded in {:.1} s", model.backend(), t.elapsed().as_secs_f32());
         loaded.push((model, spent));
     }
-    let req = Request { timestamps: !plain, ..Request::default() };
+    let req = Request { timestamps: !plain, words, ..Request::default() };
     let mut first: Option<String> = None;
     for round in 1..=rounds {
         for (b, (model, spent)) in backends.iter().zip(&loaded) {
@@ -140,6 +152,16 @@ fn main() -> Res<()> {
             let s = spent.lock().unwrap().clone();
             let ms = |d: Duration, n: usize| d.as_secs_f64() * 1000.0 / n.max(1) as f64;
             let tokens: usize = done.segments.iter().map(|s| s.tokens.len()).sum();
+            let aligned = match words {
+                true => format!(
+                    ", {} alignments {:.1} ms ({:.1}% of the run), {} words",
+                    s.alignments,
+                    ms(s.aligning, s.alignments),
+                    100.0 * s.aligning.as_secs_f32() / wall,
+                    done.segments.iter().map(|s| s.words.len()).sum::<usize>()
+                ),
+                false => String::new(),
+            };
             let same = match &first {
                 None => {
                     first = Some(done.text.clone());
@@ -149,7 +171,7 @@ fn main() -> Res<()> {
                 Some(_) => "differs",
             };
             println!(
-                "round {round} {b:9} {wall:6.2} s  {:5.1}x real time  {tokens} tokens  {same}  | {} windows {:.0} ms each, {} prompts {:.1} ms, {} steps {:.2} ms, rest {:.2} s",
+                "round {round} {b:9} {wall:6.2} s  {:5.1}x real time  {tokens} tokens  {same}  | {} windows {:.0} ms each, {} prompts {:.1} ms, {} steps {:.2} ms{aligned}, rest {:.2} s",
                 seconds / wall,
                 s.windows,
                 ms(s.hearing, s.windows),
@@ -157,7 +179,7 @@ fn main() -> Res<()> {
                 ms(s.prompting, s.prompts),
                 s.steps,
                 ms(s.stepping, s.steps),
-                wall - (s.hearing + s.prompting + s.stepping).as_secs_f32(),
+                wall - (s.hearing + s.prompting + s.stepping + s.aligning).as_secs_f32(),
             );
         }
     }

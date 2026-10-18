@@ -684,7 +684,18 @@ impl Fields {
                     None => {
                         let text = String::from_utf8(part.data)
                             .map_err(|_| Fail::bad(format!("the form field {} is not text", part.name)))?;
-                        map.insert(part.name, Value::String(text));
+                        // `name[]` is a list, a part a value, as OpenAI's
+                        // `timestamp_granularities[]` is sent; any other
+                        // name sent twice keeps the last.
+                        match part.name.ends_with("[]") {
+                            true => match map.entry(part.name).or_insert_with(|| Value::Array(Vec::new())) {
+                                Value::Array(list) => list.push(Value::String(text)),
+                                _ => unreachable!("a [] field is a list"),
+                            },
+                            false => {
+                                map.insert(part.name, Value::String(text));
+                            }
+                        }
                     }
                 }
             }
@@ -711,6 +722,20 @@ impl Fields {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         })
+    }
+
+    /// Every value of a list, under the first of `names` that is present:
+    /// a JSON array, a form's `name[]` parts, or one value alone.
+    pub(crate) fn texts(&self, names: &[&str]) -> Vec<String> {
+        let text = |v: &Value| match v {
+            Value::String(s) => s.trim().to_string(),
+            other => other.to_string(),
+        };
+        match self.get(names) {
+            None => Vec::new(),
+            Some((_, Value::Array(list))) => list.iter().map(text).filter(|s| !s.is_empty()).collect(),
+            Some((_, v)) => vec![text(v)],
+        }
     }
 
     /// A number, whether JSON sent it as one or a form as text.

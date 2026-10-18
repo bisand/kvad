@@ -456,6 +456,38 @@ impl Whisper {
     /// begin a window: every row is a token, and the causal mask is the
     /// `pos0 + i + 1` positions row `i` is allowed to see.
     pub fn decode(&self, tokens: &[u32], cache: &mut TextCache, audio: &AudioCache) -> Res<Vec<f32>> {
+        let x = self.blocks(tokens, cache, audio, self.decoder.len(), &mut |_, _| {})?;
+        Ok(self.ln_text.rows(&x))
+    }
+
+    /// The cross-attention weights of `heads`, `(layer, head)`, for `tokens`
+    /// from an empty cache: `[head][token][frame]`, softmaxed. The blocks
+    /// after the last layer named are not run.
+    pub fn attention(&self, tokens: &[u32], audio: &AudioCache, heads: &[(usize, usize)]) -> Res<Vec<f32>> {
+        let c = &self.config;
+        let (m, hd, frames) = (tokens.len(), c.d / c.decoder_heads, audio.frames);
+        let mut out = vec![0.0f32; heads.len() * m * frames];
+        let upto = heads.iter().map(|&(l, _)| l + 1).max().unwrap_or(0);
+        let mut cache = TextCache::new(c.decoder_layers);
+        self.blocks(tokens, &mut cache, audio, upto, &mut |l, q| {
+            for (k, &(_, h)) in heads.iter().enumerate().filter(|&(_, &(hl, _))| hl == l) {
+                let slot = &mut out[k * m * frames..(k + 1) * m * frames];
+                slot.par_chunks_mut(frames).enumerate().for_each(|(i, row)| {
+                    let qh = &q[i * c.d + h * hd..i * c.d + (h + 1) * hd];
+                    for (t, w) in row.iter_mut().enumerate() {
+                        *w = dot(qh, &audio.k[l][t * c.d + h * hd..t * c.d + (h + 1) * hd]);
+                    }
+                    softmax_inplace(row);
+                });
+            }
+        })?;
+        Ok(out)
+    }
+
+    /// The first `upto` decoder blocks over `tokens`, after what `cache`
+    /// holds, and the residual stream they leave, `[m][d]`. `cross` is shown
+    /// each block's cross-attention queries, scaled, as they are made.
+    fn blocks(&self, tokens: &[u32], cache: &mut TextCache, audio: &AudioCache, upto: usize, cross: &mut dyn FnMut(usize, &[f32])) -> Res<Vec<f32>> {
         let c = &self.config;
         let (m, d, pos0) = (tokens.len(), c.d, cache.len);
         if pos0 + m > c.text_ctx {
@@ -472,7 +504,7 @@ impl Whisper {
         }
 
         let hd = d / c.decoder_heads;
-        for (l, b) in self.decoder.iter().enumerate() {
+        for (l, b) in self.decoder.iter().enumerate().take(upto) {
             let h = b.ln1.rows(&x);
             let q = b.attn.queries(&h, m, hd);
             cache.k[l].extend(b.attn.k.matmul_bt(&h, m, None));
@@ -482,6 +514,7 @@ impl Whisper {
 
             let h = b.ln_cross.rows(&x);
             let q = b.cross.queries(&h, m, hd);
+            cross(l, &q);
             let a = attend_rows(&q, &audio.k[l], &audio.v[l], c.decoder_heads, hd, |_| audio.frames);
             add(&mut x, &b.cross.o.matmul_bt(&a, m, Some(&b.cross.o_b)));
 
@@ -489,7 +522,7 @@ impl Whisper {
             add(&mut x, &b.mlp.forward(&h, m));
         }
         cache.len += m;
-        Ok(self.ln_text.rows(&x))
+        Ok(x)
     }
 
     /// The next-token scores for one row of [`Whisper::decode`]'s output.
@@ -534,6 +567,10 @@ impl super::Model for Cpu {
         let d = self.whisper.config.d;
         let h = self.whisper.decode(tokens, said.get_mut()?, heard.get()?)?;
         Ok(rows.iter().map(|&r| self.whisper.logits(&h[r * d..(r + 1) * d])).collect())
+    }
+
+    fn attention(&self, tokens: &[u32], heard: &super::Heard, heads: &[(usize, usize)]) -> Res<Vec<f32>> {
+        self.whisper.attention(tokens, heard.get()?, heads)
     }
 
     fn within(&self, work: &mut (dyn FnMut() + Send)) {

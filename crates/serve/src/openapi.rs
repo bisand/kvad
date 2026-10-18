@@ -658,6 +658,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       `temperature` 0, or none, is greedy, and a 30-second window that \
                       fails — repeats itself, or is unsure of every word — is decoded \
                       again warmer; above 0 it is the only temperature tried.\n\n\
+                      `timestamp_granularities[]=word`, with `verbose_json`, adds `words`, \
+                      each `{word, start, end}`, beside the segments: timed by the \
+                      decoder's cross-attention, at the cost of one more decoder pass \
+                      over each window's text.\n\n\
                       kvad's own: `seed`, and `timestamps: true`, which decodes with \
                       timestamp tokens whatever the format (`srt`, `vtt` and \
                       `verbose_json` always do). They change the words a Whisper writes, \
@@ -670,13 +674,15 @@ pub const ENDPOINTS: &[Endpoint] = &[
         body: Some(Body {
             content_type: "multipart/form-data",
             description: "`file` and `model?`, with `language?`, `prompt?`, `response_format?`, \
-                          `temperature?`, `seed?`, `timestamps?` and `stream?`.",
+                          `temperature?`, `timestamp_granularities[]?`, `seed?`, `timestamps?` \
+                          and `stream?`.",
         }),
         produces: "application/json, text/plain, application/x-subrip, text/vtt, or text/event-stream",
         events: &[
             ("transcript.text.delta", "`{type, delta}` after each 30-second window, and under \
                                        `kvad` how far it has got (`done` and `total`, in seconds) \
-                                       and the window's `segments`, each `{start, end, text}`."),
+                                       and the window's `segments`, each `{start, end, text}`, \
+                                       and its `words` when they were asked for."),
             ("transcript.text.done", "`{type, text}`, the whole of it, and under `kvad` the \
                                       `language` and the recording's `duration`; the stream ends."),
             ("error", "`{error}`: it failed; the stream ends."),
@@ -1243,6 +1249,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       account. A device acts as `user` unless `admin` is asked, which only an administrator \
                       may. A paired device cannot open a slot unless it was paired with `admin`.",
         query: &[], body: json_body("`{ admin }`, optional."), produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/remote/voucher", tag: "Accounts", access: Access::SignedIn,
+        summary: "A fresh relay voucher for the device asking",
+        description: "`{ voucher, expires_in }`, for a request made with a paired device's key. A relay \
+                      that serves this server lets the device through with it, for thirty days.",
+        query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
         method: "get", path: "/api/devices", tag: "Accounts", access: Access::SignedIn,

@@ -50,6 +50,7 @@
 //! how well the text gzips; that needs a compressor this crate does not have,
 //! and a window caught in a loop runs into the limit regardless.
 
+use super::align::Word;
 use super::mel::{self, HOP, N_FRAMES, SAMPLE_RATE};
 use super::{Heard, Model};
 use crate::sampler::Sampler;
@@ -104,6 +105,9 @@ pub struct Request {
     /// openai-whisper.
     pub no_context: bool,
     pub seed: Option<u64>,
+    /// Time every word as well as every segment ([`super::align`]): one
+    /// more pass of the decoder over each window's text.
+    pub words: bool,
 }
 
 /// One stretch of the transcript.
@@ -116,6 +120,8 @@ pub struct Segment {
     pub temperature: f32,
     pub avg_logprob: f32,
     pub no_speech_prob: f32,
+    /// Its words with their times, when [`Request::words`] asked for them.
+    pub words: Vec<Word>,
 }
 
 /// A whole transcription.
@@ -170,6 +176,11 @@ pub struct Tokens {
     /// Empty for a tokenizer that is not byte-level, which turns the rule
     /// off.
     pub utf8: Vec<[u8; 4]>,
+    /// The decoder's heads whose cross-attention words are timed by,
+    /// `(layer, head)`: see [`super::align::heads`].
+    pub heads: Vec<(usize, usize)>,
+    /// Whether the checkpoint named none, and `heads` is a guess.
+    pub heads_guessed: bool,
 }
 
 impl Tokens {
@@ -198,6 +209,8 @@ impl Tokens {
         };
         let gen = |key: &str| generation.and_then(|g| g.get(key));
         let default_language = gen("language").and_then(|v| v.as_str()).map(|s| s.trim_start_matches("<|").trim_end_matches("|>").to_string());
+        let layer_count = |k: &str| config.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let (heads, heads_guessed) = super::align::heads(generation, layer_count("decoder_layers"), layer_count("decoder_attention_heads"));
         let multilingual = gen("is_multilingual").and_then(|v| v.as_bool()).unwrap_or_else(|| tok.token_to_id("<|en|>").is_some());
         let mut t = Tokens {
             eot: id("<|endoftext|>")?,
@@ -215,6 +228,8 @@ impl Tokens {
             max_initial_timestamp: gen("max_initial_timestamp_index").and_then(|v| v.as_u64()).map_or(50, |v| v as usize),
             multilingual,
             utf8: utf8(tok),
+            heads,
+            heads_guessed,
         };
         // What openai-whisper suppresses besides the checkpoint's list: the
         // tokens that only ever belong in a prompt.
@@ -670,6 +685,8 @@ impl Transcriber {
         let mut language = self.language_asked(req)?;
         let mut context = self.prompted(req)?;
         let mut reset_at = 0;
+        // Where the words timed so far stopped: see `align::tidy`.
+        let mut last_speech = 0.0;
 
         let mut segments: Vec<Segment> = Vec::new();
         let mut seek = 0;
@@ -712,6 +729,7 @@ impl Transcriber {
                         temperature: w.temperature,
                         avg_logprob: w.avg_logprob,
                         no_speech_prob: w.no_speech_prob,
+                        words: Vec::new(),
                     });
                 }
                 Ok(())
@@ -754,6 +772,12 @@ impl Transcriber {
                 seek += size;
             }
 
+            if req.words {
+                // The prompt as far as the task: the alignment pass puts
+                // `<|notimestamps|>` after it whatever this window had.
+                let sot: Vec<u32> = start.iter().copied().filter(|&i| i != t.no_timestamps).collect();
+                self.time_words(&heard, &sot, &mut segments[before..], size, offset, &mut last_speech)?;
+            }
             context.extend_from_slice(tokens);
             if w.temperature > 0.5 {
                 // A window that needed a lot of randomness is a poor guide
@@ -839,13 +863,25 @@ impl Transcript {
                 })
             })
             .collect();
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "task": if task == Task::Translate { "translate" } else { "transcribe" },
             "language": self.language,
             "duration": round2(self.duration),
             "text": self.text.trim(),
             "segments": segments,
-        })
+        });
+        // OpenAI's `timestamp_granularities[]=word`: every word, beside the
+        // segments rather than in them, without the space before it.
+        if self.segments.iter().any(|s| !s.words.is_empty()) {
+            let words: Vec<serde_json::Value> = self
+                .segments
+                .iter()
+                .flat_map(|s| &s.words)
+                .map(|w| serde_json::json!({ "word": w.word.trim(), "start": round2(w.start), "end": round2(w.end) }))
+                .collect();
+            out["words"] = words.into();
+        }
+        out
     }
 
     /// Numbered (SRT) or bare (VTT) cues, one per segment.
@@ -894,6 +930,8 @@ mod tests {
             max_initial_timestamp: 2,
             multilingual: true,
             utf8: Vec::new(),
+            heads: vec![(0, 0)],
+            heads_guessed: false,
         }
     }
 
@@ -1055,6 +1093,7 @@ mod tests {
             temperature: 0.0,
             avg_logprob: 0.0,
             no_speech_prob: 0.0,
+            words: vec![],
         };
         let tr = Transcript {
             text: " Hei. Hallo.".into(),
@@ -1065,5 +1104,24 @@ mod tests {
         assert_eq!(tr.render(Format::Srt, Task::Transcribe), "1\n00:00:00,000 --> 00:00:01,500\nHei.\n\n2\n01:02:03,250 --> 01:02:05,500\nHallo.\n\n");
         assert!(tr.render(Format::Vtt, Task::Transcribe).starts_with("WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nHei."));
         assert_eq!(tr.render(Format::Text, Task::Transcribe), "Hei. Hallo.\n");
+    }
+
+    /// OpenAI's `words`: beside the segments, every word without the space
+    /// before it, at two decimals; and no key at all when none were asked.
+    #[test]
+    fn verbose_json_carries_the_words_when_there_are_any() {
+        let word = |w: &str, start, end| Word { word: w.into(), start, end };
+        let mut seg = Segment { start: 0.0, end: 1.5, text: " Hei, sa han.".into(), tokens: vec![], temperature: 0.0, avg_logprob: 0.0, no_speech_prob: 0.0, words: vec![] };
+        let mut tr = Transcript { text: seg.text.clone(), language: "no".into(), duration: 1.5, segments: vec![seg.clone()] };
+        assert!(tr.verbose(Task::Transcribe).get("words").is_none());
+        seg.words = vec![word(" Hei,", 0.0, 0.42), word(" sa", 0.42, 0.7000001), word(" han.", 0.7, 1.24)];
+        tr.segments = vec![seg];
+        let v = tr.verbose(Task::Transcribe);
+        assert_eq!(v["words"], serde_json::json!([
+            { "word": "Hei,", "start": 0.0, "end": 0.42 },
+            { "word": "sa", "start": 0.42, "end": 0.7 },
+            { "word": "han.", "start": 0.7, "end": 1.24 },
+        ]));
+        assert!(v["segments"][0].get("words").is_none(), "words go beside the segments, as OpenAI's");
     }
 }

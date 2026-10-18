@@ -608,6 +608,37 @@ another mid-sentence.
 - **`kvad transcribe --live -`**: raw 16 kHz mono f32 from stdin, through
   the same session, in the CLI's own process. On the CPU only tiny keeps
   up, as measured below.
+- **The session held when the link drops**, built 2026-10-18, the server's
+  half of *When the link drops*. A socket that goes without a close leaves
+  its session held for 60 s, in memory only: the `Live`, the audio not yet
+  decoded, and the item's settled text, the update under way finished
+  first. `session.created` gives the session's `id`. Every piece of audio
+  has its sample offset at the session's rate: `kvad: {offset}` on
+  `input_audio_buffer.append`, and for binary frames an event before them,
+  `kvad.input_audio_buffer.offset`, `{offset}`, rather than a header, so a
+  frame stays the PCM a browser sends; audio without one follows on, so a
+  client says it once a connection. What the session has already is passed
+  over, and audio after a gap is refused (`audio_gap`). Every settled event
+  says the sample it was heard to (`kvad.offset`). A reconnect is
+  `?resume=<id>&offset=<n>`, `n` that of the last settled event the client
+  has: the same session, told where it stands (the samples the server has,
+  the item, its text so far), and every settled event from `n` on sent
+  again with the `event_id` it had, so the client drops the ones it has. A
+  reconnect also takes a session off a socket the server still thinks is
+  open, as a phone that changed networks leaves one behind until TCP gives
+  up on it; that socket is told `session_taken`. After the minute, for an
+  id not held, or another account's or device's, it is `error`
+  `session_not_found`, and the client sends its file to `POST
+  /v1/audio/transcriptions`. A client's close ends a session for good.
+  The tests play the scripted Whisper into the session, with nothing
+  downloaded: a link cut at 12.5 s, mid-word, what was in flight lost and
+  the phone hearing nothing of what settled meanwhile, then resumed and
+  resent from its last settled offset, gives the transcript of a session
+  never cut, each word once and each sample heard once; a decoder that
+  takes 100 ms an update, against a second of audio every 40 ms, skips
+  most updates and hears all 40 s; and the takeover, the minute running
+  out, and another's id. The `Live` tests settle the same text from audio
+  that comes in pieces of 1 to 8 s.
 
 Three things differ from the design above, each found building it:
 
@@ -658,10 +689,12 @@ SmolLM2-135M resident in the main service.
   (tiny's own file transcript goes wrong at the end, as before). The CPU
   keeps up with tiny only, at a third of its time.
 
-**Not built yet**, all of it the phone's: the session held for a minute
-after the link goes, with sample offsets to resume from; the tests over the
-tunnel's three paths; and a check against OpenAI's own SDK, which this was
-written from their reference and not tested with.
+**Not built yet**: the phone's end of a reconnect, which keeps the
+recording, names the session and resends (the server's end is built,
+above); the tests over the tunnel's three paths; and a check against
+OpenAI's own SDK, which this was written from their reference and not
+tested with. The web UI's microphone does not reconnect: a page that loses
+its socket starts again.
 
 ## What is next
 
@@ -675,7 +708,7 @@ written from their reference and not tested with.
    the subtitle files itself from the segments, byte for byte the server's.
 4. **Live transcription** is built: `/v1/realtime`, the Transcribe page's
    microphone, and `kvad transcribe --live -` (*Live, from the phone*,
-   *Built*). What is left is the phone's: resuming a session after the link
-   drops, and the tunnel's paths.
+   *Built*), and the server's half of resuming after the link drops. What
+   is left is the phone's: its half of the resume, and the tunnel's paths.
 5. **Speakers**, "who spoke when", and word timestamps before them: planned
    in [the diarization plan](diarization-plan.md).

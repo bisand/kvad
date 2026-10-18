@@ -18,6 +18,9 @@ arch-qwen3-5 = []
 # One model across several machines: `src/cluster/`, and `kvad cluster`.
 # See docs/cluster-plan.md.
 cluster = []
+# A scripted stand-in for a Whisper (`speech::live::script`), for kvad-serve's
+# tests of `/v1/realtime`. Tests only; nothing ships with it.
+script = []
 
 [dependencies]
 # `kvad --remote kvad://…`: a server reached through the tunnel of

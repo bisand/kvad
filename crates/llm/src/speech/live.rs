@@ -332,5 +332,9 @@ fn align(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
     out
 }
 
+#[cfg(any(test, feature = "script"))]
+#[doc(hidden)]
+pub mod script;
+
 #[cfg(test)]
 mod tests;

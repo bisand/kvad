@@ -505,8 +505,8 @@ with a client that offered only that.
   Personal Hotspot is a NAT of its own, in front of the carrier's
   carrier-grade NAT, and two NATs in a row rarely punch. An app on the
   phone itself is behind the carrier's NAT alone. That is the run that
-  matters, and it needs the tunnel in the app (Phase 4 of
-  `docs/phone-plan.md`).
+  matters. Kvad for iPhone's Network test runs the probe's dialler from the
+  phone for it (`apps/phone/README.md`, *The run over mobile data*).
 - *The relay is not optional for a phone on mobile data.* Here it carried
   every packet, at about 60 ms, with no ping lost.
 - *IPv6 could not help.* The carrier gave the Air a global IPv6 address,

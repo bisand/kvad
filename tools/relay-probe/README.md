@@ -7,7 +7,8 @@ path takes over, and what each path costs in round-trip time.
 
 It is a scratch tool, in a workspace of its own, so that nothing it pulls in
 reaches Kvad's builds. It is built on iroh 1.3, as the plan proposes for the
-tunnel.
+tunnel. Its core is a library (`src/lib.rs`): the command is `src/main.rs`,
+and Kvad for iPhone's Network test (`apps/phone`) dials with the same code.
 
 ## What it will and will not do
 
@@ -110,6 +111,9 @@ laptop goes elsewhere:
 5. A handover: start `dial --secs 120` on Wi-Fi, switch the laptop to the
    hotspot halfway, and look for the path change, and for whether the run
    ends without `stopped early`.
+
+6. The iPhone itself on mobile data, with Wi-Fi off: the app's Network test
+   is this command's dialler, and `apps/phone/README.md` has the steps.
 
 For each, note the table, the `network:` lines from both ends (public
 addresses, and whether the NAT gives each destination its own port), and

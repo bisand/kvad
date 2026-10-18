@@ -944,6 +944,37 @@ pub const COMMANDS: &[Command] = &[
         examples: &["kvad remote pair", "kvad remote join 'kvad://…&pair=…'", "kvad remote status --remote kvad://…"],
     },
     Command {
+        name: "tunnel",
+        group: Group::Accounts,
+        args: "",
+        about: "a local port for any HTTP client, forwarded to a kvad:// server",
+        server: false,
+        routed: false,
+        words: &[],
+        subs: &[],
+        flags: &[&[
+            f("--remote", "kvad://ID", Kind::Text, "the paired server to forward to (default: the only one this device is paired with)"),
+            f("--port", "N", Kind::Text, "the port to listen on, on 127.0.0.1 only (default 5824)"),
+            sw("--with-key", "add this device's key to every request: anything that reaches the port acts as this device"),
+        ]],
+        usage: None,
+        notes: "Listens on 127.0.0.1 and forwards each connection through the tunnel, so\n\
+                that OpenCode, curl or the openai SDK work against\n\
+                http://127.0.0.1:5824/v1 unmodified. Says which path the tunnel is on (lan,\n\
+                direct or relay) when it starts and whenever that changes, and connects\n\
+                again when it drops.\n\n\
+                The port is open to every program on this machine and to every user of it,\n\
+                and they all reach the server as this device. The server still wants a key\n\
+                with each request, so by default each program sends one of its own\n\
+                (`kvad keys add NAME`), which can be revoked on its own.\n\n\
+                --with-key adds this device's key instead, so nothing else needs one, and\n\
+                anything that can reach the port acts as this device, with its rights,\n\
+                while it runs. Use it on a machine that is yours alone. With it on,\n\
+                requests a browser sent from a web page are refused, and each request gets\n\
+                a connection of its own.",
+        examples: &["kvad tunnel --remote kvad://9ce63fe0…", "kvad tunnel --port 8080 --with-key"],
+    },
+    Command {
         name: "devices",
         group: Group::Accounts,
         args: "[ls|rm ID]",
@@ -1267,7 +1298,7 @@ mod tests {
     #[test]
     fn the_table_holds_every_command_and_only_those() {
         for command in COMMANDS {
-            let handled = matches!(command.name, "arch" | "crawl" | "transcribe" | "service" | "cluster" | "worker" | "remote" | "serve" | "help" | "completions");
+            let handled = matches!(command.name, "arch" | "crawl" | "transcribe" | "service" | "cluster" | "worker" | "remote" | "tunnel" | "serve" | "help" | "completions");
             assert!(handled || crate::cli::known(command.name), "`{}` is in the table and nothing runs it", command.name);
             assert_eq!(command.server, crate::cli::remote_only(command.name), "`{}`: does it need a server?", command.name);
             // The parser gathers words only for the commands it knows take
@@ -1293,6 +1324,23 @@ mod tests {
         assert_eq!(PROGRAMS[0].bare.name, "run");
         assert!(std::ptr::eq(PROGRAMS[0].commands, COMMANDS) || PROGRAMS[0].commands.len() == COMMANDS.len());
         assert!(command("run").is_some() && command("serve").is_some());
+    }
+
+    /// `kvad tunnel`'s server, port and key switch, and the help that says
+    /// what the switch gives away.
+    #[test]
+    fn tunnel_takes_a_server_a_port_and_the_key_switch() {
+        let a = crate::parse_from(["tunnel", "--remote", "kvad://abc", "--port", "9000", "--with-key"].map(String::from).to_vec());
+        assert_eq!(a.command, "tunnel");
+        assert!(matches!(&a.choice, kvad::client::Choice::Remote(u) if u == "kvad://abc"));
+        assert_eq!((a.port, a.with_key), (Some(9000), true));
+        // Never on unless asked for.
+        let a = crate::parse_from(vec!["tunnel".to_string()]);
+        assert_eq!((a.port, a.with_key), (None, false));
+        let tunnel = command("tunnel").unwrap();
+        let with_key = tunnel.all_flags().into_iter().find(|f| f.name == "--with-key").expect("--with-key is listed");
+        assert!(!with_key.takes_value());
+        assert!(tunnel.notes.contains("--with-key") && tunnel.notes.contains("acts as this device"), "the help says what --with-key gives away");
     }
 
     /// A subcommand in the table is one its command's source matches on.

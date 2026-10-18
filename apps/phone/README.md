@@ -8,6 +8,24 @@ The plan is [`docs/phone-plan.md`](../../docs/phone-plan.md).
 
 It is its own Cargo workspace, so Slint and Skia stay out of Kvad's builds.
 
+The app is moving to SwiftUI over a Rust core
+([`docs/phone-swiftui-plan.md`](../../docs/phone-swiftui-plan.md)). The core
+is [`core/`](core): connecting, pairing, the chat, the Keychain and the
+Network test, behind three C functions ([`core/kvad_core.h`](core/kvad_core.h))
+and the JSON messages in [`messages.json`](messages.json). Its tests run on
+the Mac and reach no server:
+
+```bash
+cargo test --manifest-path apps/phone/Cargo.toml -p kvad-phone-core
+```
+
+One more chats with a running kvad-serve, `127.0.0.1:5823` unless
+`KVAD_PHONE_TEST_SERVER` says otherwise:
+
+```bash
+cargo test --manifest-path apps/phone/Cargo.toml -p kvad-phone-core -- --ignored
+```
+
 ## On the Mac, while designing
 
 ```bash

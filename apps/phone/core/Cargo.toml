@@ -1,0 +1,41 @@
+[package]
+name = "kvad-phone-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+# The Rust under Kvad for iPhone: the client, the tunnel, pairing, the
+# Keychain and the Network test, with no UI. The app is SwiftUI and talks to
+# this through three C functions and one JSON message a call
+# (docs/phone-swiftui-plan.md). A member of apps/phone's workspace.
+
+[lib]
+# A static library for Xcode to link, and a Rust one for the tests and,
+# until it goes, the Slint app.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The CLI's client is on ureq too (crates/llm/src/client.rs); one HTTP stack
+# for both, until the shared part becomes a kvad-client crate.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
+serde_json = "1.0.151"
+# The tunnel to a paired kvad-serve: pairing, the relay vouchers, and ureq's
+# connections as streams through it (crates/tunnel's `for_ureq`).
+kvad-tunnel = { path = "../../../crates/tunnel", features = ["ureq"] }
+# The Network test runs the relay probe's dialler: the same code as
+# `relay-probe dial`, from tools/relay-probe's library.
+relay-probe = { path = "../../../tools/relay-probe" }
+# As the probe has them, so that iroh's `portmapper` is not compiled in here
+# either: `cargo tree -i portmapper` finding nothing is the check.
+iroh = { version = "1.3.0", default-features = false, features = ["tls-aws-lc-rs", "fast-apple-datapath", "unstable-net-report"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "time", "sync"] }
+
+# Held back for iOS, not used directly: iroh's netwatch lists interfaces with
+# netdev 0.46, which uses `libc::in6_ifreq` on every Apple target, and libc
+# 0.2.190 made that macOS-only, so the app stopped building for the phone.
+# Drop this once netdev has shellrow/netdev#192 or its like.
+[target.'cfg(target_os = "ios")'.dependencies]
+# The Keychain, for the pairings and the device key (src/secrets.rs).
+security-framework = "3.7.0"
+libc = "=0.2.189"

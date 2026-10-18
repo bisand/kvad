@@ -1,0 +1,63 @@
+{
+  "about": "Every message between Kvad for iPhone's SwiftUI and its Rust core (core/src/session.rs, core/src/probe.rs), one example each, with every field it may have. Each is a JSON object with one key, its name. The core's tests send every command and check every event it emits against these; the Swift tests decode every event. docs/phone-swiftui-plan.md.",
+  "commands": {
+    "connect": { "url": "kvad://bdbc76ccbacc…", "key": "", "device": "Andre's iPhone" },
+    "models": {},
+    "chat": { "model": "HuggingFaceTB/SmolLM2-135M-Instruct", "text": "Hi" },
+    "stop": {},
+    "new_chat": {},
+    "disconnect": {},
+    "unpair": {},
+    "network_changed": {},
+    "opened": { "link": "kvad://bdbc76ccbacc…?k=…&relay=https://relay.kvad.eu" },
+    "probe_open": {},
+    "probe_start": { "ticket": "kvadprobe:1:…", "secs": 60 },
+    "probe_stop": {}
+  },
+  "events": {
+    "ready": { "server": "kvad://bdbc76ccbacc…", "core": "0.1.0" },
+    "connected": {
+      "name": "kvad://bdbc76ccbacc…",
+      "label": "kvad://bdbc76ccbacc…",
+      "paired": true,
+      "version": "0.20.0",
+      "who": "andre",
+      "role": "admin",
+      "path": "lan",
+      "models": [{ "id": "HuggingFaceTB/SmolLM2-135M-Instruct", "kind": "chat", "resident": true }],
+      "default": "HuggingFaceTB/SmolLM2-135M-Instruct"
+    },
+    "connect_failed": { "error": "This phone is not paired with kvad://bdbc76ccbacc…." },
+    "path": { "now": "relay" },
+    "models": { "models": [{ "id": "HuggingFaceTB/SmolLM2-135M-Instruct", "kind": "chat", "resident": true }] },
+    "models_failed": { "error": "Not connected to a server." },
+    "piece": { "text": " the" },
+    "reply_done": {},
+    "chat_failed": { "error": "Not connected to a server.", "nothing": true },
+    "disconnected": {},
+    "unpaired": {},
+    "unpair_failed": { "error": "Could not unpair: …" },
+    "link": { "server": "kvad://bdbc76ccbacc…?k=…&relay=https://relay.kvad.eu", "notice": "Opened kvad://bdbc76ccbacc…. Tap Connect to reach it." },
+    "link_refused": { "error": "That link is not a Kvad server or pairing link." },
+    "probe_id": { "id": "5c764fc30f…" },
+    "probe_started": { "secs": 60, "status": "Asking the relay about this network…" },
+    "probe_status": { "text": "Connecting…" },
+    "probe_path": { "text": "direct · 192.168.1.20:5952" },
+    "probe_line": { "text": "connected in 412 ms, on relay · relay.kvad.eu" },
+    "probe_ping": {
+      "rows": [{ "path": "direct", "pings": 12, "median": "3.1", "p90": "4.0", "max": "9.8" }],
+      "totals": "12 pings over 3.0 s; 1 path changes; longest ping 9.8 ms; first direct path 0.6 s",
+      "last": "3.2 ms",
+      "elapsed": 3.0
+    },
+    "probe_done": {
+      "status": "Done.",
+      "rows": [{ "path": "direct", "pings": 240, "median": "3.1", "p90": "4.0", "max": "9.8" }],
+      "totals": "240 pings over 60.0 s; 1 path changes; longest ping 9.8 ms; first direct path 0.6 s",
+      "elapsed": 60.0,
+      "line": "stopped early: the listener went away"
+    },
+    "probe_failed": { "error": "That is not a probe ticket." },
+    "error": { "error": "No command is called dance." }
+  }
+}

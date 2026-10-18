@@ -12,13 +12,12 @@
 //! gives it, are kept in the Keychain (`pairings`, `secrets`). A key typed
 //! for a LAN server is held in memory only.
 
-mod api;
 mod ios;
-mod pairings;
 mod probe;
-mod secrets;
 
-use api::{Model, Server, Turn};
+use kvad_phone_core::api::{Model, Server, Turn};
+use kvad_phone_core::pairings;
+use kvad_phone_core::session::{default_model, remember, remembered, short_ids, short_name};
 use slint::{Model as _, ModelRc, SharedString, VecModel};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,67 +32,9 @@ struct State {
     stop: Arc<AtomicBool>,
 }
 
-/// The server `url` names. A pairing link pairs first; a `kvad://` name is a
-/// paired server, through the tunnel; anything else is an address on the
-/// LAN, over plain HTTP, with `key` if it wants one.
+/// The server `url` names, paired first if it is a pairing link.
 fn open(url: &str, key: &str) -> Result<Server, String> {
-    let url = url.trim();
-    if url.contains("&pair=") {
-        let name = join(url)?;
-        return through(&name);
-    }
-    if url.starts_with("kvad://") {
-        return through(url.split('?').next().unwrap_or(url).trim_end_matches('/'));
-    }
-    Server::new(url, Some(key.to_string()))
-}
-
-/// Pairs this phone with the server a link from `kvad remote pair` names,
-/// through the relay if it is not on the LAN, and keeps what the server
-/// gives it. The server's name, `kvad://<node id>`.
-fn join(link: &str) -> Result<String, String> {
-    let link: kvad_tunnel::PairLink = link.parse()?;
-    let mut store = pairings::Store::load();
-    let key = store.device_key()?;
-    let request = serde_json::json!({ "v": 1, "token": link.token, "name": ios::device_name() }).to_string();
-    let answer = kvad_tunnel::blocking::pair_as(&key, &link.address, request.as_bytes(), link.voucher.as_ref())?;
-    let answer: serde_json::Value = serde_json::from_slice(&answer).map_err(|_| "The server's answer was not one a kvad gives.".to_string())?;
-    if let Some(e) = answer["error"].as_str() {
-        return Err(e.to_string());
-    }
-    let text = |k: &str| answer[k].as_str().map(str::to_string);
-    let name = link.address.label();
-    let pairing = pairings::Pairing {
-        address: link.address.to_string(),
-        key: text("key").ok_or("The server paired this phone and sent no key.")?,
-        voucher: text("voucher"),
-        account: text("account").unwrap_or_default(),
-        role: text("role").unwrap_or_default(),
-        device: answer["paired"].as_i64(),
-    };
-    store.put(&name, &pairing)?;
-    Ok(name)
-}
-
-/// A paired server, through the tunnel, showing relays the voucher it gave
-/// this phone, and swapping that for a fresh one once half is spent.
-fn through(name: &str) -> Result<Server, String> {
-    let mut store = pairings::Store::load();
-    let mut pairing = store
-        .get(name)
-        .ok_or_else(|| format!("This phone is not paired with {name}. Paste a pairing link from `kvad remote pair` on the Mac."))?;
-    let key = store.device_key()?;
-    let address: kvad_tunnel::Address = pairing.address.parse()?;
-    let voucher = pairing.voucher.as_deref().and_then(|v| v.parse::<kvad_tunnel::Voucher>().ok());
-    let tunnel = kvad_tunnel::blocking::Tunnel::connect_as(&key, &address, voucher.as_ref())?;
-    let server = Server::through(tunnel, pairing.key.clone());
-    if voucher.is_none_or(|v| v.left() < kvad_tunnel::VOUCHER_LIFE / 2) {
-        if let Ok(fresh) = server.voucher() {
-            pairing.voucher = Some(fresh);
-            let _ = store.put(name, &pairing);
-        }
-    }
-    Ok(server)
+    kvad_phone_core::session::open(url, key, &ios::device_name())
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -437,90 +378,25 @@ fn choose(ui: &AppWindow, id: &str) {
     ui.set_model_name(id.split_once('/').map_or(id, |(_, name)| name).into());
 }
 
-/// `text` with every `kvad://` node id in it cut short, so that an error can
-/// wrap: 64 hex digits are one word, wider than the screen.
-fn short_ids(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(i) = rest.find("kvad://") {
-        out.push_str(&rest[..i + 7]);
-        rest = &rest[i + 7..];
-        let hex = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
-        if hex > 12 {
-            out.push_str(&rest[..12]);
-            out.push('…');
-            rest = &rest[hex..];
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// A server's name as a row has room for: `kvad://` and the first twelve
-/// digits of its node id, or an address as it is.
 /// Puts an opened link in front of the person, once it parses as a server or
 /// a pairing link; on the Connect screen, or, while connected to a server,
 /// as a line in the chat that says how to get to it.
 fn opened(ui: &AppWindow, link: &str) {
-    let link = link.trim();
-    let what = if link.len() > 4096 {
-        None
-    } else if link.contains("&pair=") {
-        link.parse::<kvad_tunnel::PairLink>().ok().map(|l| format!("Pair with {}? Tap Connect to pair this phone.", short_name(&format!("kvad://{}", l.address.node))))
-    } else {
-        link.parse::<kvad_tunnel::Address>().ok().map(|a| format!("Opened {}. Tap Connect to reach it.", short_name(&format!("kvad://{}", a.node))))
-    };
+    let said = kvad_phone_core::session::opened(link);
     let say = |text: &str| match ui.get_connected() {
         true => ui.set_chat_error(text.into()),
         false => ui.set_connect_error(text.into()),
     };
-    let Some(notice) = what else {
-        say("That link is not a Kvad server or pairing link.");
+    let Some(notice) = said["link"]["notice"].as_str() else {
+        say(said["link_refused"]["error"].as_str().unwrap_or_default());
         return;
     };
-    ui.set_server_url(link.into());
+    ui.set_server_url(link.trim().into());
     ui.set_api_key("".into());
     if ui.get_connected() {
         say("A Kvad link was opened. Disconnect in More to use it.");
     } else {
         ui.set_connect_error("".into());
         ui.set_connect_notice(notice.into());
-    }
-}
-
-fn short_name(name: &str) -> String {
-    match name.strip_prefix("kvad://") {
-        Some(id) if id.len() > 12 => format!("kvad://{}…", &id[..12]),
-        _ => name.trim_start_matches("http://").to_string(),
-    }
-}
-
-/// A chat model already in memory if there is one, else the first chat model.
-fn default_model(models: &[Model]) -> String {
-    let chat = models.iter().filter(|m| m.kind == "chat");
-    chat.clone().find(|m| m.resident).or_else(|| chat.clone().next()).map(|m| m.id.clone()).unwrap_or_default()
-}
-
-/// Where the last server's address is kept: in the app's own container on
-/// the phone. It is an address, not a secret; the key is never written.
-fn remembered_path() -> Option<std::path::PathBuf> {
-    if !cfg!(target_os = "ios") {
-        return None;
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join("Library/Application Support/kvad-phone/server"))
-}
-
-fn remembered() -> Option<String> {
-    let s = std::fs::read_to_string(remembered_path()?).ok()?;
-    Some(s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
-fn remember(base: &str) {
-    if let Some(p) = remembered_path() {
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(p, base);
     }
 }

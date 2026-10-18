@@ -597,8 +597,8 @@ another mid-sentence.
   update is one job on the model's engine, so other work runs between them,
   and an update still running when the next falls due skips it. The clean
   end is a commit, its `completed`, and the client's close. `axum`'s `ws`
-  feature added four crates to `Cargo.lock`: `tungstenite` and
-  `tokio-tungstenite` 0.29, `sha1` and `data-encoding`.
+  feature added three crates to `Cargo.lock`: `tungstenite` and
+  `tokio-tungstenite` 0.29, and `sha1`.
 - **The web UI's microphone**: the Transcribe page's *The microphone* tab.
   `getUserMedia`, an AudioWorklet that resamples to 16 kHz (a windowed
   sinc, cut off below 8 kHz) and sends 100 ms binary frames, and the

@@ -3,13 +3,14 @@
 A client of a kvad-serve, for the phone: chat, and in later phases speech,
 images, video and the rest of what Kvad does. Its UI is SwiftUI
 ([`ios/Kvad/`](ios/Kvad)), over a Rust core ([`core/`](core)) that does the
-work: connecting, pairing, the tunnel, the chat, the Keychain and the
-Network test. The plans are [`docs/phone-plan.md`](../../docs/phone-plan.md)
-and [`docs/phone-swiftui-plan.md`](../../docs/phone-swiftui-plan.md).
+work: connecting, pairing, the tunnel, the chat, live transcription, the
+Keychain and the Network test. The plans are [`docs/phone-plan.md`](../../docs/phone-plan.md)
+[`docs/phone-swiftui-plan.md`](../../docs/phone-swiftui-plan.md), and for
+Speak [`docs/phone-speak-plan.md`](../../docs/phone-speak-plan.md).
 
-The core is called through three C functions
-([`core/kvad_core.h`](core/kvad_core.h)) and the JSON messages in
-[`messages.json`](messages.json). It is its own Cargo workspace, which keeps
+The core is called through four C functions
+([`core/kvad_core.h`](core/kvad_core.h)): the JSON messages in
+[`messages.json`](messages.json), and the microphone's samples as they are. It is its own Cargo workspace, which keeps
 it out of Kvad's builds. Its tests run on the Mac and reach no server:
 
 ```bash

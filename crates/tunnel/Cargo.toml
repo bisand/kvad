@@ -30,7 +30,11 @@ axum = ["dep:axum"]
 ureq = ["dep:ureq"]
 
 [dev-dependencies]
-axum = "0.8.9"
+# `ws`, for a WebSocket through the tunnel, as `/v1/realtime` and Kvad for
+# iPhone's live transcription use one; tungstenite is the client end, as
+# the phone has it. Both already in the lockfile, from kvad-serve.
+axum = { version = "0.8.9", features = ["ws"] }
+tungstenite = "0.29.0"
 # A relay in the test process, over plain HTTP on loopback.
 iroh-relay = { version = "1.3.0", default-features = false, features = ["server", "tls-aws-lc-rs"] }
 tokio-stream = "0.1.19"

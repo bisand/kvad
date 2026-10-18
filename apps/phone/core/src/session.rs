@@ -13,7 +13,7 @@
 //! server is held in memory only.
 
 use crate::api::{Model, Server, Turn};
-use crate::{pairings, probe};
+use crate::{pairings, probe, speak};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,7 @@ pub struct Session {
     emit: Emit,
     state: Arc<Mutex<State>>,
     probe: probe::Probe,
+    pub(crate) speak: speak::Speak,
 }
 
 #[derive(Default)]
@@ -52,7 +53,8 @@ impl Session {
         let server = pairings::Store::load().first().or_else(remembered).unwrap_or_default();
         emit(event("ready", json!({ "server": server.trim_start_matches("http://"), "core": env!("CARGO_PKG_VERSION") })));
         let probe = probe::Probe::new(emit.clone());
-        Session { emit, state: Arc::default(), probe }
+        let speak = speak::Speak::new(emit.clone());
+        Session { emit, state: Arc::default(), probe, speak }
     }
 
     /// One command, as the app sends it.
@@ -81,13 +83,30 @@ impl Session {
             "probe_open" => self.probe.open(),
             "probe_start" => self.probe.start(&text("ticket"), args["secs"].as_u64().unwrap_or(60)),
             "probe_stop" => self.probe.stop(),
+            "speak_start" => self.speak.start(self.server(), &text("model"), &text("language"), &text("folder")),
+            "speak_stop" => self.speak.stop(),
+            "speak_cancel" => self.speak.cancel(),
+            "takes" => self.speak.takes(&text("folder")),
+            "take_delete" => self.speak.delete(&text("folder"), &text("id")),
+            "retranscribe" => self.speak.retranscribe(self.server(), &text("folder"), &text("id"), &text("model"), &text("language")),
             other => (self.emit)(event("error", json!({ "error": format!("No command is called {other}.") }))),
         }
     }
 
-    /// Ends the connection, and any reply on it.
+    /// Ends the connection, and any reply on it. A take being recorded
+    /// ends too, on the link it has.
     fn end(&self) {
+        self.speak.stop();
         reset(&self.state);
+    }
+
+    fn server(&self) -> Option<Server> {
+        self.state.lock().unwrap().server.clone()
+    }
+
+    /// Samples from the microphone for the take being recorded.
+    pub fn audio(&self, samples: &[i16]) {
+        self.speak.audio(samples);
     }
 
     fn connect(&self, url: String, key: String, device: String) {

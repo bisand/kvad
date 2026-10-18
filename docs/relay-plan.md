@@ -569,6 +569,8 @@ Tested:
   - A 4-second streamed reply that opened on the relay, went direct, and
     finished whole after the relay was shut down mid-reply.
   - The lockfile holds no port-mapping crate.
+  - A WebSocket's upgrade, then 50 frames each answered before the next,
+    direct and relayed (built 2026-10-19, for live transcription).
 - By hand, a scratch kvad-serve with `auth.mode = "local"` and the CLI:
   - `auth status`, a refused unsigned `ls`, the first account made with
     `auth setup` and a key kept with `auth login`, all through the tunnel.
@@ -581,7 +583,6 @@ Not yet done:
 - The direct path blocked mid-stream and the reply finishing over the relay.
   That needs a firewall rule in the test, or a test transport that can drop
   a path.
-- A WebSocket through the tunnel, since nothing in kvad-serve speaks one yet.
 - `direct = "lan"`, which needs Kvad's own path selection.
 
 **Phase 2: identity, pairing and the LAN.** `remote.key`, `kvad remote
@@ -745,8 +746,10 @@ at gpu-q8.
 What it asks of this plan:
 
 - *WebSocket upgrades through the tunnel.* The tunnel carries HTTP, so it
-  carries an upgrade. Phase 1 tests it, since a tunnel that buffers whole
-  requests would pass every other API test and break this one.
+  carries an upgrade. Phase 1 tests it
+  (`a_websocket_goes_through_directly_and_relayed`), since a tunnel that
+  buffers whole requests would pass every other API test and break this
+  one.
 - *A return channel that nothing holds back.* The session is one QUIC
   stream with two independent directions. The phone's audio upload, which
   can fill a slow uplink, must not delay the small events coming back.

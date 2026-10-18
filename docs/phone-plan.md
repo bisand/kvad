@@ -19,8 +19,8 @@ phone, and well made.
 **SwiftUI over a Rust core.** The screens are SwiftUI, so scrolling, the
 keyboard, the tab bar and text are UIKit's own. Everything under them is
 Rust: the client, pairing, the tunnel, the Keychain and the Network test,
-in `apps/phone/core`. Swift calls it through three C functions, with one
-JSON message each way. [phone-swiftui-plan.md](phone-swiftui-plan.md) has
+in `apps/phone/core`. Swift calls it through four C functions, with one
+JSON message each way and the microphone's samples as they are. [phone-swiftui-plan.md](phone-swiftui-plan.md) has
 the boundary and why it is drawn there.
 
 The app began on Slint 1.18, Rust only, which the owner chose over Dioxus
@@ -50,14 +50,16 @@ cannot drift apart on the protocol.
 apps/phone/
   Cargo.toml          its own workspace, of the core alone
   core/               the Rust: a static library for Xcode
-    kvad_core.h       the three C functions
+    kvad_core.h       the four C functions
     src/lib.rs        the C functions: commands in, events out
     src/session.rs    connect, pair, chat, unpair, opened links
     src/api.rs        the HTTP client: health, models, chat as a stream
     src/pairings.rs   the paired servers and the device key
     src/secrets.rs    the one Keychain item they are kept in
     src/probe.rs      the Network test, on relay-probe's dialler
+    src/speak.rs      Speak: the take's file, live over /v1/realtime, the resume
     tests/messages.rs the core driven by its messages alone
+    tests/speak.rs    Speak against a scripted realtime server
   messages.json       every message, which both sides' tests read
   ios/project.yml     XcodeGen: the app and its test target
   ios/build.sh        Xcode's first build phase: cargo for the right target
@@ -159,10 +161,10 @@ in the Keychain (until then it is held in memory only), pressing Stop
 against a long reply, the keyboard's frame (it needs a person typing, which
 a debug launch script cannot do), and a real device.
 
-**Phase 2: Speak.** Recording with AVAudioSession through `cpal`, or a
-small `objc2` binding if `cpal`'s iOS input falls short. 16 kHz mono, as
-Whisper wants. Then the file endpoint, then the live session as the speech
-plan lays it out, with words arriving as they are settled.
+**Phase 2: Speak.** Its own plan, [phone-speak-plan.md](phone-speak-plan.md).
+The microphone is Swift's `AVAudioEngine` rather than `cpal`, since the
+work on iOS is the audio session's and nothing else's. The live session and
+the take kept on the phone are the core's. Step 1, the core, is built.
 
 **Phase 3: Create, and model management.** Images and videos with job
 progress over SSE. Loading and pulling models with their progress.

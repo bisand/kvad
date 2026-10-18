@@ -28,8 +28,11 @@ before the first start, or Let's Encrypt cannot validate it.
 ## Deploying
 
 The allow list is `deploy/allow.local` (not committed): one endpoint id a
-line, from `relay-probe id` on each machine that will use the relay. Then,
-from `tools/kvad-relay`:
+line. List the servers, each the node id its kvad-serve prints as `remote
+kvad://<id>`. Their paired devices need no line: each shows the relay a
+voucher its server signed. List a device only if it should use the relay
+without one, such as a probe from `relay-probe id`. Then, from
+`tools/kvad-relay`:
 
 ```bash
 deploy/deploy.sh root@postbud.tarsier-bull.ts.net deploy/allow.local -i ~/.ssh/id_postbud_bogentech_no

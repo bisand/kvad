@@ -7,14 +7,14 @@
 //! tunnel. So the CLI's requests go through the tunnel without a listening
 //! port anywhere on the machine: nothing else on it can use the connection.
 
-use super::{Address, Client, Key, Path, Res};
+use super::{Address, Client, Key, Path, Res, Voucher};
 
 /// One pairing request to `to`, as the key in `key` (made on first use),
 /// and the server's answer.
-pub fn pair(key: &FsPath, to: &Address, request: &[u8]) -> Res<Vec<u8>> {
+pub fn pair(key: &FsPath, to: &Address, request: &[u8], voucher: Option<&Voucher>) -> Res<Vec<u8>> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("starting the tunnel: {e}"))?;
     let (key, _) = Key::load(key)?;
-    runtime.block_on(Client::pair(&key, to, request))
+    runtime.block_on(Client::pair(&key, to, request, voucher))
 }
 use std::os::unix::net::UnixStream;
 use std::path::Path as FsPath;
@@ -26,8 +26,9 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    /// Connects to `to` with the key in `key` (made on first use).
-    pub fn connect(key: &FsPath, to: &Address) -> Res<Tunnel> {
+    /// Connects to `to` with the key in `key` (made on first use), showing
+    /// relays `voucher` if there is one.
+    pub fn connect(key: &FsPath, to: &Address, voucher: Option<&Voucher>) -> Res<Tunnel> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("kvad-tunnel")
@@ -35,7 +36,7 @@ impl Tunnel {
             .build()
             .map_err(|e| format!("starting the tunnel: {e}"))?;
         let (key, _) = Key::load(key)?;
-        let client = runtime.block_on(Client::connect(&key, to))?;
+        let client = runtime.block_on(Client::connect_vouched(&key, to, voucher))?;
         Ok(Tunnel { runtime, client: std::sync::Arc::new(client), address: to.clone() })
     }
 

@@ -2,7 +2,7 @@
 //! [`Server`], reached through [`blocking::Tunnel`] as the CLI reaches it,
 //! directly, through a relay in this process, and across the relay's loss.
 
-use kvad_tunnel::{blocking, Address, Allowed, Direct, Key, NodeId, Path, Server, ServerConfig};
+use kvad_tunnel::{blocking, Address, Allowed, Direct, Key, NodeId, Path, Server, ServerConfig, Voucher};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -123,7 +123,7 @@ fn http_goes_through_directly_with_no_relay() {
     let (key, id) = client_key(&dir);
     let address = serve(&rt, &dir, Vec::new(), Direct::Auto, vec![id]);
     assert!(address.relays.is_empty() && !address.addrs.is_empty());
-    let tunnel = blocking::Tunnel::connect(&key, &address).unwrap_or_else(|e| panic!("{e}; the address was {address}"));
+    let tunnel = blocking::Tunnel::connect(&key, &address, None).unwrap_or_else(|e| panic!("{e}; the address was {address}"));
     let reply = get(&tunnel, "/hello").unwrap();
     assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("hi"), "{reply}");
     // The LAN, or a tailnet's address if the machine is on one: either way
@@ -143,7 +143,7 @@ fn http_goes_through_a_relay_when_direct_is_off() {
     let (key, id) = client_key(&dir);
     let address = serve(&rt, &dir, vec![url.clone()], Direct::Off, vec![id]);
     assert!(address.addrs.is_empty(), "direct = off advertises no address");
-    let tunnel = blocking::Tunnel::connect(&key, &address).unwrap();
+    let tunnel = blocking::Tunnel::connect(&key, &address, None).unwrap();
     assert!(get(&tunnel, "/hello").unwrap().ends_with("hi"));
     assert_eq!(tunnel.path(), Some(Path::Relay(url)));
 }
@@ -155,7 +155,7 @@ fn a_device_not_on_the_list_is_refused() {
     let (key, _) = client_key(&dir);
     let (other, _) = Key::load(&dir.path("other.key")).unwrap();
     let address = serve(&rt, &dir, Vec::new(), Direct::Auto, vec![other.id()]);
-    let outcome = blocking::Tunnel::connect(&key, &address).map(|_| ());
+    let outcome = blocking::Tunnel::connect(&key, &address, None).map(|_| ());
     let e = outcome.expect_err("an unlisted key was let in");
     assert!(e.contains("refused this device"), "{e}");
 }
@@ -167,7 +167,7 @@ fn a_wrong_knock_is_refused() {
     let (key, id) = client_key(&dir);
     let mut address = serve(&rt, &dir, Vec::new(), Direct::Auto, vec![id]);
     address.knock = "00000000000000000000000000000000".into();
-    let outcome = blocking::Tunnel::connect(&key, &address).and_then(|t| get(&t, "/hello"));
+    let outcome = blocking::Tunnel::connect(&key, &address, None).and_then(|t| get(&t, "/hello"));
     assert!(outcome.is_err(), "a wrong knock got: {outcome:?}");
 }
 
@@ -181,7 +181,7 @@ fn a_reply_carries_on_when_the_relay_goes() {
     // Only the relay, as a device that has not yet learnt a direct address
     // would have it: the connection opens there and must find the rest.
     address.addrs.clear();
-    let tunnel = blocking::Tunnel::connect(&key, &address).unwrap();
+    let tunnel = blocking::Tunnel::connect(&key, &address, None).unwrap();
     let direct = wait_for(&tunnel, |p| !matches!(p, Path::Relay(_)), Duration::from_secs(10));
     assert!(matches!(direct, Some(Path::Lan(_) | Path::Direct(_))), "never left the relay: {direct:?}");
 
@@ -208,21 +208,21 @@ fn an_unknown_key_reaches_only_the_pairing_lane_and_only_while_it_is_open() {
         p.answer(answer.into_bytes());
     });
     // Closed: refused at the handshake, as any unknown key is.
-    let e = blocking::pair(&key, &address, b"\"hello\"").unwrap_err();
+    let e = blocking::pair(&key, &address, b"\"hello\"", None).unwrap_err();
     assert!(e.contains("refused"), "{e}");
 
     allowed.open_pairing();
-    let answer = String::from_utf8(blocking::pair(&key, &address, b"\"hello\"").unwrap()).unwrap();
+    let answer = String::from_utf8(blocking::pair(&key, &address, b"\"hello\"", None).unwrap()).unwrap();
     assert_eq!(answer, format!("{{\"device\":\"{id}\",\"asked\":\"hello\"}}"), "the answer names the key the handshake proved");
     // Open, but still not paired: the lane is all it can reach.
-    let e = blocking::Tunnel::connect(&key, &address).map(|_| ()).unwrap_err();
+    let e = blocking::Tunnel::connect(&key, &address, None).map(|_| ()).unwrap_err();
     assert!(e.contains("not paired"), "{e}");
 
     // Paired: a tunnel now, and no second pairing.
     allowed.insert(id);
-    let tunnel = blocking::Tunnel::connect(&key, &address).unwrap();
+    let tunnel = blocking::Tunnel::connect(&key, &address, None).unwrap();
     assert!(get(&tunnel, "/hello").unwrap().ends_with("hi"));
-    let e = blocking::pair(&key, &address, b"\"again\"").unwrap_err();
+    let e = blocking::pair(&key, &address, b"\"again\"", None).unwrap_err();
     assert!(e.contains("already paired"), "{e}");
 }
 
@@ -232,7 +232,7 @@ fn a_removed_device_is_cut_off_mid_reply() {
     let rt = runtime();
     let (key, id) = client_key(&dir);
     let (address, allowed) = serve_with(&rt, &dir, Vec::new(), Direct::Auto, Allowed::new([id]), |_| {});
-    let tunnel = std::sync::Arc::new(blocking::Tunnel::connect(&key, &address).unwrap());
+    let tunnel = std::sync::Arc::new(blocking::Tunnel::connect(&key, &address, None).unwrap());
     let reading = std::thread::spawn({
         let tunnel = tunnel.clone();
         move || get(&tunnel, "/slow")
@@ -241,8 +241,67 @@ fn a_removed_device_is_cut_off_mid_reply() {
     assert!(allowed.remove(&id));
     let reply = reading.join().unwrap();
     assert!(reply.as_ref().map_or(true, |r| !r.contains("line 40\n")), "a removed device read the whole reply: {reply:?}");
-    let e = blocking::Tunnel::connect(&key, &address).map(|_| ()).unwrap_err();
+    let e = blocking::Tunnel::connect(&key, &address, None).map(|_| ()).unwrap_err();
     assert!(e.contains("refused"), "{e}");
+}
+
+/// kvad-relay's rule, in a relay in this process: the server it serves, and
+/// a device only with that server's voucher for it.
+#[derive(Debug)]
+struct Vouched(NodeId);
+
+impl iroh_relay::server::AccessControl for Vouched {
+    async fn on_connect(&self, r: &iroh_relay::server::ClientRequest) -> iroh_relay::server::Access {
+        let device: NodeId = r.endpoint_id().to_string().parse().unwrap();
+        let vouched = r.auth_token().and_then(|t| t.parse::<Voucher>().ok()).is_some_and(|v| v.check(&device, |n| *n == self.0).is_ok());
+        match device == self.0 || vouched {
+            true => iroh_relay::server::Access::Allow,
+            false => iroh_relay::server::Access::Deny { reason: None },
+        }
+    }
+}
+
+#[test]
+fn a_device_on_no_relays_list_gets_through_with_a_voucher_and_not_without() {
+    let dir = Scratch::new("vouched");
+    let rt = runtime();
+    let server_key = dir.path("remote.key");
+    let (key, _) = Key::load(&server_key).unwrap();
+    let mut cfg = iroh_relay::server::ServerConfig::default();
+    let mut relay_cfg = iroh_relay::server::RelayConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+    relay_cfg.access = std::sync::Arc::new(Vouched(key.id()));
+    cfg.relay = Some(relay_cfg);
+    let relay = rt.block_on(iroh_relay::server::Server::spawn(cfg)).unwrap();
+    let url = format!("http://127.0.0.1:{}", relay.http_addr().unwrap().port());
+
+    let (phone_key, phone) = client_key(&dir);
+    let (newcomer_key, _) = (dir.path("newcomer.key"), Key::load(&dir.path("newcomer.key")).unwrap().0.id());
+    let allowed = Allowed::new([phone]);
+    let cfg = ServerConfig { key: server_key, knock: dir.path("remote.knock"), relays: vec![url], direct: Direct::Off, port: 0, allowed: allowed.clone() };
+    let mut server = rt.block_on(Server::start(&cfg)).unwrap();
+    let (address, issuer) = (server.address().clone(), server.issuer());
+    let mut pairings = server.take_pairings().unwrap();
+    rt.spawn(async move {
+        while let Some(p) = pairings.recv().await {
+            p.answer(b"{\"paired\":1}".to_vec());
+        }
+    });
+    rt.spawn(async move { axum::serve(server, router()).await });
+
+    // Vouched: through the relay, which has never heard of it.
+    let voucher = issuer.issue(Some(phone), kvad_tunnel::VOUCHER_LIFE);
+    let tunnel = blocking::Tunnel::connect(&phone_key, &address, Some(&voucher)).unwrap();
+    assert!(get(&tunnel, "/hello").unwrap().ends_with("hi"));
+    assert!(matches!(tunnel.path(), Some(Path::Relay(_))));
+
+    // A pairing link's voucher, for any device, gets a newcomer to the lane.
+    allowed.open_pairing();
+    let any = issuer.issue(None, kvad_tunnel::ANY_DEVICE_LIFE);
+    assert_eq!(blocking::pair(&newcomer_key, &address, b"{}", Some(&any)).unwrap(), b"{\"paired\":1}");
+
+    // Without one, the relay does not carry it at all.
+    let refused = blocking::Tunnel::connect(&phone_key, &address, None).map(|_| ());
+    assert!(refused.is_err(), "a device with no voucher got through the relay");
 }
 
 /// The plan's rule, held to in the lockfile: nothing that asks a router for

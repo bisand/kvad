@@ -1,6 +1,6 @@
 [package]
 name = "kvad-relay"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 publish = false
 license = "MIT"
@@ -13,6 +13,9 @@ license = "MIT"
 [dependencies]
 iroh-relay = { version = "1.3.0", default-features = false, features = ["server", "tls-aws-lc-rs"] }
 iroh-base = "1.3.0"
+# The vouchers a server signs for its devices, read the same way here as
+# they are written there.
+kvad-tunnel = { path = "../../crates/tunnel" }
 rustls = { version = "0.23.33", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "signal"] }
 

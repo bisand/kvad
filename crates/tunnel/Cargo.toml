@@ -16,6 +16,9 @@ publish = false
 iroh = { version = "1.3.0", default-features = false, features = ["tls-aws-lc-rs", "fast-apple-datapath"] }
 # For `axum::serve`: a server's tunnel as one more listener for its router.
 axum = { version = "0.8.9", optional = true, default-features = false, features = ["tokio", "http1"] }
+# `for_ureq`: HTTP through the tunnel for clients that speak ureq, as the CLI
+# and Kvad for iPhone do. The CLI's version.
+ureq = { version = "3.4.2", optional = true, default-features = false }
 # For `geteuid`, which key files are checked against. Already in the tree.
 libc = "0.2.189"
 rustls = { version = "0.23.33", default-features = false, features = ["aws_lc_rs", "std"] }
@@ -24,6 +27,7 @@ tracing = "0.1.44"
 
 [features]
 axum = ["dep:axum"]
+ureq = ["dep:ureq"]
 
 [dev-dependencies]
 axum = "0.8.9"

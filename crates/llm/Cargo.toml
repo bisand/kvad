@@ -25,7 +25,7 @@ script = []
 [dependencies]
 # `kvad --remote kvad://…`: a server reached through the tunnel of
 # docs/relay-plan.md, from anywhere. Kvad's own crate, which keeps iroh behind it.
-kvad-tunnel = { path = "../tunnel" }
+kvad-tunnel = { path = "../tunnel", features = ["ureq"] }
 # `kvad tunnel`'s listener and copies, on the runtime kvad-tunnel already
 # brings into the build; `signal` to close the connection on Ctrl-C.
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "signal"] }

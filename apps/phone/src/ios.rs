@@ -66,6 +66,21 @@ pub fn keep_awake(on: bool) {
     let _ = on;
 }
 
+/// What the phone is called, for the server's list of devices: the name iOS
+/// gives apps, which is the model unless the app is entitled to more.
+pub fn device_name() -> String {
+    #[cfg(target_os = "ios")]
+    unsafe {
+        let device = objc::send(objc::class(c"UIDevice"), c"currentDevice");
+        if !device.is_null() {
+            if let Some(name) = objc::string(objc::send(device, c"name")) {
+                return name;
+            }
+        }
+    }
+    "Kvad for iPhone".into()
+}
+
 /// The text on the pasteboard, which Universal Clipboard fills from the Mac.
 /// iOS asks the user before it hands it over.
 pub fn paste() -> Option<String> {

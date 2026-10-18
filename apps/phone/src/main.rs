@@ -5,13 +5,18 @@
 //! call on a worker thread, and hands the answers back to the UI's thread
 //! with `upgrade_in_event_loop`.
 //!
-//! The API key is held in memory only, for now: it goes to the Keychain
-//! once the app has a Keychain binding (the plan's first open question), and
-//! never to a file.
+//! A server is an address on the LAN, reached over plain HTTP, or a paired
+//! `kvad://` server, reached through the tunnel of docs/relay-plan.md from
+//! anywhere (Phase 4). Pasting a pairing link from `kvad remote pair` pairs
+//! the phone; its device key, and the key and relay voucher each server
+//! gives it, are kept in the Keychain (`pairings`, `secrets`). A key typed
+//! for a LAN server is held in memory only.
 
 mod api;
 mod ios;
+mod pairings;
 mod probe;
+mod secrets;
 
 use api::{Model, Server, Turn};
 use slint::{Model as _, ModelRc, SharedString, VecModel};
@@ -28,14 +33,125 @@ struct State {
     stop: Arc<AtomicBool>,
 }
 
+/// The server `url` names. A pairing link pairs first; a `kvad://` name is a
+/// paired server, through the tunnel; anything else is an address on the
+/// LAN, over plain HTTP, with `key` if it wants one.
+fn open(url: &str, key: &str) -> Result<Server, String> {
+    let url = url.trim();
+    if url.contains("&pair=") {
+        let name = join(url)?;
+        return through(&name);
+    }
+    if url.starts_with("kvad://") {
+        return through(url.split('?').next().unwrap_or(url).trim_end_matches('/'));
+    }
+    Server::new(url, Some(key.to_string()))
+}
+
+/// Pairs this phone with the server a link from `kvad remote pair` names,
+/// through the relay if it is not on the LAN, and keeps what the server
+/// gives it. The server's name, `kvad://<node id>`.
+fn join(link: &str) -> Result<String, String> {
+    let link: kvad_tunnel::PairLink = link.parse()?;
+    let mut store = pairings::Store::load();
+    let key = store.device_key()?;
+    let request = serde_json::json!({ "v": 1, "token": link.token, "name": ios::device_name() }).to_string();
+    let answer = kvad_tunnel::blocking::pair_as(&key, &link.address, request.as_bytes(), link.voucher.as_ref())?;
+    let answer: serde_json::Value = serde_json::from_slice(&answer).map_err(|_| "The server's answer was not one a kvad gives.".to_string())?;
+    if let Some(e) = answer["error"].as_str() {
+        return Err(e.to_string());
+    }
+    let text = |k: &str| answer[k].as_str().map(str::to_string);
+    let name = link.address.label();
+    let pairing = pairings::Pairing {
+        address: link.address.to_string(),
+        key: text("key").ok_or("The server paired this phone and sent no key.")?,
+        voucher: text("voucher"),
+        account: text("account").unwrap_or_default(),
+        role: text("role").unwrap_or_default(),
+        device: answer["paired"].as_i64(),
+    };
+    store.put(&name, &pairing)?;
+    Ok(name)
+}
+
+/// A paired server, through the tunnel, showing relays the voucher it gave
+/// this phone, and swapping that for a fresh one once half is spent.
+fn through(name: &str) -> Result<Server, String> {
+    let mut store = pairings::Store::load();
+    let mut pairing = store
+        .get(name)
+        .ok_or_else(|| format!("This phone is not paired with {name}. Paste a pairing link from `kvad remote pair` on the Mac."))?;
+    let key = store.device_key()?;
+    let address: kvad_tunnel::Address = pairing.address.parse()?;
+    let voucher = pairing.voucher.as_deref().and_then(|v| v.parse::<kvad_tunnel::Voucher>().ok());
+    let tunnel = kvad_tunnel::blocking::Tunnel::connect_as(&key, &address, voucher.as_ref())?;
+    let server = Server::through(tunnel, pairing.key.clone());
+    if voucher.is_none_or(|v| v.left() < kvad_tunnel::VOUCHER_LIFE / 2) {
+        if let Ok(fresh) = server.voucher() {
+            pairing.voucher = Some(fresh);
+            let _ = store.put(name, &pairing);
+        }
+    }
+    Ok(server)
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let state = Arc::new(Mutex::new(State::default()));
     ui.set_bubbles(ModelRc::from(Rc::new(VecModel::<Bubble>::default())));
     ui.set_models(ModelRc::from(Rc::new(VecModel::<ModelRow>::default())));
-    if let Some(url) = remembered() {
-        ui.set_server_url(url.into());
+    // A paired server first: a phone that has one most likely wants it.
+    if let Some(url) = pairings::Store::load().first().or_else(remembered) {
+        ui.set_server_url(url.trim_start_matches("http://").into());
     }
+
+    // Which path the tunnel is on, kept up to date while connected.
+    let path_timer = slint::Timer::default();
+    path_timer.start(slint::TimerMode::Repeated, std::time::Duration::from_secs(2), {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let path = state.lock().unwrap().server.as_ref().and_then(|s| s.path()).unwrap_or_default();
+            if ui.get_server_path() != path.as_str() {
+                ui.set_server_path(path.into());
+            }
+        }
+    });
+
+    ui.on_paste_link({
+        let weak = ui.as_weak();
+        move || {
+            if let (Some(ui), Some(text)) = (weak.upgrade(), ios::paste()) {
+                ui.set_server_url(text.trim().into());
+            }
+        }
+    });
+
+    ui.on_unpair({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let Some(server) = state.lock().unwrap().server.clone() else { return };
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let name = server.name().to_string();
+                let mut store = pairings::Store::load();
+                let outcome = match store.get(&name).and_then(|p| p.device) {
+                    Some(id) => server.unpair(id).and_then(|_| store.forget(&name)),
+                    None => store.forget(&name),
+                };
+                let _ = weak.upgrade_in_event_loop(move |ui| match outcome {
+                    Ok(()) => {
+                        ui.set_server_url("".into());
+                        ui.invoke_disconnect();
+                    }
+                    Err(e) => ui.set_chat_error(format!("Could not unpair: {e}").into()),
+                });
+            });
+        }
+    });
 
     ui.on_connect({
         let weak = ui.as_weak();
@@ -46,8 +162,7 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_connect_error("".into());
             let (weak, state) = (weak.clone(), state.clone());
             std::thread::spawn(move || {
-                let key = Some(key.to_string());
-                let result = Server::new(&url, key).and_then(|s| {
+                let result = open(&url, &key).and_then(|s| {
                     let health = s.health()?;
                     let models = s.models()?;
                     Ok((s, health, models))
@@ -55,10 +170,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_connecting(false);
                     match result {
-                        Err(e) => ui.set_connect_error(e.into()),
+                        Err(e) => ui.set_connect_error(short_ids(&e).into()),
                         Ok((server, health, models)) => {
-                            remember(server.base());
-                            ui.set_server_url(server.base().trim_start_matches("http://").into());
+                            remember(server.name());
+                            ui.set_server_url(server.name().trim_start_matches("http://").into());
+                            ui.set_server_path(server.path().unwrap_or_default().into());
+                            ui.set_server_name(short_name(server.name()).into());
+                            ui.set_paired(server.name().starts_with("kvad://"));
                             ui.set_server_version(format!("kvad {}", health.version).into());
                             let who = if health.you.is_empty() { health.role.clone() } else { format!("{} ({})", health.you, health.role) };
                             ui.set_server_who(who.into());
@@ -204,7 +322,8 @@ fn main() -> Result<(), slint::PlatformError> {
 /// `simctl launch` passes `SIMCTL_CHILD_KVAD_PHONE_*` through as these.
 /// `KVAD_PHONE_CONNECT` is a server to connect to at launch,
 /// `KVAD_PHONE_TAB` the tab to open (0 to 4), `KVAD_PHONE_MODEL` the chat
-/// model, and `KVAD_PHONE_SAY` a message to send once connected.
+/// model, `KVAD_PHONE_SAY` a message to send once connected, and
+/// `KVAD_PHONE_UNPAIR` unpairs the phone from the server it connected to.
 /// `KVAD_PHONE_PROBE` opens the Network test, and when it is a ticket, runs
 /// it, as long as `KVAD_PHONE_PROBE_LENGTH` (0 to 2: 30 s, 1 min, 5 min) says.
 #[cfg(debug_assertions)]
@@ -243,6 +362,9 @@ mod script {
         }
         if std::env::var("KVAD_PHONE_SHEET").is_ok() {
             ui.set_picking_model(true);
+        }
+        if std::env::var("KVAD_PHONE_UNPAIR").is_ok() {
+            ui.invoke_unpair();
         }
     }
 }
@@ -292,6 +414,34 @@ fn show_models(ui: &AppWindow, models: &[Model]) {
 fn choose(ui: &AppWindow, id: &str) {
     ui.set_model(id.into());
     ui.set_model_name(id.split_once('/').map_or(id, |(_, name)| name).into());
+}
+
+/// `text` with every `kvad://` node id in it cut short, so that an error can
+/// wrap: 64 hex digits are one word, wider than the screen.
+fn short_ids(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("kvad://") {
+        out.push_str(&rest[..i + 7]);
+        rest = &rest[i + 7..];
+        let hex = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
+        if hex > 12 {
+            out.push_str(&rest[..12]);
+            out.push('…');
+            rest = &rest[hex..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A server's name as a row has room for: `kvad://` and the first twelve
+/// digits of its node id, or an address as it is.
+fn short_name(name: &str) -> String {
+    match name.strip_prefix("kvad://") {
+        Some(id) if id.len() > 12 => format!("kvad://{}…", &id[..12]),
+        _ => name.trim_start_matches("http://").to_string(),
+    }
 }
 
 /// A chat model already in memory if there is one, else the first chat model.

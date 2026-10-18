@@ -17,12 +17,22 @@ use std::time::Duration;
 pub type Res<T> = Result<T, String>;
 
 /// Where the server is, and the key to show it, if it wants one.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Server {
+    /// What request URLs start with.
     base: String,
+    /// What the server is called on screen: its address, or for one reached
+    /// through the tunnel its `kvad://<node id>`.
+    name: String,
     key: Option<String>,
     agent: ureq::Agent,
+    tunnel: Option<std::sync::Arc<kvad_tunnel::blocking::Tunnel>>,
 }
+
+/// The stand-in a tunnelled request's URL starts with: an address, so no name
+/// is looked up, and never dialled, since every connection is a stream
+/// through the tunnel.
+const TUNNELLED: &str = "http://127.0.0.1:5823";
 
 /// What `/api/health` says.
 #[derive(Clone, Debug, PartialEq)]
@@ -67,11 +77,41 @@ impl Server {
                 .build(),
         );
         let key = key.filter(|k| !k.trim().is_empty()).map(|k| k.trim().to_string());
-        Ok(Server { base, key, agent })
+        Ok(Server { name: base.clone(), base, key, agent, tunnel: None })
     }
 
-    pub fn base(&self) -> &str {
-        &self.base
+    /// A paired server, through `tunnel`, with the key it made for this phone.
+    pub fn through(tunnel: kvad_tunnel::blocking::Tunnel, key: String) -> Server {
+        let name = tunnel.address().label();
+        let tunnel = std::sync::Arc::new(tunnel);
+        let config = ureq::Agent::config_builder()
+            .user_agent(concat!("kvad-phone/", env!("CARGO_PKG_VERSION")))
+            .http_status_as_error(false)
+            .build();
+        let agent = kvad_tunnel::for_ureq::agent(tunnel.clone(), config);
+        Server { base: TUNNELLED.into(), name, key: Some(key), agent, tunnel: Some(tunnel) }
+    }
+
+    /// What the server is called on screen.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The path the tunnel is on now: `lan …`, `direct …` or `relay …`.
+    pub fn path(&self) -> Option<String> {
+        self.tunnel.as_ref()?.path().map(|p| p.to_string())
+    }
+
+    /// A fresh relay voucher for this phone, from a server it is paired with.
+    pub fn voucher(&self) -> Res<String> {
+        let v = self.get("/api/remote/voucher")?;
+        v.get("voucher").and_then(Value::as_str).map(str::to_string).ok_or_else(|| "The server sent no voucher.".to_string())
+    }
+
+    /// Unpairs device `id`: this phone, when it is its own id.
+    pub fn unpair(&self, id: i64) -> Res<()> {
+        let req = self.request("DELETE", &format!("/api/devices/{id}"), "application/json").body(Vec::new()).map_err(|e| e.to_string())?;
+        read(self.send(req)?).map(|_| ())
     }
 
     fn request(&self, method: &str, path: &str, accept: &str) -> ureq::http::request::Builder {
@@ -85,10 +125,10 @@ impl Server {
     fn send(&self, req: ureq::http::Request<Vec<u8>>) -> Res<ureq::http::Response<ureq::Body>> {
         self.agent.run(req).map_err(|e| match e {
             ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
-                format!("Nothing is answering at {}.", self.base)
+                format!("Nothing is answering at {}.", self.name)
             }
-            ureq::Error::Timeout(_) => format!("{} did not answer in time.", self.base),
-            other => format!("Could not reach {}: {other}", self.base),
+            ureq::Error::Timeout(_) => format!("{} did not answer in time.", self.name),
+            other => format!("Could not reach {}: {other}", self.name),
         })
     }
 
@@ -100,7 +140,7 @@ impl Server {
     pub fn health(&self) -> Res<Health> {
         let v = self.get("/api/health")?;
         if v.get("status").and_then(Value::as_str) != Some("ok") {
-            return Err(format!("{} answered, but not as a kvad server would.", self.base));
+            return Err(format!("{} answered, but not as a kvad server would.", self.name));
         }
         let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
         let you = v.get("you").cloned().unwrap_or(Value::Null);

@@ -564,7 +564,8 @@ A device is paired once. On the server's machine, signed in:
 kvad remote pair
 ```
 
-It shows a QR code and a link, good once, for ten minutes. On the device:
+It shows a QR code and a link, good once, for ten minutes; *Pair a device*
+under Devices in the web UI's Settings shows the same. On the device:
 
 ```bash
 kvad remote join 'kvad://9ce63fe0…?k=…&relay=https://relay.kvad.eu&pair=…'

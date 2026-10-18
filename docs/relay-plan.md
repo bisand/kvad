@@ -712,6 +712,12 @@ rate limits per node rather than per connection.
 **Phase 4: the client side.** `kvad tunnel`, the web UI's pairing screen and
 device list, and the CLI over a real relay from a real phone network.
 
+*The web UI's half built, 2026-10-18.* Settings has a Devices section: the
+pairing link as a QR code and text with its countdown, the device list
+(everyone's, with owners, for an administrator), and unpairing. The QR code
+is encoded in `web/src/lib/qr.js` rather than by a package. Not yet done:
+`kvad tunnel`, and the run from a real phone network.
+
 **Phase 5: packaging.** Helm, systemd, `install.sh --relay`, Terraform
 modules, Fly. Each target gets a short page on kvad.eu and a CI job that at
 least builds it.

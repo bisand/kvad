@@ -21,7 +21,9 @@ gpu = ["dep:kvad-gpu"]
 
 [dependencies]
 argon2 = "0.6.0"
-axum = "0.8.9"
+# `ws` for `/v1/realtime`, live transcription: tungstenite, the WebSocket
+# implementation axum is built to use.
+axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
 getrandom = "0.4.3"
 kvad = { path = "../llm" }

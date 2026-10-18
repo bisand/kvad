@@ -191,6 +191,8 @@ struct Args {
     format: Option<String>,
     translate: bool,
     timestamps: bool,
+    /// `transcribe --live -`: raw audio from stdin, written down as it comes.
+    live: bool,
 }
 
 impl Default for Args {
@@ -284,6 +286,7 @@ impl Default for Args {
             format: None,
             translate: false,
             timestamps: false,
+            live: false,
         }
     }
 }
@@ -316,6 +319,7 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--all" => a.all = true,
         "--translate" => a.translate = true,
         "--timestamps" => a.timestamps = true,
+        "--live" => a.live = true,
         _ => return false,
     }
     true
@@ -345,8 +349,9 @@ fn parse_from(argv: Vec<String>) -> Args {
     while i < argv.len() {
         let flag = argv[i].clone();
         // A word, for a command that takes them. Anywhere on the line, so
-        // that `kvad keys rm --json 4` means what it looks like.
-        if positional && !flag.starts_with('-') {
+        // that `kvad keys rm --json 4` means what it looks like. A lone `-`
+        // is a word too: stdin, as a file.
+        if positional && (!flag.starts_with('-') || flag == "-") {
             a.words.push(flag);
             i += 1;
             continue;
@@ -478,6 +483,17 @@ fn parse_from(argv: Vec<String>) -> Args {
         match a.choice {
             kvad::client::Choice::Remote(_) => {
                 eprintln!("--workers builds the model in this process, and --remote asks a server for one: not both.");
+                std::process::exit(2);
+            }
+            _ => a.choice = kvad::client::Choice::Local,
+        }
+    }
+    // A live transcription is this process's: the server's is a WebSocket,
+    // which this binary does not speak.
+    if a.live {
+        match a.choice {
+            kvad::client::Choice::Remote(_) => {
+                eprintln!("--live transcribes in this process, and --remote asks a server: not both.");
                 std::process::exit(2);
             }
             _ => a.choice = kvad::client::Choice::Local,
@@ -802,11 +818,20 @@ fn transcribe(args: Args) -> Res<()> {
         ..Request::default()
     };
 
-    let path: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
-    let ffmpeg = kvad::video::ffmpeg_on(&path);
-    let audio = speech::audio::load(std::path::Path::new(&file), ffmpeg.as_deref())?;
+    if args.live && file != "-" {
+        return Err("--live reads raw 16 kHz mono f32 from stdin: `kvad transcribe --live - --model …`".into());
+    }
+    let audio = match args.live {
+        true => Vec::new(),
+        false => {
+            let path: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+            let ffmpeg = kvad::video::ffmpeg_on(&path);
+            let audio = speech::audio::load(std::path::Path::new(&file), ffmpeg.as_deref())?;
+            eprintln!("{file}: {:.1} s", audio.len() as f32 / speech::mel::SAMPLE_RATE as f32);
+            audio
+        }
+    };
     let seconds = audio.len() as f32 / speech::mel::SAMPLE_RATE as f32;
-    eprintln!("{file}: {seconds:.1} s");
 
     // This process has the CPU only: the GPU's Whisper is in kvad-gpu,
     // which a server links and this binary does not.
@@ -823,6 +848,9 @@ fn transcribe(args: Args) -> Res<()> {
     let started = std::time::Instant::now();
     let t = Transcriber::load(&model, precision, &mut |m| eprintln!("{m}"), &weights::Watcher::none())?;
     eprintln!("{} (loaded in {:.1} s)", t.summary(), started.elapsed().as_secs_f32());
+    if args.live {
+        return transcribe_live(&t, &req);
+    }
 
     let streaming = format == Format::Text && args.out.is_none();
     let started = std::time::Instant::now();
@@ -857,6 +885,75 @@ fn transcribe(args: Args) -> Res<()> {
             None => print!("{text}"),
         }
     }
+    Ok(())
+}
+
+/// `kvad transcribe --live -`: raw 16 kHz mono f32, little-endian, from
+/// stdin, as it comes, decoded about once a second by the same live session
+/// the server's `/v1/realtime` runs. Settled text goes to stdout as it
+/// settles; the partial is shown on stderr, replaced as it changes. The
+/// end of the input settles the rest.
+///
+/// ```text
+/// ffmpeg -loglevel error -i talk.mp3 -f f32le -ac 1 -ar 16000 - | kvad transcribe --live - --model NbAiLab/nb-whisper-tiny
+/// ```
+fn transcribe_live(t: &kvad::speech::Transcriber, req: &kvad::speech::Request) -> Res<()> {
+    use std::io::Read;
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let (mut buf, mut carry) = (vec![0u8; 3200], Vec::new());
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    carry.extend_from_slice(&buf[..n]);
+                    let whole = carry.len() / 4 * 4;
+                    let samples = carry[..whole].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    carry.drain(..whole);
+                    if tx.send(samples).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let mut live = kvad::speech::Live::new(t, req)?;
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
+    let terminal = std::io::IsTerminal::is_terminal(&err);
+    let mut due = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let (mut ended, mut begun) = (false, false);
+    while !ended {
+        match rx.recv_timeout(due.saturating_duration_since(std::time::Instant::now())) {
+            Ok(samples) => {
+                live.push(&samples);
+                continue;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => ended = true,
+        }
+        // An update that runs past the next one's time skips it.
+        due = std::time::Instant::now().max(due) + std::time::Duration::from_secs(1);
+        while let Ok(samples) = rx.try_recv() {
+            live.push(&samples);
+        }
+        let u = if ended { live.finish(t)? } else { live.update(t)? };
+        if terminal {
+            let _ = write!(err, "\r\x1b[K");
+        }
+        // Whisper writes a space before every word, the first too.
+        let settled = if !begun { u.settled.trim_start() } else { &u.settled };
+        begun |= !settled.is_empty();
+        let _ = write!(out, "{settled}");
+        let _ = out.flush();
+        if terminal && !u.partial.is_empty() {
+            // Dimmed, after the settled text, on the line stdout shares.
+            let _ = write!(err, "\x1b[2m{}\x1b[0m", u.partial);
+        }
+    }
+    let _ = writeln!(out);
+    eprintln!("{:.1} s of audio, language {}", live.received(), live.language().unwrap_or("?"));
     Ok(())
 }
 

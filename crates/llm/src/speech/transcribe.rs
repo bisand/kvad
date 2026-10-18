@@ -232,14 +232,15 @@ impl Tokens {
 }
 
 /// One window, decoded.
-struct Window {
-    /// What was produced, without the end-of-text.
-    tokens: Vec<u32>,
-    avg_logprob: f32,
-    no_speech_prob: f32,
-    temperature: f32,
+pub(super) struct Window {
+    /// What was produced, without the end-of-text: what it was handed as
+    /// written already, and then what it wrote.
+    pub(super) tokens: Vec<u32>,
+    pub(super) avg_logprob: f32,
+    pub(super) no_speech_prob: f32,
+    pub(super) temperature: f32,
     /// Whether it stopped by itself rather than at the token limit.
-    ended: bool,
+    pub(super) ended: bool,
 }
 
 impl Window {
@@ -255,8 +256,13 @@ impl Window {
     /// second, and its last try over noise is a page of spaces and stray
     /// letters.
     fn skipped(&self, eot: u32) -> bool {
-        let silence = self.no_speech_prob > NO_SPEECH_THRESHOLD && self.avg_logprob < LOGPROB_THRESHOLD;
-        silence || self.looped(eot)
+        self.silent() || self.looped(eot)
+    }
+
+    /// Whether the model took the window for silence: likely no speech, and
+    /// unsure of what it wrote over it.
+    pub(super) fn silent(&self) -> bool {
+        self.no_speech_prob > NO_SPEECH_THRESHOLD && self.avg_logprob < LOGPROB_THRESHOLD
     }
 }
 
@@ -490,7 +496,7 @@ impl Transcriber {
     }
 
     /// The tokens a window's prompt is made of, after any context.
-    fn start(&self, language: u32, req: &Request) -> Vec<u32> {
+    pub(super) fn start(&self, language: u32, req: &Request) -> Vec<u32> {
         let t = &self.tokens;
         let mut s = vec![t.sot];
         if t.multilingual {
@@ -515,7 +521,22 @@ impl Transcriber {
     }
 
     /// Decode one window at one temperature.
-    fn window(&self, audio: &Heard, context: &[u32], start: &[u32], temperature: f32, sampler: &mut Sampler) -> Res<Window> {
+    ///
+    /// `written` is what the window is taken to have written already: it
+    /// goes in the prompt after `start`, the rules count it as written, and
+    /// the window's tokens begin with it. A file's windows have none; a live
+    /// one's is what it has settled ([`super::live`]). `lap` stops the
+    /// window where it begins to write that many tokens a second time.
+    pub(super) fn window(
+        &self,
+        audio: &Heard,
+        context: &[u32],
+        start: &[u32],
+        written: &[u32],
+        lap: Option<usize>,
+        temperature: f32,
+        sampler: &mut Sampler,
+    ) -> Res<Window> {
         let t = &self.tokens;
         let ctx = self.model.config().text_ctx;
         let mut prompt = Vec::new();
@@ -528,6 +549,7 @@ impl Transcriber {
         }
         let sot_at = prompt.len();
         prompt.extend_from_slice(start);
+        prompt.extend_from_slice(written);
 
         let mut said = self.model.said();
         // The scores at `<|startoftranscript|>` say whether there is speech
@@ -548,11 +570,12 @@ impl Transcriber {
 
         let rules = Rules { tokens: t, timestamps: !start.contains(&t.no_timestamps) };
         sampler.temperature = temperature;
-        let limit = (ctx / 2).min(ctx - prompt.len());
-        let mut out = Vec::new();
+        let limit = (ctx / 2).min(ctx.saturating_sub(prompt.len()));
+        let mut out = written.to_vec();
+        let fresh = |out: &Vec<u32>| out.len() - written.len();
         let mut sum_logprob = 0.0f32;
         let mut ended = false;
-        while out.len() < limit {
+        while fresh(&out) < limit {
             rules.apply(&mut logits, &out);
             let next = sampler.sample(&logits);
             sum_logprob += log_softmax(&logits)[next as usize];
@@ -561,12 +584,19 @@ impl Transcriber {
                 break;
             }
             out.push(next);
-            if prompt.len() + out.len() > ctx {
+            if let Some(lap) = lap {
+                let n = out.len();
+                if fresh(&out) >= lap && out[..n - 1].windows(lap).any(|w| w == &out[n - lap..]) {
+                    out.truncate(n - lap);
+                    break;
+                }
+            }
+            if prompt.len() + fresh(&out) > ctx {
                 break;
             }
             logits = self.model.decode(&[next], &mut said, audio, &[0])?.remove(0);
         }
-        Ok(Window { avg_logprob: sum_logprob / (out.len() + 1) as f32, tokens: out, no_speech_prob, temperature, ended })
+        Ok(Window { avg_logprob: sum_logprob / (fresh(&out) + 1) as f32, tokens: out, no_speech_prob, temperature, ended })
     }
 
     /// One window, tried warmer until it comes out well or there are no
@@ -578,7 +608,7 @@ impl Transcriber {
         };
         let mut last = None;
         for &temp in &temps {
-            let w = self.on_pool(|| self.window(audio, context, start, temp, sampler))?;
+            let w = self.on_pool(|| self.window(audio, context, start, &[], None, temp, sampler))?;
             let unsure = w.avg_logprob < LOGPROB_THRESHOLD;
             // Silence is allowed to be unsure, and to ramble: it is skipped
             // below, not retried. So is a window that loops at every
@@ -599,6 +629,32 @@ impl Transcriber {
         self.tokenizer.decode(&words, true).map_err(|e| e.to_string().into())
     }
 
+    /// The language `req` asks for, checked: `None` to ask the model.
+    pub(super) fn language_asked(&self, req: &Request) -> Res<Option<String>> {
+        let t = &self.tokens;
+        let language: Option<String> = match req.language.as_deref() {
+            Some("auto") => None,
+            Some(code) => Some(code.to_string()),
+            None => t.default_language.clone(),
+        };
+        if let Some(code) = &language {
+            if t.multilingual && t.language(code).is_none() {
+                // The asker's to change, and a server answers it as such.
+                return Err(Box::new(crate::image::Refused(format!("`{code}` is not a language this model knows"))));
+            }
+        }
+        Ok(language)
+    }
+
+    /// The context a recording is read after: whatever the caller wanted,
+    /// with a space before it as the model saw text in training.
+    pub(super) fn prompted(&self, req: &Request) -> Res<Vec<u32>> {
+        Ok(match req.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            Some(p) => self.tokenizer.encode(format!(" {p}"), false).map_err(|e| e.to_string())?.get_ids().to_vec(),
+            None => Vec::new(),
+        })
+    }
+
     /// Transcribe 16 kHz mono `audio`.
     ///
     /// `progress` is told after each window, and stops the transcription by
@@ -611,25 +667,8 @@ impl Transcriber {
         let t = &self.tokens;
 
         let mut sampler = Sampler::new(0.0, 0, 1.0, req.seed.unwrap_or(0));
-        let mut language: Option<String> = match req.language.as_deref() {
-            Some("auto") => None,
-            Some(code) => Some(code.to_string()),
-            None => t.default_language.clone(),
-        };
-        if let Some(code) = &language {
-            if t.multilingual && t.language(code).is_none() {
-                // The asker's to change, and a server answers it as such.
-                return Err(Box::new(crate::image::Refused(format!("`{code}` is not a language this model knows"))));
-            }
-        }
-
-        // The prompt's context starts as whatever the caller wanted the
-        // recording read after, with a space before it as the model saw text
-        // in training.
-        let mut context: Vec<u32> = match req.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-            Some(p) => self.tokenizer.encode(format!(" {p}"), false).map_err(|e| e.to_string())?.get_ids().to_vec(),
-            None => Vec::new(),
-        };
+        let mut language = self.language_asked(req)?;
+        let mut context = self.prompted(req)?;
         let mut reset_at = 0;
 
         let mut segments: Vec<Segment> = Vec::new();

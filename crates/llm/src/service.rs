@@ -129,6 +129,13 @@ pub enum Cmd {
     /// reporting each 30-second window as [`Evt::Transcribing`] and ending
     /// with [`Evt::Transcribed`]. Only a Whisper can.
     Transcribe { audio: Vec<f32>, request: crate::speech::Request },
+    /// One update of a live transcription ([`crate::speech::Live`]): the
+    /// audio that has come since the last pushed into the session, and the
+    /// window decoded again, or with `finish`, everything in it settled.
+    /// `session` is `None` the first time, and one is begun for `request`.
+    /// The session comes back with what the update said, as
+    /// [`Evt::Listened`], to be sent again with the next. Only a Whisper can.
+    Listen { session: Option<Box<crate::speech::Live>>, request: crate::speech::Request, audio: Vec<f32>, finish: bool },
 }
 
 /// What a [`Loader`] hands back.
@@ -312,6 +319,9 @@ pub enum Evt {
     /// A window of a recording, done, and the stretches of text it added.
     Transcribing(crate::speech::Progress),
     Transcribed(Box<crate::speech::Transcript>),
+    /// A live transcription's update, and the session to send with the
+    /// next.
+    Listened(Box<crate::speech::Live>, crate::speech::Update),
     Error(String),
     /// Something a generation sent with [`Cmd::Beside`] has to say — a
     /// token, its end, its failure — with the id it was sent under.
@@ -863,6 +873,40 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
                 match heard {
                     Ok(t) => {
                         let _ = tx.send(Evt::Transcribed(Box::new(t)));
+                    }
+                    Err(e) => match e.downcast_ref::<crate::image::Refused>() {
+                        Some(r) => {
+                            let _ = tx.send(Evt::Refused(r.0.clone()));
+                        }
+                        None => fail(e),
+                    },
+                }
+            }
+
+            Cmd::Listen { session: live, request, audio, finish } => {
+                let transcriber = match session.as_mut() {
+                    None => {
+                        say("no model loaded");
+                        continue;
+                    }
+                    Some(Held::Speech { transcriber, .. }) => transcriber,
+                    Some(other) => {
+                        fail(other.cannot("transcribe speech").into());
+                        continue;
+                    }
+                };
+                let listened = (|| -> Res<_> {
+                    let mut live = match live {
+                        Some(l) => l,
+                        None => Box::new(crate::speech::Live::new(transcriber, &request)?),
+                    };
+                    live.push(&audio);
+                    let update = if finish { live.finish(transcriber)? } else { live.update(transcriber)? };
+                    Ok((live, update))
+                })();
+                match listened {
+                    Ok((live, update)) => {
+                        let _ = tx.send(Evt::Listened(live, update));
                     }
                     Err(e) => match e.downcast_ref::<crate::image::Refused>() {
                         Some(r) => {

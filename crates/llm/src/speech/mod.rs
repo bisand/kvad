@@ -19,6 +19,8 @@
 //! 4. [`transcribe`] — the decoding loop: the prompt, the rules about what
 //!    may be said, the walk through a long recording, and the formats a
 //!    transcript is written out in.
+//! 5. [`live`] — the same loop over audio that is still arriving: a window
+//!    decoded again as it grows, and words settled once two runs agree.
 //!
 //! Every Whisper on the Hub in transformers' layout loads: OpenAI's own
 //! (`openai/whisper-*`), the distilled ones, and fine-tunes of them such as
@@ -30,11 +32,13 @@
 //! host whichever answers, so they are here once.
 
 pub mod audio;
+pub mod live;
 pub mod mel;
 pub mod reference;
 pub mod transcribe;
 pub mod whisper;
 
+pub use live::{Live, Update};
 pub use transcribe::{Format, Progress, Request, Segment, Task, Transcriber, Transcript};
 
 use crate::quant::Precision;

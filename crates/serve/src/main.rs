@@ -63,6 +63,7 @@ mod oidc;
 mod openai;
 mod openapi;
 mod playground;
+mod realtime;
 mod retrieval;
 mod scheduler;
 mod secret;

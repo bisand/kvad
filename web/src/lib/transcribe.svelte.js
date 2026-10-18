@@ -96,6 +96,9 @@ const TYPES = { text: "text/plain", srt: "application/x-subrip", vtt: "text/vtt"
 const EXTENSIONS = { text: "txt", srt: "srt", vtt: "vtt" };
 
 class Transcribe {
+  /** What the page listens to: "file", a recording, or "microphone", live
+   *  (`live.svelte.js`). */
+  mode = $state("file");
   /** Which Whisper: a repo id, or a resident's `repo@backend`. */
   model = $state(null);
   /** The recording, a `File`. */

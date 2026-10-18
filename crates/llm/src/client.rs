@@ -965,6 +965,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
     (
         "get",
+        "/v1/realtime",
+        "a WebSocket, for the web UI's microphone and the phone. `kvad transcribe --live -` \
+         runs the same live session in this process, on audio from stdin",
+    ),
+    (
+        "get",
         "/api/auth/oidc/start",
         "a redirect to an identity provider, for a browser to follow. Sign in \
          there, make a key on the Account page, and give it to `kvad auth login --key`",

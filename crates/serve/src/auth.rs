@@ -174,18 +174,34 @@ pub fn origin_is_ours(parts: &Parts) -> bool {
     else {
         // HTTP/2 puts the authority in the URI rather than in a header.
         let Some(authority) = parts.uri.authority().map(|a| a.as_str()) else { return false };
-        return declared_origin(parts).is_some_and(|o| o == authority);
+        return declared_origin(&parts.headers).is_some_and(|o| o == authority);
     };
-    declared_origin(parts).is_some_and(|o| o == host)
+    declared_origin(&parts.headers).is_some_and(|o| o == host)
+}
+
+/// Whether a WebSocket's handshake may act on the cookie it carries.
+///
+/// The handshake is a GET, which [`origin_is_ours`] lets through, but what
+/// follows it is a conversation, and a page anywhere can open one: the
+/// browser sends the cookie along, and the page reads what comes back.
+/// So a handshake on the cookie alone needs an `Origin` that is ours,
+/// which browsers always send with one. A bearer or Basic header had to be
+/// put there by whoever wrote the client, and is not asked.
+pub fn socket_may_use(headers: &axum::http::HeaderMap) -> bool {
+    if headers.contains_key(AUTHORIZATION) || !headers.contains_key(COOKIE) {
+        return true;
+    }
+    let host = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok());
+    let origin = headers.get(ORIGIN).and_then(|v| v.to_str().ok()).map(|o| o.split_once("://").map_or(o, |(_, rest)| rest));
+    matches!((host, origin), (Some(h), Some(o)) if h == o)
 }
 
 /// The host:port the request says it came from, out of `Origin` or, failing
 /// that, `Referer`.
-fn declared_origin(parts: &Parts) -> Option<String> {
-    let raw = parts
-        .headers
+fn declared_origin(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
         .get(ORIGIN)
-        .or_else(|| parts.headers.get(REFERER))
+        .or_else(|| headers.get(REFERER))
         .and_then(|v| v.to_str().ok())?;
     // `https://host:port/whatever` -> `host:port`.
     let after_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);

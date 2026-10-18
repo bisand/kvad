@@ -404,7 +404,9 @@ the table above, which was `kvad transcribe` on another day.
 
 ## Live, from the phone
 
-Planned 2026-10-17, not built. The owner's ask: record on the phone, and see
+Planned 2026-10-17. The endpoint, the engine's session under it and the
+web UI's microphone were built 2026-10-18: *Built* below says what, and
+what is still to come. The owner's ask: record on the phone, and see
 the words come back on the phone *while speaking*, over a return channel,
 not as one transcript once the recording is done. Today's `stream: true`
 cannot do that. The whole file is uploaded first, and then a delta comes
@@ -570,6 +572,97 @@ delay) skips partials but never audio. And the same session runs over the
 tunnel's three paths, relayed, direct and LAN, with a change from one to
 another mid-sentence.
 
+### Built
+
+- **The engine's session**, `kvad::speech::Live` (`crates/llm/src/speech/live.rs`):
+  audio pushed as it arrives, and `update` decodes the window again and
+  says what is settled and what is the partial; `finish` settles the rest.
+  It holds no model, so a server keeps any number of them and runs each
+  update where the model is. The window is decoded by the file path's own
+  `Transcriber::window`, given the settled tokens as written, so its rules
+  (what may be said, UTF-8 kept whole) are the same code. Its tests drive
+  it over a scripted stand-in for a Whisper, which writes a word a second
+  of sound and times its segments, so settling, cutting and silence are
+  checked with nothing downloaded.
+- **`GET /v1/realtime?intent=transcription`** (`crates/serve/src/realtime.rs`),
+  behind the same sign-in as the other `/v1` routes; a WebSocket opened on
+  a session cookie must also come from the server's own pages. OpenAI's
+  events: `session.update` (theirs, and the beta's `transcription_session.update`),
+  `input_audio_buffer.append` and `.commit` in; `session.created`,
+  `…input_audio_transcription.delta` for settled text, `.completed` after
+  a commit, and `error` out. Kvad's own, as planned: binary frames are the
+  PCM without base64, `kvad.transcription.partial` carries the partial, and
+  `kvad: {heard, lag}` on both says how far behind the voice the text is.
+  16 kHz unless the session names a rate; 8 to 48 kHz is resampled. Each
+  update is one job on the model's engine, so other work runs between them,
+  and an update still running when the next falls due skips it. The clean
+  end is a commit, its `completed`, and the client's close. `axum`'s `ws`
+  feature added four crates to `Cargo.lock`: `tungstenite` and
+  `tokio-tungstenite` 0.29, `sha1` and `data-encoding`.
+- **The web UI's microphone**: the Transcribe page's *The microphone* tab.
+  `getUserMedia`, an AudioWorklet that resamples to 16 kHz (a windowed
+  sinc, cut off below 8 kHz) and sends 100 ms binary frames, and the
+  partial greyed after the settled text. Stop is a commit.
+
+  ![The Transcribe page listening: settled text, then the partial greyed](speech/transcribe-microphone.jpg)
+- **`kvad transcribe --live -`**: raw 16 kHz mono f32 from stdin, through
+  the same session, in the CLI's own process. On the CPU only tiny keeps
+  up, as measured below.
+
+Three things differ from the design above, each found building it:
+
+- *Words are agreed whole.* `live_speed` compared tokens, so `Ġhyp` could
+  settle while one guess went on `not` and the other `nose`. A word now
+  counts as agreed only when both guesses spell it with the same tokens.
+  It settles a little later for it: see the table.
+- *The cut hears nothing again.* The timed decode that finds a cut reads
+  what the update before it has just heard, as the plan guessed it could.
+  On small at gpu-q8, in one traced run, the five updates with a cut took
+  0.34 to 0.39 s, against about 0.15 s for one without.
+- *Silence is let go of.* A window the model takes for silence (its no-speech
+  test, with nothing settled in it) is dropped but for its last second, so
+  a microphone left open fills no window and forces no restart. Finishing
+  on silence settles nothing, so what a Whisper writes over silence is not
+  sent as speech.
+
+**What it costs, measured** with `cargo run --release -p kvad-gpu --example
+live_session`, which plays `king.wav` (85 s) through the shipped `Live` at
+real time, an update due every second, and measures as `live_speed` does:
+"shown" and "settled" are the median and the 90th percentile over every
+word, from where the file's own timed transcript puts its end. The real-time
+factor is the seconds of work per second of audio. Ranges are over rounds
+(three for small, two for the others), on an M5 Pro, with an idle
+SmolLM2-135M resident in the main service.
+
+| model | backend | an update (median) | real-time factor | shown | settled | words as the file's |
+|---|---|---|---|---|---|---|
+| **small** | **gpu-q8** | 0.13–0.19 s | 0.15–0.22 | **0.37–0.43, 1.7–2.0 s** | **1.6–1.7, 3.0–3.2 s** | 129 of 134 |
+| | gpu-f16 | 0.13–0.18 s | 0.16–0.21 | 0.36–0.56, 1.9–3.0 s | 1.5–1.7, 3.1–4.7 s | 128–129 of 134 |
+| large | gpu-q8 | 0.48–0.56 s | 0.49–0.56 | 1.6–1.7, 3.8–4.0 s | 2.7–2.9, 4.9–5.7 s | 127 of 129 |
+| tiny | gpu-q8 | 0.05 s | 0.06 | 0.42–1.2, 2.0–4.9 s | 1.7–2.4, 3.0–5.9 s | 77–78 of 165 |
+| | cpu-q8 | 0.30–0.37 s | 0.33–0.43 | 0.69–0.77, 2.8 s | 2.0, 4.1–4.3 s | 72–73 of 123 |
+
+- **Small at gpu-q8 is still the live model.** A word shows 0.4 s after it
+  is spoken and settles 1.6 s after, against `live_speed`'s 0.4–0.5 and
+  1.4–1.5 s: whole-word agreement costs about 0.1 to 0.2 s at the median
+  and 0.3 s at the 90th percentile, and nothing in the words. The GPU works
+  a fifth of the time.
+- **Through the server it is the same.** Played into `/v1/realtime` on a
+  clean server at real time, in 100 ms frames, small at gpu-q8 settled its
+  text 0.2 s behind the audio received (the `lag` on its deltas, median),
+  and `completed` came 0.7 s after the audio ended. Of three runs, two
+  wrote the same transcript, and the third differed in five words, names
+  among them ("grig, hygo" for "Grieg, Kygo"): where the windows fall
+  moves with when the audio arrives.
+- **Large lags as it did**, and holds sentences back; tiny's text is poor
+  (tiny's own file transcript goes wrong at the end, as before). The CPU
+  keeps up with tiny only, at a third of its time.
+
+**Not built yet**, all of it the phone's: the session held for a minute
+after the link goes, with sample offsets to resume from; the tests over the
+tunnel's three paths; and a check against OpenAI's own SDK, which this was
+written from their reference and not tested with.
+
 ## What is next
 
 1. **The decoder's step.** At q8 a step is about 6.7 ms against about 4 ms
@@ -580,10 +673,9 @@ another mid-sentence.
    they are worth it.
 3. **The web UI** is built: the Transcribe page. It streams, and writes
    the subtitle files itself from the segments, byte for byte the server's.
-4. **Live transcription** over a WebSocket, words back while speaking, as
-   *Live, from the phone* above lays out. `live_speed` has measured the
-   cadence (small at gpu-q8, once a second). Next is the endpoint, which the
-   Transcribe page can use with the browser's microphone before any phone
-   exists.
+4. **Live transcription** is built: `/v1/realtime`, the Transcribe page's
+   microphone, and `kvad transcribe --live -` (*Live, from the phone*,
+   *Built*). What is left is the phone's: resuming a session after the link
+   drops, and the tunnel's paths.
 5. **Speakers**, "who spoke when", and word timestamps before them: planned
    in [the diarization plan](diarization-plan.md).

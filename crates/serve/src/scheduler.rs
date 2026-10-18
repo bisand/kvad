@@ -266,6 +266,15 @@ pub enum Heard {
     Refused(String),
 }
 
+/// What one update of a live transcription came to.
+pub enum Listened {
+    /// What it said, and the session, for the next update.
+    Heard(Box<kvad::speech::Live>, kvad::speech::Update),
+    Failed(String),
+    /// Asked for what the model cannot do: a language it does not know.
+    Refused(String),
+}
+
 /// Where a video has got to, or the video.
 #[derive(Debug, Clone)]
 pub enum Reel {
@@ -438,6 +447,14 @@ enum Job {
     Paint { ticket: Ticket, on: Key, request: kvad::image::ImageRequest, out: tokio_mpsc::Sender<Stroke> },
     Film { ticket: Ticket, on: Key, request: kvad::video::VideoRequest, out: tokio_mpsc::Sender<Reel> },
     Transcribe { ticket: Ticket, on: Key, audio: Vec<f32>, request: kvad::speech::Request, out: tokio_mpsc::Sender<Heard> },
+    Listen {
+        on: Key,
+        session: Option<Box<kvad::speech::Live>>,
+        request: kvad::speech::Request,
+        audio: Vec<f32>,
+        finish: bool,
+        done: oneshot::Sender<Listened>,
+    },
 }
 
 impl Job {
@@ -1317,6 +1334,29 @@ impl Scheduler {
         Ok((id, rx))
     }
 
+    /// One update of a live transcription on `on`: `audio`, what has come
+    /// since the last, pushed into `session`, and the window decoded again,
+    /// or with `finish`, everything settled. `None` begins a session for
+    /// `request`.
+    ///
+    /// A job of its own for each update, and not one for the whole session,
+    /// because a session lasts as long as somebody speaks: an update is a
+    /// tenth of a second on a GPU, and other work is let in between them.
+    pub async fn listen(
+        &self,
+        on: &Key,
+        session: Option<Box<kvad::speech::Live>>,
+        request: kvad::speech::Request,
+        audio: Vec<f32>,
+        finish: bool,
+    ) -> Listened {
+        let (done, wait) = oneshot::channel();
+        if let Err(e) = self.submit(Job::Listen { on: on.clone(), session, request, audio, finish, done }) {
+            return Listened::Failed(e);
+        }
+        wait.await.unwrap_or_else(|_| Listened::Failed("the engine stopped before it answered".into()))
+    }
+
     /// Score a text the model did not write.
     pub async fn score(
         &self,
@@ -1472,6 +1512,21 @@ fn run(queue: Closing, loaders: Loaders, budget: Budget, shared: Shared) {
                         drain_tokens(&slot.engine.rx)
                     }
                     None => Err(missing(&on)),
+                };
+                Box::new(move || drop(done.send(answer)))
+            }
+
+            Job::Listen { on, session, request, audio, finish, done } => {
+                let answer = match slots.iter().find(|s| s.key == on) {
+                    // Nobody is waiting for it any more.
+                    _ if done.is_closed() => Listened::Failed(CANCELLED.into()),
+                    Some(slot) => {
+                        slot.engine.send(Cmd::Listen { session, request, audio, finish });
+                        let heard = drain_listen(&slot.engine.rx);
+                        touch(&on, clock, None);
+                        heard
+                    }
+                    None => Listened::Failed(missing(&on)),
                 };
                 Box::new(move || drop(done.send(answer)))
             }
@@ -1703,6 +1758,20 @@ fn drain_tokens(rx: &Receiver<Evt>) -> Result<Vec<Token>, String> {
             Ok(Evt::Status(message)) => return Err(message),
             Ok(_) => {}
             Err(_) => return Err("the engine thread has stopped".into()),
+        }
+    }
+}
+
+fn drain_listen(rx: &Receiver<Evt>) -> Listened {
+    loop {
+        match rx.recv() {
+            Ok(Evt::Listened(live, update)) => return Listened::Heard(live, update),
+            Ok(Evt::Error(e)) => return Listened::Failed(e),
+            Ok(Evt::Refused(e)) => return Listened::Refused(e),
+            // What the engine says when nothing is loaded.
+            Ok(Evt::Status(message)) => return Listened::Failed(message),
+            Ok(_) => {}
+            Err(_) => return Listened::Failed("the engine thread has stopped".into()),
         }
     }
 }

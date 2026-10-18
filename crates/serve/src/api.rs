@@ -76,6 +76,7 @@ pub fn routes() -> Router<State> {
         .merge(crate::images::routes())
         .merge(crate::videos::routes())
         .merge(crate::speech::routes())
+        .merge(crate::realtime::routes())
         .merge(crate::settings::routes())
         .merge(crate::storage::routes())
 }

@@ -67,6 +67,8 @@ fn tokens() -> Tokens {
         max_initial_timestamp: 50,
         multilingual: true,
         utf8: Vec::new(),
+        heads: vec![(0, 0)],
+        heads_guessed: false,
     }
 }
 
@@ -158,6 +160,10 @@ impl Model for Script {
         let before = seq.len();
         seq.extend_from_slice(tokens);
         Ok(rows.iter().map(|&r| Script::next(&seq[..before + r + 1], seconds)).collect())
+    }
+    /// Not asked: a live session times no words.
+    fn attention(&self, _: &[u32], _: &Heard, _: &[(usize, usize)]) -> Res<Vec<f32>> {
+        Err("the script times no words".into())
     }
     fn within(&self, work: &mut (dyn FnMut() + Send)) {
         work()

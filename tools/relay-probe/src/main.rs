@@ -54,8 +54,8 @@ const BACKOFF: Duration = Duration::from_secs(30);
 
 const USAGE: &str = "\
 usage: relay-probe id     [--key FILE]
-       relay-probe listen --allow ID... [--relay URL]... [--n0] [--relay-only] [--port N] [--key FILE]
-       relay-probe dial   [--secs N] [--every MS] [--relay-only] [--key FILE]   (ticket on stdin)";
+       relay-probe listen --allow ID... [--relay URL]... [--n0] [--relay-only] [--port N] [--bind IP]... [--key FILE]
+       relay-probe dial   [--secs N] [--every MS] [--relay-only] [--bind IP]... [--key FILE]   (ticket on stdin)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -75,6 +75,9 @@ struct Opts {
     allow: Vec<EndpointId>,
     secs: u64,
     every: u64,
+    /// Local addresses to bind the UDP socket to, instead of every interface:
+    /// how a run is held to one network when a machine is on several.
+    bind: Vec<IpAddr>,
 }
 
 fn parse(args: &[String]) -> Res<Opts> {
@@ -88,6 +91,7 @@ fn parse(args: &[String]) -> Res<Opts> {
         allow: Vec::new(),
         secs: 60,
         every: 250,
+        bind: Vec::new(),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -104,6 +108,10 @@ fn parse(args: &[String]) -> Res<Opts> {
             }
             "--secs" => o.secs = value()?.parse().map_err(|_| "--secs takes a number")?,
             "--every" => o.every = value()?.parse().map_err(|_| "--every takes milliseconds")?,
+            "--bind" => {
+                let v = value()?;
+                o.bind.push(v.parse().map_err(|_| format!("--bind {v}: not an IP address"))?);
+            }
             _ => return Err(format!("unknown argument {a}\n{USAGE}")),
         }
     }
@@ -267,6 +275,14 @@ async fn endpoint(secret: SecretKey, o: &Opts, relays: Vec<RelayUrl>, alpns: Vec
     if o.relay_only {
         // No UDP socket at all: nothing on this machine answers the internet.
         b = b.clear_ip_transports();
+    } else if !o.bind.is_empty() {
+        // Only these addresses. Packets leave from them alone, and an answer
+        // to any other of this machine's addresses (a cable, a LAN, a
+        // tailnet) has no socket to arrive at, so that path cannot form.
+        b = b.clear_ip_transports();
+        for ip in &o.bind {
+            b = b.bind_addr(SocketAddr::new(*ip, port.unwrap_or(0))).map_err(|e| e.to_string())?;
+        }
     } else if let Some(port) = port {
         let v4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
         let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));

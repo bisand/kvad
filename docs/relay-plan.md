@@ -724,6 +724,10 @@ Built so far:
   so the iPhone's own Camera opens the code from `kvad remote pair` in Kvad,
   which fills in the Server field and waits for *Connect*. Coming back to
   the foreground tells the tunnel to look for paths again.
+- *A real iPhone* (2026-10-18): paired from the Camera on Wi-Fi, on the LAN
+  within 4.5 s; moved to `relay.kvad.eu` without dropping when Wi-Fi went
+  off; reconnected on mobile data after a restart, chat replies in 115 ms
+  through the relay. The details are in `docs/phone-plan.md`, Phase 4.
 
 **Phase 5: packaging.** Helm, systemd, `install.sh --relay`, Terraform
 modules, Fly. Each target gets a short page on kvad.eu and a CI job that at

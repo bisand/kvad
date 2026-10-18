@@ -1,0 +1,10 @@
+// Signing for a build on an iPhone. The team is your own, so it is kept in
+// Team.local.xcconfig, which is not committed and which `xcodegen generate`
+// leaves alone:
+//
+//     DEVELOPMENT_TEAM = ABCDE12345
+//
+// The id is under Membership on developer.apple.com, or in Xcode's Settings,
+// Accounts. A free Personal Team works; its installs run out after 7 days.
+CODE_SIGN_STYLE = Automatic
+#include? "Team.local.xcconfig"

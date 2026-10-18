@@ -57,10 +57,47 @@ is in a release build.
 
 ## On an iPhone
 
-Xcode, with your own team chosen under Signing for the Kvad target. The
-Keychain entitlement that `project.yml` asks for is in the signature
-`build.sh` makes, so pairings are kept on the device as they are in the
-simulator.
+Once, on the Mac:
+
+1. Sign in to Xcode with your Apple ID (Xcode, Settings, Accounts).
+2. Put your team's id in `ios/Team.local.xcconfig`, which is not committed:
+
+   ```
+   DEVELOPMENT_TEAM = ABCDE12345
+   ```
+
+   The id is shown in Xcode's Accounts, and under Membership on
+   developer.apple.com. A choice under Signing in Xcode would do too, but the
+   next `xcodegen generate` throws it away. A free Personal Team works; its
+   installs run out after 7 days.
+
+Once, on the iPhone: connect it to the Mac with a cable and tap *Trust*.
+Then turn on Settings, Privacy & Security, *Developer Mode*, which restarts
+the phone. After the first install, a Personal Team's app also has to be
+trusted under Settings, General, VPN & Device Management.
+
+Then, with the phone unlocked:
+
+```bash
+cd apps/phone/ios && xcodegen generate && open Kvad.xcodeproj
+```
+
+Choose the iPhone at the top of the window and press Run (⌘R). Or, without
+the Xcode window:
+
+```bash
+cd apps/phone/ios && xcodegen generate && xcodebuild -project Kvad.xcodeproj -scheme Kvad -destination 'generic/platform=iOS' -derivedDataPath ../target/xcode-device -allowProvisioningUpdates build
+```
+
+```bash
+xcrun devicectl device install app --device <iPhone UDID> apps/phone/target/xcode-device/Build/Products/Debug-iphoneos/Kvad.app
+```
+
+`xcrun devicectl list devices` shows the UDID. "Signing for Kvad requires a
+development team" means `Team.local.xcconfig` is missing; "needs to be
+unlocked" means what it says. The Keychain entitlement that `project.yml`
+asks for is in the signature `build.sh` makes, so pairings are kept on the
+device as they are in the simulator.
 
 ## From anywhere, through the tunnel
 

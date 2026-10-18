@@ -222,11 +222,39 @@ was refused. The relay refused this scratch server's vouchers, since
 `relay.kvad.eu`'s allow list no longer has its key, so that pairing was
 on the LAN only.
 
+*On a real iPhone, 2026-10-18.* An iPhone 14 Pro Max on iOS 27.0.1,
+signed by a paid team, against a kvad-serve on the MacBook Pro at home
+(`direct = "auto"`, `relay.kvad.eu`):
+
+- The Camera read the QR code from `kvad remote pair` and opened the link
+  in Kvad, which paired with *Connect*. The connection began on the relay
+  and was on the LAN 4.5 s later.
+- A chat on Wi-Fi: 32 tokens, the first in 23 ms.
+- Wi-Fi off, in Settings: the same connection moved to the relay without
+  dropping, 24 s after the chat.
+- The app closed and opened again on mobile data: it reconnected from the
+  Keychain through the relay. Two chats, 46 and 47 tokens, the first in
+  26–29 ms, each reply 115 ms.
+- No direct path on mobile data, as expected behind the carrier's NAT with
+  no port opened on the home router: the relay is that path.
+
+iOS gives an app the generic "iPhone" as the device's name without a
+special entitlement, so that is the name the server shows.
+
+Found on the way: Xcode's "Signing for Kvad requires a development team".
+The team now goes in an uncommitted `ios/Team.local.xcconfig`, included by
+`Signing.xcconfig`, which `xcodegen generate` leaves alone; a team chosen in
+Xcode's window was thrown away by the next generate. The README has the
+steps from a fresh Mac to the app on the phone.
+
 Not yet done:
 
-- *A network change while in the foreground* (`NWPathMonitor`). iroh notices
-  on its own, more slowly; coming back from the background is covered.
-- *A run on a real iPhone over mobile data*, with the real Camera.
+- *Pairing on mobile data alone*, through the relay with the link's voucher
+  (done in the simulator, not yet from a phone).
+- *A network change while the app stays in the background*, then back to
+  the foreground (`sceneDidBecomeActive:`), without closing it.
+- *A network change while in the foreground* (`NWPathMonitor`). iroh moved
+  the connection on its own when Wi-Fi went off, within the 24 s above.
 
 **Phase 5: the rest.** The More tab, screen by screen, ordered by what the
 owner reaches for from a phone.

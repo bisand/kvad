@@ -17,6 +17,10 @@ targets:
     platform: iOS
     sources:
       - path: Assets.xcassets
+    # The development team, for an iPhone build: Signing.xcconfig.
+    configFiles:
+      Debug: Signing.xcconfig
+      Release: Signing.xcconfig
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: eu.kvad.phone
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

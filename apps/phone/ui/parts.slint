@@ -1,0 +1,368 @@
+// The pieces every screen is made of, drawn the way iOS draws its own:
+// grouped cards with hairline separators, 44-point touch targets, a pressed
+// state on everything that can be pressed.
+
+import { Theme } from "theme.slint";
+import { Spinner } from "std-widgets.slint";
+
+// Anything that can be pressed: it dims while held, as UIKit's controls do.
+export component Pressable inherits Rectangle {
+    callback clicked;
+    in property <bool> enabled: true;
+    out property <bool> pressed: touch.pressed;
+    opacity: !root.enabled ? 0.4 : touch.pressed ? 0.55 : 1.0;
+    animate opacity { duration: 140ms; easing: ease-out; }
+    @children
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component Icon inherits Image {
+    in property <color> tint: Theme.label;
+    colorize: root.tint;
+    image-fit: contain;
+    width: 24px;
+    height: 24px;
+}
+
+// The filled button at the bottom of a form.
+export component PrimaryButton inherits Pressable {
+    in property <string> text;
+    in property <bool> busy;
+    height: 50px;
+    border-radius: 14px;
+    background: Theme.accent;
+    HorizontalLayout {
+        alignment: center;
+        spacing: 10px;
+        if root.busy: Spinner {
+            indeterminate: true;
+            width: 18px;
+            height: 18px;
+            y: (parent.height - self.height) / 2;
+        }
+        Text {
+            text: root.text;
+            color: Theme.on-accent;
+            font-size: Theme.body * 1rem;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// A text button in the accent, as in a navigation bar.
+export component TextButton inherits Pressable {
+    in property <string> text;
+    in property <color> tint: Theme.accent;
+    in property <bool> bold;
+    min-width: Theme.touch;
+    height: Theme.touch;
+    Text {
+        text: root.text;
+        color: root.tint;
+        font-size: Theme.body * 1rem;
+        font-weight: root.bold ? 600 : 400;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}
+
+// A round icon button, as the composer's send.
+export component RoundButton inherits Pressable {
+    in property <image> icon;
+    in property <color> tint: Theme.on-accent;
+    width: 34px;
+    height: 34px;
+    border-radius: self.width / 2;
+    background: Theme.accent;
+    Icon {
+        source: root.icon;
+        tint: root.tint;
+        width: 18px;
+        height: 18px;
+    }
+}
+
+// The rule between two rows of a card, inset from the leading edge.
+export component Separator inherits Rectangle {
+    in property <length> inset: Theme.margin;
+    height: 1phx;
+    Rectangle {
+        x: root.inset;
+        width: parent.width - root.inset;
+        height: 1phx;
+        background: Theme.separator;
+    }
+}
+
+// An inset grouped section: rounded, on the grouped background.
+export component Card inherits Rectangle {
+    background: Theme.surface;
+    border-radius: Theme.card-corner;
+    clip: true;
+    VerticalLayout {
+        @children
+    }
+}
+
+// The small caps over a card, over the card's text, which starts a margin
+// in from the card.
+export component SectionHeader inherits HorizontalLayout {
+    in property <string> text;
+    padding-left: Theme.margin * 2;
+    padding-right: Theme.margin * 2;
+    Text {
+        text: root.text;
+        color: Theme.secondary;
+        font-size: Theme.footnote * 1rem;
+    }
+}
+
+// The grey note under a card.
+export component SectionFooter inherits Text {
+    color: Theme.secondary;
+    font-size: Theme.footnote * 1rem;
+    wrap: word-wrap;
+}
+
+// A row in a card: a title, a value or detail on the right, an optional
+// chevron, and the pressed highlight a table row has.
+export component Row inherits Rectangle {
+    callback clicked;
+    in property <string> title;
+    in property <string> detail;
+    in property <string> value;
+    in property <color> title-color: Theme.label;
+    in property <bool> chevron;
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    in property <bool> dot;
+    min-height: Theme.touch;
+    background: touch.pressed ? Theme.fill : transparent;
+    animate background { duration: 120ms; }
+    HorizontalLayout {
+        padding-left: Theme.margin;
+        padding-right: Theme.margin;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 10px;
+        if root.dot: Rectangle {
+            width: 8px;
+            height: 8px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 4px;
+            background: Theme.success;
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.title;
+                color: root.title-color;
+                font-size: Theme.body * 1rem;
+                overflow: elide;
+            }
+            if root.detail != "": Text {
+                text: root.detail;
+                color: Theme.secondary;
+                font-size: Theme.subheadline * 1rem;
+                overflow: elide;
+            }
+        }
+        if root.value != "": Text {
+            text: root.value;
+            color: Theme.secondary;
+            font-size: Theme.body * 1rem;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+        }
+        if root.checked: Icon {
+            source: @image-url("icons/check.svg");
+            tint: Theme.accent;
+            width: 20px;
+            height: 20px;
+            y: (parent.height - self.height) / 2;
+        }
+        if root.chevron: Icon {
+            source: @image-url("icons/chevron-right.svg");
+            tint: Theme.tertiary;
+            width: 14px;
+            height: 14px;
+            y: (parent.height - self.height) / 2;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A labelled field in a card, as a Settings form has them.
+export component Field inherits Rectangle {
+    callback accepted;
+    in property <string> label;
+    in property <string> placeholder;
+    in property <InputType> input-type: InputType.text;
+    in-out property <string> text <=> input.text;
+    in property <bool> enabled: true;
+    height: Theme.touch;
+    HorizontalLayout {
+        padding-left: Theme.margin;
+        padding-right: Theme.margin;
+        spacing: 12px;
+        Text {
+            text: root.label;
+            width: 4.8 * 1rem;
+            color: Theme.label;
+            font-size: Theme.body * 1rem;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            input := TextInput {
+                color: Theme.label;
+                font-size: Theme.body * 1rem;
+                vertical-alignment: center;
+                single-line: true;
+                input-type: root.input-type;
+                enabled: root.enabled;
+                selection-background-color: Theme.accent.with-alpha(0.35);
+                accepted => { root.accepted(); }
+            }
+            if input.text == "": Text {
+                x: 0;
+                width: parent.width;
+                height: parent.height;
+                text: root.placeholder;
+                color: Theme.tertiary;
+                font-size: Theme.body * 1rem;
+                vertical-alignment: center;
+                horizontal-alignment: left;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+// The large title at the top of a screen, with an optional action beside it.
+export component LargeTitle inherits VerticalLayout {
+    in property <string> title;
+    in property <string> subtitle;
+    padding-left: Theme.margin;
+    padding-right: Theme.margin;
+    padding-top: 6px;
+    padding-bottom: 10px;
+    spacing: 2px;
+    HorizontalLayout {
+        Text {
+            text: root.title;
+            color: Theme.label;
+            font-size: Theme.large-title * 1rem;
+            font-weight: 700;
+            horizontal-stretch: 1;
+        }
+        @children
+    }
+    if root.subtitle != "": Text {
+        text: root.subtitle;
+        color: Theme.secondary;
+        font-size: Theme.subheadline * 1rem;
+        overflow: elide;
+    }
+}
+
+// A screen with nothing in it yet, said kindly.
+export component EmptyState inherits VerticalLayout {
+    in property <image> icon;
+    in property <string> title;
+    in property <string> text;
+    in property <string> badge;
+    alignment: center;
+    spacing: 12px;
+    padding: 32px;
+    HorizontalLayout {
+        alignment: center;
+        Rectangle {
+            width: 76px;
+            height: 76px;
+            border-radius: 22px;
+            background: Theme.accent.with-alpha(0.14);
+            Icon {
+                source: root.icon;
+                tint: Theme.accent;
+                width: 36px;
+                height: 36px;
+            }
+        }
+    }
+    Text {
+        text: root.title;
+        color: Theme.label;
+        font-size: Theme.title2 * 1rem;
+        font-weight: 700;
+        horizontal-alignment: center;
+    }
+    Text {
+        text: root.text;
+        color: Theme.secondary;
+        font-size: Theme.body * 1rem;
+        horizontal-alignment: center;
+        wrap: word-wrap;
+    }
+    if root.badge != "": HorizontalLayout {
+        alignment: center;
+        Rectangle {
+            border-radius: self.height / 2;
+            background: Theme.fill;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 5px;
+                padding-bottom: 5px;
+                Text {
+                    text: root.badge;
+                    color: Theme.secondary;
+                    font-size: Theme.footnote * 1rem;
+                    font-weight: 600;
+                }
+            }
+        }
+    }
+}
+
+// One tab of the bar.
+export component TabItem inherits Rectangle {
+    callback clicked;
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> selected;
+    horizontal-stretch: 1;
+    height: 49px;
+    VerticalLayout {
+        alignment: center;
+        spacing: 3px;
+        HorizontalLayout {
+            alignment: center;
+            Icon {
+                source: root.icon;
+                tint: root.selected ? Theme.accent : Theme.secondary;
+                width: 26px;
+                height: 26px;
+            }
+        }
+        Text {
+            text: root.label;
+            color: root.selected ? Theme.accent : Theme.secondary;
+            font-size: Theme.tab-label * 1rem;
+            font-weight: 500;
+            horizontal-alignment: center;
+        }
+    }
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}

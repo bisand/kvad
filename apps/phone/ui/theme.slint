@@ -1,0 +1,49 @@
+// Colours and type after Apple's Human Interface Guidelines: the system's
+// semantic colours, light and dark, and the text styles as fractions of Body,
+// which Slint's iOS backend sets as 1rem and keeps in step with Dynamic Type.
+// One accent, Kvad's gold (docs/brand/README.md).
+
+import { Palette } from "std-widgets.slint";
+
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+
+    // Kvad's gold, darker on light backgrounds where #f0b35a washes out.
+    out property <color> accent: dark ? #f0b35a : #e09a35;
+    out property <color> on-accent: #1b1f2e;
+    out property <color> ink: #1b1f2e;
+
+    // systemGroupedBackground and its secondary, the card on top of it.
+    out property <color> background: dark ? #000000 : #f2f2f7;
+    out property <color> surface: dark ? #1c1c1e : #ffffff;
+    out property <color> raised: dark ? #2c2c2e : #ffffff;
+    // label, secondaryLabel, tertiaryLabel
+    out property <color> label: dark ? #ffffff : #000000;
+    out property <color> secondary: dark ? #ebebf599 : #3c3c4399;
+    out property <color> tertiary: dark ? #ebebf54d : #3c3c434d;
+    // separator, and tertiarySystemFill for fields and the other side's bubble
+    out property <color> separator: dark ? #54545899 : #3c3c434a;
+    out property <color> fill: dark ? #7676803d : #7676801f;
+    out property <color> bar: dark ? #161618f0 : #f9f9f9f0;
+    out property <color> danger: dark ? #ff453a : #ff3b30;
+    out property <color> success: dark ? #30d158 : #34c759;
+
+    // Text styles, as Apple sizes them at the default Body of 17 pt, as
+    // fractions of 1rem: a global cannot hold rem itself, since it has no
+    // window to know the default font size from. `font-size: Theme.body * 1rem`.
+    out property <float> large-title: 2;        // 34
+    out property <float> title2: 1.294;         // 22
+    out property <float> title3: 1.176;         // 20
+    out property <float> body: 1;               // 17
+    out property <float> callout: 0.941;        // 16
+    out property <float> subheadline: 0.882;    // 15
+    out property <float> footnote: 0.765;       // 13
+    out property <float> caption: 0.706;        // 12
+    out property <float> tab-label: 0.588;      // 10
+
+    // The phone's geometry.
+    out property <length> margin: 16px;
+    out property <length> touch: 44px;
+    out property <length> corner: 10px;
+    out property <length> card-corner: 12px;
+}

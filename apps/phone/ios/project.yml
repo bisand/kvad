@@ -33,6 +33,13 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: Kvad
+        # kvad:// links open in the app: the Camera's QR scanner shows one
+        # from `kvad remote pair` as a button. The app only fills in the
+        # Server field with it; pairing waits for Connect.
+        CFBundleURLTypes:
+          - CFBundleURLName: eu.kvad.phone
+            CFBundleURLSchemes:
+              - kvad
         # Animations at the screen's own rate on ProMotion iPhones, not 60.
         CADisableMinimumFrameDurationOnPhone: true
         UILaunchScreen:

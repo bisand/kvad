@@ -42,6 +42,8 @@ component ConnectScreen inherits Rectangle {
     in-out property <string> key;
     in property <bool> busy;
     in property <string> error;
+    // What an opened link is, until Connect is tapped.
+    in property <string> notice;
     callback connect(string, string);
     callback open-probe();
     callback paste-link();
@@ -106,7 +108,7 @@ component ConnectScreen inherits Rectangle {
                 padding-left: Theme.margin;
                 padding-right: Theme.margin;
                 SectionFooter {
-                    text: "To reach your Mac from anywhere, run kvad remote pair on it, copy the link, and paste it here. Or type the address kvad-serve listens on, for this network only. A paired phone keeps its keys in the Keychain, on this phone alone.";
+                    text: "To reach your Mac from anywhere, run kvad remote pair on it and scan its QR code with the Camera, or paste its link here. Or type the address kvad-serve listens on, for this network only. A paired phone keeps its keys in the Keychain, on this phone alone.";
                 }
             }
             HorizontalLayout {
@@ -118,6 +120,13 @@ component ConnectScreen inherits Rectangle {
                 }
             }
             Rectangle { height: 16px; }
+            if root.notice != "" && !root.busy: Text {
+                text: root.notice;
+                color: Theme.label;
+                font-size: Theme.subheadline * 1rem;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
             PrimaryButton {
                 text: root.busy ? "Connecting…" : "Connect";
                 busy: root.busy;
@@ -941,6 +950,7 @@ export component AppWindow inherits Window {
     in-out property <string> server-url: "127.0.0.1:5823";
     in-out property <string> api-key;
     in-out property <string> connect-error;
+    in-out property <string> connect-notice;
     in-out property <string> server-version;
     in-out property <string> server-who;
     in-out property <int> tab: 0;
@@ -1004,7 +1014,8 @@ export component AppWindow inherits Window {
         key <=> root.api-key;
         busy: root.connecting;
         error: root.connect-error;
-        connect(u, k) => { root.connect(u, k); }
+        notice: root.connect-notice;
+        connect(u, k) => { root.connect-notice = ""; root.connect(u, k); }
         open-probe => { root.open-probe(); }
         paste-link => { root.paste-link(); }
     }

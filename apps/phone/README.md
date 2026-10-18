@@ -70,14 +70,27 @@ On the Mac, with `[remote]` on in kvad-serve's `kvad.toml`:
 kvad remote pair
 ```
 
-Copy the link it shows (Universal Clipboard carries it to the phone), and
-tap *Paste a pairing link*, then *Connect*. The phone pairs, through the relay
+Point the iPhone's Camera at the QR code it shows and tap the `kvad://`
+link it offers: Kvad opens with the link in the Server field and says which
+server it is for. Or copy the link (Universal Clipboard carries it to the
+phone) and tap *Paste a pairing link*. Either way nothing happens until you
+tap *Connect*: a link only fills in the field. The phone pairs, through the relay
 if it is not on the Mac's network, and keeps its device key, the key the
 server made for it, and its relay voucher in the Keychain: this phone only,
 while unlocked, never synced. After that the Server field holds
 `kvad://<node id>`, and *Connect* reaches the Mac from Wi-Fi or mobile data
 alike. More shows which path it is on, and *Unpair this phone* revokes the
 pairing on the Mac as well as here.
+
+To try an opened link in the simulator, which has no camera:
+
+```bash
+xcrun simctl openurl booted 'kvad://…&pair=…'
+```
+
+Each time the app comes back to the foreground it tells the tunnel that the
+network may have changed, so that a phone that left the Wi-Fi while Kvad was
+in the background looks for its paths again at once.
 
 Plain HTTP still reaches only the phone's own network (App Transport
 Security's `NSAllowsLocalNetworking`), so an address typed in works on the

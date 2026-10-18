@@ -310,6 +310,27 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // A `kvad://` link opened in the app, from the Camera's QR scanner or a
+    // tap, goes in the Server field and waits for Connect: pairing is the
+    // person's act, never the link's. Coming back to the foreground looks for
+    // paths again, since the phone may be on another network by then.
+    ios::listen(ios::Events {
+        opened: Box::new({
+            let weak = ui.as_weak();
+            move |link| {
+                let _ = weak.upgrade_in_event_loop(move |ui| opened(&ui, &link));
+            }
+        }),
+        active: Box::new({
+            let state = state.clone();
+            move || {
+                if let Some(server) = state.lock().unwrap().server.as_ref() {
+                    server.network_changed();
+                }
+            }
+        }),
+    });
+
     probe::wire(&ui);
 
     #[cfg(debug_assertions)]
@@ -437,6 +458,36 @@ fn short_ids(text: &str) -> String {
 
 /// A server's name as a row has room for: `kvad://` and the first twelve
 /// digits of its node id, or an address as it is.
+/// Puts an opened link in front of the person, once it parses as a server or
+/// a pairing link; on the Connect screen, or, while connected to a server,
+/// as a line in the chat that says how to get to it.
+fn opened(ui: &AppWindow, link: &str) {
+    let link = link.trim();
+    let what = if link.len() > 4096 {
+        None
+    } else if link.contains("&pair=") {
+        link.parse::<kvad_tunnel::PairLink>().ok().map(|l| format!("Pair with {}? Tap Connect to pair this phone.", short_name(&format!("kvad://{}", l.address.node))))
+    } else {
+        link.parse::<kvad_tunnel::Address>().ok().map(|a| format!("Opened {}. Tap Connect to reach it.", short_name(&format!("kvad://{}", a.node))))
+    };
+    let say = |text: &str| match ui.get_connected() {
+        true => ui.set_chat_error(text.into()),
+        false => ui.set_connect_error(text.into()),
+    };
+    let Some(notice) = what else {
+        say("That link is not a Kvad server or pairing link.");
+        return;
+    };
+    ui.set_server_url(link.into());
+    ui.set_api_key("".into());
+    if ui.get_connected() {
+        say("A Kvad link was opened. Disconnect in More to use it.");
+    } else {
+        ui.set_connect_error("".into());
+        ui.set_connect_notice(notice.into());
+    }
+}
+
 fn short_name(name: &str) -> String {
     match name.strip_prefix("kvad://") {
         Some(id) if id.len() > 12 => format!("kvad://{}…", &id[..12]),

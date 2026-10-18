@@ -67,6 +67,13 @@ impl Tunnel {
         self.client.path()
     }
 
+    /// See [`Client::network_changed`]. Returns at once; the new search runs
+    /// on the tunnel's own threads.
+    pub fn network_changed(&self) {
+        let client = self.client.clone();
+        self.runtime.spawn(async move { client.network_changed().await });
+    }
+
     pub fn address(&self) -> &Address {
         &self.address
     }

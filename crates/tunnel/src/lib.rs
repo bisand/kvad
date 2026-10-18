@@ -1093,6 +1093,13 @@ impl Client {
         selected(&self.conn)
     }
 
+    /// Says that the machine's network may have changed, so that paths are
+    /// looked for again at once rather than when iroh notices: a phone that
+    /// left the Wi-Fi, or came back to the foreground on 5G.
+    pub async fn network_changed(&self) {
+        self.endpoint.network_change().await
+    }
+
     /// Waits until the connection is gone, whichever end or whatever in
     /// between ended it, and says why: what a client that outlives one
     /// connection waits on to make the next.

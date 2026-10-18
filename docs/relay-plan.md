@@ -535,6 +535,56 @@ mapping request leaves the machine. A WebSocket opened through the tunnel
 streams both ways at once, and its events back are not held up by an upload
 filling the other direction.
 
+*Built, 2026-10-18.* `crates/tunnel` (`kvad-tunnel`) is the tunnel:
+`Server`, `Client`, `blocking::Tunnel` for the CLI, `Address` and `Path`,
+with iroh inside and named nowhere outside. It is a crate with no iroh in
+its signatures rather than a `trait Tunnel`, which gives the same freedom to
+replace it with less ceremony. `kvad-serve` serves it as a second
+`axum::serve` listener into the same router, from a `[remote]` section that
+is refused with `auth.mode = "none"`, even with `--insecure`. `kvad --remote
+kvad://…` dials it, and every HTTP connection is a stream handed to ureq as
+one end of a Unix socket pair, so the CLI opens no port. `kvad remote id`
+prints the device's id for the server's `allow`, and `kvad remote status`
+the path.
+
+What it does that the plan did not say:
+
+- *A hello.* QUIC lets a client open a stream before it learns that the
+  server refused it, so a refused device saw only an empty reply. The server
+  now writes `kvad-tunnel/1` on a stream of its own once it has let a device
+  in, and a client waits for it. A refusal is an error at connect, naming the
+  fix, and a different protocol version is refused with both versions named.
+- *No 0-RTT.* Neither side uses iroh's 0-RTT calls, so nothing replayable is
+  accepted.
+- *Owner checks by uid.* Key files are checked against the process's own
+  uid, not `$HOME`'s owner, since a service's data directory need not be
+  under a home.
+
+Tested:
+
+- `crates/tunnel/tests/tunnel.rs`, on loopback:
+  - HTTP direct with no relay, several streams over one connection.
+  - HTTP through a relay in the test process with `direct = "off"`.
+  - An unlisted key refused at connect.
+  - A wrong knock refused.
+  - A 4-second streamed reply that opened on the relay, went direct, and
+    finished whole after the relay was shut down mid-reply.
+  - The lockfile holds no port-mapping crate.
+- By hand, a scratch kvad-serve with `auth.mode = "local"` and the CLI:
+  - `auth status`, a refused unsigned `ls`, the first account made with
+    `auth setup` and a key kept with `auth login`, all through the tunnel.
+  - Then `ls` and a streamed `run`, direct on the LAN and then relay only
+    through `relay.kvad.eu`.
+
+Not yet done:
+
+- The existing API tests run through the tunnel.
+- The direct path blocked mid-stream and the reply finishing over the relay.
+  That needs a firewall rule in the test, or a test transport that can drop
+  a path.
+- A WebSocket through the tunnel, since nothing in kvad-serve speaks one yet.
+- `direct = "lan"`, which needs Kvad's own path selection.
+
 **Phase 2: identity, pairing and the LAN.** `remote.key`, `kvad remote
 pair`, the link format with its hints, token lifetime, the PAKE, the
 `devices` table and its API key, `kvad devices`, the `_kvad-remote._udp`
@@ -543,6 +593,58 @@ works over the LAN with no relay. Tests: a good pairing, over the LAN and
 through a relay; an expired token; a used token, including one first used on
 the other path; a wrong code; a revoked device; a device paired to one
 account cannot act as another.
+
+*Built, 2026-10-18 (pairing by QR code or link, without the PAKE).*
+
+- **The pairing lane.** The tunnel's allow list is a live `Allowed`. While
+  a slot is open, the handshake lets an unknown key in to one request and
+  one answer, with a hello that says so, and no HTTP. Removing a device
+  closes its live connection.
+- **Slots.** kvad-serve keeps them in memory only: a 256-bit token that lives
+  ten minutes and is burnt on first use, right or wrong. Presenting it again
+  is told "already used". A good pairing adds a row to `devices` (migration
+  022) and makes an API key for the device.
+- **What a device's key may do.** It works only through the tunnel and only
+  from its own node, checked against the `ConnectInfo` the tunnel's listener
+  attaches to each request. It acts as `user` unless the slot granted
+  `admin`, and a device without `admin` cannot open a slot.
+- **Commands.** `kvad remote pair` shows the link and a QR code in the
+  terminal, `kvad remote join LINK` pairs and keeps the key with the
+  server's whole address, and `kvad devices` lists and removes devices. The
+  server's TCP port is how the first account pairs its first device.
+- **Fewer refusals turned into a wait.** A refused handshake now starts a
+  backoff only on the third within a minute, so that a device that tried
+  before its slot was open gets its retry.
+
+Tested:
+
+- *The tunnel* (`crates/tunnel/tests/tunnel.rs`): an unknown key refused
+  with no slot open; reaching only the pairing lane while one is; refused
+  as "not paired" by a normal connect; told "already paired" once let in;
+  and a removed device cut off mid-reply.
+- *Slots and devices* (`remote.rs`, `devices.rs`): a good pairing, a used
+  token, an unknown token, an expired one, a refused token burnt too, the
+  lane closing as slots expire, admin granted only when asked, and other
+  protocol versions refused.
+- *Auth* (`auth/tests.rs`): a device's key accepted from its own node and
+  lowered to `user`; refused on the TCP port and from another device.
+- *By hand*, with two identities against a scratch server in local auth
+  mode: unpaired and refused; `pair` (a 31-line QR code), `join`, then
+  commands by `kvad://<node id>` alone; an admin account's device held to
+  `user`; the spent link refused to a second device; the device's key
+  refused on the TCP port; a device refused a slot; `devices rm`, and the
+  device refused at once.
+
+Not yet done:
+
+- *The PAKE and the six-digit code.* A link that travels anywhere but the
+  server's own screen is as good as a password for its ten minutes.
+- *The `_kvad-remote._udp` record.*
+- *Pairing through the relay.* The relay's allow list is a file
+  (`tools/kvad-relay/deploy/allow.local`), so a newly paired device gets
+  through the relay only once its id is added there. Phase 3 is the relay
+  learning a node's devices from the node.
+- *The web UI's pairing screen and device list*, which is Phase 4.
 
 **Phase 3: `kvad-relay`.** The crate, its config, access control, health,
 metrics, the self-test. Docker image and Compose file first. Tests: two

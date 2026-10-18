@@ -30,6 +30,7 @@ pub mod complete;
 pub mod help;
 pub mod models;
 pub mod out;
+pub mod remote;
 pub mod service;
 pub mod spec;
 
@@ -72,6 +73,7 @@ pub fn remote_only(command: &str) -> bool {
             | "users"
             | "sessions"
             | "keys"
+            | "devices"
             | "api"
     )
 }
@@ -138,6 +140,7 @@ pub fn remote(remote: &Remote, args: &Args) -> Res<()> {
         "users" => api::users(remote, args),
         "sessions" => api::sessions(remote, args),
         "keys" => api::keys(remote, args),
+        "devices" => remote::devices(remote, args),
         "api" => api::raw(remote, args),
         other => help::unknown_command(other),
     }
@@ -192,6 +195,7 @@ mod tests {
         ("api.rs", include_str!("cli/api.rs")),
         ("service.rs", include_str!("cli/service.rs")),
         ("cluster.rs", include_str!("cli/cluster.rs")),
+        ("remote.rs", include_str!("cli/remote.rs")),
     ];
 
     const METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
@@ -295,7 +299,7 @@ mod tests {
         let known: BTreeSet<&str> = [
             "ls", "ps", "search", "info", "pull", "use", "rm", "cache", "load", "unload", "cancel",
             "queue", "tokenize", "run", "chat", "train", "transcribe", "service", "conversations", "images", "videos", "jobs",
-            "datasets", "tune", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "api", "cluster",
+            "datasets", "tune", "evals", "bench", "metrics", "auth", "users", "sessions", "keys", "devices", "remote", "api", "cluster",
         ]
         .into();
         for (method, path, commands) in client::COMMANDS {
@@ -303,7 +307,7 @@ mod tests {
                 let word = command.split_whitespace().nth(1).unwrap_or("");
                 assert!(known.contains(word), "{method} {path} names `{command}`, which is not a command");
                 assert!(
-                    word == "service" || word == "api" || word == "cluster" || remote_only(word) || crate::cli::models::LOCAL_TOO.contains(&word),
+                    word == "service" || word == "api" || word == "cluster" || word == "remote" || remote_only(word) || crate::cli::models::LOCAL_TOO.contains(&word),
                     "`{word}` is dispatched to neither a server nor this process"
                 );
             }

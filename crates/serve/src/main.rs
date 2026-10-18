@@ -50,6 +50,7 @@ mod config;
 mod conversations;
 mod datasets;
 mod db;
+mod devices;
 mod engine;
 mod evals;
 mod images;
@@ -64,6 +65,7 @@ mod openai;
 mod openapi;
 mod playground;
 mod realtime;
+mod remote;
 mod retrieval;
 mod scheduler;
 mod secret;
@@ -169,7 +171,7 @@ async fn main() {
         .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "kvad_serve=info,tower_http=warn,warn".into()),
+                .unwrap_or_else(|_| "kvad_serve=info,kvad_tunnel=info,tower_http=warn,warn".into()),
         )
         .init();
 
@@ -252,6 +254,21 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
     let scheduler = std::sync::Arc::new(scheduler::Scheduler::spawn(engine::loader, budget).bounded(cfg.server.queue.unwrap_or(scheduler::DEFAULT_LIMIT)).sharing(cfg.server.queue_per_account.unwrap_or(scheduler::DEFAULT_SHARE)).pacing(cfg.server.generations_per_minute.unwrap_or(0)).batching(cfg.server.batch.unwrap_or(scheduler::DEFAULT_BATCH)));
     // The layers a worker holds for others come out of the same budget.
     cluster::host(scheduler.clone());
+    // The tunnel, a second way into the same router, and the pairings it
+    // carries; see `config::Remote` and `remote`.
+    let (tunnel, remote) = match cfg.remote.enabled {
+        true => {
+            let wanted = cfg.remote.tunnel(&data_dir)?;
+            let mut server = kvad_tunnel::Server::start(&wanted).await.map_err(|e| format!("[remote]: {e}"))?;
+            let remote = std::sync::Arc::new(remote::Remote::new(cfg.remote.ids()?, server.address().clone(), wanted.allowed.clone()));
+            remote.reload(&db)?;
+            if let Some(pairings) = server.take_pairings() {
+                tokio::spawn(remote.clone().serve_pairings(db.clone(), pairings));
+            }
+            (Some(server), Some(remote))
+        }
+        false => (None, None),
+    };
     let state = auth::State {
         auth: auth::provider(cfg.auth.mode, &cfg.auth.oidc)?.into(),
         engine: scheduler.clone(),
@@ -262,6 +279,7 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
         started: std::time::Instant::now(),
         load_on_request: cfg.server.load_on_request,
         settings: std::sync::Arc::clone(&settings),
+        remote: remote.clone(),
         db,
     };
 
@@ -348,6 +366,21 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
         }
     );
     println!("  videos     {ffmpeg}");
+    if let Some(t) = &tunnel {
+        let how = match cfg.remote.direct.as_str() {
+            "off" => "relay only".to_string(),
+            _ => format!("direct on udp {}", cfg.remote.port),
+        };
+        let devices = match remote.as_ref().map_or(0, |r| r.allowed.len()) {
+            0 => "no devices yet: kvad remote pair".to_string(),
+            1 => "1 device".to_string(),
+            n => format!("{n} devices"),
+        };
+        println!("  remote     {} · {how} · {devices}", t.address().label());
+        // The whole address, knock included, where only somebody at this
+        // terminal can read it: it is what `kvad --remote` dials.
+        println!("             {}", t.address());
+    }
     if let Some(repo) = &bring_back {
         println!("  autoload   {repo}, in the background");
     }
@@ -389,7 +422,31 @@ async fn run(args: Args, metrics: std::sync::Arc<metrics::Metrics>) -> Res<Stopp
             }
         }
     };
-    axum::serve(listener, app).with_graceful_shutdown(stopping).await?;
+    // One signal for both ways in, so that a restart stops them together.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        stopping.await;
+        let _ = stop.send(true);
+    });
+    let until = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = rx.wait_for(|s| *s).await;
+    };
+    let http = axum::serve(listener, app.clone()).with_graceful_shutdown(until(stopped.clone()));
+    match tunnel {
+        Some(tunnel) => {
+            let closer = tunnel.closer();
+            // With the device each request came from, which a device's key
+            // is checked against; see `remote::Tunnelled`.
+            let remote = axum::serve(tunnel, app.into_make_service_with_connect_info::<remote::Tunnelled>())
+                .with_graceful_shutdown(until(stopped));
+            let (http, remote) = tokio::join!(async { http.await }, async { remote.await });
+            // Before a restart binds the UDP port again.
+            closer.close().await;
+            http?;
+            remote?;
+        }
+        None => http.await?,
+    }
     if settings.is_restarting() {
         return Ok(Stopped::ToRestart);
     }

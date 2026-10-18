@@ -322,6 +322,7 @@ async fn the_admin_extractor_takes_administrators_and_nobody_else() {
         started: std::time::Instant::now(),
         load_on_request: false,
         settings: Default::default(),
+        remote: None,
     };
 
     // Ada is an administrator...
@@ -360,6 +361,7 @@ async fn a_cross_site_post_is_refused_before_the_cookie_is_even_looked_up() {
         started: std::time::Instant::now(),
         load_on_request: false,
         settings: Default::default(),
+        remote: None,
     };
     let cookie = format!("kvad_session={token}");
 
@@ -435,4 +437,54 @@ fn oidc_accepts_a_session_or_a_key_and_nothing_else() {
     let password = Presented::Basic { name: "ada".into(), password: "lovelace-1843".into() };
     assert!(Oidc.identify(&password, &db).is_none());
     assert!(Oidc.identify(&Presented::Nothing, &db).is_none());
+}
+
+/// A device's key is that device's, and only through the tunnel. Delete the
+/// node check in the extractor and the copied key below works; delete the
+/// role clamp and the phone is an administrator because its account is.
+#[tokio::test]
+async fn a_device_key_works_only_from_its_device_and_only_as_what_it_was_granted() {
+    let db = db_with_people();
+    let ada = users::by_name(&db, "ada").unwrap().unwrap();
+    let dir = std::env::temp_dir().join(format!("kvad-auth-device-{}", std::process::id()));
+    let node = |n: &str| kvad_tunnel::Key::load(&dir.join(n)).unwrap().0.id();
+    let (phone, other) = (node("phone"), node("other"));
+    let (_, key) = crate::devices::pair(&db, &phone.to_string(), "phone", ada.id, false).unwrap();
+
+    let state = State {
+        db: db.clone(),
+        auth: std::sync::Arc::new(Local),
+        engine: std::sync::Arc::new(crate::scheduler::Scheduler::spawn(
+            || Box::new(|_, _, _, _| Err("no backend in tests".into())),
+            crate::memory::Budget { total: 0, context: 1 },
+        )),
+        jobs: std::sync::Arc::new(crate::jobs::Jobs::new(db.clone())),
+        metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
+        setup: std::sync::Arc::new(Setup::default()),
+        oidc: std::sync::Arc::new(Default::default()),
+        started: std::time::Instant::now(),
+        load_on_request: false,
+        settings: Default::default(),
+        remote: None,
+    };
+    let bearer = format!("Bearer {key}");
+    let via = |node: Option<kvad_tunnel::NodeId>| {
+        let mut parts = request("GET", &[("authorization", bearer.as_str())]);
+        if let Some(n) = node {
+            parts.extensions.insert(axum::extract::ConnectInfo(crate::remote::Tunnelled(n)));
+        }
+        parts
+    };
+
+    let who = Identity::from_request_parts(&mut via(Some(phone)), &state).await.unwrap();
+    assert_eq!((who.name.as_str(), who.role, who.device.is_some()), ("ada", Role::User, true), "lowered to what pairing granted");
+    assert!(Admin::from_request_parts(&mut via(Some(phone)), &state).await.is_err());
+
+    for (place, parts) in [("the TCP port", via(None)), ("another device", via(Some(other)))] {
+        let Err(denied) = Identity::from_request_parts(&mut { parts }, &state).await else {
+            panic!("a device's key worked from {place}");
+        };
+        assert_eq!(denied.0, StatusCode::UNAUTHORIZED);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

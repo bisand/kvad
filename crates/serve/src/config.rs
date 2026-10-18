@@ -51,6 +51,7 @@ pub struct Config {
     pub videos: Videos,
     pub cluster: Cluster,
     pub worker: Worker,
+    pub remote: Remote,
     /// The command line's, not the server's. It is here so that a file with
     /// it in is not refused as having a key nobody knows.
     pub client: Client,
@@ -171,6 +172,75 @@ pub struct Worker {
 impl Default for Worker {
     fn default() -> Self {
         Worker { enabled: false, port: kvad::cluster::wire::PORT }
+    }
+}
+
+/// Reaching this server from anywhere, through the tunnel of
+/// `docs/relay-plan.md`: end-to-end encrypted, directly when a path can be
+/// made and through the relays here when it cannot.
+///
+/// The server's identity is `remote.key` in the data directory, and its knock
+/// `remote.knock` beside it, both made on the first start with this on. The
+/// address it prints at startup, `kvad://…`, is what `kvad --remote` dials.
+///
+/// A tunnel is a way to reach the server, not a way around signing in: a
+/// tunnelled request needs a key or a session like any other, so this is
+/// refused with `auth.mode = "none"`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Remote {
+    pub enabled: bool,
+    /// `https://` relays, tried in order.
+    pub relays: Vec<String>,
+    /// `auto`, every path; `off`, the relay only, with no UDP socket open.
+    pub direct: String,
+    /// The UDP port for direct connections, fixed so that it can be
+    /// forwarded by hand. Kvad never asks the router to open it.
+    pub port: u16,
+    /// Devices let in besides the paired ones (`kvad devices`): each the id
+    /// `kvad remote id` prints on it. Pairing is the usual way; this is for a
+    /// device that is to be let in without an account's key.
+    pub allow: Vec<String>,
+}
+
+impl Default for Remote {
+    fn default() -> Self {
+        Remote { enabled: false, relays: Vec::new(), direct: "auto".into(), port: REMOTE_PORT, allow: Vec::new() }
+    }
+}
+
+/// UDP, beside the HTTP port.
+pub const REMOTE_PORT: u16 = 5824;
+
+impl Remote {
+    /// What the tunnel is started with, from this section and the data
+    /// directory its secrets are kept in.
+    pub fn tunnel(&self, data_dir: &Path) -> Result<kvad_tunnel::ServerConfig, String> {
+        let direct = match self.direct.as_str() {
+            "auto" => kvad_tunnel::Direct::Auto,
+            "off" => kvad_tunnel::Direct::Off,
+            "lan" => {
+                return Err("remote.direct = \"lan\" is planned but not built yet: use \"auto\" or \"off\"".into())
+            }
+            other => return Err(format!("remote.direct = \"{other}\": use \"auto\" or \"off\"")),
+        };
+        let allowed = kvad_tunnel::Allowed::new(self.ids()?);
+        if self.relays.is_empty() && direct == kvad_tunnel::Direct::Off {
+            return Err("remote.direct = \"off\" needs remote.relays: with neither, nothing could reach this server".into());
+        }
+        Ok(kvad_tunnel::ServerConfig {
+            key: data_dir.join("remote.key"),
+            knock: data_dir.join("remote.knock"),
+            relays: self.relays.clone(),
+            direct,
+            port: self.port,
+            allowed,
+        })
+    }
+
+    /// `allow`, read: devices let in whatever the `devices` table says.
+    pub fn ids(&self) -> Result<Vec<kvad_tunnel::NodeId>, String> {
+        self.allow.iter().map(|id| id.parse()).collect::<Result<Vec<_>, _>>().map_err(|e| format!("remote.allow: {e}"))
     }
 }
 
@@ -422,6 +492,14 @@ impl Config {
             )
             .into());
         }
+        // Not even with --insecure: that is for something in front of this
+        // server that authenticates, and nothing stands in front of a tunnel.
+        if self.remote.enabled && self.auth.mode == Mode::None {
+            return Err("refusing [remote] with auth.mode = \"none\": every device that reached this \
+                        server through the tunnel would be an administrator. Set an auth mode, and \
+                        give each device a key (kvad auth login --remote kvad://…)."
+                .into());
+        }
         // Which modes exist is `auth::provider`'s to say, not this file's: it
         // is the one that has to build them.
         crate::auth::provider(self.auth.mode, &self.auth.oidc)?;
@@ -447,6 +525,44 @@ fn is_loopback(addr: &SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote(toml: &str) -> Config {
+        toml::from_str(toml).unwrap()
+    }
+
+    const ID: &str = "14713dcae14786ed6e5c20f250a2c67ab31ee028a72d1d12ec457ca850a2a310";
+
+    /// A tunnelled request has to sign in like any other, so there is no
+    /// `--insecure` way round it: nothing stands in front of a tunnel.
+    #[test]
+    fn a_tunnel_is_refused_without_accounts() {
+        let open = remote(&format!("[remote]\nenabled = true\nallow = [\"{ID}\"]\nrelays = [\"https://relay.kvad.eu\"]\n"));
+        assert_eq!(open.auth.mode, Mode::None);
+        let e = open.check(false).unwrap_err().to_string();
+        assert!(e.contains("[remote]"), "{e}");
+        assert!(open.check(true).is_err(), "--insecure must not let a tunnel run without accounts");
+        let signed = remote(&format!("[auth]\nmode = \"local\"\n[remote]\nenabled = true\nallow = [\"{ID}\"]\n"));
+        assert!(signed.check(false).is_ok());
+        // Off, it is nobody's business what the rest says.
+        assert!(Config::default().check(false).is_ok());
+    }
+
+    #[test]
+    fn a_tunnel_says_what_is_wrong_with_its_section() {
+        let dir = Path::new("/tmp/kvad");
+        let ok = |t: &str| remote(t).remote.tunnel(dir);
+        let base = format!("allow = [\"{ID}\"]\n");
+        let t = ok(&format!("[remote]\n{base}")).unwrap();
+        assert_eq!((t.port, t.direct), (REMOTE_PORT, kvad_tunnel::Direct::Auto));
+        assert_eq!(t.key, dir.join("remote.key"));
+        assert!(ok("[remote]\n").is_ok(), "no allow is fine: devices are paired");
+        assert!(ok("[remote]\nallow = [\"nope\"]\n").unwrap_err().contains("not a node id"));
+        assert!(ok(&format!("[remote]\n{base}direct = \"lan\"\n")).unwrap_err().contains("not built yet"));
+        assert!(ok(&format!("[remote]\n{base}direct = \"sometimes\"\n")).is_err());
+        assert!(ok(&format!("[remote]\n{base}direct = \"off\"\n")).unwrap_err().contains("needs remote.relays"));
+        let relayed = ok(&format!("[remote]\n{base}direct = \"off\"\nrelays = [\"https://relay.kvad.eu\"]\n")).unwrap();
+        assert_eq!(relayed.direct, kvad_tunnel::Direct::Off);
+    }
 
     /// `[data] dir` is where the database goes too, unless `[database] path`
     /// says otherwise, and a relative one is read from the file's directory.

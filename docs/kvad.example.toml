@@ -96,6 +96,18 @@ bind = "127.0.0.1:5823"
 # enabled = true
 # port = 7420
 
+[remote]
+# Reach this server from anywhere, through an end-to-end encrypted tunnel:
+# direct when the two machines can reach each other, through a relay when they
+# cannot (docs/serve.md, "From anywhere, through the tunnel"). Needs an auth
+# mode with accounts: a tunnelled request signs in like any other.
+# enabled = true
+# relays = ["https://relay.kvad.eu"]   # https:// relays, tried in order
+# direct = "auto"                      # or "off": the relay only, no UDP socket
+# port = 5824                          # UDP for direct paths; never mapped on the router
+# allow = ["<id>"]                     # let in without pairing: `kvad remote id` on it
+# Devices are paired with `kvad remote pair` here and `kvad remote join` on them.
+
 [videos]
 # The ffmpeg that compresses each video once it is made: H.264 at CRF 19 and
 # AAC, as LTX's reference writes them. kvad writes an MP4 itself that

@@ -27,6 +27,7 @@ axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
 getrandom = "0.4.3"
 kvad = { path = "../llm" }
+kvad-tunnel = { path = "../tunnel", features = ["axum"] }
 kvad-gpu = { path = "../gpu", optional = true }
 libc = "0.2.189"
 mime_guess = "2.0.5"

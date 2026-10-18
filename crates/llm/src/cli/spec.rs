@@ -908,6 +908,57 @@ pub const COMMANDS: &[Command] = &[
                 worker by name is written for macOS; elsewhere, give its address.",
         examples: &["kvad worker", "kvad worker --port 7421"],
     },
+    Command {
+        name: "remote",
+        group: Group::Accounts,
+        args: "[id|status|pair|join]",
+        about: "pair devices with a server, and reach it from anywhere",
+        server: false,
+        routed: false,
+        words: &[Kind::Text],
+        subs: &[
+            Sub { name: "id", args: "", about: "the id a server's [remote] allow lists for this machine", words: &[], flags: &[] },
+            Sub { name: "status", args: "", about: "which path the tunnel to a kvad:// server is on", words: &[], flags: &[] },
+            Sub {
+                name: "pair",
+                args: "",
+                about: "on the server: a link and QR code that pair one device",
+                words: &[],
+                flags: &[&[sw("--admin", "let the device act as an administrator")]],
+            },
+            Sub {
+                name: "join",
+                args: "LINK",
+                about: "on the device: pair with a link from `kvad remote pair`",
+                words: &[Kind::Text],
+                flags: &[&[f("--name", "NAME", Kind::Text, "what the server calls this device (default: hostname)")]],
+            },
+        ],
+        flags: &[],
+        usage: None,
+        notes: "A server with [remote] in its kvad.toml prints a kvad:// address when it starts. On it, \
+                `kvad remote pair` shows a link and a QR code that pair one device, once, within ten minutes; \
+                on the device, `kvad remote join LINK` pairs and keeps a key that works from that device \
+                alone. Every command then takes --remote kvad://<node id>.",
+        examples: &["kvad remote pair", "kvad remote join 'kvad://…&pair=…'", "kvad remote status --remote kvad://…"],
+    },
+    Command {
+        name: "devices",
+        group: Group::Accounts,
+        args: "[ls|rm ID]",
+        about: "the devices paired with a server, and unpairing one",
+        server: true,
+        routed: true,
+        words: &[Kind::Text],
+        subs: &[
+            Sub { name: "ls", args: "", about: "your paired devices", words: &[], flags: &[&[sw("--all", "every account's, for an administrator")]] },
+            Sub { name: "rm", args: "ID", about: "unpair one: its key is revoked and its connection closed", words: &[Kind::Text], flags: &[] },
+        ],
+        flags: &[],
+        usage: None,
+        notes: "",
+        examples: &["kvad devices", "kvad devices rm 3"],
+    },
     // -- accounts ----------------------------------------------------------
     Command {
         name: "auth",
@@ -1215,7 +1266,7 @@ mod tests {
     #[test]
     fn the_table_holds_every_command_and_only_those() {
         for command in COMMANDS {
-            let handled = matches!(command.name, "arch" | "crawl" | "transcribe" | "service" | "cluster" | "worker" | "serve" | "help" | "completions");
+            let handled = matches!(command.name, "arch" | "crawl" | "transcribe" | "service" | "cluster" | "worker" | "remote" | "serve" | "help" | "completions");
             assert!(handled || crate::cli::known(command.name), "`{}` is in the table and nothing runs it", command.name);
             assert_eq!(command.server, crate::cli::remote_only(command.name), "`{}`: does it need a server?", command.name);
             // The parser gathers words only for the commands it knows take
@@ -1246,7 +1297,7 @@ mod tests {
     /// A subcommand in the table is one its command's source matches on.
     #[test]
     fn every_subcommand_is_one_the_source_matches() {
-        let sources = [include_str!("api.rs"), include_str!("models.rs"), include_str!("service.rs"), include_str!("cluster.rs"), include_str!("complete.rs"), include_str!("../main.rs")];
+        let sources = [include_str!("api.rs"), include_str!("models.rs"), include_str!("service.rs"), include_str!("cluster.rs"), include_str!("complete.rs"), include_str!("remote.rs"), include_str!("../main.rs")];
         for command in COMMANDS {
             for sub in command.subs {
                 let arm = format!("\"{}\"", sub.name);

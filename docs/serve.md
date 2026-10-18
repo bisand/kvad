@@ -542,6 +542,76 @@ whether anything answers. A job the service manager calls running that does
 not answer on its port is the failure people actually hit, and a status
 command that only asked the service manager would call it fine.
 
+## From anywhere, through the tunnel
+
+A `[remote]` section in `kvad.toml` lets this server be reached from outside
+the machine and its network without opening a port: an end-to-end encrypted
+tunnel, direct when the two machines can reach each other and through a relay
+when they cannot (`docs/relay-plan.md`, Phase 1).
+
+```toml
+[auth]
+mode = "local"                       # a tunnel needs accounts; see below
+
+[remote]
+enabled = true
+relays = ["https://relay.kvad.eu"]   # tools/kvad-relay, run somewhere public
+```
+
+A device is paired once. On the server's machine, signed in:
+
+```bash
+kvad remote pair
+```
+
+It shows a QR code and a link, good once, for ten minutes. On the device:
+
+```bash
+kvad remote join 'kvad://9ce63fe0…?k=…&relay=https://relay.kvad.eu&pair=…'
+```
+
+The device is now in `kvad devices`, with a key of its own kept in its
+`credentials.json`, and every command takes the server's name:
+
+```bash
+kvad chat --remote kvad://9ce63fe0…
+```
+
+`kvad remote status --remote kvad://…` says which path the connection is on:
+`lan`, `direct` or `relay`. `kvad devices rm ID` unpairs one: its key is
+revoked and its connection closed at once. `[remote] allow` lists ids let in
+without pairing, from `kvad remote id` on each.
+
+- **Sign-in still applies.** A tunnelled request needs a key or a session as
+  any other does, so `[remote]` is refused with `auth.mode = "none"`, and
+  `--insecure` does not change that: nothing stands in front of a tunnel.
+- **Only paired devices get in.** Every other key is refused at the
+  handshake, before any HTTP is read. While a pairing is open, an unknown
+  key gets as far as the pairing exchange, one request and one answer, and
+  no further.
+- **A device's key is that device's.** It works only through the tunnel,
+  from the device it was made for, and acts as `user` unless the device was
+  paired with `kvad remote pair --admin`, whatever its account is. A device
+  cannot pair other devices unless it has `admin`. A connection without the knock gets no
+  answer at all, or one TLS alert sent before the server's key would be.
+- **Post-quantum.** X25519MLKEM768 is the only key exchange, to the device and
+  to the relay. A relay that cannot do it is refused.
+- **No router ports.** Kvad never asks the router for a mapping. A direct
+  path across the internet forms by hole punching, or through a port forwarded
+  by hand to `[remote] port`. `direct = "off"` opens no UDP socket at all and
+  goes through the relay alone.
+- **Keys in owner-only files.** The server's are `remote.key` and
+  `remote.knock` in the data directory; a device's is `device.key` beside
+  `credentials.json`. Each is made on first use, and refused if anyone else
+  can read it.
+- **The CLI opens no port.** Each HTTP connection is a stream through the
+  tunnel, handed to the CLI as one end of a Unix socket pair, so nothing else
+  on the device can use the connection.
+
+The relay sees which keys talk, when, and how much, but not what. Run your own
+(`tools/kvad-relay/deploy/README.md`); it serves only the keys on its own
+allow list.
+
 ## Testing
 
 The API tests train a two-layer GPT on "the cat sat on the mat" *inside the

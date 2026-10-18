@@ -234,6 +234,10 @@ pub struct Credential {
     /// Whose it is, for `kvad auth status` to say without asking.
     #[serde(default)]
     pub user: Option<String>,
+    /// For a `kvad://` server: its whole address, knock and hints, so that
+    /// `--remote kvad://<node id>` is enough once a device is paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 /// `credentials.json` in the config directory. Beside `kvad.toml` rather
@@ -319,12 +323,39 @@ pub enum Auth {
 }
 
 /// A server, and how to talk to it.
+#[derive(Clone)]
 pub struct Remote {
-    /// `http://host:port`, with no trailing slash.
+    /// `http://host:port`, with no trailing slash, or `kvad://<node id>` for
+    /// a server reached through the tunnel: what is shown, and what a key is
+    /// kept under.
     pub base: String,
     pub why: Why,
     pub auth: Auth,
     agent: ureq::Agent,
+    /// What request URLs start with: `base`, or for the tunnel a loopback
+    /// stand-in that its connector never dials.
+    http: String,
+    /// The connection to a `kvad://` server, which every agent of this
+    /// remote's opens its streams through.
+    tunnel: Option<std::sync::Arc<kvad_tunnel::blocking::Tunnel>>,
+}
+
+/// The stand-in a tunnelled request's URL starts with. An address, so that no
+/// name is looked up, and never connected to: the tunnel's connector takes
+/// every connection.
+const TUNNELLED: &str = "http://127.0.0.1:5823";
+
+/// This machine's identity as a device of a server reached through the
+/// tunnel; its id is what the server's `[remote] allow` lists.
+pub fn device_key_path() -> PathBuf {
+    crate::hub::config_dir().join("device.key")
+}
+
+/// The id of this machine's device key, made on first use, and whether it was
+/// made just now.
+pub fn device_id() -> Result<(String, bool), String> {
+    let (key, made) = kvad_tunnel::Key::load(&device_key_path())?;
+    Ok((key.id().to_string(), made))
 }
 
 /// What a request came back with when it was not a success.
@@ -422,6 +453,9 @@ impl Remote {
     /// people type, and a trailing slash is dropped so that paths join.
     pub fn new(url: &str, why: Why) -> Result<Remote, String> {
         let url = url.trim();
+        if url.starts_with("kvad://") {
+            return Remote::tunnelled(url, why);
+        }
         let base = match url.contains("://") {
             true => url.to_string(),
             false => format!("http://{url}"),
@@ -452,7 +486,52 @@ impl Remote {
                 .proxy(if loopback { None } else { ureq::Proxy::try_from_env() })
                 .build(),
         );
-        Ok(Remote { base, why, auth, agent })
+        Ok(Remote { http: base.clone(), base, why, auth, agent, tunnel: None })
+    }
+
+    /// A server by its `kvad://` address, through the tunnel: dialled now, as
+    /// this machine's device key, and held until this remote is dropped.
+    fn tunnelled(url: &str, why: Why) -> Result<Remote, String> {
+        // `kvad://<node id>` alone is a paired server's name: its address is
+        // the one kept when this device was paired.
+        let url = match url.contains('?') {
+            true => url.to_string(),
+            false => credential(url.trim_end_matches('/'))
+                .and_then(|c| c.address)
+                .ok_or_else(|| format!("{url} is not a server this device is paired with: give its whole address, with k= in it"))?,
+        };
+        let address: kvad_tunnel::Address = url.parse()?;
+        let tunnel = std::sync::Arc::new(kvad_tunnel::blocking::Tunnel::connect(&device_key_path(), &address)?);
+        let base = address.label();
+        let auth = match std::env::var(KEY_VAR).ok().filter(|k| !k.trim().is_empty()) {
+            Some(key) => Auth::Bearer(key.trim().to_string()),
+            None => credential(&base).map_or(Auth::None, |c| Auth::Bearer(c.key)),
+        };
+        let tunnel = Some(tunnel);
+        let agent = agent(&tunnel, ureq::Agent::config_builder()
+            .user_agent(concat!("kvad/", env!("CARGO_PKG_VERSION")))
+            .http_status_as_error(false)
+            .proxy(None)
+            .build());
+        Ok(Remote { base, why, auth, agent, http: TUNNELLED.into(), tunnel })
+    }
+
+    /// The same server, proving itself a different way.
+    pub fn with_auth(&self, auth: Auth) -> Remote {
+        let mut other = self.clone();
+        other.auth = auth;
+        other
+    }
+
+    /// A `kvad://` server's whole address, knock and hints, to keep with its
+    /// key.
+    pub fn dial_address(&self) -> Option<String> {
+        Some(self.tunnel.as_ref()?.address().to_string())
+    }
+
+    /// The path the tunnel is on, for a `kvad://` server.
+    pub fn path(&self) -> Option<String> {
+        self.tunnel.as_ref()?.path().map(|p| p.to_string())
     }
 
     /// The same server, asked by somebody who will not wait: half a second
@@ -463,8 +542,9 @@ impl Remote {
     /// every other request uses has no limit on the answer at all, because a
     /// generation may take an hour.
     pub fn hurried(mut self) -> Remote {
-        let loopback = self.base.contains("://127.0.0.1") || self.base.contains("://localhost") || self.base.contains("://[::1]");
-        self.agent = ureq::Agent::new_with_config(
+        let loopback = self.http.contains("://127.0.0.1") || self.http.contains("://localhost") || self.http.contains("://[::1]");
+        self.agent = agent(
+            &self.tunnel,
             ureq::Agent::config_builder()
                 .user_agent(concat!("kvad/", env!("CARGO_PKG_VERSION")))
                 .timeout_connect(Some(Duration::from_millis(500)))
@@ -494,7 +574,8 @@ impl Remote {
     /// so that case is confirmed at `/api/auth`, the one route that answers
     /// anybody, and whose `mode` field nothing else would have.
     fn probe(&self) -> Probe {
-        let quick = ureq::Agent::new_with_config(
+        let quick = agent(
+            &self.tunnel,
             ureq::Agent::config_builder()
                 .timeout_connect(Some(Duration::from_millis(400)))
                 .timeout_global(Some(Duration::from_secs(3)))
@@ -503,7 +584,7 @@ impl Remote {
                 .build(),
         );
         let ask = |path: &str, auth: bool| -> Option<(u16, Value)> {
-            let mut req = quick.get(format!("{}{path}", self.base));
+            let mut req = quick.get(format!("{}{path}", self.http));
             if let (true, Some(value)) = (auth, self.authorization()) {
                 req = req.header("authorization", value);
             }
@@ -544,7 +625,7 @@ impl Remote {
     ) -> Res<ureq::http::Response<ureq::Body>> {
         let mut req = ureq::http::Request::builder()
             .method(method.to_ascii_uppercase().as_str())
-            .uri(format!("{}{path}", self.base))
+            .uri(format!("{}{path}", self.http))
             .header("accept", accept);
         if let Some(value) = self.authorization() {
             req = req.header("authorization", value);
@@ -554,7 +635,7 @@ impl Remote {
             // it came from, or the server takes it for a forgery from some
             // other site's page. It came from here: this is the client, not
             // a page in a browser somebody else controls.
-            req = req.header("cookie", cookie.as_str()).header("origin", self.base.as_str());
+            req = req.header("cookie", cookie.as_str()).header("origin", self.http.as_str());
         }
         let sent = match body {
             None => self.agent.run(req.body(())?),
@@ -873,6 +954,10 @@ impl<R: BufRead> Iterator for Events<R> {
 /// here.
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("get", "/api/health", "kvad service status"),
+    ("get", "/api/remote", "kvad remote status"),
+    ("post", "/api/remote/pair", "kvad remote pair"),
+    ("get", "/api/devices", "kvad devices"),
+    ("delete", "/api/devices/{id}", "kvad devices rm"),
     ("get", "/api/openapi.json", "kvad api"),
     ("get", "/api/models", "kvad ls, kvad ps, kvad cache"),
     ("delete", "/api/models", "kvad rm"),
@@ -1010,6 +1095,95 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
     ("delete", "/api/data/move", "cancelling a move the Settings page started"),
     ("delete", "/api/data/previous", "deleting what a move from the Settings page left behind"),
 ];
+
+/// An agent with `config`, which for a tunnelled server opens every
+/// connection through the tunnel.
+fn agent(tunnel: &Option<std::sync::Arc<kvad_tunnel::blocking::Tunnel>>, config: ureq::config::Config) -> ureq::Agent {
+    match tunnel {
+        None => ureq::Agent::new_with_config(config),
+        Some(t) => ureq::Agent::with_parts(
+            config,
+            through_tunnel::Connector(t.clone()),
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        ),
+    }
+}
+
+/// ureq's connections, made of streams through the tunnel: each one end of a
+/// Unix socket pair the tunnel copies to a QUIC stream, so that no port is
+/// opened anywhere for the CLI to talk through.
+mod through_tunnel {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use ureq::unversioned::transport::{Buffers, ConnectionDetails, LazyBuffers, NextTimeout, Transport};
+
+    pub struct Connector(pub Arc<kvad_tunnel::blocking::Tunnel>);
+
+    impl std::fmt::Debug for Connector {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Connector({})", self.0.address().label())
+        }
+    }
+
+    impl ureq::unversioned::transport::Connector<()> for Connector {
+        type Out = Socket;
+
+        fn connect(&self, details: &ConnectionDetails, _: Option<()>) -> Result<Option<Socket>, ureq::Error> {
+            let stream = self.0.open().map_err(|e| ureq::Error::Io(std::io::Error::other(e)))?;
+            let buffers = LazyBuffers::new(details.config.input_buffer_size(), details.config.output_buffer_size());
+            Ok(Some(Socket { stream, buffers }))
+        }
+    }
+
+    pub struct Socket {
+        stream: UnixStream,
+        buffers: LazyBuffers,
+    }
+
+    impl std::fmt::Debug for Socket {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Socket(tunnel)")
+        }
+    }
+
+    fn timed_out(e: &std::io::Error) -> bool {
+        matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+    }
+
+    impl Transport for Socket {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+            self.stream.set_write_timeout(timeout.not_zero().map(|t| *t))?;
+            let output = &self.buffers.output()[..amount];
+            match self.stream.write_all(output) {
+                Err(e) if timed_out(&e) => Err(ureq::Error::Timeout(timeout.reason)),
+                other => Ok(other?),
+            }
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+            self.stream.set_read_timeout(timeout.not_zero().map(|t| *t))?;
+            let input = self.buffers.input_append_buf();
+            let amount = match self.stream.read(input) {
+                Err(e) if timed_out(&e) => return Err(ureq::Error::Timeout(timeout.reason)),
+                other => other?,
+            };
+            self.buffers.input_appended(amount);
+            Ok(amount > 0)
+        }
+
+        fn is_open(&mut self) -> bool {
+            // A peek would say whether the other end has gone; a pooled
+            // stream the server closed is found out at the next request
+            // instead, which ureq retries.
+            true
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

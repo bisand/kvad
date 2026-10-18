@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "kvad-relay"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "iroh-base",
  "iroh-relay",

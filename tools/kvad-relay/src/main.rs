@@ -41,6 +41,7 @@ type Res<T> = Result<T, String>;
 
 const USAGE: &str = "\
 usage: kvad-relay --hostname NAME --bind IP --allow FILE --cache DIR [--staging]
+                  [--https-port 443] [--quic-port 7842] [--http-port 80]
        kvad-relay --dev --allow FILE";
 
 struct Opts {
@@ -50,10 +51,26 @@ struct Opts {
     cache: Option<PathBuf>,
     staging: bool,
     dev: bool,
+    /// Where HTTPS, QUIC address discovery and the loopback HTTP listen. Not
+    /// the defaults when another server holds 443 and passes the relay's
+    /// name through to it, as Traefik does on a k3s that serves websites.
+    https_port: u16,
+    quic_port: u16,
+    http_port: u16,
 }
 
 fn parse() -> Res<Opts> {
-    let mut o = Opts { hostname: None, bind: None, allow: PathBuf::new(), cache: None, staging: false, dev: false };
+    let mut o = Opts {
+        hostname: None,
+        bind: None,
+        allow: PathBuf::new(),
+        cache: None,
+        staging: false,
+        dev: false,
+        https_port: 443,
+        quic_port: 7842,
+        http_port: 80,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{a} needs a value\n{USAGE}"));
@@ -64,6 +81,9 @@ fn parse() -> Res<Opts> {
             "--cache" => o.cache = Some(PathBuf::from(value()?)),
             "--staging" => o.staging = true,
             "--dev" => o.dev = true,
+            "--https-port" => o.https_port = value()?.parse().map_err(|_| "--https-port takes a port")?,
+            "--quic-port" => o.quic_port = value()?.parse().map_err(|_| "--quic-port takes a port")?,
+            "--http-port" => o.http_port = value()?.parse().map_err(|_| "--http-port takes a port")?,
             _ => return Err(format!("unknown argument {a}\n{USAGE}")),
         }
     }
@@ -166,15 +186,15 @@ async fn config(o: &Opts, allow: Arc<Allow>) -> Res<ServerConfig> {
         .map_err(|e| e.to_string())?
         .with_no_client_auth();
     let acme = AcmeConfig::letsencrypt(!o.staging).domains(vec![hostname]).cache_path(cache);
-    let tls = TlsConfig::new(SocketAddr::new(bind, 443), CertConfig::LetsEncrypt { acme_config: acme, server_config_builder: builder });
+    let tls = TlsConfig::new(SocketAddr::new(bind, o.https_port), CertConfig::LetsEncrypt { acme_config: acme, server_config_builder: builder });
     // Plain HTTP only where nothing outside the machine can reach it.
-    let mut relay = RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    let mut relay = RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, o.http_port)));
     relay.tls = Some(tls);
     relay.access = Arc::new(Gate(allow));
     relay.limits = limits();
     let mut c = ServerConfig::default();
     c.relay = Some(relay);
-    c.quic = Some(QuicConfig::new(SocketAddr::new(bind, 7842)));
+    c.quic = Some(QuicConfig::new(SocketAddr::new(bind, o.quic_port)));
     c.metrics_addr = None;
     Ok(c)
 }
@@ -189,6 +209,10 @@ async fn main() {
 
 async fn run() -> Res<()> {
     let o = parse()?;
+    // Ours is the process's provider too: parts of the relay ask rustls for
+    // the default, and with ring and aws-lc-rs both compiled in (iroh-relay's
+    // server feature brings ring) it cannot choose one by itself.
+    let _ = rustls::crypto::CryptoProvider::install_default((*crypto()).clone());
     let allow = Arc::new(Allow::load(o.allow.clone())?);
     eprintln!("kvad-relay: {} allowed keys", allow.ids.read().unwrap().len());
     let server = Server::spawn(config(&o, allow.clone()).await?).await.map_err(|e| format!("starting: {e}"))?;

@@ -53,6 +53,43 @@ from anywhere, a probe run through it (see `tools/relay-probe/README.md`):
 the listener's `network:` lines show its public address, which only the
 relay's address discovery can have told it.
 
+## Behind a Traefik that already holds 443
+
+On a k3s that serves websites, Traefik has 443. `deploy/k8s-traefik.yaml`
+runs the relay as an ordinary pod beside it:
+
+- Traefik passes connections that name the relay through as they are
+  (`IngressRouteTCP` with `HostSNI` and TLS passthrough), so the relay keeps
+  its own certificate and post-quantum TLS, and every other site is as it
+  was. The Let's Encrypt challenge reaches the relay the same way.
+- UDP 7842 goes to the pod by a host port on the public address, which keeps
+  each client's own address.
+- Every port is above 1024, so the pod runs as a non-root user with no
+  capabilities at all.
+- The certificate is kept on a 16 MiB PersistentVolumeClaim.
+
+Only 7842/udp needs opening in the firewall; 443 is already Traefik's.
+
+```bash
+ufw allow in on eth0 to 217.170.199.230 port 7842 proto udp comment 'kvad-relay address discovery'
+```
+
+```bash
+RELAY_MANIFEST=deploy/k8s-traefik.yaml RELAY_HOSTNAME=relay2.kvad.eu RELAY_ADDRESS=217.170.199.230 deploy/deploy.sh root@tst01 deploy/allow.local -i ~/.ssh/id_tst01_networco_bogentech_no
+```
+
+## Before deploying anywhere: does traffic arrive?
+
+A provider's network can drop what its panel says it lets through. On the
+host, capture while connecting from outside:
+
+```bash
+tcpdump -ni eth0 "tcp[tcpflags] & tcp-syn != 0 or udp port 7842"
+```
+
+A port whose packets never show there is closed upstream, and nothing on the
+host will open it.
+
 ## What runs
 
 - `hostNetwork`, ports 443/tcp and 7842/udp on `85.137.228.199` only.

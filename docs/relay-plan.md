@@ -483,6 +483,45 @@ honest client (see *Security*). And iroh's path choice is not "LAN first":
 in one run it stayed on the tailnet address at 0.9 ms with the LAN beside
 it. Kvad's own `PathSelector` decides that, per the open question below.
 
+*The first field run (2026-10-18).* The listener was the MacBook Pro at
+home: Norwegian broadband, IPv4 only, behind the home router. The dialler
+was a MacBook Air on an iPhone's Personal Hotspot over mobile data, held to
+the hotspot interface with `relay-probe --bind`. The relay was
+`tools/kvad-relay` at `relay2.kvad.eu`, a k3s node in a Norwegian data
+centre, behind Traefik's TLS passthrough. Its TLS negotiated X25519MLKEM768
+with a client that offered only that.
+
+| Run | Opened on | Then | Median RTT | p90 | Worst | Lost |
+|---|---|---|---|---|---|---|
+| Relay only, 40 s | relay, in 0.85 s | stayed | 62.5 ms | 96.6 ms | 302 ms | 0 of 156 |
+| All paths, 60 s | relay, in 0.20 s | **no direct path** | 57.3 ms | 68.0 ms | 94.1 ms | 0 of 238 |
+
+- *Address discovery worked.* The home Mac learnt `81.166.239.243:5824`,
+  its own port kept by the router, and the Air learnt the carrier's
+  `77.18.34.152:41523`. Neither learnt whether its NAT maps each
+  destination to a new port: that needs two relays to compare, and there
+  was one.
+- *Hole punching did not succeed* in 60 s. The likely cause is that
+  Personal Hotspot is a NAT of its own, in front of the carrier's
+  carrier-grade NAT, and two NATs in a row rarely punch. An app on the
+  phone itself is behind the carrier's NAT alone. That is the run that
+  matters, and it needs the tunnel in the app (Phase 4 of
+  `docs/phone-plan.md`).
+- *The relay is not optional for a phone on mobile data.* Here it carried
+  every packet, at about 60 ms, with no ping lost.
+- *IPv6 could not help.* The carrier gave the Air a global IPv6 address,
+  but the home connection has none, and neither has the relay's node, so
+  every path was IPv4.
+- *iroh reports "behind a captive portal" falsely.* It checks for a portal
+  over the relay's plain HTTP on port 80, which kvad-relay keeps on
+  loopback. Kvad's own status should not repeat that line.
+- *The first relay host could not be used.* At `postbud`'s provider,
+  inbound traffic reached the VM on TCP 25 alone. Rules for 443 and 7842,
+  an ACCEPT policy, the provider firewall switched off and a stop and start
+  of the VM changed nothing, and a capture on the VM's interface saw no
+  other port arrive. Before deploying to a host, a capture there while
+  connecting from outside answers in a minute what the panel cannot.
+
 **Phase 1: a tunnel on one machine.** `trait Tunnel` with the current path as
 a watchable value, an iroh-backed implementation, `kvad-serve` accepting a
 tunnelled connection and handing it to the router, `kvad --remote kvad://...`

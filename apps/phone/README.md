@@ -1,19 +1,16 @@
 # Kvad for iPhone
 
 A client of a kvad-serve, for the phone: chat, and in later phases speech,
-images, video and the rest of what Kvad does. Written in Rust, with its UI
-in [Slint](https://slint.dev) (`ui/*.slint`), drawn natively through
-winit and Skia, and designed for iOS rather than ported from the web UI.
-The plan is [`docs/phone-plan.md`](../../docs/phone-plan.md).
+images, video and the rest of what Kvad does. Its UI is SwiftUI
+([`ios/Kvad/`](ios/Kvad)), over a Rust core ([`core/`](core)) that does the
+work: connecting, pairing, the tunnel, the chat, the Keychain and the
+Network test. The plans are [`docs/phone-plan.md`](../../docs/phone-plan.md)
+and [`docs/phone-swiftui-plan.md`](../../docs/phone-swiftui-plan.md).
 
-It is its own Cargo workspace, so Slint and Skia stay out of Kvad's builds.
-
-The app is moving to SwiftUI over a Rust core
-([`docs/phone-swiftui-plan.md`](../../docs/phone-swiftui-plan.md)). The core
-is [`core/`](core): connecting, pairing, the chat, the Keychain and the
-Network test, behind three C functions ([`core/kvad_core.h`](core/kvad_core.h))
-and the JSON messages in [`messages.json`](messages.json). Its tests run on
-the Mac and reach no server:
+The core is called through three C functions
+([`core/kvad_core.h`](core/kvad_core.h)) and the JSON messages in
+[`messages.json`](messages.json). It is its own Cargo workspace, which keeps
+it out of Kvad's builds. Its tests run on the Mac and reach no server:
 
 ```bash
 cargo test --manifest-path apps/phone/Cargo.toml -p kvad-phone-core
@@ -25,6 +22,15 @@ One more chats with a running kvad-serve, `127.0.0.1:5823` unless
 ```bash
 cargo test --manifest-path apps/phone/Cargo.toml -p kvad-phone-core -- --ignored
 ```
+
+The Swift side's tests decode every event in `messages.json`:
+
+```bash
+cd apps/phone/ios && xcodegen generate && xcodebuild test -project Kvad.xcodeproj -scheme Kvad -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -derivedDataPath ../target/xcode
+```
+
+The Slint UI the app had first (`src/`, `ui/`) still runs on the Mac with
+`cargo run`, until it is deleted; the iOS project no longer builds it.
 
 ## On the Mac, while designing
 
@@ -68,10 +74,8 @@ SIMCTL_CHILD_KVAD_PHONE_CONNECT=127.0.0.1:5823 SIMCTL_CHILD_KVAD_PHONE_TAB=3 xcr
 
 `CONNECT` connects at launch (an address, a paired `kvad://<node id>`, or a
 pairing link, which pairs first), `TAB` opens a tab (0 Chat to 4 More),
-`MODEL` picks the chat model, `SAY` sends a message, `SHEET` opens the model
-sheet, and `UNPAIR` unpairs the phone from the server it connected to. `PROBE` opens the Network test, and when it is a ticket, runs it,
-for as long as `PROBE_LENGTH` says (0 to 2: 30 s, 1 min, 5 min). None of it
-is in a release build.
+`MODEL` picks the chat model, and `SAY` sends a message (`Script` in
+`ios/Kvad/Model.swift`). None of it is in a release build.
 
 ## On an iPhone
 
@@ -206,5 +210,6 @@ mapping that expires; and Wi-Fi on at home, for the LAN case.
 
 ## Licences
 
-Kvad's code here is MIT. Slint is used under its royalty-free licence, whose
-attribution is the About section of the More tab (`AboutSlint`).
+Kvad's code here is MIT. The iPhone app ships no Slint. The Slint UI that
+still runs on the Mac uses Slint under its royalty-free licence, whose
+attribution is its More tab's About section (`AboutSlint`).

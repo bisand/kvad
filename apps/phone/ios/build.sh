@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Xcode's build phase for the app: builds the Rust binary for the platform
-# Xcode is building for, and puts it where Xcode expects the executable.
-# Takes the cargo binary's name.
+# Xcode's build phase for the app, before it compiles the Swift: builds the
+# Rust core (apps/phone/core) as a static library for the platform Xcode is
+# building for, and links it where the target's LIBRARY_SEARCH_PATHS look.
 set -euo pipefail
 
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 cd "$(dirname "$0")/.."
 
-# macOS's bash is 3.2, where an empty array under `set -u` is unbound.
 profile=debug
 if [[ "${CONFIGURATION:-Debug}" != "Debug" ]]; then
     profile=release
 fi
+cargo_profile=$([[ $profile == debug ]] && echo dev || echo release)
 
 # The simulator and the device are different targets for the same arm64.
 case "${PLATFORM_NAME:-iphonesimulator}" in
@@ -20,30 +20,9 @@ case "${PLATFORM_NAME:-iphonesimulator}" in
     *) echo "build.sh: no Rust target for ${PLATFORM_NAME}" >&2; exit 1 ;;
 esac
 
-cargo_profile=$([[ $profile == debug ]] && echo dev || echo release)
+cargo build --profile "$cargo_profile" --target "$target" -p kvad-phone-core
 
-# The entitlements (the Keychain's access group, see project.yml) reach the
-# app differently on each. The simulator reads them from two sections of the
-# executable, which Xcode's own link would have added, so cargo's link adds
-# them: `cargo rustc` passes the flags to the final link alone, so nothing it
-# depends on is built again. A device reads them from the signature, below.
-xcent="${TARGET_TEMP_DIR:-}/${FULL_PRODUCT_NAME:-Kvad.app}-Simulated.xcent"
-if [[ "$target" == aarch64-apple-ios-sim && -f "$xcent" ]]; then
-    cargo rustc --profile "$cargo_profile" --target "$target" --bin "$1" -- \
-        -C "link-arg=-Wl,-sectcreate,__TEXT,__entitlements,$xcent" \
-        -C "link-arg=-Wl,-sectcreate,__TEXT,__ents_der,$xcent.der"
-else
-    cargo build --profile "$cargo_profile" --target "$target" --bin "$1"
-fi
-cp "target/$target/$profile/$1" "$TARGET_BUILD_DIR/$EXECUTABLE_PATH"
-
-# A device build is signed again, now that the binary has been replaced, with
-# the entitlements Xcode prepared for it.
-if [[ "$target" == aarch64-apple-ios && -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" && "${CODE_SIGNING_ALLOWED:-YES}" != NO ]]; then
-    entitlements="${TARGET_TEMP_DIR:-}/${FULL_PRODUCT_NAME:-Kvad.app}.xcent"
-    if [[ -s "$entitlements" ]]; then
-        codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --entitlements "$entitlements" "$TARGET_BUILD_DIR/$EXECUTABLE_PATH"
-    else
-        codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" "$TARGET_BUILD_DIR/$EXECUTABLE_PATH"
-    fi
-fi
+# A link, not a copy: a debug library is some 430 MB, nearly all debug info.
+out="${TARGET_TEMP_DIR:?build.sh runs from Xcode}/rust"
+mkdir -p "$out"
+ln -sf "$PWD/target/$target/$profile/libkvad_phone_core.a" "$out/libkvad_phone_core.a"

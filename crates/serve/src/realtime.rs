@@ -115,6 +115,14 @@ const CADENCE: Duration = Duration::from_secs(1);
 /// minute of audio waiting for an engine that is busy with something else.
 const MOST_BEHIND: f32 = 60.0;
 
+/// The most audio one update hears, in samples at 16 kHz. A live window is
+/// cut at a segment once it holds more than `CUT` (20 s); handed more than
+/// the 10 s between that and Whisper's 30 s at once, it begins again at its
+/// newest 30 s and what came before was never decoded. A backlog, from a
+/// busy server or a slow decoder, is heard this much at a time instead, an
+/// update after another until it is gone.
+const MOST_AT_ONCE: usize = 5 * SAMPLE_RATE;
+
 /// How long a session is held after its socket goes without a close, for
 /// the client to reconnect and go on with it.
 pub const HOLD: Duration = Duration::from_secs(60);
@@ -597,8 +605,9 @@ impl Session {
                 listened = async { (&mut self.pending.as_mut().expect("guarded").0).await }, if self.pending.is_some() => {
                     let (_, finished) = self.pending.take().expect("guarded");
                     (out, ended) = self.listened(listened, finished);
-                    // A commit that came during an update is run at once.
-                    if !ended && self.commit {
+                    // A commit that came during an update is run at once,
+                    // and so is a backlog's next piece.
+                    if !ended && (self.commit || self.audio.len() >= MOST_AT_ONCE) {
                         if let Err(m) = self.begin().await {
                             out.push(m);
                             ended = true;
@@ -706,15 +715,18 @@ impl Session {
         Ok(())
     }
 
-    /// Send the audio come since the last update to the engine, and the
-    /// window decoded again, or with a commit, everything settled. An
-    /// error, which ends the session, if there is no model to do it.
+    /// Send the audio come since the last update to the engine, up to
+    /// `MOST_AT_ONCE` of it, and the window decoded again; with a commit and
+    /// nothing left waiting, everything settled. An error, which ends the
+    /// session, if there is no model to do it.
     async fn begin(&mut self) -> Result<(), Message> {
         if let Err(why) = self.ears.find(self.setup.model.as_deref()).await {
             return Err(self.error("model_not_available", why));
         }
-        let finish = std::mem::take(&mut self.commit);
-        let audio = std::mem::take(&mut self.audio);
+        let audio: Vec<f32> = self.audio.drain(..self.audio.len().min(MOST_AT_ONCE)).collect();
+        // A commit finishes the item once the audio before it is all heard.
+        let finish = self.commit && self.audio.is_empty();
+        self.commit &= !finish;
         let pending = self.ears.listen(self.live.take(), self.setup.request.clone(), audio, finish);
         self.pending = Some((pending, finish));
         Ok(())
@@ -1055,9 +1067,10 @@ mod tests {
     /// meanwhile are skipped, but every second of audio is heard, and the
     /// text is what a decoder that keeps up writes. A second of audio comes
     /// every 40 ms, and an update takes 100 ms and more, so each hears 3 s
-    /// or so. Not much more: a window that fills to 30 s between updates
-    /// begins again and loses its partial, by design, and the script
-    /// hears a window with no padding as silence.
+    /// or so, and on a slow machine up to `MOST_AT_ONCE`, never more: a
+    /// window handed 30 s at once would begin again, and the script hears a
+    /// window with no padding as silence. On a busy CI runner, before
+    /// `MOST_AT_ONCE`, this one kept 10 words of 40.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_slow_decoder_skips_partials_but_never_audio() {
         let (held, tr, rec) = (Arc::new(Held::new(HOLD)), Arc::new(Script::transcriber()), recording());
@@ -1072,6 +1085,23 @@ mod tests {
         assert_eq!(completed["kvad"]["heard"], 40.0);
         let partials = c.events.iter().filter(|v| v["type"] == "kvad.transcription.partial").count();
         assert!(partials < 20, "{partials} updates in 40 s of audio; most were skipped");
+        let (deltas, whole) = transcript(&c.events);
+        assert_eq!(whole, script_text(40).trim());
+        assert_eq!(deltas.trim(), whole);
+    }
+
+    /// A backlog, as a busy server or a slow decoder makes: all 40 s come
+    /// while the first update is under way. The next updates hear it a few
+    /// seconds at a time, and every word is in the transcript.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_backlog_is_heard_a_few_seconds_at_a_time() {
+        let (held, tr, rec) = (Arc::new(Held::new(HOLD)), Arc::new(Script::transcriber()), recording());
+        let mut c = connect(&held, &tr, Duration::from_millis(300), None);
+        c.until("session.created").await;
+        c.play(&rec, 0, 40 * S);
+        c.say(json!({ "type": "input_audio_buffer.commit" }));
+        let completed = c.until("conversation.item.input_audio_transcription.completed").await;
+        assert_eq!(completed["kvad"]["heard"], 40.0);
         let (deltas, whole) = transcript(&c.events);
         assert_eq!(whole, script_text(40).trim());
         assert_eq!(deltas.trim(), whole);

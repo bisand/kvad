@@ -78,7 +78,7 @@ fn serve_with(
 ) -> (Address, Allowed) {
     let cfg = ServerConfig { key: dir.path("remote.key"), knock: dir.path("remote.knock"), relays, direct, port: 0, allowed: allowed.clone() };
     let mut server = rt.block_on(Server::start(&cfg)).unwrap();
-    let address = server.address().clone();
+    let address = loopback(server.address().clone());
     let mut pairings = server.take_pairings().unwrap();
     rt.spawn(async move {
         while let Some(p) = pairings.recv().await {
@@ -87,6 +87,17 @@ fn serve_with(
     });
     rt.spawn(async move { axum::serve(server, router()).await });
     (address, allowed)
+}
+
+/// `address` with its direct addresses moved to loopback, at the same ports.
+/// A test then never depends on this machine's LAN, or on a firewall that
+/// asks before a freshly built test binary may take a connection there.
+fn loopback(mut address: Address) -> Address {
+    let mut ports: Vec<u16> = address.addrs.iter().map(|a| a.port()).collect();
+    ports.sort();
+    ports.dedup();
+    address.addrs = ports.into_iter().map(|p| std::net::SocketAddr::from(([127, 0, 0, 1], p))).collect();
+    address
 }
 
 fn client_key(dir: &Scratch) -> (PathBuf, NodeId) {

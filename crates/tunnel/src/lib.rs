@@ -50,6 +50,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, Se
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub mod blocking;
+#[cfg(feature = "ureq")]
+pub mod for_ureq;
 
 pub type Res<T> = Result<T, String>;
 
@@ -118,6 +120,24 @@ impl Key {
 
     pub fn id(&self) -> NodeId {
         NodeId(self.secret.public())
+    }
+
+    /// A new key, for a caller that keeps keys somewhere other than a file:
+    /// the iPhone app keeps its in the Keychain.
+    pub fn generate() -> Key {
+        Key { secret: SecretKey::generate() }
+    }
+
+    /// A key from the 32 bytes [`Key::to_bytes`] gave.
+    pub fn from_bytes(bytes: &[u8; 32]) -> Key {
+        Key { secret: SecretKey::from_bytes(bytes) }
+    }
+
+    /// The secret itself, for a caller that keeps it somewhere safer than
+    /// this process's memory. Never for a log, a file anyone else can read,
+    /// or the network.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
     }
 
     /// Vouchers signed with this key.

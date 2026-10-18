@@ -167,6 +167,45 @@ endpoint at once (`network_change`), so that a phone moving from Wi-Fi to 5G
 finds its paths again in milliseconds rather than when iroh notices. The
 relay voucher kept with the device key renews itself through the tunnel.
 
+*Built, 2026-10-18, without the camera.*
+
+- **Pairing by link.** The link from `kvad remote pair` is pasted, from
+  Universal Clipboard, into the Server field. The phone pairs on the LAN or
+  through the relay, using the link's voucher.
+- **Every request through the tunnel**, with crates/tunnel's `for_ureq`
+  connector: the CLI's code, moved into kvad-tunnel so that both use it.
+- **The Keychain** (`security-framework`) holds the device key, and each
+  server's key, voucher and device id, as one item that is "when unlocked,
+  this device only", never synced.
+- **The path** (`lan`, `direct`, `relay`) is shown in More and kept up to
+  date.
+- **The voucher renews itself** once half spent.
+- **Unpair this phone** removes the device on the Mac and forgets it here.
+
+Found on the way: an app whose executable cargo builds gets no
+entitlements, on the simulator from the executable's own sections and on a
+device from its signature. So `build.sh` links the simulator's sections into
+cargo's binary and signs a device build with Xcode's entitlements file.
+Without that, iOS refuses the Keychain with "a required entitlement isn't
+present".
+
+Tested in the iOS 26.5 simulator against a scratch kvad-serve:
+
+- Paired over the LAN, reconnected by name from the Keychain, and chatted
+  through the tunnel. The account is an administrator, and the device was
+  shown acting as `user`.
+- Then, with the server set to `direct = "off"` and a new Keychain, paired
+  through `relay.kvad.eu`. More said `relay https://relay.kvad.eu`.
+- Unpaired from the phone: the Mac closed its connection, and the app then
+  says it is not paired.
+
+Not yet done:
+
+- *The camera.* Scanning the QR code needs AVFoundation, or the system's
+  Camera opening a `kvad://` URL in the app.
+- *Telling iroh about network changes* (`NWPathMonitor`).
+- *A run on a real iPhone over mobile data.*
+
 **Phase 5: the rest.** The More tab, screen by screen, ordered by what the
 owner reaches for from a phone.
 

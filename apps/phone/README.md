@@ -48,18 +48,40 @@ looking at a state without tapping to it. `simctl launch` passes
 SIMCTL_CHILD_KVAD_PHONE_CONNECT=127.0.0.1:5823 SIMCTL_CHILD_KVAD_PHONE_TAB=3 xcrun simctl launch booted eu.kvad.phone
 ```
 
-`CONNECT` connects at launch, `TAB` opens a tab (0 Chat to 4 More), `MODEL`
-picks the chat model, `SAY` sends a message, and `SHEET` opens the model
-sheet. `PROBE` opens the Network test, and when it is a ticket, runs it,
+`CONNECT` connects at launch (an address, a paired `kvad://<node id>`, or a
+pairing link, which pairs first), `TAB` opens a tab (0 Chat to 4 More),
+`MODEL` picks the chat model, `SAY` sends a message, `SHEET` opens the model
+sheet, and `UNPAIR` unpairs the phone from the server it connected to. `PROBE` opens the Network test, and when it is a ticket, runs it,
 for as long as `PROBE_LENGTH` says (0 to 2: 30 s, 1 min, 5 min). None of it
 is in a release build.
 
 ## On an iPhone
 
-Xcode, with your own team chosen under Signing for the Kvad target. Plain
-HTTP reaches only the phone's own network (App Transport Security's
-`NSAllowsLocalNetworking`), so the Mac's LAN address works and the internet
-does not, until the tunnel in `docs/relay-plan.md` is in.
+Xcode, with your own team chosen under Signing for the Kvad target. The
+Keychain entitlement that `project.yml` asks for is in the signature
+`build.sh` makes, so pairings are kept on the device as they are in the
+simulator.
+
+## From anywhere, through the tunnel
+
+On the Mac, with `[remote]` on in kvad-serve's `kvad.toml`:
+
+```bash
+kvad remote pair
+```
+
+Copy the link it shows (Universal Clipboard carries it to the phone), and
+tap *Paste a pairing link*, then *Connect*. The phone pairs, through the relay
+if it is not on the Mac's network, and keeps its device key, the key the
+server made for it, and its relay voucher in the Keychain: this phone only,
+while unlocked, never synced. After that the Server field holds
+`kvad://<node id>`, and *Connect* reaches the Mac from Wi-Fi or mobile data
+alike. More shows which path it is on, and *Unpair this phone* revokes the
+pairing on the Mac as well as here.
+
+Plain HTTP still reaches only the phone's own network (App Transport
+Security's `NSAllowsLocalNetworking`), so an address typed in works on the
+LAN alone.
 
 ## Network test
 

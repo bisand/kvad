@@ -12,9 +12,14 @@ use super::{Address, Client, Key, Path, Res, Voucher};
 /// One pairing request to `to`, as the key in `key` (made on first use),
 /// and the server's answer.
 pub fn pair(key: &FsPath, to: &Address, request: &[u8], voucher: Option<&Voucher>) -> Res<Vec<u8>> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("starting the tunnel: {e}"))?;
     let (key, _) = Key::load(key)?;
-    runtime.block_on(Client::pair(&key, to, request, voucher))
+    pair_as(&key, to, request, voucher)
+}
+
+/// The same, as `key`.
+pub fn pair_as(key: &Key, to: &Address, request: &[u8], voucher: Option<&Voucher>) -> Res<Vec<u8>> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("starting the tunnel: {e}"))?;
+    runtime.block_on(Client::pair(key, to, request, voucher))
 }
 use std::os::unix::net::UnixStream;
 use std::path::Path as FsPath;
@@ -29,14 +34,19 @@ impl Tunnel {
     /// Connects to `to` with the key in `key` (made on first use), showing
     /// relays `voucher` if there is one.
     pub fn connect(key: &FsPath, to: &Address, voucher: Option<&Voucher>) -> Res<Tunnel> {
+        let (key, _) = Key::load(key)?;
+        Tunnel::connect_as(&key, to, voucher)
+    }
+
+    /// The same, as `key`.
+    pub fn connect_as(key: &Key, to: &Address, voucher: Option<&Voucher>) -> Res<Tunnel> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("kvad-tunnel")
             .enable_all()
             .build()
             .map_err(|e| format!("starting the tunnel: {e}"))?;
-        let (key, _) = Key::load(key)?;
-        let client = runtime.block_on(Client::connect_vouched(&key, to, voucher))?;
+        let client = runtime.block_on(Client::connect_vouched(key, to, voucher))?;
         Ok(Tunnel { runtime, client: std::sync::Arc::new(client), address: to.clone() })
     }
 

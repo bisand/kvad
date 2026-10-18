@@ -21,6 +21,14 @@ targets:
       PRODUCT_BUNDLE_IDENTIFIER: eu.kvad.phone
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
       TARGETED_DEVICE_FAMILY: "1"
+    # The Keychain, where the pairings and the device key are kept
+    # (src/secrets.rs): without an access group iOS refuses the app its own
+    # items. XcodeGen writes the file; it is not committed.
+    entitlements:
+      path: Kvad.entitlements
+      properties:
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)eu.kvad.phone
     info:
       path: Info.plist
       properties:

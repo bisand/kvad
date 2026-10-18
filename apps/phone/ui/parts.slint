@@ -175,12 +175,15 @@ export component Row inherits Rectangle {
                 overflow: elide;
             }
         }
+        // Cut short with an ellipsis, so that a long value gives way rather
+        // than push the card past the edge of the screen.
         if root.value != "": Text {
             text: root.value;
             color: Theme.secondary;
             font-size: Theme.body * 1rem;
             vertical-alignment: center;
             horizontal-alignment: right;
+            overflow: elide;
         }
         if root.checked: Icon {
             source: @image-url("icons/check.svg");

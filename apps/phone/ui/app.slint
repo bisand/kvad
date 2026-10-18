@@ -44,6 +44,7 @@ component ConnectScreen inherits Rectangle {
     in property <string> error;
     callback connect(string, string);
     callback open-probe();
+    callback paste-link();
 
     Flickable {
         VerticalLayout {
@@ -87,7 +88,7 @@ component ConnectScreen inherits Rectangle {
             Card {
                 Field {
                     label: "Server";
-                    placeholder: "192.168.1.20:5823";
+                    placeholder: "192.168.1.20:5823 or kvad://…";
                     text <=> root.url;
                     enabled: !root.busy;
                 }
@@ -105,7 +106,15 @@ component ConnectScreen inherits Rectangle {
                 padding-left: Theme.margin;
                 padding-right: Theme.margin;
                 SectionFooter {
-                    text: "The address kvad-serve listens on. A key is only needed when the server asks for one. It is kept in memory, and never written to the phone.";
+                    text: "To reach your Mac from anywhere, run kvad remote pair on it, copy the link, and paste it here. Or type the address kvad-serve listens on, for this network only. A paired phone keeps its keys in the Keychain, on this phone alone.";
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                TextButton {
+                    text: "Paste a pairing link";
+                    enabled: !root.busy;
+                    clicked => { root.paste-link(); }
                 }
             }
             Rectangle { height: 16px; }
@@ -415,8 +424,11 @@ component MoreScreen inherits Rectangle {
     in property <string> server;
     in property <string> version;
     in property <string> who;
+    in property <string> path;
+    in property <bool> paired;
     callback disconnect();
     callback open-probe();
+    callback unpair();
 
     Flickable {
         VerticalLayout {
@@ -434,11 +446,19 @@ component MoreScreen inherits Rectangle {
                     Row { title: "Version"; value: root.version; }
                     Separator { }
                     Row { title: "Signed in as"; value: root.who; }
+                    if root.path != "": Separator { }
+                    if root.path != "": Row { title: "Path"; value: root.path; }
                     Separator { }
                     Row {
                         title: "Disconnect";
                         title-color: Theme.danger;
                         clicked => { root.disconnect(); }
+                    }
+                    if root.paired: Separator { }
+                    if root.paired: Row {
+                        title: "Unpair this phone";
+                        title-color: Theme.danger;
+                        clicked => { root.unpair(); }
                     }
                 }
             }
@@ -955,6 +975,12 @@ export component AppWindow inherits Window {
 
     callback connect(string, string);
     callback disconnect();
+    callback paste-link();
+    callback unpair();
+    in-out property <string> server-path;
+    // The server as More shows it: a kvad:// id cut to its first digits.
+    in-out property <string> server-name;
+    in-out property <bool> paired;
     callback send(string);
     callback stop();
     callback new-chat();
@@ -980,6 +1006,7 @@ export component AppWindow inherits Window {
         error: root.connect-error;
         connect(u, k) => { root.connect(u, k); }
         open-probe => { root.open-probe(); }
+        paste-link => { root.paste-link(); }
     }
 
     if root.connected: VerticalLayout {
@@ -1021,11 +1048,14 @@ export component AppWindow inherits Window {
                 refresh => { root.refresh-models(); }
             }
             if root.tab == 4: MoreScreen {
-                server: root.server-url;
+                server: root.server-name;
                 version: root.server-version;
                 who: root.server-who;
+                path: root.server-path;
+                paired: root.paired;
                 disconnect => { root.disconnect(); }
                 open-probe => { root.open-probe(); }
+                unpair => { root.unpair(); }
             }
         }
         if root.keyboard == 0: Rectangle {

@@ -1,3 +1,4 @@
 /target
 /ios/*.xcodeproj
 /ios/Info.plist
+/ios/Kvad.entitlements

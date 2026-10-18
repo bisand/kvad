@@ -1,0 +1,21 @@
+[package]
+name = "relay-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Phase 0 of docs/relay-plan.md: a scratch tool, in a workspace of its own
+# so that nothing it pulls in reaches Kvad's builds.
+[workspace]
+
+[dependencies]
+# Without the default features, so that iroh's `portmapper` is not compiled
+# in at all: the probe never asks a router for a port, by PCP, NAT-PMP or
+# UPnP. `cargo tree -i portmapper` finding nothing is the check.
+# aws-lc-rs rather than ring, for the hybrid post-quantum key exchange.
+iroh = { version = "1.3.0", default-features = false, features = ["tls-aws-lc-rs", "fast-apple-datapath", "unstable-net-report"] }
+rustls = { version = "0.23.33", default-features = false, features = ["aws_lc_rs", "std"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "time", "signal", "io-util"] }
+
+[profile.release]
+opt-level = 3

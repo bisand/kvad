@@ -316,15 +316,21 @@ mod tests {
     use crate::db::Db;
     use crate::users;
 
+    /// Where this test keeps its keys. libtest names each test's thread after the test, so tests running in
+    /// parallel never share a key file, while two helper calls inside one test find the same keys.
+    fn keys() -> std::path::PathBuf {
+        let name = std::thread::current().name().unwrap_or("unnamed").replace(':', "_");
+        std::env::temp_dir().join(format!("kvad-remote-test-{}", std::process::id())).join(name)
+    }
+
     fn remote() -> Remote {
-        let (key, _) = kvad_tunnel::Key::load(&std::env::temp_dir().join(format!("kvad-remote-test-{}/k", std::process::id()))).unwrap();
+        let (key, _) = kvad_tunnel::Key::load(&keys().join("k")).unwrap();
         let address = kvad_tunnel::Address { node: key.id(), knock: "0".repeat(32), relays: vec!["https://relay.kvad.eu".into()], addrs: Vec::new() };
         Remote::new(Vec::new(), address, kvad_tunnel::Allowed::default(), key.issuer())
     }
 
     fn node(n: u8) -> kvad_tunnel::NodeId {
-        let dir = std::env::temp_dir().join(format!("kvad-remote-test-{}", std::process::id()));
-        kvad_tunnel::Key::load(&dir.join(format!("d{n}"))).unwrap().0.id()
+        kvad_tunnel::Key::load(&keys().join(format!("d{n}"))).unwrap().0.id()
     }
 
     fn ask(token: &str, name: &str) -> Vec<u8> {

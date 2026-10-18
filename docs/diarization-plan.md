@@ -1,6 +1,7 @@
 # Plan: who spoke when
 
-Written 2026-10-18, research and plan only: nothing here is built. It
+Written 2026-10-18 as research and a plan; step 1 of *The order it is
+built in* is built (`speech::score`), the rest not yet. It
 follows [the speech plan](speech-plan.md), whose Whisper, CPU and Metal,
 file and live, it extends.
 
@@ -696,14 +697,28 @@ committed: a test or an example reads a directory it is pointed at.
 - **Published Norwegian results: none found**, for any of these models.
   The tables here would be the first.
 
-**The scorer is written here.** DER is a frame count at 10 ms after an
-optimal one-to-one mapping, which is the Hungarian algorithm on a matrix
-of a few speakers a side: a hundred lines in a test helper, with no
-dependency. `scripts/der-fixtures.py` scores the same reference and
-hypothesis RTTM files with `pyannote.metrics` (MIT) and writes its
-numbers, and a test holds the Rust scorer to them to 0.01 points on every
-fixture. `md-eval.pl`, NIST's scorer, is the historical reference, and is
-not needed when pyannote.metrics agrees with it.
+**The scorer is written here.** DER is time counted after an optimal
+one-to-one mapping, which is the Hungarian algorithm on a matrix of a few
+speakers a side, with no dependency. `scripts/der-fixtures.py` scores the
+same reference and hypothesis RTTM files with `pyannote.metrics` (MIT) and
+writes its numbers, and a test holds the Rust scorer to them to 0.01 points
+on every fixture. `md-eval.pl`, NIST's scorer, is the historical reference,
+and is not needed when pyannote.metrics agrees with it.
+
+As built (`crates/llm/src/speech/score.rs`): the time is exact, between
+every boundary on either side, not a frame count at 10 ms as first planned,
+because frames move each boundary by up to 5 ms, which on the 27 s dialogue
+is about 0.3 points, thirty times the bound. pyannote's choices are kept
+where they change a number: the scored stretch runs from the first turn of
+either side to the last; speakers map by shared time, and a pair sharing
+none is not mapped; JER uses DER's mapping and ignores a hypothesis speaker
+with nothing to map to (DIHARD's `dscore` does neither). cpWER is held to
+`meeteval` (MIT), the CHiME scorer. No package scores WDER, so the fixture
+script writes Shafey et al.'s definition a second time; which words pair
+depends on how an alignment breaks ties, and both take a substitution
+before a deletion before an insertion. On the 15 fixtures (hand-made, the
+dialogue, six random meetings with overlap, edge cases) the largest gap to
+pyannote is 3·10⁻¹⁴ at all three protocols.
 
 **Tests never download.** Every test that needs a model finds it with
 `crate::weights::local_file` and skips, saying so, when it is not in the
@@ -728,7 +743,9 @@ measured.
    helper, the Hungarian algorithm it needs, `scripts/der-fixtures.py`
    and `scripts/dialogue.py`. *Done* when the Rust scorer agrees with
    `pyannote.metrics` to 0.01 points on every fixture, at all three
-   protocols.
+   protocols. **Built**: `speech::score`; agrees to 3·10⁻¹⁴, and
+   `dialogue.py` with no script remakes the probe's turns to the
+   millisecond.
 2. **Words with times**, on the CPU, then the GPU: the `attention`
    question, the alignment on the host, `timestamp_granularities[]=word`,
    `--words`. *Done* as in *Words with times*: within a frame of

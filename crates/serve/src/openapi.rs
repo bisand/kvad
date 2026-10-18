@@ -1222,6 +1222,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
         query: &[], body: json_body("`{ admin }`, optional."), produces: JSON, events: &[],
     },
     Endpoint {
+        method: "get", path: "/api/remote/voucher", tag: "Accounts", access: Access::SignedIn,
+        summary: "A fresh relay voucher for the device asking",
+        description: "`{ voucher, expires_in }`, for a request made with a paired device's key. A relay \
+                      that serves this server lets the device through with it, for thirty days.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
         method: "get", path: "/api/devices", tag: "Accounts", access: Access::SignedIn,
         summary: "Your paired devices",
         description: "`?all=true` lists every account's, for an administrator.",

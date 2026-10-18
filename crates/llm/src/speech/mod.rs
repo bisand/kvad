@@ -21,6 +21,8 @@
 //!    transcript is written out in.
 //! 5. [`live`] — the same loop over audio that is still arriving: a window
 //!    decoded again as it grows, and words settled once two runs agree.
+//! 6. [`score`] — how wrong a "who spoke when" is: the diarization error
+//!    rates, and the Hungarian algorithm they map speakers with.
 //!
 //! Every Whisper on the Hub in transformers' layout loads: OpenAI's own
 //! (`openai/whisper-*`), the distilled ones, and fine-tunes of them such as
@@ -35,6 +37,7 @@ pub mod audio;
 pub mod live;
 pub mod mel;
 pub mod reference;
+pub mod score;
 pub mod transcribe;
 pub mod whisper;
 

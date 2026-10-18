@@ -292,7 +292,7 @@ impl Default for Args {
 const POSITIONAL: &[&str] = &[
     "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload", "cancel",
     "tokenize", "service", "conversations", "jobs", "datasets", "tune", "evals", "bench", "metrics",
-    "auth", "users", "sessions", "keys", "api", "images", "videos", "cluster", "transcribe",
+    "auth", "users", "sessions", "keys", "api", "images", "videos", "cluster", "transcribe", "remote",
 ];
 
 /// Flags that stand alone, and the short spellings some of them have.
@@ -678,6 +678,7 @@ fn real_main() -> Res<()> {
         "arch" => return arch(),
         "crawl" => return crawl_site(args),
         "service" => return cli::service::run(&args),
+        "remote" => return cli::remote::run(&args),
         #[cfg(feature = "cluster")]
         "cluster" => return cli::cluster::run(&args),
         #[cfg(feature = "cluster")]

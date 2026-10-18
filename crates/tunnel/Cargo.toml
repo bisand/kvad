@@ -1,0 +1,36 @@
+[package]
+name = "kvad-tunnel"
+description = "Reaching a kvad-serve from anywhere: an end-to-end encrypted tunnel, direct when it can be, relayed when not"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# docs/relay-plan.md picks iroh for the transport, and keeps it behind this
+# crate so that kvad-serve and the CLI never name it. Without its default
+# features, so that its `portmapper` is not compiled in at all: Kvad never
+# asks a router for a port (docs/relay-plan.md, *No ports opened in the
+# router*). aws-lc-rs for the hybrid post-quantum key exchange.
+iroh = { version = "1.3.0", default-features = false, features = ["tls-aws-lc-rs", "fast-apple-datapath"] }
+# For `axum::serve`: a server's tunnel as one more listener for its router.
+axum = { version = "0.8.9", optional = true, default-features = false, features = ["tokio", "http1"] }
+# For `geteuid`, which key files are checked against. Already in the tree.
+libc = "0.2.189"
+rustls = { version = "0.23.33", default-features = false, features = ["aws_lc_rs", "std"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+tracing = "0.1.44"
+
+[features]
+axum = ["dep:axum"]
+
+[dev-dependencies]
+axum = "0.8.9"
+# A relay in the test process, over plain HTTP on loopback.
+iroh-relay = { version = "1.3.0", default-features = false, features = ["server", "tls-aws-lc-rs"] }
+tokio-stream = "0.1.19"
+
+[[test]]
+name = "tunnel"
+required-features = ["axum"]

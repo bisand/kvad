@@ -1862,9 +1862,7 @@ fn hostname() -> String {
 
 /// The same server, proving itself a different way.
 fn with(remote: &Remote, auth: Auth) -> Res<Remote> {
-    let mut other = Remote::new(&remote.base, remote.why.clone())?;
-    other.auth = auth;
-    Ok(other)
+    Ok(remote.with_auth(auth))
 }
 
 /// A new password, asked twice.

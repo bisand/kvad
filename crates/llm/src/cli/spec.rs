@@ -902,6 +902,25 @@ pub const COMMANDS: &[Command] = &[
                 worker by name is written for macOS; elsewhere, give its address.",
         examples: &["kvad worker", "kvad worker --port 7421"],
     },
+    Command {
+        name: "remote",
+        group: Group::Accounts,
+        args: "[id|status]",
+        about: "this machine as a device of a server reached from anywhere",
+        server: false,
+        routed: false,
+        words: &[Kind::Text],
+        subs: &[
+            Sub { name: "id", args: "", about: "the id a server's [remote] allow lists for this machine", words: &[], flags: &[] },
+            Sub { name: "status", args: "", about: "which path the tunnel to a kvad:// server is on", words: &[], flags: &[] },
+        ],
+        flags: &[],
+        usage: None,
+        notes: "A server with [remote] in its kvad.toml prints a kvad:// address when it starts. Add this \
+                machine's `kvad remote id` to that server's [remote] allow, sign in with \
+                `kvad auth login --remote kvad://…`, and every command takes --remote kvad://… after that.",
+        examples: &["kvad remote id", "kvad remote status --remote kvad://…"],
+    },
     // -- accounts ----------------------------------------------------------
     Command {
         name: "auth",
@@ -1209,7 +1228,7 @@ mod tests {
     #[test]
     fn the_table_holds_every_command_and_only_those() {
         for command in COMMANDS {
-            let handled = matches!(command.name, "arch" | "crawl" | "transcribe" | "service" | "cluster" | "worker" | "serve" | "help" | "completions");
+            let handled = matches!(command.name, "arch" | "crawl" | "transcribe" | "service" | "cluster" | "worker" | "remote" | "serve" | "help" | "completions");
             assert!(handled || crate::cli::known(command.name), "`{}` is in the table and nothing runs it", command.name);
             assert_eq!(command.server, crate::cli::remote_only(command.name), "`{}`: does it need a server?", command.name);
             // The parser gathers words only for the commands it knows take

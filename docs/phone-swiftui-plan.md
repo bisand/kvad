@@ -140,6 +140,13 @@ The About screen's Slint attribution goes too. Kvad stays MIT.
    - `.scrollDismissesKeyboard(.interactively)`;
    - `defaultScrollAnchor(.bottom)` for the chat's follow;
    - `TextField(axis: .vertical).lineLimit(1...5)` for the composer.
+   *Done, 2026-10-18:* every screen on SwiftUI, on iOS 18 for
+   `onScrollGeometryChange`, in Swift 6. The one trap: the core's C
+   callback has to be a top-level function. A closure written inside a
+   `@MainActor` function is main-actor code, and Swift checks that on entry
+   and traps on the core's thread. Linking the core takes the Network,
+   Security and SystemConfiguration frameworks and `libresolv`. Felt right
+   on the iPhone 14 Pro Max.
 3. **Slint out.** Delete the Slint UI, update phone-plan.md and the README,
    and close [#271](https://github.com/bisand/kvad/pull/271) unmerged. Its
    findings are written down above.

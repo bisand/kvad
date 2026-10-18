@@ -1,21 +1,25 @@
 # XcodeGen's description of the app: `xcodegen` here makes Kvad.xcodeproj,
-# which is not committed. The Rust is built by build.sh, which Xcode runs.
+# which is not committed. The app is SwiftUI (Kvad/), over the Rust core
+# (../core), which build.sh builds as a static library before the Swift is
+# compiled. docs/phone-swiftui-plan.md.
 name: Kvad
 options:
   bundleIdPrefix: eu.kvad
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "18.0"
 settings:
   # The build phase runs cargo, which reads and writes outside the sandbox
   # Xcode gives scripts.
   ENABLE_USER_SCRIPT_SANDBOXING: NO
   MARKETING_VERSION: "0.1.0"
   CURRENT_PROJECT_VERSION: "1"
+  SWIFT_VERSION: "6.0"
 targets:
   Kvad:
     type: application
     platform: iOS
     sources:
+      - path: Kvad
       - path: Assets.xcassets
     # The development team, for an iPhone build: Signing.xcconfig.
     configFiles:
@@ -24,7 +28,13 @@ targets:
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: eu.kvad.phone
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
       TARGETED_DEVICE_FAMILY: "1"
+      # The core's three C functions (../core/kvad_core.h), and the library
+      # build.sh links into the target's temporary directory.
+      SWIFT_OBJC_BRIDGING_HEADER: Kvad/Kvad-Bridging-Header.h
+      LIBRARY_SEARCH_PATHS: $(TARGET_TEMP_DIR)/rust
+      OTHER_LDFLAGS: -lkvad_phone_core -framework Security -framework SystemConfiguration -framework Network -lresolv"
     # The Keychain, where the pairings and the device key are kept
     # (src/secrets.rs): without an access group iOS refuses the app its own
     # items. XcodeGen writes the file; it is not committed.
@@ -51,22 +61,41 @@ targets:
           UIImageRespectsSafeAreaInsets: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-        # The scene lifecycle, which iOS 27 requires; the delegate is
-        # Slint's winit backend's.
+        # The scene lifecycle, which iOS 27 requires; SwiftUI's App makes the
+        # scene itself.
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
-          UISceneConfigurations:
-            UIWindowSceneSessionRoleApplication:
-              - UISceneConfigurationName: Slint
-                UISceneDelegateClassName: SlintWindowSceneDelegate
         # App Transport Security stays on: plain HTTP only to the phone's own
         # network, where a Mac on the LAN is, until the tunnel replaces it.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
         NSLocalNetworkUsageDescription: Kvad connects to the Kvad server on your Mac over your local network.
-    postCompileScripts:
-      - name: Build the Rust app with cargo
-        script: ./build.sh kvad-phone
+    preBuildScripts:
+      - name: Build the Rust core with cargo
+        script: ./build.sh
         basedOnDependencyAnalysis: false
-        outputFiles:
-          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)
+  # Every event in ../messages.json decodes, as the core's tests check every
+  # event the core sends is in it.
+  KvadTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: KvadTests
+      - path: ../messages.json
+        buildPhase: resources
+    dependencies:
+      - target: Kvad
+    settings:
+      GENERATE_INFOPLIST_FILE: YES
+      TEST_HOST: $(BUILT_PRODUCTS_DIR)/Kvad.app/Kvad
+      BUNDLE_LOADER: $(TEST_HOST)
+      PRODUCT_BUNDLE_IDENTIFIER: eu.kvad.phone.tests
+schemes:
+  Kvad:
+    build:
+      targets:
+        Kvad: all
+        KvadTests: [test]
+    test:
+      targets:
+        - KvadTests

@@ -1,0 +1,148 @@
+# kvad-relay on a k3s whose Traefik already holds 443 for other sites.
+# Traefik passes connections for the relay's name through untouched (TLS
+# passthrough by SNI), so the relay keeps its own certificate and its own
+# post-quantum TLS, and every other site on 443 is as it was. UDP 7842 goes
+# to the pod by a host port, which keeps the client's own address, the one
+# thing address discovery exists to report. See deploy/README.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kvad-relay
+---
+# The keys the relay serves: endpoint ids, which are public keys and not
+# secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kvad-relay-allow
+  namespace: kvad-relay
+data:
+  allow: |
+    # one endpoint id a line
+    ALLOWED_KEYS
+---
+# The ACME account and certificate, kept across restarts so that a restart
+# is not a new certificate (Let's Encrypt rate-limits those).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kvad-relay-acme
+  namespace: kvad-relay
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 16Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kvad-relay
+  namespace: kvad-relay
+spec:
+  replicas: 1
+  # The host port cannot be held by two pods at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kvad-relay
+  template:
+    metadata:
+      labels:
+        app: kvad-relay
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kvad-relay
+          image: kvad-relay:IMAGE_TAG
+          imagePullPolicy: Never
+          args:
+            - --hostname
+            - RELAY_HOSTNAME
+            - --bind
+            - 0.0.0.0
+            - --https-port
+            - "8443"
+            - --quic-port
+            - "7842"
+            - --http-port
+            - "8080"
+            - --allow
+            - /etc/kvad-relay/allow
+            - --cache
+            - /var/lib/kvad-relay
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+            - name: quic
+              containerPort: 7842
+              protocol: UDP
+              hostPort: 7842
+              hostIP: RELAY_ADDRESS
+          # Every port is above 1024, so nothing needs root or a capability.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: allow
+              mountPath: /etc/kvad-relay
+              readOnly: true
+            - name: acme
+              mountPath: /var/lib/kvad-relay
+      volumes:
+        - name: allow
+          configMap:
+            name: kvad-relay-allow
+        - name: acme
+          persistentVolumeClaim:
+            claimName: kvad-relay-acme
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvad-relay
+  namespace: kvad-relay
+spec:
+  selector:
+    app: kvad-relay
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+---
+# Connections to 443 that name the relay go to it as they are, still
+# encrypted; Traefik neither terminates nor sees inside them.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: kvad-relay
+  namespace: kvad-relay
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: HostSNI(`RELAY_HOSTNAME`)
+      services:
+        - name: kvad-relay
+          port: 8443
+  tls:
+    passthrough: true

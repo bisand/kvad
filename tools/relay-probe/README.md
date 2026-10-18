@@ -67,13 +67,35 @@ which is the LAN case and the "no relay at all" case.
 
 ## Which relay
 
-Hole punching needs a relay to see both ends' public addresses. You can run
-your own on a small VPS: `cargo install iroh-relay --features server`, with
-a domain name and its ACME or certificate config. Or pass `--n0` to use n0's
-public relays. They would then see both machines' IP addresses and when they
-talk, but not what they say. For a test on one machine, `iroh-relay --dev`
-serves plain HTTP on port 3340, which the probe accepts only for localhost.
-Note that it listens on every interface, its metrics port 9090 included.
+Hole punching needs a relay to see both ends' public addresses. Kvad's own is
+`tools/kvad-relay`, which `tools/kvad-relay/deploy/README.md` puts on a VPS,
+at `https://relay.kvad.eu` for this repo's owner. The stock `iroh-relay` will
+not do: it is built on ring, which has no post-quantum key exchange, and the
+probe offers nothing else. For the same reason `--n0`, n0's public relays,
+will refuse the probe if they run the stock binary, which has not been
+tried. For a test on one machine, `kvad-relay --dev --allow FILE` serves
+plain HTTP on 127.0.0.1:3340, which the probe accepts only for localhost.
+
+## Held to one network
+
+A machine on several networks at once (Wi-Fi, a cable, a tailnet) will find
+the fastest of them, which is never the one being measured. `--bind IP`, once
+for each address, binds the probe's UDP socket to those addresses alone.
+Packets then leave from them only, and an answer to any other address has no
+socket to arrive at, so no other path can form. For a laptop on a phone's
+hotspot, bind the hotspot interface's addresses:
+
+```bash
+ipconfig getifaddr en0
+```
+
+```bash
+tools/relay-probe/target/release/relay-probe dial --bind 172.20.10.2 --secs 60
+```
+
+Add `--bind` with the interface's global IPv6 address as well, if the carrier
+gives one (`ifconfig en0 | grep inet6`), to see whether IPv6 makes the path
+direct.
 
 ## The field runs
 

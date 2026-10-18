@@ -1,0 +1,91 @@
+# kvad-relay on a single-node k3s, with the image imported straight into
+# k3s's containerd (no registry). See deploy/README.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kvad-relay
+---
+# The keys the relay serves: endpoint ids, which are public keys and not
+# secret. After an edit, `kubectl -n kvad-relay rollout restart deploy/kvad-relay`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kvad-relay-allow
+  namespace: kvad-relay
+data:
+  allow: |
+    # one endpoint id a line
+    ALLOWED_KEYS
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kvad-relay
+  namespace: kvad-relay
+spec:
+  replicas: 1
+  # Host ports cannot be held by two pods at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kvad-relay
+  template:
+    metadata:
+      labels:
+        app: kvad-relay
+    spec:
+      # The relay must see clients' real addresses for address discovery, and
+      # binds the public address itself: 443/tcp and 7842/udp.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kvad-relay
+          image: kvad-relay:IMAGE_TAG
+          imagePullPolicy: Never
+          args:
+            - --hostname
+            - relay.kvad.eu
+            - --bind
+            - 85.137.228.199
+            - --allow
+            - /etc/kvad-relay/allow
+            - --cache
+            - /var/lib/kvad-relay
+          # Root inside the container only to bind 443 on the host network,
+          # where containerd gives a non-root process no capabilities; every
+          # capability but that one is dropped, and nothing can be gained.
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: allow
+              mountPath: /etc/kvad-relay
+              readOnly: true
+            - name: acme
+              mountPath: /var/lib/kvad-relay
+      volumes:
+        - name: allow
+          configMap:
+            name: kvad-relay-allow
+        # The ACME account and certificate, kept across restarts so that a
+        # restart is not a new certificate (Let's Encrypt rate-limits those).
+        - name: acme
+          hostPath:
+            path: /var/lib/kvad-relay
+            type: DirectoryOrCreate

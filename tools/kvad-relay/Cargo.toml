@@ -1,0 +1,23 @@
+[package]
+name = "kvad-relay"
+version = "0.0.2"
+edition = "2021"
+publish = false
+license = "MIT"
+
+# The start of docs/relay-plan.md's kvad-relay: iroh's relay server as a
+# library, in a binary of Kvad's own, so that the TLS it speaks is ours to
+# choose. A workspace of its own, as tools/relay-probe has.
+[workspace]
+
+[dependencies]
+iroh-relay = { version = "1.3.0", default-features = false, features = ["server", "tls-aws-lc-rs"] }
+iroh-base = "1.3.0"
+rustls = { version = "0.23.33", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "signal"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

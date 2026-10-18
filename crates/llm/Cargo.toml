@@ -20,6 +20,9 @@ arch-qwen3-5 = []
 cluster = []
 
 [dependencies]
+# `kvad --remote kvad://…`: a server reached through the tunnel of
+# docs/relay-plan.md, from anywhere. Kvad's own crate, which keeps iroh behind it.
+kvad-tunnel = { path = "../tunnel" }
 hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
 # For `F_NOCACHE`: a residency cache that holds its own slabs does not
 # want the kernel holding a second copy of the same bytes. Already a direct

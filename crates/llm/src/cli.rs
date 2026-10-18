@@ -30,6 +30,7 @@ pub mod complete;
 pub mod help;
 pub mod models;
 pub mod out;
+pub mod remote;
 pub mod service;
 pub mod spec;
 

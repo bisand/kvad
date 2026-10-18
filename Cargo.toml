@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nervus", "crates/llm", "crates/tui", "crates/gpu", "crates/serve"]
+members = ["crates/nervus", "crates/llm", "crates/tui", "crates/gpu", "crates/serve", "crates/tunnel"]
 
 [workspace.package]
 # What every crate here ships as, bar one. They inherit it with

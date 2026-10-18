@@ -535,6 +535,56 @@ mapping request leaves the machine. A WebSocket opened through the tunnel
 streams both ways at once, and its events back are not held up by an upload
 filling the other direction.
 
+*Built, 2026-10-18.* `crates/tunnel` (`kvad-tunnel`) is the tunnel:
+`Server`, `Client`, `blocking::Tunnel` for the CLI, `Address` and `Path`,
+with iroh inside and named nowhere outside. It is a crate with no iroh in
+its signatures rather than a `trait Tunnel`, which gives the same freedom to
+replace it with less ceremony. `kvad-serve` serves it as a second
+`axum::serve` listener into the same router, from a `[remote]` section that
+is refused with `auth.mode = "none"`, even with `--insecure`. `kvad --remote
+kvad://…` dials it, and every HTTP connection is a stream handed to ureq as
+one end of a Unix socket pair, so the CLI opens no port. `kvad remote id`
+prints the device's id for the server's `allow`, and `kvad remote status`
+the path.
+
+What it does that the plan did not say:
+
+- *A hello.* QUIC lets a client open a stream before it learns that the
+  server refused it, so a refused device saw only an empty reply. The server
+  now writes `kvad-tunnel/1` on a stream of its own once it has let a device
+  in, and a client waits for it. A refusal is an error at connect, naming the
+  fix, and a different protocol version is refused with both versions named.
+- *No 0-RTT.* Neither side uses iroh's 0-RTT calls, so nothing replayable is
+  accepted.
+- *Owner checks by uid.* Key files are checked against the process's own
+  uid, not `$HOME`'s owner, since a service's data directory need not be
+  under a home.
+
+Tested:
+
+- `crates/tunnel/tests/tunnel.rs`, on loopback:
+  - HTTP direct with no relay, several streams over one connection.
+  - HTTP through a relay in the test process with `direct = "off"`.
+  - An unlisted key refused at connect.
+  - A wrong knock refused.
+  - A 4-second streamed reply that opened on the relay, went direct, and
+    finished whole after the relay was shut down mid-reply.
+  - The lockfile holds no port-mapping crate.
+- By hand, a scratch kvad-serve with `auth.mode = "local"` and the CLI:
+  - `auth status`, a refused unsigned `ls`, the first account made with
+    `auth setup` and a key kept with `auth login`, all through the tunnel.
+  - Then `ls` and a streamed `run`, direct on the LAN and then relay only
+    through `relay.kvad.eu`.
+
+Not yet done:
+
+- The existing API tests run through the tunnel.
+- The direct path blocked mid-stream and the reply finishing over the relay.
+  That needs a firewall rule in the test, or a test transport that can drop
+  a path.
+- A WebSocket through the tunnel, since nothing in kvad-serve speaks one yet.
+- `direct = "lan"`, which needs Kvad's own path selection.
+
 **Phase 2: identity, pairing and the LAN.** `remote.key`, `kvad remote
 pair`, the link format with its hints, token lifetime, the PAKE, the
 `devices` table and its API key, `kvad devices`, the `_kvad-remote._udp`

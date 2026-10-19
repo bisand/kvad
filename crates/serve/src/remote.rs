@@ -13,6 +13,8 @@
 //!   request and one answer; a request that presents the token pairs that
 //!   key to the slot's account. The token is burned on first use, right or
 //!   wrong, and slots are kept in memory only, so a restart burns them too.
+//!   A slot also has an id of its own, unrelated to the token, by which the
+//!   web UI that opened it asks whether it is still open, and closes it.
 //! - **What a device may do.** Its key works only from that device, through
 //!   the tunnel ([`Tunnelled`]), and as `user` unless the slot granted
 //!   `admin`. A device cannot open a slot for another unless it has `admin`.
@@ -49,6 +51,10 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, kvad
 }
 
 struct Slot {
+    /// What the slot is called in `/api/remote/pair/{slot}`: random, and
+    /// nothing to do with the token, so that naming it in a URL gives
+    /// nothing away.
+    id: String,
     user: i64,
     admin: bool,
     opened: Instant,
@@ -64,15 +70,17 @@ pub struct Remote {
     issuer: kvad_tunnel::Issuer,
     /// Open slots by their token's fingerprint; the token itself is never kept.
     slots: Mutex<HashMap<String, Slot>>,
-    burnt: Mutex<HashMap<String, Instant>>,
+    /// Tokens used or cancelled, and what presenting one again is told.
+    burnt: Mutex<HashMap<String, (Instant, Refusal)>>,
 }
 
 /// Why a pairing was refused, in the words the device is shown.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     Unknown,
     Used,
     Expired,
+    Cancelled,
 }
 
 impl std::fmt::Display for Refusal {
@@ -81,6 +89,7 @@ impl std::fmt::Display for Refusal {
             Refusal::Unknown => "this server did not make that pairing link",
             Refusal::Used => "that pairing link has been used: make a new one with `kvad remote pair`",
             Refusal::Expired => "that pairing link has expired: make a new one with `kvad remote pair`",
+            Refusal::Cancelled => "that pairing link was cancelled: make a new one with `kvad remote pair`",
         })
     }
 }
@@ -112,14 +121,42 @@ impl Remote {
         Ok(())
     }
 
-    /// Opens a slot for `user`; the token is returned once and only its
-    /// fingerprint is kept.
-    pub fn open(&self, user: i64, admin: bool) -> String {
+    /// [`Remote::open_slot`]'s token alone.
+    #[cfg(test)]
+    fn open(&self, user: i64, admin: bool) -> String {
+        self.open_slot(user, admin).0
+    }
+
+    /// Opens a slot for `user`: its token, which is returned once and only
+    /// its fingerprint kept, and its id.
+    fn open_slot(&self, user: i64, admin: bool) -> (String, String) {
         self.sweep();
         let token = secret::token();
-        self.slots.lock().unwrap().insert(secret::fingerprint(&token), Slot { user, admin, opened: Instant::now() });
+        let id = secret::token()[..16].to_string();
+        self.slots.lock().unwrap().insert(secret::fingerprint(&token), Slot { id: id.clone(), user, admin, opened: Instant::now() });
         self.allowed.open_pairing();
-        token
+        (token, id)
+    }
+
+    /// How long the slot called `id` has left, if it is open and `who` may
+    /// see it: its own account's, or any for an administrator.
+    fn left(&self, who: &Identity, id: &str) -> Option<Duration> {
+        let slots = self.slots.lock().unwrap();
+        let slot = slots.values().find(|s| s.id == id && (Some(s.user) == who.id || who.is_admin()))?;
+        SLOT_LIFE.checked_sub(slot.opened.elapsed()).filter(|d| !d.is_zero())
+    }
+
+    /// Closes the slot called `id`, if `who` may, burning its token: the
+    /// link stops working at once rather than at the end of its ten minutes.
+    fn cancel(&self, who: &Identity, id: &str) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        let Some(fingerprint) = slots.iter().find(|(_, s)| s.id == id && (Some(s.user) == who.id || who.is_admin())).map(|(f, _)| f.clone()) else {
+            return false;
+        };
+        slots.remove(&fingerprint);
+        self.burnt.lock().unwrap().insert(fingerprint, (Instant::now(), Refusal::Cancelled));
+        self.allowed.close_pairing();
+        true
     }
 
     /// Closes the slots that have run out, so that the tunnel stops letting
@@ -131,7 +168,7 @@ impl Remote {
         for _ in slots.len()..before {
             self.allowed.close_pairing();
         }
-        self.burnt.lock().unwrap().retain(|_, at| at.elapsed() < BURNT_FOR);
+        self.burnt.lock().unwrap().retain(|_, (at, _)| at.elapsed() < BURNT_FOR);
     }
 
     /// Takes the slot `token` opened, burning the token whether or not it is
@@ -139,8 +176,8 @@ impl Remote {
     fn take(&self, token: &str) -> Result<Slot, Refusal> {
         let fingerprint = secret::fingerprint(token);
         let slot = self.slots.lock().unwrap().remove(&fingerprint);
-        if self.burnt.lock().unwrap().insert(fingerprint, Instant::now()).is_some() {
-            return Err(Refusal::Used);
+        if let Some((_, why)) = self.burnt.lock().unwrap().insert(fingerprint, (Instant::now(), Refusal::Used)) {
+            return Err(why);
         }
         let Some(slot) = slot else { return Err(Refusal::Unknown) };
         self.allowed.close_pairing();
@@ -224,12 +261,23 @@ pub struct PairAsk {
     /// administrator can ask for it.
     #[serde(default)]
     admin: bool,
+    /// Send the link's QR code as well, as SVG, for a page to show.
+    #[serde(default)]
+    qr: bool,
 }
 
+/// The answer to a pair request is as good as a password for ten minutes:
+/// nothing on the way should keep it.
+const NO_STORE: [(axum::http::HeaderName, &str); 1] = [(axum::http::header::CACHE_CONTROL, "no-store")];
+
 /// `POST /api/remote/pair`: a slot, and the link that uses it.
-pub async fn pair(who: Identity, St(state): St<State>, body: Option<Json<PairAsk>>) -> Result<Json<serde_json::Value>, Fail> {
+pub async fn pair(who: Identity, St(state): St<State>, body: Option<Json<PairAsk>>) -> Result<impl axum::response::IntoResponse, Fail> {
     let remote = remote(&state)?;
     let Json(ask) = body.unwrap_or_default();
+    Ok((NO_STORE, Json(opened(&remote, &who, &ask)?)))
+}
+
+fn opened(remote: &Remote, who: &Identity, ask: &PairAsk) -> Result<serde_json::Value, Fail> {
     let Some(user) = who.id else {
         return Err(Fail::bad("a device belongs to an account, and this server has none"));
     };
@@ -239,17 +287,46 @@ pub async fn pair(who: Identity, St(state): St<State>, body: Option<Json<PairAsk
     if ask.admin && !who.is_admin() {
         return Err(Fail(StatusCode::FORBIDDEN, "only an administrator can pair a device as one".into(), None));
     }
-    let token = remote.open(user, ask.admin);
+    let (token, slot) = remote.open_slot(user, ask.admin);
     // For any device, for the slot's life: a device that is not on the LAN
     // pairs through the relay with it.
     let voucher = remote.issuer.issue(None, SLOT_LIFE);
-    let link = kvad_tunnel::PairLink { address: remote.address().clone(), token, voucher: Some(voucher) };
-    Ok(Json(json!({
-        "link": link.to_string(),
+    let link = kvad_tunnel::PairLink { address: remote.address().clone(), token, voucher: Some(voucher) }.to_string();
+    let qr = match ask.qr {
+        true => Some(kvad::qr::svg(&link).map_err(|e| Fail::internal(format!("the pairing link would not make a QR code: {e}")))?),
+        false => None,
+    };
+    let mut made = json!({
+        "link": link,
+        "slot": slot,
         "server": remote.address().label(),
         "expires_in": SLOT_LIFE.as_secs(),
         "role": if ask.admin { "admin" } else { "user" },
-    })))
+    });
+    if let Some(qr) = qr {
+        made["qr"] = qr.into();
+    }
+    Ok(made)
+}
+
+/// `GET /api/remote/pair/{slot}`: whether a slot you opened is still open,
+/// so that a page showing its link can stop once it is used.
+pub async fn slot(who: Identity, St(state): St<State>, Path(id): Path<String>) -> Result<Json<serde_json::Value>, Fail> {
+    let remote = remote(&state)?;
+    Ok(Json(match remote.left(&who, &id) {
+        Some(left) => json!({ "open": true, "expires_in": left.as_secs() }),
+        None => json!({ "open": false }),
+    }))
+}
+
+/// `DELETE /api/remote/pair/{slot}`: closes a slot you opened, so its link
+/// stops working now.
+pub async fn cancel(who: Identity, St(state): St<State>, Path(id): Path<String>) -> Result<Json<serde_json::Value>, Fail> {
+    let remote = remote(&state)?;
+    match remote.cancel(&who, &id) {
+        true => Ok(Json(json!({ "closed": id }))),
+        false => Err(Fail::missing("no such pairing link open: it was used, it expired, or it is another account's")),
+    }
 }
 
 /// `GET /api/remote/voucher`: a fresh voucher for the device asking, which
@@ -401,6 +478,86 @@ mod tests {
         assert_eq!(granted["role"], "admin");
         let plain = r.answer(&db, node(7), &ask(&r.open(ada.id, false), "phone"));
         assert_eq!(plain["role"], "user");
+    }
+
+    fn person(id: i64, admin: bool) -> Identity {
+        let role = if admin { crate::auth::Role::Admin } else { crate::auth::Role::User };
+        Identity { id: Some(id), name: format!("person {id}"), role, device: None }
+    }
+
+    #[test]
+    fn a_fresh_slot_comes_with_its_qr_code_as_svg_when_asked() {
+        let r = remote();
+        let ada = person(1, true);
+        let made = opened(&r, &ada, &PairAsk { admin: false, qr: true }).unwrap();
+        let svg = made["qr"].as_str().unwrap();
+        assert!(svg.starts_with("<svg ") && svg.ends_with("</svg>"), "{svg}");
+        let link = made["link"].as_str().unwrap();
+        assert!(link.starts_with("kvad://"));
+        assert!(!svg.contains(link), "the drawing is not the text");
+        let slot = made["slot"].as_str().unwrap();
+        assert!(r.left(&ada, slot).is_some_and(|d| d > SLOT_LIFE - Duration::from_secs(5)));
+        assert!(r.allowed.pairing());
+
+        let plain = opened(&r, &ada, &PairAsk::default()).unwrap();
+        assert!(plain.get("qr").is_none(), "the CLI draws its own and is not sent one");
+        assert_ne!(plain["slot"], made["slot"]);
+    }
+
+    #[test]
+    fn an_admin_slot_needs_an_administrator() {
+        let r = remote();
+        let maria = person(2, false);
+        let refused = opened(&r, &maria, &PairAsk { admin: true, qr: true }).unwrap_err();
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
+        assert!(!r.allowed.pairing(), "a refusal opens nothing");
+        assert_eq!(opened(&r, &maria, &PairAsk { admin: false, qr: true }).unwrap()["role"], "user");
+        assert_eq!(opened(&r, &person(1, true), &PairAsk { admin: true, qr: true }).unwrap()["role"], "admin");
+
+        // A device paired without admin opens no slots at all.
+        let phone = Identity { device: Some(7), ..person(2, false) };
+        assert_eq!(opened(&r, &phone, &PairAsk::default()).unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn a_slot_is_seen_and_cancelled_only_by_its_account_or_an_administrator() {
+        let db = Db::in_memory().unwrap();
+        let maria = users::create(&db, "maria", Some("sklodowska-1867"), "user", None).unwrap();
+        let r = remote();
+        let (token, slot) = r.open_slot(maria.id, false);
+        let (her, bob, ada) = (person(maria.id, false), person(maria.id + 1, false), person(maria.id + 2, true));
+        assert!(r.left(&her, &slot).is_some());
+        assert!(r.left(&ada, &slot).is_some());
+        assert!(r.left(&bob, &slot).is_none(), "another account's slot is not there for bob");
+        assert!(!r.cancel(&bob, &slot));
+        assert!(r.left(&her, "0123456789abcdef").is_none());
+
+        assert!(r.cancel(&her, &slot));
+        assert!(r.left(&her, &slot).is_none());
+        assert!(!r.allowed.pairing(), "the lane closes with the last slot");
+        assert!(!r.cancel(&her, &slot), "cancelled once");
+        let late = r.answer(&db, node(9), &ask(&token, "phone"));
+        assert!(late["error"].as_str().unwrap().contains("cancelled"), "{late}");
+        assert!(!r.allowed.contains(&node(9)));
+
+        let (_, slot) = r.open_slot(maria.id, false);
+        assert!(r.cancel(&ada, &slot), "an administrator can close anyone's");
+    }
+
+    #[test]
+    fn a_used_slot_is_no_longer_open() {
+        let db = Db::in_memory().unwrap();
+        let maria = users::create(&db, "maria", Some("sklodowska-1867"), "user", None).unwrap();
+        let r = remote();
+        let (token, slot) = r.open_slot(maria.id, false);
+        let her = person(maria.id, false);
+        assert!(r.answer(&db, node(10), &ask(&token, "phone")).get("key").is_some());
+        assert!(r.left(&her, &slot).is_none());
+        assert!(!r.cancel(&her, &slot), "nothing left to cancel");
+        // And one that ran out.
+        let (_, slot) = r.open_slot(maria.id, false);
+        r.slots.lock().unwrap().values_mut().for_each(|s| s.opened -= SLOT_LIFE);
+        assert!(r.left(&her, &slot).is_none());
     }
 
     #[test]

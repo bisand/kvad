@@ -69,6 +69,7 @@ pub fn routes() -> Router<State> {
         .route("/api/keys/{id}", delete(crate::accounts::revoke_key))
         .route("/api/remote", get(crate::remote::status))
         .route("/api/remote/pair", post(crate::remote::pair))
+        .route("/api/remote/pair/{slot}", get(crate::remote::slot).delete(crate::remote::cancel))
         .route("/api/remote/voucher", get(crate::remote::voucher))
         .route("/api/devices", get(crate::remote::list))
         .route("/api/devices/{id}", delete(crate::remote::remove))

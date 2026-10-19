@@ -1247,8 +1247,23 @@ pub const ENDPOINTS: &[Endpoint] = &[
         summary: "Open a pairing slot for a device of yours",
         description: "A single-use link that lives ten minutes; `kvad remote join` with it pairs the device to your \
                       account. A device acts as `user` unless `admin` is asked, which only an administrator \
-                      may. A paired device cannot open a slot unless it was paired with `admin`.",
-        query: &[], body: json_body("`{ admin }`, optional."), produces: JSON, events: &[],
+                      may. A paired device cannot open a slot unless it was paired with `admin`. \
+                      `{ link, slot, server, expires_in, role }`, and with `qr` the link's QR code as SVG. \
+                      Sent `no-store`: the link is as good as a password until it is used or expires.",
+        query: &[], body: json_body("`{ admin, qr }`, both optional."), produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "get", path: "/api/remote/pair/{slot}", tag: "Accounts", access: Access::SignedIn,
+        summary: "Whether a pairing slot of yours is still open",
+        description: "`{ open, expires_in }`; `{ open: false }` once its link is used, cancelled or expired, \
+                      and for a slot that is another account's, unless you are an administrator.",
+        query: &[], body: None, produces: JSON, events: &[],
+    },
+    Endpoint {
+        method: "delete", path: "/api/remote/pair/{slot}", tag: "Accounts", access: Access::SignedIn,
+        summary: "Cancel a pairing slot",
+        description: "Its link stops working now. Your own slots, or any for an administrator.",
+        query: &[], body: None, produces: JSON, events: &[],
     },
     Endpoint {
         method: "get", path: "/api/remote/voucher", tag: "Accounts", access: Access::SignedIn,

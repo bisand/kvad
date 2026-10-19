@@ -564,7 +564,11 @@ A device is paired once. On the server's machine, signed in:
 kvad remote pair
 ```
 
-It shows a QR code and a link, good once, for ten minutes. On the device:
+It shows a QR code and a link, good once, for ten minutes. An administrator
+can do the same from the web UI: *Pair a device* under Devices in Settings,
+with *allow admin* for a device that should act as one. The page shows the
+code until it is used or expires, and closes the slot on Cancel or when it
+is left. On the device:
 
 ```bash
 kvad remote join 'kvad://9ce63fe0…?k=…&relay=https://relay.kvad.eu&pair=…'

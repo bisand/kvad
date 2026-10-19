@@ -1094,6 +1094,18 @@ pub const NOT_COMMANDS: &[(&str, &str, &str)] = &[
     ),
     (
         "get",
+        "/api/remote/pair/{slot}",
+        "for the web UI's Pair a device, which watches the slot its code came from so that it can stop \
+         showing it once it is spent. `kvad remote pair` prints its link and is done",
+    ),
+    (
+        "delete",
+        "/api/remote/pair/{slot}",
+        "the web UI's Cancel, and what it does on leaving the page. A link `kvad remote pair` printed \
+         lapses in ten minutes, or at once if the server restarts",
+    ),
+    (
+        "get",
         "/api/auth/oidc/start",
         "a redirect to an identity provider, for a browser to follow. Sign in \
          there, make a key on the Account page, and give it to `kvad auth login --key`",

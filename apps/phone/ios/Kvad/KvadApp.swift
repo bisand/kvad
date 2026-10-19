@@ -40,7 +40,7 @@ struct RootView: View {
                 ChatView()
                     .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
                     .tag(Tab.chat)
-                ComingSoon(title: "Speak", symbol: "waveform", text: "Talk, and watch the words appear as your Mac hears them.")
+                SpeakView()
                     .tabItem { Label("Speak", systemImage: "waveform") }
                     .tag(Tab.speak)
                 ComingSoon(title: "Create", symbol: "sparkles", text: "Images and video, made on your Mac and kept on it.")

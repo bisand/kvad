@@ -13,10 +13,22 @@
 //!   session ([`HOLD`]). The server says how much audio it has, and the rest
 //!   is sent again from the file. Settled events it sends again are known by
 //!   their `event_id` and dropped.
-//! - **A session the server has let go of**, a server with no live
-//!   transcription, or one that fell too far behind: the take goes on into
-//!   its file alone, and when it ends it is sent whole to
+//! - **A session the server has let go of**, as a server that was restarted
+//!   has: a new one is begun from the last settled word, and what was said
+//!   since is sent from the file, so the words go on coming live. A Mac out
+//!   of reach for longer than [`HOLD`] is tried on and on, and goes live
+//!   again the same way once it answers.
+//! - **A server with no live transcription**, one that fell too far behind,
+//!   or a Mac still out of reach when the take is stopped: the take goes on
+//!   into its file alone, and when it ends it is sent whole to
 //!   `POST /v1/audio/transcriptions`.
+//!
+//! **Paragraphs.** A pause of [`PAUSE`] or more begins a new paragraph.
+//! The pauses are found in the audio as it comes ([`Quiet`]), and a settled
+//! word heard after one ends goes down after a blank line. A take sent whole
+//! has its paragraphs from the gaps between Whisper's segments instead.
+//! Who is speaking would begin one too, once kvad can tell speakers apart
+//! (docs/diarization-plan.md).
 //!
 //! Every take is a WAV and a JSON file beside it, named by the millisecond
 //! it began, in the folder the app gives. The app makes that folder, with
@@ -39,8 +51,23 @@ use std::time::{Duration, Instant};
 pub const RATE: u64 = 16_000;
 
 /// How long the server holds a session after its socket goes
-/// (`realtime::HOLD` in kvad-serve): after this the phone stops trying.
+/// (`realtime::HOLD` in kvad-serve): after this the app is told the Mac is
+/// out of reach, and a take stopped meanwhile is sent whole.
 pub const HOLD: Duration = Duration::from_secs(60);
+
+/// The shortest quiet that begins a new paragraph, in samples: a second
+/// and a half, longer than a breath or a comma, shorter than a turn.
+pub const PAUSE: u64 = RATE * 3 / 2;
+
+/// The blocks loudness is judged in, in samples: 50 ms.
+const BLOCK: u64 = RATE / 20;
+
+/// Below this amplitude a block is quiet in any room: about -66 dBFS.
+const QUIETEST: f32 = 0.0005;
+
+/// Where the noise floor starts, before the room has been heard: a quiet
+/// room through a phone's microphone, about -54 dBFS.
+const FLOOR: f32 = 0.002;
 
 /// How long the socket may go without a word from the server while it owes
 /// one (audio sent, or a commit) before it is taken for dead. The server
@@ -85,6 +112,74 @@ struct Take {
     cancel: AtomicBool,
     /// Why the file could not be written, which ends the take.
     broken: Mutex<Option<String>>,
+    /// The pauses in it so far.
+    quiet: Mutex<Quiet>,
+}
+
+/// The pauses in a take, found from its loudness 50 ms at a time against
+/// the room's own noise: a block is quiet when it is under 2.5 times the
+/// floor's amplitude (8 dB). The floor falls at once to a quieter block, and
+/// rises only toward a block that was quiet, over a second or so: a room
+/// that gets a little noisier is followed, and a voice, however steady,
+/// never raises it. A room that gets very much noisier at once has no
+/// pauses until it settles, which is the safe way to be wrong.
+#[derive(Default)]
+pub struct Quiet {
+    floor: Option<f32>,
+    /// Where the quiet under way began.
+    since: Option<u64>,
+    /// The pauses over, as the samples they began and ended at.
+    pauses: Vec<(u64, u64)>,
+    /// Samples fed so far.
+    at: u64,
+    /// The block being filled: its samples and their sum of squares.
+    block: (u64, f64),
+}
+
+impl Quiet {
+    pub fn feed(&mut self, samples: &[i16]) {
+        for &s in samples {
+            let x = s as f64 / 32768.0;
+            self.block.0 += 1;
+            self.block.1 += x * x;
+            self.at += 1;
+            if self.block.0 == BLOCK {
+                let rms = (self.block.1 / BLOCK as f64).sqrt() as f32;
+                self.block = (0, 0.0);
+                self.judge(rms);
+            }
+        }
+    }
+
+    fn judge(&mut self, rms: f32) {
+        let floor = self.floor.get_or_insert(FLOOR);
+        let quiet = rms < (*floor * 2.5).max(QUIETEST);
+        if rms < *floor {
+            *floor = rms;
+        } else if quiet {
+            *floor += (rms - *floor) * 0.05;
+        }
+        let begun = self.at - BLOCK;
+        match (quiet, self.since) {
+            (true, None) => self.since = Some(begun),
+            (false, Some(since)) => {
+                if begun - since >= PAUSE {
+                    self.pauses.push((since, begun));
+                }
+                self.since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a pause ended after sample `after` and by sample `to`.
+    pub fn ended_between(&self, after: u64, to: u64) -> bool {
+        self.pauses.iter().any(|&(_, end)| end > after && end <= to)
+    }
+
+    pub fn pauses(&self) -> &[(u64, u64)] {
+        &self.pauses
+    }
 }
 
 impl Speak {
@@ -132,6 +227,7 @@ impl Speak {
             stop: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             broken: Mutex::new(None),
+            quiet: Mutex::new(Quiet::default()),
         });
         *current = Some(take.clone());
         drop(current);
@@ -149,6 +245,7 @@ impl Speak {
         let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         match w.write_all(&bytes) {
             Ok(()) => {
+                take.quiet.lock().unwrap().feed(samples);
                 take.recorded.fetch_add(samples.len() as u64, Ordering::Release);
             }
             Err(e) => {
@@ -300,8 +397,8 @@ fn header(samples: u64) -> [u8; HEADER as usize] {
 
 /// How a take's thread ended its live session.
 enum End {
-    /// `completed` came: the transcript.
-    Done(String),
+    /// `completed` came: the take's text is all settled.
+    Done,
     /// Live is over, and the take goes on into its file. The app has been
     /// told why.
     Offline,
@@ -322,14 +419,21 @@ struct Live {
     /// The session's id, once the server has given one: what a reconnect
     /// names.
     id: Option<String>,
+    /// The take's sample that is the session's first. A session the server
+    /// let go of is followed by one that begins where its words were
+    /// settled to, and the offsets the server speaks of are the session's.
+    origin: u64,
     /// The offset of the last settled event, what a reconnect resumes from.
     settled_to: u64,
     /// The samples the server has.
     sent: u64,
     /// Settled events had, by `event_id`, so that those sent again are
-    /// dropped.
+    /// dropped. A session's ids are its own.
     seen: HashSet<String>,
-    settled: String,
+    /// The take's text so far, every session's, with its paragraphs.
+    text: String,
+    /// The take's sample up to which pauses have made their paragraphs.
+    broke_to: u64,
     /// The commit is in: the server said `committed`, or a resumed session
     /// is on an item after the take's first.
     committed: bool,
@@ -351,10 +455,12 @@ impl Live {
             server,
             reader,
             id: None,
+            origin: 0,
             settled_to: 0,
             sent: 0,
             seen: HashSet::new(),
-            settled: String::new(),
+            text: String::new(),
+            broke_to: 0,
             committed: false,
             owed: None,
             said: "",
@@ -368,23 +474,24 @@ impl Live {
             return;
         }
         // Wait for the end of the take, whatever happened to the link.
-        while !self.take.stop.load(Ordering::Relaxed) && !self.take.cancel.load(Ordering::Relaxed) && self.broken().is_none() && !matches!(end, End::Done(_) | End::Failed(_)) {
+        while !self.take.stop.load(Ordering::Relaxed) && !self.take.cancel.load(Ordering::Relaxed) && self.broken().is_none() && !matches!(end, End::Done | End::Failed(_)) {
             std::thread::sleep(Duration::from_millis(50));
         }
         if self.take.cancel.load(Ordering::Relaxed) {
             return;
         }
         let samples = self.close_file();
+        let so_far = self.text.trim().to_string();
         let (text, how, failed) = match end {
-            End::Done(text) => (text, "live", None),
-            End::Failed(why) => (self.settled.trim().to_string(), "", Some(why)),
+            End::Done => (so_far, "live", None),
+            End::Failed(why) => (so_far, "", Some(why)),
             End::Offline => match self.broken() {
-                Some(broken) => (self.settled.trim().to_string(), "", Some(broken)),
+                Some(broken) => (so_far, "", Some(broken)),
                 None => {
                     self.link("sending");
                     match self.send_whole() {
                         Ok(text) => (text, "file", None),
-                        Err(e) => (self.settled.trim().to_string(), "", Some(format!("The take could not be transcribed: {e} It is kept on this phone, to send again."))),
+                        Err(e) => (so_far, "", Some(format!("The take could not be transcribed: {e} It is kept on this phone, to send again."))),
                     }
                 }
             },
@@ -449,6 +556,18 @@ impl Live {
         }
     }
 
+    /// The server has let go of the session, as a server restarted has: a
+    /// new one, beginning at the last word settled, for the rest of the
+    /// take. What was said after it is sent from the file.
+    fn anew(&mut self) {
+        self.origin += self.settled_to;
+        self.settled_to = 0;
+        self.sent = 0;
+        self.id = None;
+        self.seen.clear();
+        self.committed = false;
+    }
+
     fn offline(&mut self, why: String) -> End {
         self.said = "offline";
         (self.emit)(event("speak_link", json!({ "state": "offline", "why": why })));
@@ -467,11 +586,19 @@ impl Live {
             if let Some(why) = self.broken() {
                 return End::Failed(why);
             }
-            if down.elapsed() > HOLD {
-                return self.offline("The Mac could not be reached for a minute. The take goes on, and is sent whole when it ends.".into());
+            let out_of_reach = down.elapsed() > HOLD;
+            if out_of_reach && self.take.stop.load(Ordering::Relaxed) {
+                return End::Offline;
+            }
+            if out_of_reach && self.said != "offline" {
+                self.said = "offline";
+                let why = "The Mac cannot be reached. Recording goes on, and the words come back live once it answers.";
+                (self.emit)(event("speak_link", json!({ "state": "offline", "why": why })));
             }
             if tries > 0 {
-                self.link("reconnecting");
+                if !out_of_reach {
+                    self.link("reconnecting");
+                }
                 std::thread::sleep(Duration::from_millis(250 << tries.min(3)));
             }
             tries += 1;
@@ -491,10 +618,13 @@ impl Live {
             };
             match self.on(socket) {
                 Some(end) => return end,
+                // The link went, or the session did: try again. A session
+                // let go of has been begun again (`anew`), so the next
+                // socket asks for a new one.
                 None => {
-                    // The link went: try again, for as long as the server
-                    // holds the session.
-                    down = Instant::now();
+                    if self.said == "live" {
+                        down = Instant::now();
+                    }
                     tries = 1;
                 }
             }
@@ -531,7 +661,7 @@ impl Live {
                             Heard::On => {}
                             Heard::Gone => return None,
                             Heard::End(end) => {
-                                if let End::Done(_) = end {
+                                if let End::Done = end {
                                     closed(&mut ws);
                                 }
                                 return Some(end);
@@ -551,12 +681,12 @@ impl Live {
             }
             // What is to go.
             self.link("live");
-            let recorded = self.take.recorded.load(Ordering::Acquire);
+            let recorded = self.take.recorded.load(Ordering::Acquire).saturating_sub(self.origin);
             let mut sent_now = 0;
             while self.sent < recorded && sent_now < 10 * FRAME {
                 let n = (recorded - self.sent).min(FRAME);
                 let mut pcm = vec![0u8; 2 * n as usize];
-                if self.reader.read_exact_at(&mut pcm, HEADER + 2 * self.sent).is_err() {
+                if self.reader.read_exact_at(&mut pcm, HEADER + 2 * (self.origin + self.sent)).is_err() {
                     return Some(End::Failed("The take could not be read back.".into()));
                 }
                 if ws.send(tungstenite::Message::Binary(pcm.into())).is_err() {
@@ -618,9 +748,14 @@ impl Live {
             "conversation.item.input_audio_transcription.delta" => {
                 if !again(&mut self.seen) {
                     let delta = v["delta"].as_str().unwrap_or_default();
-                    self.settled.push_str(delta);
                     self.settled_to = v["kvad"]["offset"].as_u64().unwrap_or(self.settled_to);
-                    (self.emit)(event("speak_settled", json!({ "text": delta, "lag": lag })));
+                    // Heard after a pause ended: a new paragraph.
+                    let heard = self.origin + self.settled_to;
+                    let paragraph = !self.text.trim().is_empty() && self.take.quiet.lock().unwrap().ended_between(self.broke_to, heard);
+                    self.broke_to = self.broke_to.max(heard);
+                    let piece = if paragraph { format!("\n\n{}", delta.trim_start()) } else { delta.to_string() };
+                    self.text.push_str(&piece);
+                    (self.emit)(event("speak_settled", json!({ "text": piece, "lag": lag })));
                 }
                 Heard::On
             }
@@ -639,13 +774,16 @@ impl Live {
                 if again(&mut self.seen) {
                     return Heard::On;
                 }
-                Heard::End(End::Done(v["transcript"].as_str().unwrap_or_default().to_string()))
+                Heard::End(End::Done)
             }
             "error" => {
                 let e = &v["error"];
                 let why = e["message"].as_str().unwrap_or("The server refused the live session.").to_string();
                 match e["code"].as_str().unwrap_or_default() {
-                    "session_not_found" => Heard::End(self.offline("The Mac let go of the live session while the link was down. The take goes on, and is sent whole when it ends.".into())),
+                    "session_not_found" => {
+                        self.anew();
+                        Heard::Gone
+                    }
                     "too_far_behind" => Heard::End(self.offline("The Mac fell too far behind to keep up live. The take goes on, and is sent whole when it ends.".into())),
                     // A gap, or a socket taken over: a reconnect puts it right.
                     "audio_gap" | "session_taken" => Heard::Gone,
@@ -678,5 +816,51 @@ fn closed(ws: &mut Socket) {
             Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(_) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `secs` of a 220 Hz tone at amplitude `a`, with a noise of amplitude
+    /// `noise` under it, from a fixed seed.
+    fn sound(secs: f64, a: f64, noise: f64, seed: &mut u64) -> Vec<i16> {
+        (0..(secs * RATE as f64) as usize)
+            .map(|i| {
+                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let n = ((*seed >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 2.0 * noise;
+                let x = a * (i as f64 * 220.0 * std::f64::consts::TAU / RATE as f64).sin() + n;
+                (x * 32767.0) as i16
+            })
+            .collect()
+    }
+
+    fn pauses(parts: &[(f64, f64)], noise: f64) -> Vec<(f64, f64)> {
+        let (mut q, mut seed) = (Quiet::default(), 7u64);
+        for &(secs, a) in parts {
+            // Fed as the app feeds it, a tenth of a second at a time.
+            for chunk in sound(secs, a, noise, &mut seed).chunks(1600) {
+                q.feed(chunk);
+            }
+        }
+        q.pauses().iter().map(|&(a, b)| (a as f64 / RATE as f64, b as f64 / RATE as f64)).collect()
+    }
+
+    #[test]
+    fn a_pause_is_found_where_it_is() {
+        assert_eq!(pauses(&[(3.0, 0.1), (2.0, 0.0), (3.0, 0.1)], 0.0), [(3.0, 5.0)]);
+    }
+
+    #[test]
+    fn a_breath_is_not_a_pause() {
+        assert_eq!(pauses(&[(3.0, 0.1), (0.8, 0.0), (3.0, 0.1), (1.2, 0.0), (2.0, 0.1)], 0.0), []);
+    }
+
+    /// In a noisy room the quiet between sentences is the room's noise, not
+    /// silence; and a voice held steady for long is still a voice.
+    #[test]
+    fn a_pause_in_a_noisy_room_is_found_and_steady_speech_is_not_one() {
+        assert_eq!(pauses(&[(20.0, 0.05), (2.0, 0.0), (3.0, 0.05)], 0.004), [(20.0, 22.0)]);
     }
 }

@@ -1093,6 +1093,13 @@ impl Client {
         selected(&self.conn)
     }
 
+    /// Whether the connection has ended: closed by either end, reset, or
+    /// timed out after the far end went quiet, as one does when its server
+    /// is restarted.
+    pub fn is_closed(&self) -> bool {
+        self.conn.close_reason().is_some()
+    }
+
     /// Says that the machine's network may have changed, so that paths are
     /// looked for again at once rather than when iroh notices: a phone that
     /// left the Wi-Fi, or came back to the foreground on 5G.

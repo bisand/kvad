@@ -1,6 +1,7 @@
-// The Rust core (apps/phone/core): connecting, pairing, the chat, the
-// Keychain and the Network test. Three C functions and one JSON object a
-// message each way; every command and event is in apps/phone/messages.json.
+// The Rust core (apps/phone/core): connecting, pairing, the chat, Speak's
+// takes, the Keychain and the Network test. Four C functions: one JSON
+// object a message each way, every command and event of them in
+// apps/phone/messages.json, and the microphone's samples (Microphone.swift).
 
 import Foundation
 
@@ -83,6 +84,39 @@ struct ProbeTable: Decodable {
     var line: String?
 }
 
+/// A take on this phone: its audio and what was said in it.
+struct Take: Decodable, Identifiable, Hashable {
+    /// The millisecond it began, which also names its files.
+    let id: String
+    let started: Int
+    let seconds: Double
+    let model: String
+    let language: String
+    var text: String
+    /// `live`, `file`, or empty when nothing has transcribed it yet.
+    var how: String
+    let server: String
+
+    var date: Date { Date(timeIntervalSince1970: TimeInterval(started)) }
+    var transcribed: Bool { !how.isEmpty }
+}
+
+/// A conversation kept on this phone, as its list shows it.
+struct ChatInfo: Decodable, Identifiable, Hashable {
+    let id: String
+    let started: Int
+    let updated: Int
+    let model: String
+    let title: String
+
+    var date: Date { Date(timeIntervalSince1970: TimeInterval(updated)) }
+}
+
+struct ChatTurn: Decodable {
+    let role: String
+    let content: String
+}
+
 /// One event from the core, by the name that is its only key.
 enum Event: Decodable {
     case ready(server: String, core: String)
@@ -94,6 +128,11 @@ enum Event: Decodable {
     case piece(String)
     case replyDone
     case chatFailed(error: String, nothing: Bool)
+    case chatSaved(ChatInfo)
+    case chats([ChatInfo])
+    case chatOpened(id: String, model: String, turns: [ChatTurn])
+    case chatDeleted(String)
+    case chatsFailed(String)
     case disconnected
     case unpaired
     case unpairFailed(String)
@@ -107,6 +146,18 @@ enum Event: Decodable {
     case probePing(ProbeTable)
     case probeDone(ProbeTable)
     case probeFailed(String)
+    case speakStarted(String)
+    case speakSettled(text: String, lag: Double)
+    case speakPartial(text: String, lag: Double)
+    case speakLink(state: String, why: String)
+    case speakDone(Take)
+    case speakFailed(error: String, kept: Bool)
+    case speakCancelled(String)
+    case takes([Take])
+    case takeDeleted(String)
+    case retranscribePiece(id: String, text: String)
+    case retranscribeDone(Take)
+    case retranscribeFailed(id: String, error: String)
     case error(String)
     /// A name this app does not know: a newer core.
     case unknown(String)
@@ -126,6 +177,16 @@ enum Event: Decodable {
     private struct Link: Decodable { let server: String; let notice: String }
     private struct ID: Decodable { let id: String }
     private struct Started: Decodable { let secs: Int; let status: String }
+    private struct Heard: Decodable { let text: String; let lag: Double }
+    private struct SpeakLink: Decodable { let state: String; let why: String? }
+    private struct OfTake: Decodable { let take: Take }
+    private struct SpeakFailure: Decodable { let error: String; let kept: Bool }
+    private struct Takes: Decodable { let takes: [Take] }
+    private struct Piece: Decodable { let id: String; let text: String }
+    private struct TakeFailure: Decodable { let id: String; let error: String }
+    private struct OfChat: Decodable { let chat: ChatInfo }
+    private struct Chats: Decodable { let chats: [ChatInfo] }
+    private struct Opened: Decodable { let id: String; let model: String; let turns: [ChatTurn] }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Name.self)
@@ -143,6 +204,11 @@ enum Event: Decodable {
         case "piece": self = .piece(try body(Text.self).text)
         case "reply_done": self = .replyDone
         case "chat_failed": let f = try body(ChatFailure.self); self = .chatFailed(error: f.error, nothing: f.nothing)
+        case "chat_saved": self = .chatSaved(try body(OfChat.self).chat)
+        case "chats": self = .chats(try body(Chats.self).chats)
+        case "chat_opened": let o = try body(Opened.self); self = .chatOpened(id: o.id, model: o.model, turns: o.turns)
+        case "chat_deleted": self = .chatDeleted(try body(ID.self).id)
+        case "chats_failed": self = .chatsFailed(try body(Failure.self).error)
         case "disconnected": self = .disconnected
         case "unpaired": self = .unpaired
         case "unpair_failed": self = .unpairFailed(try body(Failure.self).error)
@@ -156,6 +222,18 @@ enum Event: Decodable {
         case "probe_ping": self = .probePing(try body(ProbeTable.self))
         case "probe_done": self = .probeDone(try body(ProbeTable.self))
         case "probe_failed": self = .probeFailed(try body(Failure.self).error)
+        case "speak_started": self = .speakStarted(try body(ID.self).id)
+        case "speak_settled": let h = try body(Heard.self); self = .speakSettled(text: h.text, lag: h.lag)
+        case "speak_partial": let h = try body(Heard.self); self = .speakPartial(text: h.text, lag: h.lag)
+        case "speak_link": let l = try body(SpeakLink.self); self = .speakLink(state: l.state, why: l.why ?? "")
+        case "speak_done": self = .speakDone(try body(OfTake.self).take)
+        case "speak_failed": let f = try body(SpeakFailure.self); self = .speakFailed(error: f.error, kept: f.kept)
+        case "speak_cancelled": self = .speakCancelled(try body(ID.self).id)
+        case "takes": self = .takes(try body(Takes.self).takes)
+        case "take_deleted": self = .takeDeleted(try body(ID.self).id)
+        case "retranscribe_piece": let p = try body(Piece.self); self = .retranscribePiece(id: p.id, text: p.text)
+        case "retranscribe_done": self = .retranscribeDone(try body(OfTake.self).take)
+        case "retranscribe_failed": let f = try body(TakeFailure.self); self = .retranscribeFailed(id: f.id, error: f.error)
         case "error": self = .error(try body(Failure.self).error)
         default: self = .unknown(key.stringValue)
         }

@@ -13,7 +13,7 @@
 //! server is held in memory only.
 
 use crate::api::{Model, Server, Turn};
-use crate::{pairings, probe, speak};
+use crate::{chats, pairings, probe, speak};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +40,9 @@ struct State {
     turns: Vec<Turn>,
     stop: Arc<AtomicBool>,
     replying: bool,
+    /// The conversation's id, once it has a first question: what it is kept
+    /// as on the phone.
+    chat: Option<String>,
     /// Counts connections. An answer for an earlier one, which a disconnect
     /// has since ended, is dropped.
     connection: u64,
@@ -66,9 +69,16 @@ impl Session {
         match name.as_str() {
             "connect" => self.connect(text("url"), text("key"), text("device")),
             "models" => self.models(),
-            "chat" => self.chat(text("model"), text("text")),
+            "chat" => self.chat(text("model"), text("text"), text("folder")),
             "stop" => self.state.lock().unwrap().stop.store(true, Ordering::Relaxed),
-            "new_chat" => self.state.lock().unwrap().turns.clear(),
+            "new_chat" => {
+                let mut st = self.state.lock().unwrap();
+                st.turns.clear();
+                st.chat = None;
+            }
+            "chats" => (self.emit)(event("chats", json!({ "chats": chats::list(&text("folder")) }))),
+            "chat_open" => self.open_chat(&text("folder"), &text("id")),
+            "chat_delete" => self.delete_chat(&text("folder"), &text("id")),
             "disconnect" => {
                 self.end();
                 (self.emit)(event("disconnected", json!({})));
@@ -162,7 +172,44 @@ impl Session {
         });
     }
 
-    fn chat(&self, model: String, text: String) {
+    /// Conversation `id` from the phone, to go on with.
+    fn open_chat(&self, folder: &str, id: &str) {
+        let mut st = self.state.lock().unwrap();
+        if st.replying {
+            return (self.emit)(event("chats_failed", json!({ "error": "A reply is still coming. Stop it first." })));
+        }
+        match chats::load(folder, id) {
+            Ok((model, turns)) => {
+                let shown: Vec<Value> = turns.iter().map(|t| json!({ "role": t.role, "content": t.content })).collect();
+                st.turns = turns;
+                st.chat = Some(id.to_string());
+                drop(st);
+                (self.emit)(event("chat_opened", json!({ "id": id, "model": model, "turns": shown })));
+            }
+            Err(e) => (self.emit)(event("chats_failed", json!({ "error": e }))),
+        }
+    }
+
+    fn delete_chat(&self, folder: &str, id: &str) {
+        let mut st = self.state.lock().unwrap();
+        if st.chat.as_deref() == Some(id) {
+            if st.replying {
+                return (self.emit)(event("chats_failed", json!({ "error": "A reply is still coming. Stop it first." })));
+            }
+            st.turns.clear();
+            st.chat = None;
+        }
+        drop(st);
+        match chats::delete(folder, id) {
+            Ok(()) => (self.emit)(event("chat_deleted", json!({ "id": id }))),
+            Err(e) => (self.emit)(event("chats_failed", json!({ "error": e }))),
+        }
+    }
+
+    /// A question in the conversation, and the reply to it as it comes. The
+    /// conversation is kept in `folder` once the reply is in, or as much of
+    /// it as came.
+    fn chat(&self, model: String, text: String, folder: String) {
         let text = text.trim().to_string();
         let fail = |e: &str| (self.emit)(event("chat_failed", json!({ "error": e, "nothing": true })));
         let (server, turns, stop, connection) = {
@@ -177,6 +224,7 @@ impl Session {
             st.turns.push(Turn { role: "user", content: text });
             st.stop = Arc::new(AtomicBool::new(false));
             st.replying = true;
+            st.chat.get_or_insert_with(chats::new_id);
             (server, st.turns.clone(), st.stop.clone(), st.connection)
         };
         let (emit, state) = (self.emit.clone(), self.state.clone());
@@ -194,12 +242,19 @@ impl Session {
             if !reply.is_empty() {
                 st.turns.push(Turn { role: "assistant", content: reply.clone() });
             }
+            let kept = (st.chat.clone(), st.turns.clone());
             drop(st);
             match result {
                 Ok(()) => emit(event("reply_done", json!({}))),
                 // Nothing came back: the error says why, and an empty reply
                 // would only say it less well.
                 Err(e) => emit(event("chat_failed", json!({ "error": e, "nothing": reply.is_empty() }))),
+            }
+            if let (Some(id), false) = (kept.0, folder.is_empty()) {
+                match chats::save(&folder, &id, &model, &kept.1) {
+                    Ok(about) => emit(event("chat_saved", json!({ "chat": about }))),
+                    Err(e) => emit(event("chats_failed", json!({ "error": e }))),
+                }
             }
         });
     }

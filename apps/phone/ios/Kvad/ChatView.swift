@@ -1,11 +1,13 @@
 // The chat: the model is the title, and tapping it chooses; the reply
-// streams in word by word; the composer rides on the keyboard.
+// streams in word by word; the composer rides on the keyboard. The
+// conversations are kept on this phone, and listed from the top left.
 
 import SwiftUI
 
 struct ChatView: View {
     @Environment(AppModel.self) private var model
     @State private var choosing = false
+    @State private var listing = false
     /// Whether the newest words are in view. While they are, the chat stays
     /// with them as they arrive; scrolled up to read, it stays put.
     @State private var atEnd = true
@@ -61,6 +63,10 @@ struct ChatView: View {
                         .foregroundStyle(.primary)
                     }
                 }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { listing = true } label: { Image(systemName: "list.bullet") }
+                        .accessibilityLabel("Conversations")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { model.newChat() } label: { Image(systemName: "square.and.pencil") }
                         .disabled(model.replying || model.bubbles.isEmpty)
@@ -68,6 +74,7 @@ struct ChatView: View {
                 }
             }
             .sheet(isPresented: $choosing) { ModelSheet() }
+            .sheet(isPresented: $listing) { ConversationsSheet() }
         }
     }
 }
@@ -187,6 +194,68 @@ struct ModelSheet: View {
                 }
             }
             .refreshable { await model.refreshModels() }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+/// The conversations on this phone, the latest first: one to go on with, or
+/// a new one.
+struct ConversationsSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(model.conversations) { chat in
+                    Button {
+                        model.openChat(chat)
+                        dismiss()
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(chat.title.isEmpty ? "Untitled" : chat.title).foregroundStyle(.primary).lineLimit(2)
+                                Text("\(chat.date.formatted(.relative(presentation: .named))) · \(ModelInfo(id: chat.model, kind: "", resident: false).name)")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            if chat.id == model.chatID {
+                                Image(systemName: "checkmark").fontWeight(.semibold).foregroundStyle(.tint)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    // A row reads as text, not as a gold button.
+                    .buttonStyle(.plain)
+                    .disabled(model.replying)
+                    .swipeActions {
+                        Button("Delete", role: .destructive) { model.deleteChat(chat) }
+                    }
+                }
+            }
+            .overlay {
+                if model.conversations.isEmpty {
+                    ContentUnavailableView("No conversations yet", systemImage: "bubble.left.and.bubble.right", description: Text("They are kept on this phone, and nowhere else."))
+                }
+            }
+            .navigationTitle("Conversations")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        model.newChat()
+                        dismiss()
+                    } label: { Label("New chat", systemImage: "square.and.pencil") }
+                    .disabled(model.replying)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .onAppear { model.loadChats() }
         }
         .presentationDetents([.medium, .large])
     }

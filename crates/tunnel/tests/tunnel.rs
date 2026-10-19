@@ -207,6 +207,50 @@ fn a_websocket_goes_through_directly_and_relayed() {
     assert_eq!(tunnel.path(), Some(Path::Relay(url)));
 }
 
+/// A server whose process ends with nothing said, as one killed or
+/// restarted does, then starts again with the same key on the same port: a
+/// client that held its tunnel all along gets through again, on a new
+/// connection it dials itself.
+#[test]
+fn a_client_outlives_a_server_restart() {
+    let dir = Scratch::new("restart");
+    let (key, id) = client_key(&dir);
+    let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let start = || {
+        let rt = runtime();
+        let cfg = ServerConfig { key: dir.path("remote.key"), knock: dir.path("remote.knock"), relays: Vec::new(), direct: Direct::Auto, port, allowed: Allowed::new(vec![id]) };
+        // The port comes free a moment after the last server's runtime goes.
+        let begun = Instant::now();
+        let server = loop {
+            match rt.block_on(Server::start(&cfg)) {
+                Ok(s) => break s,
+                Err(e) if begun.elapsed() > Duration::from_secs(10) => panic!("{e}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        };
+        let address = loopback(server.address().clone());
+        rt.spawn(async move { axum::serve(server, router()).await });
+        (rt, address)
+    };
+    let (rt, address) = start();
+    let tunnel = blocking::Tunnel::connect(&key, &address, None).unwrap();
+    assert!(get(&tunnel, "/hello").unwrap().ends_with("hi"));
+
+    // Gone without a word: the client's connection has to time out.
+    rt.shutdown_background();
+    let (_rt, _) = start();
+    let gone = Instant::now();
+    let reply = loop {
+        match get(&tunnel, "/hello") {
+            Ok(r) if r.ends_with("hi") => break r,
+            _ if gone.elapsed() > Duration::from_secs(90) => panic!("no way through 90 s after the restart"),
+            _ => std::thread::sleep(Duration::from_millis(500)),
+        }
+    };
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    eprintln!("through again {:.1} s after the restart", gone.elapsed().as_secs_f64());
+}
+
 #[test]
 fn a_device_not_on_the_list_is_refused() {
     let dir = Scratch::new("refused");

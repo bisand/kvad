@@ -112,3 +112,41 @@ fn fewer_updates_settle_the_same_text() {
     slow.push(1.0);
     assert_eq!(settled_from(&slow), script_text(40));
 }
+
+/// What `text` says with every `x` taken out: the words a restless
+/// script's guesses have in common.
+fn no_x(text: &str) -> String {
+    text.replace('x', "")
+}
+
+/// Updates that never agree, as a phone's backlog fed to a new session
+/// once did: nothing settles for 30 s, so the window fills with nowhere to
+/// cut. It begins again without losing a word: every word heard is settled,
+/// in order, and every word shown as the guess before is among them. A
+/// second at a time, and five, as `/v1/realtime` feeds a backlog.
+#[test]
+fn a_window_full_of_guesses_is_settled_not_dropped() {
+    let tr = Script::restless();
+    for step in [1, 5] {
+        let mut live = Live::new(&tr, &Request::default()).unwrap();
+        let (mut settled, mut partial, mut forced) = (String::new(), String::new(), 0);
+        for heard in (step..=45).step_by(step) {
+            live.push(&sound(step as f32));
+            let u = live.update(&tr).unwrap();
+            let before = settled.len();
+            settled.push_str(&u.settled);
+            if heard <= 30 {
+                assert!(settled.is_empty(), "settled `{settled}` at {heard} s, with no two guesses agreeing");
+            }
+            if u.forced {
+                forced += 1;
+                assert!(no_x(&settled[before..]).starts_with(&no_x(&partial)), "the guess `{partial}` was dropped at {heard} s");
+            }
+            assert!(no_x(&script_text(45)).starts_with(&no_x(&settled)), "settled `{settled}` at {heard} s");
+            partial = u.partial;
+        }
+        assert_eq!(forced, 1, "the window fills once in 45 s of guesses, {step} s at a time");
+        settled.push_str(&live.finish(&tr).unwrap().settled);
+        assert_eq!(no_x(&settled), no_x(&script_text(45)), "{step} s at a time");
+    }
+}

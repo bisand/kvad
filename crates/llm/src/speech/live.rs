@@ -22,7 +22,10 @@
 //!    side, as a file's windows are. The plain tail has none, so one timed
 //!    decode of what the update has just heard finds them, and its words
 //!    are matched to the settled ones. A window that reaches 30 s with
-//!    nowhere to cut begins again at its newest 30 s, losing its partial.
+//!    nowhere to cut has its first 30 s finished, as [`Live::finish`]
+//!    would: decoded once more and settled as they come, so that no word
+//!    heard is lost. It begins again where a timed decode of them ends a
+//!    segment, or after them where none does.
 //! 4. A window the model takes for silence, with nothing settled in it, is
 //!    let go of but for its last second, so that silence never fills one.
 //!
@@ -35,6 +38,7 @@
 
 use super::mel::{self, SAMPLE_RATE};
 use super::transcribe::{Request, Transcriber, TIME_STEP};
+use super::Heard;
 use crate::sampler::Sampler;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -89,7 +93,8 @@ pub struct Update {
     pub heard: f32,
     /// The window was finished at a segment's end ([`CUT`]).
     pub cut: bool,
-    /// The window reached 30 s with nowhere to cut, and began again.
+    /// The window reached 30 s with nowhere to cut: its first 30 s were
+    /// settled, and it began again.
     pub forced: bool,
     /// The model took the window for silence.
     pub silent: bool,
@@ -158,32 +163,12 @@ impl Live {
         if self.window.is_empty() {
             return Ok(u);
         }
-        if self.window.len() > mel::N_SAMPLES {
-            // Nothing settled to cut at in time: begin again at the newest
-            // 30 s, what was settled kept as context.
-            let gone = self.window.len() - mel::N_SAMPLES;
-            self.window.drain(..gone);
-            self.before += gone;
-            self.context.append(&mut self.settled);
-            self.trim_context(tr);
-            self.last.clear();
-            u.forced = true;
+        while self.window.len() > mel::N_SAMPLES {
+            self.force(tr, &mut u)?;
         }
 
-        let m = &*tr.model;
-        let n_mels = m.config().n_mels;
-        let window = &self.window;
-        let spectrogram = tr.on_pool(|| Ok(mel::window(&mel::log_mel(window, mel::N_SAMPLES - window.len(), n_mels), 0)))?;
-        let heard = tr.on_pool(|| m.hear(&spectrogram))?;
-        let (_, language) = match &self.language {
-            Some(l) => l.clone(),
-            None => {
-                let (code, _) = tr.on_pool(|| tr.detect(&heard))?;
-                let id = tr.tokens.language(&code).unwrap_or(0);
-                self.language = Some((code, id));
-                self.language.clone().expect("just set")
-            }
-        };
+        let heard = self.hear(tr, self.window.len())?;
+        let language = self.language_id(tr, &heard)?;
         let plain = tr.start(language, &self.request);
         let sampler = &mut self.sampler;
         let (context, settled) = (&self.context, &self.settled);
@@ -214,7 +199,7 @@ impl Live {
                 agreed.map_or(0, |(a, _)| a.end).max(self.settled.len())
             }
         };
-        u.settled = tr.text(&guess[self.settled.len()..upto])?;
+        u.settled.push_str(&tr.text(&guess[self.settled.len()..upto])?);
         u.partial = tr.text(&guess[upto..])?;
         self.settled = guess[..upto].to_vec();
         self.last = guess;
@@ -222,10 +207,8 @@ impl Live {
         if !finishing && self.window.len() as f32 / SAMPLE_RATE as f32 > CUT {
             // Where to finish the window: one timed decode of what was just
             // heard.
-            let timed = tr.start(language, &Request { timestamps: true, ..self.request.clone() });
-            let (sampler, context) = (&mut self.sampler, &self.context);
-            let w = tr.on_pool(|| tr.window(&heard, context, &timed, &[], Some(LAP), 0.0, sampler))?;
-            if let Some((i, at)) = cut(tr, &w.tokens, &self.settled) {
+            let timed = self.timed(tr, &heard, language)?;
+            if let Some((i, at)) = cut(tr, &timed, &self.settled) {
                 let gone = ((at * SAMPLE_RATE as f32) as usize).min(self.window.len());
                 self.window.drain(..gone);
                 self.before += gone;
@@ -236,6 +219,76 @@ impl Live {
             }
         }
         Ok(u)
+    }
+
+    /// A window of more than 30 s, with nowhere it could be cut: its first
+    /// 30 s are decoded once more, after what is settled, and the guess is
+    /// settled whole, as [`Live::finish`] settles. The last update's
+    /// partial was a guess at the same words, heard to a little less; to
+    /// drop it, and the audio under it, would lose speech from the text
+    /// that the recording has. The window then begins again where a timed
+    /// decode of those 30 s ends a segment that another follows, with what
+    /// was settled after it kept, as at a cut. Where they end none, it
+    /// begins after them, as a file's window with no timestamps does.
+    fn force(&mut self, tr: &Transcriber, u: &mut Update) -> Res<()> {
+        u.forced = true;
+        let heard = self.hear(tr, mel::N_SAMPLES)?;
+        let language = self.language_id(tr, &heard)?;
+        let plain = tr.start(language, &self.request);
+        let (sampler, context, settled) = (&mut self.sampler, &self.context, &self.settled);
+        let w = tr.on_pool(|| tr.window(&heard, context, &plain, settled, Some(LAP), 0.0, sampler))?;
+        let mut cut_at = None;
+        // Silence with nothing settled is let go of, as an update lets it go.
+        if !(self.settled.is_empty() && w.silent()) {
+            u.settled.push_str(&tr.text(&w.tokens[self.settled.len()..])?);
+            self.settled = w.tokens;
+            let timed = self.timed(tr, &heard, language)?;
+            if let Some((i, at)) = cut(tr, &timed, &self.settled) {
+                cut_at = Some(((at * SAMPLE_RATE as f32) as usize).min(mel::N_SAMPLES));
+                self.context.extend(self.settled.drain(..i));
+            }
+        }
+        let gone = match cut_at {
+            Some(gone) => gone,
+            None => {
+                self.context.append(&mut self.settled);
+                mel::N_SAMPLES
+            }
+        };
+        self.window.drain(..gone);
+        self.before += gone;
+        self.last = self.settled.clone();
+        self.trim_context(tr);
+        Ok(())
+    }
+
+    /// What the encoder hears of the window's first `n` samples, padded to
+    /// 30 s.
+    fn hear(&self, tr: &Transcriber, n: usize) -> Res<Heard> {
+        let m = &*tr.model;
+        let n_mels = m.config().n_mels;
+        let window = &self.window[..n];
+        let spectrogram = tr.on_pool(|| Ok(mel::window(&mel::log_mel(window, mel::N_SAMPLES - window.len(), n_mels), 0)))?;
+        tr.on_pool(|| m.hear(&spectrogram))
+    }
+
+    /// The language token: known, or detected in what was `heard`.
+    fn language_id(&mut self, tr: &Transcriber, heard: &Heard) -> Res<u32> {
+        if let Some((_, id)) = &self.language {
+            return Ok(*id);
+        }
+        let (code, _) = tr.on_pool(|| tr.detect(heard))?;
+        let id = tr.tokens.language(&code).unwrap_or(0);
+        self.language = Some((code, id));
+        Ok(id)
+    }
+
+    /// A timed decode of what was `heard`, read after the context and
+    /// nothing settled: where its segments end.
+    fn timed(&mut self, tr: &Transcriber, heard: &Heard, language: u32) -> Res<Vec<u32>> {
+        let timed = tr.start(language, &Request { timestamps: true, ..self.request.clone() });
+        let (sampler, context) = (&mut self.sampler, &self.context);
+        Ok(tr.on_pool(|| tr.window(heard, context, &timed, &[], Some(LAP), 0.0, sampler))?.tokens)
     }
 
     /// Keep no more context than a window can be read after.

@@ -6,7 +6,10 @@
 //! second is not yet heard. So what is settled, and where a window is cut,
 //! can be checked against what the script says, with no model downloaded.
 //! [`Script::restless`] is one that never writes the same plain guess
-//! twice running, so that no update agrees with the last.
+//! twice running, so that no update agrees with the last;
+//! [`Script::punctuating`] writes the same words each time, with a full
+//! stop and a question mark after them by turns, as Whisper writes a "Ja"
+//! in a meeting.
 //!
 //! Built for this crate's tests, and with the `script` feature for
 //! kvad-serve's, which play it into `/v1/realtime`. Not a part of the API.
@@ -31,7 +34,9 @@ const TRANSLATE: u32 = 56;
 const NO_TIMESTAMPS: u32 = 57;
 const NO_SPEECH: u32 = 58;
 const NO: u32 = 59;
-const TB: u32 = 60;
+const DOT: u32 = 60;
+const ASK: u32 = 61;
+const TB: u32 = 62;
 const VOCAB: usize = TB as usize + 1501;
 /// Timestamp steps in a second.
 const STEPS: u32 = 50;
@@ -49,6 +54,8 @@ fn tokenizer() -> tokenizers::Tokenizer {
         vocab.insert(format!("Ġw{k}"), k.into());
     }
     vocab.insert("x".into(), X.into());
+    vocab.insert(".".into(), DOT.into());
+    vocab.insert("?".into(), ASK.into());
     vocab.insert("<unk>".into(), 51.into());
     let json = serde_json::json!({
         "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
@@ -84,12 +91,13 @@ fn tokens() -> Tokens {
 pub struct Script {
     config: whisper::Config,
     restless: bool,
+    punctuating: bool,
 }
 
 impl Script {
     /// A transcriber over the script.
     pub fn transcriber() -> Transcriber {
-        Script::over(false)
+        Script::over(false, false)
     }
 
     /// A transcriber over the script that writes every word with an `x`
@@ -100,10 +108,17 @@ impl Script {
     /// from the last word written, as Whisper goes on from what it is
     /// handed, so a settled word may be given an `x` after it.
     pub fn restless() -> Transcriber {
-        Script::over(true)
+        Script::over(true, false)
     }
 
-    fn over(restless: bool) -> Transcriber {
+    /// A transcriber over the script that writes, plain, a full stop after
+    /// every word when it hears an odd number of seconds and a question mark
+    /// when it hears an even number: the same words, punctuated by turns.
+    pub fn punctuating() -> Transcriber {
+        Script::over(false, true)
+    }
+
+    fn over(restless: bool, punctuating: bool) -> Transcriber {
         let config = whisper::Config {
             n_mels: 80,
             d: 8,
@@ -117,7 +132,7 @@ impl Script {
             text_ctx: 448,
             vocab: VOCAB,
         };
-        Transcriber { model: Box::new(Script { config, restless }), tokenizer: tokenizer(), tokens: tokens() }
+        Transcriber { model: Box::new(Script { config, restless, punctuating }), tokenizer: tokenizer(), tokens: tokens() }
     }
 
     /// What the model would write after `seq`, heard `seconds` of sound.
@@ -143,6 +158,23 @@ impl Script {
             let next = match seq[begin..].last() {
                 Some(&k) if k < WORDS && x => X,
                 _ => match seq[begin..].iter().rev().find(|&&i| i < WORDS).map_or(base, |&i| i + 1) {
+                    k if k < base + whole => k,
+                    _ => EOT,
+                },
+            };
+            logits[next as usize] = 10.0;
+            return logits;
+        }
+        if plain && self.punctuating {
+            // Goes on from what it is handed, whatever marks are in it: a
+            // word's `x` if it is two tokens, its mark, then the next word.
+            let mark = if seconds.round() as u32 % 2 == 1 { DOT } else { ASK };
+            let written = &seq[begin..];
+            let last = written.iter().rev().find(|&&i| i < WORDS).copied();
+            let next = match (last, written.last()) {
+                (Some(k), Some(&t)) if t == k && k % 4 == 3 => X,
+                (Some(_), Some(&t)) if t < WORDS || t == X => mark,
+                _ => match last.map_or(base, |k| k + 1) {
                     k if k < base + whole => k,
                     _ => EOT,
                 },

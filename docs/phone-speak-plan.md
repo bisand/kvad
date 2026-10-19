@@ -242,6 +242,15 @@ Each is a PR, merged on a green check, as the SwiftUI move was.
    chosen model on the file endpoint, streamed. Taking audio from elsewhere:
    the Files picker, and the share sheet's *Open in Kvad* for a Voice Memo.
    Subtitles (SRT, VTT) from the segments, as the web UI writes them.
+   **Takes stored smaller.** A take is 16 kHz 16-bit PCM, 1.9 MB a minute
+   and 115 MB an hour; a 19-minute meeting was 36 MB. It has to be PCM
+   while it is recorded, since the core reads it back to resend what a
+   dropped link lost. Once it ends, it is converted on the phone with
+   Apple's own encoder to AAC in `.m4a` at about 32 kbit/s, about 0.24 MB a
+   minute, which the server's file endpoint reads through ffmpeg as it reads
+   any recording. Opus would be smaller still at the same quality for
+   speech, if the server is shown to read it. The WAV goes once the
+   compressed file is written and read back.
 
 ## Open questions
 

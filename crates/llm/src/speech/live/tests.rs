@@ -35,6 +35,29 @@ fn settled_text_is_the_script_and_never_changes() {
     assert_eq!(settled, script_text(40));
 }
 
+/// The same words punctuated differently each update, as Whisper writes a
+/// "Ja" heard on its own in a meeting: they are agreed, and settle a second
+/// behind, as unpunctuated ones do. Compared as written, none would settle
+/// before the end.
+#[test]
+fn punctuation_that_changes_holds_nothing_back() {
+    let tr = Script::punctuating();
+    let mut live = Live::new(&tr, &Request::default()).unwrap();
+    let mut settled = String::new();
+    for second in 1..=12 {
+        live.push(&sound(1.0));
+        let u = live.update(&tr).unwrap();
+        settled.push_str(&u.settled);
+        if second >= 3 {
+            let words = settled.split_whitespace().count();
+            assert!(words + 2 >= second, "{words} words settled at {second} s: `{settled}`");
+        }
+    }
+    settled.push_str(&live.finish(&tr).unwrap().settled);
+    let letters: Vec<String> = settled.split_whitespace().map(|w| w.trim_end_matches(['.', '?']).to_string()).collect();
+    assert_eq!(letters.join(" "), script_text(12).trim(), "the script's words, in order, each once: `{settled}`");
+}
+
 /// A word whose first half is heard, and then all of it, is not settled
 /// on the half the two guesses share: whole words are compared.
 #[test]

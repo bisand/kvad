@@ -93,7 +93,7 @@ impl Session {
             "probe_open" => self.probe.open(),
             "probe_start" => self.probe.start(&text("ticket"), args["secs"].as_u64().unwrap_or(60)),
             "probe_stop" => self.probe.stop(),
-            "speak_start" => self.speak.start(self.server(), &text("model"), &text("language"), &text("folder")),
+            "speak_start" => self.speak.start(self.server(), &text("model"), &text("language"), &text("folder"), args["level"].as_bool().unwrap_or(false)),
             "speak_stop" => self.speak.stop(),
             "speak_cancel" => self.speak.cancel(),
             "takes" => self.speak.takes(&text("folder")),

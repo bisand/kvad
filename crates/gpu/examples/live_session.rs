@@ -20,6 +20,21 @@
 //! segment's time shared out by letters, as `live_speed` has it, and is
 //! good to a second or so: read the median and the 90th percentile.
 //! `--trace` prints every update.
+//!
+//! A backend may end in `+gain=X`, the recording made X times louder and
+//! clipped, or in `+level`, or `+level=TARGET:MOST`: the recording is
+//! then heard through Kvad for iPhone's gain stage first
+//! (`apps/phone/core/src/level.rs`, the same file), as a take with it on is
+//! sent. Each such entry is a column of its own, interleaved with the rest,
+//! so `gpu-q8,gpu-q8+level` compares the two on one recording. `--from=S`
+//! and `--to=S` play a part of it. `--private` prints no text, only the
+//! numbers, for a recording that is not to be read; with it, the stretches
+//! with nothing settled are listed by where they are, with how many of the
+//! file's words were spoken in them. `--script=FILE` is the text the
+//! recording is known to say, for one played in a room: each column then
+//! says how many of its words the live text has, and the file's. It may be
+//! another model's transcript: `--save=PREFIX` writes each entry's file
+//! transcript to PREFIX-N.txt, the first being 1.
 use kvad::quant::Precision;
 use kvad::speech::mel::SAMPLE_RATE;
 use kvad::speech::{audio, Live, Request, Transcriber, Transcript};
@@ -27,6 +42,21 @@ use kvad::weights::Watcher;
 use std::time::{Duration, Instant};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+#[path = "../../../apps/phone/core/src/level.rs"]
+#[allow(dead_code)]
+mod level;
+
+/// `samples` as the phone's gain stage leaves them: at 16 bits, as the
+/// microphone gives them to it, a tenth of a second at a time.
+fn levelled(samples: &[f32], target: f32, most: f32) -> Vec<f32> {
+    let mut pcm: Vec<i16> = samples.iter().map(|&x| (x * 32768.0).round().clamp(-32768.0, 32767.0) as i16).collect();
+    let mut stage = level::Level::new(target, most);
+    for chunk in pcm.chunks_mut(1600) {
+        stage.feed(chunk);
+    }
+    pcm.iter().map(|&x| x as f32 / 32768.0).collect()
+}
 
 fn load(repo: &str, backend: &str) -> Res<Transcriber> {
     let quiet = &mut |_: &str| {};
@@ -168,42 +198,100 @@ fn live(tr: &Transcriber, samples: &[f32], cadence: f64, trace: bool) -> Res<Run
     Ok(run)
 }
 
+/// The longest waits between one settled word and the next, as (from,
+/// to) on the audio's clock, longest first.
+fn waits(settled: &[f64], end: f64, n: usize) -> Vec<(f64, f64)> {
+    let mut at: Vec<f64> = settled.to_vec();
+    at.push(end);
+    let mut gaps: Vec<(f64, f64)> = std::iter::once(0.0).chain(at.iter().copied()).zip(at.iter().copied()).filter(|(a, b)| b > a).collect();
+    gaps.sort_by(|x, y| (y.1 - y.0).total_cmp(&(x.1 - x.0)));
+    gaps.truncate(n);
+    gaps
+}
+
 fn main() -> Res<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let trace = args.iter().any(|a| a == "--trace");
+    let private = args.iter().any(|a| a == "--private");
     let cadence: f64 = args.iter().find_map(|a| a.strip_prefix("--cadence=")).map_or(Ok(1.0), str::parse)?;
+    let from: f64 = args.iter().find_map(|a| a.strip_prefix("--from=")).map_or(Ok(0.0), str::parse)?;
+    let to: f64 = args.iter().find_map(|a| a.strip_prefix("--to=")).map_or(Ok(f64::MAX), str::parse)?;
+    let save = args.iter().find_map(|a| a.strip_prefix("--save="));
+    let script = args.iter().find_map(|a| a.strip_prefix("--script=")).map(std::fs::read_to_string).transpose()?.map(|t| plain_words(&t));
     let args: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [repo, wav, backends, rounds] = args[..] else {
-        return Err("usage: live_session REPO WAV BACKEND,BACKEND,… ROUNDS [--cadence=SECONDS] [--trace]".into());
+        return Err("usage: live_session REPO WAV BACKEND[+level[=TARGET:MOST]],… ROUNDS [--cadence=SECONDS] [--from=S] [--to=S] [--trace] [--private]".into());
     };
-    let samples = audio::from_wav(&std::fs::read(wav)?)?;
-    let seconds = samples.len() as f64 / SAMPLE_RATE as f64;
+    let all = audio::from_wav(&std::fs::read(wav)?)?;
+    let cut = |s: f64| ((s * SAMPLE_RATE as f64) as usize).min(all.len());
+    let raw = &all[cut(from)..cut(to)];
+    let seconds = raw.len() as f64 / SAMPLE_RATE as f64;
     let rounds: usize = rounds.parse()?;
-    let backends: Vec<&str> = backends.split(',').collect();
-    let (mut loaded, mut spoken) = (Vec::new(), Vec::new());
-    for b in &backends {
-        let t = Instant::now();
-        let model = load(repo, b)?;
-        // One update over five seconds, so that no round is the first time
-        // each kernel runs.
-        let mut warm = Live::new(&model, &Request::default())?;
-        warm.push(&samples[..5 * SAMPLE_RATE]);
-        warm.update(&model)?;
-        println!("{b}: {} loaded in {:.1} s", model.backend(), t.elapsed().as_secs_f32());
-        let done = model.transcribe(&samples, &Request { timestamps: true, ..Request::default() }, &mut |_| true)?;
+    let entries: Vec<&str> = backends.split(',').collect();
+    let mut models: Vec<(String, Transcriber)> = Vec::new();
+    let (mut which, mut heard, mut spoken) = (Vec::new(), Vec::new(), Vec::new());
+    for e in &entries {
+        let (b, stage) = e.split_once('+').map_or((*e, None), |(b, s)| (b, Some(s)));
+        let samples = match stage {
+            None => raw.to_vec(),
+            Some("level") => levelled(raw, level::TARGET, level::MOST),
+            // A fixed gain, clipped: what turning the microphone up does.
+            Some(g) if g.starts_with("gain=") => {
+                let g: f32 = g[5..].parse()?;
+                raw.iter().map(|&x| (x * g).clamp(-1.0, 1.0)).collect()
+            }
+            Some(s) => {
+                let (t, m) = s.strip_prefix("level=").and_then(|v| v.split_once(':')).ok_or("+level or +level=TARGET:MOST")?;
+                levelled(raw, t.parse()?, m.parse()?)
+            }
+        };
+        let n = match models.iter().position(|(name, _)| name == b) {
+            Some(n) => n,
+            None => {
+                let t = Instant::now();
+                let model = load(repo, b)?;
+                // One update over five seconds, so that no round is the first
+                // time each kernel runs.
+                let mut warm = Live::new(&model, &Request::default())?;
+                warm.push(&samples[..5 * SAMPLE_RATE]);
+                warm.update(&model)?;
+                println!("{b}: {} loaded in {:.1} s", model.backend(), t.elapsed().as_secs_f32());
+                models.push((b.to_string(), model));
+                models.len() - 1
+            }
+        };
+        let done = models[n].1.transcribe(&samples, &Request { timestamps: true, ..Request::default() }, &mut |_| true)?;
         spoken.push(spoken_words(&done));
-        loaded.push(model);
+        let words: Vec<&str> = spoken.last().unwrap().iter().map(|w| w.0.as_str()).collect();
+        // How much of the first entry's it keeps, and how much of it is
+        // written twice, which is what a model makes up over noise does.
+        let first: Vec<&str> = spoken[0].iter().map(|w| w.0.as_str()).collect();
+        let mut seen = std::collections::HashSet::new();
+        let again = words.windows(4).filter(|g| !seen.insert(*g)).count();
+        let mut line = format!("{e}: the file's transcript has {} words, {} of the first's {}, {:.1}% of its 4-grams again", words.len(), align(&words, &first).len(), first.len(), 100.0 * again as f64 / words.len().max(1) as f64);
+        if let Some(known) = &script {
+            line += &format!(", {} of the script's {}", align(&words, &known.iter().map(String::as_str).collect::<Vec<_>>()).len(), known.len());
+        }
+        println!("{line}");
+        if let Some(prefix) = save {
+            std::fs::write(format!("{prefix}-{}.txt", spoken.len()), words.join(" "))?;
+        }
+        which.push(n);
+        heard.push(samples);
     }
-    println!("{seconds:.1} s of audio, an update due every {cadence} s");
+    println!("{seconds:.1} s of audio from {from:.0} s, an update due every {cadence} s");
     println!("columns: min/median/p90/max; a word's lag is from where the file's timed transcript puts its end");
-    let mut texts: Vec<Option<String>> = vec![None; backends.len()];
+    let mut texts: Vec<Option<String>> = vec![None; entries.len()];
     for round in 1..=rounds {
-        for (n, b) in backends.iter().enumerate() {
-            let run = live(&loaded[n], &samples, cadence, trace)?;
+        for (n, b) in entries.iter().enumerate() {
+            let run = live(&models[which[n]].1, &heard[n], cadence, trace && !private)?;
             let reference = &spoken[n];
             let pairs = align(&run.words.iter().map(|w| w.0.as_str()).collect::<Vec<_>>(), &reference.iter().map(|w| w.0.as_str()).collect::<Vec<_>>());
             let shown: Vec<f64> = pairs.iter().map(|&(i, j)| run.words[i].1 - reference[j].1 as f64).collect();
             let settled: Vec<f64> = pairs.iter().map(|&(i, j)| run.words[i].2 - reference[j].1 as f64).collect();
+            // Against the first entry's file transcript too, which is the
+            // same for every entry.
+            let common = align(&run.words.iter().map(|w| w.0.as_str()).collect::<Vec<_>>(), &spoken[0].iter().map(|w| w.0.as_str()).collect::<Vec<_>>()).len();
             println!(
                 "round {round} {b:8} {} updates, wall {} s, real-time factor {:.2}, {} skipped, {} cuts{}, ends {:.2} s after the audio",
                 run.walls.len(),
@@ -214,12 +302,27 @@ fn main() -> Res<()> {
                 if run.forced > 0 { format!(" ({} forced)", run.forced) } else { String::new() },
                 run.end,
             );
-            println!("         {b:8} {} words, {} of {} as the file's, lag shown {} s, settled {} s", run.words.len(), pairs.len(), reference.len(), spread(shown), spread(settled));
+            println!("         {b:8} {} words, {} of {} as the file's ({} of the first's {}), lag shown {} s, settled {} s", run.words.len(), pairs.len(), reference.len(), common, spoken[0].len(), spread(shown), spread(settled));
+            let times: Vec<f64> = run.words.iter().map(|w| w.2).collect();
+            let longest: Vec<String> = waits(&times, seconds + run.end, 3)
+                .iter()
+                .map(|&(a, b)| {
+                    let said = reference.iter().filter(|w| (w.1 as f64) > a && (w.1 as f64) <= b).count();
+                    format!("{:.1} s to {:.0} s ({said} words)", b - a, from + b)
+                })
+                .collect();
+            println!("         {b:8} longest with nothing settled: {}", longest.join(", "));
+            if let Some(known) = &script {
+                let found = align(&run.words.iter().map(|w| w.0.as_str()).collect::<Vec<_>>(), &known.iter().map(String::as_str).collect::<Vec<_>>()).len();
+                println!("         {b:8} {found} of the script's {} words", known.len());
+            }
             texts[n].get_or_insert(run.text);
         }
     }
-    for (b, text) in backends.iter().zip(texts) {
-        println!("{b}: {}", text.unwrap_or_default().trim());
+    if !private {
+        for (b, text) in entries.iter().zip(texts) {
+            println!("{b}: {}", text.unwrap_or_default().trim());
+        }
     }
     Ok(())
 }

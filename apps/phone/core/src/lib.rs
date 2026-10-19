@@ -18,6 +18,7 @@
 
 pub mod api;
 pub mod chats;
+pub mod level;
 pub mod pairings;
 pub mod probe;
 pub mod secrets;

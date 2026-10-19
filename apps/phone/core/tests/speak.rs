@@ -428,7 +428,7 @@ fn a_take_gives_its_words_each_once() {
     let (fake, addr) = Fake::start(Script::default());
     let dir = folder("whole");
     let (s, rx) = speak();
-    s.start(Some(Server::new(&addr, None).unwrap()), "NbAiLab/nb-whisper-small", "no", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "NbAiLab/nb-whisper-small", "no", dir.to_str().unwrap(), false);
     assert_eq!(name(&rx.recv_timeout(Duration::from_secs(1)).unwrap()), "speak_started");
     let samples = play(&s, 0, 10.0);
     std::thread::sleep(Duration::from_millis(300));
@@ -457,7 +457,7 @@ fn a_socket_cut_mid_word_and_resumed_gives_the_take_of_one_never_cut() {
     let (fake, addr) = Fake::start(Script { cut_at: Some(RATE * 9 / 2), down_for: Duration::from_millis(300), ..Script::default() });
     let dir = folder("cut");
     let (s, rx) = speak();
-    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
     let samples = play(&s, 0, 10.0);
     std::thread::sleep(Duration::from_millis(1500));
     s.stop();
@@ -479,7 +479,7 @@ fn a_session_let_go_of_goes_on_live_in_a_new_one() {
     let (fake, addr) = Fake::start(Script { cut_at: Some(RATE * 7 / 2), forget: true, ..Script::default() });
     let dir = folder("forgot");
     let (s, rx) = speak();
-    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
     let samples = play(&s, 0, 10.0);
     std::thread::sleep(Duration::from_millis(1500));
     s.stop();
@@ -507,7 +507,7 @@ fn a_server_without_live_gets_the_take_whole_in_paragraphs() {
     let (fake, addr) = Fake::start(Script { no_live: true, quiet, ..Script::default() });
     let dir = folder("nolive");
     let (s, rx) = speak();
-    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
     let samples = play_with(&s, 0, 8.0, quiet);
     s.stop();
     let events = until(&rx, "speak_done", 30);
@@ -527,7 +527,7 @@ fn a_pause_begins_a_paragraph() {
     let (fake, addr) = Fake::start(Script { quiet, ..Script::default() });
     let dir = folder("pause");
     let (s, rx) = speak();
-    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
     let samples = play_with(&s, 0, 11.0, quiet);
     std::thread::sleep(Duration::from_millis(300));
     s.stop();
@@ -545,7 +545,7 @@ fn a_stop_during_a_reconnect_loses_nothing() {
     let (fake, addr) = Fake::start(Script { cut_at: Some(RATE * 6), down_for: Duration::from_millis(1500), ..Script::default() });
     let dir = folder("stop");
     let (s, rx) = speak();
-    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
     let samples = play(&s, 0, 8.0);
     // Stopped while the server is down.
     std::thread::sleep(Duration::from_millis(300));
@@ -564,7 +564,7 @@ fn a_cancelled_take_leaves_nothing() {
     let (_fake, addr) = Fake::start(Script::default());
     let dir = folder("cancel");
     let (s, rx) = speak();
-    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
     let id = rx.recv_timeout(Duration::from_secs(1)).unwrap()["speak_started"]["id"].as_str().unwrap().to_string();
     play(&s, 0, 1.0);
     s.cancel();
@@ -574,7 +574,7 @@ fn a_cancelled_take_leaves_nothing() {
     // Nothing more comes of it, and a new take can begin.
     std::thread::sleep(Duration::from_millis(500));
     assert!(rx.try_iter().all(|e| !matches!(name(&e), "speak_done" | "speak_failed")));
-    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
     assert_eq!(name(&rx.recv_timeout(Duration::from_secs(1)).unwrap()), "speak_started");
     s.cancel();
 }
@@ -600,16 +600,42 @@ fn a_take_cut_short_by_the_app_is_listed_untranscribed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A take of a room keeps its far voice brought up in its file, which is
+/// what is sent.
+#[test]
+fn a_take_of_a_room_is_kept_levelled() {
+    let (_fake, addr) = Fake::start(Script::default());
+    let dir = folder("level");
+    let (s, rx) = speak();
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), true);
+    assert_eq!(name(&rx.recv_timeout(Duration::from_secs(1)).unwrap()), "speak_started");
+    // Words at -40 dBFS, 250 ms with 100 ms between, for 4 s.
+    let tau = std::f64::consts::TAU;
+    let far: Vec<i16> = (0..4 * RATE).map(|i| if i % 5600 < 4000 { (330.0 * (i as f64 * 220.0 * tau / RATE as f64).sin()) as i16 } else { 0 }).collect();
+    for chunk in far.chunks(RATE as usize / 10) {
+        s.audio(chunk);
+    }
+    s.stop();
+    let events = until(&rx, "speak_done", 20);
+    let take = &events.last().unwrap()["speak_done"]["take"];
+    let wav = std::fs::read(dir.join(format!("{}.wav", take["id"].as_str().unwrap()))).unwrap();
+    let kept: Vec<i16> = wav[44..].chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let peak = |s: &[i16]| s.iter().map(|x| x.unsigned_abs()).max().unwrap();
+    let last = 3 * RATE as usize;
+    assert!(peak(&kept[last..]) > 6 * peak(&far[last..]), "{} against {}", peak(&kept[last..]), peak(&far[last..]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_take_wants_a_server_and_one_at_a_time() {
     let (s, rx) = speak();
     let dir = folder("one");
-    s.start(None, "", "", dir.to_str().unwrap());
+    s.start(None, "", "", dir.to_str().unwrap(), false);
     assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), json!({ "speak_failed": { "error": "Not connected to a server.", "kept": false } }));
     let (_fake, addr) = Fake::start(Script::default());
-    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
     assert_eq!(name(&rx.recv_timeout(Duration::from_secs(1)).unwrap()), "speak_started");
-    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
     let e = rx.try_iter().find(|e| name(e) == "speak_failed").expect("a second take refused");
     assert_eq!(e["speak_failed"]["kept"], false);
     s.cancel();
@@ -643,7 +669,7 @@ fn a_take_with_a_running_server() {
     let dir = folder("live");
     let (s, rx) = speak();
     let server = || Some(Server::new(&url, None).unwrap());
-    s.start(server(), &model, "no", dir.to_str().unwrap());
+    s.start(server(), &model, "no", dir.to_str().unwrap(), false);
     // `KVAD_PHONE_TEST_BACKLOG` seconds of it at once first, as a session
     // begun again after a restart is sent what was said meanwhile.
     let backlog: u64 = env("KVAD_PHONE_TEST_BACKLOG", "0").parse().unwrap();

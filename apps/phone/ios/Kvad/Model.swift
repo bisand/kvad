@@ -25,6 +25,37 @@ let speakLanguages: [(code: String, name: String)] = [
     ("de", "German"), ("fr", "French"), ("es", "Spanish"), ("fi", "Finnish"), ("pl", "Polish"),
 ]
 
+/// How Speak hears, chosen in the Speak sheet: a table of people, or one
+/// voice close to the phone (docs/phone-speak-plan.md, *Hearing the far end
+/// of the table*).
+enum Room: String, CaseIterable {
+    case meeting, near
+
+    var name: String { self == .meeting ? "Meeting" : "Close by" }
+
+    var hearing: Hearing {
+        switch self {
+        case .meeting: Hearing(level: true)
+        case .near: Hearing()
+        }
+    }
+}
+
+#if DEBUG
+/// The ways of hearing compared for *Hearing the far end of the table*, by
+/// name, for the debug picker and `KVAD_PHONE_MIC`. Each records with no
+/// gain of the core's: `live_session`'s `+level` puts it on afterwards, on
+/// the very same take.
+let hearingTrials: [(name: String, hearing: Hearing)] = [
+    ("standard", Hearing()),
+    ("measurement", Hearing(mode: .measurement)),
+    ("voice", Hearing(voiceProcessing: true)),
+    ("front", Hearing(facing: .front, everyWay: true)),
+    ("back", Hearing(facing: .back, everyWay: true)),
+    ("bottom", Hearing(facing: .bottom, everyWay: true)),
+]
+#endif
+
 @Observable @MainActor
 final class AppModel {
     // Connect
@@ -79,6 +110,21 @@ final class AppModel {
     var speakPaused = false
     var speakModel = ""
     var speakLanguage = "no"
+    var speakRoom = Room(rawValue: UserDefaults.standard.string(forKey: "speakRoom") ?? "") ?? .meeting {
+        didSet { UserDefaults.standard.set(speakRoom.rawValue, forKey: "speakRoom") }
+    }
+    #if DEBUG
+    /// A trial's name, heard with in place of the room's way.
+    var speakTrial = Script.env["KVAD_PHONE_MIC"] ?? ""
+    /// What the last take heard with, as iOS had it.
+    var speakRoute = ""
+    #endif
+    var hearing: Hearing {
+        #if DEBUG
+        if let trial = hearingTrials.first(where: { $0.name == speakTrial }) { return trial.hearing }
+        #endif
+        return speakRoom.hearing
+    }
     var takes: [Take] = []
     /// Takes being transcribed again, with the text so far.
     var again: [String: String] = [:]
@@ -245,7 +291,7 @@ final class AppModel {
         speakNotice = ""
         speakPaused = false
         recording = .starting
-        Core.send("speak_start", ["model": speakModel, "language": speakLanguage, "folder": folder])
+        Core.send("speak_start", ["model": speakModel, "language": speakLanguage, "folder": folder, "level": hearing.level])
     }
 
     func stopTake() {
@@ -415,9 +461,13 @@ final class AppModel {
             do {
                 #if DEBUG
                 // A scripted take is the file's audio alone.
-                if Script.env["KVAD_PHONE_SPEAK"] == nil { try microphone.start() }
+                if Script.env["KVAD_PHONE_SPEAK"] == nil {
+                    try microphone.start(hearing)
+                    speakRoute = Microphone.route()
+                    print("kvad-mic \(speakTrial.isEmpty ? speakRoom.rawValue : speakTrial): \(speakRoute)")
+                }
                 #else
-                try microphone.start()
+                try microphone.start(hearing)
                 #endif
                 recording = .on
                 takeStarted = Date()
@@ -499,6 +549,9 @@ final class AppModel {
 /// `KVAD_PHONE_SAY` a message to send once connected. `KVAD_PHONE_SPEAK` is
 /// a WAV (16 kHz mono 16-bit) to record a take from once connected, played
 /// in at real time in place of the microphone's, then stopped.
+/// `KVAD_PHONE_RECORD` is a number of seconds to record from the microphone
+/// once connected, then stop, with the screen kept on; `KVAD_PHONE_MIC` the
+/// trial to hear with (`hearingTrials`).
 @MainActor
 enum Script {
     static let env = ProcessInfo.processInfo.environment
@@ -521,6 +574,16 @@ enum Script {
         }
         if env["KVAD_PHONE_SPEAK"] != nil {
             Task { await m.startTake() }
+        }
+        if let seconds = env["KVAD_PHONE_RECORD"].flatMap(Double.init) {
+            m.tab = .speak
+            UIApplication.shared.isIdleTimerDisabled = true
+            Task {
+                await m.startTake()
+                try? await Task.sleep(for: .seconds(seconds))
+                m.stopTake()
+                UIApplication.shared.isIdleTimerDisabled = false
+            }
         }
     }
 

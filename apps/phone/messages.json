@@ -16,7 +16,7 @@
     "probe_open": {},
     "probe_start": { "ticket": "kvadprobe:1:…", "secs": 60 },
     "probe_stop": {},
-    "speak_start": { "model": "NbAiLab/nb-whisper-small", "language": "no", "folder": "/var/mobile/Containers/Data/Application/…/Library/Application Support/Takes" },
+    "speak_start": { "model": "NbAiLab/nb-whisper-small", "language": "no", "folder": "/var/mobile/Containers/Data/Application/…/Library/Application Support/Takes", "level": true },
     "speak_stop": {},
     "speak_cancel": {},
     "takes": { "folder": "/var/mobile/Containers/Data/Application/…/Library/Application Support/Takes" },

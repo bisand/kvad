@@ -674,6 +674,11 @@ fn a_take_with_a_running_server() {
     let (l, f) = (words(&live), words(&file));
     let shared = l.iter().filter(|w| f.contains(w)).count();
     eprintln!("{shared} of the live take's {} words are in the file's {}", l.len(), f.len());
+    // `KVAD_PHONE_TEST_KEEP` keeps the take, and its link's log, to read.
+    if std::env::var_os("KVAD_PHONE_TEST_KEEP").is_some() {
+        eprintln!("kept in {}", dir.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     assert!(shared * 10 >= f.len() * 8, "live and file differ by more than a fifth");
-    let _ = std::fs::remove_dir_all(&dir);
 }

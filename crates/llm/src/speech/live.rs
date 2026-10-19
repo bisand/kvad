@@ -16,7 +16,12 @@
 //! 2. A word is *settled* once two updates in a row write it, and every
 //!    word before it, the same: LocalAgreement-2, from Macháček et al.'s
 //!    whisper_streaming (2023). Settled text never changes. The rest is the
-//!    *partial*, which the next update replaces.
+//!    *partial*, which the next update replaces. "The same" is the same
+//!    letters and digits, whole words, in any case and with any punctuation
+//!    after them: in a meeting Whisper writes a "Ja" heard on its own as
+//!    "Ja.", "Ja?" and "Ja ..." by turns, and compared as written it held
+//!    back everything after it for as long as it went on. The latest guess's
+//!    spelling is what is settled.
 //! 3. A window holding more than [`CUT`] seconds is finished where a
 //!    settled segment ends and the next begins, two timestamps side by
 //!    side, as a file's windows are. The plain tail has none, so one timed
@@ -189,13 +194,18 @@ impl Live {
         let guess = w.tokens;
 
         // Settled is every word this guess and the last agree on, from the
-        // start, compared whole: a word the two begin the same and end
-        // differently is not agreed.
+        // start, compared whole by their letters (`plain`): a word the two
+        // begin the same and end differently is not agreed, and one they
+        // punctuate differently is.
         let upto = match finishing {
             true => guess.len(),
             false => {
                 let (ours, theirs) = (words(tr, &guess), words(tr, &self.last));
-                let agreed = ours.iter().zip(&theirs).take_while(|(a, b)| guess[(*a).clone()] == self.last[(*b).clone()]).last();
+                let same = |a: &std::ops::Range<usize>, b: &std::ops::Range<usize>| match (tr.text(&guess[a.clone()]), tr.text(&self.last[b.clone()])) {
+                    (Ok(x), Ok(y)) => self::plain(&x) == self::plain(&y),
+                    _ => guess[a.clone()] == self.last[b.clone()],
+                };
+                let agreed = ours.iter().zip(&theirs).take_while(|(a, b)| same(a, b)).last();
                 agreed.map_or(0, |(a, _)| a.end).max(self.settled.len())
             }
         };

@@ -657,6 +657,27 @@ Three things differ from the design above, each found building it:
   settle while one guess went on `not` and the other `nose`. A word now
   counts as agreed only when both guesses spell it with the same tokens.
   It settles a little later for it: see the table.
+  *Then by its letters, 2026-10-19.* In a meeting recorded on the phone,
+  Whisper wrote a "Ja" heard on its own as "Ja ...", "Ja?" and "Ja." by
+  turns, and compared token for token nothing after it settled for nine
+  seconds. A word is now agreed when both guesses have the same letters
+  and digits, whole, in any case and with any punctuation after them, as
+  the cut already matched words; the latest guess's spelling is settled.
+  Played at real time through `live_session` (small, gpu-q8), two
+  4-minute stretches of that meeting, three interleaved rounds each: the
+  median settled delay fell in all six pairs (3.86, 3.61, 3.75 s to 3.62,
+  2.77, 3.59 s, and 3.57, 3.44, 3.17 s to 3.26, 3.14, 2.49 s), and the
+  second stretch matched more of the file transcript's words every round
+  (288, 284, 302 to 304, 321, 309). The 90th percentile and the worst
+  case moved both ways: one binary on the same audio wrote 387 to 469
+  words over three rounds, so they are noise at this count.
+  *Most of a meeting's delay is not agreement.* The longest stretches with
+  nothing settled, 17 to 24 s, had an empty guess throughout: Whisper wrote
+  nothing while someone spoke, then the whole sentence at once, which
+  settled soon after. They were the quieter voices, ones the file endpoint
+  left out altogether, whole and in 30-second pieces. Hearing them sooner
+  is the audio's business (the phone's microphone and gain) or a larger
+  model's, not this rule's.
 - *The cut hears nothing again.* The timed decode that finds a cut reads
   what the update before it has just heard, as the plan guessed it could.
   On small at gpu-q8, in one traced run, the five updates with a cut took

@@ -36,6 +36,7 @@
 //! folder's class.
 
 use crate::api::{Refused, Server, Socket};
+use crate::level::Level;
 use crate::session::{event, Emit};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -114,6 +115,9 @@ struct Take {
     broken: Mutex<Option<String>>,
     /// The pauses in it so far.
     quiet: Mutex<Quiet>,
+    /// The gain the samples go through first, for a take of a room
+    /// (`level.rs`).
+    level: Option<Mutex<Level>>,
 }
 
 /// The pauses in a take, found from its loudness 50 ms at a time against
@@ -189,7 +193,7 @@ impl Speak {
 
     /// Begins a take in `folder`, live through `server`. The app starts its
     /// microphone once this returns: the take's file is there by then.
-    pub fn start(&self, server: Option<Server>, model: &str, language: &str, folder: &str) {
+    pub fn start(&self, server: Option<Server>, model: &str, language: &str, folder: &str, level: bool) {
         let fail = |e: String| (self.emit)(event("speak_failed", json!({ "error": e, "kept": false })));
         let Some(server) = server else { return fail("Not connected to a server.".into()) };
         let mut current = self.take.lock().unwrap();
@@ -228,6 +232,7 @@ impl Speak {
             cancel: AtomicBool::new(false),
             broken: Mutex::new(None),
             quiet: Mutex::new(Quiet::default()),
+            level: level.then(|| Mutex::new(Level::default())),
         });
         *current = Some(take.clone());
         drop(current);
@@ -236,16 +241,27 @@ impl Speak {
         std::thread::spawn(move || Live::new(emit, current, take, server, reader).run());
     }
 
-    /// Samples from the microphone, 16 kHz mono, into the take's file.
-    /// Dropped when no take is being recorded.
+    /// Samples from the microphone, 16 kHz mono, into the take's file,
+    /// through its gain if it has one. Dropped when no take is being
+    /// recorded.
     pub fn audio(&self, samples: &[i16]) {
         let Some(take) = self.take.lock().unwrap().clone() else { return };
         let mut writer = take.writer.lock().unwrap();
         let Some(w) = writer.as_mut() else { return };
+        // The pauses are found in the room as it is, before any gain.
+        take.quiet.lock().unwrap().feed(samples);
+        let mut levelled = Vec::new();
+        let samples = match &take.level {
+            Some(level) => {
+                levelled.extend_from_slice(samples);
+                level.lock().unwrap().feed(&mut levelled);
+                &levelled[..]
+            }
+            None => samples,
+        };
         let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         match w.write_all(&bytes) {
             Ok(()) => {
-                take.quiet.lock().unwrap().feed(samples);
                 take.recorded.fetch_add(samples.len() as u64, Ordering::Release);
             }
             Err(e) => {

@@ -309,6 +309,30 @@ private struct SpeakSheet: View {
                         ForEach(speakLanguages, id: \.code) { Text($0.name).tag($0.code) }
                     }
                 }
+                Section {
+                    Picker("Microphone", selection: $model.speakRoom) {
+                        ForEach(Room.allCases, id: \.self) { Text($0.name).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("Microphone")
+                } footer: {
+                    Text(model.speakRoom == .meeting
+                        ? "For a table of people: quieter voices, farther from the phone, are brought up, so that they are heard as soon as the near ones."
+                        : "For one voice near the phone: the sound as the microphone hears it.")
+                }
+                #if DEBUG
+                Section {
+                    Picker("Trial", selection: $model.speakTrial) {
+                        Text("None").tag("")
+                        ForEach(hearingTrials, id: \.name) { Text($0.name).tag($0.name) }
+                    }
+                } header: {
+                    Text("Debug")
+                } footer: {
+                    Text(model.speakRoute.isEmpty ? "A trial records with no gain, in place of the choice above." : "Last take: \(model.speakRoute)")
+                }
+                #endif
             }
             .overlay {
                 if model.speechModels.isEmpty {

@@ -141,6 +141,68 @@ the link drops*):
   full pairing. The scoped pairing is relay-plan's to build, and Speak
   will not need to change for it.
 
+## Hearing the far end of the table
+
+A 19-minute meeting recorded with the phone on the table had stretches of
+17 to 24 s with nothing settled, and in them the guess was empty: small
+wrote nothing while a quieter voice across the table spoke, then the whole
+sentence at once. The file endpoint left those passages out altogether.
+The take was quiet. Its 50 ms blocks were at -40 dBFS at the median, -26
+at the 90th percentile (the voices near the phone) and -54 at the 10th
+(the room). Whisper reads loudness as it comes: its log-mel has no gain of
+its own, and a voice 15 dB under the near ones was too faint for small.
+
+**Meeting**, the default in the Speak sheet, brings quieter voices up
+before the take is written: `apps/phone/core/src/level.rs`. It measures
+50 ms at a time, takes a block as voice when it is 8 dB over the quietest
+block of the last 3 s, and follows the voice's level in decibels, up to a
+louder one in a block or two, down to a quieter one over about a second.
+The gain brings that level toward -26 dBFS, by at most 18 dB (8 times). It
+never turns a voice down, holds between voices so that the room is raised
+no more than the last voice was, and a block's peak caps it so that nothing
+clips. **Close by** is the sound as the microphone gives it, as before. The
+gain is the core's, on the take's file, so live, the file endpoint after a
+dropped link and *Transcribe again* all hear the same audio. The pauses
+that begin paragraphs are found before it.
+
+Measured on that meeting with `live_session` (`+level` runs the take
+through the same `level.rs`), nb-whisper-small at gpu-q8 on an M5 Pro, at
+real time with an update a second. The reference is nb-whisper-large's file
+transcript of the take as recorded, 2023 words. Large hears the far voices
+either way: with the gain it writes 1983 words, 1826 of them the same.
+
+| small, gpu-q8 | words | of large's 2023 | settled, median / p90 / max | longest with nothing settled |
+|---|---|---|---|---|
+| live, no gain, run 1 | 1791 | 1248 | 3.79 / 10.45 / 57.0 s | 57.1 s |
+| live, no gain, run 2 | 1782 | 1258 | 3.72 / 9.65 / 96.8 s | 36.9 s |
+| live, Meeting (gain at most 8) | 2012 | **1429** | 3.35 / 9.45 / 38.3 s | 41.0 s |
+| live, gain at most 16 | 1957 | 1341 | 3.57 / 11.85 / 32.9 s | 30.6 s |
+| file, no gain | 1332 | 1008 | | |
+| file, gain at most 8 | 1630 | 1158 | | |
+| file, gain at most 16 | 1830 | 1308 | | |
+
+The two runs with no gain agree within 1%. Meeting's live text has 14%
+more of large's words, and they settle sooner. A file transcript is one
+decode, and it swings by ±10% with any change to the audio: a plain gain of
+2, 4 and 8 times gave 1163, 1015 and 1202. So the file rows say only that
+any gain helps. At most 16 times did best on the file, but not live, so the
+cap is 8. The share of 4-grams written twice stayed at 0.2 to 0.5% in
+every case: the gain does not make small invent text over the room's
+noise. With the Mac's `say -v Nora`, every other sentence 24 dB under the
+rest over a noise floor, the live text kept 135 of the file's words in
+place of 97 to 104.
+
+*Not measured:* iOS's own ways of hearing. A debug build has a *Trial*
+picker in the Speak sheet, and `KVAD_PHONE_MIC` for a launch from the Mac,
+for `measurement` (none of iOS's processing), `voice` (voice processing:
+its own gain and noise suppression, made for one near voice), and the
+`front`, `back` and `bottom` microphones with no direction. Each records
+with no gain, so `+level` can be tried on the same take afterwards.
+`KVAD_PHONE_RECORD=<seconds>` records that long and stops, for a room test
+driven by `devicectl`. One run of radio has been recorded and not yet
+measured. Measuring these needs a room test that is the same every time:
+the same recording played from the same place, and the phone not moved.
+
 ## Steps
 
 Each is a PR, merged on a green check, as the SwiftUI move was.
@@ -227,6 +289,10 @@ Each is a PR, merged on a green check, as the SwiftUI move was.
      after the server came back.
 
    *Asked for after the field runs:*
+   - **Meeting and Close by.** In a meeting, the quieter voices farther
+     from the phone came out late or not at all. Meeting, the default,
+     brings them up before the take is written (*Hearing the far end of
+     the table*).
    - **Paragraphs.** A pause of 1.5 s or more begins a new one. The core
      finds pauses in the audio as it comes (`speak::Quiet`: loudness every
      50 ms against a noise floor that a voice cannot raise), and a word

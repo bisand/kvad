@@ -122,11 +122,23 @@ On the Mac, with `[remote]` on in kvad-serve's `kvad.toml`:
 kvad remote pair
 ```
 
-Point the iPhone's Camera at the QR code it shows and tap the `kvad://`
-link it offers: Kvad opens with the link in the Server field and says which
-server it is for. Or copy the link (Universal Clipboard carries it to the
-phone) and tap *Paste a pairing link*. Either way nothing happens until you
-tap *Connect*: a link only fills in the field. The phone pairs, through the relay
+On the Connect screen, tap *Scan a pairing code* and point the phone at the
+QR code it shows: Kvad puts the link in the Server field, says which server
+it is for, and closes the scanner. Or point the iPhone's Camera at the code
+and tap the `kvad://` link it offers, which does the same. Or copy the link
+(Universal Clipboard carries it to the phone) and tap *Paste a pairing
+link*. Whichever way, nothing happens until you tap *Connect*: a link only
+fills in the field.
+
+The scanner (`ios/Kvad/Scanner.swift`) is VisionKit's
+`DataScannerViewController`, QR codes only, or AVFoundation's
+`AVCaptureMetadataOutput` on a phone VisionKit's does not run on. It asks for
+the camera at the first *Scan*, not before, and if that is refused it says
+so, with a way to Settings. A code it reads is only text for the core's link
+parser, the one an opened link goes through: a code that is not a Kvad
+server or pairing link is a note under the viewfinder, and the scanner
+looks on. No code is ever opened as a URL, and nothing the camera sees is
+kept or sent. The phone pairs, through the relay
 if it is not on the Mac's network, and keeps its device key, the key the
 server made for it, and its relay voucher in the Keychain: this phone only,
 while unlocked, never synced. After that the Server field holds
@@ -138,6 +150,14 @@ To try an opened link in the simulator, which has no camera:
 
 ```bash
 xcrun simctl openurl booted 'kvad://…&pair=…'
+```
+
+In the simulator the scanner says there is no camera to scan with. A debug
+build reads codes as if scanned from `KVAD_PHONE_SCAN`, space-separated, two
+seconds apart, with the scanner open:
+
+```bash
+SIMCTL_CHILD_KVAD_PHONE_SCAN='https://example.com kvad://…&pair=…' xcrun simctl launch booted eu.kvad.phone
 ```
 
 Each time the app comes back to the foreground it tells the tunnel that the

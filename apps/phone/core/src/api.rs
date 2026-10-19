@@ -10,7 +10,9 @@
 //! server-sent events a line at a time.
 
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -130,7 +132,7 @@ impl Server {
         req
     }
 
-    fn send(&self, req: ureq::http::Request<Vec<u8>>) -> Res<ureq::http::Response<ureq::Body>> {
+    fn send(&self, req: ureq::http::Request<impl ureq::AsSendBody>) -> Res<ureq::http::Response<ureq::Body>> {
         self.agent.run(req).map_err(|e| match e {
             ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
                 format!("Nothing is answering at {}.", self.name)
@@ -201,6 +203,157 @@ impl Server {
                 Event::Done => return Ok(()),
                 Event::Nothing => {}
             }
+        }
+    }
+}
+
+impl Server {
+    /// A WebSocket to `path` (with its query), for the live transcription
+    /// of `docs/speech-plan.md`: a stream through the tunnel, or a TCP
+    /// connection on the LAN, upgraded with the same key as every request.
+    /// Its timeouts are 10 s each way until the caller sets its own.
+    pub fn socket(&self, path: &str) -> Result<Socket, Refused> {
+        let not = |why: String| Refused { status: None, why };
+        let (scheme, host) = self.base.split_once("://").expect("a base has a scheme");
+        let stream = match &self.tunnel {
+            Some(t) => Stream::Tunnel(t.open().map_err(not)?),
+            None if scheme == "https" => {
+                return Err(not("Live words need a paired server or an http:// address. This recording is kept, and sent whole when it ends.".into()))
+            }
+            None => {
+                let addr = host.to_socket_addrs().ok().and_then(|mut a| a.next()).ok_or_else(|| not(format!("{} is not an address this phone can find.", self.name)))?;
+                Stream::Tcp(TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| not(format!("Could not reach {}: {e}", self.name)))?)
+            }
+        };
+        stream.set_timeouts(Some(Duration::from_secs(10))).map_err(|e| not(e.to_string()))?;
+        let mut req = tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{host}{path}")).map_err(|e| not(e.to_string()))?;
+        let headers = req.headers_mut();
+        headers.insert("user-agent", concat!("kvad-phone/", env!("CARGO_PKG_VERSION")).parse().expect("a header value"));
+        if let Some(key) = &self.key {
+            headers.insert("authorization", format!("Bearer {key}").parse().map_err(|_| not("The key is not one a header can carry.".into()))?);
+        }
+        match tungstenite::client(req, stream) {
+            Ok((socket, _)) => Ok(socket),
+            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(answer))) => {
+                let status = answer.status().as_u16();
+                let json: Value = answer.body().as_deref().and_then(|b| serde_json::from_slice(b).ok()).unwrap_or(Value::Null);
+                Err(Refused { status: Some(status), why: error_message(&json).unwrap_or_else(|| format!("The server answered {status}.")) })
+            }
+            Err(e) => Err(not(format!("The live connection to {} failed: {e}", self.name))),
+        }
+    }
+
+    /// `wav` transcribed whole by `POST /v1/audio/transcriptions`, the text
+    /// a 30-second window at a time to `piece` as the server writes it
+    /// (`stream: true`), and all of it at the end. The file is read as it
+    /// is sent, never held whole. Stops between windows once `stop` is set.
+    pub fn transcribe(&self, wav: &std::path::Path, model: &str, language: &str, stop: &AtomicBool, mut piece: impl FnMut(&str)) -> Res<String> {
+        let boundary = format!("kvad-{:016x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let mut head = String::new();
+        let mut field = |name: &str, value: &str| {
+            if !value.is_empty() {
+                head += &format!("--{boundary}\r\ncontent-disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n");
+            }
+        };
+        field("model", model);
+        field("language", language);
+        field("stream", "true");
+        head += &format!("--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"take.wav\"\r\ncontent-type: audio/wav\r\n\r\n");
+        let tail = format!("\r\n--{boundary}--\r\n");
+        let file = std::fs::File::open(wav).map_err(|e| format!("The recording could not be read: {e}"))?;
+        let length = head.len() as u64 + file.metadata().map_err(|e| e.to_string())?.len() + tail.len() as u64;
+        let body = std::io::Cursor::new(head.into_bytes()).chain(file).chain(std::io::Cursor::new(tail.into_bytes()));
+        let req = self
+            .request("POST", "/v1/audio/transcriptions", "text/event-stream")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .header("content-length", length.to_string())
+            .body(ureq::SendBody::from_owned_reader(body))
+            .map_err(|e| e.to_string())?;
+        let response = self.send(req)?;
+        if response.status().as_u16() >= 400 {
+            return read(response).and(Err("The server sent no transcript.".into()));
+        }
+        let mut lines = BufReader::new(response.into_body().into_reader());
+        let mut line = String::new();
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Err("Stopped.".into());
+            }
+            line.clear();
+            if lines.read_line(&mut line).map_err(|e| format!("The transcript broke off: {e}"))? == 0 {
+                return Err("The transcript broke off before its end.".into());
+            }
+            let Some(data) = line.trim_end().strip_prefix("data:") else { continue };
+            let v: Value = serde_json::from_str(data.trim_start()).map_err(|_| "The server sent a piece of transcript that was not JSON.".to_string())?;
+            if let Some(message) = error_message(&v) {
+                return Err(message);
+            }
+            match v["type"].as_str() {
+                Some("transcript.text.delta") => piece(v["delta"].as_str().unwrap_or_default()),
+                Some("transcript.text.done") => return Ok(v["text"].as_str().unwrap_or_default().to_string()),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A connection to the server: TCP on the LAN, or a stream through the
+/// tunnel.
+pub enum Stream {
+    Tcp(TcpStream),
+    Tunnel(UnixStream),
+}
+
+/// A live transcription's WebSocket.
+pub type Socket = tungstenite::WebSocket<Stream>;
+
+/// Why a WebSocket was not opened, with the server's status when it
+/// answered at all.
+#[derive(Debug)]
+pub struct Refused {
+    pub status: Option<u16>,
+    pub why: String,
+}
+
+impl Stream {
+    /// How long a read or a write may wait before it gives up with
+    /// `WouldBlock` or `TimedOut`.
+    pub fn set_timeouts(&self, wait: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_read_timeout(wait).and_then(|_| s.set_write_timeout(wait)),
+            Stream::Tunnel(s) => s.set_read_timeout(wait).and_then(|_| s.set_write_timeout(wait)),
+        }
+    }
+
+    /// Only reads, for `read`; a write keeps its own.
+    pub fn set_read_timeout(&self, wait: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_read_timeout(wait),
+            Stream::Tunnel(s) => s.set_read_timeout(wait),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.read(buf),
+            Stream::Tunnel(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.write(buf),
+            Stream::Tunnel(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.flush(),
+            Stream::Tunnel(s) => s.flush(),
         }
     }
 }

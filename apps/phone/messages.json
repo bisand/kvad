@@ -1,5 +1,5 @@
 {
-  "about": "Every message between Kvad for iPhone's SwiftUI and its Rust core (core/src/session.rs, core/src/probe.rs), one example each, with every field it may have. Each is a JSON object with one key, its name. The core's tests send every command and check every event it emits against these; the Swift tests decode every event. docs/phone-swiftui-plan.md.",
+  "about": "Every message between Kvad for iPhone's SwiftUI and its Rust core (core/src/session.rs, core/src/probe.rs, core/src/speak.rs), one example each, with every field it may have. Each is a JSON object with one key, its name. The core's tests send every command and check every event it emits against these; the Swift tests decode every event. docs/phone-swiftui-plan.md.",
   "commands": {
     "connect": { "url": "kvad://bdbc76ccbacc…", "key": "", "device": "Andre's iPhone" },
     "models": {},
@@ -12,7 +12,13 @@
     "opened": { "link": "kvad://bdbc76ccbacc…?k=…&relay=https://relay.kvad.eu" },
     "probe_open": {},
     "probe_start": { "ticket": "kvadprobe:1:…", "secs": 60 },
-    "probe_stop": {}
+    "probe_stop": {},
+    "speak_start": { "model": "NbAiLab/nb-whisper-small", "language": "no", "folder": "/var/mobile/Containers/Data/Application/…/Library/Application Support/Takes" },
+    "speak_stop": {},
+    "speak_cancel": {},
+    "takes": { "folder": "/var/mobile/Containers/Data/Application/…/Library/Application Support/Takes" },
+    "take_delete": { "folder": "/var/mobile/Containers/Data/Application/…/Library/Application Support/Takes", "id": "1760870000000" },
+    "retranscribe": { "folder": "/var/mobile/Containers/Data/Application/…/Library/Application Support/Takes", "id": "1760870000000", "model": "NbAiLab/nb-whisper-large", "language": "no" }
   },
   "events": {
     "ready": { "server": "kvad://bdbc76ccbacc…", "core": "0.1.0" },
@@ -58,6 +64,18 @@
       "line": "stopped early: the listener went away"
     },
     "probe_failed": { "error": "That is not a probe ticket." },
+    "speak_started": { "id": "1760870000000" },
+    "speak_link": { "state": "offline", "why": "The Mac could not be reached for a minute. The take goes on, and is sent whole when it ends." },
+    "speak_settled": { "text": " Det er ikke", "lag": 0.2 },
+    "speak_partial": { "text": " alltid så lett", "lag": 0.2 },
+    "speak_done": { "take": { "id": "1760870000000", "started": 1760870000, "seconds": 12.5, "model": "NbAiLab/nb-whisper-small", "language": "no", "text": "Det er ikke alltid så lett å si hvor vi er fra.", "how": "live", "server": "kvad://bdbc76ccbacc…" } },
+    "speak_failed": { "error": "Not connected to a server.", "kept": false },
+    "speak_cancelled": { "id": "1760870000000" },
+    "takes": { "takes": [{ "id": "1760870000000", "started": 1760870000, "seconds": 12.5, "model": "NbAiLab/nb-whisper-small", "language": "no", "text": "Det er ikke alltid så lett å si hvor vi er fra.", "how": "live", "server": "kvad://bdbc76ccbacc…" }] },
+    "take_deleted": { "id": "1760870000000" },
+    "retranscribe_piece": { "id": "1760870000000", "text": " Det er ikke alltid så lett å si hvor vi er fra." },
+    "retranscribe_done": { "take": { "id": "1760870000000", "started": 1760870000, "seconds": 12.5, "model": "NbAiLab/nb-whisper-small", "language": "no", "text": "Det er ikke alltid så lett å si hvor vi er fra.", "how": "live", "server": "kvad://bdbc76ccbacc…" } },
+    "retranscribe_failed": { "id": "1760870000000", "error": "Not connected to a server." },
     "error": { "error": "No command is called dance." }
   }
 }

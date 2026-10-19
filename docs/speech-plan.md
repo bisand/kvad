@@ -689,9 +689,16 @@ SmolLM2-135M resident in the main service.
   (tiny's own file transcript goes wrong at the end, as before). The CPU
   keeps up with tiny only, at a third of its time.
 
-**Not built yet**: the phone's end of a reconnect, which keeps the
-recording, names the session and resends (the server's end is built,
-above); the tests over the tunnel's three paths; and a check against
+**The phone's end** is built in Kvad for iPhone's core
+(`apps/phone/core/src/speak.rs`, [phone-speak-plan.md](phone-speak-plan.md)):
+the take kept on the phone, the reconnect that names the session and sends
+again from the file, and the file endpoint once the session is let go of.
+Its tests run against a scripted session that cuts the socket mid-word.
+A WebSocket through the tunnel, direct and relayed, is tested in
+`crates/tunnel`.
+
+**Not built yet**: a session over the tunnel with a change of path
+mid-sentence, which is the phone's field test; and a check against
 OpenAI's own SDK, which this was written from their reference and not
 tested with. The web UI's microphone does not reconnect: a page that loses
 its socket starts again.

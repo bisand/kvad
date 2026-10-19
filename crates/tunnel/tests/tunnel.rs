@@ -32,10 +32,26 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 /// `/hello` says hi; `/slow` writes a numbered line every 100 ms for 4 s, so
-/// that something can happen to the network while a reply is under way.
+/// that something can happen to the network while a reply is under way;
+/// `/socket` is a WebSocket that answers each binary frame with the bytes
+/// it has had so far.
 fn router() -> axum::Router {
+    use axum::extract::ws::{Message, WebSocketUpgrade};
     use axum::routing::get;
-    axum::Router::new().route("/hello", get(|| async { "hi" })).route(
+    let socket = get(|ws: WebSocketUpgrade| async {
+        ws.on_upgrade(|mut ws| async move {
+            let mut had = 0;
+            while let Some(Ok(m)) = ws.recv().await {
+                if let Message::Binary(b) = m {
+                    had += b.len();
+                    if ws.send(Message::Text(had.to_string().into())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+    });
+    axum::Router::new().route("/hello", get(|| async { "hi" })).route("/socket", socket).route(
         "/slow",
         get(|| async {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(4);
@@ -156,6 +172,38 @@ fn http_goes_through_a_relay_when_direct_is_off() {
     assert!(address.addrs.is_empty(), "direct = off advertises no address");
     let tunnel = blocking::Tunnel::connect(&key, &address, None).unwrap();
     assert!(get(&tunnel, "/hello").unwrap().ends_with("hi"));
+    assert_eq!(tunnel.path(), Some(Path::Relay(url)));
+}
+
+/// A WebSocket's upgrade through one tunnel stream, then frames both ways
+/// on it, each answered before the next goes: what `/v1/realtime` needs, and
+/// what a tunnel that buffered whole requests would break.
+fn socket_through(tunnel: &blocking::Tunnel) {
+    let stream = tunnel.open().unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let (mut ws, answer) = tungstenite::client("ws://tunnel/socket", stream).unwrap();
+    assert_eq!(answer.status(), 101);
+    for i in 1..=50 {
+        ws.send(tungstenite::Message::Binary(vec![i as u8; 3200].into())).unwrap();
+        assert_eq!(ws.read().unwrap(), tungstenite::Message::Text((3200 * i).to_string().into()));
+    }
+    ws.close(None).unwrap();
+}
+
+#[test]
+fn a_websocket_goes_through_directly_and_relayed() {
+    let dir = Scratch::new("socket");
+    let rt = runtime();
+    let (key, id) = client_key(&dir);
+    let address = serve(&rt, &dir, Vec::new(), Direct::Auto, vec![id]);
+    socket_through(&blocking::Tunnel::connect(&key, &address, None).unwrap());
+
+    let dir = Scratch::new("socket-relayed");
+    let (_relay, url) = rt.block_on(relay());
+    let (key, id) = client_key(&dir);
+    let address = serve(&rt, &dir, vec![url.clone()], Direct::Off, vec![id]);
+    let tunnel = blocking::Tunnel::connect(&key, &address, None).unwrap();
+    socket_through(&tunnel);
     assert_eq!(tunnel.path(), Some(Path::Relay(url)));
 }
 

@@ -1,12 +1,14 @@
-//! The Rust under Kvad for iPhone, for the SwiftUI app to call: three C
-//! functions, and one JSON object a message each way. The commands and
-//! events are in `session` and `probe`, and every one of them is in
+//! The Rust under Kvad for iPhone, for the SwiftUI app to call: four C
+//! functions, and one JSON object a message each way, but for the
+//! microphone's samples, which go as they are. The commands and events are
+//! in `session`, `probe` and `speak`, and every one of them is in
 //! `messages.json`, which the tests on both sides read
 //! (docs/phone-swiftui-plan.md).
 //!
 //! ```c
 //! void kvad_core_start(void *context, void (*on_event)(void *context, const char *json));
 //! void kvad_core_send(const char *json);
+//! void kvad_core_audio(const int16_t *samples, size_t count);
 //! const char *kvad_core_version(void);
 //! ```
 //!
@@ -19,6 +21,7 @@ pub mod pairings;
 pub mod probe;
 pub mod secrets;
 pub mod session;
+pub mod speak;
 
 use session::{Emit, Session};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -82,6 +85,25 @@ pub unsafe extern "C" fn kvad_core_send(json: *const c_char) {
         return;
     }
     send(&CStr::from_ptr(json).to_string_lossy());
+}
+
+/// Samples from the microphone, 16 kHz mono, for the take being recorded:
+/// `speak_start` begins one. Called on the audio thread, a tenth of a
+/// second at a time; it writes them to the take's file and returns.
+pub fn audio(samples: &[i16]) {
+    if let Some(session) = SESSION.get() {
+        session.audio(samples);
+    }
+}
+
+/// # Safety
+/// `samples` must point at `count` samples, or be null, which is ignored.
+#[no_mangle]
+pub unsafe extern "C" fn kvad_core_audio(samples: *const i16, count: usize) {
+    if samples.is_null() || count == 0 {
+        return;
+    }
+    audio(std::slice::from_raw_parts(samples, count));
 }
 
 #[no_mangle]

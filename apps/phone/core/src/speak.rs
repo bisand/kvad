@@ -269,6 +269,7 @@ impl Speak {
         *take.writer.lock().unwrap() = None;
         let _ = std::fs::remove_file(&take.wav);
         let _ = std::fs::remove_file(&take.meta);
+        let _ = std::fs::remove_file(take.wav.with_extension("log"));
         (self.emit)(event("speak_cancelled", json!({ "id": take.id })));
     }
 
@@ -312,6 +313,7 @@ impl Speak {
         let folder = Path::new(folder);
         let _ = std::fs::remove_file(folder.join(format!("{id}.wav")));
         let _ = std::fs::remove_file(folder.join(format!("{id}.json")));
+        let _ = std::fs::remove_file(folder.join(format!("{id}.log")));
         (self.emit)(event("take_deleted", json!({ "id": id })));
     }
 
@@ -444,6 +446,11 @@ struct Live {
     /// Events `heard` has for the server, which `on` sends: it holds the
     /// socket.
     outbox: Vec<Value>,
+    /// In debug builds, a log of the take's link beside it (`<id>.log`):
+    /// connects, sessions, offsets, errors and why each socket ended, and
+    /// none of the words. For field runs, where nothing else can be seen.
+    trace: Option<File>,
+    began: Instant,
 }
 
 impl Live {
@@ -451,7 +458,6 @@ impl Live {
         Live {
             emit,
             current,
-            take,
             server,
             reader,
             id: None,
@@ -465,7 +471,23 @@ impl Live {
             owed: None,
             said: "",
             outbox: Vec::new(),
+            trace: cfg!(debug_assertions).then(|| File::create(take.wav.with_extension("log")).ok()).flatten(),
+            began: Instant::now(),
+            take,
         }
+    }
+
+    fn note(&mut self, what: impl AsRef<str>) {
+        let at = self.began.elapsed().as_secs_f64();
+        if let Some(f) = &mut self.trace {
+            let _ = writeln!(f, "{at:8.3} {}", what.as_ref());
+        }
+    }
+
+    /// The socket is done with, for `why`: try another.
+    fn gone(&mut self, why: impl AsRef<str>) -> Option<End> {
+        self.note(format!("socket gone: {}", why.as_ref()));
+        None
     }
 
     fn run(mut self) {
@@ -560,6 +582,7 @@ impl Live {
     /// new one, beginning at the last word settled, for the rest of the
     /// take. What was said after it is sent from the file.
     fn anew(&mut self) {
+        self.note(format!("session lost; a new one from {}", self.origin + self.settled_to));
         self.origin += self.settled_to;
         self.settled_to = 0;
         self.sent = 0;
@@ -606,15 +629,21 @@ impl Live {
                 None => "/v1/realtime?intent=transcription".to_string(),
                 Some(id) => format!("/v1/realtime?intent=transcription&resume={id}&offset={}", self.settled_to),
             };
+            self.note(format!("connect {}", if self.id.is_some() { format!("resume from {}", self.settled_to) } else { format!("fresh at {}", self.origin) }));
             let socket = match self.server.socket(&path) {
                 Ok(s) => s,
-                Err(Refused { status: Some(401 | 403), why }) => return End::Failed(why),
-                // Busy, or starting: again in a moment.
-                Err(Refused { status: Some(429 | 500..), .. }) | Err(Refused { status: None, .. }) => continue,
-                // Any other answer but the upgrade: a server from before
-                // `/v1/realtime`, which may answer an unknown path with its
-                // web page.
-                Err(Refused { status: Some(_), .. }) => return self.offline("This server has no live transcription. The take is sent whole when it ends.".into()),
+                Err(r) => {
+                    self.note(format!("refused {:?}: {}", r.status, r.why));
+                    match r {
+                        Refused { status: Some(401 | 403), why } => return End::Failed(why),
+                        // Busy, or starting: again in a moment.
+                        Refused { status: Some(429 | 500..) | None, .. } => continue,
+                        // Any other answer but the upgrade: a server from
+                        // before `/v1/realtime`, which may answer an unknown
+                        // path with its web page.
+                        Refused { status: Some(_), .. } => return self.offline("This server has no live transcription. The take is sent whole when it ends.".into()),
+                    }
+                }
             };
             match self.on(socket) {
                 Some(end) => return end,
@@ -653,13 +682,13 @@ impl Live {
                         let Ok(v) = serde_json::from_str::<Value>(&body) else { continue };
                         let heard = self.heard(&v, &mut ready);
                         for m in std::mem::take(&mut self.outbox) {
-                            if ws.send(text(m)).is_err() {
-                                return None;
+                            if let Err(e) = ws.send(text(m)) {
+                                return self.gone(format!("sending an event: {e}"));
                             }
                         }
                         match heard {
                             Heard::On => {}
-                            Heard::Gone => return None,
+                            Heard::Gone => return self.gone("the server said so"),
                             Heard::End(end) => {
                                 if let End::Done = end {
                                     closed(&mut ws);
@@ -670,12 +699,12 @@ impl Live {
                     }
                     Ok(_) => self.owed = None,
                     Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
-                    Err(_) => return None,
+                    Err(e) => return self.gone(format!("reading: {e}")),
                 }
             }
             if !ready {
                 if self.owed.is_some_and(|t| t.elapsed() > STALLED) {
-                    return None;
+                    return self.gone("no session.created in time");
                 }
                 continue;
             }
@@ -689,22 +718,26 @@ impl Live {
                 if self.reader.read_exact_at(&mut pcm, HEADER + 2 * (self.origin + self.sent)).is_err() {
                     return Some(End::Failed("The take could not be read back.".into()));
                 }
-                if ws.send(tungstenite::Message::Binary(pcm.into())).is_err() {
-                    return None;
+                if let Err(e) = ws.send(tungstenite::Message::Binary(pcm.into())) {
+                    return self.gone(format!("sending audio at {}: {e}", self.sent));
+                }
+                if (self.sent + n) / (5 * RATE) > self.sent / (5 * RATE) {
+                    self.note(format!("sent to {} of {recorded}", self.sent + n));
                 }
                 self.sent += n;
                 sent_now += n;
                 self.owed.get_or_insert_with(Instant::now);
             }
             if self.take.stop.load(Ordering::Relaxed) && self.sent >= recorded && !commit_sent && !self.committed {
-                if ws.send(text(json!({ "type": "input_audio_buffer.commit" }))).is_err() {
-                    return None;
+                if let Err(e) = ws.send(text(json!({ "type": "input_audio_buffer.commit" }))) {
+                    return self.gone(format!("sending the commit: {e}"));
                 }
+                self.note(format!("commit at {}", self.sent));
                 commit_sent = true;
                 self.owed.get_or_insert_with(Instant::now);
             }
             if self.owed.is_some_and(|t| t.elapsed() > STALLED) {
-                return None;
+                return self.gone(format!("nothing heard for {} s", STALLED.as_secs()));
             }
         }
     }
@@ -715,6 +748,15 @@ impl Live {
         let lag = v["kvad"]["lag"].as_f64().unwrap_or(0.0);
         // A settled event sent again after a reconnect is one had already.
         let again = |seen: &mut HashSet<String>| !seen.insert(v["event_id"].as_str().unwrap_or_default().to_string());
+        let k = &v["kvad"];
+        let line = match kind {
+            "kvad.transcription.partial" => format!("partial {} chars, heard {}, lag {}", v["text"].as_str().map_or(0, |t| t.chars().count()), k["heard"], k["lag"]),
+            "conversation.item.input_audio_transcription.delta" => format!("delta {} {} chars to {}", v["event_id"], v["delta"].as_str().map_or(0, |t| t.chars().count()), k["offset"]),
+            "session.created" => format!("session {} resumed {} offset {} item {}", v["session"]["id"], k["resumed"], k["offset"], k["item_id"]),
+            "error" => format!("error {}: {}", v["error"]["code"], v["error"]["message"]),
+            other => format!("{other} {}", v["event_id"]),
+        };
+        self.note(line);
         match kind {
             "session.created" => {
                 let s = &v["session"];

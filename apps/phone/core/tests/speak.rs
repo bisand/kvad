@@ -644,11 +644,14 @@ fn a_take_with_a_running_server() {
     let (s, rx) = speak();
     let server = || Some(Server::new(&url, None).unwrap());
     s.start(server(), &model, "no", dir.to_str().unwrap());
+    // `KVAD_PHONE_TEST_BACKLOG` seconds of it at once first, as a session
+    // begun again after a restart is sent what was said meanwhile.
+    let backlog: u64 = env("KVAD_PHONE_TEST_BACKLOG", "0").parse().unwrap();
     let begun = Instant::now();
     for (i, chunk) in audio.chunks(RATE as usize / 10).enumerate() {
         s.audio(chunk);
-        // At the pace it was spoken.
-        let due = begun + Duration::from_millis(100 * (i as u64 + 1));
+        // At the pace it was spoken, after the backlog.
+        let due = begun + Duration::from_millis((100 * (i as u64 + 1)).saturating_sub(1000 * backlog));
         std::thread::sleep(due.saturating_duration_since(Instant::now()));
     }
     s.stop();

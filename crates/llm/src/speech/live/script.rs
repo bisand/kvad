@@ -5,6 +5,8 @@
 //! its window as Whisper does, and writes half of a two-token word whose
 //! second is not yet heard. So what is settled, and where a window is cut,
 //! can be checked against what the script says, with no model downloaded.
+//! [`Script::restless`] is one that never writes the same plain guess
+//! twice running, so that no update agrees with the last.
 //!
 //! Built for this crate's tests, and with the `script` feature for
 //! kvad-serve's, which play it into `/v1/realtime`. Not a part of the API.
@@ -81,11 +83,27 @@ fn tokens() -> Tokens {
 
 pub struct Script {
     config: whisper::Config,
+    restless: bool,
 }
 
 impl Script {
     /// A transcriber over the script.
     pub fn transcriber() -> Transcriber {
+        Script::over(false)
+    }
+
+    /// A transcriber over the script that writes every word with an `x`
+    /// after it, plain, when it hears an odd number of seconds, and none
+    /// with one when it hears an even number. A word is not the same word
+    /// with an `x`, so two updates a second apart agree on nothing. Timed,
+    /// it writes the script as [`Script::transcriber`]'s does. It goes on
+    /// from the last word written, as Whisper goes on from what it is
+    /// handed, so a settled word may be given an `x` after it.
+    pub fn restless() -> Transcriber {
+        Script::over(true)
+    }
+
+    fn over(restless: bool) -> Transcriber {
         let config = whisper::Config {
             n_mels: 80,
             d: 8,
@@ -99,11 +117,11 @@ impl Script {
             text_ctx: 448,
             vocab: VOCAB,
         };
-        Transcriber { model: Box::new(Script { config }), tokenizer: tokenizer(), tokens: tokens() }
+        Transcriber { model: Box::new(Script { config, restless }), tokenizer: tokenizer(), tokens: tokens() }
     }
 
     /// What the model would write after `seq`, heard `seconds` of sound.
-    fn next(seq: &[u32], seconds: f32) -> Vec<f32> {
+    fn next(&self, seq: &[u32], seconds: f32) -> Vec<f32> {
         let mut logits = vec![-10.0f32; VOCAB];
         let sot = seq.iter().position(|&i| i == SOT).expect("a prompt has a start");
         if seq.len() == sot + 1 {
@@ -120,6 +138,18 @@ impl Script {
         }
         let mut target = Vec::new();
         let whole = (seconds.floor() as u32).min(WORDS - base);
+        if plain && self.restless {
+            let x = seconds.round() as u32 % 2 == 1;
+            let next = match seq[begin..].last() {
+                Some(&k) if k < WORDS && x => X,
+                _ => match seq[begin..].iter().rev().find(|&&i| i < WORDS).map_or(base, |&i| i + 1) {
+                    k if k < base + whole => k,
+                    _ => EOT,
+                },
+            };
+            logits[next as usize] = 10.0;
+            return logits;
+        }
         if plain {
             for j in 0..whole {
                 target.extend(script_word(base + j));
@@ -152,11 +182,12 @@ impl Model for Script {
     fn config(&self) -> &whisper::Config {
         &self.config
     }
-    /// Seconds of sound in the window: its frames louder than the padding.
+    /// Seconds of sound in the window: its loud frames. [`sound`] is about
+    /// 1.4 in the log-mel, and silence or padding under 0, whether or not
+    /// the window is full.
     fn hear(&self, window: &[f32]) -> Res<Heard> {
         let frames: Vec<f32> = window.chunks(80).map(|f| f.iter().copied().fold(f32::MIN, f32::max)).collect();
-        let floor = frames.iter().copied().fold(f32::MAX, f32::min);
-        let loud = frames.iter().filter(|&&f| f > floor + 0.5).count();
+        let loud = frames.iter().filter(|&&f| f > 0.0).count();
         Ok(Heard(Box::new(loud as f32 / 100.0)))
     }
     fn said(&self) -> Said {
@@ -167,7 +198,7 @@ impl Model for Script {
         let seq = said.get_mut::<Vec<u32>>()?;
         let before = seq.len();
         seq.extend_from_slice(tokens);
-        Ok(rows.iter().map(|&r| Script::next(&seq[..before + r + 1], seconds)).collect())
+        Ok(rows.iter().map(|&r| self.next(&seq[..before + r + 1], seconds)).collect())
     }
     /// Not asked: a live session times no words.
     fn attention(&self, _: &[u32], _: &Heard, _: &[(usize, usize)]) -> Res<Vec<f32>> {

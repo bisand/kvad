@@ -471,6 +471,17 @@ live loop decodes the window again as it grows. Measured by `live_speed`
    lone closing timestamp is not a cut: the model closes a segment early
    when it has not heard the next one, and a window started there hears
    the end of it again.
+
+   A window that reaches 30 s with nowhere to cut, because no two runs
+   agreed for that long, has its first 30 s finished as the end of a take
+   is: decoded once more and settled as they come. It then begins again
+   where a timed decode of them ends a segment, or after them where none
+   does. It used to begin again at its newest 30 s and drop the partial,
+   so words shown as a guess vanished and were never settled. That is
+   what a phone's field run showed after a new session began mid-take
+   with 40 s of backlog, fed 5 s an update: guesses came and went, and
+   only "." settled for the rest of the take. Replays did not reproduce it.
+   The script's restless stand-in, whose guesses never agree, tests it.
 4. The rules that already hold stay in force: UTF-8 kept whole (`#245`),
    loops caught (`#246`, `#247`), a hang-up stops the work after the step
    under way. The example stops a tail that writes eight tokens it has

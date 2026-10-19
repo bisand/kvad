@@ -1,7 +1,7 @@
 //! The Rust under Kvad for iPhone, for the SwiftUI app to call: four C
 //! functions, and one JSON object a message each way, but for the
 //! microphone's samples, which go as they are. The commands and events are
-//! in `session`, `probe` and `speak`, and every one of them is in
+//! in `session`, `chats`, `probe` and `speak`, and every one of them is in
 //! `messages.json`, which the tests on both sides read
 //! (docs/phone-swiftui-plan.md).
 //!
@@ -17,6 +17,7 @@
 //! thread. `kvad_core_send` returns at once; what comes of it are events.
 
 pub mod api;
+pub mod chats;
 pub mod pairings;
 pub mod probe;
 pub mod secrets;

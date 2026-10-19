@@ -30,7 +30,7 @@ targets:
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
       ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
       TARGETED_DEVICE_FAMILY: "1"
-      # The core's three C functions (../core/kvad_core.h), and the library
+      # The core's four C functions (../core/kvad_core.h), and the library
       # build.sh links into the target's temporary directory.
       SWIFT_OBJC_BRIDGING_HEADER: Kvad/Kvad-Bridging-Header.h
       LIBRARY_SEARCH_PATHS: $(TARGET_TEMP_DIR)/rust
@@ -70,6 +70,12 @@ targets:
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
         NSLocalNetworkUsageDescription: Kvad connects to the Kvad server on your Mac over your local network.
+        # Speak: the microphone, only while a take is being recorded, and on
+        # with the screen off or the app in the background, as a voice memo
+        # is (docs/phone-speak-plan.md).
+        NSMicrophoneUsageDescription: Kvad records what you say so that the Kvad server on your Mac can write it out. The recording goes to your Mac and nowhere else.
+        UIBackgroundModes:
+          - audio
     preBuildScripts:
       - name: Build the Rust core with cargo
         script: ./build.sh

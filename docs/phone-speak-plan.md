@@ -53,7 +53,7 @@ times a second for nothing. Everything else stays a message:
   `speak_cancel`, `takes {folder}`, `take_delete {folder, id}`,
   `retranscribe {folder, id, model, language}`.
 - Events: `speak_started {id}`; `speak_settled {text, lag}`, settled text
-  to add, and `speak_partial {text, lag}`, the guess after it, which
+  to add, after a blank line when it begins a paragraph, and `speak_partial {text, lag}`, the guess after it, which
   replaces the last; `speak_link {state, why}`, the link as `live`,
   `reconnecting`, `offline` or `sending`; `speak_done {take}`,
   `speak_failed {error, kept}`, `speak_cancelled {id}`; `takes {takes}`,
@@ -182,7 +182,7 @@ Each is a PR, merged on a green check, as the SwiftUI move was.
      kvad-serve built from master: 11.7 s of Norwegian from `say -v Nora`,
      played in at real time, came back whole 0.9 s after the stop. All 41
      words were the file endpoint's.
-2. **The Speak tab.** The microphone, the audio session, the background
+2. **The Speak tab.** *Built 2026-10-19.* The microphone, the audio session, the background
    mode, interruptions, the live text, the list of takes, copy, share and
    delete, the model and language sheet. Then on the iPhone:
    - A take on Wi-Fi.
@@ -190,6 +190,54 @@ Each is a PR, merged on a green check, as the SwiftUI move was.
    - One that starts on Wi-Fi and ends on 5G.
    - One with the screen locked halfway.
    - One with the Mac's server stopped and started again inside the minute.
+   - One with the phone in Airplane Mode for 20 s mid-take.
+
+   *As built:*
+   - `Microphone.swift`: `AVAudioSession` set to `.record` only while a
+     take is being recorded, `AVAudioEngine`'s input tap, and
+     `AVAudioConverter` to 16 kHz mono 16-bit, made again when the input
+     changes.
+   - The take's folder is made by the app with `completeUnlessOpen` and
+     `isExcludedFromBackup`.
+   - Copy, *Transcribe again* (with the model chosen for Speak), *Share the
+     recording* and Delete are in the take's top bar. A bottom bar does not
+     show under a tab bar.
+   - A debug launch can record from a WAV in place of the microphone
+     (`KVAD_PHONE_SPEAK`), for the simulator.
+
+   *Found by the field runs.* The first four went as they should. The fifth
+   showed three things:
+   - A server restarted is a session lost, not resumed: the server holds
+     sessions in memory, and the phone is told `session_not_found`. At
+     first the phone recorded on and sent the take whole when it stopped,
+     which lost nothing, but left the screen still for the rest of the take.
+     It now begins a new session at the last settled word, sends what was
+     said since from the file, and the words come live again. A Mac out of
+     reach for longer than the minute is tried on and on, the same way. Only
+     a take stopped while the Mac is still out of reach is sent whole.
+     Resuming is for a link that drops while the server stays up, which is
+     the Airplane Mode run.
+   - The tunnel never dialled again. `blocking::Tunnel` held its one QUIC
+     connection for good, so after a restart every stream failed until the
+     phone was connected again by hand: Chat, and the take's file, as well
+     as live. It now dials again on the next `open` once the connection has
+     ended. `a_client_outlives_a_server_restart` in `crates/tunnel` restarts
+     a server with nothing said. The client gets through again 31.6 s later,
+     which is QUIC's idle timeout. On the iPhone, it dialled again 22 s
+     after the server came back.
+
+   *Asked for after the field runs:*
+   - **Paragraphs.** A pause of 1.5 s or more begins a new one. The core
+     finds pauses in the audio as it comes (`speak::Quiet`: loudness every
+     50 ms against a noise floor that a voice cannot raise), and a word
+     settled after one ends begins its paragraph. A take sent whole has its
+     paragraphs from the gaps between Whisper's segments. A new speaker
+     would begin one too, once kvad can tell speakers apart
+     (docs/diarization-plan.md, *Speakers*, not built yet).
+   - **Conversations kept, as takes are.** Chat's conversations are kept on
+     the phone (`chats.rs`, `Application Support/Chats`, the same protection
+     and no backups), listed from the top left of the Chat tab, opened again
+     with the model they were had with, and deleted with a swipe.
 3. **Files in, and again with a better model.** "Transcribe again" with a
    chosen model on the file endpoint, streamed. Taking audio from elsewhere:
    the Files picker, and the share sheet's *Open in Kvad* for a Voice Memo.

@@ -245,8 +245,10 @@ impl Server {
 
     /// `wav` transcribed whole by `POST /v1/audio/transcriptions`, the text
     /// a 30-second window at a time to `piece` as the server writes it
-    /// (`stream: true`), and all of it at the end. The file is read as it
-    /// is sent, never held whole. Stops between windows once `stop` is set.
+    /// (`stream: true`), and all of it at the end, a new paragraph wherever
+    /// Whisper's segments leave a gap of `speak::PAUSE` or more. The file is
+    /// read as it is sent, never held whole. Stops between windows once
+    /// `stop` is set.
     pub fn transcribe(&self, wav: &std::path::Path, model: &str, language: &str, stop: &AtomicBool, mut piece: impl FnMut(&str)) -> Res<String> {
         let boundary = format!("kvad-{:016x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         let mut head = String::new();
@@ -275,6 +277,7 @@ impl Server {
         }
         let mut lines = BufReader::new(response.into_body().into_reader());
         let mut line = String::new();
+        let mut segments: Vec<(f64, f64, String)> = Vec::new();
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Err("Stopped.".into());
@@ -289,8 +292,17 @@ impl Server {
                 return Err(message);
             }
             match v["type"].as_str() {
-                Some("transcript.text.delta") => piece(v["delta"].as_str().unwrap_or_default()),
-                Some("transcript.text.done") => return Ok(v["text"].as_str().unwrap_or_default().to_string()),
+                Some("transcript.text.delta") => {
+                    piece(v["delta"].as_str().unwrap_or_default());
+                    for s in v["kvad"]["segments"].as_array().into_iter().flatten() {
+                        let time = |k: &str| s[k].as_f64().unwrap_or(0.0);
+                        segments.push((time("start"), time("end"), s["text"].as_str().unwrap_or_default().to_string()));
+                    }
+                }
+                Some("transcript.text.done") => {
+                    let text = v["text"].as_str().unwrap_or_default();
+                    return Ok(if segments.is_empty() { text.to_string() } else { paragraphs(&segments) });
+                }
                 _ => {}
             }
         }
@@ -358,6 +370,28 @@ impl Write for Stream {
     }
 }
 
+/// Segments' text, with a blank line where one begins a pause or more after
+/// the last ended.
+pub fn paragraphs(segments: &[(f64, f64, String)]) -> String {
+    let pause = crate::speak::PAUSE as f64 / crate::speak::RATE as f64;
+    let mut text = String::new();
+    let mut last_end: Option<f64> = None;
+    for (start, end, words) in segments {
+        let words = words.trim();
+        if words.is_empty() {
+            continue;
+        }
+        match last_end {
+            Some(e) if start - e >= pause => text.push_str("\n\n"),
+            Some(_) => text.push(' '),
+            None => {}
+        }
+        text.push_str(words);
+        last_end = Some(*end);
+    }
+    text
+}
+
 /// What one line of a streamed chat is.
 #[derive(Debug, PartialEq)]
 enum Event {
@@ -422,6 +456,14 @@ fn normalise(url: &str) -> Res<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gap_between_segments_begins_a_paragraph() {
+        let seg = |a: f64, b: f64, t: &str| (a, b, t.to_string());
+        let text = paragraphs(&[seg(0.0, 2.0, " Hei."), seg(2.4, 4.0, " Hvordan går det?"), seg(6.0, 7.0, " Bra."), seg(7.1, 7.5, " ")]);
+        assert_eq!(text, "Hei. Hvordan går det?\n\nBra.");
+        assert_eq!(paragraphs(&[]), "");
+    }
 
     #[test]
     fn a_typed_address_becomes_a_base() {

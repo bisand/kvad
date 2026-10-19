@@ -6,9 +6,11 @@
 //! or forget the session. `POST /v1/audio/transcriptions` answers with how
 //! many samples the WAV it was sent holds.
 //!
-//! The audio is a known ramp, sample `i` being `i % 1000`, and the server
-//! checks every sample it takes against it: a sample sent twice, lost or
-//! out of place fails the test.
+//! The audio is a known ramp, sample `i` being `i % 1000`, with silence
+//! where a test wants a pause, and the server checks every sample it takes
+//! against it: a sample sent twice, lost or out of place fails the test. A
+//! session begun again after one was let go of goes on from where the
+//! phone's settled words ended, and so do its words' numbers.
 
 use kvad_phone_core::api::Server;
 use kvad_phone_core::session::Emit;
@@ -31,12 +33,23 @@ struct Script {
     down_for: Duration,
     /// After the cut, the session is let go of: a resume is not found.
     forget: bool,
+    /// No `/v1/realtime`: the upgrade is answered 404, as a server from
+    /// before it answers.
+    no_live: bool,
+    /// Samples of the take that are silence.
+    quiet: Option<(u64, u64)>,
 }
 
 /// The session, as the server holds it between sockets.
 #[derive(Default)]
 struct Held {
     id: String,
+    /// The take's sample that is this session's first.
+    base: u64,
+    /// The words of the take before this session's.
+    first: u64,
+    /// This session's words whose deltas went out.
+    sent_words: u64,
     /// Samples taken.
     offset: u64,
     /// Where the next frame begins.
@@ -76,6 +89,14 @@ fn now_ms() -> u64 {
 
 fn ramp(i: u64) -> i16 {
     (i % 1000) as i16
+}
+
+/// The take's sample `i`.
+fn signal(i: u64, quiet: Option<(u64, u64)>) -> i16 {
+    match quiet {
+        Some((a, b)) if (a..b).contains(&i) => 0,
+        _ => ramp(i),
+    }
 }
 
 impl Fake {
@@ -118,6 +139,13 @@ impl Fake {
         }
         if &first == b"POST" {
             self.file(stream);
+        } else if self.script.no_live {
+            let mut r = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while r.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                line.clear();
+            }
+            let _ = (&stream).write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         } else {
             self.socket(stream);
         }
@@ -151,8 +179,14 @@ impl Fake {
         }
         self.files.lock().unwrap().push(samples);
         let text = format!("file {samples}");
+        let secs = |n: u64| n as f64 / RATE as f64;
+        // Whisper's segments, with the silence between two of them.
+        let segments = match self.script.quiet {
+            None => json!([{ "start": 0.0, "end": secs(samples), "text": format!(" {text}") }]),
+            Some((a, b)) => json!([{ "start": 0.0, "end": secs(a), "text": " file a" }, { "start": secs(b), "end": secs(samples), "text": " file b" }]),
+        };
         let mut w = stream;
-        let delta = json!({ "type": "transcript.text.delta", "delta": text });
+        let delta = json!({ "type": "transcript.text.delta", "delta": text, "kvad": { "segments": segments } });
         let done = json!({ "type": "transcript.text.done", "text": text });
         let _ = write!(
             w,
@@ -181,7 +215,13 @@ impl Fake {
             let mut held = self.held.lock().unwrap();
             match arg("resume") {
                 None => {
-                    let mut h = Held { id: "sess_test".into(), item: 1, ..Held::default() };
+                    // A take's session let go of before its end is followed
+                    // by one from where the phone's words were settled to.
+                    let (base, first) = match held.as_ref().filter(|h| h.item == 1) {
+                        Some(h) => (h.base + h.sent_words * RATE, h.first + h.sent_words),
+                        None => (0, 0),
+                    };
+                    let mut h = Held { id: format!("sess_{}", n), item: 1, base, first, ..Held::default() };
                     hello.push(h.event("session.created", json!({ "session": { "id": h.id } })));
                     *held = Some(h);
                 }
@@ -209,7 +249,7 @@ impl Fake {
         }
         loop {
             let Ok(msg) = ws.read() else { return };
-            let mut out = Vec::new();
+            let mut out: Vec<String> = Vec::new();
             {
                 let mut guard = self.held.lock().unwrap();
                 let h = guard.as_mut().unwrap();
@@ -227,14 +267,15 @@ impl Fake {
                                     continue;
                                 }
                                 let s = i16::from_le_bytes(*c);
-                                if s != ramp(i) {
-                                    self.wrong(format!("sample {i} was {s}, not {}", ramp(i)));
+                                let want = signal(h.base + i, self.script.quiet);
+                                if s != want {
+                                    self.wrong(format!("sample {} of the take was {s}, not {want}", h.base + i));
                                 }
                                 h.offset = i + 1;
                             }
                             while h.offset >= (h.words + 1) * RATE {
                                 h.words += 1;
-                                let delta = format!(" w{}", h.words);
+                                let delta = format!(" w{}", h.first + h.words);
                                 h.said.push_str(&delta);
                                 let at = h.words * RATE;
                                 let item = format!("item_{}", h.item);
@@ -285,8 +326,12 @@ impl Fake {
                 }
             }
             for m in out {
+                let delta = m.contains("input_audio_transcription.delta");
                 if ws.send(Message::Text(m.into())).is_err() {
                     return;
+                }
+                if delta {
+                    self.held.lock().unwrap().as_mut().unwrap().sent_words += 1;
                 }
             }
         }
@@ -316,11 +361,16 @@ fn name(e: &Value) -> &str {
 /// `seconds` of the ramp, a tenth of a second at a time as the app hands
 /// it over, from sample `from`.
 fn play(s: &Speak, from: u64, seconds: f64) -> u64 {
+    play_with(s, from, seconds, None)
+}
+
+/// The same, silent from one sample to another.
+fn play_with(s: &Speak, from: u64, seconds: f64, quiet: Option<(u64, u64)>) -> u64 {
     let end = from + (seconds * RATE as f64) as u64;
     let mut at = from;
     while at < end {
         let n = (end - at).min(RATE / 10);
-        let chunk: Vec<i16> = (at..at + n).map(ramp).collect();
+        let chunk: Vec<i16> = (at..at + n).map(|i| signal(i, quiet)).collect();
         s.audio(&chunk);
         at += n;
         std::thread::sleep(Duration::from_millis(2));
@@ -422,22 +472,70 @@ fn a_socket_cut_mid_word_and_resumed_gives_the_take_of_one_never_cut() {
     assert_eq!(fake.held.lock().unwrap().as_ref().unwrap().offset, samples, "the server did not hear every sample once");
 }
 
+/// As a server restarted mid-take does: the resume is not found, and a new
+/// session goes on from the last settled word, live, each word once.
 #[test]
-fn a_session_let_go_of_goes_to_the_file_endpoint() {
+fn a_session_let_go_of_goes_on_live_in_a_new_one() {
     let (fake, addr) = Fake::start(Script { cut_at: Some(RATE * 7 / 2), forget: true, ..Script::default() });
     let dir = folder("forgot");
     let (s, rx) = speak();
     s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
-    let samples = play(&s, 0, 6.0);
+    let samples = play(&s, 0, 10.0);
     std::thread::sleep(Duration::from_millis(1500));
     s.stop();
     let events = until(&rx, "speak_done", 30);
     let take = &events.last().unwrap()["speak_done"]["take"];
-    assert_eq!(take["how"], "file", "{events:?}");
-    assert_eq!(take["text"], format!("file {samples}"));
-    assert_eq!(*fake.files.lock().unwrap(), [samples]);
+    assert_eq!(take["how"], "live", "{events:?}");
+    assert_eq!(take["text"], words(10));
+    assert_eq!(settled(&events).trim(), words(10), "a word was settled twice, or lost");
     let l = links(&events);
-    assert!(l.contains(&"offline".to_string()) && l.last().unwrap() == "sending", "{l:?}");
+    let back = l.iter().position(|s| s == "reconnecting").and_then(|r| l[r..].iter().position(|s| s == "live"));
+    assert!(back.is_some(), "never live again: {l:?}");
+    assert!(fake.files.lock().unwrap().is_empty(), "the take was sent whole as well");
+    kept(&dir, take, samples);
+    no_wrong(&fake);
+    let h = fake.held.lock().unwrap();
+    let h = h.as_ref().unwrap();
+    assert!(h.base > 0 && h.base + h.offset == samples, "the new session heard {} from {}", h.offset, h.base);
+}
+
+/// A server from before `/v1/realtime`: the take is sent whole when it
+/// ends, and its paragraphs come from the gaps between segments.
+#[test]
+fn a_server_without_live_gets_the_take_whole_in_paragraphs() {
+    let quiet = Some((RATE * 3, RATE * 6));
+    let (fake, addr) = Fake::start(Script { no_live: true, quiet, ..Script::default() });
+    let dir = folder("nolive");
+    let (s, rx) = speak();
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    let samples = play_with(&s, 0, 8.0, quiet);
+    s.stop();
+    let events = until(&rx, "speak_done", 30);
+    let take = &events.last().unwrap()["speak_done"]["take"];
+    assert_eq!(take["how"], "file", "{events:?}");
+    assert_eq!(take["text"], "file a\n\nfile b");
+    assert_eq!(*fake.files.lock().unwrap(), [samples]);
+    assert_eq!(links(&events), ["offline", "sending"]);
+    kept(&dir, take, samples);
+    no_wrong(&fake);
+}
+
+/// Three seconds of silence: the word heard after it begins a paragraph.
+#[test]
+fn a_pause_begins_a_paragraph() {
+    let quiet = Some((RATE * 4, RATE * 7));
+    let (fake, addr) = Fake::start(Script { quiet, ..Script::default() });
+    let dir = folder("pause");
+    let (s, rx) = speak();
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap());
+    let samples = play_with(&s, 0, 11.0, quiet);
+    std::thread::sleep(Duration::from_millis(300));
+    s.stop();
+    let events = until(&rx, "speak_done", 30);
+    let take = &events.last().unwrap()["speak_done"]["take"];
+    let want = "w1 w2 w3 w4 w5 w6\n\nw7 w8 w9 w10 w11";
+    assert_eq!(take["text"], want, "{events:?}");
+    assert_eq!(settled(&events).trim(), want, "the app is told the paragraph as it comes");
     kept(&dir, take, samples);
     no_wrong(&fake);
 }
@@ -546,11 +644,14 @@ fn a_take_with_a_running_server() {
     let (s, rx) = speak();
     let server = || Some(Server::new(&url, None).unwrap());
     s.start(server(), &model, "no", dir.to_str().unwrap());
+    // `KVAD_PHONE_TEST_BACKLOG` seconds of it at once first, as a session
+    // begun again after a restart is sent what was said meanwhile.
+    let backlog: u64 = env("KVAD_PHONE_TEST_BACKLOG", "0").parse().unwrap();
     let begun = Instant::now();
     for (i, chunk) in audio.chunks(RATE as usize / 10).enumerate() {
         s.audio(chunk);
-        // At the pace it was spoken.
-        let due = begun + Duration::from_millis(100 * (i as u64 + 1));
+        // At the pace it was spoken, after the backlog.
+        let due = begun + Duration::from_millis((100 * (i as u64 + 1)).saturating_sub(1000 * backlog));
         std::thread::sleep(due.saturating_duration_since(Instant::now()));
     }
     s.stop();

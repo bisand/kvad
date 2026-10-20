@@ -9,6 +9,7 @@
   import Secret from "../lib/components/Secret.svelte";
   import ServerSettings from "../lib/components/ServerSettings.svelte";
   import DataSettings from "../lib/components/DataSettings.svelte";
+  import Devices from "../lib/components/Devices.svelte";
 
   const TRASH =
     "M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6";
@@ -274,6 +275,9 @@
         </tbody>
       </table>
     </section>
+
+    <!-- Devices, through the tunnel. -->
+    <Devices onchange={load} />
 
     <!-- Everybody, for an administrator. -->
     {#if auth.isAdmin}

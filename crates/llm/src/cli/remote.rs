@@ -74,7 +74,7 @@ fn pair(args: &Args) -> Res<()> {
         out::json(&made);
         return Ok(());
     }
-    println!("{}", qr(link)?);
+    println!("{}", kvad::qr::terminal(link)?);
     println!("Scan that with the iPhone's Camera, which opens it in Kvad, or on another machine run:\n");
     println!("    kvad remote join '{link}'\n");
     println!(
@@ -84,17 +84,6 @@ fn pair(args: &Args) -> Res<()> {
     );
     println!("Anyone who has this link in that time can pair, so keep it on this screen.");
     Ok(())
-}
-
-/// A QR code in the terminal: two rows of modules to a line, dark on light.
-fn qr(text: &str) -> Res<String> {
-    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L)?;
-    Ok(code
-        .render::<qrcode::render::unicode::Dense1x2>()
-        .dark_color(qrcode::render::unicode::Dense1x2::Light)
-        .light_color(qrcode::render::unicode::Dense1x2::Dark)
-        .quiet_zone(true)
-        .build())
 }
 
 /// Pairs this machine with the server a link names, and keeps the key it

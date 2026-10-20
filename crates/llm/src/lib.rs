@@ -59,6 +59,7 @@ pub mod machine;
 pub mod model;
 pub mod pipeline;
 pub mod qcache;
+pub mod qr;
 pub mod quant;
 pub mod residency;
 pub mod retrieve;

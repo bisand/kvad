@@ -273,23 +273,44 @@ const fn plain(
     Command { name, group: Group::Cli, args, about, server: false, routed: false, words, subs: &[], flags, usage: None, notes, examples }
 }
 
+/// Serving, which is what `kvad-serve` does with no command.
+const SERVING: Command = plain(
+    "serve",
+    "",
+    "serve the API and the web UI until Ctrl-C; the default",
+    &[],
+    &[SERVE_FLAGS],
+    "Serves the OpenAI-compatible API and the web UI in this terminal, until Ctrl-C.\n\
+     `kvad serve` is the same thing. To keep it running after the terminal closes,\n\
+     and start it at login, `kvad service install` installs it as a service.\n\n\
+     An address beyond this machine is refused while the configuration has no\n\
+     accounts, unless --insecure says that is meant.",
+    &["kvad-serve", "kvad-serve --bind 127.0.0.1:8080", "kvad-serve --config ./kvad.toml --db ./kvad.db"],
+);
+
 pub const SERVE: Program = Program {
     name: "kvad-serve",
     about: "the HTTP server and web UI",
-    commands: &[],
-    bare: &plain(
-        "kvad-serve",
-        "",
-        "the HTTP server and web UI",
-        &[],
-        &[SERVE_FLAGS],
-        "Serves the OpenAI-compatible API and the web UI in this terminal, until Ctrl-C.\n\
-         `kvad serve` is the same thing. To keep it running after the terminal closes,\n\
-         and start it at login, `kvad service install` installs it as a service.\n\n\
-         An address beyond this machine is refused while the configuration has no\n\
-         accounts, unless --insecure says that is meant.",
-        &["kvad-serve", "kvad-serve --bind 127.0.0.1:8080", "kvad-serve --config ./kvad.toml --db ./kvad.db"],
-    ),
+    commands: &[
+        SERVING,
+        plain(
+            "password",
+            "NAME",
+            "set an account's password, for when it is lost",
+            &[Kind::Text],
+            &[&[
+                f("--config", "FILE", Kind::File, "the kvad.toml of the server, if not the usual one"),
+                f("--db", "FILE", Kind::File, "the server's database, if not the one kvad.toml names"),
+            ]],
+            "Opens the database the server with the same --config and --db would, asks for\n\
+             a new password twice, and sets it. Every session of the account ends, as when\n\
+             it changes its own; its API keys go on working. The server can be running.\n\n\
+             It gives nothing away: whoever can open the database file already owns the\n\
+             server, every account and conversation in it, and could edit the rows by hand.",
+            &["kvad-serve password ada", "kvad-serve password ada --config ./kvad.toml"],
+        ),
+    ],
+    bare: &SERVING,
     local: false,
 };
 

@@ -542,6 +542,45 @@ whether anything answers. A job the service manager calls running that does
 not answer on its port is the failure people actually hit, and a status
 command that only asked the service manager would call it fine.
 
+## Accounts, and a password that is lost
+
+With `auth.mode = "local"` or `"basic"`, a server with no accounts prints a
+one-time setup token where it was started. The first account is made with it,
+in the web UI's setup form or with `kvad auth setup TOKEN`, and is an
+administrator; it is also given every conversation the server kept before it
+had accounts. More are made by an administrator, in Settings or with
+`kvad users add`.
+
+A password is changed by its owner, who has to know the current one, or set by
+an administrator for somebody else. Neither helps the only administrator who
+has forgotten theirs, and deleting the account is not a way out: its
+conversations go with it. What does help is the machine:
+
+```
+$ kvad-serve password ada
+A new password for ada (admin), in /Users/ada/.local/share/kvad/kvad.db.
+new password:
+the same again:
+ada's password is changed.
+Ended its 2 sessions: a browser signed in with the old password signs in again.
+Its 1 API key still works.
+```
+
+It opens the database a server with the same `--config` and `--db` would,
+asks twice with echo off, and sets the password the way a change does: every
+session of the account ends, its API keys stay. The server may be running; the
+next request from an ended session is refused. This gives nothing away.
+Whoever can open `kvad.db` already holds the server — its accounts, the hashes
+of its keys, every conversation — and could rewrite the rows with `sqlite3`;
+this is that, without getting the argon2 hash wrong.
+
+So **if the password is lost**, sign in to the machine the server runs on,
+run `kvad-serve password NAME` as the user the server runs as (with the
+server's `--config` if it is not the usual one), and sign in with the new one.
+For the web UI's setup form, let the password manager save what it generates
+before pressing *Create*: the form asks for it twice, and a password manager
+that offers to save is the only copy there is.
+
 ## From anywhere, through the tunnel
 
 A `[remote]` section in `kvad.toml` lets this server be reached from outside

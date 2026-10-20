@@ -6,6 +6,7 @@
   import { auth } from "../lib/auth.svelte.js";
   import { toasts } from "../lib/toasts.svelte.js";
   import Icon from "../lib/components/Icon.svelte";
+  import Secret from "../lib/components/Secret.svelte";
   import ServerSettings from "../lib/components/ServerSettings.svelte";
   import DataSettings from "../lib/components/DataSettings.svelte";
 
@@ -20,7 +21,9 @@
   let freshKey = $state(null);
   let newKeyName = $state("");
   let newUser = $state({ name: "", password: "", role: "user" });
-  let passwords = $state({ current: "", next: "" });
+  let passwords = $state({ current: "", next: "", again: "" });
+  let showPasswords = $state(false);
+  let showNewUser = $state(false);
   let confirming = $state(null);
 
   $effect(() => {
@@ -77,10 +80,14 @@
 
   async function changePassword(event) {
     event.preventDefault();
+    if (passwords.next !== passwords.again) {
+      toasts.error("The two new passwords are not the same.");
+      return;
+    }
     const ok = await act("Could not change the password", () =>
       post("/api/auth/password", { current: passwords.current, new: passwords.next }),
     );
-    passwords = { current: "", next: "" };
+    passwords = { current: "", next: "", again: "" };
     if (ok) {
       // Changing a password ends every session, this one included. Saying so
       // and then doing it is better than a page that quietly 401s.
@@ -122,24 +129,55 @@
         <span class="badge badge-sm ml-1">{auth.who?.role}</span>
       </p>
 
-      <form class="flex flex-wrap items-end gap-2" onsubmit={changePassword}>
+      <!-- A change-password form, as password managers know one: the
+           account's name in a username field they can read but nobody sees,
+           the current password, and the new one twice. -->
+      <form class="flex flex-wrap items-end gap-2" method="post" onsubmit={changePassword}>
+        <input
+          class="hidden"
+          id="account-name"
+          name="username"
+          autocomplete="username"
+          value={auth.who?.name ?? ""}
+          readonly
+          tabindex="-1"
+          aria-hidden="true"
+        />
         <fieldset class="fieldset">
-          <legend class="fieldset-legend">Current password</legend>
-          <input
-            class="input input-sm"
-            type="password"
+          <label class="fieldset-legend" for="current-password">Current password</label>
+          <Secret
+            small
+            id="current-password"
+            name="current-password"
             autocomplete="current-password"
             bind:value={passwords.current}
+            bind:shown={showPasswords}
             required
           />
         </fieldset>
         <fieldset class="fieldset">
-          <legend class="fieldset-legend">New password</legend>
-          <input
-            class="input input-sm"
-            type="password"
+          <label class="fieldset-legend" for="new-password">New password</label>
+          <Secret
+            small
+            id="new-password"
+            name="new-password"
             autocomplete="new-password"
+            minlength="8"
             bind:value={passwords.next}
+            bind:shown={showPasswords}
+            required
+          />
+        </fieldset>
+        <fieldset class="fieldset">
+          <label class="fieldset-legend" for="new-password-again">The same again</label>
+          <Secret
+            small
+            id="new-password-again"
+            name="new-password-again"
+            autocomplete="new-password"
+            aria-invalid={passwords.again !== "" && passwords.again !== passwords.next}
+            bind:value={passwords.again}
+            bind:shown={showPasswords}
             required
           />
         </fieldset>
@@ -293,24 +331,39 @@
           </tbody>
         </table>
 
-        <form class="flex flex-wrap items-end gap-2" onsubmit={createUser}>
+        <!-- Somebody else's account. Its name is not `username`, or a password
+             manager would fill in yours; the password is `new-password` so a
+             generated one is offered, and can be shown to be handed on. -->
+        <form class="flex flex-wrap items-end gap-2" method="post" onsubmit={createUser}>
           <fieldset class="fieldset">
-            <legend class="fieldset-legend">Name</legend>
-            <input class="input input-sm" bind:value={newUser.name} required />
-          </fieldset>
-          <fieldset class="fieldset">
-            <legend class="fieldset-legend">Password</legend>
+            <label class="fieldset-legend" for="new-user-name">Name</label>
             <input
               class="input input-sm"
-              type="password"
-              autocomplete="new-password"
-              bind:value={newUser.password}
+              id="new-user-name"
+              name="new-user-name"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              bind:value={newUser.name}
               required
             />
           </fieldset>
           <fieldset class="fieldset">
-            <legend class="fieldset-legend">Role</legend>
-            <select class="select select-sm w-24" bind:value={newUser.role}>
+            <label class="fieldset-legend" for="new-user-password">Password</label>
+            <Secret
+              small
+              id="new-user-password"
+              name="new-user-password"
+              autocomplete="new-password"
+              minlength="8"
+              bind:value={newUser.password}
+              bind:shown={showNewUser}
+              required
+            />
+          </fieldset>
+          <fieldset class="fieldset">
+            <label class="fieldset-legend" for="new-user-role">Role</label>
+            <select class="select select-sm w-24" id="new-user-role" name="new-user-role" bind:value={newUser.role}>
               <option value="user">user</option>
               <option value="admin">admin</option>
             </select>

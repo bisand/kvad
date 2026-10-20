@@ -1266,9 +1266,12 @@ mod tests {
         assert_eq!(tab_at("kvad-gpu tune --sa"), ["--sample", "--sample-size", "--sample-steps", "--samples"]);
         assert!(tab_at("kvad-gpu tune ").contains(&"stabilityai/sdxl-turbo".to_string()));
 
-        // The other two have no commands: everything is the program's own.
-        assert_eq!(tab_at("kvad-serve "), ["--bind", "--config", "--db", "--insecure", "--version", "--help"]);
+        // kvad-serve has two, and serving is what flags mean without one.
+        assert_eq!(tab_at("kvad-serve "), ["serve", "password"]);
+        assert_eq!(tab_at("kvad-serve -"), ["--bind", "--config", "--db", "--insecure", "--version", "--help"]);
         assert_eq!(tab_at("kvad-serve --bind 127.0.0.1:1 --i"), ["--insecure"]);
+        assert_eq!(tab_at("kvad-serve password ada --"), ["--config", "--db", "--help"]);
+        // kvad-tui has none: everything is the program's own.
         assert_eq!(tab_at("kvad-tui "), ["book", "Qwen/Qwen3-14B"]);
         assert_eq!(tab_at("kvad-tui Q"), ["Qwen/Qwen3-14B"]);
 

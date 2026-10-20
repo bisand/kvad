@@ -3,6 +3,7 @@
 //!     kvad-serve                          loopback on 5823, no auth
 //!     kvad-serve --bind 0.0.0.0:5823      needs an auth mode, or --insecure
 //!     kvad-serve --config path/kvad.toml
+//!     kvad-serve password NAME            a lost password, from the database
 //!
 //! It loads config, opens and migrates a database, decides who a request is
 //! from, manages and runs models, trains them, scores them, measures them,
@@ -63,6 +64,7 @@ mod monitoring;
 mod oidc;
 mod openai;
 mod openapi;
+mod password;
 mod playground;
 mod realtime;
 mod remote;
@@ -95,6 +97,8 @@ struct Args {
     bind: Option<SocketAddr>,
     db: Option<PathBuf>,
     insecure: bool,
+    /// `kvad-serve password NAME`: set NAME's password instead of serving.
+    password: Option<String>,
 }
 
 /// `--help`: the page `kvad::help` prints from the table of this program's
@@ -107,37 +111,61 @@ fn help() -> ! {
 }
 
 /// A flag that is not one, or one with nothing after it.
-fn bad_flag(problem: &str, flag: &str) -> ! {
-    let program = &kvad::spec::SERVE;
-    kvad::help::bad_flag(program, program.bare, problem, flag)
+fn bad_flag(command: &kvad::spec::Command, problem: &str, flag: &str) -> ! {
+    kvad::help::bad_flag(&kvad::spec::SERVE, command, problem, flag)
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { config: None, bind: None, db: None, insecure: false };
+    let mut a = Args { config: None, bind: None, db: None, insecure: false, password: None };
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
+    let program = &kvad::spec::SERVE;
+    // The command, if the first word names one. `serve` is what no command
+    // means, and is taken so that `kvad-serve serve` is not a surprise.
+    let (command, mut i) = match argv.first().map(String::as_str) {
+        Some(word) if !word.starts_with('-') && word != "help" => {
+            (program.command(word).unwrap_or_else(|| kvad::help::unknown_command(program, word)), 1)
+        }
+        _ => (program.bare, 0),
+    };
     while i < argv.len() {
         let flag = argv[i].as_str();
-        if matches!(flag, "-h" | "--help" | "help") {
-            help();
+        if matches!(flag, "-h" | "--help") {
+            match command.name == program.bare.name {
+                true => help(),
+                false => kvad::help::show(program, Some(command.name)),
+            }
+        }
+        if flag == "help" {
+            match argv.get(i + 1) {
+                None => help(),
+                Some(name) => kvad::help::show(program, Some(name)),
+            }
         }
         if matches!(flag, "-V" | "--version") {
             println!("kvad-serve {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
+        }
+        // `password`'s one word, the account's name.
+        if command.name == "password" && !flag.starts_with('-') && a.password.is_none() {
+            a.password = Some(flag.to_string());
+            i += 1;
+            continue;
+        }
+        let known = command.all_flags().iter().any(|f| f.name == flag);
+        if !known {
+            let called = format!("kvad-serve {}", command.name);
+            match flag.starts_with('-') {
+                true => bad_flag(command, &format!("{flag} is not an option of `{called}`."), flag),
+                false => bad_flag(command, &format!("`{called}` takes options and no more words, and `{flag}` is one."), ""),
+            }
         }
         if flag == "--insecure" {
             a.insecure = true;
             i += 1;
             continue;
         }
-        if !matches!(flag, "--config" | "--db" | "--bind") {
-            match flag.starts_with('-') {
-                true => bad_flag(&format!("{flag} is not an option of `kvad-serve`."), flag),
-                false => bad_flag(&format!("`kvad-serve` takes options and no words, and `{flag}` is a word."), ""),
-            }
-        }
         let Some(value) = argv.get(i + 1) else {
-            bad_flag(&format!("{flag} needs a value after it."), "");
+            bad_flag(command, &format!("{flag} needs a value after it."), "");
         };
         match flag {
             "--config" => a.config = Some(value.into()),
@@ -153,6 +181,9 @@ fn parse_args() -> Args {
             _ => unreachable!("{flag} was let through and is not matched"),
         }
         i += 2;
+    }
+    if command.name == "password" && a.password.is_none() {
+        bad_flag(command, "`kvad-serve password` needs the name of the account.", "");
     }
     a
 }
@@ -175,7 +206,16 @@ async fn main() {
         )
         .init();
 
-    match run(parse_args(), metrics).await {
+    let args = parse_args();
+    // Not a server at all: the database, a question, and an answer.
+    if let Some(name) = &args.password {
+        if let Err(e) = password::run(name, args.config.clone(), args.db.clone()) {
+            eprintln!("kvad-serve password: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    match run(args, metrics).await {
         Ok(Stopped::ForGood) => {}
         // After `run` has returned, so that everything it held — the
         // database above all — has been dropped before the process image is.

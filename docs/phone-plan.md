@@ -170,7 +170,8 @@ the take kept on the phone are the core's. Step 1, the core, is built.
 progress over SSE. Loading and pulling models with their progress.
 
 **Phase 4: the tunnel.** Pairing by QR code: the camera through a small
-`objc2` binding to AVFoundation's code scanner. Then iroh as a `Transport`,
+`objc2` binding to AVFoundation's code scanner (in the end the Camera app's,
+then, with SwiftUI, VisionKit's in the app: below). Then iroh as a `Transport`,
 the keys in the Keychain, and the path shown in the connection's status
 (`lan`, `direct`, `relay`). When iOS reports a network change (`NWPathMonitor`), the app tells the
 endpoint at once (`network_change`), so that a phone moving from Wi-Fi to 5G
@@ -213,12 +214,13 @@ Tested in the iOS 26.5 simulator against a scratch kvad-serve:
 
 - **The Camera pairs.** The app registers the `kvad` URL scheme, so the
   system Camera, scanning the QR code from `kvad remote pair`, offers to open
-  the link in Kvad; so does tapping one. Rather than a scanner of our own
-  (AVFoundation, and the camera permission with it), the app adds the scene
-  delegate's `scene:openURLContexts:` and
-  `scene:willConnectToSession:options:` to Slint's `SlintWindowSceneDelegate`
-  through the Objective-C runtime (`class_addMethod`), which implements
-  neither. (The SwiftUI app has `.onOpenURL` and `scenePhase` instead.) An opened link that parses as a server or a pairing link goes in
+  the link in Kvad; so does tapping one. The Slint app had no scanner of its
+  own, since one needed an `objc2` binding to AVFoundation and the camera
+  permission with it: it added the scene delegate's `scene:openURLContexts:`
+  and `scene:willConnectToSession:options:` to Slint's
+  `SlintWindowSceneDelegate` through the Objective-C runtime
+  (`class_addMethod`), which implements neither. (The SwiftUI app has
+  `.onOpenURL` and `scenePhase` instead, and now a scanner: below.) An opened link that parses as a server or a pairing link goes in
   the Server field with a line saying which server it is; it is never
   acted on until *Connect*. While connected, the chat says a link was opened.
 - **Back in the foreground** (`sceneDidBecomeActive:`), the app tells the
@@ -257,8 +259,47 @@ The team now goes in an uncommitted `ios/Team.local.xcconfig`, included by
 Xcode's window was thrown away by the next generate. The README has the
 steps from a fresh Mac to the app on the phone.
 
+*Added, 2026-10-19: a scanner of the app's own.* With SwiftUI the reason
+for leaving it to the Camera was gone, so the Connect screen has *Scan a
+pairing code* beside *Paste a pairing link* (`ios/Kvad/Scanner.swift`):
+
+- **VisionKit's `DataScannerViewController`**, QR codes only, with no tap
+  action on what it highlights. Where `isSupported` is false, AVFoundation's
+  `AVCaptureMetadataOutput` with `.qr` alone. No third-party scanner.
+- **The camera is asked for at the first Scan**, not at launch, with
+  `NSCameraUsageDescription` saying it only reads the pairing code and that
+  nothing is recorded or sent. Refused, the scanner says so and offers
+  Settings, the Camera app and Paste. A device with no camera (the
+  simulator) says that instead.
+- **A code is only text for the core's `opened`**, the parser an opened link
+  goes through. A code that parses as a server or pairing link fills in the
+  Server field with the line saying which server it is for, the phone gives
+  a success haptic, and the scanner closes; pairing still waits for
+  *Connect*. Anything else is a note under the viewfinder, and the scanner
+  looks on; each code goes to the core once, one at a time, while the
+  scanner is open, so a second code in sight cannot replace the first. No
+  code is opened as a URL, and nothing the camera sees is kept or sent.
+- More has no way to add a server (a connected phone disconnects first), so
+  Connect is the one place a pairing link is entered. The Camera's
+  `kvad://` path and *Paste a pairing link* are as they were.
+
+Tested in the iOS 26.5 simulator, which has no camera: the camera prompt
+came at the first Scan ([asks](phone/scanner-asks.png)); refused, the
+scanner said so with Open Settings ([refused](phone/scanner-refused.png));
+allowed, it said there is no camera ([no camera](phone/scanner-no-camera.png)).
+With codes read in by a debug build's `KVAD_PHONE_SCAN`, `https://example.com`
+and `kvad://nothing` were each a note ([not Kvad](phone/scanner-not-kvad.png)),
+and a pairing link closed the scanner, filled in the field and said which
+server, with no connection tried ([read](phone/scanner-read.png)). A link
+from `simctl openurl` and a pasted one went as before. A real scan is the
+field check below.
+
 Not yet done:
 
+- *The scanner on a real iPhone*: the prompt at the first Scan, reading the
+  QR code from `kvad remote pair` (the haptic, the field filled in, the
+  scanner closed, pairing at *Connect*), a QR code that is not Kvad's (a
+  note, the scanner open, nothing opened), and a refusal then Settings.
 - *Pairing on mobile data alone*, through the relay with the link's voucher
   (done in the simulator, not yet from a phone).
 - *A network change while the app stays in the background*, then back to

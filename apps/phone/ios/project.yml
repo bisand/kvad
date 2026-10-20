@@ -49,7 +49,8 @@ targets:
         CFBundleDisplayName: Kvad
         # kvad:// links open in the app: the Camera's QR scanner shows one
         # from `kvad remote pair` as a button. The app only fills in the
-        # Server field with it; pairing waits for Connect.
+        # Server field with it; pairing waits for Connect. The app's own
+        # scanner (Kvad/Scanner.swift) does the same with the code it reads.
         CFBundleURLTypes:
           - CFBundleURLName: eu.kvad.phone
             CFBundleURLSchemes:
@@ -76,6 +77,9 @@ targets:
         NSMicrophoneUsageDescription: Kvad records what you say so that the Kvad server on your Mac can write it out. The recording goes to your Mac and nowhere else.
         UIBackgroundModes:
           - audio
+        # The scanner: the camera, only while it is open, asked for at the
+        # first Scan a pairing code.
+        NSCameraUsageDescription: Kvad uses the camera only to read the pairing code that kvad remote pair shows on your Mac. Nothing the camera sees is recorded or sent.
     preBuildScripts:
       - name: Build the Rust core with cargo
         script: ./build.sh

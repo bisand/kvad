@@ -1,6 +1,7 @@
 // The first screen: which server, and the key if it wants one. A pairing
-// link from `kvad remote pair` pairs the phone at Connect; a paired
-// `kvad://` server is reached through the tunnel from anywhere.
+// link from `kvad remote pair`, scanned or pasted, pairs the phone at
+// Connect; a paired `kvad://` server is reached through the tunnel from
+// anywhere.
 
 import SwiftUI
 
@@ -40,12 +41,22 @@ struct ConnectView: View {
                 .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .padding(.top, 28)
 
-                Text("To reach your Mac from anywhere, run kvad remote pair on it and scan its QR code with the Camera, or paste its link here. Or type the address kvad-serve listens on, for this network only. A paired phone keeps its keys in the Keychain, on this phone alone.")
+                Text("To reach your Mac from anywhere, run kvad remote pair on it and scan its QR code, here or with the Camera, or paste its link. Or type the address kvad-serve listens on, for this network only. A paired phone keeps its keys in the Keychain, on this phone alone.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 16)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
+                // The camera is asked for here, at the first Scan, and not
+                // before.
+                Button {
+                    focused = false
+                    model.scanning = true
+                } label: {
+                    Label("Scan a pairing code", systemImage: "qrcode.viewfinder")
+                }
+                .disabled(model.connecting)
+                .padding(.top, 8)
                 Button("Paste a pairing link") { model.pasteLink() }
                     .disabled(model.connecting)
                     .padding(.vertical, 8)
@@ -90,6 +101,9 @@ struct ConnectView: View {
         // A form bounces only when it is taller than the screen.
         .scrollBounceBehavior(.basedOnSize)
         .background(Color(.systemGroupedBackground))
+        .sheet(isPresented: $model.scanning) {
+            ScannerSheet()
+        }
         .sheet(isPresented: $testing) {
             NavigationStack {
                 NetworkTestView()

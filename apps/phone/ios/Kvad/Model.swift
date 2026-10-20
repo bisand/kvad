@@ -64,6 +64,18 @@ final class AppModel {
     var connecting = false
     var connectError = ""
     var connectNotice = ""
+    /// The scanner is open (Scanner.swift), and what it last read that was
+    /// not a Kvad link.
+    var scanning = false {
+        didSet { if scanning { scanNote = ""; scanTried = []; scanWaiting = false } }
+    }
+    var scanNote = ""
+    /// The codes already handed to the core while the scanner is open: a
+    /// code stays in sight, and the camera reads it every frame.
+    @ObservationIgnored private var scanTried: Set<String> = []
+    /// A code is with the core: the next waits for its answer, so that a
+    /// second code in sight cannot take the first one's place.
+    @ObservationIgnored private var scanWaiting = false
     var server: Connected?
     var path = ""
     var coreVersion = ""
@@ -247,6 +259,21 @@ final class AppModel {
         Core.send("opened", ["link": url.absoluteString])
     }
 
+    /// A QR code's text, from the scanner: to the core's link parser, as an
+    /// opened link goes, and nowhere else. A link fills in the Server field
+    /// and closes the scanner (`link`); anything else is a note under the
+    /// viewfinder (`link_refused`), and the scanner looks on.
+    func scanned(_ code: String) {
+        guard scanning, !scanWaiting, server == nil, !scanTried.contains(code) else { return }
+        scanTried.insert(code)
+        if code.isEmpty {
+            scanNote = "That code holds no text. Scan the one kvad remote pair shows."
+        } else {
+            scanWaiting = true
+            Core.send("opened", ["link": code])
+        }
+    }
+
     func networkChanged() {
         Core.send("network_changed")
     }
@@ -418,9 +445,20 @@ final class AppModel {
                 keyText = ""
                 connectError = ""
                 connectNotice = notice
+                if scanning {
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    scanning = false
+                }
             }
         case let .linkRefused(e):
-            if server != nil { chatError = e } else { connectError = e }
+            scanWaiting = false
+            if scanning {
+                scanNote = "That is not a Kvad pairing code. Scan the one kvad remote pair shows."
+            } else if server != nil {
+                chatError = e
+            } else {
+                connectError = e
+            }
         case let .probeID(id):
             probeID = id
         case let .probeStarted(secs, status):
@@ -551,7 +589,9 @@ final class AppModel {
 /// in at real time in place of the microphone's, then stopped.
 /// `KVAD_PHONE_RECORD` is a number of seconds to record from the microphone
 /// once connected, then stop, with the screen kept on; `KVAD_PHONE_MIC` the
-/// trial to hear with (`hearingTrials`).
+/// trial to hear with (`hearingTrials`). `KVAD_PHONE_SCAN` opens the
+/// scanner at launch and reads its codes, separated by spaces, two seconds
+/// apart, as if the camera had: the simulator has none.
 @MainActor
 enum Script {
     static let env = ProcessInfo.processInfo.environment
@@ -560,6 +600,15 @@ enum Script {
         if let url = env["KVAD_PHONE_CONNECT"] {
             m.serverText = url
             m.connect()
+        }
+        if let codes = env["KVAD_PHONE_SCAN"] {
+            m.scanning = true
+            Task {
+                for code in codes.split(separator: " ") {
+                    try? await Task.sleep(for: .seconds(2))
+                    m.scanned(String(code))
+                }
+            }
         }
     }
 

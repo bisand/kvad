@@ -245,11 +245,13 @@ impl Server {
 
     /// `wav` transcribed whole by `POST /v1/audio/transcriptions`, the text
     /// a 30-second window at a time to `piece` as the server writes it
-    /// (`stream: true`), and all of it at the end, a new paragraph wherever
-    /// Whisper's segments leave a gap of `speak::PAUSE` or more. The file is
-    /// read as it is sent, never held whole. Stops between windows once
-    /// `stop` is set.
-    pub fn transcribe(&self, wav: &std::path::Path, model: &str, language: &str, stop: &AtomicBool, mut piece: impl FnMut(&str)) -> Res<String> {
+    /// (`stream: true`), and all of it at the end in [`paragraphs`] at the
+    /// recording's `pauses` (seconds). Whisper is asked for timestamps, so
+    /// that its segments are sentences: without them a segment is a whole
+    /// 30-second window, and the windows meet with no gap to break at. The
+    /// file is read as it is sent, never held whole. Stops between windows
+    /// once `stop` is set.
+    pub fn transcribe(&self, wav: &std::path::Path, model: &str, language: &str, pauses: &[(f64, f64)], stop: &AtomicBool, mut piece: impl FnMut(&str)) -> Res<String> {
         let boundary = format!("kvad-{:016x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         let mut head = String::new();
         let mut field = |name: &str, value: &str| {
@@ -260,6 +262,7 @@ impl Server {
         field("model", model);
         field("language", language);
         field("stream", "true");
+        field("timestamps", "true");
         head += &format!("--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"take.wav\"\r\ncontent-type: audio/wav\r\n\r\n");
         let tail = format!("\r\n--{boundary}--\r\n");
         let file = std::fs::File::open(wav).map_err(|e| format!("The recording could not be read: {e}"))?;
@@ -301,7 +304,7 @@ impl Server {
                 }
                 Some("transcript.text.done") => {
                     let text = v["text"].as_str().unwrap_or_default();
-                    return Ok(if segments.is_empty() { text.to_string() } else { paragraphs(&segments) });
+                    return Ok(if segments.is_empty() { text.to_string() } else { paragraphs(&segments, pauses) });
                 }
                 _ => {}
             }
@@ -370,24 +373,39 @@ impl Write for Stream {
     }
 }
 
-/// Segments' text, with a blank line where one begins a pause or more after
-/// the last ended.
-pub fn paragraphs(segments: &[(f64, f64, String)]) -> String {
+/// How far a pause may lie from the gap between two segments and still be
+/// that gap's, in seconds. Whisper's segment times are a guess: across a
+/// pause it often stretches the one before and starts the next early, so
+/// the two can meet with the silence between them inside one or the other.
+const NEAR: f64 = 1.0;
+
+/// Segments' text, with a blank line between two of them where the
+/// recording paused: at the gap nearest each of `pauses` (start and end, in
+/// seconds) if one is within [`NEAR`], and wherever a segment begins a
+/// pause or more after the last ended.
+pub fn paragraphs(segments: &[(f64, f64, String)], pauses: &[(f64, f64)]) -> String {
     let pause = crate::speak::PAUSE as f64 / crate::speak::RATE as f64;
-    let mut text = String::new();
-    let mut last_end: Option<f64> = None;
-    for (start, end, words) in segments {
-        let words = words.trim();
-        if words.is_empty() {
-            continue;
+    let segments: Vec<(f64, f64, &str)> = segments.iter().map(|(a, b, t)| (*a, *b, t.trim())).filter(|s| !s.2.is_empty()).collect();
+    // Before segment i, the gap from where the last ended to where it begins,
+    // either way round, since the two can overlap.
+    let gaps: Vec<(f64, f64)> = (1..segments.len()).map(|i| {
+        let (end, start) = (segments[i - 1].1, segments[i].0);
+        (end.min(start), end.max(start))
+    }).collect();
+    let mut breaks: Vec<bool> = (1..segments.len()).map(|i| segments[i].0 - segments[i - 1].1 >= pause).collect();
+    for &(from, to) in pauses {
+        let far = |&(lo, hi): &(f64, f64)| (lo - to).max(from - hi).max(0.0);
+        let nearest = (0..gaps.len()).min_by(|&a, &b| far(&gaps[a]).total_cmp(&far(&gaps[b])));
+        if let Some(i) = nearest.filter(|&i| far(&gaps[i]) <= NEAR) {
+            breaks[i] = true;
         }
-        match last_end {
-            Some(e) if start - e >= pause => text.push_str("\n\n"),
-            Some(_) => text.push(' '),
-            None => {}
+    }
+    let mut text = String::new();
+    for (i, (_, _, words)) in segments.iter().enumerate() {
+        if i > 0 {
+            text.push_str(if breaks[i - 1] { "\n\n" } else { " " });
         }
         text.push_str(words);
-        last_end = Some(*end);
     }
     text
 }
@@ -460,9 +478,23 @@ mod tests {
     #[test]
     fn a_gap_between_segments_begins_a_paragraph() {
         let seg = |a: f64, b: f64, t: &str| (a, b, t.to_string());
-        let text = paragraphs(&[seg(0.0, 2.0, " Hei."), seg(2.4, 4.0, " Hvordan går det?"), seg(6.0, 7.0, " Bra."), seg(7.1, 7.5, " ")]);
+        let text = paragraphs(&[seg(0.0, 2.0, " Hei."), seg(2.4, 4.0, " Hvordan går det?"), seg(6.0, 7.0, " Bra."), seg(7.1, 7.5, " ")], &[]);
         assert_eq!(text, "Hei. Hvordan går det?\n\nBra.");
-        assert_eq!(paragraphs(&[]), "");
+        assert_eq!(paragraphs(&[], &[(1.0, 3.0)]), "");
+    }
+
+    /// Whisper stretched both segments into the pause, so they nearly meet;
+    /// the pause the recording had still begins the paragraph, and one that
+    /// fell inside a segment, or far from any gap, begins none.
+    #[test]
+    fn a_pause_in_the_recording_begins_a_paragraph_at_the_nearest_gap() {
+        let seg = |a: f64, b: f64, t: &str| (a, b, t.to_string());
+        let segments = [seg(0.0, 4.2, " Hei."), seg(4.6, 9.0, " Hvordan går det?"), seg(9.0, 14.0, " Bra."), seg(14.0, 20.0, " Og du?")];
+        assert_eq!(paragraphs(&segments, &[]), "Hei. Hvordan går det? Bra. Og du?");
+        assert_eq!(paragraphs(&segments, &[(3.0, 5.5)]), "Hei.\n\nHvordan går det? Bra. Og du?");
+        assert_eq!(paragraphs(&segments, &[(14.5, 16.0)]), "Hei. Hvordan går det? Bra.\n\nOg du?");
+        assert_eq!(paragraphs(&segments, &[(16.5, 18.5)]), "Hei. Hvordan går det? Bra. Og du?", "inside a segment, 2.5 s from a gap");
+        assert_eq!(paragraphs(&[seg(0.0, 30.0, " Ett vindu.")], &[(10.0, 12.0)]), "Ett vindu.");
     }
 
     #[test]

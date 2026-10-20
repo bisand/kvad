@@ -180,10 +180,16 @@ impl Fake {
         self.files.lock().unwrap().push(samples);
         let text = format!("file {samples}");
         let secs = |n: u64| n as f64 / RATE as f64;
-        // Whisper's segments, with the silence between two of them.
-        let segments = match self.script.quiet {
-            None => json!([{ "start": 0.0, "end": secs(samples), "text": format!(" {text}") }]),
-            Some((a, b)) => json!([{ "start": 0.0, "end": secs(a), "text": " file a" }, { "start": secs(b), "end": secs(samples), "text": " file b" }]),
+        // Whisper's segments as kvad-serve sends them. Without timestamps a
+        // segment is a whole 30-second window, and the windows meet. With
+        // them it is a sentence, but its times are a guess: across the
+        // silence each side is stretched in, to well under a pause apart.
+        let asked = b"name=\"timestamps\"\r\n\r\ntrue\r\n";
+        let timed = body.windows(asked.len()).any(|w| w == asked);
+        let segments = match (self.script.quiet, timed) {
+            (Some((a, b)), true) => json!([{ "start": 0.0, "end": secs(a) + 1.2, "text": " file a" }, { "start": secs(b) - 1.2, "end": secs(samples), "text": " file b" }]),
+            (Some(_), false) => json!([{ "start": 0.0, "end": secs(samples), "text": " file a file b" }]),
+            _ => json!([{ "start": 0.0, "end": secs(samples), "text": format!(" {text}") }]),
         };
         let mut w = stream;
         let delta = json!({ "type": "transcript.text.delta", "delta": text, "kvad": { "segments": segments } });
@@ -517,6 +523,45 @@ fn a_server_without_live_gets_the_take_whole_in_paragraphs() {
     assert_eq!(*fake.files.lock().unwrap(), [samples]);
     assert_eq!(links(&events), ["offline", "sending"]);
     kept(&dir, take, samples);
+    no_wrong(&fake);
+}
+
+/// A take transcribed again begins its paragraphs where the recording
+/// paused, though Whisper's segments nearly meet across the pause: from the
+/// pauses kept with the take, and for a take kept before they were, from
+/// its file.
+#[test]
+fn a_take_transcribed_again_keeps_its_paragraphs() {
+    let quiet = Some((RATE * 3, RATE * 6));
+    let (fake, addr) = Fake::start(Script { quiet, ..Script::default() });
+    let dir = folder("again");
+    let (s, rx) = speak();
+    s.start(Some(Server::new(&addr, None).unwrap()), "", "", dir.to_str().unwrap(), false);
+    let samples = play_with(&s, 0, 8.0, quiet);
+    std::thread::sleep(Duration::from_millis(300));
+    s.stop();
+    let events = until(&rx, "speak_done", 30);
+    let take = events.last().unwrap()["speak_done"]["take"].clone();
+    let id = take["id"].as_str().unwrap().to_string();
+    let pauses = take["pauses"].as_array().expect("the take keeps its pauses");
+    assert_eq!(pauses.len(), 1, "{pauses:?}");
+    let (from, to) = (pauses[0][0].as_f64().unwrap(), pauses[0][1].as_f64().unwrap());
+    assert!((from - 3.0).abs() <= 0.1 && (to - 6.0).abs() <= 0.1, "the pause kept was {from}–{to} s");
+
+    let again = |rx: &mpsc::Receiver<Value>| {
+        s.retranscribe(Some(Server::new(&addr, None).unwrap()), dir.to_str().unwrap(), &id, "", "");
+        let events = until(rx, "retranscribe_done", 30);
+        events.last().unwrap()["retranscribe_done"]["take"]["text"].as_str().unwrap().to_string()
+    };
+    assert_eq!(again(&rx), "file a\n\nfile b");
+
+    // The same take as one kept before pauses were.
+    let meta = dir.join(format!("{id}.json"));
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("pauses");
+    std::fs::write(&meta, v.to_string()).unwrap();
+    assert_eq!(again(&rx), "file a\n\nfile b");
+    assert_eq!(*fake.files.lock().unwrap(), [samples, samples]);
     no_wrong(&fake);
 }
 

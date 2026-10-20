@@ -296,8 +296,17 @@ Each is a PR, merged on a green check, as the SwiftUI move was.
    - **Paragraphs.** A pause of 1.5 s or more begins a new one. The core
      finds pauses in the audio as it comes (`speak::Quiet`: loudness every
      50 ms against a noise floor that a voice cannot raise), and a word
-     settled after one ends begins its paragraph. A take sent whole has its
-     paragraphs from the gaps between Whisper's segments. A new speaker
+     settled after one ends begins its paragraph. A take keeps its pauses
+     in its record (`pauses`, seconds, heard before any gain), and a take
+     sent whole, or transcribed again, begins a paragraph at the gap between
+     Whisper's segments nearest each one, within a second
+     (`api::paragraphs`). The file endpoint is asked for timestamps for it:
+     without them each segment is a whole 30-second window and the windows
+     meet, so a take transcribed again came back as one paragraph (field
+     run, 2026-10-20). With them the segments are sentences, but their times
+     are a guess: on a test recording with 3 s of silence between two
+     sentences, nb-whisper-small's two segments met exactly, at 6.62 s. A
+     take kept before its pauses were has them found again in its file. A new speaker
      would begin one too, once kvad can tell speakers apart
      (docs/diarization-plan.md, *Speakers*, not built yet).
    - **Conversations kept, as takes are.** Chat's conversations are kept on
@@ -317,6 +326,14 @@ Each is a PR, merged on a green check, as the SwiftUI move was.
    any recording. Opus would be smaller still at the same quality for
    speech, if the server is shown to read it. The WAV goes once the
    compressed file is written and read back.
+   *Not MP3.* AAC is the later and more efficient codec: at a low rate
+   such as 32 kbit/s it keeps more of a voice than MP3 does with the same
+   bits. iOS has no MP3 encoder either (it reads MP3, it does not write
+   it), so MP3 would mean bringing in LAME, a C library under the LGPL,
+   against what kvad lets in. AAC is in `AVAudioConverter`, and `.m4a` plays
+   and shares everywhere a Voice Memo does. Before the WAV is let go, the
+   19-minute meeting is transcribed from both and compared, as the gain
+   was: that is the check that the format costs Whisper nothing.
 
 ## Open questions
 

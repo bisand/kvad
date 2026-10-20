@@ -41,7 +41,7 @@ use crate::session::{event, Emit};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -184,6 +184,37 @@ impl Quiet {
     pub fn pauses(&self) -> &[(u64, u64)] {
         &self.pauses
     }
+
+    /// The pauses, in seconds.
+    pub fn seconds(&self) -> Vec<(f64, f64)> {
+        self.pauses.iter().map(|&(a, b)| (a as f64 / RATE as f64, b as f64 / RATE as f64)).collect()
+    }
+
+    /// The pauses in a take's WAV, for a take kept before its pauses were.
+    /// Found in what was saved, which for a take of a room is after its gain
+    /// (`level.rs`): the gain holds between voices, so a pause after a quiet
+    /// one is raised with it and can be missed, never invented.
+    pub fn of_file(wav: &Path) -> Vec<(f64, f64)> {
+        let mut quiet = Quiet::default();
+        let Ok(mut file) = File::open(wav) else { return Vec::new() };
+        let mut bytes = vec![0u8; 64 * 1024];
+        let mut skip = HEADER as usize;
+        let mut odd: Option<u8> = None;
+        while let Ok(n) = file.read(&mut bytes) {
+            if n == 0 {
+                break;
+            }
+            let mut chunk: Vec<u8> = odd.take().into_iter().collect();
+            chunk.extend_from_slice(&bytes[skip.min(n)..n]);
+            skip = skip.saturating_sub(n);
+            if chunk.len() % 2 == 1 {
+                odd = chunk.pop();
+            }
+            let samples: Vec<i16> = chunk.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+            quiet.feed(&samples);
+        }
+        quiet.seconds()
+    }
 }
 
 impl Speak {
@@ -311,7 +342,7 @@ impl Speak {
                         let _ = f.write_all_at(&header(samples), 0);
                     }
                     let started = id.parse::<u64>().map(|ms| ms / 1000).unwrap_or(0);
-                    let v = record(&id, started, samples, "", "", "", "", "");
+                    let v = record(&id, started, samples, "", "", "", "", "", None);
                     let _ = std::fs::write(&meta, v.to_string());
                     v
                 }
@@ -349,7 +380,14 @@ impl Speak {
         let (emit, id, model, language) = (self.emit.clone(), id.to_string(), model.to_string(), language.to_string());
         std::thread::spawn(move || {
             let stop = AtomicBool::new(false);
-            let result = server.transcribe(&wav, &model, &language, &stop, |piece| emit(event("retranscribe_piece", json!({ "id": id, "text": piece }))));
+            // The pauses kept with the take, heard before any gain; a take
+            // from before they were kept has them found in its file.
+            let kept = std::fs::read(wav.with_extension("json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            let pauses = match kept.as_ref().and_then(|v| v["pauses"].as_array()) {
+                Some(p) => p.iter().filter_map(|p| Some((p[0].as_f64()?, p[1].as_f64()?))).collect(),
+                None => Quiet::of_file(&wav),
+            };
+            let result = server.transcribe(&wav, &model, &language, &pauses, &stop, |piece| emit(event("retranscribe_piece", json!({ "id": id, "text": piece }))));
             match result {
                 Ok(text) => {
                     let meta = wav.with_extension("json");
@@ -381,8 +419,13 @@ fn plain(id: &str) -> bool {
 /// `live` or `file`, for how its text was written, or empty for a take
 /// with no transcript yet.
 #[allow(clippy::too_many_arguments)]
-fn record(id: &str, started: u64, samples: u64, model: &str, language: &str, text: &str, how: &str, server: &str) -> Value {
-    json!({
+/// What is kept of a take beside its WAV. `pauses` are where it was quiet
+/// for [`PAUSE`] or more, in seconds, heard before any gain, so that the take
+/// transcribed again has its paragraphs where live had them. A take found
+/// without its record has none: they are found in its file if it is sent.
+#[allow(clippy::too_many_arguments)]
+fn record(id: &str, started: u64, samples: u64, model: &str, language: &str, text: &str, how: &str, server: &str, pauses: Option<&[(f64, f64)]>) -> Value {
+    let mut v = json!({
         "id": id,
         "started": started,
         "seconds": samples as f64 / RATE as f64,
@@ -391,7 +434,12 @@ fn record(id: &str, started: u64, samples: u64, model: &str, language: &str, tex
         "text": text,
         "how": how,
         "server": server,
-    })
+    });
+    if let Some(pauses) = pauses {
+        let hundredths = |x: f64| (x * 100.0).round() / 100.0;
+        v["pauses"] = pauses.iter().map(|&(a, b)| [hundredths(a), hundredths(b)]).collect::<Vec<_>>().into();
+    }
+    v
 }
 
 /// A WAV header for `samples` of 16 kHz mono 16-bit PCM.
@@ -536,7 +584,8 @@ impl Live {
             End::Cancelled => unreachable!("returned above"),
         };
         let t = &self.take;
-        let v = record(&t.id, t.started, samples, &t.model, &t.language, &text, how, &t.server);
+        let pauses = t.quiet.lock().unwrap().seconds();
+        let v = record(&t.id, t.started, samples, &t.model, &t.language, &text, how, &t.server, Some(&pauses));
         let kept = std::fs::write(&t.meta, v.to_string());
         // The take has ended: no more audio goes into it.
         let mut current = self.current.lock().unwrap();
@@ -577,7 +626,8 @@ impl Live {
             if self.take.cancel.load(Ordering::Relaxed) {
                 return Err("Cancelled.".into());
             }
-            match self.server.transcribe(&self.take.wav, &self.take.model, &self.take.language, &stop, |_| {}) {
+            let pauses = self.take.quiet.lock().unwrap().seconds();
+            match self.server.transcribe(&self.take.wav, &self.take.model, &self.take.language, &pauses, &stop, |_| {}) {
                 Ok(text) => return Ok(text),
                 Err(e) => last = e,
             }

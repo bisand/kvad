@@ -116,7 +116,9 @@ macOS gets all four binaries. Linux gets `kvad` and a CPU-only `kvad-serve`:
 off a Mac. On macOS that means Apple Silicon, which is what this is developed
 and measured on; Intel Macs had an untested build up to v0.6.0 and none since.
 
-The binaries are unsigned and unnotarized, which is deliberate rather than
-lazy: Gatekeeper's quarantine flag is set by LaunchServices, so a tarball
-fetched with `curl` never gets one and runs as-is. Download the same tarball
-with a browser and macOS will want convincing.
+The Mac binaries are signed with a Developer ID and notarized by Apple, so a
+tarball downloaded with a browser runs too, without macOS wanting convincing.
+The first run of a downloaded binary asks Apple about it, since a bare
+executable has nowhere to keep the answer. A Mac whose IT allowlists programs
+by developer can allow kvad by its Team ID, which `codesign -dv
+~/.local/bin/kvad-serve` shows.

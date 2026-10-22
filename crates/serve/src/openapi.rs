@@ -1228,7 +1228,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
         method: "post", path: "/api/keys", tag: "Accounts", access: Access::SignedIn,
         summary: "Create an API key",
         description: "Shown once. Only its hash is kept, so a lost key is replaced \
-                      rather than recovered.",
+                      rather than recovered. Asked for through a paired device, the key is \
+                      that device's: it works only from it through the tunnel, with its role, \
+                      and goes when the device is unpaired.",
         query: &[], body: json_body("`{ name }`."), produces: JSON, events: &[],
     },
     Endpoint {

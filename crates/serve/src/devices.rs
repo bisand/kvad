@@ -5,6 +5,10 @@
 //! works only when that same device presents it through the tunnel. What it
 //! may do is its account's role, lowered to `user` unless it was paired with
 //! `admin` granted.
+//!
+//! The same goes for every key made through the device (`kvad keys add` on
+//! it): `api_keys.device` says whose it is, and such a key is the device's in
+//! all three ways, so that asking for a key is not a way out of the limits.
 
 use crate::db::Db;
 use crate::secret;
@@ -55,26 +59,29 @@ pub fn clean_name(name: &str) -> String {
     }
 }
 
-/// Pairs `node` to `user`: an API key for it, and the row. One transaction
-/// in effect, since a key with no device would be a key nobody can use, and
-/// the key is removed again if the row cannot be written.
+/// Pairs `node` to `user`: the row, and an API key of the device's. One
+/// transaction in effect, since a device with no key is a device that cannot
+/// sign in, and the row is removed again if the key cannot be made.
 pub fn pair(db: &Db, node: &str, name: &str, user: i64, admin: bool) -> Res<(Device, String)> {
     if get_by_node(db, node)?.is_some() {
         return Err("this device is already paired; remove it first (kvad devices rm)".into());
     }
     let name = clean_name(name);
-    let (key, token) = users::create_key(db, user, &format!("device: {name}"))?;
-    let made = db.with(|c| {
+    let id = db.with(|c| {
         c.execute(
-            "INSERT INTO devices (node, name, user, api_key, admin) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![node, name, user, key.id, admin as i64],
+            "INSERT INTO devices (node, name, user, admin) VALUES (?1, ?2, ?3, ?4)",
+            params![node, name, user, admin as i64],
         )?;
         Ok(c.last_insert_rowid())
+    })?;
+    let keyed = users::create_key(db, user, Some(id), &format!("device: {name}")).and_then(|(key, token)| {
+        db.with(|c| c.execute("UPDATE devices SET api_key = ?1 WHERE id = ?2", [key.id, id]))?;
+        Ok(token)
     });
-    let id = match made {
-        Ok(id) => id,
+    let token = match keyed {
+        Ok(token) => token,
         Err(e) => {
-            let _ = users::revoke_key(db, user, key.id);
+            let _ = remove(db, id);
             return Err(e);
         }
     };
@@ -96,14 +103,15 @@ pub fn get_by_node(db: &Db, node: &str) -> Res<Option<Device>> {
     })
 }
 
-/// The device whose API key `token` is, if it is a device's.
+/// The device whose key `token` is, if it is a device's: the one pairing
+/// gave it, or one made through it.
 pub fn by_token(db: &Db, token: &str) -> Res<Option<Device>> {
     let fingerprint = secret::fingerprint(token);
     db.with(|c| {
         c.query_row(
             &format!(
                 "SELECT {COLUMNS} FROM devices d JOIN users u ON u.id = d.user
-                 JOIN api_keys k ON k.id = d.api_key WHERE k.token_hash = ?1"
+                 JOIN api_keys k ON k.device = d.id WHERE k.token_hash = ?1"
             ),
             [&fingerprint],
             row,
@@ -130,14 +138,13 @@ pub fn nodes(db: &Db) -> Res<Vec<String>> {
     db.with(|c| c.prepare("SELECT node FROM devices")?.query_map([], |r| r.get(0))?.collect())
 }
 
-/// Removes a device and its key together, so that it can neither reach the
-/// server nor use the key anywhere else. The device it was, if there was one.
+/// Removes a device and its keys together, so that it can neither reach the
+/// server nor use a key anywhere else. The device it was, if there was one.
 pub fn remove(db: &Db, id: i64) -> Res<Option<Device>> {
     let Some(device) = get(db, id)? else { return Ok(None) };
     db.with(|c| {
-        if let Some(key) = device.api_key {
-            c.execute("DELETE FROM api_keys WHERE id = ?1", [key])?;
-        }
+        // The foreign key cascades too; said here, since it is the point.
+        c.execute("DELETE FROM api_keys WHERE device = ?1", [id])?;
         c.execute("DELETE FROM devices WHERE id = ?1", [id])
     })?;
     Ok(Some(device))
@@ -178,7 +185,7 @@ mod tests {
     #[test]
     fn an_ordinary_key_is_not_a_device() {
         let (db, ada) = seeded();
-        let (_, token) = users::create_key(&db, ada, "laptop").unwrap();
+        let (_, token) = users::create_key(&db, ada, None, "laptop").unwrap();
         assert!(by_token(&db, &token).unwrap().is_none());
     }
 }

@@ -245,7 +245,7 @@ fn an_account_without_a_password_cannot_be_signed_in_to() {
 fn a_key_signs_in_as_whoever_made_it_until_it_is_revoked() {
     let db = db_with_people();
     let bob = users::by_name(&db, "bob").unwrap().unwrap();
-    let (key, token) = users::create_key(&db, bob.id, "script").unwrap();
+    let (key, token) = users::create_key(&db, bob.id, None, "script").unwrap();
 
     for provider in [&Local as &dyn Provider, &Basic as &dyn Provider] {
         let who =
@@ -268,7 +268,7 @@ fn a_deleted_account_takes_its_sessions_and_keys_with_it() {
     let db = db_with_people();
     let bob = users::by_name(&db, "bob").unwrap().unwrap();
     let (_, session) = users::sign_in(&db, "bob", "builder-2024", None).unwrap();
-    let (_, key) = users::create_key(&db, bob.id, "script").unwrap();
+    let (_, key) = users::create_key(&db, bob.id, None, "script").unwrap();
 
     assert!(users::delete(&db, bob.id).unwrap());
     assert!(Local.identify(&Presented::Cookie(session), &db).is_none());
@@ -381,7 +381,7 @@ async fn a_cross_site_post_is_refused_before_the_cookie_is_even_looked_up() {
 
     // And a bearer token is not forgeable, so it is not caught by the check.
     let ada = users::by_name(&db, "ada").unwrap().unwrap();
-    let (_, key) = users::create_key(&db, ada.id, "script").unwrap();
+    let (_, key) = users::create_key(&db, ada.id, None, "script").unwrap();
     let bearer = format!("Bearer {key}");
     let with_key = &[("authorization", bearer.as_str())];
     assert!(Identity::from_request_parts(&mut request("POST", with_key), &state).await.is_ok());
@@ -430,7 +430,7 @@ fn oidc_accepts_a_session_or_a_key_and_nothing_else() {
     let (ada, token) = users::sign_in(&db, "ada", "lovelace-1843", None).unwrap();
     assert_eq!(Oidc.identify(&Presented::Cookie(token), &db).unwrap().id, Some(ada.id));
 
-    let (_, key) = users::create_key(&db, ada.id, "script").unwrap();
+    let (_, key) = users::create_key(&db, ada.id, None, "script").unwrap();
     assert!(Oidc.identify(&Presented::Bearer(key), &db).is_some());
 
     // A password is not a way in when the provider is somewhere else.
@@ -486,5 +486,71 @@ async fn a_device_key_works_only_from_its_device_and_only_as_what_it_was_granted
         };
         assert_eq!(denied.0, StatusCode::UNAUTHORIZED);
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A key a device makes is that device's too. Without that, `POST /api/keys`
+/// through a phone paired as `user` handed back an ordinary key of its
+/// account's, which was an administrator from anywhere: both of the device's
+/// limits gone in one request. Unbind the key from the device in
+/// `create_key` and the minted key works off the tunnel; drop the role clamp
+/// for it and it is an administrator through the phone.
+#[tokio::test]
+async fn a_key_made_through_a_device_is_held_to_that_device() {
+    let db = db_with_people();
+    let ada = users::by_name(&db, "ada").unwrap().unwrap();
+    let dir = std::env::temp_dir().join(format!("kvad-auth-minted-{}", std::process::id()));
+    let node = |n: &str| kvad_tunnel::Key::load(&dir.join(n)).unwrap().0.id();
+    let (phone, other) = (node("phone"), node("other"));
+    let (device, key) = crate::devices::pair(&db, &phone.to_string(), "phone", ada.id, false).unwrap();
+
+    let state = State {
+        db: db.clone(),
+        auth: std::sync::Arc::new(Local),
+        engine: std::sync::Arc::new(crate::scheduler::Scheduler::spawn(
+            || Box::new(|_, _, _, _| Err("no backend in tests".into())),
+            crate::memory::Budget { total: 0, context: 1 },
+        )),
+        jobs: std::sync::Arc::new(crate::jobs::Jobs::new(db.clone())),
+        metrics: std::sync::Arc::new(crate::metrics::Metrics::new()),
+        setup: std::sync::Arc::new(Setup::default()),
+        oidc: std::sync::Arc::new(Default::default()),
+        started: std::time::Instant::now(),
+        load_on_request: false,
+        settings: Default::default(),
+        remote: None,
+    };
+    let via = |token: &str, node: Option<kvad_tunnel::NodeId>| {
+        let bearer = format!("Bearer {token}");
+        let mut parts = request("POST", &[("authorization", bearer.as_str())]);
+        if let Some(n) = node {
+            parts.extensions.insert(axum::extract::ConnectInfo(crate::remote::Tunnelled(n)));
+        }
+        parts
+    };
+
+    // The phone asks for a key of its own, as `kvad keys add` does.
+    let who = Identity::from_request_parts(&mut via(&key, Some(phone)), &state).await.unwrap();
+    let body = serde_json::from_value(serde_json::json!({ "name": "a script" })).unwrap();
+    let axum::Json(made) =
+        crate::accounts::create_key(who, axum::extract::State(state.clone()), axum::Json(body)).await.unwrap();
+    let minted = made["token"].as_str().unwrap().to_string();
+
+    // Off the tunnel, and from another device, it is a key somebody copied.
+    assert!(Admin::from_request_parts(&mut via(&minted, None), &state).await.is_err(), "the phone minted an administrator's key");
+    for (place, parts) in [("the TCP port", via(&minted, None)), ("another device", via(&minted, Some(other)))] {
+        let Err(denied) = Identity::from_request_parts(&mut { parts }, &state).await else {
+            panic!("a key the phone made worked from {place}");
+        };
+        assert_eq!(denied.0, StatusCode::UNAUTHORIZED);
+    }
+    // Through the phone it is the phone: `user`, whatever ada is.
+    let who = Identity::from_request_parts(&mut via(&minted, Some(phone)), &state).await.unwrap();
+    assert_eq!((who.role, who.device), (Role::User, Some(device.id)));
+    assert!(Admin::from_request_parts(&mut via(&minted, Some(phone)), &state).await.is_err());
+
+    // And it goes when the phone does.
+    crate::devices::remove(&db, device.id).unwrap().unwrap();
+    assert!(users::from_key(&db, &minted).unwrap().is_none(), "an unpaired device's key still works");
     let _ = std::fs::remove_dir_all(&dir);
 }

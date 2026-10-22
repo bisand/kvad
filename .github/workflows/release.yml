@@ -43,10 +43,21 @@
 # * `--no-default-features` is given to `-p kvad-serve` alone. Applied to the
 #   whole workspace it would also switch off `kvad`'s `arch-*` features, and
 #   the result would be an engine that can run no architectures at all.
-# * Nothing is stripped or notarized. Stripping a macOS arm64 binary breaks
-#   the ad-hoc signature the linker gave it, and a tarball fetched with curl
-#   is never quarantined by Gatekeeper — so the simple thing is also the
-#   thing that runs.
+# * The Mac binaries are signed with a Developer ID and notarized, and the
+#   job fails without the secrets for it (see `release`, below). The
+#   installer's curl download is never quarantined and would run unsigned,
+#   but a tarball fetched with a browser is, and a managed Mac may refuse
+#   any binary its IT cannot allowlist by Team ID — which the linker's
+#   ad-hoc signature does not have.
+#
+#   The `release` environment holds five secrets: MACOS_CERT_P12, the
+#   Developer ID Application certificate and its key exported as a .p12
+#   and base64-encoded; MACOS_CERT_PASSWORD, that export's password, left
+#   unset if it has none; and
+#   NOTARY_KEY_P8 (base64 again), NOTARY_KEY_ID and NOTARY_ISSUER_ID, an
+#   App Store Connect API key with the Developer role.
+# * Nothing is stripped. The symbol names are what make a panic's backtrace
+#   readable in a bug report.
 
 name: release
 
@@ -128,6 +139,9 @@ jobs:
     name: ${{ matrix.target }}
     needs: [version, web]
     runs-on: ${{ matrix.os }}
+    # Holds the signing and notarization secrets, so they are given to this
+    # workflow's builds and to nothing that runs on a pull request.
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -186,6 +200,110 @@ jobs:
             cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.extra }}
           fi
 
+      # The certificate goes into a keychain of its own, made for this job
+      # and deleted at the end of it, so nothing else on the runner can sign
+      # with it and nothing is left behind if the runner is not as fresh as
+      # it should be. Missing secrets fail the job: a release that quietly
+      # shipped unsigned Mac binaries would look fine until it reached a
+      # machine that refuses them.
+      - name: Sign the Mac binaries
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -eu
+          # The password may be empty: Keychain Access exports without one
+          # if nothing is typed, and the secret store is what protects the
+          # file here anyway.
+          [ -n "$MACOS_CERT_P12" ] || {
+            echo "::error::MACOS_CERT_P12 is not set"; exit 1; }
+
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          kc_pw=$(openssl rand -hex 24)
+          security create-keychain -p "$kc_pw" "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p "$kc_pw" "$kc"
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -f pkcs12 \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign >/dev/null
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Without this, codesign stops to ask whether it may use the key,
+          # and nobody is there to answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$kc_pw" "$kc" >/dev/null
+          # codesign finds identities through the search list only. The
+          # existing list is split on purpose: one argument per keychain.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+
+          identity=$(security find-identity -v -p codesigning "$kc" |
+            awk '/"Developer ID Application: / { print $2; exit }')
+          [ -n "$identity" ] || {
+            echo "::error::the certificate is not a Developer ID Application identity"; exit 1; }
+
+          # The hardened runtime is what notarization asks for. kvad needs
+          # no entitlements under it: Metal compiles its kernels in a
+          # separate process, and nothing here maps executable memory or
+          # loads a library it did not link. --timestamp keeps a signature
+          # valid after the certificate itself has expired. The identifier
+          # is fixed so the firewall, Login Items and an IT allowlist see
+          # the same program from one release to the next.
+          for bin in kvad kvad-serve kvad-tui kvad-gpu; do
+            f="target/${{ matrix.target }}/release/$bin"
+            [ -f "$f" ] || continue
+            codesign --force --options runtime --timestamp \
+              --identifier "eu.kvad.$bin" --keychain "$kc" --sign "$identity" "$f"
+            codesign --verify --strict --verbose=2 "$f"
+            details=$(codesign -dv "$f" 2>&1)
+            echo "$details" | grep -E '^(Identifier|Authority|TeamIdentifier)='
+            echo "$details" | grep -q 'flags=.*runtime' || {
+              echo "::error::$bin was signed without the hardened runtime"; exit 1; }
+          done
+
+      # Apple's answer is waited for here rather than after the upload, so a
+      # rejected build never reaches the release. There is nothing to staple:
+      # a ticket can be attached to an app, a disk image or a package, not to
+      # a bare executable, so Gatekeeper fetches it from Apple the first time
+      # a downloaded binary runs.
+      - name: Notarize the Mac binaries
+        if: runner.os == 'macOS'
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -eu
+          [ -n "$NOTARY_KEY_P8" ] && [ -n "$NOTARY_KEY_ID" ] && [ -n "$NOTARY_ISSUER_ID" ] || {
+            echo "::error::NOTARY_KEY_P8, NOTARY_KEY_ID and NOTARY_ISSUER_ID are not set"; exit 1; }
+
+          key="$RUNNER_TEMP/notary.p8"
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$key"
+          auth="--key $key --key-id $NOTARY_KEY_ID --issuer $NOTARY_ISSUER_ID"
+
+          staging="$RUNNER_TEMP/notarize/kvad"
+          mkdir -p "$staging"
+          for bin in kvad kvad-serve kvad-tui kvad-gpu; do
+            f="target/${{ matrix.target }}/release/$bin"
+            [ -f "$f" ] && cp "$f" "$staging/"
+          done
+          ditto -c -k --keepParent "$staging" "$RUNNER_TEMP/notarize.zip"
+
+          # shellcheck disable=SC2086 # $auth is meant to split into flags
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" $auth \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary.json" || true
+          cat "$RUNNER_TEMP/notary.json"; echo
+          status=$(plutil -extract status raw -o - "$RUNNER_TEMP/notary.json" 2>/dev/null || true)
+          if [ "$status" != Accepted ]; then
+            id=$(plutil -extract id raw -o - "$RUNNER_TEMP/notary.json" 2>/dev/null || true)
+            # Apple's log says which file and which rule, which the status
+            # never does.
+            # shellcheck disable=SC2086
+            [ -n "$id" ] && xcrun notarytool log "$id" $auth || true
+            echo "::error::notarization ended '${status:-without an answer}'"
+            exit 1
+          fi
+
       - name: Package
         id: package
         run: |
@@ -223,6 +341,30 @@ jobs:
           [ "$got" = "$expected" ] || {
             echo "::error::built binary reports '$got', expected '$expected'"; exit 1; }
           ./dist/${{ steps.package.outputs.name }}/kvad-serve --version
+
+      # The case the signing is for: a binary downloaded with a browser,
+      # which marks it quarantined, so Gatekeeper checks it before it runs.
+      # The flag is set by hand here the way Safari would set it. Under a
+      # time limit, because a binary Gatekeeper dislikes may be held for a
+      # dialog nobody on a runner will ever see.
+      - name: Gatekeeper accepts a downloaded binary
+        if: runner.os == 'macOS'
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/downloaded"
+          mkdir -p "$dir"
+          cp "dist/${{ steps.package.outputs.name }}/kvad-serve" "$dir/"
+          xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");Safari;$(uuidgen)" "$dir/kvad-serve"
+          xattr -p com.apple.quarantine "$dir/kvad-serve"
+          perl -e 'alarm shift; exec @ARGV' 120 "$dir/kvad-serve" --version || {
+            echo "::error::Gatekeeper would not run a quarantined kvad-serve"; exit 1; }
+
+      - name: Remove the signing keychain and keys
+        if: always() && runner.os == 'macOS'
+        run: |
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          if [ -f "$kc" ]; then security delete-keychain "$kc"; fi
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"
 
       - uses: actions/upload-artifact@v7
         with:

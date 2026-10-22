@@ -52,7 +52,8 @@
 #
 #   The `release` environment holds five secrets: MACOS_CERT_P12, the
 #   Developer ID Application certificate and its key exported as a .p12
-#   and base64-encoded; MACOS_CERT_PASSWORD, that export's password; and
+#   and base64-encoded; MACOS_CERT_PASSWORD, that export's password, left
+#   unset if it has none; and
 #   NOTARY_KEY_P8 (base64 again), NOTARY_KEY_ID and NOTARY_ISSUER_ID, an
 #   App Store Connect API key with the Developer role.
 # * Nothing is stripped. The symbol names are what make a panic's backtrace
@@ -212,8 +213,11 @@ jobs:
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: |
           set -eu
-          [ -n "$MACOS_CERT_P12" ] && [ -n "$MACOS_CERT_PASSWORD" ] || {
-            echo "::error::MACOS_CERT_P12 and MACOS_CERT_PASSWORD are not set"; exit 1; }
+          # The password may be empty: Keychain Access exports without one
+          # if nothing is typed, and the secret store is what protects the
+          # file here anyway.
+          [ -n "$MACOS_CERT_P12" ] || {
+            echo "::error::MACOS_CERT_P12 is not set"; exit 1; }
 
           kc="$RUNNER_TEMP/signing.keychain-db"
           kc_pw=$(openssl rand -hex 24)

@@ -407,11 +407,12 @@ fn logs(args: &Args) -> Res<()> {
     Err(format!("could not read the log: {failure}").into())
 }
 
-/// The `kvad-serve` beside this binary, which is the one to install.
+/// The `kvad-serve` beside this binary, which is the one to install: the
+/// copy in Kvad.app where a release put one, so Login Items says Kvad.
 fn serve_beside_us() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-    let path = exe.parent()?.join("kvad-serve");
-    path.is_file().then_some(path)
+    let dir = exe.parent()?;
+    [dir.join(daemon::APP), dir.join("kvad-serve")].into_iter().find(|p| p.is_file())
 }
 
 fn install(args: &Args) -> Res<()> {

@@ -40,6 +40,14 @@ pub const LABEL: &str = "net.kvad.serve";
 /// systemd's.
 pub const UNIT: &str = "kvad-serve.service";
 
+/// The bundle the agent runs `kvad-serve` from on a Mac, beside the
+/// binaries (`scripts/kvad-app.sh`). Login Items lists an agent under the
+/// app it names, and one that names none under the developer on its
+/// signature: "Bogentech AS" rather than Kvad.
+pub const APP: &str = "Kvad.app/Contents/MacOS/kvad-serve";
+/// [`APP`]'s bundle identifier.
+const APP_ID: &str = "eu.kvad.app";
+
 /// The label every function here acts on: [`LABEL`], except in the test that
 /// drives a real launchd, which must never touch the service somebody is
 /// actually running.
@@ -446,9 +454,14 @@ pub fn manager_name() -> &'static str {
 /// `KeepAlive` on an unsuccessful exit only, so a server that crashes comes
 /// back and one that was asked to stop stays stopped. `Interactive` because
 /// it is somebody's model server rather than a background chore, and macOS
-/// throttles the other kind.
+/// throttles the other kind. A `program` inside [`APP`] names the bundle, so
+/// Login Items says Kvad.
 fn plist(program: &Path, bind: &str) -> String {
     let logs = log_paths();
+    let app = match program.ends_with(APP) {
+        true => format!("    <key>AssociatedBundleIdentifiers</key> <array><string>{APP_ID}</string></array>\n"),
+        false => String::new(),
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -468,7 +481,7 @@ fn plist(program: &Path, bind: &str) -> String {
     <key>StandardOutPath</key>    <string>{out}</string>
     <key>StandardErrorPath</key>  <string>{err}</string>
     <key>WorkingDirectory</key>   <string>{home}</string>
-</dict>
+{app}</dict>
 </plist>
 "#,
         label = xml(&label()),
@@ -692,6 +705,15 @@ mod tests {
         let (p, b) = read_unit(Manager::Systemd, &systemd_unit(program, "[::1]:9000"));
         assert_eq!(p.as_deref(), Some(program));
         assert_eq!(b.as_deref(), Some("[::1]:9000"));
+
+        // Run from the bundle, the agent names it, and still reads back.
+        assert!(!plist(program, "0.0.0.0:5823").contains("AssociatedBundleIdentifiers"));
+        let program = Path::new("/Users/ada/.local/bin").join(APP);
+        let text = plist(&program, "127.0.0.1:5823");
+        assert!(text.contains("<key>AssociatedBundleIdentifiers</key> <array><string>eu.kvad.app</string></array>\n</dict>"));
+        let (p, b) = read_unit(Manager::Launchd, &text);
+        assert_eq!(p.as_deref(), Some(program.as_path()));
+        assert_eq!(b.as_deref(), Some("127.0.0.1:5823"));
     }
 
     /// A plist reformatted onto one line is still the plist launchd runs.

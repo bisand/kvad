@@ -892,8 +892,13 @@ service_elsewhere() {
     running_program=$(installed_program 2>/dev/null || true)
     [ -n "$running_program" ] || return 0
     running_dir=$(dirname "$running_program")
+    running_dir=${running_dir%/Kvad.app/Contents/MacOS}
     [ "$(canonical_dir "$running_dir")" = "$(canonical_dir "$PREFIX")" ] || printf '%s\n' "$running_dir"
 }
+
+# Where macOS learns that Kvad.app exists, so Login Items can name the
+# service after it. Not in PATH, and the same path on every macOS since 10.5.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
 if [ "$UNINSTALL" -eq 1 ]; then
     elsewhere=$(service_elsewhere)
@@ -917,6 +922,12 @@ if [ "$UNINSTALL" -eq 1 ]; then
             removed=$((removed + 1))
         fi
     done
+    if [ -d "$PREFIX/Kvad.app" ]; then
+        [ -x "$LSREGISTER" ] && "$LSREGISTER" -u "$PREFIX/Kvad.app" 2>/dev/null || true
+        rm -rf "$PREFIX/Kvad.app"
+        say "  removed $PREFIX/Kvad.app"
+        removed=$((removed + 1))
+    fi
     [ "$removed" -gt 0 ] || say "  nothing to remove"
     say ""
     say "Models, conversations and configuration were left alone. They are in:"
@@ -1075,6 +1086,17 @@ for name in $BINARIES; do
     mv -f "$install_tmp" "$PREFIX/$name"
     say "  $PREFIX/$name"
 done
+# The bundle the service runs kvad-serve from on a Mac, so Login Items lists
+# it as Kvad rather than under the developer's name. The service is stopped
+# by now, so the old one can go before the new one is moved in.
+if [ -d "$SRC/Kvad.app" ]; then
+    rm -rf "$PREFIX/.Kvad.app.new.$$"
+    cp -R "$SRC/Kvad.app" "$PREFIX/.Kvad.app.new.$$"
+    rm -rf "$PREFIX/Kvad.app"
+    mv "$PREFIX/.Kvad.app.new.$$" "$PREFIX/Kvad.app"
+    [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$PREFIX/Kvad.app" 2>/dev/null || true
+    say "  $PREFIX/Kvad.app"
+fi
 
 # Before the service comes back, so that it starts on the directory it was
 # given. Nothing is moved: a database is not something to copy behind

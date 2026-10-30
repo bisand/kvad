@@ -37,6 +37,8 @@
 #   target needs those files present — but they are the same files, and
 #   building them once per target would be a chance to ship a different UI
 #   with each.
+# * macOS also gets Kvad.app (scripts/kvad-app.sh), a copy of kvad-serve in
+#   a bundle, which the service runs so Login Items lists it as Kvad.
 # * Linux gets `kvad` and `kvad-serve` only. `kvad-tui` and `kvad-gpu` both
 #   link candle with Metal, which does not exist off macOS, so `kvad-serve`
 #   there is built `--no-default-features`.
@@ -261,11 +263,20 @@ jobs:
               echo "::error::$bin was signed without the hardened runtime"; exit 1; }
           done
 
+          # The bundle the service runs kvad-serve from, so Login Items lists
+          # it as Kvad rather than under the developer's name. Signed as a
+          # bundle, which seals the Info.plist and the icon with the binary.
+          app=$(scripts/kvad-app.sh "target/${{ matrix.target }}/release/kvad-serve" \
+            "${{ needs.version.outputs.tag }}" "target/${{ matrix.target }}/release")
+          codesign --force --options runtime --timestamp \
+            --keychain "$kc" --sign "$identity" "$app"
+          codesign --verify --strict --verbose=2 "$app"
+
       # Apple's answer is waited for here rather than after the upload, so a
-      # rejected build never reaches the release. There is nothing to staple:
-      # a ticket can be attached to an app, a disk image or a package, not to
-      # a bare executable, so Gatekeeper fetches it from Apple the first time
-      # a downloaded binary runs.
+      # rejected build never reaches the release. Only Kvad.app gets its ticket
+      # stapled: a ticket can be attached to an app, a disk image or a
+      # package, not to a bare executable, so Gatekeeper fetches the binaries'
+      # from Apple the first time a downloaded one runs.
       - name: Notarize the Mac binaries
         if: runner.os == 'macOS'
         env:
@@ -287,6 +298,7 @@ jobs:
             f="target/${{ matrix.target }}/release/$bin"
             [ -f "$f" ] && cp "$f" "$staging/"
           done
+          ditto "target/${{ matrix.target }}/release/Kvad.app" "$staging/Kvad.app"
           ditto -c -k --keepParent "$staging" "$RUNNER_TEMP/notarize.zip"
 
           # shellcheck disable=SC2086 # $auth is meant to split into flags
@@ -303,6 +315,7 @@ jobs:
             echo "::error::notarization ended '${status:-without an answer}'"
             exit 1
           fi
+          xcrun stapler staple "target/${{ matrix.target }}/release/Kvad.app"
 
       - name: Package
         id: package
@@ -322,6 +335,8 @@ jobs:
             fi
           done
           test -f "$out/kvad" || { echo "::error::no kvad binary was built"; exit 1; }
+          app="target/${{ matrix.target }}/release/Kvad.app"
+          [ ! -d "$app" ] || ditto "$app" "$out/Kvad.app"
 
           cp LICENSE README.md "$out/"
           cp docs/kvad.example.toml "$out/"
@@ -441,8 +456,9 @@ jobs:
           like; \`--uninstall\` takes the binaries and the service and leaves your
           models and conversations alone. \`sh install.sh --help\` lists the rest.
 
-          macOS ships \`kvad\`, \`kvad-serve\`, \`kvad-tui\` and \`kvad-gpu\`. Linux ships
-          \`kvad\` and a CPU-only \`kvad-serve\`; the other two link Metal.
+          macOS ships \`kvad\`, \`kvad-serve\`, \`kvad-tui\` and \`kvad-gpu\`, and
+          \`Kvad.app\`, which the background service runs \`kvad-serve\` from. Linux
+          ships \`kvad\` and a CPU-only \`kvad-serve\`; the other two link Metal.
 
           Downloads can be checked against \`SHA256SUMS\` below."
 

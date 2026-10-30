@@ -830,6 +830,11 @@ measured.
    are in a table on AMI test, NB Samtale and NPSC (not VoxConverse,
    which it was trained on), beside pyannote 3.1 run in Python on the
    same audio, with the first Norwegian numbers recorded here.
+   **Built on the CPU** (`speech::nemotron`, `kvad diarize`): on a
+   70-second, three-voice Norwegian dialogue from `scripts/dialogue.py`,
+   3.8·10⁻⁶ from transformers in probability and the same 21 turns
+   (`scripts/nemotron-fixtures.py`), across two compressions of the
+   speaker cache; no speaker confused. The GPU and the table are next.
 4. **Speakers in the transcript**: the merge, `diarized_json`,
    `diarize=true` and the four formats, `num_speakers` (more than eight
    refused, saying so), the CLI. *Done* as in *In the API, the CLI and

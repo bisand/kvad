@@ -125,18 +125,18 @@ impl Config {
 }
 
 /// A LayerNorm's gain and bias.
-struct Norm {
+pub(super) struct Norm {
     g: Vec<f32>,
     b: Vec<f32>,
 }
 
 impl Norm {
-    fn load(src: &dyn Source, p: &str) -> Res<Norm> {
+    pub(super) fn load(src: &dyn Source, p: &str) -> Res<Norm> {
         Ok(Norm { g: src.vector(&format!("{p}.weight"))?, b: src.vector(&format!("{p}.bias"))? })
     }
 
     /// Every row of `x`, normalised by itself.
-    fn rows(&self, x: &[f32]) -> Vec<f32> {
+    pub(super) fn rows(&self, x: &[f32]) -> Vec<f32> {
         let d = self.g.len();
         let mut out = vec![0.0; x.len()];
         out.par_chunks_mut(d).zip(x.par_chunks(d)).for_each(|(o, r)| o.copy_from_slice(&layer_norm(r, &self.g, &self.b, EPS)));
@@ -174,7 +174,7 @@ impl Attn {
     }
 }
 
-struct Mlp {
+pub(super) struct Mlp {
     fc1: Weight,
     fc1_b: Vec<f32>,
     fc2: Weight,
@@ -182,7 +182,7 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn load(src: &dyn Source, p: &str) -> Res<Mlp> {
+    pub(super) fn load(src: &dyn Source, p: &str) -> Res<Mlp> {
         Ok(Mlp {
             fc1: src.matrix(&format!("{p}.fc1.weight"))?,
             fc1_b: src.vector(&format!("{p}.fc1.bias"))?,
@@ -191,7 +191,11 @@ impl Mlp {
         })
     }
 
-    fn forward(&self, x: &[f32], m: usize) -> Vec<f32> {
+    pub(super) fn params(&self) -> usize {
+        self.fc1.param_count() + self.fc2.param_count()
+    }
+
+    pub(super) fn forward(&self, x: &[f32], m: usize) -> Vec<f32> {
         let mut h = self.fc1.matmul_bt(x, m, Some(&self.fc1_b));
         gelu_erf_inplace(&mut h);
         self.fc2.matmul_bt(&h, m, Some(&self.fc2_b))
@@ -590,7 +594,7 @@ impl super::Model for Cpu {
     }
 }
 
-fn add(x: &mut [f32], y: &[f32]) {
+pub(super) fn add(x: &mut [f32], y: &[f32]) {
     x.iter_mut().zip(y).for_each(|(a, b)| *a += b);
 }
 
@@ -612,7 +616,7 @@ fn add(x: &mut [f32], y: &[f32]) {
 /// comes back `[query][key]` — rows of scores, as the softmax wants. The
 /// second has `Vᵀ` as `W` and `P` as `X`, and comes back `[dim][query]`,
 /// which is put back the right way round on the way out.
-fn attend_all(q: &[f32], k: &[f32], v: &[f32], n_q: usize, n_k: usize, heads: usize, hd: usize) -> Vec<f32> {
+pub(super) fn attend_all(q: &[f32], k: &[f32], v: &[f32], n_q: usize, n_k: usize, heads: usize, hd: usize) -> Vec<f32> {
     let d = heads * hd;
     let mut out = vec![0.0f32; n_q * d];
     let head_of = |x: &[f32], n: usize, h: usize| -> Vec<f32> { (0..n).flat_map(|r| x[r * d + h * hd..r * d + (h + 1) * hd].iter().copied()).collect() };

@@ -301,7 +301,7 @@ impl Default for Args {
 
 /// Commands that take words after them, rather than only flags.
 const POSITIONAL: &[&str] = &[
-    "search", "pull", "use", "rm", "cache", "crawl", "info", "train", "load", "unload", "cancel",
+    "search", "pull", "use", "rm", "cache", "crawl", "diarize", "info", "train", "load", "unload", "cancel",
     "tokenize", "service", "conversations", "jobs", "datasets", "tune", "evals", "bench", "metrics",
     "auth", "users", "sessions", "keys", "api", "images", "videos", "cluster", "transcribe", "remote", "devices",
 ];
@@ -704,6 +704,7 @@ fn real_main() -> Res<()> {
     match args.command.as_str() {
         "arch" => return arch(),
         "crawl" => return crawl_site(args),
+        "diarize" => return diarize(args),
         "service" => return cli::service::run(&args),
         "remote" => return cli::remote::run(&args),
         "tunnel" => return cli::tunnel::run(&args),
@@ -895,6 +896,43 @@ fn transcribe(args: Args) -> Res<()> {
             }
             None => print!("{text}"),
         }
+    }
+    Ok(())
+}
+
+/// `kvad diarize FILE`: who spoke when, as RTTM, by Nemotron-3-Diarization
+/// in this process.
+fn diarize(args: Args) -> Res<()> {
+    use kvad::speech::{self, nemotron};
+    let Some(file) = args.target.clone() else {
+        eprintln!("usage: kvad diarize FILE [--model MODEL] [--out FILE.rttm]");
+        std::process::exit(2);
+    };
+    let path: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let audio = speech::audio::load(std::path::Path::new(&file), kvad::video::ffmpeg_on(&path).as_deref())?;
+    let seconds = audio.len() as f32 / speech::mel::SAMPLE_RATE as f32;
+    eprintln!("{file}: {seconds:.1} s");
+
+    let repo = args.model.as_deref().unwrap_or(nemotron::REPO);
+    let started = std::time::Instant::now();
+    let model = nemotron::Nemotron::fetch(repo, args.quant, &weights::Watcher::none())?;
+    eprintln!("{} (loaded in {:.1} s)", model.summary(), started.elapsed().as_secs_f32());
+
+    let started = std::time::Instant::now();
+    let probs = model.diarize(&audio, &mut |done, total| eprint!("\r{done:.0} of {total:.0} s"));
+    let took = started.elapsed().as_secs_f32();
+    let turns = nemotron::turns(&probs, model.config.speakers, 0.5);
+    let speakers = turns.iter().map(|t| &t.speaker).collect::<std::collections::BTreeSet<_>>().len();
+    eprintln!("\r{file} in {took:.1} s: {:.1}× real time, {speakers} speakers, {} turns", seconds / took.max(1e-3), turns.len());
+
+    let name = std::path::Path::new(&file).file_stem().and_then(|s| s.to_str()).unwrap_or("audio").replace(' ', "_");
+    let rttm = speech::score::to_rttm(&name, &turns);
+    match &args.out {
+        Some(out) => {
+            std::fs::write(out, &rttm)?;
+            eprintln!("wrote {out}");
+        }
+        None => print!("{rttm}"),
     }
     Ok(())
 }

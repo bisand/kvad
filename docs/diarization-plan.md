@@ -803,6 +803,54 @@ transcript written beside it. It is not a benchmark. It is a fixture
 whose right answer is known to the sample, for tests that must not depend
 on a dataset being present.
 
+### First numbers
+
+Nemotron-3-Diarization in kvad (f32, the CPU, all cores of an M5) beside
+pyannote's 3.1 and community-1 (pyannote.audio 4.0.7 in Python, on the
+GPU through MPS), on the three sets as `scripts/diar-sets.py` lays them
+out, scored by `score::tests::diarization_sets` (2026-10-30). Pooled over
+each set's recordings, in points of reference speech; *s / h* is seconds
+of wall time an hour of audio, one run each, on a machine not otherwise
+idle (community-1's NB Samtale run spanned the machine being moved, and
+its 239 is not its speed).
+
+| set | system | hours | DER full | missed | false alarm | confusion | DER fair | DER forgiving | JER | s / h |
+|---|---|---|---|---|---|---|---|---|---|---|
+| AMI test | Nemotron, kvad | 9.1 | 26.0 | 24.0 | 1.2 | 0.7 | 24.1 | 20.6 | 28.2 | 176 |
+| | pyannote 3.1 | | 17.7 | 9.5 | 3.6 | 4.6 | 11.4 | 6.6 | 23.8 | 124 |
+| | community-1 | | 17.1 | 9.5 | 3.6 | 4.0 | 10.8 | 6.5 | 22.2 | 120 |
+| NB Samtale | Nemotron, kvad | 24.5 | **9.3** | 8.6 | 0.4 | 0.3 | 7.2 | 6.5 | 12.2 | 176 |
+| | pyannote 3.1 | | 12.1 | 8.8 | 1.1 | 2.3 | 9.7 | 8.9 | 16.5 | 118 |
+| | community-1 | | 11.5 | 8.8 | 1.1 | 1.6 | 9.0 | 8.3 | 16.0 | — |
+| NPSC test | Nemotron, kvad | 13.1 | 61.7 | 11.1 | 0.1 | 50.4 | 60.9 | 60.9 | 78.3 | 159 |
+| | pyannote 3.1 | | 10.0 | 6.5 | 0.0 | 3.4 | 7.1 | 7.1 | 13.8 | 126 |
+| | community-1 | | 8.5 | 6.5 | 0.0 | 1.9 | 5.5 | 5.5 | 11.0 | 127 |
+
+- **The harness agrees with pyannote's cards.** On AMI, 17.7 for 3.1 and
+  17.1 for community-1 against their cards' 18.8 and 17.0 (Full, the same
+  `only_words` references, scored here without their UEM files).
+- **On Norwegian meetings, Nemotron is the best of the three.** NB
+  Samtale, 2 to 8 people in podcasts and live events, the meetings Kvad is
+  for: 9.3 against 12.1 and 11.5, and a fifth of their confusion (0.3
+  against 2.3 and 1.6). Its card does not list Norwegian; it does not
+  need to. All three miss the same 8.6–8.8 points, much of it the
+  reference's: its turns are sentences, pauses included.
+- **On AMI, Nemotron misses speech.** 24 points missed against pyannote's
+  9.5, with less confusion than either (0.7). On IS1009a transformers'
+  own run gives the same 379 turns and the same 26.7% to the tenth
+  (`scripts/nemotron-fixtures.py`, the agreement test passing), so it is
+  the model, not the port: the far-field headset mix with references that
+  count every short word. Where it hears speech, it knows whose.
+- **NPSC is the eight-speaker limit.** By sitting, Nemotron: 21.9% with
+  9 speakers, 51.9% with 41, 71.0% with 50, 67.9% with 30, nearly all
+  confusion. pyannote, which clusters, finds 11–50 speakers and stays at
+  6.5–11.1% in every sitting. A sitting of Stortinget is what steps 8–11
+  are for.
+- **The cost**: Nemotron 159–176 s an hour on the CPU, about 21 times
+  real time; pyannote 118–127 on the GPU. Nemotron on the GPU is next.
+- **WDER** waits for step 4: it needs the words given to speakers, which
+  is that step's merge.
+
 ## The order it is built in
 
 Each step is a PR of its own, and none begins before the one it needs is
@@ -834,7 +882,11 @@ measured.
    70-second, three-voice Norwegian dialogue from `scripts/dialogue.py`,
    3.8·10⁻⁶ from transformers in probability and the same 21 turns
    (`scripts/nemotron-fixtures.py`), across two compressions of the
-   speaker cache; no speaker confused. The GPU and the table are next.
+   speaker cache; no speaker confused. On the three sets (*First numbers*,
+   above): 9.3% DER on NB Samtale, better than pyannote 3.1 (12.1) and
+   community-1 (11.5); 26.0% on AMI (17.7, 17.1), all of it missed speech;
+   61.7% on NPSC (10.0, 8.5), the eight-speaker limit; about 21 times real
+   time. The GPU is next.
 4. **Speakers in the transcript**: the merge, `diarized_json`,
    `diarize=true` and the four formats, `num_speakers` (more than eight
    refused, saying so), the CLI. *Done* as in *In the API, the CLI and

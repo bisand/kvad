@@ -25,9 +25,9 @@
   const kvShare = $derived(m?.kv ? (m.kv.cached_bytes / m.kv.max_bytes) * 100 : 0);
 </script>
 
-{#if error}
+{#if error ?? monitoring.error}
   <div role="alert" class="alert alert-error">
-    <span>{error}</span>
+    <span>{error ?? monitoring.error}</span>
   </div>
 {:else if !m}
   <div class="stats stats-vertical sm:stats-horizontal w-full shadow-sm">

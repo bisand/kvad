@@ -397,6 +397,30 @@ pub const COMMANDS: &[Command] = &[
             "ffmpeg -i talk.mp3 -f f32le -ac 1 -ar 16000 - | kvad transcribe --live - --model NbAiLab/nb-whisper-tiny --quant q8",
         ],
     },
+    Command {
+        name: "diarize",
+        group: Group::Make,
+        args: "FILE",
+        about: "say who spoke when in a recording, as RTTM",
+        server: false,
+        routed: false,
+        words: &[Kind::File],
+        subs: &[],
+        flags: &[&[
+            f("--model", "MODEL", Kind::Model(Want::Any), "the diarization model (default nvidia/Nemotron-3-Diarization)"),
+            f("--out", "FILE", Kind::File, "where to write the RTTM (default: the terminal)"),
+            QUANT,
+        ]],
+        usage: None,
+        notes: "Nemotron-3-Diarization numbers up to eight speakers by when they first speak:\n\
+                speaker_0 is the first voice heard. A meeting of more than eight people needs\n\
+                another diarization, which kvad does not have yet. Each line is one turn, as\n\
+                SPEAKER file 1 start duration <NA> <NA> speaker_N <NA> <NA>, and turns of\n\
+                different speakers may overlap.\n\n\
+                It runs in this process, on the CPU, at f32 unless --quant says otherwise. A\n\
+                WAV file is read here; anything else takes ffmpeg.",
+        examples: &["kvad diarize meeting.wav", "kvad diarize intervju.mp3 --out intervju.rttm"],
+    },
     // -- train your own ----------------------------------------------------
     Command {
         name: "crawl",
@@ -1298,7 +1322,7 @@ mod tests {
     #[test]
     fn the_table_holds_every_command_and_only_those() {
         for command in COMMANDS {
-            let handled = matches!(command.name, "arch" | "crawl" | "transcribe" | "service" | "cluster" | "worker" | "remote" | "tunnel" | "serve" | "help" | "completions");
+            let handled = matches!(command.name, "arch" | "crawl" | "diarize" | "transcribe" | "service" | "cluster" | "worker" | "remote" | "tunnel" | "serve" | "help" | "completions");
             assert!(handled || crate::cli::known(command.name), "`{}` is in the table and nothing runs it", command.name);
             assert_eq!(command.server, crate::cli::remote_only(command.name), "`{}`: does it need a server?", command.name);
             // The parser gathers words only for the commands it knows take

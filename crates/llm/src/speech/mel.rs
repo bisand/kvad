@@ -178,7 +178,13 @@ pub fn mel_to_hz(m: f64) -> f64 {
 /// openai-whisper ships these as a file of numbers; transformers computes
 /// them as here, and the two agree.
 pub fn filterbank(n_mels: usize) -> Vec<Vec<f32>> {
-    let n_freqs = N_FFT / 2 + 1;
+    filterbank_for(n_mels, N_FFT)
+}
+
+/// [`filterbank`] over the spectrum of an `n_fft`-sample frame: Nemotron's
+/// are 512 samples, Whisper's 400.
+pub fn filterbank_for(n_mels: usize, n_fft: usize) -> Vec<Vec<f32>> {
+    let n_freqs = n_fft / 2 + 1;
     let top = SAMPLE_RATE as f64 / 2.0;
     let (lo, hi) = (hz_to_mel(0.0), hz_to_mel(top));
     // n_mels + 2 edges: every band's left edge, centre and right edge.

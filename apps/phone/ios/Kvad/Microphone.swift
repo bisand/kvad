@@ -10,9 +10,12 @@
 // The audio session is active only while a take is being recorded, so iOS's
 // microphone dot goes out when it ends. A call or Siri pauses the take, and
 // it carries on after; AirPods put in or taken out change the input, and
-// the converter is made again for it.
+// the converter is made again for it. A call that ends with Kvad in the
+// background cannot record again until Kvad is in front (the app has no
+// background audio), so the take stays paused until then.
 
 import AVFoundation
+import UIKit
 
 /// How a take hears the room.
 struct Hearing: Equatable, Sendable {
@@ -35,6 +38,8 @@ final class Microphone: @unchecked Sendable {
     private var hearing = Hearing()
     private let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
     private var observers: [NSObjectProtocol] = []
+    /// Interrupted, and not recording again yet.
+    private var paused = false
     /// Told on the main queue when a take is paused (`true`) or goes on.
     var onPause: (@MainActor (Bool) -> Void)?
     /// Told on the main queue when the input cannot go on.
@@ -69,10 +74,15 @@ final class Microphone: @unchecked Sendable {
             center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
                 self?.again()
             },
+            // Back in front after a call that ended with Kvad behind it.
+            center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                if self?.paused == true { self?.again() }
+            },
         ]
     }
 
     func stop() {
+        paused = false
         observers.forEach(NotificationCenter.default.removeObserver)
         observers = []
         engine.inputNode.removeTap(onBus: 0)
@@ -130,6 +140,7 @@ final class Microphone: @unchecked Sendable {
 
     private func interrupted(began: Bool) {
         if began {
+            paused = true
             MainActor.assumeIsolated { onPause?(true) }
         } else {
             again()
@@ -141,7 +152,13 @@ final class Microphone: @unchecked Sendable {
         do {
             try AVAudioSession.sharedInstance().setActive(true)
             try listen()
+            paused = false
             MainActor.assumeIsolated { onPause?(false) }
+        } catch where MainActor.assumeIsolated({ UIApplication.shared.applicationState != .active }) {
+            // iOS refuses the microphone to an app behind another: wait to
+            // be in front again.
+            paused = true
+            MainActor.assumeIsolated { onPause?(true) }
         } catch {
             let why = (error as? Failure)?.why ?? "The microphone could not start again: \(error.localizedDescription)"
             MainActor.assumeIsolated { onFailure?(why) }

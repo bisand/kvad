@@ -875,18 +875,19 @@ measured.
 
 ## Open questions
 
-- **The VoxCeleb question.** Every embedding model's training data was
-  offered for research. Is the CC-BY-4.0 on the weights enough for the
-  owner's commercial use? If not, Nemotron (whose card lists no
-  VoxCeleb) becomes the diarization, and named speakers wait for an embedding model whose data
-  allows it.
+- **The VoxCeleb question.** *Answered 2026-10-30:* the owner uses kvad
+  as an open-source, non-commercial project, so VoxCeleb's research terms
+  do not stand in the way of the embedding model. Kvad itself is MIT, so
+  the documentation still says plainly that the speaker models carry
+  their own terms, for anyone who uses kvad commercially.
 - **A mirror.** Should the project publish segmentation-3.0, converted
   to safetensors, under its own name on the Hub, as MIT allows? It would
   remove the contact form and the pickle reader. It is outward-facing, so
-  it is the owner's decision.
-- **How many speakers is a meeting?** If the owner's meetings stay under
-  eight voices, Nemotron alone may be the whole pipeline, and steps 4 to
-  7 only feed tracks and names. Step 10's numbers answer it.
+  it is the owner's decision. *Undecided as of 2026-10-30.*
+- **How many speakers is a meeting?** *Answered 2026-10-30:* the owner's
+  meetings normally stay under eight people. Nemotron's limit of eight
+  is acceptable, and documented where diarization is. Step 10's numbers
+  still decide the default for files.
 - **Norwegian dialects.** Neither model was trained on Norwegian. NB
   Samtale's speakers come from across the country; if the numbers there
   lag the English ones badly, fine-tuning the segmentation model (1.5 M

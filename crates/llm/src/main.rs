@@ -198,6 +198,8 @@ struct Args {
     /// `transcribe --live -`: raw audio from stdin, written down as it comes.
     live: bool,
     word_times: bool,
+    /// `transcribe --speakers`: who says what.
+    speakers: bool,
 }
 
 impl Default for Args {
@@ -295,6 +297,7 @@ impl Default for Args {
             timestamps: false,
             live: false,
             word_times: false,
+            speakers: false,
         }
     }
 }
@@ -331,6 +334,7 @@ fn switch(a: &mut Args, flag: &str) -> bool {
         "--timestamps" => a.timestamps = true,
         "--live" => a.live = true,
         "--words" => a.word_times = true,
+        "--speakers" => a.speakers = true,
         _ => return false,
     }
     true
@@ -814,7 +818,8 @@ fn transcribe(args: Args) -> Res<()> {
         return Err("which Whisper? --model NbAiLab/nb-whisper-small, say, or openai/whisper-small".into());
     };
     let format = speech_format(&args, Format::Text)?;
-    let timestamps = args.timestamps || matches!(format, Format::Srt | Format::Vtt | Format::VerboseJson);
+    let speakers = args.speakers || format == Format::DiarizedJson;
+    let timestamps = args.timestamps || speakers || matches!(format, Format::Srt | Format::Vtt | Format::VerboseJson);
     let task = if args.translate { Task::Translate } else { Task::Transcribe };
     let req = Request {
         language: args.language.clone(),
@@ -826,10 +831,17 @@ fn transcribe(args: Args) -> Res<()> {
         // same transcript whichever process answers it.
         temperature: args.temperature_given.then_some(args.temperature).filter(|&t| t > 0.0),
         seed: args.seed_given.then_some(args.seed),
-        words: args.word_times,
+        // Speakers are given a word at a time.
+        words: args.word_times || speakers,
         ..Request::default()
     };
 
+    if format == Format::DiarizedJson && task == Task::Translate {
+        return Err("diarized_json is a transcription's: --translate with --speakers writes any other format".into());
+    }
+    if args.live && speakers {
+        return Err("--speakers needs the whole recording, and --live has not heard it yet".into());
+    }
     if args.live && file != "-" {
         return Err("--live reads raw 16 kHz mono f32 from stdin: `kvad transcribe --live - --model …`".into());
     }
@@ -864,9 +876,10 @@ fn transcribe(args: Args) -> Res<()> {
         return transcribe_live(&t, &req);
     }
 
-    let streaming = format == Format::Text && args.out.is_none();
+    // Speakers are found once the whole recording has been heard.
+    let streaming = format == Format::Text && args.out.is_none() && !speakers;
     let started = std::time::Instant::now();
-    let done = t.transcribe(&audio, &req, &mut |p| {
+    let mut done = t.transcribe(&audio, &req, &mut |p| {
         if streaming {
             let mut out = std::io::stdout().lock();
             for s in &p.segments {
@@ -886,6 +899,13 @@ fn transcribe(args: Args) -> Res<()> {
     }
     let took = started.elapsed().as_secs_f32();
     eprintln!("{} in {took:.1} s: {:.1}× real time, language {}", file, seconds / took.max(1e-3), done.language);
+    if speakers {
+        let model = speech::nemotron::Nemotron::fetch(speech::nemotron::REPO, kvad::quant::Precision::F32, &weights::Watcher::none())?;
+        let started = std::time::Instant::now();
+        done = speech::speakers::diarize(&done, &audio, &model, args.word_times, &mut |d, t| eprint!("\rspeakers: {d:.0} of {t:.0} s"));
+        let named = done.segments.iter().filter_map(|s| s.speaker.as_deref()).collect::<std::collections::BTreeSet<_>>().len();
+        eprintln!("\rspeakers: {named} in {:.1} s", started.elapsed().as_secs_f32());
+    }
 
     if !streaming {
         let text = done.render(format, task);
@@ -1015,7 +1035,7 @@ pub(crate) fn speech_format(args: &Args, plain: kvad::speech::Format) -> Res<kva
         None if args.word_times => Ok(Format::VerboseJson),
         None => Ok(plain),
         Some(f) => {
-            let format = Format::parse(f).ok_or_else(|| format!("--format expects text, json, verbose_json, srt or vtt, got `{f}`"))?;
+            let format = Format::parse(f).ok_or_else(|| format!("--format expects text, json, verbose_json, srt, vtt or diarized_json, got `{f}`"))?;
             if args.word_times && format != Format::VerboseJson {
                 return Err(format!("--words are written in verbose_json, not {f}: leave out --format, or name that one").into());
             }

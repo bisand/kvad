@@ -103,6 +103,7 @@ const TRANSCRIBE: &[Flag] = &[
     sw("--translate", "write it down in English, whatever is spoken"),
     sw("--timestamps", "time each stretch of text (on for srt, vtt and verbose_json)"),
     sw("--words", "time every word as well, in verbose_json (its default with this)"),
+    sw("--speakers", "say who says what, by Nemotron-3-Diarization (up to eight people)"),
     f(
         "--format",
         "F",
@@ -112,6 +113,7 @@ const TRANSCRIBE: &[Flag] = &[
             ("verbose_json", "the words, the language, and every segment with its times"),
             ("srt", "subtitles"),
             ("vtt", "subtitles for the web"),
+            ("diarized_json", "OpenAI's segments with speakers (--speakers is implied)"),
         ]),
         "what to write",
     ),
@@ -389,11 +391,16 @@ pub const COMMANDS: &[Command] = &[
                 --live - reads raw audio from stdin, 16 kHz mono f32 little-endian, and writes\n\
                 the words down while it comes: settled text to stdout, the guess at the rest\n\
                 dimmed after it on a terminal. It runs in this process; on the CPU only tiny\n\
-                keeps up with speech.",
+                keeps up with speech.\n\n\
+                --speakers says who says what: each turn a line after its speaker, A: …, as\n\
+                text, in WebVTT's <v A> as vtt, and a speaker on every segment and word in\n\
+                verbose_json. The speakers are found by Nemotron-3-Diarization, on the CPU,\n\
+                which tells up to eight people apart; with more, some are heard as others.",
         examples: &[
             "kvad transcribe intervju.mp3 --model NbAiLab/nb-whisper-small",
             "kvad transcribe talk.wav --model openai/whisper-small --format srt --out talk.srt",
             "kvad transcribe nyheter.m4a --model NbAiLab/nb-whisper-large --backend gpu-q8 --language en",
+            "kvad transcribe møte.m4a --model NbAiLab/nb-whisper-small --speakers --out referat.txt",
             "ffmpeg -i talk.mp3 -f f32le -ac 1 -ar 16000 - | kvad transcribe --live - --model NbAiLab/nb-whisper-tiny --quant q8",
         ],
     },

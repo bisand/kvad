@@ -44,6 +44,7 @@ pub mod mel;
 pub mod nemotron;
 pub mod reference;
 pub mod score;
+pub mod speakers;
 pub mod transcribe;
 pub mod whisper;
 

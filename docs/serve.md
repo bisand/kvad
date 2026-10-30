@@ -37,6 +37,11 @@ by its diffusion decoder or, when asked, its convolutional one
 the GPU or the CPU; a form with the recording in, the transcript out in any
 of OpenAI's five formats, at a CPU backend the same bytes
 `kvad transcribe --local` writes, and nothing kept (`docs/speech-plan.md`).
+With `response_format=diarized_json`, or `diarize=true` for the other
+formats, it says who says what, `A`, `B`, … by Nemotron-3-Diarization on the
+CPU, which tells up to eight people apart: a meeting of more has some of them
+heard as others, and `num_speakers` over eight is refused
+(`docs/diarization-plan.md`).
 `/v1/realtime?intent=transcription` is OpenAI's Realtime WebSocket for a
 transcription session: audio up while somebody speaks, settled words and a
 replaceable partial down, about half a second behind the voice on a small

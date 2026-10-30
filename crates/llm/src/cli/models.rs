@@ -1065,9 +1065,13 @@ pub fn transcribe(remote: &Remote, args: &Args) -> Res<()> {
     if args.word_times {
         parts.push(Part::text("timestamp_granularities[]", "word"));
     }
+    if args.speakers {
+        parts.push(Part::text("diarize", true));
+    }
 
     let started = std::time::Instant::now();
-    let streaming = format == Format::Text && args.out.is_none() && !args.json;
+    // Speakers come once the whole recording has been heard.
+    let streaming = format == Format::Text && args.out.is_none() && !args.json && !args.speakers;
     if !streaming {
         let body = Some(Body::Form(parts));
         let text = match args.translate {
@@ -1134,5 +1138,6 @@ fn format_name(f: kvad::speech::Format) -> &'static str {
         Format::VerboseJson => "verbose_json",
         Format::Srt => "srt",
         Format::Vtt => "vtt",
+        Format::DiarizedJson => "diarized_json",
     }
 }

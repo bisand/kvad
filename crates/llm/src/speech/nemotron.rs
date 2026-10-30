@@ -219,6 +219,16 @@ impl Nemotron {
         Nemotron::load(config, &[weights], precision)
     }
 
+    /// From the cache only, as a server loads: `None` when it is not there.
+    pub fn cached(repo: &str, precision: Precision) -> Option<Res<Nemotron>> {
+        let config = crate::weights::local_file(repo, "config.json")?;
+        let weights = crate::weights::local_file(repo, "model.safetensors")?;
+        Some((|| {
+            let config = Config::from_json(&crate::weights::read_json(&config)?).map_err(|e| format!("{repo}: {e}"))?;
+            Nemotron::load(config, &[weights], precision)
+        })())
+    }
+
     pub fn load(config: Config, files: &[PathBuf], precision: Precision) -> Res<Nemotron> {
         let ckpt = crate::weights::Checkpoint::open(files)?;
         let src = crate::qcache::Live::new(&ckpt, precision);

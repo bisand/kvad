@@ -12,6 +12,15 @@
 //! as well ([`kvad::speech::align`]): a `words` array beside `segments`, as
 //! OpenAI's. It costs one more pass of the decoder over each window's text.
 //!
+//! `response_format=diarized_json`, OpenAI's, or `diarize=true`, Kvad's own
+//! for every other format, says who says what
+//! ([`kvad::speech::speakers`]): Nemotron-3-Diarization over the same audio,
+//! on the CPU, from the cache only, loaded at the first such request and
+//! kept. It tells up to eight people apart, so `num_speakers` or
+//! `max_speakers` above eight is refused, saying so; at eight or under they
+//! are read and need nothing more, as Nemotron counts its speakers itself.
+//! Speakers come once the whole recording is heard, so not with `stream`.
+//!
 //! What OpenAI has no field for: `seed`, and `timestamps`, which asks for
 //! timestamp tokens whatever the format. They change what is written, not
 //! only how it is laid out — a Whisper decodes a window differently when it
@@ -78,6 +87,10 @@ struct Asked {
     format: Format,
     request: Request,
     stream: bool,
+    /// Whether to say who says what; words are timed for it, and dropped
+    /// again unless `words` asked for them.
+    diarize: bool,
+    words: bool,
     /// The recording, and the name it was sent under.
     file: (String, Vec<u8>),
 }
@@ -97,7 +110,7 @@ impl Asked {
         let format = match f.text(&["response_format"]) {
             None => Format::Json,
             Some(name) => Format::parse(name.trim())
-                .ok_or_else(|| Fail::bad(format!("response_format is json, text, srt, verbose_json or vtt, not {name}")))?,
+                .ok_or_else(|| Fail::bad(format!("response_format is json, text, srt, verbose_json, vtt or diarized_json, not {name}")))?,
         };
         let temperature: Option<f32> = f.number(&["temperature"])?;
         if let Some(t) = temperature {
@@ -105,7 +118,26 @@ impl Asked {
                 return Err(Fail::bad(format!("temperature is between 0 and 1, not {t}")));
             }
         }
-        let timed = matches!(format, Format::Srt | Format::Vtt | Format::VerboseJson);
+        // OpenAI's diarized_json only ever transcribes; `diarize` speaks for
+        // a translation in the other formats.
+        if format == Format::DiarizedJson && task == Task::Translate {
+            return Err(Fail::bad("diarized_json is a transcription's: ask a translation for verbose_json with diarize"));
+        }
+        let diarize = format == Format::DiarizedJson || f.flag("diarize")?.unwrap_or(false);
+        for name in ["num_speakers", "max_speakers", "min_speakers"] {
+            if let Some(n) = f.number::<usize>(&[name])? {
+                if n > 8 {
+                    return Err(Fail::bad(format!(
+                        "{name} is {n}, and this server's diarization tells up to eight people apart"
+                    )));
+                }
+            }
+        }
+        let stream = f.flag("stream")?.unwrap_or(false);
+        if diarize && stream {
+            return Err(Fail::bad("speakers are found once the whole recording is heard: leave out stream, or diarize"));
+        }
+        let timed = diarize || matches!(format, Format::Srt | Format::Vtt | Format::VerboseJson);
         let mut words = false;
         for g in f.texts(&["timestamp_granularities[]", "timestamp_granularities"]) {
             match g.as_str() {
@@ -125,14 +157,16 @@ impl Asked {
             // 0 is where OpenAI's fallback starts; see the module docs.
             temperature: temperature.filter(|&t| t > 0.0),
             seed: f.number(&["seed"])?,
-            words,
+            words: words || diarize,
             ..Request::default()
         };
         Ok(Asked {
             model: f.text(&["model"]),
             format,
             request,
-            stream: f.flag("stream")?.unwrap_or(false),
+            stream,
+            diarize,
+            words,
             file: (filename, bytes.clone()),
         })
     }
@@ -164,6 +198,12 @@ async fn listen(who: Identity, headers: &HeaderMap, state: State, body: &[u8], t
         return Err(Fail::bad("file has no sound in it"));
     }
     let resident = crate::openai::resident_for(&state, asked.model.as_deref(), Kind::Speech).await?;
+    let diarizer = match asked.diarize {
+        true => Some(blocking_or(diarizer).await?),
+        false => None,
+    };
+    // Nemotron hears the same samples Whisper does.
+    let kept = diarizer.as_ref().map(|_| audio.clone());
 
     let (_, mut heard) = state.engine.transcribe(who.id, Entry::Request, &resident.key, audio, asked.request)?;
     if asked.stream {
@@ -178,7 +218,35 @@ async fn listen(who: Identity, headers: &HeaderMap, state: State, body: &[u8], t
             None => return Err(Fail::internal("the engine stopped before it answered")),
         }
     };
+    let transcript = match (diarizer, kept) {
+        (Some(model), Some(audio)) => {
+            let words = asked.words;
+            blocking_or(move || Ok(kvad::speech::speakers::diarize(&transcript, &audio, &model, words, &mut |_, _| {}))).await?
+        }
+        _ => transcript,
+    };
     Ok(([(header::CONTENT_TYPE, asked.format.content_type())], transcript.render(asked.format, task)).into_response())
+}
+
+/// Nemotron-3-Diarization, loaded from the cache at the first request that
+/// asks for speakers, and kept for every one after.
+///
+/// shortcut: held outside the resident models' memory accounting (about
+/// 400 MB at f32); account for it when the diarizer is a model to choose.
+fn diarizer() -> Result<std::sync::Arc<kvad::speech::nemotron::Nemotron>, Fail> {
+    use kvad::speech::nemotron::{Nemotron, REPO};
+    static LOADED: std::sync::Mutex<Option<std::sync::Arc<Nemotron>>> = std::sync::Mutex::new(None);
+    let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = &*loaded {
+        return Ok(m.clone());
+    }
+    let model = match Nemotron::cached(REPO, kvad::quant::Precision::F32) {
+        None => return Err(Fail::bad(format!("speakers need {REPO}, which this server does not have: `kvad pull {REPO}`"))),
+        Some(Err(e)) => return Err(Fail::internal(format!("{REPO}: {e}"))),
+        Some(Ok(m)) => std::sync::Arc::new(m),
+    };
+    *loaded = Some(model.clone());
+    Ok(model)
 }
 
 /// OpenAI's streamed transcription: a delta a window, then the whole text.
@@ -272,6 +340,25 @@ mod tests {
         let a = Asked::read(&form(&[("file", Some("a.wav"), b"x"), ("timestamps", None, b"true")]), Task::Translate).unwrap();
         assert!(a.request.timestamps);
         assert_eq!(a.request.task, Task::Translate);
+    }
+
+    /// Speakers time every word, and say they were not asked for when only
+    /// speakers were; more than eight, or with a stream, is refused.
+    #[test]
+    fn speakers_are_asked_for_with_diarize_or_diarized_json() {
+        let file = ("file", Some("a.wav"), &b"x"[..]);
+        for parts in [vec![file, ("response_format", None, &b"diarized_json"[..])], vec![file, ("diarize", None, &b"true"[..])]] {
+            let a = Asked::read(&form(&parts), Task::Transcribe).unwrap();
+            assert!(a.diarize && a.request.words && a.request.timestamps && !a.words, "{parts:?}");
+        }
+        let a = Asked::read(&form(&[file, ("response_format", None, b"verbose_json"), ("diarize", None, b"true"), ("timestamp_granularities[]", None, b"word")]), Task::Transcribe).unwrap();
+        assert!(a.diarize && a.words);
+        assert!(!Asked::read(&form(&[file]), Task::Transcribe).unwrap().diarize);
+        assert!(Asked::read(&form(&[file, ("diarize", None, b"true"), ("num_speakers", None, b"8")]), Task::Transcribe).is_ok());
+        let nine = Asked::read(&form(&[file, ("diarize", None, b"true"), ("max_speakers", None, b"9")]), Task::Transcribe).unwrap_err();
+        assert!(nine.1.contains("eight"), "{}", nine.1);
+        let streamed = Asked::read(&form(&[file, ("diarize", None, b"true"), ("stream", None, b"true")]), Task::Transcribe).unwrap_err();
+        assert!(streamed.1.contains("stream"), "{}", streamed.1);
     }
 
     #[test]

@@ -848,8 +848,48 @@ its 239 is not its speed).
   are for.
 - **The cost**: Nemotron 159–176 s an hour on the CPU, about 21 times
   real time; pyannote 118–127 on the GPU. Nemotron on the GPU is next.
-- **WDER** waits for step 4: it needs the words given to speakers, which
-  is that step's merge.
+- **WDER** is in step 4's table, below.
+
+### Words to speakers, measured
+
+Whisper's words (NbAiLab/nb-whisper-large on NB Samtale,
+openai/whisper-large-v3-turbo on AMI, both gpu-q8 through the service, with
+`--words`) given to each system's speakers by `speech::speakers`, scored by
+`speakers::tests::word_sets` against each set's reference words: AMI's
+manual word annotations, NB Samtale's transcriptions in their standard
+forms. WER ignores speakers; WDER is the share of reference words matched
+to a hypothesis word whose speaker maps to the wrong person; cpWER is WER
+with each speaker's words scored against the best-matched reference
+speaker's (2026-10-30).
+
+| set | words | WER | diarization | WDER | cpWER |
+|---|---|---|---|---|---|
+| AMI test | 88 828 | 31.0 | Nemotron, kvad | **8.2** | **34.3** |
+| | | | pyannote 3.1 | 11.3 | 38.7 |
+| | | | community-1 | 11.1 | 37.9 |
+| NB Samtale | 238 640 | 34.8 | Nemotron, kvad | **1.7** | **35.4** |
+| | | | pyannote 3.1 | 3.7 | 37.6 |
+| | | | community-1 | 2.9 | 36.7 |
+
+- **Nemotron puts the most words on the right person on both sets**,
+  AMI included: the speech it misses there is mostly short words between
+  others' turns, and the nearest-turn rule gives those to someone anyway.
+  The three systems are given the same words, so the gaps are the
+  diarization's alone.
+- **Speakers cost little on top of the words.** cpWER is 0.6 points over
+  WER on NB Samtale with Nemotron, 3.3 on AMI.
+- **WER is high for reasons of its own.** AMI's references keep every
+  "uh" and "mm", which Whisper leaves out; NB Samtale's are often dialect
+  or Nynorsk where nb-whisper writes Bokmål.
+- **The first AMI run found a decoder bug.** whisper-large-v3-turbo fell
+  into loops of one-second "Okay." and "Yeah." segments that ended
+  cleanly, which the loop check passed because it only looked at windows
+  that hit the token limit: 95.8% WER and 37% WDER. Windows that end now
+  count as loops too when at least 12 of their 4-grams repeat and over
+  half do. NB Samtale's speech never passed 0.31, and AMI's loops sat at
+  0.97 (`transcribe::LOOP_MIN`).
+- **Not measured**: the sentence-end correction in *Words to speakers*.
+  At 1.7% WDER on NB Samtale there is little left for it to win.
 
 ## The order it is built in
 
@@ -892,6 +932,15 @@ measured.
    refused, saying so), the CLI. *Done* as in *In the API, the CLI and
    the web UI*, with WDER and cpWER on AMI and NB Samtale beside the
    DER. The eight-speaker limit is in the documentation.
+   **Built** (`speech::speakers`, `kvad transcribe --speakers`): every
+   format rendered byte for byte from a hand-made transcript,
+   `diarized_json` parsed by OpenAI's Python SDK, and the server, the
+   routed CLI and `--local` writing the same bytes. Nemotron's WDER is
+   1.7% on NB Samtale and 8.2% on AMI, below both pyannotes' (*Words to
+   speakers, measured*). Left out: streaming with `diarize` is refused
+   rather than sending the segments at the end, and `num_speakers` and
+   its kin are only checked against eight, since Nemotron takes no count,
+   so the CLI has no `--speakers 2-4`.
 5. **The Transcribe page**: the switch, the chips, renaming and merging.
    *Done* with a screenshot from a clean demo server, and the page's
    downloads byte for byte the server's for the same transcript.

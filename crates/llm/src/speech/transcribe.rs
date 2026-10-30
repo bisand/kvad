@@ -44,11 +44,12 @@
 //! # When a window goes wrong
 //!
 //! A window whose tokens the model was unsure of on average (log-probability
-//! below −1), or that never stopped — repeating a phrase until the token
-//! limit, the usual way a Whisper fails — is decoded again at a higher
-//! temperature, up to five times. openai-whisper also measures repetition by
-//! how well the text gzips; that needs a compressor this crate does not have,
-//! and a window caught in a loop runs into the limit regardless.
+//! below −1), or that goes round in circles, is decoded again at a higher
+//! temperature, up to five times. openai-whisper measures the circling by
+//! how well the text gzips; this crate counts repeated 4-grams instead
+//! (`repeated`). A loop usually runs into the token limit, but not always:
+//! on AMI's meetings whisper-large-v3-turbo wrote thirty confident one-second
+//! "Okay." segments and stopped, window after window.
 
 use super::align::Word;
 use super::mel::{self, HOP, N_FRAMES, SAMPLE_RATE};
@@ -73,6 +74,12 @@ const NO_SPEECH_THRESHOLD: f32 = 0.6;
 /// limit is a loop rather than speech too dense to fit. Speech measured 0.01
 /// to 0.07, loops and pages of spaces 0.72 to 1.
 const REPEATED_THRESHOLD: f32 = 0.5;
+/// A window that ended is a loop too when this many of its 4-grams repeat
+/// as well: AMI's meetings stopped cleanly after thirty one-second "Okay."
+/// segments, 57 repeats, where NB Samtale's speech never passed 32 nor a
+/// share of 0.31. A short "ja. ja. ja." is kept, as gzip's overhead keeps
+/// it for openai-whisper.
+const LOOP_MIN: usize = 12;
 
 /// What to do with the speech.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -122,6 +129,9 @@ pub struct Segment {
     pub no_speech_prob: f32,
     /// Its words with their times, when [`Request::words`] asked for them.
     pub words: Vec<Word>,
+    /// Who says it, `A`, `B`, …, once [`super::speakers::assign`] has been
+    /// given who spoke when.
+    pub speaker: Option<String>,
 }
 
 /// A whole transcription.
@@ -259,11 +269,11 @@ pub(super) struct Window {
 }
 
 impl Window {
-    /// Whether it ran into the token limit going round in circles: this
-    /// crate's gzip test. Speech dense enough to fill the limit is not a
-    /// loop, and is kept.
+    /// Whether it went round in circles: this crate's gzip test. Speech
+    /// dense enough to fill the limit is not a loop, and is kept.
     fn looped(&self, eot: u32) -> bool {
-        !self.ended && repeated(&self.tokens, eot) > REPEATED_THRESHOLD
+        let (again, share) = repeated(&self.tokens, eot);
+        share > REPEATED_THRESHOLD && (!self.ended || again >= LOOP_MIN)
     }
 
     /// Whether none of it is written down, as fallback left it: silence, or
@@ -281,18 +291,18 @@ impl Window {
     }
 }
 
-/// The share of the text's 4-grams in `tokens` that were written earlier in
-/// them: what a compressor would find to point back to. Timestamps and
-/// special tokens are not text, and a window of nothing else repeats all
-/// of it.
-fn repeated(tokens: &[u32], eot: u32) -> f32 {
+/// How many of the text's 4-grams in `tokens` were written earlier in them,
+/// and what share: what a compressor would find to point back to.
+/// Timestamps and special tokens are not text, and a window of nothing else
+/// repeats all of it.
+fn repeated(tokens: &[u32], eot: u32) -> (usize, f32) {
     let text: Vec<u32> = tokens.iter().copied().filter(|&i| i < eot).collect();
     if text.len() < 4 {
-        return 1.0;
+        return (0, 1.0);
     }
     let mut seen = std::collections::HashSet::new();
     let again = text.windows(4).filter(|g| !seen.insert(*g)).count();
-    again as f32 / (text.len() - 3) as f32
+    (again, again as f32 / (text.len() - 3) as f32)
 }
 
 /// The rules about what the next token may be, given what has been produced.
@@ -730,6 +740,7 @@ impl Transcriber {
                         avg_logprob: w.avg_logprob,
                         no_speech_prob: w.no_speech_prob,
                         words: Vec::new(),
+                        speaker: None,
                     });
                 }
                 Ok(())
@@ -808,6 +819,9 @@ pub enum Format {
     VerboseJson,
     Srt,
     Vtt,
+    /// OpenAI's for a transcript with speakers: its segments, each with who
+    /// says it.
+    DiarizedJson,
 }
 
 impl Format {
@@ -818,13 +832,14 @@ impl Format {
             "verbose_json" => Format::VerboseJson,
             "srt" => Format::Srt,
             "vtt" => Format::Vtt,
+            "diarized_json" => Format::DiarizedJson,
             _ => return None,
         })
     }
 
     pub fn content_type(self) -> &'static str {
         match self {
-            Format::Json | Format::VerboseJson => "application/json",
+            Format::Json | Format::VerboseJson | Format::DiarizedJson => "application/json",
             Format::Text => "text/plain; charset=utf-8",
             Format::Srt => "application/x-subrip; charset=utf-8",
             Format::Vtt => "text/vtt; charset=utf-8",
@@ -835,14 +850,66 @@ impl Format {
 impl Transcript {
     /// The transcript in `format`. `task` is what `verbose_json` reports it
     /// was asked to do.
+    ///
+    /// With speakers, each format says who: `text` and `json` a turn a line
+    /// after its speaker, `A: …`; `srt` the same before each cue's text;
+    /// `vtt` in WebVTT's voice span, `<v A>`; `verbose_json` a `speaker` on
+    /// every segment and word. `diarized_json` is OpenAI's.
     pub fn render(&self, format: Format, task: Task) -> String {
+        let text = match self.has_speakers() {
+            true => self.turns(),
+            false => self.text.trim().to_string(),
+        };
         match format {
-            Format::Text => format!("{}\n", self.text.trim()),
-            Format::Json => serde_json::json!({ "text": self.text.trim() }).to_string(),
+            Format::Text => format!("{text}\n"),
+            Format::Json => serde_json::json!({ "text": text }).to_string(),
             Format::VerboseJson => self.verbose(task).to_string(),
             Format::Srt => self.cues(",", true),
             Format::Vtt => format!("WEBVTT\n\n{}", self.cues(".", false)),
+            Format::DiarizedJson => self.diarized(task).to_string(),
         }
+    }
+
+    pub fn has_speakers(&self) -> bool {
+        self.segments.iter().any(|s| s.speaker.is_some())
+    }
+
+    /// A turn a line, `A: …`: the segments one speaker says in a row, joined.
+    fn turns(&self) -> String {
+        let mut lines: Vec<(&str, String)> = Vec::new();
+        for s in &self.segments {
+            let who = s.speaker.as_deref().unwrap_or("?");
+            match lines.last_mut() {
+                Some((w, text)) if *w == who => text.push_str(&s.text),
+                _ => lines.push((who, s.text.clone())),
+            }
+        }
+        lines.iter().map(|(w, t)| format!("{w}: {}", t.trim())).collect::<Vec<_>>().join("\n")
+    }
+
+    /// OpenAI's `diarized_json` (`TranscriptionDiarized`).
+    pub fn diarized(&self, task: Task) -> serde_json::Value {
+        let segments: Vec<serde_json::Value> = self
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                serde_json::json!({
+                    "type": "transcript.text.segment",
+                    "id": format!("seg_{i}"),
+                    "start": round2(s.start),
+                    "end": round2(s.end),
+                    "text": s.text.trim(),
+                    "speaker": s.speaker.as_deref().unwrap_or("?"),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "task": if task == Task::Translate { "translate" } else { "transcribe" },
+            "duration": round2(self.duration),
+            "text": self.turns(),
+            "segments": segments,
+        })
     }
 
     pub fn verbose(&self, task: Task) -> serde_json::Value {
@@ -851,7 +918,7 @@ impl Transcript {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                serde_json::json!({
+                let mut v = serde_json::json!({
                     "id": i,
                     "start": round2(s.start),
                     "end": round2(s.end),
@@ -860,7 +927,11 @@ impl Transcript {
                     "temperature": s.temperature,
                     "avg_logprob": s.avg_logprob,
                     "no_speech_prob": s.no_speech_prob,
-                })
+                });
+                if let Some(who) = &s.speaker {
+                    v["speaker"] = who.as_str().into();
+                }
+                v
             })
             .collect();
         let mut out = serde_json::json!({
@@ -876,8 +947,14 @@ impl Transcript {
             let words: Vec<serde_json::Value> = self
                 .segments
                 .iter()
-                .flat_map(|s| &s.words)
-                .map(|w| serde_json::json!({ "word": w.word.trim(), "start": round2(w.start), "end": round2(w.end) }))
+                .flat_map(|s| s.words.iter().map(move |w| (w, &s.speaker)))
+                .map(|(w, who)| {
+                    let mut v = serde_json::json!({ "word": w.word.trim(), "start": round2(w.start), "end": round2(w.end) });
+                    if let Some(who) = who {
+                        v["speaker"] = who.as_str().into();
+                    }
+                    v
+                })
                 .collect();
             out["words"] = words.into();
         }
@@ -891,7 +968,12 @@ impl Transcript {
             if numbered {
                 out.push_str(&format!("{}\n", i + 1));
             }
-            out.push_str(&format!("{} --> {}\n{}\n\n", clock(s.start, comma), clock(s.end, comma), s.text.trim()));
+            let text = match (&s.speaker, numbered) {
+                (None, _) => s.text.trim().to_string(),
+                (Some(who), true) => format!("{who}: {}", s.text.trim()),
+                (Some(who), false) => format!("<v {who}>{}", s.text.trim()),
+            };
+            out.push_str(&format!("{} --> {}\n{text}\n\n", clock(s.start, comma), clock(s.end, comma)));
         }
         out
     }
@@ -1054,7 +1136,7 @@ mod tests {
             x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
             if i % 20 == 19 { EOT + 100 + i } else { 300 + (x >> 8) % 20_000 }
         }).collect();
-        assert!(repeated(&dense, EOT) < 0.05, "{}", repeated(&dense, EOT));
+        assert!(repeated(&dense, EOT).1 < 0.05, "{:?}", repeated(&dense, EOT));
         assert!(!w(dense.clone(), false, -0.25, 0.0).looped(EOT));
         assert!(!w(dense.clone(), false, -0.25, 0.0).skipped(EOT));
         // The same words ending in a phrase said over and over.
@@ -1071,11 +1153,15 @@ mod tests {
         assert!(w(page, false, -0.03, 0.0).skipped(EOT));
         // Nothing but a special token, over and over: no text at all.
         assert!(w(vec![EOT + 31; 224], false, -3.25, 0.0).skipped(EOT));
-        // A window that ended is kept, however it repeats itself; fallback
-        // has had its say on how sure it is.
+        // A window that ended is kept when it repeats itself a little;
+        // fallback has had its say on how sure it is.
         let ja = [1000, 13, 1000, 13, 1000, 13, 1000, 13, 1000, 13].to_vec();
         assert!(!w(ja.clone(), true, -0.3, 0.0).skipped(EOT));
         assert!(!w(ja, true, -1.5, 0.0).skipped(EOT));
+        // Not when it is a confident page of one-second "Okay."s, each
+        // segment timed, as AMI's meetings came out.
+        let okay: Vec<u32> = (0..30).flat_map(|i| [EOT + 100 + 50 * i, 4120, 13, EOT + 150 + 50 * i]).collect();
+        assert!(w(okay, true, -0.1, 0.0).skipped(EOT));
         // A likely `<|nospeech|>` alone is not enough, and with an unsure
         // window it is silence, which may ramble too.
         assert!(!w(vec![1000], true, -0.3, 0.9).skipped(EOT));
@@ -1094,6 +1180,7 @@ mod tests {
             avg_logprob: 0.0,
             no_speech_prob: 0.0,
             words: vec![],
+            speaker: None,
         };
         let tr = Transcript {
             text: " Hei. Hallo.".into(),
@@ -1111,7 +1198,7 @@ mod tests {
     #[test]
     fn verbose_json_carries_the_words_when_there_are_any() {
         let word = |w: &str, start, end| Word { word: w.into(), start, end };
-        let mut seg = Segment { start: 0.0, end: 1.5, text: " Hei, sa han.".into(), tokens: vec![], temperature: 0.0, avg_logprob: 0.0, no_speech_prob: 0.0, words: vec![] };
+        let mut seg = Segment { start: 0.0, end: 1.5, text: " Hei, sa han.".into(), tokens: vec![], temperature: 0.0, avg_logprob: 0.0, no_speech_prob: 0.0, words: vec![], speaker: None };
         let mut tr = Transcript { text: seg.text.clone(), language: "no".into(), duration: 1.5, segments: vec![seg.clone()] };
         assert!(tr.verbose(Task::Transcribe).get("words").is_none());
         seg.words = vec![word(" Hei,", 0.0, 0.42), word(" sa", 0.42, 0.7000001), word(" han.", 0.7, 1.24)];
@@ -1123,5 +1210,58 @@ mod tests {
             { "word": "han.", "start": 0.7, "end": 1.24 },
         ]));
         assert!(v["segments"][0].get("words").is_none(), "words go beside the segments, as OpenAI's");
+    }
+
+    /// Each format with speakers, byte for byte, from one hand-made
+    /// transcript: two turns of A's, one of B's between them.
+    #[test]
+    fn every_format_says_who_speaks() {
+        let word = |w: &str, start, end| Word { word: w.into(), start, end };
+        let seg = |start, end, text: &str, who: &str, words| Segment {
+            start,
+            end,
+            text: text.into(),
+            tokens: vec![],
+            temperature: 0.0,
+            avg_logprob: -0.25,
+            no_speech_prob: 0.5,
+            words,
+            speaker: Some(who.into()),
+        };
+        let tr = Transcript {
+            text: " Hva synes du? Bra. Takk.".into(),
+            language: "no".into(),
+            duration: 4.0,
+            segments: vec![
+                seg(0.0, 1.4, " Hva synes du?", "A", vec![word(" Hva", 0.1, 0.4), word(" synes", 0.5, 0.9), word(" du?", 1.0, 1.4)]),
+                seg(2.0, 2.6, " Bra.", "B", vec![word(" Bra.", 2.0, 2.6)]),
+                seg(3.0, 4.0, " Takk.", "A", vec![word(" Takk.", 3.0, 3.6)]),
+            ],
+        };
+        let render = |f| tr.render(f, Task::Transcribe);
+        assert_eq!(render(Format::Text), "A: Hva synes du?\nB: Bra.\nA: Takk.\n");
+        assert_eq!(render(Format::Json), r#"{"text":"A: Hva synes du?\nB: Bra.\nA: Takk."}"#);
+        assert_eq!(
+            render(Format::Srt),
+            "1\n00:00:00,000 --> 00:00:01,400\nA: Hva synes du?\n\n2\n00:00:02,000 --> 00:00:02,600\nB: Bra.\n\n3\n00:00:03,000 --> 00:00:04,000\nA: Takk.\n\n"
+        );
+        assert_eq!(
+            render(Format::Vtt),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.400\n<v A>Hva synes du?\n\n00:00:02.000 --> 00:00:02.600\n<v B>Bra.\n\n00:00:03.000 --> 00:00:04.000\n<v A>Takk.\n\n"
+        );
+        assert_eq!(
+            render(Format::DiarizedJson),
+            concat!(
+                r#"{"task":"transcribe","duration":4.0,"text":"A: Hva synes du?\nB: Bra.\nA: Takk.","segments":["#,
+                r#"{"type":"transcript.text.segment","id":"seg_0","start":0.0,"end":1.4,"text":"Hva synes du?","speaker":"A"},"#,
+                r#"{"type":"transcript.text.segment","id":"seg_1","start":2.0,"end":2.6,"text":"Bra.","speaker":"B"},"#,
+                r#"{"type":"transcript.text.segment","id":"seg_2","start":3.0,"end":4.0,"text":"Takk.","speaker":"A"}]}"#,
+            )
+        );
+        let v = tr.verbose(Task::Transcribe);
+        assert_eq!(v["text"], "Hva synes du? Bra. Takk.", "verbose_json's text stays the words alone");
+        assert_eq!(v["segments"].as_array().unwrap().iter().map(|s| s["speaker"].as_str().unwrap()).collect::<Vec<_>>(), ["A", "B", "A"]);
+        assert_eq!(v["words"][2], serde_json::json!({ "word": "du?", "start": 1.0, "end": 1.4, "speaker": "A" }));
+        assert_eq!(v["words"][3]["speaker"], "B");
     }
 }

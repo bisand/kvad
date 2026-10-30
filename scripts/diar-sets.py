@@ -7,7 +7,8 @@ whole recordings with their reference beside them:
 
     <data>/<set>/<name>.wav     16 kHz mono 16-bit
     <data>/<set>/<name>.rttm    who spoke when
-    <data>/<set>/<name>.json    the reference's words, a turn an entry
+    <data>/<set>/<name>.json    the reference's words, a turn an entry (AMI's a
+                                word an entry, from its manual annotations)
 
 - `ami`: the 16 test meetings' headset mix, with `pyannote/AMI-diarization-setup`'s
   `only_words` references, the ones pyannote's and NVIDIA's cards score on.
@@ -24,6 +25,8 @@ not is refused, and said so.
 
     D=~/data/diar
     git clone --depth 1 https://github.com/pyannote/AMI-diarization-setup $D/ami/setup
+    curl -fLo $D/ami/manual.zip https://groups.inf.ed.ac.uk/ami/AMICorpusAnnotations/ami_public_manual_1.6.2.zip
+    unzip -q $D/ami/manual.zip -d $D/ami/manual
     for m in $(cat $D/ami/setup/lists/test.meetings.txt); do
       curl -fLo $D/ami/$m.Mix-Headset.wav \\
         https://groups.inf.ed.ac.uk/ami/AMICorpusMirror/amicorpus/$m/audio/$m.Mix-Headset.wav
@@ -94,7 +97,15 @@ def lay(clips, length=None):
 
 
 def ami(data, out):
+    import xml.etree.ElementTree as ET
+
     setup = os.path.join(data, "ami", "setup")
+    manual = os.path.join(data, "ami", "manual")
+    nite = "{http://nite.sourceforge.net/}"
+    agents = {}
+    for meeting in ET.parse(os.path.join(manual, "corpusResources", "meetings.xml")).getroot():
+        for sp in meeting:
+            agents[(meeting.get("observation"), sp.get("nxt_agent"))] = sp.get("global_name")
     for m in open(os.path.join(setup, "lists", "test.meetings.txt")).read().split():
         audio = decode(os.path.join(data, "ami", f"{m}.Mix-Headset.wav"))
         turns = []
@@ -102,6 +113,20 @@ def ami(data, out):
             f = line.split()
             turns.append((f[7], float(f[3]), float(f[3]) + float(f[4]), ""))
         write(out, m, audio, turns)
+        # The manual words, for the word-level scores: one entry a word,
+        # punctuation and words without times left out.
+        words = []
+        for path in glob.glob(os.path.join(manual, "words", f"{m}.?.words.xml")):
+            who = agents.get((m, path.split(".")[-3]))
+            if who is None:
+                continue  # EN2002c's D: an empty file for an agent the meeting does not have
+            for w in ET.parse(path).getroot():
+                if w.tag == "w" and not w.get("punc") and w.get("starttime") and w.text:
+                    words.append({"speaker": who, "start": float(w.get("starttime")), "end": float(w.get("endtime")), "text": w.text})
+        words.sort(key=lambda w: w["start"])
+        with open(os.path.join(out, m + ".json"), "w") as f:
+            json.dump(words, f, ensure_ascii=False, indent=0)
+        print(f"{m}: {len(words)} words")
 
 
 def npsc(data, out):
@@ -126,6 +151,13 @@ def npsc(data, out):
         write(out, f"npsc_{d}", audio, turns)
 
 
+def written(text):
+    """NB Samtale's transcription as the standard writes it: `dokker\\dere`,
+    the said form and the standard one, becomes `dere`, and `%eee`, a filler
+    or a mark such as `%foreign`, goes."""
+    return " ".join(w.split("\\")[-1] for w in text.split() if not w.startswith("%"))
+
+
 def samtale(data, out):
     # Every split's segments: no system here was trained on any of them, and
     # a conversation is only whole with all of them.
@@ -142,7 +174,7 @@ def samtale(data, out):
             clips.append((round(a * RATE), clip))
             # P0 is music and noise: audio, but nobody speaking.
             if r["speaker_id"] != "P0":
-                turns.append((r["speaker_id"], a, b, r["transcription"]))
+                turns.append((r["speaker_id"], a, b, written(r["transcription"])))
         audio = lay(clips)
         if audio is None:
             print(f"{name}: refused, overlapping segments disagree")

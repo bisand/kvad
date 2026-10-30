@@ -662,6 +662,15 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       each `{word, start, end}`, beside the segments: timed by the \
                       decoder's cross-attention, at the cost of one more decoder pass \
                       over each window's text.\n\n\
+                      `response_format=diarized_json`, OpenAI's, says who says what: \
+                      `segments`, each `{type, id, start, end, text, speaker}`, speakers \
+                      `A`, `B`, … in the order they are heard, and `text` a turn a line, \
+                      `A: …`. kvad's `diarize: true` does the same for every other \
+                      format: `A: …` lines in `text`, `json` and `srt`, WebVTT's `<v A>` \
+                      in `vtt`, and a `speaker` on each segment and word of \
+                      `verbose_json`. The speakers are Nemotron-3-Diarization's, on the \
+                      CPU, which tells up to eight people apart: `num_speakers` or \
+                      `max_speakers` over eight is refused. Not with `stream`.\n\n\
                       kvad's own: `seed`, and `timestamps: true`, which decodes with \
                       timestamp tokens whatever the format (`srt`, `vtt` and \
                       `verbose_json` always do). They change the words a Whisper writes, \
@@ -674,8 +683,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
         body: Some(Body {
             content_type: "multipart/form-data",
             description: "`file` and `model?`, with `language?`, `prompt?`, `response_format?`, \
-                          `temperature?`, `timestamp_granularities[]?`, `seed?`, `timestamps?` \
-                          and `stream?`.",
+                          `temperature?`, `timestamp_granularities[]?`, `seed?`, `timestamps?`, \
+                          `diarize?`, `num_speakers?`, `max_speakers?` and `stream?`.",
         }),
         produces: "application/json, text/plain, application/x-subrip, text/vtt, or text/event-stream",
         events: &[

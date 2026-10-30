@@ -416,23 +416,25 @@ pub fn jer(reference: &[Turn], hypothesis: &[Turn], protocol: Protocol) -> f64 {
 /// before a deletion, and a deletion before an insertion.
 pub fn align(reference: &[&str], hypothesis: &[&str]) -> (usize, Vec<(usize, usize)>) {
     let (n, m) = (reference.len(), hypothesis.len());
-    // d[i][j]: the edits that turn the first i words into the first j.
-    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    // d[i][j]: the edits that turn the first i words into the first j. A
+    // u32 a cell, as two hours of conversation is twenty thousand words a
+    // side.
+    let mut d = vec![vec![0u32; m + 1]; n + 1];
     for i in 0..=n {
-        d[i][0] = i;
+        d[i][0] = i as u32;
     }
     for j in 0..=m {
-        d[0][j] = j;
+        d[0][j] = j as u32;
     }
     for i in 1..=n {
         for j in 1..=m {
-            let sub = d[i - 1][j - 1] + (reference[i - 1] != hypothesis[j - 1]) as usize;
+            let sub = d[i - 1][j - 1] + (reference[i - 1] != hypothesis[j - 1]) as u32;
             d[i][j] = sub.min(d[i - 1][j] + 1).min(d[i][j - 1] + 1);
         }
     }
     let (mut i, mut j, mut pairs) = (n, m, Vec::new());
     while i > 0 || j > 0 {
-        if i > 0 && j > 0 && d[i][j] == d[i - 1][j - 1] + (reference[i - 1] != hypothesis[j - 1]) as usize {
+        if i > 0 && j > 0 && d[i][j] == d[i - 1][j - 1] + (reference[i - 1] != hypothesis[j - 1]) as u32 {
             pairs.push((i - 1, j - 1));
             i -= 1;
             j -= 1;
@@ -443,7 +445,7 @@ pub fn align(reference: &[&str], hypothesis: &[&str]) -> (usize, Vec<(usize, usi
         }
     }
     pairs.reverse();
-    (d[n][m], pairs)
+    (d[n][m] as usize, pairs)
 }
 
 /// Speakers in order of first appearance, and each word's index among them.

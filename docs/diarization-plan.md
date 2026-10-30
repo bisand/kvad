@@ -803,6 +803,43 @@ transcript written beside it. It is not a benchmark. It is a fixture
 whose right answer is known to the sample, for tests that must not depend
 on a dataset being present.
 
+### First numbers
+
+Nemotron-3-Diarization in kvad, f32 on the CPU (M5, all cores), on the
+three sets as `scripts/diar-sets.py` lays them out, scored by
+`score::tests::diarization_sets` (2026-10-30). Pooled over each set's
+recordings; points of reference speech; *s / h* is seconds of wall time
+an hour of audio, one run each, with the machine not otherwise idle.
+
+| set | files | hours | DER full | missed | false alarm | confusion | DER fair | DER forgiving | JER | s / h |
+|---|---|---|---|---|---|---|---|---|---|---|
+| AMI test | 16 | 9.1 | 26.0 | 24.0 | 1.2 | 0.7 | 24.1 | 20.6 | 28.2 | 176 |
+| NB Samtale | 35 | 24.5 | 9.3 | 8.6 | 0.4 | 0.3 | 7.2 | 6.5 | 12.2 | 176 |
+| NPSC test | 4 | 13.1 | 61.7 | 11.1 | 0.1 | 50.4 | 60.9 | 60.9 | 78.3 | 159 |
+
+- **Norwegian is not the problem.** NB Samtale, 2 to 8 people in podcasts
+  and live events, the meetings Kvad is for, has almost no confusion:
+  0.3 points. What error there is, is speech not found, and some of that
+  is the reference's: its turns are sentences, pauses included.
+- **AMI is missed speech, and it is the model's.** 24 points missed, 0.7
+  confused: Nemotron hears who but not all of when on the far-field
+  headset mix, with `only_words` references that count every short word.
+  On IS1009a transformers' own run gives the same 379 turns and the same
+  26.7% to the tenth (`scripts/nemotron-fixtures.py`, the agreement test
+  passing), so this is not the port. Its card's AMI number uses another
+  reference, and is not this one.
+- **NPSC is the eight-speaker limit, as expected.** By sitting: 21.9%
+  with 9 speakers, 51.9% with 41, 71.0% with 50, 67.9% with 30, nearly
+  all of it confusion. A sitting of Stortinget is not a meeting; the
+  pyannote pipeline (steps 8–11) is for it.
+- **The cost**: 159–176 s an hour, about 21 times real time on the CPU,
+  slower than the 27 times of the short dialogue; the GPU is next.
+- **pyannote 3.1 beside it** waits for its gated models' terms to be
+  accepted on the Hub; `scripts/pyannote-diarize.py` runs it then, into
+  the same table.
+- **WDER** waits for step 4: it needs the words given to speakers, which
+  is that step's merge.
+
 ## The order it is built in
 
 Each step is a PR of its own, and none begins before the one it needs is
@@ -834,7 +871,9 @@ measured.
    70-second, three-voice Norwegian dialogue from `scripts/dialogue.py`,
    3.8·10⁻⁶ from transformers in probability and the same 21 turns
    (`scripts/nemotron-fixtures.py`), across two compressions of the
-   speaker cache; no speaker confused. The GPU and the table are next.
+   speaker cache; no speaker confused. On the three sets (*First numbers*,
+   above): 26.0% DER on AMI, 9.3% on NB Samtale, 61.7% on NPSC, at about
+   21 times real time. The GPU and pyannote's column are next.
 4. **Speakers in the transcript**: the merge, `diarized_json`,
    `diarize=true` and the four formats, `num_speakers` (more than eight
    refused, saying so), the CLI. *Done* as in *In the API, the CLI and

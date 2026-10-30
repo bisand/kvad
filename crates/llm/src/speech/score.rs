@@ -680,4 +680,73 @@ mod tests {
         }
         eprintln!("{} cases at three protocols, largest gap {worst:.2e}", cases.len());
     }
+
+    /// The plan's table: every system's turns on every evaluation set,
+    /// pooled over a set's recordings as pyannote's `abs(metric)` pools
+    /// them, at the three protocols, with the time each took per hour of
+    /// audio. `scripts/diar-sets.py` lays the sets out, a system's turns go
+    /// in `<set>/hyp/<system>/<name>.rttm`, and the seconds each recording
+    /// took in `<set>/hyp/<system>/seconds.txt`, `<name> <seconds>` a line.
+    ///
+    /// ```text
+    /// KVAD_DIAR_DATA=~/data/diar/sets cargo test --release -p kvad speech::score::tests::diarization_sets -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn diarization_sets() {
+        use std::path::Path;
+        let root = std::env::var("KVAD_DIAR_DATA").expect("KVAD_DIAR_DATA is not set");
+        let mut sets: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.path()).filter(|p| p.join("hyp").is_dir()).collect();
+        sets.sort();
+        println!("| set | system | files | hours | DER full | miss | FA | conf | DER fair | DER forgiving | JER | s / h |");
+        println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+        let read = |p: &Path| rttm(&std::fs::read_to_string(p).unwrap()).unwrap();
+        for set in sets {
+            let mut systems: Vec<_> = std::fs::read_dir(set.join("hyp")).unwrap().flatten().map(|e| e.path()).collect();
+            systems.sort();
+            for system in systems {
+                let seconds: std::collections::HashMap<String, f64> = std::fs::read_to_string(system.join("seconds.txt"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|l| l.split_once(' ').map(|(n, s)| (n.to_string(), s.parse().unwrap())))
+                    .collect();
+                let (mut full, mut fair, mut forgiving, mut jers, mut hours, mut took, mut files) =
+                    (Der::default(), Der::default(), Der::default(), 0.0, 0.0, 0.0, 0);
+                let mut names: Vec<_> = std::fs::read_dir(&system).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "rttm")).collect();
+                names.sort();
+                for hyp in names {
+                    let name = hyp.file_stem().unwrap().to_str().unwrap().to_string();
+                    let reference = read(&set.join(format!("{name}.rttm")));
+                    let hypothesis = read(&hyp);
+                    for (sum, protocol) in [(&mut full, Protocol::FULL), (&mut fair, Protocol::FAIR), (&mut forgiving, Protocol::FORGIVING)] {
+                        let d = der(&reference, &hypothesis, protocol);
+                        sum.total += d.total;
+                        sum.missed += d.missed;
+                        sum.false_alarm += d.false_alarm;
+                        sum.confusion += d.confusion;
+                    }
+                    jers += jer(&reference, &hypothesis, Protocol::FULL);
+                    // 16 kHz mono 16-bit after a 44-byte header.
+                    let h = (std::fs::metadata(set.join(format!("{name}.wav"))).unwrap().len() - 44) as f64 / 32000.0 / 3600.0;
+                    hours += h;
+                    took += seconds.get(&name).copied().unwrap_or(f64::NAN);
+                    files += 1;
+                }
+                let pc = |x: f64, d: &Der| 100.0 * x / d.total;
+                println!(
+                    "| {} | {} | {files} | {hours:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} |",
+                    set.file_name().unwrap().to_string_lossy(),
+                    system.file_name().unwrap().to_string_lossy(),
+                    100.0 * full.rate(),
+                    pc(full.missed, &full),
+                    pc(full.false_alarm, &full),
+                    pc(full.confusion, &full),
+                    100.0 * fair.rate(),
+                    100.0 * forgiving.rate(),
+                    100.0 * jers / files as f64,
+                    took / hours,
+                );
+            }
+        }
+    }
 }

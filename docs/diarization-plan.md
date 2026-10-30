@@ -437,12 +437,13 @@ dozens), and Norwegian is not among the languages its card lists. Speaker
 turns depend on voices more than on words, but that is a guess until
 measured.
 
-So both are built and measured on the same sets, the pyannote pipeline
-first because its pieces are needed whichever wins: the segmentation's
-speech activity cuts per-person tracks, and the embedding model is what
-names speakers from reference clips. Nemotron is then a second
-diarization behind the same interface, and the measurements choose the
-default per case, offline and live. A transformers port
+The owner's meetings stay under eight people (*Open questions*), so
+Nemotron is built first, as the whole diarization, offline and live
+(reordered 2026-10-30). The pyannote pipeline follows for what Nemotron
+cannot do: the segmentation's speech activity cuts per-person tracks,
+the embedding model names speakers from reference clips, and the two
+with clustering handle more than eight. Both sit behind the same
+interface, and the measurements choose the default per case. A transformers port
 (`Nemotron3DiarizationForAudioFrameClassification`) exists to hold it to.
 
 ## Words to speakers
@@ -531,7 +532,8 @@ at gpu-q8.
 labels speakers frame by frame as audio streams in, in the order they
 first spoke, keeping each one's channel through its speaker cache, at
 0.32 to 1.04 s of latency by its card. It is the shape this problem
-wants, and step 12 measures it beside the diart loop.
+wants, and step 6 builds the live labels on it; the diart loop above
+waits for the pyannote models (steps 8 and 9) and is measured beside it then.
 
 ## One track a person
 
@@ -821,72 +823,76 @@ measured.
    `timing.py` over transformers' attention in f32 on both backends and
    all three sizes, every matched word on the right speaker, and a pass
    that is 2–5% of a GPU run (*As built, and what it measured*).
-3. **Reading pickled checkpoints** without running them (`weights.rs`).
+3. **Nemotron-3-Diarization**, offline, on the CPU and the GPU.
+   `kvad diarize FILE` prints RTTM, which is what the scorer reads.
+   *Done* when it agrees with the transformers port in f32 (largest gap
+   set from the first run), and its DER, WDER and cost per hour of audio
+   are in a table on AMI test, NB Samtale and NPSC (not VoxConverse,
+   which it was trained on), beside pyannote 3.1 run in Python on the
+   same audio, with the first Norwegian numbers recorded here.
+4. **Speakers in the transcript**: the merge, `diarized_json`,
+   `diarize=true` and the four formats, `num_speakers` (more than eight
+   refused, saying so), the CLI. *Done* as in *In the API, the CLI and
+   the web UI*, with WDER and cpWER on AMI and NB Samtale beside the
+   DER. The eight-speaker limit is in the documentation.
+5. **The Transcribe page**: the switch, the chips, renaming and merging.
+   *Done* with a screenshot from a clean demo server, and the page's
+   downloads byte for byte the server's for the same transcript.
+6. **Live labels** on Nemotron's streaming mode, on the live endpoint
+   (#260), measured by `live_speed --speakers`. *Done* as in *Live
+   labels*.
+
+The pyannote pipeline, for tracks, names and more than eight speakers:
+
+7. **Reading pickled checkpoints** without running them (`weights.rs`).
    *Done* when the fixture checkpoint and segmentation-3.0's file read
    tensor for tensor as torch reads them, and a pickle that asks for any
    callable outside the three it knows is still read as data, with
    nothing called.
-4. **Segmentation** on the CPU, with the speech activity it gives.
+8. **Segmentation** on the CPU, with the speech activity it gives.
    *Done* when its seven-class output agrees with pyannote's on fixture
    chunks (largest gap set from the first run), and its speech activity
    on AMI's test set misses and falsely finds speech no more than
    pyannote's own run does, to 0.1 points. Timed per hour of audio.
-5. **Embedding** on the CPU and the GPU, with the Kaldi fbank. *Done*
+9. **Embedding** on the CPU and the GPU, with the Kaldi fbank. *Done*
    when the fbank agrees with torchaudio's to 1e-4, and the embeddings
    with pyannote's to a cosine of 0.9999 in f32 on fixture chunks. Timed
-   per hour of audio on both backends, which settles whether the GPU is
-   needed for files.
-6. **Clustering and the whole offline diarization**: 3.1's
-   agglomerative clustering, the constrained assignment, the
-   reconstruction. `kvad diarize FILE` prints RTTM, which is what the
-   scorer reads. *Done* when DER (Full) on AMI test and VoxConverse test is
-   within 0.5 points of pyannote 3.1 run on the same audio, and then on NB
-   Samtale and NPSC, with the first Norwegian numbers recorded here.
-7. **VBx**, community-1's clustering. *Done* when it is within 0.5 points
-   of community-1 run on the same audio. Kept as the default if it beats
-   step 6 on the Norwegian sets, as it does on the English ones by the
-   card.
-8. **Speakers in the transcript**: the merge, `diarized_json`,
-   `diarize=true` and the four formats, `num_speakers`, the CLI. *Done*
-   as in *In the API, the CLI and the web UI*, with WDER and cpWER on AMI
-   and NB Samtale beside the DER.
-9. **The Transcribe page**: the switch, the chips, renaming and merging.
-   *Done* with a screenshot from a clean demo server, and the page's
-   downloads byte for byte the server's for the same transcript.
-10. **Nemotron-3-Diarization**, offline, behind the same interface.
-    *Done* when it agrees with the transformers port in f32 (largest gap
-    set from the first run), and its DER, WDER and cost are in a table
-    beside steps 6 and 7 on AMI, NB Samtale and NPSC (not VoxConverse,
-    which it was trained on). The default for files becomes
-    whichever is better on NB Samtale, unless the recording has more than
-    eight speakers.
-11. **One track a person**: several files, `channels=separate`, the
+   per hour of audio on both backends.
+10. **Clustering and the whole offline diarization**: 3.1's
+    agglomerative clustering, the constrained assignment, the
+    reconstruction, behind `kvad diarize`. *Done* when DER (Full) on AMI
+    test and VoxConverse test is within 0.5 points of pyannote 3.1 run
+    on the same audio, and in step 3's table beside Nemotron. The
+    default for files stays Nemotron unless this is better on NB
+    Samtale, and is this pipeline when more than eight speakers are
+    asked for.
+11. **VBx**, community-1's clustering. *Done* when it is within 0.5
+    points of community-1 run on the same audio, and kept over step 10's
+    clustering if it beats it on the Norwegian sets.
+12. **One track a person**: several files, `channels=separate`, the
     speech cut, the bleed rule. *Done* as in *One track a person*, and on
     AMI's individual headsets, cpWER beside the single-mix pipeline's on
     the same meetings.
-12. **Live labels**, once the live endpoint exists: diart's online
-    clustering on steps 4 and 5, and Nemotron's streaming mode, both
-    measured by `live_speed --speakers`. *Done* as in *Live labels*. The
-    live default is whichever settles labels sooner within the DER
-    bound.
 13. **Named speakers.** `known_speaker_references[]` first, which keeps
     nothing. Saved speakers only if the owner asks for them, as *Privacy*
-    lays out.
+    lays out. The diart loop (*Live labels*) is measured beside
+    Nemotron's streaming here too, now that its models exist.
 
 ## Open questions
 
-- **The VoxCeleb question.** Every embedding model's training data was
-  offered for research. Is the CC-BY-4.0 on the weights enough for the
-  owner's commercial use? If not, Nemotron (whose card lists no
-  VoxCeleb) becomes the diarization, and named speakers wait for an embedding model whose data
-  allows it.
+- **The VoxCeleb question.** *Answered 2026-10-30:* the owner uses kvad
+  as an open-source, non-commercial project, so VoxCeleb's research terms
+  do not stand in the way of the embedding model. Kvad itself is MIT, so
+  the documentation still says plainly that the speaker models carry
+  their own terms, for anyone who uses kvad commercially.
 - **A mirror.** Should the project publish segmentation-3.0, converted
   to safetensors, under its own name on the Hub, as MIT allows? It would
   remove the contact form and the pickle reader. It is outward-facing, so
-  it is the owner's decision.
-- **How many speakers is a meeting?** If the owner's meetings stay under
-  eight voices, Nemotron alone may be the whole pipeline, and steps 4 to
-  7 only feed tracks and names. Step 10's numbers answer it.
+  it is the owner's decision. *Undecided as of 2026-10-30.*
+- **How many speakers is a meeting?** *Answered 2026-10-30:* the owner's
+  meetings normally stay under eight people. Nemotron's limit of eight
+  is acceptable, and documented where diarization is, so Nemotron is
+  built first and the pyannote pipeline after it.
 - **Norwegian dialects.** Neither model was trained on Norwegian. NB
   Samtale's speakers come from across the country; if the numbers there
   lag the English ones badly, fine-tuning the segmentation model (1.5 M

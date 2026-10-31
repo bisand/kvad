@@ -1038,6 +1038,16 @@ pub fn transcribe(remote: &Remote, args: &Args) -> Res<()> {
     // `--json` is what the server sent, and its fullest answer.
     let format = crate::speech_format(args, if args.json { Format::VerboseJson } else { Format::Text })?;
     let path = std::path::Path::new(&file);
+    let size = std::fs::metadata(path).map_err(|e| format!("{file}: {e}"))?.len();
+    if size > kvad::speech::MAX_FILE as u64 {
+        return Err(format!(
+            "{file} is {} MB, and a server takes recordings up to {} MB. \
+             Compressed it fits: FLAC is about half a WAV, or transcribe it here with --local",
+            size >> 20,
+            kvad::speech::MAX_FILE >> 20
+        )
+        .into());
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("{file}: {e}"))?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("audio").to_string();
 

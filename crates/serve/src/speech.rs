@@ -53,7 +53,7 @@ use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use kvad::speech::{Format, Request, Task};
+use kvad::speech::{Format, Request, Task, MAX_FILE};
 use serde_json::json;
 
 pub fn routes() -> Router<State> {
@@ -63,11 +63,6 @@ pub fn routes() -> Router<State> {
         .layer(DefaultBodyLimit::max(MAX_FILE + (1 << 16)))
 }
 
-/// The largest recording a request may carry. OpenAI's is 25 MB, which is
-/// under half an hour of MP3 at 128 kbit/s, and a meeting is longer than
-/// that. 200 MiB is three and a half hours of it; the body is held whole
-/// while it is read, and then once more as the file `ffmpeg` opens.
-const MAX_FILE: usize = 200 << 20;
 
 pub async fn transcriptions(who: Identity, headers: HeaderMap, St(state): St<State>, body: Bytes) -> Result<Response, Fail> {
     listen(who, &headers, state, &body, Task::Transcribe).await

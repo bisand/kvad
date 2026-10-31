@@ -170,6 +170,14 @@ impl Said {
 /// ([`crate::hub::pipeline`]).
 pub const PIPELINE: &str = "WhisperForConditionalGeneration";
 
+/// The largest recording a server takes. OpenAI's is 25 MB, which is under
+/// half an hour of MP3 at 128 kbit/s, and a meeting is longer than that.
+/// 200 MiB is three and a half hours of it; the body is held whole while it
+/// is read, and then once more as the file `ffmpeg` opens. The CLI checks
+/// it before sending, since a server that stops reading a body part way
+/// shows the sender only a broken pipe.
+pub const MAX_FILE: usize = 200 << 20;
+
 /// What `repo`'s weights will take once loaded at `precision`, from its
 /// `config.json` in the cache: `None` for anything that is not a Whisper
 /// there. Asked before the load, to decide whether it fits.

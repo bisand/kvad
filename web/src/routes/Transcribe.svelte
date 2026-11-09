@@ -67,6 +67,16 @@
           ? "Settling the last words"
           : `Listening · ${at(l.sent)} · ${l.lag < 1 ? "under a second" : `${l.lag.toFixed(1)} s`} behind`,
   );
+  // Live text has no speakers: they are told apart once all of it is heard,
+  // so the take goes to the file side whole, as the phone's Transcribe again.
+  function speakersOfLive() {
+    t.choose(l.recording());
+    t.model = l.chosen?.id ?? t.model;
+    t.speakers = true;
+    t.mode = "file";
+    t.start();
+  }
+
   const busy = $derived(t.running || l.running);
 </script>
 
@@ -159,7 +169,7 @@
       {/if}
 
       {#if l.settled || l.partial}
-        <p class="max-h-[32rem] overflow-y-auto leading-relaxed">
+        <p class="max-h-[32rem] overflow-y-auto leading-relaxed whitespace-pre-line">
           <span>{l.settled.trimStart()}</span><span class="opacity-50">{l.settled ? l.partial : l.partial.trimStart()}</span>
         </p>
       {:else if !l.running && !l.error}
@@ -170,6 +180,9 @@
         <div class="mt-auto flex flex-wrap items-center gap-1 pt-2">
           <button class="btn btn-sm" onclick={() => l.copy()}>
             <Icon path={COPY} size={14} /> Copy text
+          </button>
+          <button class="btn btn-sm" onclick={speakersOfLive} title="Hear what was said again, whole, and say who said what">
+            Find the speakers
           </button>
         </div>
       {/if}

@@ -48,7 +48,9 @@
       ? `Loading ${t.chosen?.id}${models.busy ? ` — ${models.busy.message}` : ""}`
       : t.phase === "sending"
         ? "Sending the recording, and reading its sound"
-        : t.total
+        : t.phase === "speakers"
+          ? `All of it heard; telling the speakers apart · ${took.toFixed(0)} s`
+          : t.total
           ? `${at(t.heard)} of ${at(t.total)} heard · ${took.toFixed(0)} s`
           : `Listening to the first 30 seconds · ${took.toFixed(0)} s`,
   );
@@ -251,12 +253,18 @@
         <input type="checkbox" class="checkbox checkbox-sm" bind:checked={t.timestamps} disabled={t.running} />
         Timestamps
       </label>
+
+      <label class="label text-sm">
+        <input type="checkbox" class="checkbox checkbox-sm" bind:checked={t.speakers} disabled={t.running} />
+        Speakers
+      </label>
       <p class="text-xs opacity-60">
         With timestamps the Whisper times each sentence, and the transcript can be saved as
         subtitles; without, each 30-second window is one piece. The model's own language is the
         one its checkpoint names, or else detected from the first window. The prompt is read as
         what was said just before the recording, so its spellings carry over. Nothing is kept on
-        the server.
+        the server. Speakers are told apart once the whole recording is heard, up to eight of
+        them, named A, B, … in the order they first speak.
       </p>
 
       <div class="flex items-center gap-2">
@@ -296,7 +304,7 @@
           {#each t.segments as s, i (i)}
             <p class="flex gap-3 text-sm">
               <span class="shrink-0 font-mono text-xs leading-5 opacity-50" title="{clock(s.start, '.')} → {clock(s.end, '.')}">{at(s.start)}</span>
-              <span>{s.text.trim()}</span>
+              <span>{#if s.speaker}<b class="mr-1">{s.speaker}:</b>{/if}{s.text.trim()}</span>
             </p>
           {/each}
         </div>

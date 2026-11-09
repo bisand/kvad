@@ -250,8 +250,10 @@ impl Server {
     /// that its segments are sentences: without them a segment is a whole
     /// 30-second window, and the windows meet with no gap to break at. The
     /// file is read as it is sent, never held whole. Stops between windows
-    /// once `stop` is set.
-    pub fn transcribe(&self, wav: &std::path::Path, model: &str, language: &str, pauses: &[(f64, f64)], stop: &AtomicBool, mut piece: impl FnMut(&str)) -> Res<String> {
+    /// once `stop` is set. With `speakers`, the server says who says what
+    /// once it has heard it all, and the text is in [`turns`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn transcribe(&self, wav: &std::path::Path, model: &str, language: &str, pauses: &[(f64, f64)], speakers: bool, stop: &AtomicBool, mut piece: impl FnMut(&str)) -> Res<String> {
         let boundary = format!("kvad-{:016x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         let mut head = String::new();
         let mut field = |name: &str, value: &str| {
@@ -263,6 +265,9 @@ impl Server {
         field("language", language);
         field("stream", "true");
         field("timestamps", "true");
+        if speakers {
+            field("diarize", "true");
+        }
         head += &format!("--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"take.wav\"\r\ncontent-type: audio/wav\r\n\r\n");
         let tail = format!("\r\n--{boundary}--\r\n");
         let file = std::fs::File::open(wav).map_err(|e| format!("The recording could not be read: {e}"))?;
@@ -304,6 +309,15 @@ impl Server {
                 }
                 Some("transcript.text.done") => {
                     let text = v["text"].as_str().unwrap_or_default();
+                    // With speakers, the segments again, each saying who.
+                    if let Some(said) = v["kvad"]["segments"].as_array() {
+                        let said: Vec<(f64, f64, String, String)> = said.iter().map(|s| {
+                            let time = |k: &str| s[k].as_f64().unwrap_or(0.0);
+                            let text = |k: &str| s[k].as_str().unwrap_or_default().to_string();
+                            (time("start"), time("end"), text("text"), text("speaker"))
+                        }).collect();
+                        return Ok(turns(&said, pauses));
+                    }
                     return Ok(if segments.is_empty() { text.to_string() } else { paragraphs(&segments, pauses) });
                 }
                 _ => {}
@@ -371,6 +385,23 @@ impl Write for Stream {
             Stream::Tunnel(s) => s.flush(),
         }
     }
+}
+
+/// A turn a paragraph, `A: …`, from segments that say who says them, with
+/// [`paragraphs`] inside a turn as without speakers.
+pub fn turns(segments: &[(f64, f64, String, String)], pauses: &[(f64, f64)]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < segments.len() {
+        let who = &segments[i].3;
+        let run: Vec<(f64, f64, String)> = segments[i..].iter().take_while(|s| &s.3 == who).map(|s| (s.0, s.1, s.2.clone())).collect();
+        i += run.len();
+        let text = paragraphs(&run, pauses);
+        if !text.is_empty() {
+            out.push(if who.is_empty() { text } else { format!("{who}: {text}") });
+        }
+    }
+    out.join("\n\n")
 }
 
 /// How far a pause may lie from the gap between two segments and still be
@@ -474,6 +505,16 @@ fn normalise(url: &str) -> Res<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A speaker's turn is a paragraph after their name, and a pause inside
+    /// it begins another.
+    #[test]
+    fn each_turn_is_a_paragraph_after_its_speaker() {
+        let seg = |a: f64, b: f64, t: &str, w: &str| (a, b, t.to_string(), w.to_string());
+        let said = [seg(0.0, 2.0, " Hei.", "A"), seg(2.0, 4.0, " Hvordan går det?", "A"), seg(4.2, 5.0, " Bra.", "B"), seg(5.0, 6.0, " Og du?", "A"), seg(9.0, 10.0, " Fint.", "A")];
+        assert_eq!(turns(&said, &[]), "A: Hei. Hvordan går det?\n\nB: Bra.\n\nA: Og du?\n\nFint.");
+        assert_eq!(turns(&[], &[]), "");
+    }
 
     #[test]
     fn a_gap_between_segments_begins_a_paragraph() {

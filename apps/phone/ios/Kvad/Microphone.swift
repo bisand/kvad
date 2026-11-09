@@ -11,8 +11,9 @@
 // microphone dot goes out when it ends. A call or Siri pauses the take, and
 // it carries on after; AirPods put in or taken out change the input, and
 // the converter is made again for it. A call that ends with Kvad in the
-// background cannot record again until Kvad is in front (the app has no
-// background audio), so the take stays paused until then.
+// background cannot record again until Kvad is in front (iOS lets the
+// `audio` background mode go on recording, not start again), so the take
+// stays paused until then.
 
 import AVFoundation
 import UIKit

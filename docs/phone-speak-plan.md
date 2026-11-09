@@ -306,9 +306,10 @@ Each is a PR, merged on a green check, as the SwiftUI move was.
      run, 2026-10-20). With them the segments are sentences, but their times
      are a guess: on a test recording with 3 s of silence between two
      sentences, nb-whisper-small's two segments met exactly, at 6.62 s. A
-     take kept before its pauses were has them found again in its file. A new speaker
-     would begin one too, once kvad can tell speakers apart
-     (docs/diarization-plan.md, *Speakers*, not built yet).
+     take kept before its pauses were has them found again in its file. With *Speakers*
+     on in the sheet, a take transcribed again asks the server to diarize
+     (docs/diarization-plan.md), and each speaker's turn is a paragraph
+     after their name, `A: …` (`api::turns`). Live text has no speakers.
    - **Conversations kept, as takes are.** Chat's conversations are kept on
      the phone (`chats.rs`, `Application Support/Chats`, the same protection
      and no backups), listed from the top left of the Chat tab, opened again

@@ -664,17 +664,20 @@ pub const ENDPOINTS: &[Endpoint] = &[
                       over each window's text.\n\n\
                       `response_format=diarized_json`, OpenAI's, says who says what: \
                       `segments`, each `{type, id, start, end, text, speaker}`, speakers \
-                      `A`, `B`, … in the order they are heard, and `text` a turn a line, \
+                      `A`, `B`, … in the order they are heard, and `text` a turn a paragraph, \
                       `A: …`. kvad's `diarize: true` does the same for every other \
                       format: `A: …` lines in `text`, `json` and `srt`, WebVTT's `<v A>` \
                       in `vtt`, and a `speaker` on each segment and word of \
                       `verbose_json`. The speakers are Nemotron-3-Diarization's, on the \
                       CPU, which tells up to eight people apart: `num_speakers` or \
-                      `max_speakers` over eight is refused. Not with `stream`.\n\n\
-                      kvad's own: `seed`, and `timestamps: true`, which decodes with \
-                      timestamp tokens whatever the format (`srt`, `vtt` and \
+                      `max_speakers` over eight is refused. With `stream`, the deltas have \
+                      no speakers, and `transcript.text.done` has them, its `kvad.segments` \
+                      each with a `speaker`.\n\n\
+                      kvad's own: `seed`, and `timestamps`, on unless it is `false`, \
+                      which decodes with timestamp tokens (`srt`, `vtt` and \
                       `verbose_json` always do). They change the words a Whisper writes, \
-                      not only how they are laid out.\n\n\
+                      not only how they are laid out, and without them the text has no \
+                      paragraphs: a blank line begins one wherever the speaker paused.\n\n\
                       `stream: true` answers with events, a delta as each 30 seconds is \
                       done. Nothing is kept: neither the recording nor its transcript. \
                       A Whisper runs on the CPU only, so a load names a cpu backend; with \

@@ -367,7 +367,7 @@ impl Speak {
     /// Take `id` transcribed again, whole, by `model` on the file endpoint:
     /// a better model than live could keep up with, or a take that never
     /// reached a Mac. Its transcript is replaced once the new one is in.
-    pub fn retranscribe(&self, server: Option<Server>, folder: &str, id: &str, model: &str, language: &str) {
+    pub fn retranscribe(&self, server: Option<Server>, folder: &str, id: &str, model: &str, language: &str, speakers: bool) {
         let fail = |e: &str| (self.emit)(event("retranscribe_failed", json!({ "id": id, "error": e })));
         let Some(server) = server else { return fail("Not connected to a server.") };
         if !plain(id) || self.take.lock().unwrap().as_ref().is_some_and(|t| t.id == id) {
@@ -387,7 +387,7 @@ impl Speak {
                 Some(p) => p.iter().filter_map(|p| Some((p[0].as_f64()?, p[1].as_f64()?))).collect(),
                 None => Quiet::of_file(&wav),
             };
-            let result = server.transcribe(&wav, &model, &language, &pauses, &stop, |piece| emit(event("retranscribe_piece", json!({ "id": id, "text": piece }))));
+            let result = server.transcribe(&wav, &model, &language, &pauses, speakers, &stop, |piece| emit(event("retranscribe_piece", json!({ "id": id, "text": piece }))));
             match result {
                 Ok(text) => {
                     let meta = wav.with_extension("json");
@@ -627,7 +627,9 @@ impl Live {
                 return Err("Cancelled.".into());
             }
             let pauses = self.take.quiet.lock().unwrap().seconds();
-            match self.server.transcribe(&self.take.wav, &self.take.model, &self.take.language, &pauses, &stop, |_| {}) {
+            // Speakers are for a take transcribed again: this is live's
+            // stand-in, and as quick as it can be.
+            match self.server.transcribe(&self.take.wav, &self.take.model, &self.take.language, &pauses, false, &stop, |_| {}) {
                 Ok(text) => return Ok(text),
                 Err(e) => last = e,
             }

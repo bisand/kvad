@@ -11,11 +11,13 @@
 // transcript lives in this store until the next one, which is long enough to
 // read, copy and download it, and survives a visit to another page.
 //
-// The downloads are written here from the segments rather than asked for
-// again, since asking again is listening again. `render` is
-// `kvad::speech::Transcript::render` (crates/llm/src/speech/transcribe.rs)
-// line for line, so a file saved here is the file `kvad transcribe` and the
-// server write for the same transcript.
+// The downloads are written here rather than asked for again, since asking
+// again is listening again. The text is the server's own, with its
+// paragraphs where the speaker paused (crates/llm/src/speech/paragraphs.rs),
+// and `render` writes the subtitles as `kvad::speech::Transcript::render`
+// (crates/llm/src/speech/transcribe.rs) does, line for line, so a file saved
+// here is the file `kvad transcribe` and the server write for the same
+// transcript.
 
 import { sse } from "./api.js";
 import { models } from "./models.svelte.js";
@@ -64,26 +66,26 @@ export function clock(seconds, comma) {
   return `${two(Math.floor(ms / 3_600_000))}:${two(Math.floor(ms / 60_000) % 60)}:${two(Math.floor(ms / 1000) % 60)}${comma}${String(ms % 1000).padStart(3, "0")}`;
 }
 
-/** Numbered (SRT) or bare (VTT) cues, one per segment. */
+/** Numbered (SRT) or bare (VTT) cues, one per segment, with who says it as
+ *  `A: …` (SRT) or WebVTT's `<v A>` when the segment has a speaker. */
 function cues(segments, comma, numbered) {
   let out = "";
   segments.forEach((s, i) => {
     if (numbered) out += `${i + 1}\n`;
-    out += `${clock(s.start, comma)} --> ${clock(s.end, comma)}\n${trim(s.text)}\n\n`;
+    const text = !s.speaker ? trim(s.text) : numbered ? `${s.speaker}: ${trim(s.text)}` : `<v ${s.speaker}>${trim(s.text)}`;
+    out += `${clock(s.start, comma)} --> ${clock(s.end, comma)}\n${text}\n\n`;
   });
   return out;
 }
 
 /**
- * The transcript in `format`: `text`, `srt` or `vtt`.
+ * The transcript's subtitles in `format`: `srt` or `vtt`.
  *
  * @param {{ start: number, end: number, text: string }[]} segments
- * @param {"text"|"srt"|"vtt"} format
+ * @param {"srt"|"vtt"} format
  */
 export function render(segments, format) {
   switch (format) {
-    case "text":
-      return `${trim(segments.map((s) => s.text).join(""))}\n`;
     case "srt":
       return cues(segments, ",", true);
     case "vtt":
@@ -107,11 +109,15 @@ class Transcribe {
   language = $state("");
   task = $state("transcribe");
   timestamps = $state(true);
+  /** Say who says what: the server's `diarize`, found once the whole
+   *  recording is heard. */
+  speakers = $state(false);
   prompt = $state("");
 
   /** Between the button and the last event. */
   running = $state(false);
-  /** Where a running one is: "loading", "sending", "listening". */
+  /** Where a running one is: "loading", "sending", "listening", or
+   *  "speakers" once every window is heard and who spoke is being found. */
   phase = $state(null);
   /** The run being shown: what was asked, and what has come back. */
   segments = $state([]);
@@ -169,7 +175,7 @@ class Transcribe {
     this.done = null;
     this.error = null;
     this.stopped = false;
-    this.asked = { task: this.task, timestamps: this.timestamps, name: this.file.name };
+    this.asked = { task: this.task, timestamps: this.timestamps, speakers: this.speakers, name: this.file.name };
     this.startedAt = Date.now();
     this.finishedAt = null;
     try {
@@ -191,6 +197,7 @@ class Transcribe {
       form.append("model", target);
       form.append("stream", "true");
       form.append("timestamps", String(this.timestamps));
+      if (this.speakers) form.append("diarize", "true");
       if (this.language) form.append("language", this.language);
       if (this.prompt.trim()) form.append("prompt", this.prompt.trim());
       form.append("file", this.file, this.file.name || "recording");
@@ -204,10 +211,13 @@ class Transcribe {
             this.segments = [...this.segments, ...d.kvad.segments];
             this.heard = d.kvad.done;
             this.total = d.kvad.total;
+            if (this.asked.speakers && d.kvad.done >= d.kvad.total) this.phase = "speakers";
           },
           "transcript.text.done": (data) => {
             const d = JSON.parse(data);
             this.done = { text: d.text, language: d.kvad.language, duration: d.kvad.duration };
+            // With speakers, the segments again, cut where the speaker changes.
+            if (d.kvad.segments) this.segments = d.kvad.segments;
             this.heard = this.total = d.kvad.duration;
           },
           error: (data) => {
@@ -246,7 +256,8 @@ class Transcribe {
 
   /** @param {"text"|"srt"|"vtt"} format */
   download(format) {
-    const blob = new Blob([render(this.segments, format)], { type: `${TYPES[format]};charset=utf-8` });
+    const body = format === "text" ? `${this.text}\n` : render(this.segments, format);
+    const blob = new Blob([body], { type: `${TYPES[format]};charset=utf-8` });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;

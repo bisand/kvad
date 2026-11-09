@@ -801,7 +801,7 @@ impl Transcriber {
             }
         }
 
-        let text = segments.iter().map(|s| s.text.as_str()).collect::<String>();
+        let text = super::paragraphs::paragraphs(&segments, &super::paragraphs::pauses(audio));
         Ok(Transcript { text, language: language.unwrap_or_else(|| "en".into()), duration, segments })
     }
 }
@@ -851,7 +851,7 @@ impl Transcript {
     /// The transcript in `format`. `task` is what `verbose_json` reports it
     /// was asked to do.
     ///
-    /// With speakers, each format says who: `text` and `json` a turn a line
+    /// With speakers, each format says who: `text` and `json` a turn a paragraph
     /// after its speaker, `A: …`; `srt` the same before each cue's text;
     /// `vtt` in WebVTT's voice span, `<v A>`; `verbose_json` a `speaker` on
     /// every segment and word. `diarized_json` is OpenAI's.
@@ -874,7 +874,8 @@ impl Transcript {
         self.segments.iter().any(|s| s.speaker.is_some())
     }
 
-    /// A turn a line, `A: …`: the segments one speaker says in a row, joined.
+    /// A turn a paragraph, `A: …`: the segments one speaker says in a row,
+    /// joined, and a blank line between turns.
     fn turns(&self) -> String {
         let mut lines: Vec<(&str, String)> = Vec::new();
         for s in &self.segments {
@@ -884,7 +885,7 @@ impl Transcript {
                 _ => lines.push((who, s.text.clone())),
             }
         }
-        lines.iter().map(|(w, t)| format!("{w}: {}", t.trim())).collect::<Vec<_>>().join("\n")
+        lines.iter().map(|(w, t)| format!("{w}: {}", t.trim())).collect::<Vec<_>>().join("\n\n")
     }
 
     /// OpenAI's `diarized_json` (`TranscriptionDiarized`).
@@ -1239,8 +1240,8 @@ mod tests {
             ],
         };
         let render = |f| tr.render(f, Task::Transcribe);
-        assert_eq!(render(Format::Text), "A: Hva synes du?\nB: Bra.\nA: Takk.\n");
-        assert_eq!(render(Format::Json), r#"{"text":"A: Hva synes du?\nB: Bra.\nA: Takk."}"#);
+        assert_eq!(render(Format::Text), "A: Hva synes du?\n\nB: Bra.\n\nA: Takk.\n");
+        assert_eq!(render(Format::Json), r#"{"text":"A: Hva synes du?\n\nB: Bra.\n\nA: Takk."}"#);
         assert_eq!(
             render(Format::Srt),
             "1\n00:00:00,000 --> 00:00:01,400\nA: Hva synes du?\n\n2\n00:00:02,000 --> 00:00:02,600\nB: Bra.\n\n3\n00:00:03,000 --> 00:00:04,000\nA: Takk.\n\n"
@@ -1252,7 +1253,7 @@ mod tests {
         assert_eq!(
             render(Format::DiarizedJson),
             concat!(
-                r#"{"task":"transcribe","duration":4.0,"text":"A: Hva synes du?\nB: Bra.\nA: Takk.","segments":["#,
+                r#"{"task":"transcribe","duration":4.0,"text":"A: Hva synes du?\n\nB: Bra.\n\nA: Takk.","segments":["#,
                 r#"{"type":"transcript.text.segment","id":"seg_0","start":0.0,"end":1.4,"text":"Hva synes du?","speaker":"A"},"#,
                 r#"{"type":"transcript.text.segment","id":"seg_1","start":2.0,"end":2.6,"text":"Bra.","speaker":"B"},"#,
                 r#"{"type":"transcript.text.segment","id":"seg_2","start":3.0,"end":4.0,"text":"Takk.","speaker":"A"}]}"#,

@@ -19,13 +19,19 @@
 //! kept. It tells up to eight people apart, so `num_speakers` or
 //! `max_speakers` above eight is refused, saying so; at eight or under they
 //! are read and need nothing more, as Nemotron counts its speakers itself.
-//! Speakers come once the whole recording is heard, so not with `stream`.
+//! Speakers come once the whole recording is heard: with `stream`, the
+//! windows come as they are heard, without them, and `transcript.text.done`
+//! carries the text with its speakers and, under `kvad`, the segments that
+//! say who.
 //!
-//! What OpenAI has no field for: `seed`, and `timestamps`, which asks for
-//! timestamp tokens whatever the format. They change what is written, not
-//! only how it is laid out — a Whisper decodes a window differently when it
-//! is timing it — and `srt`, `vtt` and `verbose_json` always ask for them,
-//! since their segments are timed.
+//! What OpenAI has no field for: `seed`, and `timestamps`, on unless it is
+//! `false`, which decodes with timestamp tokens. They change what is
+//! written, not only how it is laid out — a Whisper decodes a window
+//! differently when it is timing it. Without them a segment is a whole
+//! 30-second window, and the text has no paragraphs (`speech::paragraphs`):
+//! the gaps between segments are where a pause can begin one. They cost
+//! about 5% on nb-whisper-small. `srt`, `vtt` and `verbose_json` always
+//! decode with them, since their segments are timed.
 //!
 //! `stream: true` answers with OpenAI's events for a streamed transcription,
 //! `transcript.text.delta` as each 30-second window is done and
@@ -129,9 +135,6 @@ impl Asked {
             }
         }
         let stream = f.flag("stream")?.unwrap_or(false);
-        if diarize && stream {
-            return Err(Fail::bad("speakers are found once the whole recording is heard: leave out stream, or diarize"));
-        }
         let timed = diarize || matches!(format, Format::Srt | Format::Vtt | Format::VerboseJson);
         let mut words = false;
         for g in f.texts(&["timestamp_granularities[]", "timestamp_granularities"]) {
@@ -147,7 +150,7 @@ impl Asked {
         let request = Request {
             language: f.text(&["language"]).map(|l| l.trim().to_ascii_lowercase()),
             task,
-            timestamps: timed || f.flag("timestamps")?.unwrap_or(false),
+            timestamps: timed || f.flag("timestamps")?.unwrap_or(true),
             prompt: f.text(&["prompt"]),
             // 0 is where OpenAI's fallback starts; see the module docs.
             temperature: temperature.filter(|&t| t > 0.0),
@@ -202,7 +205,7 @@ async fn listen(who: Identity, headers: &HeaderMap, state: State, body: &[u8], t
 
     let (_, mut heard) = state.engine.transcribe(who.id, Entry::Request, &resident.key, audio, asked.request)?;
     if asked.stream {
-        return Ok(streamed(heard).into_response());
+        return Ok(streamed(heard, diarizer.zip(kept), asked.words).into_response());
     }
     let transcript = loop {
         match heard.recv().await {
@@ -244,11 +247,16 @@ fn diarizer() -> Result<std::sync::Arc<kvad::speech::nemotron::Nemotron>, Fail> 
     Ok(model)
 }
 
+/// Nemotron, and the audio it is to hear.
+type Diarizer = (std::sync::Arc<kvad::speech::nemotron::Nemotron>, Vec<f32>);
+
 /// OpenAI's streamed transcription: a delta a window, then the whole text.
+/// With `speakers`, the whole text says who, and its segments come with it
+/// under `kvad`.
 ///
 /// Dropping `heard`, which a client that hangs up does, is what tells the
 /// scheduler to stop after the window it is on.
-fn streamed(mut heard: tokio::sync::mpsc::Receiver<Heard>) -> impl IntoResponse {
+fn streamed(mut heard: tokio::sync::mpsc::Receiver<Heard>, mut speakers: Option<Diarizer>, words: bool) -> impl IntoResponse {
     let (events, rx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
         while let Some(h) = heard.recv().await {
@@ -266,11 +274,24 @@ fn streamed(mut heard: tokio::sync::mpsc::Receiver<Heard>) -> impl IntoResponse 
                     (sse("transcript.text.delta", &delta), false)
                 }
                 Heard::Done(t) => {
-                    let done = json!({
+                    let t = match speakers.take() {
+                        Some((model, audio)) => match tokio::task::spawn_blocking(move || kvad::speech::speakers::diarize(&t, &audio, &model, words, &mut |_, _| {})).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let _ = events.send(sse("error", &json!({ "error": format!("finding the speakers failed: {e}") }))).await;
+                                return;
+                            }
+                        },
+                        None => *t,
+                    };
+                    let mut done = json!({
                         "type": "transcript.text.done",
-                        "text": t.text.trim(),
+                        "text": t.render(Format::Text, Task::Transcribe).trim(),
                         "kvad": { "language": t.language, "duration": t.duration },
                     });
+                    if t.has_speakers() {
+                        done["kvad"]["segments"] = t.segments.iter().map(segment).collect::<Vec<_>>().into();
+                    }
                     (sse("transcript.text.done", &done), true)
                 }
                 Heard::Refused(why) | Heard::Failed(why) => (sse("error", &json!({ "error": why })), true),
@@ -286,6 +307,9 @@ fn streamed(mut heard: tokio::sync::mpsc::Receiver<Heard>) -> impl IntoResponse 
 /// A segment in a delta, with its words when they were asked for.
 fn segment(s: &kvad::speech::Segment) -> serde_json::Value {
     let mut v = json!({ "start": s.start, "end": s.end, "text": s.text });
+    if let Some(who) = &s.speaker {
+        v["speaker"] = who.as_str().into();
+    }
     if !s.words.is_empty() {
         v["words"] = s.words.iter().map(|w| json!({ "word": w.word.trim(), "start": w.start, "end": w.end })).collect::<Vec<_>>().into();
     }
@@ -320,25 +344,26 @@ mod tests {
         assert_eq!(a.model.as_deref(), Some("NbAiLab/nb-whisper-tiny"));
         assert_eq!(a.format, Format::Json);
         assert_eq!(a.file, ("talk.mp3".to_string(), b"ID3".to_vec()));
-        assert_eq!(a.request, Request { task: Task::Transcribe, ..Request::default() });
+        assert_eq!(a.request, Request { task: Task::Transcribe, timestamps: true, ..Request::default() });
         assert!(!a.stream);
     }
 
-    /// The timed formats decode with timestamps, as `kvad transcribe` does
-    /// for them, and `timestamps` asks for it for any other.
+    /// Every format decodes with timestamps, for the paragraphs, and
+    /// `timestamps=false` turns them off for those whose segments need no
+    /// times.
     #[test]
     fn the_formats_with_times_ask_for_timestamps() {
         for (format, timed) in [("json", false), ("text", false), ("srt", true), ("vtt", true), ("verbose_json", true)] {
             let a = Asked::read(&form(&[("file", Some("a.wav"), b"x"), ("response_format", None, format.as_bytes())]), Task::Transcribe).unwrap();
-            assert_eq!(a.request.timestamps, timed, "{format}");
+            assert!(a.request.timestamps, "{format}");
+            let off = Asked::read(&form(&[("file", Some("a.wav"), b"x"), ("response_format", None, format.as_bytes()), ("timestamps", None, b"false")]), Task::Translate).unwrap();
+            assert_eq!(off.request.timestamps, timed, "{format}, timestamps=false");
+            assert_eq!(off.request.task, Task::Translate);
         }
-        let a = Asked::read(&form(&[("file", Some("a.wav"), b"x"), ("timestamps", None, b"true")]), Task::Translate).unwrap();
-        assert!(a.request.timestamps);
-        assert_eq!(a.request.task, Task::Translate);
     }
 
     /// Speakers time every word, and say they were not asked for when only
-    /// speakers were; more than eight, or with a stream, is refused.
+    /// speakers were; more than eight is refused.
     #[test]
     fn speakers_are_asked_for_with_diarize_or_diarized_json() {
         let file = ("file", Some("a.wav"), &b"x"[..]);
@@ -352,8 +377,8 @@ mod tests {
         assert!(Asked::read(&form(&[file, ("diarize", None, b"true"), ("num_speakers", None, b"8")]), Task::Transcribe).is_ok());
         let nine = Asked::read(&form(&[file, ("diarize", None, b"true"), ("max_speakers", None, b"9")]), Task::Transcribe).unwrap_err();
         assert!(nine.1.contains("eight"), "{}", nine.1);
-        let streamed = Asked::read(&form(&[file, ("diarize", None, b"true"), ("stream", None, b"true")]), Task::Transcribe).unwrap_err();
-        assert!(streamed.1.contains("stream"), "{}", streamed.1);
+        let streamed = Asked::read(&form(&[file, ("diarize", None, b"true"), ("stream", None, b"true")]), Task::Transcribe).unwrap();
+        assert!(streamed.diarize && streamed.stream);
     }
 
     #[test]

@@ -549,7 +549,7 @@ fn a_take_transcribed_again_keeps_its_paragraphs() {
     assert!((from - 3.0).abs() <= 0.1 && (to - 6.0).abs() <= 0.1, "the pause kept was {from}–{to} s");
 
     let again = |rx: &mpsc::Receiver<Value>| {
-        s.retranscribe(Some(Server::new(&addr, None).unwrap()), dir.to_str().unwrap(), &id, "", "");
+        s.retranscribe(Some(Server::new(&addr, None).unwrap()), dir.to_str().unwrap(), &id, "", "", false);
         let events = until(rx, "retranscribe_done", 30);
         events.last().unwrap()["retranscribe_done"]["take"]["text"].as_str().unwrap().to_string()
     };
@@ -737,7 +737,7 @@ fn a_take_with_a_running_server() {
     assert!(first.is_some(), "nothing was settled before the end");
     kept(&dir, &take, audio.len() as u64);
 
-    s.retranscribe(server(), dir.to_str().unwrap(), take["id"].as_str().unwrap(), &model, "no");
+    s.retranscribe(server(), dir.to_str().unwrap(), take["id"].as_str().unwrap(), &model, "no", false);
     let events = until(&rx, "retranscribe_done", 120);
     let file = events.last().unwrap()["retranscribe_done"]["take"]["text"].as_str().unwrap().to_string();
     eprintln!("file: {file}");

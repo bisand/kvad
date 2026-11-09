@@ -27,6 +27,7 @@
 //!    rates, and the Hungarian algorithm they map speakers with.
 //! 8. [`nemotron`] — who spoke when: NVIDIA's Nemotron-3-Diarization, one
 //!    network that numbers up to eight speakers by when they first spoke.
+//! 9. [`paragraphs`] — a blank line in the text wherever the speaker paused.
 //!
 //! Every Whisper on the Hub in transformers' layout loads: OpenAI's own
 //! (`openai/whisper-*`), the distilled ones, and fine-tunes of them such as
@@ -42,6 +43,7 @@ pub mod audio;
 pub mod live;
 pub mod mel;
 pub mod nemotron;
+pub mod paragraphs;
 pub mod reference;
 pub mod score;
 pub mod speakers;

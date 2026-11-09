@@ -310,6 +310,11 @@ private struct SpeakSheet: View {
                     }
                 }
                 Section {
+                    Toggle("Speakers", isOn: $model.speakSpeakers)
+                } footer: {
+                    Text("When a take is transcribed again, say who says what: A, B, … in the order they first speak, up to eight. The live text has none, since speakers are told apart once the whole take is heard.")
+                }
+                Section {
                     Picker("Microphone", selection: $model.speakRoom) {
                         ForEach(Room.allCases, id: \.self) { Text($0.name).tag($0) }
                     }

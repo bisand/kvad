@@ -824,7 +824,9 @@ fn transcribe(args: Args) -> Res<()> {
     let req = Request {
         language: args.language.clone(),
         task,
-        timestamps,
+        // Always, for the paragraphs (`speech::paragraphs`): without them a
+        // segment is a whole window. `timestamps` is whether to print them.
+        timestamps: true,
         prompt: args.prompt.clone(),
         // OpenAI's meaning, as the server reads it: 0 is where the fallback
         // starts, not a temperature to keep to. The same command line is the

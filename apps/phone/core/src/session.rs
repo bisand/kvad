@@ -98,7 +98,7 @@ impl Session {
             "speak_cancel" => self.speak.cancel(),
             "takes" => self.speak.takes(&text("folder")),
             "take_delete" => self.speak.delete(&text("folder"), &text("id")),
-            "retranscribe" => self.speak.retranscribe(self.server(), &text("folder"), &text("id"), &text("model"), &text("language")),
+            "retranscribe" => self.speak.retranscribe(self.server(), &text("folder"), &text("id"), &text("model"), &text("language"), args["speakers"].as_bool().unwrap_or(false)),
             other => (self.emit)(event("error", json!({ "error": format!("No command is called {other}.") }))),
         }
     }

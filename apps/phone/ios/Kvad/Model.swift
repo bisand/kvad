@@ -122,6 +122,10 @@ final class AppModel {
     var speakPaused = false
     var speakModel = ""
     var speakLanguage = "no"
+    /// Whether a take transcribed again says who says what.
+    var speakSpeakers = UserDefaults.standard.bool(forKey: "speakSpeakers") {
+        didSet { UserDefaults.standard.set(speakSpeakers, forKey: "speakSpeakers") }
+    }
     var speakRoom = Room(rawValue: UserDefaults.standard.string(forKey: "speakRoom") ?? "") ?? .meeting {
         didSet { UserDefaults.standard.set(speakRoom.rawValue, forKey: "speakRoom") }
     }
@@ -325,7 +329,32 @@ final class AppModel {
         guard recording == .on || recording == .starting else { return }
         microphone.stop()
         recording = .finishing
+        // The take's last words come after the microphone is off, when iOS
+        // no longer counts Kvad as recording: a phone locked now would
+        // suspend it before they did.
+        hold("take")
         Core.send("speak_stop")
+    }
+
+    /// Time iOS gives work begun in front to finish behind a locked screen,
+    /// by name: "take" for a take's end, a take's id for its transcription.
+    ///
+    /// shortcut: iOS gives about 30 s, which covers a take's last words but
+    /// not a long take sent whole; past it the work fails and the take is
+    /// kept, to be transcribed again. Upgrade to a background URLSession
+    /// upload if long takes are sent with the phone locked.
+    private var grace: [String: UIBackgroundTaskIdentifier] = [:]
+
+    private func hold(_ name: String) {
+        guard grace[name] == nil else { return }
+        grace[name] = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            MainActor.assumeIsolated { self?.release(name) }
+        }
+    }
+
+    private func release(_ name: String) {
+        guard let id = grace.removeValue(forKey: name) else { return }
+        UIApplication.shared.endBackgroundTask(id)
     }
 
     func cancelTake() {
@@ -348,7 +377,8 @@ final class AppModel {
     /// up with.
     func transcribeAgain(_ take: Take) {
         again[take.id] = ""
-        Core.send("retranscribe", ["folder": folder, "id": take.id, "model": speakModel, "language": take.language.isEmpty ? speakLanguage : take.language])
+        hold(take.id)
+        Core.send("retranscribe", ["folder": folder, "id": take.id, "model": speakModel, "language": take.language.isEmpty ? speakLanguage : take.language, "speakers": speakSpeakers])
     }
 
     func audioURL(_ take: Take) -> URL {
@@ -526,6 +556,7 @@ final class AppModel {
             speakLink = state
             if !why.isEmpty { speakNotice = why }
         case let .speakDone(take):
+            release("take")
             recording = .idle
             takeStarted = nil
             takes.removeAll { $0.id == take.id }
@@ -533,12 +564,14 @@ final class AppModel {
             settled = ""
             partial = ""
         case let .speakFailed(e, kept):
+            release("take")
             if recording == .on || recording == .starting { microphone.stop() }
             recording = .idle
             takeStarted = nil
             speakError = e
             if kept { loadTakes() }
         case .speakCancelled:
+            release("take")
             recording = .idle
             takeStarted = nil
             settled = ""
@@ -550,9 +583,11 @@ final class AppModel {
         case let .retranscribePiece(id, text):
             again[id, default: ""] += text
         case let .retranscribeDone(take):
+            release(take.id)
             again[take.id] = nil
             if let i = takes.firstIndex(where: { $0.id == take.id }) { takes[i] = take }
         case let .retranscribeFailed(id, e):
+            release(id)
             again[id] = nil
             speakError = e
         case let .error(e):

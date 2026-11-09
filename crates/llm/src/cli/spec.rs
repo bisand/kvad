@@ -101,7 +101,7 @@ const TRANSCRIBE: &[Flag] = &[
     f("--model", "MODEL", Kind::Model(Want::Any), "the Whisper to use: a Hub repo id or a directory"),
     f("--language", "CODE", Kind::Text, "what is spoken, as no or en (default: the model's own, or detected); auto detects"),
     sw("--translate", "write it down in English, whatever is spoken"),
-    sw("--timestamps", "time each stretch of text (on for srt, vtt and verbose_json)"),
+    sw("--timestamps", "show each stretch of text's times as it is written"),
     sw("--words", "time every word as well, in verbose_json (its default with this)"),
     sw("--speakers", "say who says what, by Nemotron-3-Diarization (up to eight people)"),
     f(
@@ -392,7 +392,7 @@ pub const COMMANDS: &[Command] = &[
                 the words down while it comes: settled text to stdout, the guess at the rest\n\
                 dimmed after it on a terminal. It runs in this process; on the CPU only tiny\n\
                 keeps up with speech.\n\n\
-                --speakers says who says what: each turn a line after its speaker, A: …, as\n\
+                --speakers says who says what: each turn a paragraph after its speaker, A: …, as\n\
                 text, in WebVTT's <v A> as vtt, and a speaker on every segment and word in\n\
                 verbose_json. The speakers are found by Nemotron-3-Diarization, on the CPU,\n\
                 which tells up to eight people apart; with more, some are heard as others.",

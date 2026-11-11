@@ -62,6 +62,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("020-video-epilogue", include_str!("migrations/020-video-epilogue.sql")),
     ("021-request-owners", include_str!("migrations/021-request-owners.sql")),
     ("022-devices", include_str!("migrations/022-devices.sql")),
+    ("023-device-keys", include_str!("migrations/023-device-keys.sql")),
 ];
 
 #[derive(Clone)]
@@ -348,5 +349,38 @@ mod tests {
         conn.pragma_update(None, "user_version", 99).unwrap();
         let err = migrate(&conn).unwrap_err().to_string();
         assert!(err.contains("newer version"), "{err}");
+    }
+
+    /// Migration 023 binds keys to devices. A device paired before it keeps
+    /// its key, now marked as the device's, and an ordinary key stays one.
+    #[test]
+    fn device_keys_made_before_023_become_their_devices() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let before: Vec<_> = MIGRATIONS.iter().take_while(|(n, _)| *n != "023-device-keys").collect();
+        for (i, (_, sql)) in before.iter().enumerate() {
+            conn.execute_batch(&format!("BEGIN; {sql}; PRAGMA user_version = {}; COMMIT;", i + 1)).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO users (id, name, role) VALUES (1, 'ada', 'admin');
+             INSERT INTO api_keys (id, name, token_hash, prefix, user) VALUES (1, 'device: phone', 'a', 'a', 1), (2, 'laptop', 'b', 'b', 1);
+             INSERT INTO devices (id, node, name, user, api_key) VALUES (4, 'n', 'phone', 1, 1);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let owners: Vec<(i64, Option<i64>)> = conn
+            .prepare("SELECT id, device FROM api_keys ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(owners, [(1, Some(4)), (2, None)]);
+        // And the device takes its keys with it.
+        conn.execute("DELETE FROM devices WHERE id = 4", []).unwrap();
+        let left: i64 = conn.query_row("SELECT count(*) FROM api_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 1);
     }
 }

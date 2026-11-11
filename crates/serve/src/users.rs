@@ -54,6 +54,9 @@ pub struct ApiKey {
     pub name: String,
     pub prefix: String,
     pub user: i64,
+    /// The paired device it was made through, whose limits it has; see
+    /// `devices`. `None` for an ordinary key of the account's.
+    pub device: Option<i64>,
     pub created_at: String,
     pub last_used_at: Option<String>,
 }
@@ -358,7 +361,10 @@ pub fn sweep(db: &Db) -> Res<usize> {
 // ---------------------------------------------------------------------------
 
 /// Make a key. The token comes back once and is never recoverable.
-pub fn create_key(db: &Db, user: i64, name: &str) -> Res<(ApiKey, String)> {
+///
+/// With a `device`, the key belongs to that paired device as well as to the
+/// account, and is held to the device's limits; see `devices`.
+pub fn create_key(db: &Db, user: i64, device: Option<i64>, name: &str) -> Res<(ApiKey, String)> {
     let name = name.trim();
     if name.is_empty() {
         return Err("a key needs a name, so it can be told from the others".into());
@@ -366,8 +372,8 @@ pub fn create_key(db: &Db, user: i64, name: &str) -> Res<(ApiKey, String)> {
     let token = secret::token();
     let id = db.with(|c| {
         c.execute(
-            "INSERT INTO api_keys (name, token_hash, prefix, user) VALUES (?1, ?2, ?3, ?4)",
-            params![name, secret::fingerprint(&token), secret::prefix(&token), user],
+            "INSERT INTO api_keys (name, token_hash, prefix, user, device) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, secret::fingerprint(&token), secret::prefix(&token), user, device],
         )?;
         Ok(c.last_insert_rowid())
     })?;
@@ -381,7 +387,7 @@ pub fn create_key(db: &Db, user: i64, name: &str) -> Res<(ApiKey, String)> {
 pub fn keys(db: &Db, user: i64) -> Res<Vec<ApiKey>> {
     db.with(|c| {
         let mut q = c.prepare(
-            "SELECT id, name, prefix, user, created_at, last_used_at
+            "SELECT id, name, prefix, user, device, created_at, last_used_at
              FROM api_keys WHERE user = ?1 ORDER BY id",
         )?;
         let rows = q
@@ -391,6 +397,7 @@ pub fn keys(db: &Db, user: i64) -> Res<Vec<ApiKey>> {
                     name: r.get("name")?,
                     prefix: r.get("prefix")?,
                     user: r.get("user")?,
+                    device: r.get("device")?,
                     created_at: r.get("created_at")?,
                     last_used_at: r.get("last_used_at")?,
                 })
@@ -521,7 +528,7 @@ mod tests {
     fn a_key_is_shown_once_and_recognised_by_its_hash() {
         let db = seeded();
         let ada = by_name(&db, "ada").unwrap().unwrap();
-        let (key, token) = create_key(&db, ada.id, "laptop").unwrap();
+        let (key, token) = create_key(&db, ada.id, None, "laptop").unwrap();
         assert_eq!(key.prefix, token[..8]);
         assert!(key.last_used_at.is_none());
 
@@ -542,7 +549,7 @@ mod tests {
         let ada = by_name(&db, "ada").unwrap().unwrap();
         let bob = create(&db, "bob", Some("builder-2024"), "user", None).unwrap();
 
-        let (key, _) = create_key(&db, ada.id, "ada's").unwrap();
+        let (key, _) = create_key(&db, ada.id, None, "ada's").unwrap();
         assert!(!revoke_key(&db, bob.id, key.id).unwrap(), "bob revoked ada's key");
         assert!(keys(&db, bob.id).unwrap().is_empty());
 

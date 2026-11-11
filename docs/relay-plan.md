@@ -332,7 +332,9 @@ its API key gets that scope. A phone paired for transcription can transcribe
 and nothing else. Account and device management (creating users, minting
 keys, pairing further devices) is not reachable through the tunnel unless
 the owner turns it on for that device. A lost phone is then a lost
-microphone, not a lost admin account.
+microphone, not a lost admin account. A key a device makes for a program of
+its own (`kvad keys add` behind `kvad tunnel`) is not a way round that: it is
+the device's, with the device's limits, and goes when the device does.
 
 **The LAN record.** `_kvad-remote._udp` does not carry the node id in TXT.
 It carries a short tag derived from a secret shared at pairing and the

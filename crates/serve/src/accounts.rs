@@ -325,6 +325,10 @@ pub struct NewKey {
 }
 
 /// Make a key. The token is in the answer and nowhere else, ever again.
+///
+/// Asked for through a paired device, the key is that device's: it has the
+/// device's limits (`devices`), not the account's reach, or asking for a key
+/// would be a way out of them.
 pub async fn create_key(
     who: Identity,
     St(state): St<State>,
@@ -336,8 +340,9 @@ pub async fn create_key(
         ));
     };
     let db = state.db.clone();
-    let (key, token) =
-        blocking(move || users::create_key(&db, id, &body.name)).await.map_err(|e| Fail::bad(e.1))?;
+    let (key, token) = blocking(move || users::create_key(&db, id, who.device, &body.name))
+        .await
+        .map_err(|e| Fail::bad(e.1))?;
     Ok(Json(json!({ "key": key, "token": token })))
 }
 

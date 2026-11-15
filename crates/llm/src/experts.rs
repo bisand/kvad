@@ -438,6 +438,14 @@ impl Cache {
     pub fn slot(&self, key: u32) -> Option<usize> {
         self.at.get(&key).copied()
     }
+
+    /// Drop `key`, whose slot was reserved and then never filled.
+    pub fn forget(&mut self, key: u32) {
+        if let Some(slot) = self.at.remove(&key) {
+            self.key[slot] = u32::MAX;
+            self.used[slot] = 0;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +481,8 @@ struct Slots {
     /// guarantees no weight still reading an evicted expert sees it change.
     slabs: Vec<std::sync::Arc<crate::qcache::Slab>>,
     bytes: u64,
+    /// Of `bytes`, those read ahead on a guess.
+    ahead: u64,
 }
 
 impl Resident {
@@ -548,6 +558,7 @@ impl Resident {
                 lru: Cache::new(slots),
                 slabs: (0..slots).map(|_| std::sync::Arc::new(crate::qcache::Slab::new())).collect(),
                 bytes: 0,
+                ahead: 0,
             }),
             store,
             fetcher,
@@ -568,6 +579,11 @@ impl Resident {
         self.slots.lock().unwrap_or_else(|p| p.into_inner()).lru.capacity()
     }
 
+    /// Bytes read ahead on a guess so far.
+    pub fn ahead(&self) -> u64 {
+        self.slots.lock().unwrap_or_else(|p| p.into_inner()).ahead
+    }
+
     /// Hits and misses so far.
     pub fn stats(&self) -> (u64, u64) {
         let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
@@ -583,15 +599,22 @@ impl Resident {
     /// every expert is the most recently wanted, and LRU evicts the rest
     /// first. Decode wants `top_k` at a time and is always one group; a long
     /// prefill can want every expert of the layer.
+    ///
+    /// `ahead` is a guess at another layer's experts. Those missing are read
+    /// on another thread while the last group runs, so that when that layer
+    /// asks they are hits. Not counted as hits or misses -- the asking is --
+    /// and skipped when the cache cannot hold them beside the group running.
     pub fn with(
         &self,
         layer: usize,
         experts: &[usize],
+        ahead: Option<(usize, &[usize])>,
         mut run: impl FnMut(&[(usize, &std::sync::Arc<crate::qcache::Slab>, u64)]),
     ) -> Res<()> {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         let group = slots.lru.capacity();
-        for chunk in experts.chunks(group) {
+        let last = experts.len().saturating_sub(1) / group.max(1);
+        for (c, chunk) in experts.chunks(group).enumerate() {
             let mut misses: Vec<(usize, Extent)> = Vec::new();
             let mut found: Vec<(usize, usize, Extent)> = Vec::with_capacity(chunk.len());
             for &expert in chunk {
@@ -627,11 +650,67 @@ impl Resident {
                 }
                 *bytes += self.fetcher.fetch_into(&mut jobs)?;
             }
-            let group: Vec<_> = found
-                .iter()
-                .map(|&(expert, slot, extent)| (expert, &slots.slabs[slot], extent.aligned().0))
-                .collect();
-            run(&group);
+            // The guessed experts' slabs, taken out of the cache while they
+            // are read so that the group can borrow the rest.
+            let mut early: Vec<(u32, usize, Extent, std::sync::Arc<crate::qcache::Slab>)> = Vec::new();
+            if let Some((later, guess)) = ahead.filter(|(_, g)| c == last && chunk.len() + g.len() <= group) {
+                let (hits, misses) = (slots.lru.hits, slots.lru.misses);
+                for &expert in guess {
+                    let Some(extent) = self.store.get(later, expert) else { continue };
+                    let key = (later * self.store.n_experts + expert) as u32;
+                    if slots.lru.touch(key) {
+                        continue;
+                    }
+                    let slot = slots.lru.slot(key).ok_or("expert cache: a key has no slot")?;
+                    let mut slab = std::mem::replace(&mut slots.slabs[slot], std::sync::Arc::new(crate::qcache::Slab::new()));
+                    if std::sync::Arc::get_mut(&mut slab).is_none() {
+                        slab = std::sync::Arc::new(crate::qcache::Slab::new());
+                    }
+                    std::sync::Arc::get_mut(&mut slab).ok_or("expert cache: slab is shared")?.reserve(extent.aligned().1);
+                    early.push((key, slot, extent, slab));
+                }
+                (slots.lru.hits, slots.lru.misses) = (hits, misses);
+            }
+            let read = std::thread::scope(|scope| {
+                let reading = (!early.is_empty()).then(|| {
+                    scope.spawn(|| {
+                        let mut jobs: Vec<(Extent, &mut [u8])> = early
+                            .iter_mut()
+                            .filter_map(|(_, _, extent, slab)| Some((*extent, std::sync::Arc::get_mut(slab)?.bytes_mut())))
+                            .collect();
+                        self.fetcher.fetch_into(&mut jobs).map_err(|e| e.to_string())
+                    })
+                });
+                let group: Vec<_> = found
+                    .iter()
+                    .map(|&(expert, slot, extent)| (expert, &slots.slabs[slot], extent.aligned().0))
+                    .collect();
+                run(&group);
+                reading.map(|r| r.join())
+            });
+            let read = match read {
+                None => Ok(0),
+                Some(Ok(read)) => read,
+                Some(Err(_)) => Err("a read ahead panicked".to_string()),
+            };
+            let ok = read.as_ref().is_ok();
+            for (key, slot, _, slab) in early {
+                slots.slabs[slot] = slab;
+                // A guess that was not read must not be found as a hit.
+                if !ok {
+                    slots.lru.forget(key);
+                }
+            }
+            match read {
+                Ok(n) => {
+                    slots.bytes += n;
+                    slots.ahead += n;
+                }
+                Err(e) => {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| eprintln!("expert cache: reading ahead failed: {e}"));
+                }
+            }
         }
         Ok(())
     }
@@ -688,10 +767,11 @@ impl Drop for Resident {
         let (h, m) = (slots.lru.hits, slots.lru.misses);
         if h + m > 0 {
             eprintln!(
-                "expert cache: {:.1}% hits ({h} of {}), {:.2} GB read",
+                "expert cache: {:.1}% hits ({h} of {}), {:.2} GB read, {:.2} GB of it ahead",
                 100.0 * h as f64 / (h + m) as f64,
                 h + m,
-                slots.bytes as f64 / 1e9
+                slots.bytes as f64 / 1e9,
+                slots.ahead as f64 / 1e9
             );
         }
     }

@@ -978,6 +978,9 @@ fn write_a_fixture_for_the_reference_implementation() {
 #[test]
 fn experts_read_off_the_disk_give_the_mapped_answer_exactly() {
     use kvad::qcache::{Mapped, Source};
+    // Off by default, and the read-ahead is what the four-slot case is for.
+    // Harmless to any test beside this one: the answer is the same either way.
+    kvad::model::ffn::set_guessing(true);
     for (flavour, tag) in [(Flavour::V2, "v2"), (Flavour::V3, "v3")] {
         let t = tiny(flavour);
         let base = std::env::temp_dir().join(format!("kvad-ds-{}-resident-{tag}", std::process::id()));
@@ -1004,28 +1007,34 @@ fn experts_read_off_the_disk_give_the_mapped_answer_exactly() {
             let model = deepseek::Model::load(&mapped, spec.clone()).unwrap();
             let mut kv = KvCache::new(&spec);
             let batch = model.forward_batch(&tokens, &mut kv);
-            let step = model.forward(4, &mut kv);
+            // Several steps, so that experts read ahead on a guess are run.
+            let step: Vec<Vec<f32>> = [4u32, 9, 2].iter().map(|&t| model.forward(t, &mut kv)).collect();
             let stats = mapped.experts().map(|r| {
                 // Not vacuous the other way either: an expert that could not
                 // be pointed at its slab runs from the mapping, and would
                 // agree for that reason alone.
                 assert_eq!(r.fallbacks(), 0, "{tag}: experts ran from the mapping");
-                r.stats()
+                (r.stats(), r.ahead())
             });
             (batch, step, stats)
         };
 
         let (want_batch, want_step, none) = run(None);
         assert_eq!(none, None, "{tag}: a cache nobody asked for");
-        for slots in [1, 3] {
+        // Four is half the store: room for a layer's two experts and a guess at
+        // the next layer's two, with evictions left to make the guess a read.
+        for slots in [1, 3, 4] {
             let (batch, step, stats) = run(Some(slots));
             assert_eq!(batch, want_batch, "{tag}, {slots} slot(s): prefill differs");
             assert_eq!(step, want_step, "{tag}, {slots} slot(s): decode differs");
             // Not vacuous: the experts really were read, not left to the mapping.
-            let (hits, misses) = stats.expect("the cache that was asked for is missing");
+            let ((hits, misses), ahead) = stats.expect("the cache that was asked for is missing");
             assert!(misses > 0, "{tag}, {slots} slot(s): nothing was read");
             if slots == 1 {
                 assert!(hits < misses, "{tag}: one slot cannot hit often");
+            }
+            if slots == 4 {
+                assert!(ahead > 0, "{tag}: nothing was read ahead");
             }
         }
         let _ = std::fs::remove_file(&weights);

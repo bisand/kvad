@@ -279,7 +279,7 @@ impl Model {
                 hs[i * e..(i + 1) * e]
                     .copy_from_slice(&rms_norm(&xs[i * e..(i + 1) * e], &block.mlp_norm, spec.eps));
             }
-            let mlp = block.mlp.run(&hs, m, e);
+            let mlp = block.mlp.run(&hs, m, e, self.blocks.get(l + 1).map(|b| &b.mlp));
             for (x, val) in xs.iter_mut().zip(mlp.iter()) {
                 *x += val;
             }
@@ -477,7 +477,7 @@ impl Transformer for Model {
 
             // ---- MLP sub-block -------------------------------------------
             let h = rms_norm(&x, &block.mlp_norm, spec.eps);
-            let mlp = block.mlp.run_one(&h, spec.n_embd);
+            let mlp = block.mlp.run_one(&h, spec.n_embd, self.blocks.get(l + 1).map(|b| &b.mlp));
             for (xi, m) in x.iter_mut().zip(mlp.iter()) {
                 *xi += m; // residual
             }

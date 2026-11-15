@@ -852,7 +852,7 @@ impl Transformer for Model {
             }
 
             let h = rms_norm(&x, &block.mlp_norm, spec.eps);
-            let mlp = block.mlp.run_one(&h, e);
+            let mlp = block.mlp.run_one(&h, e, self.blocks.get(l + 1).map(|b| &b.mlp));
             for (xi, m) in x.iter_mut().zip(mlp.iter()) {
                 *xi += m;
             }

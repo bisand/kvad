@@ -482,7 +482,7 @@ impl Model {
                     spec.eps,
                 ));
             }
-            let out = block.mlp.run(&hs, m, e);
+            let out = block.mlp.run(&hs, m, e, self.blocks.get(l + 1).map(|b| &b.mlp));
             for (x, v) in xs.iter_mut().zip(out.iter()) {
                 *x += v;
             }

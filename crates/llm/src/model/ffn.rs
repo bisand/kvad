@@ -494,6 +494,25 @@ pub struct Moe {
     /// Where to read the routed experts from instead of the mapping, when a
     /// cache for them was asked for. Shared by every layer of the model.
     pub resident: Option<std::sync::Arc<crate::experts::Resident>>,
+    /// The experts the layer below guessed this one would want, to score
+    /// against what it does want.
+    pub guessed: std::sync::Mutex<Vec<usize>>,
+}
+
+/// How often a layer's guess at the next layer's experts was right, over the
+/// whole process. Said on stderr when the model is dropped, as the expert
+/// cache's hits are.
+static GUESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Drop for Moe {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (g, r) = (GUESSED.swap(0, Relaxed), RIGHT.swap(0, Relaxed));
+        if g > 0 {
+            eprintln!("expert guess: {:.1}% right ({r} of {g})", 100.0 * r as f64 / g as f64);
+        }
+    }
 }
 
 impl Moe {
@@ -517,7 +536,19 @@ impl Moe {
             shared: SharedExpert::load(src, prefix, shared)?,
             layer: layer_of(prefix),
             resident: src.experts(),
+            guessed: Default::default(),
         })
+    }
+
+    /// The experts this layer's router would pick for `logits`, which were
+    /// computed from an earlier layer's input. Noted for scoring, if the
+    /// guesses are being scored.
+    fn guess(&self, logits: &[f32]) -> Vec<usize> {
+        let mut picks = Vec::with_capacity(self.router.top_k);
+        self.router.route(logits, self.bias.as_deref(), &mut picks);
+        let guess: Vec<usize> = picks.iter().map(|p| p.0).collect();
+        *self.guessed.lock().unwrap_or_else(|p| p.into_inner()) = guess.clone();
+        guess
     }
 
     /// The router's logits for one token and, when this family has a shared
@@ -531,8 +562,15 @@ impl Moe {
     ///
     /// `None` when a weight is not quantised, and the caller does both the
     /// ordinary way.
-    fn early(&self, x: &[f32]) -> Option<(Vec<f32>, Option<Pending<'_>>)> {
+    ///
+    /// `next` is a later layer whose router should read `x` too, for a guess
+    /// at its experts; its logits come back last.
+    #[allow(clippy::type_complexity)]
+    fn early(&self, x: &[f32], next: Option<&Moe>) -> Option<(Vec<f32>, Option<Pending<'_>>, Option<Vec<f32>>)> {
         let mut jobs: Vec<(&Weight, &[f32])> = vec![(&self.gate, x)];
+        if let Some(next) = next {
+            jobs.push((&next.gate, x));
+        }
         if let Some(s) = &self.shared {
             jobs.push((&s.ffn.gate, x));
             jobs.push((&s.ffn.up, x));
@@ -542,6 +580,10 @@ impl Moe {
         }
         let mut ys = crate::quant::matvec_many(&jobs)?.into_iter();
         let logits = ys.next()?;
+        let ahead = match next {
+            Some(_) => Some(ys.next()?),
+            None => None,
+        };
         let shared = match &self.shared {
             None => None,
             Some(s) => {
@@ -554,7 +596,7 @@ impl Moe {
                 Some(Pending { down: &s.ffn.down, hidden, score })
             }
         };
-        Some((logits, shared))
+        Some((logits, shared, ahead))
     }
 
     /// The mixture, over a batch.
@@ -564,15 +606,23 @@ impl Moe {
     /// experts however you slice it — but walking tokens would read each
     /// chosen expert's weights again for every token that chose it, and
     /// walking experts reads each one once.
-    pub fn run(&self, hs: &[f32], m: usize, e: usize) -> Vec<f32> {
+    ///
+    /// `next` is the mixture one block up. Decoding one token, its router
+    /// reads this layer's input as well, and the experts it picks there are
+    /// read ahead while this layer computes: the residual stream changes
+    /// little in one block, so the guess is mostly right, and a wrong one
+    /// costs a read, never the answer. Off unless `KVAD_EXPERT_GUESS=1`.
+    pub fn run(&self, hs: &[f32], m: usize, e: usize, next: Option<&Moe>) -> Vec<f32> {
         let router = &self.router;
         let n = router.n_experts;
+        let next = next.filter(|_| m == 1 && guessing());
         // One token: the router and the shared expert read the same input
         // and neither needs the other, so they are one parallel section.
-        let (logits, mut shared) = match (m == 1 && together()).then(|| self.early(hs)).flatten() {
-            Some((logits, shared)) => (logits, shared),
-            None => (self.gate.matmul_bt(hs, m, None), None),
+        let (logits, mut shared, ahead) = match (m == 1 && together()).then(|| self.early(hs, next)).flatten() {
+            Some(all) => all,
+            None => (self.gate.matmul_bt(hs, m, None), None, next.map(|x| x.gate.matvec_bt(hs, None))),
         };
+        let ahead: Option<(&Moe, Vec<usize>)> = next.zip(ahead).map(|(x, logits)| (x, x.guess(&logits)));
 
         let mut picks = Vec::with_capacity(router.top_k);
         let mut by_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
@@ -599,11 +649,32 @@ impl Moe {
             None => vec![0.0f32; m * e],
         };
         let chosen: Vec<usize> = (0..n).filter(|&x| !by_expert[x].is_empty()).collect();
+        if m == 1 {
+            let guessed = std::mem::take(&mut *self.guessed.lock().unwrap_or_else(|p| p.into_inner()));
+            if !guessed.is_empty() {
+                use std::sync::atomic::Ordering::Relaxed;
+                GUESSED.fetch_add(guessed.len() as u64, Relaxed);
+                RIGHT.fetch_add(guessed.iter().filter(|x| chosen.contains(x)).count() as u64, Relaxed);
+            }
+        }
+        // Mapped, the kernel reads the guess while this layer computes. Into
+        // the cache, `Resident::with` does.
+        if let (None, Some((next, guess))) = (&self.resident, &ahead) {
+            if hint() {
+                for &x in guess {
+                    let ffn = &next.experts[x];
+                    ffn.gate.will_need();
+                    ffn.up.will_need();
+                    ffn.down.will_need();
+                }
+            }
+        }
+        let ahead = ahead.as_ref().map(|(next, guess)| (next.layer, guess.as_slice()));
         let mut done = vec![false; n];
         if let Some(resident) = &self.resident {
             // The same arithmetic on the same bytes, read by us rather than
             // paged in. A weight that cannot be rebased runs as mapped.
-            let read = resident.with(self.layer, &chosen, |group| {
+            let read = resident.with(self.layer, &chosen, ahead, |group| {
                 let views: Vec<Option<Ffn>> =
                     group.iter().map(|&(x, slab, lo)| self.experts[x].rebased(lo, slab)).collect();
                 let pairs: Vec<(usize, &Ffn)> = group
@@ -777,6 +848,30 @@ fn hint() -> bool {
     *ON.get_or_init(|| !matches!(std::env::var("KVAD_EXPERT_WILLNEED").as_deref(), Ok("0") | Ok("false")))
 }
 
+/// Whether a decoding layer guesses the next one's experts and reads them
+/// ahead. Off unless `KVAD_EXPERT_GUESS=1`: right 88% of the time, and no
+/// faster for it -- see [`crate::residency`].
+fn guessing() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match GUESS.load(Relaxed) {
+        0 => {
+            let on = matches!(std::env::var("KVAD_EXPERT_GUESS").as_deref(), Ok("1") | Ok("true"));
+            GUESS.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+        g => g == 2,
+    }
+}
+
+/// 0 for not yet read from the environment, 1 off, 2 on.
+static GUESS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Turn guessing on or off for the whole process, whatever the environment
+/// says. For a test, which cannot set a variable before another test reads it.
+pub fn set_guessing(on: bool) {
+    GUESS.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether a token's experts run as one batch. `KVAD_EXPERTS_ONE_BY_ONE=1`
 /// puts back the path this replaced, so the two are one flag apart.
 fn together() -> bool {
@@ -787,11 +882,22 @@ fn together() -> bool {
 }
 
 impl Mlp {
-    /// A batch of tokens. Prefill, and scoring.
-    pub fn run(&self, hs: &[f32], m: usize, e: usize) -> Vec<f32> {
+    /// A batch of tokens. Prefill, and scoring -- and decode, for a model that
+    /// decodes as a batch of one.
+    ///
+    /// `next` is the block above's, for a mixture to guess its experts; see
+    /// [`Moe::run`].
+    pub fn run(&self, hs: &[f32], m: usize, e: usize, next: Option<&Mlp>) -> Vec<f32> {
         match self {
             Mlp::Dense(ffn) => ffn.run(hs, m),
-            Mlp::Moe(moe) => moe.run(hs, m, e),
+            Mlp::Moe(moe) => moe.run(hs, m, e, next.and_then(Mlp::moe)),
+        }
+    }
+
+    fn moe(&self) -> Option<&Moe> {
+        match self {
+            Mlp::Moe(moe) => Some(moe),
+            Mlp::Dense(_) => None,
         }
     }
 
@@ -801,10 +907,10 @@ impl Mlp {
     /// batched expert path, which is a batch of one per chosen expert however
     /// it is spelled. Worth revisiting when a mixture is the thing being
     /// decoded rather than the thing being loaded.
-    pub fn run_one(&self, x: &[f32], e: usize) -> Vec<f32> {
+    pub fn run_one(&self, x: &[f32], e: usize, next: Option<&Mlp>) -> Vec<f32> {
         match self {
             Mlp::Dense(ffn) => ffn.run_one(x),
-            Mlp::Moe(moe) => moe.run(x, 1, e),
+            Mlp::Moe(moe) => moe.run(x, 1, e, next.and_then(Mlp::moe)),
         }
     }
 
@@ -893,6 +999,7 @@ mod tests {
                 }),
                 layer: 0,
                 resident: None,
+                guessed: Default::default(),
             };
             let x = mat(1, hidden).data;
 
@@ -911,11 +1018,11 @@ mod tests {
             }
             // Not vacuous: the folded path is the one that ran, and it carried
             // the shared expert out with it where there is one.
-            let (_, pending) = moe
-                .early(&x)
+            let (_, pending, _) = moe
+                .early(&x, None)
                 .unwrap_or_else(|| panic!("{kind}: the router and shared expert did not batch"));
             assert_eq!(pending.is_some(), moe.shared.is_some(), "shared expert: {kind}");
-            assert_eq!(moe.run(&x, 1, hidden), want, "shared expert: {kind}");
+            assert_eq!(moe.run(&x, 1, hidden, None), want, "shared expert: {kind}");
         }
     }
 

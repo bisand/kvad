@@ -218,6 +218,34 @@
 //! where the cache measured best. A fit with no room to spare is not a fit,
 //! and the rule does not yet know where the room runs out.
 //!
+//! # Guessing the next layer's experts
+//!
+//! Belady sits seventeen points above LRU, so foresight has room to pay.
+//! The cheap kind: run layer `l + 1`'s router on layer `l`'s input and read
+//! what it picks while layer `l` computes (`Moe::run`, `KVAD_EXPERT_GUESS=1`).
+//! On Qwen3-30B at q8 the guess is right 87.6% of the time, and with a 16 GB
+//! cache it lifts hits from 92.1% to 94.7%, cutting misses by a third, for
+//! 16.6 GB read ahead per 200 tokens -- 5.3 GB more read in all.
+//!
+//! It did not make a token faster. Interleaved, 200 tokens, three pairs in
+//! each order on AC power:
+//!
+//! ```text
+//!                      guess run second         guess run first
+//!   16 GB  off     17.2  18.4  13.2         14.3  15.3  15.5   tok/s
+//!   16 GB  on      18.2  19.7  13.4         18.1  14.1  14.7
+//!   mmap   off     15.3  17.7  16.0         14.3  14.7  15.0
+//!   mmap   on      14.9  16.6  10.7         13.6  12.9  13.5
+//! ```
+//!
+//! With the cache, whichever ran second won, so the order was the effect
+//! and the guess was within it. Mapped, the guess lost in both orders, by
+//! about 8%: `madvise(WILLNEED)` on a wrong guess reads 0.2 GB a token into
+//! a page cache with no room, evicting what the next token wants. Either
+//! way the cause is the one this file already found -- the misses are a
+//! few milliseconds of a token that spends most of itself in matvecs --
+//! so it stays off, and is one flag from its A/B.
+//!
 //! # What a line means
 //!
 //! ```text

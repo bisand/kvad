@@ -1001,6 +1001,26 @@ impl Checkpoint {
         Ok(data)
     }
 
+    /// An integer tensor's raw 32-bit words, and its shape; `Ok(None)` if the
+    /// checkpoint does not have it.
+    ///
+    /// For tensors that are not numbers to be widened but bits to be kept:
+    /// LittleBit's packed signs, stored as `int32` because that is the widest
+    /// integer PyTorch will save without a sign. A 64-bit tensor comes back as
+    /// two words per value, low half first, which is what a little-endian file
+    /// holds. See [`crate::littlebit::read`].
+    pub fn read_words(&self, name: &str) -> Res<Option<(Vec<usize>, Vec<u32>)>> {
+        let Some(key) = self.resolve(name) else { return Ok(None) };
+        let st = SafeTensors::deserialize(&self.maps[self.index[key]])?;
+        let view = st.tensor(key)?;
+        if !matches!(view.dtype(), Dtype::I32 | Dtype::U32 | Dtype::I64 | Dtype::U64) {
+            return Err(format!("`{name}` is {:?}, not a tensor of integer words", view.dtype()).into());
+        }
+        let words =
+            view.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        Ok(Some((view.shape().to_vec(), words)))
+    }
+
     /// For 1-D tensors, where the shape is noise.
     pub fn get_flat(&self, name: &str) -> Res<Vec<f32>> {
         Ok(self.get(name)?.data)

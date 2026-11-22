@@ -896,11 +896,33 @@ impl<'a> Reader<'a> {
         name: &str,
     ) -> candle_core::Result<Tensor> {
         self.record(name);
-        let w = self.vb.get(shape, name)?;
+        let w = self.vb.get(shape, name).map_err(|e| self.why_missing(name, e))?;
         match &self.lora {
             Some(l) => l.fuse(&self.full(name), w),
             None => Ok(w),
         }
+    }
+
+    /// The error for a weight that could not be read, saying why when the
+    /// reason is that the checkpoint stores it as LittleBit factors.
+    ///
+    /// Those run on the CPU backend only (see `docs/littlebit-plan.md`), and
+    /// "cannot find tensor q_proj.weight" about a file whose `q_proj` is
+    /// sitting right there would send someone looking in the wrong place.
+    fn why_missing(&self, name: &str, e: candle_core::Error) -> candle_core::Error {
+        let factors = match name.strip_suffix("weight") {
+            Some("") => "U_packed".to_string(),
+            Some(stem) if stem.ends_with('.') => format!("{stem}U_packed"),
+            _ => return e,
+        };
+        if self.vb.contains_tensor(&factors) {
+            return candle_core::Error::Msg(format!(
+                "`{}` is stored as LittleBit factors, which only the CPU backend runs: \
+                 load this model with --quant q8 (or f32, or q4) rather than on the GPU",
+                self.full(name)
+            ));
+        }
+        e
     }
 
     /// A depthwise convolution's filters, as `[channels, kernel]`.

@@ -16,6 +16,8 @@
 //! 5. [`chat`]    — why an instruction-tuned model needs exact marker tokens.
 //! 6. [`quant`]   — making the weights smaller, and the kernels that read
 //!    them, then [`qcache`] — doing that work once instead of every load.
+//!    [`littlebit`] is the step past one bit a weight: not the matrix, but
+//!    two matrices of signs that multiply out to it.
 //! 7. [`train`]   — `kvad train`, which is the `nervus` crate's training
 //!    loop with the models given names and a home.
 //! 8. [`service`] — the same engine driven from another thread, which is what
@@ -54,6 +56,7 @@ pub mod gguf;
 pub mod help;
 pub mod hub;
 pub mod image;
+pub mod littlebit;
 pub mod lora;
 pub mod machine;
 pub mod model;

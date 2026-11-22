@@ -168,12 +168,72 @@ published yet.
 
 ### 2. Measure it on the M5
 
-Every number above is from a cloud VM. Decode on the M5 Pro is the one the
-README quotes for everything else, and the one that says whether LittleBit
-is worth having: by the arithmetic, its decode is compute-bound where every
-other format's is memory-bound, so it should do relatively *better* on a
-machine with more cores per byte of bandwidth. That is a claim until it is a
-measurement.
+Measured 2026-11-22 on an M5 Pro (6 + 12 cores, 48 GB), CPU, same checkpoint,
+q8 embeddings and head, a 27-token prompt and 64 greedy tokens, four runs:
+
+| | |
+|---|---|
+| first load (reads the checkpoint, writes the cache) | 15.3 s, 4.57 GB peak footprint |
+| later loads (maps the cache) | 0.1 s, 176 MB footprint, 1.4 GB resident |
+| prefill, 27 tokens | 1.13 – 1.18 s |
+| decode, default threads | 10.6 – 11.1 tok/s |
+
+Decode by `KVAD_THREADS`, two runs each:
+
+| threads | decode, tok/s | system time, s |
+|---|---|---|
+| 4 | 6.7 – 6.8 | 1.2 – 1.5 |
+| 6 | 8.0 – 8.1 | 4.7 – 4.8 |
+| 8 | 8.6 – 8.8 | 9.9 |
+| 12 | 8.4 – 9.9 | 18.5 – 19.7 |
+| 18 | 9.4 – 10.1 | 36.9 |
+
+Going from 4 threads to 18 buys 1.5x while system time grows about 25x, so
+this does not yet show the compute-bound scaling the arithmetic predicted.
+There is no dense or q4 Qwen3-8B on this machine to compare with, so whether
+LittleBit is *faster* than the other formats here is still open. The numpy
+check and the perplexity were not repeated on this machine.
+
+**Where the system time goes.** `sample` during decode puts it in `swtch_pri`,
+rayon's idle workers yielding while they wait for work. It is a symptom of
+waiting rather than a cost of its own:
+
+| threads | in `signed_sum` | yielding | sleeping |
+|---|---|---|---|
+| 4 | 86% | 2 – 4% | 2 – 3% |
+| 14 (default) | 40 – 53% | 28 – 43% | 4 – 11% |
+
+Cutting each section into 2, 4, 8 or 16 times as many tasks, so fast cores
+could steal from slow ones, changed decode by less than the run-to-run spread
+(four interleaved rounds), so uneven chunks are not the cause.
+
+**What they wait for is the start and end of each parallel section.** A token
+makes 252 projections, so 504 sections. Timers inside every task, in ms per
+token:
+
+| threads | token | arithmetic, if perfectly shared | waiting inside sections | outside sections |
+|---|---|---|---|---|
+| 4 | 141.3 | 123.3 | 6.3 | 11.7 |
+| 6 | 108.9 | 87.0 | 11.9 | 10.0 |
+| 14 | 91.3 | 41.2 | 41.1 | 9.0 |
+
+At 14 threads the average section's last task starts 51 µs after the section
+opens, and the section closes 25 µs after its last task ends, against about
+80 µs of arithmetic per task. Those two delays are 39 of the 41 ms. Workers
+also miss sections: each of 13 ran about 97% of its share, and the first
+worker picked up the rest.
+
+Removing all of the wait would take a token to about 50 ms, or 20 tok/s. That
+is a ceiling, not a projection.
+
+**Merging sections did not reach it.** Running Q, K and V as one job, and gate
+and up as another, cuts a token from 504 sections to 288. If each section had
+a fixed 76 µs price that would save about 16 ms a token. Eight alternating
+rounds of the old and new builds measured no gain: median 10.14 tok/s before,
+10.02 after, paired ratios from 0.89 to 1.05, and the text identical in every
+round. So the wait is not a fixed price per section. It grows with the work
+in the section, and what causes that is still not identified. The merge was
+not kept.
 
 ### 3. Prefill on the matrix units
 

@@ -1063,6 +1063,13 @@ mod tests {
         assert_eq!(Router::count(&config(json!({ "hidden_size": 2048 }))), None);
     }
 
+    #[test]
+    fn a_mixture_reads_its_prompt_in_bigger_passes() {
+        assert_eq!(crate::model::prefill_chunk_for(&config(json!({ "num_experts": 128 }))), 512);
+        assert_eq!(crate::model::prefill_chunk_for(&config(json!({ "num_experts": 0 }))), 64);
+        assert_eq!(crate::model::prefill_chunk_for(&config(json!({ "hidden_size": 2048 }))), 64);
+    }
+
     /// DeepSeek asks `layer % freq` and Qwen3 asks `(layer + 1) % step`, so at
     /// a period of two they route on opposite layers.
     ///

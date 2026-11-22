@@ -32,6 +32,7 @@
 //! production formats do. f32 is kept here because it is one less thing in the
 //! way.)
 
+use crate::littlebit::Factored;
 use crate::qcache::Store;
 use crate::tensor::{gemm_bt, matvec_bt, Tensor};
 use rayon::prelude::*;
@@ -124,6 +125,11 @@ enum Data {
     Q8 { scales: Store<f32>, qs: Store<i8> },
     /// Two 4-bit values per byte, one `f32` scale per block.
     Q4 { scales: Store<f32>, qs: Store<u8> },
+    /// Not the matrix at all, but LittleBit factors of it: two matrices of
+    /// signs and the vectors that scale them. See [`crate::littlebit`].
+    ///
+    /// Boxed because it is several arrays, and every other variant is two.
+    Bits(Box<Factored>),
 }
 
 /// The shape checks a quantised weight has to satisfy: one scale per block,
@@ -146,6 +152,7 @@ pub enum Parts<'a> {
     F32(&'a [f32]),
     Q8 { scales: &'a [f32], qs: &'a [i8] },
     Q4 { scales: &'a [f32], qs: &'a [u8] },
+    Bits(&'a Factored),
 }
 
 /// Pass 1 for one 4-bit weight row: `out[b]` is block `b`'s integer dot.
@@ -307,7 +314,7 @@ impl Weight {
             Data::Q4 { scales, qs } => {
                 Data::Q4 { scales: scales.rebased(lo, slab)?, qs: qs.rebased(lo, slab)? }
             }
-            Data::F32(_) => return None,
+            Data::F32(_) | Data::Bits(_) => return None,
         };
         Some(Weight { rows: self.rows, cols: self.cols, data })
     }
@@ -324,6 +331,7 @@ impl Weight {
                 scales.will_need();
                 qs.will_need();
             }
+            Data::Bits(f) => f.will_need(),
             Data::F32(_) => {}
         }
     }
@@ -332,12 +340,25 @@ impl Weight {
         Weight { rows: t.rows, cols: t.cols, data: Data::F32(t) }
     }
 
+    /// A weight stored as LittleBit factors. No precision applies to it: the
+    /// factors are already as small as they are going to get, and what is
+    /// left in them that is not a sign is a few vectors kept at f32.
+    pub fn from_factored(f: Factored) -> Weight {
+        Weight { rows: f.rows(), cols: f.cols(), data: Data::Bits(Box::new(f)) }
+    }
+
+    /// Whether this is LittleBit factors rather than a matrix.
+    pub fn is_factored(&self) -> bool {
+        matches!(self.data, Data::Bits(_))
+    }
+
     /// The arrays behind this weight, ready to be written to disk.
     pub fn parts(&self) -> Parts<'_> {
         match &self.data {
             Data::F32(t) => Parts::F32(&t.data),
             Data::Q8 { scales, qs } => Parts::Q8 { scales, qs },
             Data::Q4 { scales, qs } => Parts::Q4 { scales, qs },
+            Data::Bits(f) => Parts::Bits(f),
         }
     }
 
@@ -349,9 +370,14 @@ impl Weight {
         self.cols
     }
 
+    /// The precision this weight was quantised to.
+    ///
+    /// LittleBit factors report [`Precision::F32`], which is the precision
+    /// their arithmetic runs at and the only one of the three that does not
+    /// claim a rounding they never had; [`Weight::is_factored`] tells them apart.
     pub fn precision(&self) -> Precision {
         match self.data {
-            Data::F32(_) => Precision::F32,
+            Data::F32(_) | Data::Bits(_) => Precision::F32,
             Data::Q8 { .. } => Precision::Q8,
             Data::Q4 { .. } => Precision::Q4,
         }
@@ -367,6 +393,7 @@ impl Weight {
             Data::F32(t) => t.data.len() * 4,
             Data::Q8 { scales, qs } => scales.len() * 4 + qs.len(),
             Data::Q4 { scales, qs } => scales.len() * 4 + qs.len(),
+            Data::Bits(f) => f.bytes(),
         }
     }
 
@@ -398,6 +425,7 @@ impl Weight {
                 }
                 out
             }
+            Data::Bits(f) => f.row(r),
         }
     }
 
@@ -436,13 +464,13 @@ impl Weight {
                 let row = &qs[r * n / 2..(r + 1) * n / 2];
                 q4_row_dots(row, &xq.qs, &xq.sums, dots);
             }
-            Data::F32(_) => unreachable!(),
+            Data::F32(_) | Data::Bits(_) => unreachable!(),
         }
 
         // ---- pass 2: apply the scales ------------------
         let scales = match &self.data {
             Data::Q8 { scales, .. } | Data::Q4 { scales, .. } => scales,
-            Data::F32(_) => unreachable!(),
+            Data::F32(_) | Data::Bits(_) => unreachable!(),
         };
         let mut sums = [0.0f32; 2];
         for (b, &d) in dots.iter().enumerate() {
@@ -483,6 +511,7 @@ impl Weight {
 
         let mut out = match &self.data {
             Data::F32(t) => matvec_bt(x, t),
+            Data::Bits(f) => f.matvec(x),
             _ if dequant_kernel() => self.matvec_bt_dequant(x),
             _ => {
                 let n = self.cols;
@@ -580,7 +609,7 @@ impl Weight {
                             sums[0] += scales[base + b] * dot;
                         }
                     }
-                    Data::F32(_) => unreachable!(),
+                    Data::F32(_) | Data::Bits(_) => unreachable!(),
                 }
                 *slot = (sums[0] + sums[1]) + (sums[2] + sums[3]);
             }
@@ -627,7 +656,7 @@ fn dequant_kernel() -> bool {
 /// asked for: the caller runs them one at a time, as before.
 pub fn matvec_many(jobs: &[(&Weight, &[f32])]) -> Option<Vec<Vec<f32>>> {
     if dequant_kernel()
-        || jobs.iter().any(|(w, x)| matches!(w.data, Data::F32(_)) || x.len() != w.cols)
+        || jobs.iter().any(|(w, x)| matches!(w.data, Data::F32(_) | Data::Bits(_)) || x.len() != w.cols)
     {
         return None;
     }
@@ -780,6 +809,17 @@ impl Weight {
 
         // Both precisions fill the same transposed buffer, so the layout fix-up
         // and the bias are written once rather than per kernel.
+        if let Data::Bits(f) = &self.data {
+            let mut out = f.matmul(xs, m);
+            if let Some(b) = bias {
+                for row in out.chunks_exact_mut(rows) {
+                    for (v, bi) in row.iter_mut().zip(b) {
+                        *v += bi;
+                    }
+                }
+            }
+            return out;
+        }
         let mut out_t = vec![0.0f32; rows * m];
         if let Data::F32(t) = &self.data {
             gemm_bt(xs, m, t, &mut out_t);
@@ -889,13 +929,13 @@ impl Weight {
                 let arow = &act.qs[i * n..(i + 1) * n];
                 q4_row_dots(wrow, arow, &act.sums[i * blocks..(i + 1) * blocks], scratch);
             }
-            Data::F32(_) => unreachable!(),
+            Data::F32(_) | Data::Bits(_) => unreachable!(),
         }
 
         // ---- pass 2: apply the scales ----
         let scales = match &self.data {
             Data::Q8 { scales, .. } | Data::Q4 { scales, .. } => scales,
-            Data::F32(_) => unreachable!(),
+            Data::F32(_) | Data::Bits(_) => unreachable!(),
         };
         let (wbase, abase) = (r * blocks, i * blocks);
 
@@ -982,7 +1022,7 @@ impl Weight {
                 self.unpack_q4_pair(r0, unpacked);
                 (scales, unpacked.as_ptr(), unpacked.as_ptr().add(n))
             }
-            Data::F32(_) => unreachable!(),
+            Data::F32(_) | Data::Bits(_) => unreachable!(),
         };
         let (ws0, ws1) = (r0 * blocks, (r0 + 1) * blocks);
 

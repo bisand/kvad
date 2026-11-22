@@ -129,6 +129,8 @@ pub unsafe trait Plain: Copy {}
 unsafe impl Plain for f32 {}
 unsafe impl Plain for i8 {}
 unsafe impl Plain for u8 {}
+/// LittleBit's sign words: any 32 bits are 32 signs.
+unsafe impl Plain for u32 {}
 
 /// A run of values the model can read, whoever owns the memory.
 ///
@@ -519,10 +521,49 @@ impl<'a> Live<'a> {
     fn quantized(&self, t: Tensor) -> Weight {
         Weight::quantize(t, self.precision)
     }
+
+    /// `name` as LittleBit factors, if that is how this checkpoint stores it.
+    ///
+    /// Asked only when the checkpoint has no `name` of its own, so a model that
+    /// is not LittleBit pays one failed lookup per weight it has anyway. The
+    /// factors are taken as they are: the precision is for rounding a matrix,
+    /// and these are already signs.
+    ///
+    /// Everything under the weight's stem counts as read, the bookkeeping
+    /// scalars included — they restate what the factors' shapes already say.
+    fn factored(&self, name: &str) -> Res<Option<Weight>> {
+        if self.ckpt.resolve(name).is_some() {
+            return Ok(None);
+        }
+        let Some(stem) = name.strip_suffix(".weight") else { return Ok(None) };
+        let Some(f) = crate::littlebit::read(self.ckpt, stem)? else { return Ok(None) };
+        self.audit.saw_under(&format!("{stem}."));
+        let w = Weight::from_factored(f);
+        self.tee(|out| out.put_weight(name, &w));
+        Ok(Some(w))
+    }
+
+    /// The error for asking a LittleBit weight to be transposed or sliced.
+    ///
+    /// Both are possible — slice `U` and `u1` for rows, swap the factors for a
+    /// transpose — and nothing needs either yet. The reference converts OPT,
+    /// Phi, Gemma and the Llama family; of those Kvad runs the Llama family,
+    /// whose projections all come through [`Source::matrix`]. A clear refusal
+    /// beats a "tensor not found" for a tensor that is plainly there.
+    fn refuse_factored(&self, name: &str, what: &str) -> Res<()> {
+        let stem = name.strip_suffix(".weight").unwrap_or(name);
+        if self.ckpt.resolve(name).is_none() && crate::littlebit::present(self.ckpt, stem) {
+            return Err(format!("`{stem}` is stored as LittleBit factors, which this cannot {what}").into());
+        }
+        Ok(())
+    }
 }
 
 impl Source for Live<'_> {
     fn matrix(&self, name: &str) -> Res<Weight> {
+        if let Some(w) = self.factored(name)? {
+            return Ok(w);
+        }
         self.audit.saw(name);
         let w = self.quantized(self.ckpt.get(name)?);
         self.tee(|out| out.put_weight(name, &w));
@@ -530,6 +571,9 @@ impl Source for Live<'_> {
     }
 
     fn try_matrix(&self, name: &str) -> Option<Weight> {
+        if let Ok(Some(w)) = self.factored(name) {
+            return Some(w);
+        }
         self.audit.saw(name);
         let w = self.quantized(self.ckpt.try_get(name)?);
         self.tee(|out| out.put_weight(name, &w));
@@ -537,6 +581,7 @@ impl Source for Live<'_> {
     }
 
     fn matrix_t(&self, name: &str) -> Res<Weight> {
+        self.refuse_factored(name, "transpose")?;
         self.audit.saw(name);
         let w = self.quantized(self.ckpt.get(name)?.transposed());
         self.tee(|out| out.put_weight(name, &w));
@@ -544,6 +589,7 @@ impl Source for Live<'_> {
     }
 
     fn matrix_rows(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
+        self.refuse_factored(name, "slice")?;
         self.audit.saw(name);
         let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?);
         let as_name = slice_name(name, start, count, false);
@@ -552,6 +598,7 @@ impl Source for Live<'_> {
     }
 
     fn matrix_rows_t(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
+        self.refuse_factored(name, "slice")?;
         self.audit.saw(name);
         let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?.transposed());
         let as_name = slice_name(name, start, count, true);
@@ -593,6 +640,18 @@ enum Entry {
     F32 { shape: (usize, usize), data: Span },
     Q8 { shape: (usize, usize), scales: Span, qs: Span },
     Q4 { shape: (usize, usize), scales: Span, qs: Span },
+    /// LittleBit factors: one [`PathSpans`] per factorisation summed.
+    Bits { paths: Vec<PathSpans> },
+}
+
+/// Where one LittleBit factorisation's arrays are. `u` and `v` carry their
+/// own shapes, since a span of words does not say how wide a row is.
+struct PathSpans {
+    u: ((usize, usize), Span),
+    v: ((usize, usize), Span),
+    u1: Span,
+    mid: Span,
+    v2: Span,
 }
 
 /// A cache file, mapped.
@@ -708,11 +767,42 @@ impl Mapped {
                 Store::mapped(self.file.map(), scales.0, scales.1)?,
                 Store::mapped(self.file.map(), qs.0, qs.1)?,
             ),
+            Entry::Bits { paths } => {
+                use crate::littlebit::{Factored, Path, Signs};
+                let map = self.file.map();
+                let signs = |((rows, cols), span): ((usize, usize), Span)| {
+                    Signs::new(rows, cols, Store::mapped(map, span.0, span.1)?)
+                };
+                let paths = paths
+                    .iter()
+                    .map(|p| {
+                        Path::from_parts(
+                            signs(p.u)?,
+                            signs(p.v)?,
+                            self.f32s(p.u1)?,
+                            self.f32s(p.mid)?,
+                            self.f32s(p.v2)?,
+                        )
+                    })
+                    .collect::<Res<Vec<_>>>()?;
+                Ok(Weight::from_factored(Factored::new(paths)?))
+            }
         }
     }
 
     fn f32s(&self, span: Span) -> Res<Store<f32>> {
         Store::mapped(self.file.map(), span.0, span.1)
+    }
+
+    /// Record that `name` was read, by the names the checkpoint filed it under.
+    ///
+    /// For a LittleBit weight that is not `name` at all — the checkpoint has no
+    /// such tensor — but the factors under its stem, as [`Live`] recorded them.
+    fn saw_weight(&self, name: &str, w: &Weight) {
+        match name.strip_suffix(".weight") {
+            Some(stem) if w.is_factored() => self.audit.saw_under(&format!("{stem}.")),
+            _ => self.audit.saw(name),
+        }
     }
 
     /// Checkpoint tensors this file was written without, that something has
@@ -745,7 +835,7 @@ impl Source for Mapped {
 
     fn matrix(&self, name: &str) -> Res<Weight> {
         let w = self.build(name)?;
-        self.audit.saw(name);
+        self.saw_weight(name, &w);
         Ok(w)
     }
 
@@ -767,7 +857,7 @@ impl Source for Mapped {
         // audit is what tells those apart, and it is the checkpoint's list that
         // settles it.
         let w = self.build(name).ok()?;
-        self.audit.saw(name);
+        self.saw_weight(name, &w);
         Some(w)
     }
 
@@ -829,8 +919,38 @@ fn parse_entry(v: &serde_json::Value) -> Res<Entry> {
         "f32" => Entry::F32 { shape, data: span("data")? },
         "q8" => Entry::Q8 { shape, scales: span("scales")?, qs: span("qs")? },
         "q4" => Entry::Q4 { shape, scales: span("scales")?, qs: span("qs")? },
+        "littlebit" => {
+            let paths = v.get("paths").and_then(|p| p.as_array()).ok_or("no `paths`")?;
+            let paths = paths.iter().map(parse_path).collect::<Res<Vec<_>>>()?;
+            if paths.is_empty() {
+                return Err("a littlebit entry with no paths".into());
+            }
+            Entry::Bits { paths }
+        }
         other => return Err(format!("unknown kind `{other}`").into()),
     })
+}
+
+/// One factorisation of a `littlebit` entry: `u` and `v` as
+/// `[rows, cols, offset, words]`, the vectors as spans.
+fn parse_path(v: &serde_json::Value) -> Res<PathSpans> {
+    let nums = |key: &str, n: usize| -> Res<Vec<usize>> {
+        let a = v.get(key).and_then(|s| s.as_array()).ok_or_else(|| format!("no `{key}`"))?;
+        let xs: Option<Vec<usize>> = a.iter().map(|x| x.as_u64().map(|x| x as usize)).collect();
+        match xs {
+            Some(xs) if xs.len() == n => Ok(xs),
+            _ => Err(format!("bad `{key}`").into()),
+        }
+    };
+    let signs = |key: &str| -> Res<((usize, usize), Span)> {
+        let a = nums(key, 4)?;
+        Ok(((a[0], a[1]), (a[2], a[3])))
+    };
+    let span = |key: &str| -> Res<Span> {
+        let a = nums(key, 2)?;
+        Ok((a[0], a[1]))
+    };
+    Ok(PathSpans { u: signs("u")?, v: signs("v")?, u1: span("u1")?, mid: span("mid")?, v2: span("v2")? })
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,6 +1120,21 @@ impl Writer {
                 "kind": "q4", "shape": shape,
                 "scales": self.put(scales)?, "qs": self.put(qs)?,
             }),
+            Parts::Bits(f) => {
+                let mut paths = Vec::with_capacity(f.paths().len());
+                for p in f.paths() {
+                    let mut signs = |s: &crate::littlebit::Signs| -> Res<serde_json::Value> {
+                        let at = self.put(s.bits())?;
+                        Ok(serde_json::json!([s.rows(), s.cols(), at[0], at[1]]))
+                    };
+                    let (u, v) = (signs(p.u())?, signs(p.v())?);
+                    paths.push(serde_json::json!({
+                        "u": u, "v": v,
+                        "u1": self.put(p.u1())?, "mid": self.put(p.mid())?, "v2": self.put(p.v2())?,
+                    }));
+                }
+                serde_json::json!({ "kind": "littlebit", "shape": shape, "paths": paths })
+            }
         };
         self.tensors.insert(name.to_string(), entry);
         Ok(())

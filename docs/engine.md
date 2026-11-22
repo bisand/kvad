@@ -954,6 +954,46 @@ The GPU backend used to be exempt from all this, on the grounds that candle's
 worth a second format. That was true of the model it was measured on and of no
 other: [it does not survive a 16B checkpoint](gpu.md#the-quantising-done-once-over-there-too).
 
+## Below one bit: LittleBit
+
+Every format above stores the matrix, and one bit a weight is where that
+runs out. Samsung's LittleBit
+([NeurIPS 2025](https://arxiv.org/abs/2506.13771),
+[LittleBit-2, ICML 2026](https://arxiv.org/abs/2603.00042)) stores a
+rank-`s` factorisation of it instead, with both factors rounded to signs and
+four vectors to put the magnitudes back:
+
+```text
+W  ≈  diag(u1) · U · diag(u2 ⊙ v1) · V · diag(v2)        U: [out, s] of ±1,  V: [s, in] of ±1
+```
+
+Kvad runs checkpoints in that format:
+
+```bash
+kvad run --model LittleBitLLM/littlebit-qwen3-8b-0.55bpw --quant q8 --prompt "..."
+```
+
+Nothing in the architectures changed. A checkpoint that has
+`q_proj.U_packed` where the loader asked for `q_proj.weight` is read as
+factors, and [`littlebit.rs`](../crates/llm/src/littlebit.rs) runs them as a
+chain that never rebuilds `W` — the two products with `U` and `V` are sums
+of values with their sign bits flipped, and no multiplies. `--quant` applies
+to the embeddings and the head, which LittleBit leaves dense.
+
+Qwen3-8B at 0.55 bits a weight is 1.9 GB in memory, against 9.2 GB at q8.
+What it does to the cost of a token is the interesting part: with its two
+paths, an MLP projection reads sixteen times fewer bytes than at q8 but does
+more than half as many additions as q8 does multiply-adds, so a model that was
+waiting on memory is now waiting on the adders. The kernels are written
+for that — which took two goes for prefill, and the reason is in
+`sign_gemm`'s documentation.
+
+Making LittleBit models is a different matter: an SVD, a rotation, and then
+epochs of distillation from the original model on a GPU. None of that is
+here. [docs/littlebit-plan.md](littlebit-plan.md) has what was checked, what
+it measured, what it would take to go further, and the licence the reference
+code and its checkpoints carry (CC BY-NC 4.0).
+
 ## The floor under everything
 
 For most of this project, CPU decode ran at about 35 tok/s. Not approximately

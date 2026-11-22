@@ -223,6 +223,11 @@ impl<'v> Loader<'v> {
         }
     }
 
+    /// Where this load's mixture layers run from, if they run on the host.
+    pub(crate) fn hosted(&self) -> Option<&'v dyn kvad::qcache::Source> {
+        self.vault.hosted()
+    }
+
     /// The same load, with its Q8_0 projections on the M5's matrix units
     /// where this machine has them, and as before where it does not.
     ///

@@ -1085,6 +1085,13 @@ pub fn pool() -> rayon::ThreadPool {
         .expect("building a thread pool")
 }
 
+/// Run `work` inside one [`pool`] kept for the process, for a backend that
+/// hands the CPU engine a piece of each pass. See [`CpuSession::forward`] for
+/// why from inside.
+pub fn in_shared_pool<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(pool).install(work)
+}
 
 impl CpuSession {
     /// Read a prompt `chunk` tokens a pass rather than the usual 64. For

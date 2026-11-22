@@ -115,9 +115,23 @@ pub struct Vault {
     failure: RefCell<Option<String>>,
     /// Names this build wanted that the file did not hold.
     missed: RefCell<Vec<String>>,
+    /// Where a mixture's routed layers come from when they run on the host;
+    /// see [`crate::ffn::Hosted`].
+    hosted: Option<Box<dyn kvad::qcache::Source>>,
 }
 
 impl Vault {
+    /// No file, and a mixture's MLPs read from `source` to run on the host.
+    /// No file because this load leaves the experts out, and a file written
+    /// from it would be a cache missing most of the model.
+    pub fn hosting(source: Box<dyn kvad::qcache::Source>) -> Self {
+        Vault { hosted: Some(source), ..Vault::off() }
+    }
+
+    pub(crate) fn hosted(&self) -> Option<&dyn kvad::qcache::Source> {
+        self.hosted.as_deref()
+    }
+
     /// No cache: quantise from the checkpoint, keep nothing.
     pub fn off() -> Self {
         Vault {
@@ -129,6 +143,7 @@ impl Vault {
             write: RefCell::new(None),
             failure: RefCell::new(None),
             missed: RefCell::new(Vec::new()),
+            hosted: None,
         }
     }
 

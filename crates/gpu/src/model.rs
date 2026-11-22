@@ -28,7 +28,7 @@ use crate::common::{
     causal_mask, check_block, embedding, label, linear, report_failures, unread, unread_error, Embed, KvCache, kv_store, Loader, Proj,
     Reader, Stored,
 };
-use crate::ffn::{Ffn, Mlp, Moe};
+use crate::ffn::{Ffn, Hosted, Mlp, Moe};
 use crate::fused;
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
@@ -155,9 +155,14 @@ fn read_blocks(
             k_norm: attn.try_get(hd, "k_norm.weight").map(&to_dev).transpose()?,
             mlp_norm: to_dev(l.get(e, "post_attention_layernorm.weight")?)?,
             mlp: match routed {
-                Some((router, layout)) if layout.is_moe(i, router.n_experts) => Mlp::Moe(
-                    Box::new(Moe::load(ld, &mlp, e, expert_width, router, layout.shared)?),
-                ),
+                Some((router, layout)) if layout.is_moe(i, router.n_experts) => match ld.hosted() {
+                    Some(src) => {
+                        // The CPU engine's name for it, which has no `model.`.
+                        let prefix = format!("layers.{i}.mlp");
+                        Mlp::Hosted(Box::new(Hosted::load(src, &mlp, &prefix, router, layout.shared)?))
+                    }
+                    None => Mlp::Moe(Box::new(Moe::load(ld, &mlp, e, expert_width, router, layout.shared)?)),
+                },
                 _ => Mlp::Dense(Ffn::load(ld, &mlp, e, spec.intermediate)?),
             },
         });
@@ -972,7 +977,13 @@ fn read_session(
     // questions are answered by the load: a file is only whole once every
     // weight has been through it, and a mapped file is only known to be
     // missing something once the architecture has finished asking.
-    let mut cache = Vault::open(repo, paths, spec, quant, progress);
+    let mut cache = match hosted_experts(repo, paths, spec, quant)? {
+        Some(source) => {
+            progress("routed experts on the host, read through the expert cache");
+            Vault::hosting(source)
+        }
+        None => Vault::open(repo, paths, spec, quant, progress),
+    };
     let session: Box<dyn Session> = if arch.is("llama") {
         Box::new(GpuLlama::load(paths, spec.clone(), dtype, quant, device, &cache)?)
     } else if arch.is("gpt2") {
@@ -998,6 +1009,34 @@ fn read_session(
     };
     cache.finish(progress);
     Ok(session)
+}
+
+/// The CPU engine's cache file for this model, when `KVAD_GPU_EXPERTS=host`
+/// asks for its routed experts to stay off the device. How much of them is in
+/// memory is `KVAD_EXPERT_CACHE`, in gigabytes.
+fn hosted_experts(
+    repo: &str,
+    paths: &[std::path::PathBuf],
+    spec: &Spec,
+    quant: Option<GgmlDType>,
+) -> Res<Option<Box<dyn kvad::qcache::Source>>> {
+    use kvad::quant::Precision;
+    if std::env::var("KVAD_GPU_EXPERTS").as_deref() != Ok("host") {
+        return Ok(None);
+    }
+    if !spec.arch.is("llama") || Router::count(&spec.config).is_none() {
+        return Err("KVAD_GPU_EXPERTS=host is for a Llama-family mixture such as Qwen3-30B".into());
+    }
+    let (precision, name) = match quant {
+        Some(GgmlDType::Q8_0) => (Precision::Q8, "q8"),
+        Some(GgmlDType::Q4_0) => (Precision::Q4, "q4"),
+        _ => return Err("KVAD_GPU_EXPERTS=host needs --quant q8 or q4".into()),
+    };
+    let path = kvad::qcache::path_for(repo, precision);
+    let mapped = kvad::qcache::Mapped::open(&path, repo, paths, spec, precision)?.ok_or_else(|| {
+        format!("no CPU {name} cache for {repo}: run `kvad run --local --quant {name} --model {repo}` once")
+    })?;
+    Ok(Some(Box::new(mapped)))
 }
 
 /// The architectures this backend has an implementation for, by the id the
@@ -2197,6 +2236,65 @@ pub(crate) mod tests {
             assert!(worst < 1e-4, "the mixture on {where_} differs from the CPU engine by {worst}");
         }
 
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Routed layers run by the CPU engine, the rest on the device: the same
+    /// answer as all of it on either.
+    #[test]
+    fn a_mixture_hosted_off_the_device_agrees_with_the_cpu_engine() {
+        use kvad::model::Transformer;
+
+        let (spec, path) = moe_checkpoint("hosted");
+        let tokens = [1u32, 2, 3, 4, 5];
+        let mut cache = kvad::model::KvCache::new(&spec);
+        let ours = cpu_model(&path, &spec).forward_batch(&tokens, &mut cache);
+
+        let devices = match Device::new_metal(0) {
+            Ok(gpu) => vec![("cpu device", Device::Cpu), ("metal", gpu)],
+            Err(_) => vec![("cpu device", Device::Cpu)],
+        };
+        for (where_, dev) in devices {
+            let ckpt: &'static _ = Box::leak(Box::new(kvad::weights::Checkpoint::open(std::slice::from_ref(&path)).unwrap()));
+            let vault = Vault::hosting(Box::new(kvad::qcache::Live::new(ckpt, kvad::quant::Precision::F32)));
+            let mut gpu = GpuLlama::load(std::slice::from_ref(&path), spec.clone(), DType::F32, None, dev, &vault).unwrap();
+            let on_device: usize = gpu.blocks.iter().map(|b| b.mlp.bytes()).sum();
+            assert!(matches!(gpu.blocks[1].mlp, Mlp::Hosted(_)), "on {where_}");
+            assert_eq!(on_device, gpu.blocks[0].mlp.bytes(), "on {where_}: a hosted layer is on the device");
+            let theirs = gpu.forward(&tokens).unwrap();
+            let worst = theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(worst < 1e-4, "hosted on {where_} differs from the CPU engine by {worst}");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A prompt pass lent to the device: the same mixture as the CPU engine's,
+    /// to within what their different quantised kernels round.
+    #[test]
+    fn prompt_experts_lent_to_the_device_agree_with_the_cpu_engine() {
+        use kvad::quant::Precision;
+
+        let (spec, path) = moe_checkpoint("lent");
+        let router = Router::read(&spec.config).unwrap();
+        let ckpt = kvad::weights::Checkpoint::open(std::slice::from_ref(&path)).unwrap();
+        let (m, e) = (40usize, spec.n_embd);
+        let xs: Vec<f32> = (0..m * e).map(|i| ((i * 37 % 101) as f32 / 50.0 - 1.0) * 0.5).collect();
+        let devices = match Device::new_metal(0) {
+            Ok(gpu) => vec![Device::Cpu, gpu],
+            Err(_) => vec![Device::Cpu],
+        };
+        for precision in [Precision::Q4] {
+            let live = kvad::qcache::Live::new(&ckpt, precision);
+            let moe = kvad::model::ffn::Moe::load(&live, "layers.1.mlp", &router, kvad::model::ffn::Shared::None).unwrap();
+            let ours = moe.run(&xs, m, e, None);
+            let scale = ours.iter().fold(0f32, |a, v| a.max(v.abs()));
+            for dev in &devices {
+                let h = Tensor::from_slice(&xs, (m, e), dev).unwrap();
+                let theirs = crate::ffn::on_device(&moe, &xs, &h, m, e).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let worst = theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                assert!(scale > 0.0 && worst < 0.05 * scale, "{precision:?} on {dev:?}: off by {worst} of {scale}");
+            }
+        }
         std::fs::remove_file(&path).unwrap();
     }
 

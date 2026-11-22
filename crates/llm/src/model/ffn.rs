@@ -387,6 +387,11 @@ impl Ffn {
         self.down.matvec_bt(&gate, None)
     }
 
+    /// Gate, up and down, for a backend that runs them itself.
+    pub fn weights(&self) -> [&Weight; 3] {
+        [&self.gate, &self.up, &self.down]
+    }
+
     /// This MLP with its weights read from `slab`. See [`Weight::rebased`].
     fn rebased(&self, lo: u64, slab: &std::sync::Arc<crate::qcache::Slab>) -> Option<Ffn> {
         Some(Ffn {
@@ -597,6 +602,50 @@ impl Moe {
             }
         };
         Some((logits, shared, ahead))
+    }
+
+    /// Which experts each of `m` tokens chose, as `(token, weight)` per expert,
+    /// for a backend that runs the experts itself.
+    pub fn routed(&self, hs: &[f32], m: usize) -> Vec<Vec<(usize, f32)>> {
+        let n = self.router.n_experts;
+        let logits = self.gate.matmul_bt(hs, m, None);
+        let mut picks = Vec::with_capacity(self.router.top_k);
+        let mut by_expert = vec![Vec::new(); n];
+        for i in 0..m {
+            self.router.route(&logits[i * n..(i + 1) * n], self.bias.as_deref(), &mut picks);
+            for &(expert, weight) in &picks {
+                by_expert[expert].push((i, weight));
+            }
+        }
+        by_expert
+    }
+
+    /// Hand `each` the weights of every expert in `chosen`, in order within a
+    /// cache group, through the expert cache if there is one. A failed read
+    /// falls back to the mapping, as [`Moe::run`]'s does.
+    pub fn with_experts(&self, chosen: &[usize], mut each: impl FnMut(usize, &Ffn)) {
+        let mut done = vec![false; self.router.n_experts];
+        if let Some(resident) = &self.resident {
+            let read = resident.with(self.layer, chosen, None, |group| {
+                for &(x, slab, lo) in group {
+                    match self.experts[x].rebased(lo, slab) {
+                        Some(view) => each(x, &view),
+                        None => {
+                            resident.fell_back();
+                            each(x, &self.experts[x]);
+                        }
+                    }
+                    done[x] = true;
+                }
+            });
+            if let Err(err) = read {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| eprintln!("expert cache: falling back to the mapping: {err}"));
+            }
+        }
+        for &x in chosen.iter().filter(|&&x| !done[x]) {
+            each(x, &self.experts[x]);
+        }
     }
 
     /// The mixture, over a batch.
@@ -1061,6 +1110,13 @@ mod tests {
         assert_eq!(Router::count(&config(json!({ "n_routed_experts": 64 }))), Some(64));
         assert_eq!(Router::count(&config(json!({ "num_experts": 128 }))), Some(128));
         assert_eq!(Router::count(&config(json!({ "hidden_size": 2048 }))), None);
+    }
+
+    #[test]
+    fn a_mixture_reads_its_prompt_in_bigger_passes() {
+        assert_eq!(crate::model::prefill_chunk_for(&config(json!({ "num_experts": 128 }))), 512);
+        assert_eq!(crate::model::prefill_chunk_for(&config(json!({ "num_experts": 0 }))), 64);
+        assert_eq!(crate::model::prefill_chunk_for(&config(json!({ "hidden_size": 2048 }))), 64);
     }
 
     /// DeepSeek asks `layer % freq` and Qwen3 asks `(layer + 1) % step`, so at

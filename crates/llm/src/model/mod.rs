@@ -993,7 +993,8 @@ pub struct CpuSession {
 impl CpuSession {
     pub fn new(model: Box<dyn Transformer>, precision: crate::quant::Precision) -> Self {
         let cache = KvCache::new(model.spec());
-        CpuSession { model, cache, precision, chunk: prefill_chunk(), pool: pool() }
+        let chunk = prefill_chunk_for(&model.spec().config);
+        CpuSession { model, cache, precision, chunk, pool: pool() }
     }
 }
 
@@ -1002,7 +1003,20 @@ impl CpuSession {
 /// Tunable so the effect of batching stays measurable; 1 gives the old
 /// token-at-a-time behaviour.
 pub fn prefill_chunk() -> usize {
-    std::env::var("KVAD_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0).unwrap_or(64)
+    prefill_chunk_set().unwrap_or(64)
+}
+
+/// [`prefill_chunk`] for a model of this config. A mixture reads a bigger
+/// pass, because a pass reads each expert it reaches once: more tokens in it
+/// is more rows for each read. Not the whole prompt, because a stop, or
+/// another conversation's next token, waits for the pass in hand.
+pub fn prefill_chunk_for(config: &Json) -> usize {
+    let mixture = ffn::Router::count(config).is_some_and(|n| n > 0);
+    prefill_chunk_set().unwrap_or(if mixture { 512 } else { 64 })
+}
+
+fn prefill_chunk_set() -> Option<usize> {
+    std::env::var("KVAD_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0)
 }
 
 /// A machine kept awake for work that is on its way: see [`linger`].
@@ -1071,6 +1085,13 @@ pub fn pool() -> rayon::ThreadPool {
         .expect("building a thread pool")
 }
 
+/// Run `work` inside one [`pool`] kept for the process, for a backend that
+/// hands the CPU engine a piece of each pass. See [`CpuSession::forward`] for
+/// why from inside.
+pub fn in_shared_pool<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(pool).install(work)
+}
 
 impl CpuSession {
     /// Read a prompt `chunk` tokens a pass rather than the usual 64. For

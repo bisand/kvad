@@ -270,6 +270,37 @@ cycles through all six: `cpu f32`, `cpu q8`, `cpu q4`, `gpu bf16`, `gpu q8`,
 That is the usual shape of this kind of work: the interesting part was not the
 new backend, it was the seam the old one had to grow.
 
+## Experts beside the GPU, and why they wait
+
+`KVAD_GPU_EXPERTS=host` keeps attention and the dense layers on the GPU and
+leaves a mixture's routed experts to the CPU engine, read through its expert
+cache, so Qwen3-30B-A3B runs in under 8 GB. Every mixture layer of a decode
+token then waits for the GPU, copies one row down, runs its eight experts on
+the CPU and copies the result up. Taken apart (q4, M5 Pro, a layer of 48):
+the CPU's experts are about 660 µs, the GPU's attention and its round trip
+about 350, the copy back about 155 when timed as its own round trip, and
+encoding the next attention about 75. Untimed, that is 19.6 tok/s.
+
+The obvious upgrade is to run the experts while the GPU works, as
+[Strata](https://github.com/Niko1221/Strata) does. In one token of this model
+there is nothing to run them beside: the next layer's attention needs this
+layer's output, and Qwen3's mixture has no shared expert for the GPU to do
+meanwhile. What is left is giving the GPU some of the experts. Measured, six
+interleaved rounds each:
+
+| | decode |
+|---|---|
+| as it is | 19.6 tok/s |
+| both processors kept busy between their turns | 18.3 tok/s |
+| 5 of 8 experts on the CPU, the rest free (ceiling for a GPU hot set) | 23.6 tok/s |
+
+A hot set chosen ahead, from another conversation's counts, catches 17% of
+the picks at 1.6 GB, 35% at 3.2 GB and 47% at 4.8 GB: routing is too even to
+pin much (see [`residency.rs`](../crates/llm/src/residency.rs)). So a fifth
+more speed at most, for 3–5 GB more GPU memory in a mode whose point is to
+need less. It is not built; the numbers are in
+[`ffn.rs`](../crates/gpu/src/ffn.rs)'s `Hosted`.
+
 ## The seam that cannot rewind
 
 `truncate` returns a number now, and the number is the interesting part.

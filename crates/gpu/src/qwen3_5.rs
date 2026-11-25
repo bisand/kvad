@@ -24,13 +24,13 @@ use crate::common::{
     check_block, embedding, label, linear, report_failures, unread, unread_error, Embed, KvCache, kv_store, Loader, Proj, Reader,
     Stored,
 };
-use crate::ffn::{Ffn, Mlp, Moe};
+use crate::ffn::{Ffn, Hosted, Mlp, Moe};
 use crate::qcache::Vault;
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{ops, VarBuilder};
 use kvad::model::ffn::{Layout, Router};
-use kvad::model::qwen3_5::{Delta, Family, Kind};
+use kvad::model::qwen3_5::{Delta, Family, Kind, Streams};
 use kvad::model::{Session, Spec};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -47,7 +47,7 @@ impl Inputs {
     fn load(ld: &Loader, vb: &Reader<'_>, e: usize, d: &Delta, family: Family) -> Res<Self> {
         let p = |name: &str, out: usize| ld.proj(vb, name, out, e, Stored::OutIn);
         Ok(match family {
-            Family::Qwen35 => Inputs::Split {
+            Family::Qwen35 | Family::Exp => Inputs::Split {
                 qkv: p("in_proj_qkv.weight", d.conv_dim)?,
                 z: p("in_proj_z.weight", d.value_dim)?,
                 b: p("in_proj_b.weight", d.n_v_head)?,
@@ -134,6 +134,244 @@ struct Attn {
     o: Proj,
     q_norm: Tensor,
     k_norm: Tensor,
+    indexer: Option<Indexer>,
+}
+
+/// Qwen3.8-Flash-Next's block selection; see
+/// [`kvad::model::qwen3_5::Streams`] for what it computes.
+struct Indexer {
+    qk: Proj,
+    q_norm: Tensor,
+    k_norm: Tensor,
+}
+
+/// One hyper-connection: the CPU engine's `Hyper`, as six kernels.
+struct Hyper {
+    /// `[hc, e]`, with the one folded in.
+    norm: Tensor,
+    down: Proj,
+    up: Proj,
+    inject: Option<Proj>,
+}
+
+impl Hyper {
+    fn load(ld: &Loader, vb: &Reader<'_>, hc: usize, e: usize, low: usize, combine: bool, device: &Device) -> Res<Self> {
+        let p = |name: &str, out: usize, inp: usize| ld.proj(vb, name, out, inp, Stored::OutIn);
+        Ok(Hyper {
+            norm: (vb.get(hc * e, "hc_norm.weight")?.to_dtype(DType::F32)? + 1.0)?.reshape((hc, e))?.to_device(device)?,
+            down: p("input_mix_weight_down.weight", low, hc * e)?,
+            up: p("input_mix_weight_up.weight", hc * e, low)?,
+            inject: if combine { Some(p("block_inject_weight.weight", hc, hc * e)?) } else { None },
+        })
+    }
+
+    /// `(in, share)`: the sublayer's input `[1, e]`, and each stream's share
+    /// of its output, `[hc, 1]` (empty for the last one).
+    fn mix(&self, x: &Tensor, eps: f32) -> Res<(Tensor, Option<Tensor>)> {
+        let (hc, e) = self.norm.dims2()?;
+        let n = group_norm(&x.reshape((hc, e))?, &self.norm, eps)?;
+        let flat = n.reshape((1, hc * e))?;
+        let low = ops::silu(&(self.down.forward(&flat)? / hc as f64)?)?;
+        let w = ops::sigmoid(&self.up.forward(&low)?)?.reshape((hc, e))?;
+        let mixed = (w.mul(&n)?.sum_keepdim(0)? / hc as f64)?;
+        let share = match &self.inject {
+            None => None,
+            Some(m) => Some((ops::sigmoid(&(m.forward(&flat)? / hc as f64)?)? * 2.0)?.reshape((hc, 1))?),
+        };
+        Ok((mixed, share))
+    }
+
+    fn params(&self) -> usize {
+        self.norm.elem_count() + self.down.params() + self.up.params() + self.inject.as_ref().map_or(0, Proj::params)
+    }
+
+    fn bytes(&self) -> usize {
+        self.down.bytes() + self.up.bytes() + self.inject.as_ref().map_or(0, Proj::bytes)
+    }
+}
+
+/// RMSNorm of each row of `x` `[hc, e]`, each with its own row of `w`; in
+/// f32 whatever the activations are.
+fn group_norm(x: &Tensor, w: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
+    let dtype = x.dtype();
+    let x = x.to_dtype(DType::F32)?;
+    let r = (x.sqr()?.mean_keepdim(1)? + eps as f64)?.sqrt()?;
+    x.broadcast_div(&r)?.mul(&w.to_dtype(DType::F32)?)?.to_dtype(dtype)
+}
+
+/// `x + share · y` on every stream: `x` `[1, hc × e]`, `y` `[1, e]`,
+/// `share` `[hc, 1]`.
+fn inject(x: &Tensor, y: &Tensor, share: &Tensor) -> candle_core::Result<Tensor> {
+    let (hc, _) = share.dims2()?;
+    let e = y.dim(1)?;
+    x.reshape((hc, e))?.add(&y.broadcast_mul(share)?)?.reshape((1, hc * e))
+}
+
+/// Per-layer embeddings; see the CPU engine's `Ple`. The table stays in
+/// the checkpoint and its rows are gathered on the host, sixteen of them a
+/// token; everything after the gather runs here.
+struct Ple {
+    table: kvad::weights::Table,
+    heads: Vec<(u64, u64)>,
+    mult: Vec<u64>,
+    key: Proj,
+    value: Proj,
+    /// `[hc, e]` each, with the one folded in.
+    norm_key: Tensor,
+    norm_query: Tensor,
+    norm_conv: Tensor,
+    /// `[hc × e, kernel]`.
+    conv: Tensor,
+    /// The window's columns the filter's taps read, the current input last.
+    taps: Tensor,
+}
+
+/// An n-gram layer's state: the last tokens, nearest first, and the
+/// convolution's window `[hc × e, (kernel − 1) × ngram]`, oldest first.
+struct PleState {
+    history: Vec<u32>,
+    window: Tensor,
+}
+
+impl Ple {
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        ld: &Loader,
+        vb: &Reader<'_>,
+        paths: &[std::path::PathBuf],
+        layer: &str,
+        st: &Streams,
+        nth: usize,
+        e: usize,
+        device: &Device,
+    ) -> Res<Self> {
+        let hc = st.hc;
+        let table = kvad::weights::Table::open(paths, &format!("{layer}.ple.ple_embedding.ngram_embedding"))?;
+        // The table is read in place, and the hash's int64 buffers are
+        // derived rather than read: see `Streams::heads`.
+        vb.skip_under("ple_embedding.");
+        let heads = st.heads(nth);
+        if table.cols * heads.len() != st.ple_dim {
+            return Err(format!("the n-gram table is {} wide; {} heads want {}", table.cols, heads.len(), st.ple_dim).into());
+        }
+        let norm = |name: &str| -> Res<Tensor> {
+            Ok((vb.get(hc * e, name)?.to_dtype(DType::F32)? + 1.0)?.reshape((hc, e))?.to_device(device)?)
+        };
+        let len = st.ple_window();
+        let taps: Vec<u32> = (0..st.ple_kernel).map(|j| (len - (st.ple_kernel - 1 - j) * st.ngram) as u32).collect();
+        Ok(Ple {
+            table,
+            mult: st.multipliers(nth),
+            heads,
+            key: ld.proj(vb, "key_proj.weight", hc * e, st.ple_dim, Stored::OutIn)?,
+            value: ld.proj(vb, "value_proj.weight", e, st.ple_dim, Stored::OutIn)?,
+            norm_key: norm("norm_key.weight")?,
+            norm_query: norm("norm_query.weight")?,
+            norm_conv: norm("norm_conv.weight")?,
+            conv: vb.conv(hc * e, st.ple_kernel, "conv1d.weight")?.to_dtype(DType::F32)?.to_device(device)?,
+            taps: Tensor::from_vec(taps, st.ple_kernel, device)?,
+        })
+    }
+
+    /// What this layer adds to the streams `x` `[1, hc × e]` for `token`.
+    fn step(&self, st: &Streams, x: &Tensor, token: u32, state: &mut PleState, eps: f32) -> Res<Tensor> {
+        let (hc, e) = self.norm_key.dims2()?;
+        let before = st.before(&state.history);
+        state.history.rotate_right(1);
+        state.history[0] = token;
+
+        let width = self.table.cols;
+        let mut emb = vec![0.0f32; self.heads.len() * width];
+        for (row, out) in st.rows(&self.heads, &self.mult, token, &before).into_iter().zip(emb.chunks_mut(width)) {
+            self.table.row_into(row as usize, out);
+        }
+        let dtype = x.dtype();
+        let emb = Tensor::from_vec(emb, (1, st.ple_dim), x.device())?.to_dtype(dtype)?;
+
+        let key = group_norm(&self.key.forward(&emb)?.reshape((hc, e))?, &self.norm_key, eps)?;
+        let value = self.value.forward(&emb)?;
+        let query = group_norm(&x.reshape((hc, e))?, &self.norm_query, eps)?;
+        // The gate's signed square root, in f32: `sign(g)·√max(|g|, 1e-6)`.
+        let g = (key.to_dtype(DType::F32)?.mul(&query.to_dtype(DType::F32)?)?.sum_keepdim(1)? / (e as f64).sqrt())?;
+        let root = g.abs()?.clamp(1e-6, f64::INFINITY)?.sqrt()?.mul(&g.sign()?)?;
+        let gated = value.to_dtype(DType::F32)?.broadcast_mul(&ops::sigmoid(&root)?)?; // [hc, e]
+        let normed = group_norm(&gated, &self.norm_conv, eps)?.reshape((hc * e, 1))?;
+
+        // Dilated and depthwise: the window and this input side by side, and
+        // the filter's taps picked out of them by column.
+        let full = Tensor::cat(&[&state.window, &normed], 1)?;
+        let conved = full.index_select(&self.taps, 1)?.mul(&self.conv)?.sum(1)?;
+        let len = state.window.dim(1)?;
+        state.window = full.narrow(1, 1, len)?.contiguous()?;
+        let out = (gated.reshape(hc * e)? + ops::silu(&conved)?)?;
+        Ok(out.reshape((1, hc * e))?.to_dtype(dtype)?)
+    }
+
+    fn params(&self) -> usize {
+        self.table.rows * self.table.cols
+            + self.key.params()
+            + self.value.params()
+            + 3 * self.norm_key.elem_count()
+            + self.conv.elem_count()
+    }
+}
+
+impl Indexer {
+    /// Which cached positions a query at `n − 1` reads: `None` for all of
+    /// them, which is every query that sees `budget + ratio − 1` tokens or
+    /// fewer, and which needs nothing read back.
+    #[allow(clippy::too_many_arguments)]
+    fn select(
+        &self,
+        h: &Tensor,
+        keys: &Tensor,
+        (heads, dim, budget, ratio): (usize, usize, usize, usize),
+        cos: &Tensor,
+        sin: &Tensor,
+        rope_dim: usize,
+        pos: usize,
+        eps: f32,
+    ) -> Res<Option<Tensor>> {
+        let n = pos + 1;
+        let (blocks, keep) = (n / ratio, budget / ratio);
+        if blocks <= keep {
+            return Ok(None);
+        }
+        let rope = |t: &Tensor, cos: &Tensor, sin: &Tensor| -> candle_core::Result<Tensor> {
+            let rot = crate::grad::rope(&t.narrow(3, 0, rope_dim)?.contiguous()?, cos, sin)?;
+            match rope_dim == dim {
+                true => Ok(rot),
+                false => Tensor::cat(&[rot, t.narrow(3, rope_dim, dim - rope_dim)?.contiguous()?], 3),
+            }
+        };
+        let q = linear(h, &self.qk, None)?.narrow(1, 0, heads * dim)?.reshape((heads, dim))?.to_dtype(DType::F32)?;
+        let q = crate::grad::rms_norm(&q.contiguous()?, &self.q_norm.to_dtype(DType::F32)?, eps)?;
+        let q = rope(
+            &q.reshape((1, heads, 1, dim))?,
+            &cos.narrow(0, pos, 1)?.to_dtype(DType::F32)?,
+            &sin.narrow(0, pos, 1)?.to_dtype(DType::F32)?,
+        )?
+        .reshape((heads, dim))?;
+
+        let pooled = keys.narrow(0, 0, blocks * ratio)?.to_dtype(DType::F32)?.reshape((blocks, ratio, dim))?.mean(1)?;
+        let k = crate::grad::rms_norm(&pooled.contiguous()?, &self.k_norm.to_dtype(DType::F32)?, eps)?;
+        let starts: Vec<u32> = (0..blocks).map(|b| (b * ratio) as u32).collect();
+        let starts = Tensor::from_vec(starts, blocks, keys.device())?;
+        let k = rope(
+            &k.reshape((1, 1, blocks, dim))?,
+            &cos.index_select(&starts, 0)?.to_dtype(DType::F32)?,
+            &sin.index_select(&starts, 0)?.to_dtype(DType::F32)?,
+        )?
+        .reshape((blocks, dim))?;
+        let scores = q.matmul(&k.t()?)?.relu()?.sum(0)?.to_vec1::<f32>()?;
+
+        let mut order: Vec<usize> = (0..blocks).collect();
+        order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+        let mut chosen: Vec<u32> =
+            order[..keep].iter().flat_map(|&b| (b * ratio) as u32..((b + 1) * ratio) as u32).collect();
+        chosen.extend((blocks * ratio) as u32..n as u32);
+        Ok(Some(Tensor::from_vec(chosen.clone(), chosen.len(), keys.device())?))
+    }
 }
 
 enum Mixer {
@@ -141,10 +379,14 @@ enum Mixer {
     Full(Box<Attn>),
 }
 
+enum Residual {
+    Plain { attn_norm: Tensor, mlp_norm: Tensor },
+    Hyper { attn: Hyper, mlp: Hyper, ple: Option<Box<Ple>> },
+}
+
 struct Block {
-    attn_norm: Tensor,
+    residual: Residual,
     mixer: Mixer,
-    mlp_norm: Tensor,
     mlp: Mlp,
 }
 
@@ -176,6 +418,13 @@ pub struct GpuQwen35 {
     /// Per linear layer.
     state: Vec<Option<State>>,
     pos: usize,
+    /// Qwen3.8-Flash-Next's additions, and the hyper-connection in front of
+    /// the output head; `final_norm` is unused when this is set.
+    streams: Option<(Streams, Hyper)>,
+    /// Per n-gram layer.
+    ple: Vec<Option<PleState>>,
+    /// Per attention layer with an indexer: every raw index key, `[seq, dim]`.
+    index_keys: Vec<Option<Tensor>>,
 }
 
 impl GpuQwen35 {
@@ -249,10 +498,22 @@ impl GpuQwen35 {
             ld.proj(vb, name, out, inp, Stored::OutIn)
         };
 
+        let streams = Streams::read(&spec.config, &spec)?;
+        let low = spec.config.num(&["hc_lowrank"]).unwrap_or(0);
+
         let mut blocks = Vec::with_capacity(spec.n_layer);
         for (i, kind) in kinds.iter().enumerate() {
             let l = model.pp(format!("layers.{i}"));
             let mlp = l.pp("mlp");
+            let indexer = |sa: &Reader<'_>| -> Res<Option<Indexer>> {
+                let Some((heads, dim, _, _)) = streams.as_ref().and_then(|s| s.indexer) else { return Ok(None) };
+                let ix = sa.pp("indexer");
+                Ok(Some(Indexer {
+                    qk: load_t(&ix, "index_qk_proj.weight", (heads + 1) * dim, e)?,
+                    q_norm: offset(ix.get(dim, "q_layernorm.weight")?)?,
+                    k_norm: offset(ix.get(dim, "k_layernorm.weight")?)?,
+                }))
+            };
             let mixer = match kind {
                 Kind::Full => {
                     let sa = l.pp("self_attn");
@@ -265,6 +526,7 @@ impl GpuQwen35 {
                         o: load_t(&sa, "o_proj.weight", e, qd)?,
                         q_norm: offset(sa.get(hd, "q_norm.weight")?)?,
                         k_norm: offset(sa.get(hd, "k_norm.weight")?)?,
+                        indexer: indexer(&sa)?,
                     }))
                 }
                 Kind::Linear => {
@@ -283,14 +545,33 @@ impl GpuQwen35 {
                     }))
                 }
             };
+            let residual = match &streams {
+                None => Residual::Plain {
+                    attn_norm: offset(l.get(e, "input_layernorm.weight")?)?,
+                    mlp_norm: offset(l.get(e, "post_attention_layernorm.weight")?)?,
+                },
+                Some(st) => Residual::Hyper {
+                    attn: Hyper::load(&ld, &l.pp("attn_hyper_connection"), st.hc, e, low, true, &device)?,
+                    mlp: Hyper::load(&ld, &l.pp("mlp_hyper_connection"), st.hc, e, low, true, &device)?,
+                    ple: match st.ple_layers.iter().position(|&x| x == i) {
+                        None => None,
+                        Some(nth) => Some(Box::new(Ple::load(&ld, &l.pp("ple"), paths, &format!("model.{}layers.{i}", family.prefix()), st, nth, e, &device)?)),
+                    },
+                },
+            };
             blocks.push(Block {
-                attn_norm: offset(l.get(e, "input_layernorm.weight")?)?,
+                residual,
                 mixer,
-                mlp_norm: offset(l.get(e, "post_attention_layernorm.weight")?)?,
                 mlp: match &routed {
-                    Some((router, layout)) if layout.is_moe(i, router.n_experts) => {
-                        Mlp::Moe(Box::new(Moe::load(&ld, &mlp, e, expert, router, layout.shared)?))
-                    }
+                    Some((router, layout)) if layout.is_moe(i, router.n_experts) => match ld.hosted() {
+                        // The CPU engine's name for it: no `model.`, and the
+                        // family's own prefix.
+                        Some(src) => {
+                            let prefix = format!("{}layers.{i}.mlp", family.prefix());
+                            Mlp::Hosted(Box::new(Hosted::load(src, &mlp, &prefix, router, layout.shared)?))
+                        }
+                        None => Mlp::Moe(Box::new(Moe::load(&ld, &mlp, e, expert, router, layout.shared)?)),
+                    },
                     _ => Mlp::Dense(Ffn::load(&ld, &mlp, e, spec.intermediate)?),
                 },
             });
@@ -300,12 +581,18 @@ impl GpuQwen35 {
         // below can tell a decision from an omission. Both families ship a
         // multi-token-prediction head; the vision tower is Qwen3.5's alone.
         vb.skip_under("mtp.");
-        if family == Family::Qwen35 {
+        if family != Family::Next {
             vb.skip_under("model.visual.");
         }
 
         let (embed, head, tied) = embedding(&ld, &vb, &model, "embed_tokens.weight", &spec)?;
-        let final_norm = offset(model.get(e, "norm.weight")?)?;
+        let (final_norm, streams) = match streams {
+            None => (offset(model.get(e, "norm.weight")?)?, None),
+            Some(st) => {
+                let last = Hyper::load(&ld, &model.pp("hyper_connection_mixer"), st.hc, e, low, false, &device)?;
+                (Tensor::zeros(0, compute, &device)?, Some((st, last)))
+            }
+        };
 
         let left = unread(paths, &vb.seen(), &vb.skipped())?;
         if !left.is_empty() {
@@ -344,6 +631,9 @@ impl GpuQwen35 {
             dtype: compute,
             quant,
             pos: 0,
+            ple: (0..spec.n_layer).map(|_| None).collect(),
+            index_keys: (0..spec.n_layer).map(|_| None).collect(),
+            streams,
             spec,
         })
     }
@@ -408,14 +698,18 @@ impl GpuQwen35 {
         // The gated norm scales by `w` itself — not by `1 + w`, which is what
         // every *other* norm in this architecture does.
         let out = crate::grad::rms_norm(&out.contiguous()?, &net.norm, self.spec.eps)?;
-        let out = out.mul(&ops::silu(&z)?)?;
+        let gate = match d.sigmoid_gate {
+            true => ops::sigmoid(&z)?,
+            false => ops::silu(&z)?,
+        };
+        let out = out.mul(&gate)?;
 
         let out = net.out.forward(&out.reshape((1, d.value_dim))?)?;
         Ok((out, State { conv: next_conv, s }))
     }
 
     /// One token through a full-attention layer.
-    fn full_step(&self, attn: &Attn, h: &Tensor, cache: &mut KvCache) -> Res<Tensor> {
+    fn full_step(&self, attn: &Attn, h: &Tensor, cache: &mut KvCache, index_keys: &mut Option<Tensor>) -> Res<Tensor> {
         let spec = &self.spec;
         let (hd, nh, nkv) = (spec.head_dim, spec.n_head, spec.n_kv_head);
         let pos = self.pos;
@@ -453,6 +747,27 @@ impl GpuQwen35 {
 
         let (k, v) = cache.push(&k, &v)?;
 
+        // Qwen3.8-Flash-Next: keep this token's index key, and attend only to
+        // the positions the indexer picks once there are more than its budget.
+        let index = self.streams.as_ref().and_then(|(s, _)| s.indexer);
+        let (k, v) = match (&attn.indexer, index) {
+            (Some(ix), Some(shape)) => {
+                let (heads, dim) = (shape.0, shape.1);
+                let key = linear(h, &ix.qk, None)?.narrow(1, heads * dim, dim)?.contiguous()?;
+                let keys = match index_keys.take() {
+                    None => key,
+                    Some(past) => Tensor::cat(&[&past, &key], 0)?,
+                };
+                let chosen = ix.select(h, &keys, shape, &self.cos, &self.sin, self.rope_dim, pos, spec.eps)?;
+                *index_keys = Some(keys);
+                match chosen {
+                    None => (k, v),
+                    Some(at) => (k.contiguous()?.index_select(&at, 2)?, v.contiguous()?.index_select(&at, 2)?),
+                }
+            }
+            _ => (k, v),
+        };
+
         // `attention` folds the query heads onto their KV head rather than
         // copying the KV head out per query head, and takes the fused kernel
         // where it is trustworthy. One token, so no mask: the cache holds
@@ -482,15 +797,31 @@ impl GpuQwen35 {
             let ids = Tensor::from_slice(&[token], (1,), &self.device)?;
             let mut x = self.embed.rows(&ids)?.to_dtype(self.dtype)?;
 
+            // Every stream starts as the embedding.
+            if let Some((st, _)) = &self.streams {
+                x = x.repeat((1, st.hc))?;
+            }
+
             for l in 0..self.blocks.len() {
-                let h = crate::grad::rms_norm(&x, &self.blocks[l].attn_norm, spec.eps)?;
+                let (h, share) = match &self.blocks[l].residual {
+                    Residual::Plain { attn_norm, .. } => (crate::grad::rms_norm(&x, attn_norm, spec.eps)?, None),
+                    Residual::Hyper { attn, ple, .. } => {
+                        if let (Some(ple), Some((st, _))) = (ple, &self.streams) {
+                            let state = self.ple[l].as_mut().ok_or("n-gram layer has no state")?;
+                            x = (&x + ple.step(st, &x, token, state, spec.eps)?)?;
+                        }
+                        attn.mix(&x, spec.eps)?
+                    }
+                };
                 let mixed = match &self.blocks[l].mixer {
                     Mixer::Full(attn) => {
                         // Lent out for the step: `full_step` reads the rest
                         // of `self` while it writes this.
                         let mut cache = std::mem::replace(&mut self.kv[l], KvCache::new(2));
-                        let out = self.full_step(attn, &h, &mut cache);
+                        let mut keys = self.index_keys[l].take();
+                        let out = self.full_step(attn, &h, &mut cache, &mut keys);
                         self.kv[l] = cache;
+                        self.index_keys[l] = keys;
                         out?
                     }
                     Mixer::Linear(net) => {
@@ -499,15 +830,28 @@ impl GpuQwen35 {
                         out
                     }
                 };
-                x = (x + mixed)?;
+                x = match &share {
+                    None => (x + mixed)?,
+                    Some(share) => inject(&x, &mixed, share)?,
+                };
 
                 let b = &self.blocks[l];
-                let h = crate::grad::rms_norm(&x, &b.mlp_norm, spec.eps)?;
-                x = (x + b.mlp.forward(&h, 1, spec.n_embd)?)?;
+                let (h, share) = match &b.residual {
+                    Residual::Plain { mlp_norm, .. } => (crate::grad::rms_norm(&x, mlp_norm, spec.eps)?, None),
+                    Residual::Hyper { mlp, .. } => mlp.mix(&x, spec.eps)?,
+                };
+                let out = b.mlp.forward(&h, 1, spec.n_embd)?;
+                x = match &share {
+                    None => (x + out)?,
+                    Some(share) => inject(&x, &out, share)?,
+                };
             }
             self.pos += 1;
 
-            let h = crate::grad::rms_norm(&x, &self.final_norm, spec.eps)?;
+            let h = match &self.streams {
+                None => crate::grad::rms_norm(&x, &self.final_norm, spec.eps)?,
+                Some((_, last)) => last.mix(&x, spec.eps)?.0,
+            };
             let logits = self.head.forward(&h)?.to_dtype(DType::F32)?;
             last = logits.flatten_all()?.to_vec1::<f32>()?;
         }
@@ -521,6 +865,14 @@ impl GpuQwen35 {
         let d = &self.delta;
         for l in 0..self.blocks.len() {
             self.kv[l].truncate(0);
+            self.index_keys[l] = None;
+            self.ple[l] = match (&self.blocks[l].residual, &self.streams) {
+                (Residual::Hyper { ple: Some(_), .. }, Some((st, _))) => Some(PleState {
+                    history: vec![st.eos; st.ngram - 1],
+                    window: Tensor::zeros((st.hc * self.spec.n_embd, st.ple_window()), DType::F32, &self.device)?,
+                }),
+                _ => None,
+            };
             self.state[l] = match self.kinds[l] {
                 Kind::Full => None,
                 Kind::Linear => Some(State {
@@ -555,6 +907,7 @@ impl GpuQwen35 {
                             + a.o.params()
                             + n(&a.q_norm)
                             + n(&a.k_norm)
+                            + a.indexer.as_ref().map_or(0, |i| i.qk.params() + n(&i.q_norm) + n(&i.k_norm))
                     }
                     Mixer::Linear(d) => {
                         d.inputs.params()
@@ -565,12 +918,14 @@ impl GpuQwen35 {
                             + d.out.params()
                     }
                 };
-                mixer
-                    + b.mlp.params()
-                    + n(&b.attn_norm)
-                    + n(&b.mlp_norm)
+                let residual = match &b.residual {
+                    Residual::Plain { attn_norm, mlp_norm } => n(attn_norm) + n(mlp_norm),
+                    Residual::Hyper { attn, mlp, ple } => attn.params() + mlp.params() + ple.as_ref().map_or(0, |p| p.params()),
+                };
+                mixer + b.mlp.params() + residual
             })
-            .sum();
+            .sum::<usize>()
+            + self.streams.as_ref().map_or(0, |(_, h)| h.params());
         let head = match self.spec.tie_embeddings {
             true => 0,
             false => self.head.params(),
@@ -585,12 +940,22 @@ impl GpuQwen35 {
             .iter()
             .map(|b| {
                 let mixer = match &b.mixer {
-                    Mixer::Full(a) => a.q.bytes() + a.k.bytes() + a.v.bytes() + a.o.bytes(),
+                    Mixer::Full(a) => {
+                        a.q.bytes() + a.k.bytes() + a.v.bytes() + a.o.bytes() + a.indexer.as_ref().map_or(0, |i| i.qk.bytes())
+                    }
                     Mixer::Linear(d) => d.inputs.bytes() + per(&d.conv) + d.out.bytes(),
                 };
-                mixer + b.mlp.bytes()
+                // The n-gram table is not here: it stays in the checkpoint.
+                let residual = match &b.residual {
+                    Residual::Plain { .. } => 0,
+                    Residual::Hyper { attn, mlp, ple } => {
+                        attn.bytes() + mlp.bytes() + ple.as_ref().map_or(0, |p| p.key.bytes() + p.value.bytes())
+                    }
+                };
+                mixer + b.mlp.bytes() + residual
             })
-            .sum();
+            .sum::<usize>()
+            + self.streams.as_ref().map_or(0, |(_, h)| h.bytes());
         let head = if self.tied { 0 } else { self.head.bytes() };
         blocks + self.embed.bytes() + head
     }
@@ -957,4 +1322,78 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    // -----------------------------------------------------------------------
+    // Qwen3.8-Flash-Next, against transformers
+    // -----------------------------------------------------------------------
+
+    /// The fixture `scripts/qwen4-exp-fixtures.py` writes: a tiny random
+    /// `qwen4_exp` with its experts packed, and transformers' logits at each
+    /// position of a 24-token prompt. See `crates/llm/tests/qwen4_exp.rs`.
+    fn qwen4() -> (Spec, Vec<std::path::PathBuf>, Vec<u32>, Vec<f32>) {
+        let dir = std::path::PathBuf::from(std::env::var("KVAD_QWEN4_FIXTURES").expect("KVAD_QWEN4_FIXTURES"));
+        let spec = Spec::from_json(&dir.join("config.json")).unwrap();
+        let r = kvad::weights::Checkpoint::open(&[dir.join("reference.safetensors")]).unwrap();
+        let tokens = r.read_words("tokens").unwrap().unwrap().1.chunks(2).map(|w| w[0]).collect();
+        (spec, vec![dir.join("model.safetensors")], tokens, r.get("logits").unwrap().data)
+    }
+
+    /// `‖got − want‖ / ‖want‖` over every position's logits.
+    fn relative(got: &[f32], want: &[f32]) -> f32 {
+        let d: f32 = got.iter().zip(want).map(|(a, b)| (a - b) * (a - b)).sum();
+        (d / want.iter().map(|b| b * b).sum::<f32>()).sqrt()
+    }
+
+    /// Every position, a token at a time, in f32 on the host and on Metal.
+    #[test]
+    #[ignore = "needs KVAD_QWEN4_FIXTURES from scripts/qwen4-exp-fixtures.py"]
+    fn qwen4_exp_agrees_with_transformers() {
+        let (spec, paths, tokens, want) = qwen4();
+        let vocab = spec.vocab_size;
+        let devices = match Device::new_metal(0) {
+            Ok(gpu) => vec![("cpu device", Device::Cpu), ("metal", gpu)],
+            Err(_) => vec![("cpu device", Device::Cpu)],
+        };
+        for (where_, dev) in devices {
+            let mut gpu = GpuQwen35::load(&paths, spec.clone(), DType::F32, None, dev, &Vault::off()).unwrap();
+            for (i, &t) in tokens.iter().enumerate() {
+                let got = gpu.forward(&[t]).unwrap();
+                let want = &want[i * vocab..(i + 1) * vocab];
+                let worst = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                let scale = want.iter().map(|x| x.abs()).fold(1f32, f32::max);
+                assert!(worst < 1e-3 * scale, "{where_}, position {i}: off by {worst} (scale {scale})");
+            }
+        }
+    }
+
+    /// q8 the way the published model has to run: the experts left on the
+    /// host and read through the CPU engine's cache file, everything else on
+    /// the device. Not equal to f32, but near it.
+    #[test]
+    #[ignore = "needs KVAD_QWEN4_FIXTURES from scripts/qwen4-exp-fixtures.py"]
+    fn qwen4_exp_at_q8_with_its_experts_on_the_host() {
+        let (spec, paths, tokens, want) = qwen4();
+        let vocab = spec.vocab_size;
+        let file = std::env::temp_dir().join(format!("kvad-qwen4-{}.kvq", std::process::id()));
+        let ckpt = kvad::weights::Checkpoint::open(&paths).unwrap();
+        let mut live = kvad::qcache::Live::new(&ckpt, kvad::quant::Precision::Q8);
+        live.record_to(&file).unwrap();
+        kvad::model::qwen3_5::Model::load(&live, spec.clone()).unwrap();
+        live.finish("test/qwen4", &paths, &spec).unwrap().expect("a cache file");
+        let mapped = kvad::qcache::Mapped::open(&file, "test/qwen4", &paths, &spec, kvad::quant::Precision::Q8)
+            .unwrap()
+            .expect("the file just written");
+        let vault = Vault::hosting(Box::new(mapped));
+
+        let dev = Device::new_metal(0).unwrap_or(Device::Cpu);
+        let mut gpu = GpuQwen35::load(&paths, spec.clone(), DType::F32, Some(GgmlDType::Q8_0), dev, &vault).unwrap();
+        let got: Vec<f32> = tokens.iter().flat_map(|&t| gpu.forward(&[t]).unwrap()).collect();
+        let _ = std::fs::remove_file(&file);
+        // Measured: 12.9% hosted, 9.5% with everything on the device, 13.5%
+        // on the CPU engine — random weights make a model q8 rounds badly —
+        // and 76% with every packed expert read as expert 0, the bug this was
+        // written next to.
+        let off = relative(&got, &want);
+        assert!(off < 0.25, "q8 with hosted experts is {:.1}% off transformers", off * 100.0);
+        let _ = vocab;
+    }
 }

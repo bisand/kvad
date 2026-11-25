@@ -988,7 +988,7 @@ fn read_session(
         Box::new(GpuLlama::load(paths, spec.clone(), dtype, quant, device, &cache)?)
     } else if arch.is("gpt2") {
         Box::new(crate::gpt2::GpuGpt2::load(paths, spec.clone(), dtype, quant, device, &cache)?)
-    } else if arch.is("qwen3_5") || arch.is("qwen3_next") {
+    } else if arch.is("qwen3_5") || arch.is("qwen3_next") || arch.is("qwen4_exp") {
         Box::new(crate::qwen3_5::GpuQwen35::load(
             paths,
             spec.clone(),
@@ -1024,8 +1024,9 @@ fn hosted_experts(
     if std::env::var("KVAD_GPU_EXPERTS").as_deref() != Ok("host") {
         return Ok(None);
     }
-    if !spec.arch.is("llama") || Router::count(&spec.config).is_none() {
-        return Err("KVAD_GPU_EXPERTS=host is for a Llama-family mixture such as Qwen3-30B".into());
+    let family = ["llama", "qwen3_next", "qwen4_exp"].iter().any(|a| spec.arch.is(a));
+    if !family || Router::count(&spec.config).is_none() {
+        return Err("KVAD_GPU_EXPERTS=host is for a Llama-family or Qwen3-Next-family mixture".into());
     }
     let (precision, name) = match quant {
         Some(GgmlDType::Q8_0) => (Precision::Q8, "q8"),
@@ -1051,7 +1052,7 @@ fn hosted_experts(
 /// `deepseek.rs` implements V3 as well, and V3 is not here: the dispatch
 /// below has no arm for it, so no V3 checkpoint reaches that code. The arm
 /// and this list go together when it gets one.
-const IMPLEMENTED: [&str; 5] = ["llama", "gpt2", "deepseek_v2", "qwen3_5", "qwen3_next"];
+const IMPLEMENTED: [&str; 6] = ["llama", "gpt2", "deepseek_v2", "qwen3_5", "qwen3_next", "qwen4_exp"];
 
 /// Whether this backend can run `arch`, asked before anything is loaded.
 pub fn supports(arch: Arch) -> bool {
@@ -1078,7 +1079,7 @@ pub fn kv_number_bytes(arch: Arch, dtype: DType, quant: Option<GgmlDType>, metal
     // The architectures whose cache follows `kv_store`: those whose
     // attention is `attention` in this file. GPT-2 and DeepSeek do their own
     // arithmetic on the cache, in the compute dtype.
-    let follows = arch.is("llama") || arch.is("qwen3_5") || arch.is("qwen3_next");
+    let follows = arch.is("llama") || arch.is("qwen3_5") || arch.is("qwen3_next") || arch.is("qwen4_exp");
     match crate::common::kv_store_on(metal, quant) {
         Some(store) if follows => store.size_in_bytes(),
         _ => compute.size_in_bytes(),

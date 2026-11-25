@@ -310,6 +310,30 @@ impl<'v> Loader<'v> {
         Ok(Proj::Quant(QMatMul::from_qtensor(self.quantized(vb, name, out, inp, stored)?)?))
     }
 
+    /// A projection from a matrix already in hand, `[out, in]` on the host.
+    ///
+    /// For a slice of a packed stack of experts — Qwen3.8-Flash-Next's
+    /// `experts.gate_up_proj` — which has no name of its own to look up or
+    /// file in the cache under, so it is quantised on every load.
+    pub(crate) fn proj_of(&self, w: &Tensor) -> Res<Proj> {
+        let (out, inp) = w.dims2()?;
+        let Some(gd) = self.quant else {
+            return Ok(Proj::Dense(w.t()?.contiguous()?.to_device(&self.device)?));
+        };
+        // `force_contiguous`, not `contiguous`: one expert's slice of the
+        // stack is already contiguous, at an offset, and `contiguous` hands
+        // it back as it is. `QTensor::quantize` reads the storage from its
+        // start and ignores the offset, so every expert came out as expert
+        // 0: 76% off transformers in q8 on the fixture, against 10% with
+        // this.
+        let cpu = QTensor::quantize(&w.to_dtype(DType::F32)?.force_contiguous()?, gd)?;
+        let q = match self.device.is_cpu() {
+            true => cpu,
+            false => QTensor::new(QStorage::from_data(cpu.data()?, &self.device, gd)?, (out, inp))?,
+        };
+        Ok(Proj::Quant(QMatMul::from_qtensor(q)?))
+    }
+
     /// Projections that read the same input, as one: `parts` are each one's
     /// name and output width, and the merged projection returns their
     /// outputs side by side, in that order.

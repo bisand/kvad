@@ -189,6 +189,8 @@ pub fn registry() -> &'static [Arch] {
         all.push(Arch(&super::qwen3_5::ARCH));
         #[cfg(feature = "arch-qwen3-5")]
         all.push(Arch(&super::qwen3_5::NEXT));
+        #[cfg(feature = "arch-qwen3-5")]
+        all.push(Arch(&super::qwen3_5::EXP));
         all
     });
     &REGISTRY

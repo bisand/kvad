@@ -304,6 +304,78 @@ The smallest real `qwen3_next` on the Hub is a 16 MB random-weight test model,
 and it is the one that found this. It says nothing sensible, and both backends
 say the same nothing, byte for byte.
 
+## The third family, and the first that is not just a spelling
+
+`qwen4_exp` — Qwen3.8-Flash-Next — went into the same module too, and this
+time the diff against Qwen3-Next is not three spellings. The delta net, the
+gated attention and the mixture with its gated shared expert are Next's line
+for line (the delta net's output gate is a sigmoid rather than a SiLU, which
+the config says as `output_gate_type`). Three things are new, read from
+transformers' `modular_qwen4_exp.py`:
+
+- **Four residual streams.** The hidden state between layers is four copies of
+  the 2560-wide vector. Before each mixer and each MLP, a *hyper-connection*
+  normalises each stream, weighs every number by a low-rank learned function of
+  all four, and averages them to the one vector the sublayer reads; the
+  sublayer's output is added back to each stream scaled by its own weight in
+  `(0, 2)`. That replaces both RMSNorms of every block, and a last one replaces
+  the final norm.
+- **Per-layer embeddings** (`ple_*`, `ngram_*`). On layer 2 alone, the bigram
+  and trigram ending at each token are hashed eight ways each — token ids times
+  odd SplitMix64 multipliers, XORed, modulo a different prime per head — into a
+  table, and the sixteen 160-wide rows found are gated into the streams and run
+  through a depthwise convolution of dilation 3. An n-gram never reaches back
+  across an EOS. The table is the remarkable part: 128 shards of
+  `[2500012, 160]`, 51.2 billion numbers, 102 GB in bf16, read sixteen rows a
+  token. It is never quantised or cached:
+  [`Table`](../crates/llm/src/weights.rs) reads the rows where they lie in the
+  checkpoint's own mapped files.
+- **Query-selected attention** (`indexer_*`). A small projection in front of
+  each attention layer scores blocks of four past tokens and keeps the best 512
+  of them plus the incomplete block at the end. With a budget of 2048 tokens it
+  changes nothing until a query sees more than 2051, so the GPU reads nothing
+  back until then.
+
+The experts are packed, too: one `experts.gate_up_proj` of `[512, 1280, 2560]`
+and one `experts.down_proj` of `[512, 2560, 640]` per layer where every other
+mixture has `experts.N.gate_proj`. The CPU loader answers the per-expert names
+by slicing only that expert's bytes out of the stack, so the mixture code, the
+cache file and the expert cache beside the GPU never learn there was a second
+spelling. On the GPU the slice is quantised directly, and that found candle's
+offset trap again in a new place: one expert's slice is contiguous at an
+offset, `contiguous()` hands it back unchanged, and `QTensor::quantize` reads
+the storage from its start — so every expert was expert 0. On the fixture that
+was 76% relative error in q8 against 10% after `force_contiguous`.
+
+The fixture is transformers' own class at toy size
+([`scripts/qwen4-exp-fixtures.py`](../scripts/qwen4-exp-fixtures.py)), shaped to
+reach all three: an indexer budget of 8 under a 24-token prompt, so selection
+changes positions 9 to 23; an EOS at position 9; the table in twelve shards,
+which transformers joins in numeric order, not string order; and every weight
+redrawn after construction, because the reference initialises the PLE
+convolution and every norm to zero and a zero checks nothing. Measured on it:
+
+| | worst \|Δlogit\| or relative error |
+|---|---|
+| CPU engine, f32, every position | 6.8e-5 absolute, logits up to 1.95 |
+| GPU, f32, CPU device / Metal | 6.4e-5 / 6.8e-5 absolute |
+| CPU engine, q8 | 13.5% relative RMS |
+| GPU, q8 on the device | 9.5% (CPU device), 10.4% (Metal) |
+| GPU, q8, experts on the host | 12.9% |
+| GPU, q8, every expert read as expert 0 | 76% |
+
+Random weights make a model q8 rounds badly, which is why those percentages
+are large; the bug is not hidden among them. Turning the block selection off,
+or letting an n-gram reach across an EOS, fails the f32 test.
+
+What was not measured is the real checkpoint. It is 360 GB, 131 files; at
+Kvad's q4 its experts alone are 75.5 GB (q8: 136 GB) on top of the 102 GB
+table that stays in bf16. The first load used to hold the whole quantised
+model in memory while it wrote the cache, 76 GB at q4 on a 48 GB machine; it
+no longer does (see [the first load](#the-first-load-no-longer-holds-the-model)).
+What is left is disk: with the checkpoint and its cache side by side it wants
+about 440 GB, and this machine had 337 GiB free.
+
 ## Base models versus instruction-tuned
 
 GPT-2 is a **base** model: pure next-token prediction, no instruction tuning.
@@ -953,6 +1025,30 @@ The GPU backend used to be exempt from all this, on the grounds that candle's
 `quantize_onto` takes about 0.2 s for the same model — fast enough not to be
 worth a second format. That was true of the model it was measured on and of no
 other: [it does not survive a 16B checkpoint](gpu.md#the-quantising-done-once-over-there-too).
+
+
+### The first load no longer holds the model
+
+Recording used to tee each quantised weight to the file and keep it too, so
+the model being built held every code it had written: a first load needed the
+whole quantised model in memory at once, where every later load maps it. Now
+[`Live::keep`](../crates/llm/src/qcache.rs) answers with the copy it has just
+written, mapped back from the file: one mapping per weight, of that weight's
+bytes. What stays resident is the one tensor being quantised; the kernel
+writes the rest out and lets it go. Once the file is finished the model is
+built again from it as a whole, so the first load and every later one get the
+same model, expert cache included.
+
+Qwen3-30B-A3B at q4, into an empty cache, `/usr/bin/time -l`:
+
+| | peak footprint | wall | cache file |
+|---|---|---|---|
+| holding the model | 20.9 GB | 266 s | 19,086,662,004 bytes |
+| mapping it back | 1.55 GB | 215 s | 19,086,662,004 bytes |
+
+One run each, so the time is a hint rather than a result. The footprint is the
+point: it no longer grows with the model, which is what lets a model bigger than
+the machine's memory be quantised on it at all.
 
 ## Below one bit: LittleBit
 

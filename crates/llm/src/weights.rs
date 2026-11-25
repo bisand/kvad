@@ -1259,7 +1259,47 @@ fn f16_to_f32(h: u16) -> f32 {
 
 /// Read a JSON file into a `serde_json::Value`.
 pub fn read_json(path: &Path) -> Res<serde_json::Value> {
-    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+    let text = std::fs::read_to_string(path)?;
+    match serde_json::from_str(&text) {
+        Ok(v) => Ok(v),
+        // Python's `json.dump` writes `Infinity` and `NaN` unless told not
+        // to, and Nemotron-H's configs say `"time_step_limit": [0.0,
+        // Infinity]`. JSON has no such numbers, so they are read as `null`:
+        // absent, which every reader here already answers with its default.
+        Err(err) => serde_json::from_str(&python_numbers_as_null(&text)).map_err(|_| err.into()),
+    }
+}
+
+/// `Infinity`, `-Infinity` and `NaN` outside strings, as `null`.
+fn python_numbers_as_null(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if in_string {
+            in_string = escaped || c != '"';
+            escaped = !escaped && c == '\\';
+        } else if c == '"' {
+            in_string = true;
+        } else if let Some(word) = ["-Infinity", "Infinity", "NaN"].into_iter().find(|w| rest.starts_with(w)) {
+            out.push_str("null");
+            rest = &rest[word.len()..];
+            continue;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn pythons_infinity_is_read_as_absent() {
+    let text = r#"{"time_step_limit": [0.0, Infinity], "a": -Infinity, "b": NaN, "s": "NaN \"Infinity\""}"#;
+    let v: serde_json::Value = serde_json::from_str(&python_numbers_as_null(text)).unwrap();
+    assert_eq!(v["time_step_limit"], serde_json::json!([0.0, null]));
+    assert!(v["a"].is_null() && v["b"].is_null());
+    assert_eq!(v["s"], "NaN \"Infinity\"");
 }
 
 #[cfg(test)]

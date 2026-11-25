@@ -107,29 +107,31 @@ impl ExpertStore {
         // read off the names rather than guessed from the config — which
         // matters because a family with a dense prefix has layers that are
         // simply absent from this table.
+        //
+        // Each expert's arrays are gathered under its `(layer, expert)`,
+        // whatever the family calls them: `gate`, `up` and `down` for SwiGLU,
+        // `up` and `down` for Nemotron-H's ungated ReLU².
         let (mut n_layers, mut n_experts) = (0usize, 0usize);
-        let mut seen: Vec<(usize, usize)> = Vec::new();
-        for name in tensors.keys() {
+        let mut seen: std::collections::BTreeMap<(usize, usize), (Vec<(u64, u64)>, Vec<&str>)> =
+            Default::default();
+        for (name, entry) in tensors {
             let Some((layer, expert)) = parse_expert(name) else { continue };
             n_layers = n_layers.max(layer + 1);
             n_experts = n_experts.max(expert + 1);
-            seen.push((layer, expert));
+            let (spans, projs) = seen.entry((layer, expert)).or_default();
+            spans.extend(arrays(entry)?);
+            projs.extend(["gate_proj", "up_proj", "down_proj"].into_iter().filter(|p| name.contains(p)));
         }
         if seen.is_empty() {
             return Ok(None);
         }
-        seen.sort_unstable();
-        seen.dedup();
 
         let mut extents = vec![None; n_layers * n_experts];
-        for (layer, expert) in seen {
-            let mut spans: Vec<(u64, u64)> = Vec::with_capacity(6);
-            for proj in ["gate_proj", "up_proj", "down_proj"] {
-                let name = format!("layers.{layer}.mlp.experts.{expert}.{proj}.weight");
-                let Some(entry) = tensors.get(&name) else {
+        for ((layer, expert), (mut spans, projs)) in seen {
+            for proj in ["up_proj", "down_proj"] {
+                if !projs.contains(&proj) {
                     return Err(format!("expert {expert} of layer {layer} has no {proj}").into());
-                };
-                spans.extend(arrays(entry)?);
+                }
             }
             spans.sort_unstable();
             let lo = spans[0].0;
@@ -237,10 +239,11 @@ fn arrays(entry: &serde_json::Value) -> Res<Vec<(u64, u64)>> {
     Ok(out)
 }
 
-/// `layers.3.mlp.experts.7.gate_proj.weight` -> `(3, 7)`.
+/// `layers.3.mlp.experts.7.gate_proj.weight` -> `(3, 7)`, and Nemotron-H's
+/// `backbone.layers.3.mixer.experts.7.up_proj.weight` the same.
 fn parse_expert(name: &str) -> Option<(usize, usize)> {
-    let rest = name.strip_prefix("layers.")?;
-    let (layer, rest) = rest.split_once(".mlp.experts.")?;
+    let rest = name.strip_prefix("backbone.").unwrap_or(name).strip_prefix("layers.")?;
+    let (layer, rest) = rest.split_once(".mlp.experts.").or_else(|| rest.split_once(".mixer.experts."))?;
     let (expert, _) = rest.split_once('.')?;
     Some((layer.parse().ok()?, expert.parse().ok()?))
 }
@@ -817,6 +820,11 @@ mod tests {
     fn names_are_read_the_way_the_cache_writes_them() {
         assert_eq!(parse_expert("layers.3.mlp.experts.7.gate_proj.weight"), Some((3, 7)));
         assert_eq!(parse_expert("layers.0.mlp.experts.127.down_proj.weight"), Some((0, 127)));
+        assert_eq!(parse_expert("backbone.layers.5.mixer.experts.511.up_proj.weight"), Some((5, 511)));
+        // The shared expert runs for every token and is not one of these.
+        assert_eq!(parse_expert("backbone.layers.5.mixer.shared_experts.up_proj.weight"), None);
+        // Nor is the multi-token-prediction head's mixture, which is never run.
+        assert_eq!(parse_expert("mtp.layers.1.mixer.experts.3.up_proj.weight"), None);
         assert_eq!(parse_expert("layers.3.self_attn.q_proj.weight"), None);
         assert_eq!(parse_expert("layers.3.mlp.gate.weight"), None);
     }

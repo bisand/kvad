@@ -351,9 +351,14 @@ impl Router {
 // The weights
 // ---------------------------------------------------------------------------
 
-/// A SwiGLU MLP, which is what both a dense layer and one expert are.
+/// A SwiGLU MLP, which is what both a dense layer and one expert are -- or,
+/// without its gate, Nemotron-H's `down(relu(up(x))²)`.
 pub struct Ffn {
-    gate: Weight,
+    /// `None` for the ungated ReLU² form. Which form an MLP is comes from the
+    /// loader that asked, never from whether a checkpoint happens to have the
+    /// tensor: a SwiGLU checkpoint missing its gate should fail to load, not
+    /// run as something else.
+    gate: Option<Weight>,
     up: Weight,
     down: Weight,
 }
@@ -361,17 +366,42 @@ pub struct Ffn {
 impl Ffn {
     pub fn load(src: &dyn Source, prefix: &str) -> Res<Self> {
         Ok(Ffn {
-            gate: src.matrix(&format!("{prefix}.gate_proj.weight"))?,
+            gate: Some(src.matrix(&format!("{prefix}.gate_proj.weight"))?),
             up: src.matrix(&format!("{prefix}.up_proj.weight"))?,
             down: src.matrix(&format!("{prefix}.down_proj.weight"))?,
         })
     }
 
+    /// Nemotron-H's MLP: `up`, ReLU squared, `down`, and no gate.
+    pub fn load_ungated(src: &dyn Source, prefix: &str) -> Res<Self> {
+        Ok(Ffn {
+            gate: None,
+            up: src.matrix(&format!("{prefix}.up_proj.weight"))?,
+            down: src.matrix(&format!("{prefix}.down_proj.weight"))?,
+        })
+    }
+
+    /// The hidden activation from the gate's and up's outputs: SwiGLU, or
+    /// ReLU² when there is no gate.
+    fn activate(gate: Option<Vec<f32>>, mut up: Vec<f32>) -> Vec<f32> {
+        match gate {
+            Some(mut gate) => {
+                swiglu_inplace(&mut gate, &up);
+                gate
+            }
+            None => {
+                for v in up.iter_mut() {
+                    *v = v.max(0.0) * v.max(0.0);
+                }
+                up
+            }
+        }
+    }
+
     pub fn run(&self, xs: &[f32], m: usize) -> Vec<f32> {
-        let mut gate = self.gate.matmul_bt(xs, m, None);
-        let up = self.up.matmul_bt(xs, m, None);
-        swiglu_inplace(&mut gate, &up);
-        self.down.matmul_bt(&gate, m, None)
+        let gate = self.gate.as_ref().map(|g| g.matmul_bt(xs, m, None));
+        let hidden = Ffn::activate(gate, self.up.matmul_bt(xs, m, None));
+        self.down.matmul_bt(&hidden, m, None)
     }
 
     /// One token, through the matrix-*vector* kernel.
@@ -381,32 +411,47 @@ impl Ffn {
     /// into the batched spelling for tidiness would be a change to the hottest
     /// loop in the engine, measured in neither direction.
     pub fn run_one(&self, x: &[f32]) -> Vec<f32> {
-        let mut gate = self.gate.matvec_bt(x, None);
-        let up = self.up.matvec_bt(x, None);
-        swiglu_inplace(&mut gate, &up);
-        self.down.matvec_bt(&gate, None)
+        let gate = self.gate.as_ref().map(|g| g.matvec_bt(x, None));
+        let hidden = Ffn::activate(gate, self.up.matvec_bt(x, None));
+        self.down.matvec_bt(&hidden, None)
     }
 
     /// Gate, up and down, for a backend that runs them itself.
+    ///
+    /// shortcut: panics on an ungated MLP; the GPU backend runs no ungated
+    /// family yet, so return an `Option` when one does.
     pub fn weights(&self) -> [&Weight; 3] {
-        [&self.gate, &self.up, &self.down]
+        [self.gate.as_ref().expect("a gated MLP"), &self.up, &self.down]
+    }
+
+    /// Start reading every weight, if they are mapped. See
+    /// [`Weight::will_need`].
+    fn will_need(&self) {
+        if let Some(gate) = &self.gate {
+            gate.will_need();
+        }
+        self.up.will_need();
+        self.down.will_need();
     }
 
     /// This MLP with its weights read from `slab`. See [`Weight::rebased`].
     fn rebased(&self, lo: u64, slab: &std::sync::Arc<crate::qcache::Slab>) -> Option<Ffn> {
         Some(Ffn {
-            gate: self.gate.rebased(lo, slab)?,
+            gate: match &self.gate {
+                Some(g) => Some(g.rebased(lo, slab)?),
+                None => None,
+            },
             up: self.up.rebased(lo, slab)?,
             down: self.down.rebased(lo, slab)?,
         })
     }
 
     pub fn param_count(&self) -> usize {
-        self.gate.param_count() + self.up.param_count() + self.down.param_count()
+        self.gate.as_ref().map_or(0, Weight::param_count) + self.up.param_count() + self.down.param_count()
     }
 
     pub fn bytes(&self) -> usize {
-        self.gate.bytes() + self.up.bytes() + self.down.bytes()
+        self.gate.as_ref().map_or(0, Weight::bytes) + self.up.bytes() + self.down.bytes()
     }
 }
 
@@ -423,12 +468,16 @@ pub struct SharedExpert {
 }
 
 impl SharedExpert {
-    fn load(src: &dyn Source, prefix: &str, shared: Shared) -> Res<Option<Self>> {
+    fn load(src: &dyn Source, prefix: &str, shared: Shared, gated: bool) -> Res<Option<Self>> {
         if shared == Shared::None {
             return Ok(None);
         }
+        let name = format!("{prefix}.{}", shared.name());
         Ok(Some(SharedExpert {
-            ffn: Ffn::load(src, &format!("{prefix}.{}", shared.name()))?,
+            ffn: match gated {
+                true => Ffn::load(src, &name)?,
+                false => Ffn::load_ungated(src, &name)?,
+            },
             gate: match shared {
                 Shared::Gated(_) => Some(src.matrix(&format!("{prefix}.shared_expert_gate.weight"))?),
                 _ => None,
@@ -502,6 +551,11 @@ pub struct Moe {
     /// The experts the layer below guessed this one would want, to score
     /// against what it does want.
     pub guessed: std::sync::Mutex<Vec<usize>>,
+    /// Nemotron 3 Super's latent projections, `[latent, hidden]` and
+    /// `[hidden, latent]`: the routed experts read `fc1 · x` and their
+    /// weighted sum goes through `fc2` before the shared expert, which reads
+    /// `x` itself, is added. `None` for every other family.
+    pub latent: Option<(Weight, Weight)>,
 }
 
 /// How often a layer's guess at the next layer's experts was right, over the
@@ -531,14 +585,33 @@ impl Moe {
     /// bias nor a shared expert and asks for neither, DeepSeek has both, and
     /// Qwen3-Next has a shared expert with a mind of its own.
     pub fn load(src: &dyn Source, prefix: &str, router: &Router, shared: Shared) -> Res<Self> {
+        Moe::load_as(src, prefix, router, shared, true)
+    }
+
+    /// As [`Moe::load`], with every expert, shared ones too, `gated` or not.
+    ///
+    /// Nemotron-H's experts are ungated ReLU² MLPs, and Nemotron 3 Super's
+    /// run in a latent space: the two projections round them are read when
+    /// the checkpoint has them, which no other family's does.
+    pub fn load_as(src: &dyn Source, prefix: &str, router: &Router, shared: Shared, gated: bool) -> Res<Self> {
+        let expert = |e: usize| {
+            let name = format!("{prefix}.experts.{e}");
+            match gated {
+                true => Ffn::load(src, &name),
+                false => Ffn::load_ungated(src, &name),
+            }
+        };
+        let latent = match src.try_matrix(&format!("{prefix}.fc1_latent_proj.weight")) {
+            Some(fc1) => Some((fc1, src.matrix(&format!("{prefix}.fc2_latent_proj.weight"))?)),
+            None => None,
+        };
         Ok(Moe {
             router: router.clone(),
             gate: src.matrix(&format!("{prefix}.gate.weight"))?,
             bias: src.try_vector(&format!("{prefix}.gate.e_score_correction_bias")),
-            experts: (0..router.n_experts)
-                .map(|e| Ffn::load(src, &format!("{prefix}.experts.{e}")))
-                .collect::<Res<Vec<_>>>()?,
-            shared: SharedExpert::load(src, prefix, shared)?,
+            shared: SharedExpert::load(src, prefix, shared, gated)?,
+            latent,
+            experts: (0..router.n_experts).map(expert).collect::<Res<Vec<_>>>()?,
             layer: layer_of(prefix),
             resident: src.experts(),
             guessed: Default::default(),
@@ -577,7 +650,7 @@ impl Moe {
             jobs.push((&next.gate, x));
         }
         if let Some(s) = &self.shared {
-            jobs.push((&s.ffn.gate, x));
+            jobs.push((s.ffn.gate.as_ref()?, x));
             jobs.push((&s.ffn.up, x));
             if let Some(gate) = &s.gate {
                 jobs.push((gate, x));
@@ -592,8 +665,8 @@ impl Moe {
         let shared = match &self.shared {
             None => None,
             Some(s) => {
-                let mut hidden = ys.next()?;
-                swiglu_inplace(&mut hidden, &ys.next()?);
+                let gate = ys.next()?;
+                let hidden = Ffn::activate(Some(gate), ys.next()?);
                 let score = match &s.gate {
                     Some(_) => Some(ys.next()?[0]),
                     None => None,
@@ -661,13 +734,28 @@ impl Moe {
     /// read ahead while this layer computes: the residual stream changes
     /// little in one block, so the guess is mostly right, and a wrong one
     /// costs a read, never the answer. Off unless `KVAD_EXPERT_GUESS=1`.
+    ///
+    /// With a latent projection the routed experts read `fc1 · hs`, `w` wide,
+    /// and are summed there; `fc2` brings the sum back to `e` before the
+    /// shared expert's output is added.
     pub fn run(&self, hs: &[f32], m: usize, e: usize, next: Option<&Moe>) -> Vec<f32> {
         let router = &self.router;
         let n = router.n_experts;
         let next = next.filter(|_| m == 1 && guessing());
+        let latent = self.latent.as_ref().map(|(fc1, _)| match m {
+            1 => fc1.matvec_bt(hs, None),
+            _ => fc1.matmul_bt(hs, m, None),
+        });
+        let (xs, w) = match &latent {
+            Some(l) => (l.as_slice(), l.len() / m),
+            None => (hs, e),
+        };
         // One token: the router and the shared expert read the same input
-        // and neither needs the other, so they are one parallel section.
-        let (logits, mut shared, ahead) = match (m == 1 && together()).then(|| self.early(hs, next)).flatten() {
+        // and neither needs the other, so they are one parallel section. Not
+        // with a latent projection, where the shared expert's output must not
+        // land in the latent sum.
+        let early = m == 1 && together() && latent.is_none();
+        let (logits, mut shared, ahead) = match early.then(|| self.early(hs, next)).flatten() {
             Some(all) => all,
             None => (self.gate.matmul_bt(hs, m, None), None, next.map(|x| x.gate.matvec_bt(hs, None))),
         };
@@ -689,13 +777,20 @@ impl Moe {
         }
         trace.finish(self.layer, n, self.experts.first().map_or(0, Ffn::bytes));
 
+        // The shared expert's output, when it is added after `fc2` rather
+        // than being where the routed experts' sum starts.
+        let mut beside = None;
         let mut out = match &self.shared {
             // Waiting for its down projection, which `mix` runs with the
             // routed experts' and lands before any of theirs is added.
-            Some(_) if shared.is_some() => vec![0.0f32; m * e],
+            Some(_) if shared.is_some() => vec![0.0f32; m * w],
+            Some(expert) if latent.is_some() => {
+                beside = Some(expert.run(hs, m));
+                vec![0.0f32; m * w]
+            }
             // Every token, so it is one batched pass and needs no grouping.
             Some(expert) => expert.run(hs, m),
-            None => vec![0.0f32; m * e],
+            None => vec![0.0f32; m * w],
         };
         let chosen: Vec<usize> = (0..n).filter(|&x| !by_expert[x].is_empty()).collect();
         if m == 1 {
@@ -711,16 +806,24 @@ impl Moe {
         if let (None, Some((next, guess))) = (&self.resident, &ahead) {
             if hint() {
                 for &x in guess {
-                    let ffn = &next.experts[x];
-                    ffn.gate.will_need();
-                    ffn.up.will_need();
-                    ffn.down.will_need();
+                    next.experts[x].will_need();
                 }
             }
         }
         let ahead = ahead.as_ref().map(|(next, guess)| (next.layer, guess.as_slice()));
-        self.experts_into(hs, m, e, &by_expert, &chosen, ahead, &mut shared, &mut out);
+        self.experts_into(xs, m, w, &by_expert, &chosen, ahead, &mut shared, &mut out);
         debug_assert!(shared.is_none(), "the shared expert never landed");
+        if let Some((_, fc2)) = &self.latent {
+            out = match m {
+                1 => fc2.matvec_bt(&out, None),
+                _ => fc2.matmul_bt(&out, m, None),
+            };
+            if let Some(beside) = beside {
+                for (o, s) in out.iter_mut().zip(&beside) {
+                    *o += s;
+                }
+            }
+        }
         out
     }
 
@@ -840,9 +943,7 @@ fn mix(
         // it won (13.8). A no-op for experts read into slabs.
         if hint() {
             for &(_, ffn) in group {
-                ffn.gate.will_need();
-                ffn.up.will_need();
-                ffn.down.will_need();
+                ffn.will_need();
             }
         }
         let tail = shared.as_ref().map(|p| (p.down, p.hidden.as_slice()));
@@ -899,14 +1000,19 @@ fn decode_together(
 ) -> Option<(Vec<Vec<f32>>, Option<Vec<f32>>)> {
     let mut jobs = Vec::with_capacity(2 * group.len());
     for &(_, ffn) in group {
-        jobs.push((&ffn.gate, x));
+        if let Some(gate) = &ffn.gate {
+            jobs.push((gate, x));
+        }
         jobs.push((&ffn.up, x));
     }
     let mut both = crate::quant::matvec_many(&jobs)?.into_iter();
     let mut hidden = Vec::with_capacity(group.len());
-    while let (Some(mut gate), Some(up)) = (both.next(), both.next()) {
-        swiglu_inplace(&mut gate, &up);
-        hidden.push(gate);
+    for &(_, ffn) in group {
+        let gate = match ffn.gate {
+            Some(_) => Some(both.next()?),
+            None => None,
+        };
+        hidden.push(Ffn::activate(gate, both.next()?));
     }
     let mut jobs: Vec<(&Weight, &[f32])> =
         group.iter().zip(&hidden).map(|(&(_, ffn), h)| (&ffn.down, h.as_slice())).collect();
@@ -996,6 +1102,7 @@ impl Mlp {
                 moe.gate.param_count()
                     + moe.bias.as_ref().map_or(0, Vec::len)
                     + moe.experts.iter().map(Ffn::param_count).sum::<usize>()
+                    + moe.latent.as_ref().map_or(0, |(a, b)| a.param_count() + b.param_count())
                     + moe.shared.as_ref().map_or(0, SharedExpert::param_count)
             }
         }
@@ -1007,6 +1114,7 @@ impl Mlp {
             Mlp::Moe(moe) => {
                 moe.gate.bytes()
                     + moe.experts.iter().map(Ffn::bytes).sum::<usize>()
+                    + moe.latent.as_ref().map_or(0, |(a, b)| a.bytes() + b.bytes())
                     + moe.shared.as_ref().map_or(0, SharedExpert::bytes)
             }
         }
@@ -1048,7 +1156,7 @@ mod tests {
         for (kind, shared) in [("none", Shared::None), ("fused", Shared::Fused(2)), ("gated", Shared::Gated(64))] {
             let precision = Precision::Q8;
             let mut ffn = |w: usize| Ffn {
-                gate: Weight::quantize(mat(w, hidden), precision),
+                gate: Some(Weight::quantize(mat(w, hidden), precision)),
                 up: Weight::quantize(mat(w, hidden), precision),
                 down: Weight::quantize(mat(hidden, w), precision),
             };
@@ -1075,6 +1183,7 @@ mod tests {
                 layer: 0,
                 resident: None,
                 guessed: Default::default(),
+                latent: None,
             };
             let x = mat(1, hidden).data;
 
@@ -1104,6 +1213,7 @@ mod tests {
     /// A token's experts run as one batch give each expert's output exactly
     /// as it came from running that expert alone -- the property that lets
     /// the batched decode path replace the old one without changing a token.
+    /// Gated and ungated (Nemotron-H's ReLU²) alike.
     #[test]
     fn a_tokens_experts_together_equal_them_one_by_one() {
         use crate::quant::Precision;
@@ -1112,11 +1222,11 @@ mod tests {
         let mut mat = |rows: usize, cols: usize| {
             Tensor::new(rows, cols, (0..rows * cols).map(|_| rng.normal() * 0.1).collect())
         };
-        for precision in [Precision::Q8, Precision::Q4] {
+        for (precision, gated) in [(Precision::Q8, true), (Precision::Q4, true), (Precision::Q8, false)] {
             let (hidden, width) = (64, 96);
             let experts: Vec<Ffn> = (0..3)
                 .map(|_| Ffn {
-                    gate: Weight::quantize(mat(width, hidden), precision),
+                    gate: gated.then(|| Weight::quantize(mat(width, hidden), precision)),
                     up: Weight::quantize(mat(width, hidden), precision),
                     down: Weight::quantize(mat(hidden, width), precision),
                 })

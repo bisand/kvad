@@ -51,6 +51,10 @@ pub(crate) enum Proj {
     Quant(QMatMul),
     #[cfg(target_os = "macos")]
     Blocks(crate::mpp::Blocks),
+    /// LittleBit factors, one per part of a merged projection
+    /// ([`Loader::proj_cat`]), their outputs side by side.
+    #[cfg(target_os = "macos")]
+    LittleBit(Vec<crate::littlebit::LittleBit>),
 }
 
 impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
@@ -97,6 +101,11 @@ impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<T
             // the offset bug above cannot reach it.
             #[cfg(target_os = "macos")]
             Proj::Blocks(q) => q.forward(x),
+            #[cfg(target_os = "macos")]
+            Proj::LittleBit(parts) => {
+                let ys = parts.iter().map(|p| p.forward(x)).collect::<candle_core::Result<Vec<_>>>()?;
+                Tensor::cat(&ys, candle_core::D::Minus1)
+            }
         }
     }
 
@@ -109,6 +118,8 @@ impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<T
             },
             #[cfg(target_os = "macos")]
             Proj::Blocks(q) => q.bytes(),
+            #[cfg(target_os = "macos")]
+            Proj::LittleBit(parts) => parts.iter().map(|p| p.bytes()).sum(),
         }
     }
 
@@ -121,6 +132,8 @@ impl Proj {    pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<T
             },
             #[cfg(target_os = "macos")]
             Proj::Blocks(q) => q.params(),
+            #[cfg(target_os = "macos")]
+            Proj::LittleBit(parts) => parts.iter().map(|p| p.params()).sum(),
         }
     }
 }
@@ -274,6 +287,10 @@ impl<'v> Loader<'v> {
         if let Some(p) = self.stored(vb, name, out, inp, stored)? {
             return Ok(p);
         }
+        #[cfg(target_os = "macos")]
+        if let Some(p) = self.littlebit(vb, &[(name, out)], inp)? {
+            return Ok(p);
+        }
         let Some(_) = self.quant else {
             // Transposed on the host and moved once, never transposed on the
             // device. `.t()?.contiguous()?` allocates a second buffer the
@@ -328,6 +345,10 @@ impl<'v> Loader<'v> {
         if let [(name, out)] = parts {
             return self.proj(vb, name, *out, inp, stored);
         }
+        #[cfg(target_os = "macos")]
+        if let Some(p) = self.littlebit(vb, parts, inp)? {
+            return Ok(p);
+        }
         // A GGUF's parts may each be a different type, and blocks of two
         // types are not one matrix. No model read from one merges any yet.
         if parts.iter().any(|(name, _)| vb.gguf.as_ref().is_some_and(|g| g.stored(&vb.full(name)).is_some_and(|t| t.quantised()))) {
@@ -373,6 +394,27 @@ impl<'v> Loader<'v> {
         }
         let q = QTensor::new(QStorage::from_data(bytes.into(), &self.device, gd)?, (total, inp))?;
         Ok(Proj::Quant(QMatMul::from_qtensor(q)?))
+    }
+
+    /// `parts` as LittleBit factors on Metal, if the checkpoint stores the
+    /// first that way; then every part must be. Neither the quantisation nor
+    /// the cache has anything to do with them: they are already smaller than
+    /// any blocks, and reading them is a copy.
+    #[cfg(target_os = "macos")]
+    fn littlebit(&self, vb: &Reader<'_>, parts: &[(&str, usize)], inp: usize) -> Res<Option<Proj>> {
+        if !self.device.is_metal() {
+            return Ok(None);
+        }
+        let Some(first) = vb.factored(parts[0].0)? else { return Ok(None) };
+        let mut all = vec![crate::littlebit::LittleBit::new(&first, parts[0].1, inp, &self.device)?];
+        drop(first);
+        for &(name, out) in &parts[1..] {
+            let f = vb
+                .factored(name)?
+                .ok_or_else(|| format!("{}: not LittleBit factors, where {} is", vb.full(name), vb.full(parts[0].0)))?;
+            all.push(crate::littlebit::LittleBit::new(&f, out, inp, &self.device)?);
+        }
+        Ok(Some(Proj::LittleBit(all)))
     }
 
     /// One matrix in blocks: read back from the cache, or quantised and filed.
@@ -738,6 +780,10 @@ pub(crate) struct Reader<'a> {
     /// Where the linear layers read through it register for LoRAs applied at
     /// run time ([`crate::image::lora`]).
     adapters: Option<crate::image::lora::Part>,
+    /// The checkpoint again, when it holds LittleBit factors: they are
+    /// `int32` words that a `VarBuilder` would read as numbers, so they are
+    /// read through the CPU engine's reader instead ([`Reader::factored`]).
+    factors: Option<Rc<kvad::weights::Checkpoint>>,
 }
 
 /// A LoRA, fused into each weight it adapts as the weight is read:
@@ -820,7 +866,29 @@ impl<'a> Reader<'a> {
             lora: None,
             gguf: None,
             adapters: None,
+            factors: None,
         }
+    }
+
+    /// The same reader, able to read LittleBit factors from `paths` where
+    /// they hold any. Opening reads the headers only.
+    pub(crate) fn with_littlebit(self, paths: &[std::path::PathBuf]) -> Res<Self> {
+        let ckpt = kvad::weights::Checkpoint::open(paths)?;
+        let any = ckpt.names().any(|n| n.ends_with(".U_packed") || n.ends_with(".U"));
+        Ok(Reader { factors: any.then(|| Rc::new(ckpt)), ..self })
+    }
+
+    /// The factors of `name`, a `{stem}.weight`, if the checkpoint stores it
+    /// as LittleBit factors; every tensor under `{stem}.` recorded as read,
+    /// bookkeeping scalars included.
+    pub(crate) fn factored(&self, name: &str) -> Res<Option<kvad::littlebit::Factored>> {
+        let Some(ckpt) = &self.factors else { return Ok(None) };
+        let full = self.full(name);
+        let Some(stem) = full.strip_suffix(".weight") else { return Ok(None) };
+        let Some(f) = kvad::littlebit::read(ckpt, stem)? else { return Ok(None) };
+        let under = format!("{stem}.");
+        self.seen.borrow_mut().extend(ckpt.names().filter(|n| n.starts_with(&under)).map(str::to_string));
+        Ok(Some(f))
     }
 
     /// A reader over a GGUF file: its plain tensors read in `dtype`, like
@@ -869,6 +937,7 @@ impl<'a> Reader<'a> {
             lora: self.lora.clone(),
             gguf: self.gguf.clone(),
             adapters: self.adapters.clone(),
+            factors: self.factors.clone(),
         }
     }
 
@@ -911,7 +980,8 @@ impl<'a> Reader<'a> {
     /// The error for a weight that could not be read, saying why when the
     /// reason is that the checkpoint stores it as LittleBit factors.
     ///
-    /// Those run on the CPU backend only (see `docs/littlebit-plan.md`), and
+    /// This backend runs those on Metal, for the models whose loaders open
+    /// the checkpoint for them ([`Reader::with_littlebit`]); anywhere else,
     /// "cannot find tensor q_proj.weight" about a file whose `q_proj` is
     /// sitting right there would send someone looking in the wrong place.
     fn why_missing(&self, name: &str, e: candle_core::Error) -> candle_core::Error {
@@ -922,8 +992,8 @@ impl<'a> Reader<'a> {
         };
         if self.vb.contains_tensor(&factors) {
             return candle_core::Error::Msg(format!(
-                "`{}` is stored as LittleBit factors, which only the CPU backend runs: \
-                 load this model with --quant q8 (or f32, or q4) rather than on the GPU",
+                "`{}` is stored as LittleBit factors, which this backend runs only on Metal, \
+                 for Llama-family models: load it there, or on the CPU backend",
                 self.full(name)
             ));
         }

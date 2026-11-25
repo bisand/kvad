@@ -319,7 +319,7 @@ impl GpuLlama {
         // SAFETY: candle memory-maps the checkpoints; they are read-only cache
         // entries that nothing else writes while we hold them.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(paths, load_dtype, &load_dev)? };
-        let vb = Reader::new(vb);
+        let vb = Reader::new(vb).with_littlebit(paths)?;
 
         // Dense tensors (norms, embeddings) still have to make the trip.
         let to_dev = |t: Tensor| -> Res<Tensor> { Ok(t.to_device(&device)?) };
@@ -1655,6 +1655,77 @@ pub(crate) mod tests {
 
         assert_eq!(theirs.len(), ours.len());
         theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+    }
+
+    /// A checkpoint whose projections are LittleBit factors — packed words,
+    /// a residual path, a rank that is not a whole word — runs on Metal as
+    /// the CPU engine runs it, through a prompt and a token at a time.
+    ///
+    /// The factors are random words: what is checked is that the two
+    /// engines read and multiply the same file alike. That the CPU engine
+    /// reads the reference's layout right is `kvad`'s `tests/littlebit.rs`.
+    #[test]
+    fn littlebit_factors_run_on_metal_as_on_the_cpu() {
+        use kvad::model::Transformer;
+
+        let Ok(metal) = Device::new_metal(0) else { return };
+        let spec = tiny_spec();
+        let dense = write_tensors(&spec, false, &[], "littlebit-dense");
+        let mut t = candle_core::safetensors::load(&dense, &Device::Cpu).unwrap();
+        std::fs::remove_file(&dense).unwrap();
+
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut word = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u32
+        };
+        let cpu = Device::Cpu;
+        let names: Vec<String> = t.keys().filter(|n| n.ends_with("_proj.weight")).cloned().collect();
+        let rank = 37;
+        for name in names {
+            let (out, inp) = t.remove(&name).unwrap().dims2().unwrap();
+            let stem = name.strip_suffix(".weight").unwrap();
+            let mut signs = |rows: usize, cols: usize| {
+                let words: Vec<u32> = (0..rows * cols.div_ceil(32)).map(|_| word()).collect();
+                Tensor::from_vec(words, (rows, cols.div_ceil(32)), &cpu).unwrap()
+            };
+            let vector = |n: usize, lo: f32, hi: f32| Tensor::rand(lo, hi, (1, n), &cpu).unwrap();
+            for suffix in ["", "_R"] {
+                t.insert(format!("{stem}.U{suffix}_packed"), signs(out, rank));
+                t.insert(format!("{stem}.V{suffix}_packed"), signs(rank, inp));
+                t.insert(format!("{stem}.U{suffix}_shape"), Tensor::new(&[out as i64, rank as i64], &cpu).unwrap());
+                t.insert(format!("{stem}.V{suffix}_shape"), Tensor::new(&[rank as i64, inp as i64], &cpu).unwrap());
+                t.insert(format!("{stem}.u1{suffix}"), vector(out, 0.1, 0.3));
+                t.insert(format!("{stem}.u2{suffix}"), vector(rank, 0.3, 0.9));
+                t.insert(format!("{stem}.v1{suffix}"), vector(rank, 0.3, 0.9));
+                t.insert(format!("{stem}.v2{suffix}"), vector(inp, 0.3, 0.5));
+            }
+        }
+        let path = std::env::temp_dir().join(format!("gpu-tiny-{}-littlebit.safetensors", std::process::id()));
+        candle_core::safetensors::save(&t, &path).unwrap();
+
+        let mut gpu = GpuLlama::load(std::slice::from_ref(&path), spec.clone(), DType::F32, None, metal, &Vault::off()).unwrap();
+        let cpu_engine = cpu_model(&path, &spec);
+        let mut cache = kvad::model::KvCache::new(&spec);
+        // Relative to the largest logit: the projections are loud enough here
+        // that a wrong sign moves every logit, not only the last digits.
+        let differ = |a: &[f32], b: &[f32]| {
+            let top = a.iter().fold(0f32, |m, x| m.max(x.abs()));
+            // `f32::max` would drop a NaN, and a broken kernel's NaN is a pass.
+            a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0f32, |m, d| if d.is_nan() || d > m { d } else { m }) / top
+        };
+        let before = crate::fused::tests_ran();
+        let (ours, theirs) = (cpu_engine.forward_batch(&[1, 2, 3, 4], &mut cache), gpu.forward(&[1, 2, 3, 4]).unwrap());
+        assert!(crate::fused::tests_ran() > before, "the LittleBit kernels did not run");
+        assert_eq!(ours.len(), theirs.len());
+        assert!(differ(&ours, &theirs) < 1e-4, "the prompt differs by {}", differ(&ours, &theirs));
+        for token in [5u32, 6, 7] {
+            let (ours, theirs) = (cpu_engine.forward_batch(&[token], &mut cache), gpu.forward(&[token]).unwrap());
+            assert!(differ(&ours, &theirs) < 1e-4, "token {token} differs by {}", differ(&ours, &theirs));
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// A model run a stage at a time says what it says whole: a prompt read

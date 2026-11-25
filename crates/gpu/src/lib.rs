@@ -46,6 +46,8 @@ pub mod grad;
 pub mod gguf;
 pub mod gpt2;
 pub mod image;
+#[cfg(target_os = "macos")]
+mod littlebit;
 pub mod model;
 #[cfg(target_os = "macos")]
 mod mpp;

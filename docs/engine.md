@@ -370,10 +370,11 @@ or letting an n-gram reach across an EOS, fails the f32 test.
 
 What was not measured is the real checkpoint. It is 360 GB, 131 files; at
 Kvad's q4 its experts alone are 75.5 GB (q8: 136 GB) on top of the 102 GB
-table that stays in bf16, and the first load holds the whole quantised model in
-memory while it writes the cache. On a 48 GB machine with 337 GiB free, that
-wants room the disk does not have and a cache written as a stream, which this
-engine does not have yet.
+table that stays in bf16. The first load used to hold the whole quantised
+model in memory while it wrote the cache, 76 GB at q4 on a 48 GB machine; it
+no longer does (see [the first load](#the-first-load-no-longer-holds-the-model)).
+What is left is disk: with the checkpoint and its cache side by side it wants
+about 440 GB, and this machine had 337 GiB free.
 
 ## Base models versus instruction-tuned
 
@@ -1024,6 +1025,30 @@ The GPU backend used to be exempt from all this, on the grounds that candle's
 `quantize_onto` takes about 0.2 s for the same model — fast enough not to be
 worth a second format. That was true of the model it was measured on and of no
 other: [it does not survive a 16B checkpoint](gpu.md#the-quantising-done-once-over-there-too).
+
+
+### The first load no longer holds the model
+
+Recording used to tee each quantised weight to the file and keep it too, so
+the model being built held every code it had written: a first load needed the
+whole quantised model in memory at once, where every later load maps it. Now
+[`Live::keep`](../crates/llm/src/qcache.rs) answers with the copy it has just
+written, mapped back from the file: one mapping per weight, of that weight's
+bytes. What stays resident is the one tensor being quantised; the kernel
+writes the rest out and lets it go. Once the file is finished the model is
+built again from it as a whole, so the first load and every later one get the
+same model, expert cache included.
+
+Qwen3-30B-A3B at q4, into an empty cache, `/usr/bin/time -l`:
+
+| | peak footprint | wall | cache file |
+|---|---|---|---|
+| holding the model | 20.9 GB | 266 s | 19,086,662,004 bytes |
+| mapping it back | 1.55 GB | 215 s | 19,086,662,004 bytes |
+
+One run each, so the time is a hint rather than a result. The footprint is the
+point: it no longer grows with the model, which is what lets a model bigger than
+the machine's memory be quantised on it at all.
 
 ## Below one bit: LittleBit
 

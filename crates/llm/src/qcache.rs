@@ -484,6 +484,26 @@ impl<'a> Live<'a> {
         }
     }
 
+    /// Tee `w` to the cache file, and answer with the copy just written.
+    ///
+    /// The copy is the same bytes, mapped back from the file, so the model
+    /// being built holds page cache rather than memory of its own. Without
+    /// this a first load held the whole quantised model at once: about 76 GB
+    /// at q4 for Qwen3.8-Flash-Next, on a machine with 48. With it the
+    /// resident part is one tensor being quantised, and the kernel writes the
+    /// rest out and lets it go. Later loads already worked this way, through
+    /// [`Mapped`]; now the first one does too.
+    ///
+    /// Not recording, or recording stopped, answers with `w` itself.
+    fn keep(&self, name: &str, w: Weight) -> Weight {
+        let mut back = None;
+        self.tee(|out| {
+            back = out.put_weight_back(name, &w)?;
+            Ok(())
+        });
+        back.unwrap_or(w)
+    }
+
     /// Checkpoint tensors that nothing asked about, derived buffers aside.
     ///
     /// Call it after the architecture has finished loading. Anything here is a
@@ -544,9 +564,7 @@ impl<'a> Live<'a> {
         let Some(stem) = name.strip_suffix(".weight") else { return Ok(None) };
         let Some(f) = crate::littlebit::read(self.ckpt, stem)? else { return Ok(None) };
         self.audit.saw_under(&format!("{stem}."));
-        let w = Weight::from_factored(f);
-        self.tee(|out| out.put_weight(name, &w));
-        Ok(Some(w))
+        Ok(Some(self.keep(name, Weight::from_factored(f))))
     }
 
     /// The error for asking a LittleBit weight to be transposed or sliced.
@@ -600,14 +618,10 @@ impl Source for Live<'_> {
             return Ok(w);
         }
         if let Some(t) = self.packed(name)? {
-            let w = self.quantized(t);
-            self.tee(|out| out.put_weight(name, &w));
-            return Ok(w);
+            return Ok(self.keep(name, self.quantized(t)));
         }
         self.audit.saw(name);
-        let w = self.quantized(self.ckpt.get(name)?);
-        self.tee(|out| out.put_weight(name, &w));
-        Ok(w)
+        Ok(self.keep(name, self.quantized(self.ckpt.get(name)?)))
     }
 
     fn try_matrix(&self, name: &str) -> Option<Weight> {
@@ -615,35 +629,27 @@ impl Source for Live<'_> {
             return Some(w);
         }
         self.audit.saw(name);
-        let w = self.quantized(self.ckpt.try_get(name)?);
-        self.tee(|out| out.put_weight(name, &w));
-        Some(w)
+        Some(self.keep(name, self.quantized(self.ckpt.try_get(name)?)))
     }
 
     fn matrix_t(&self, name: &str) -> Res<Weight> {
         self.refuse_factored(name, "transpose")?;
         self.audit.saw(name);
-        let w = self.quantized(self.ckpt.get(name)?.transposed());
-        self.tee(|out| out.put_weight(name, &w));
-        Ok(w)
+        Ok(self.keep(name, self.quantized(self.ckpt.get(name)?.transposed())))
     }
 
     fn matrix_rows(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
         self.refuse_factored(name, "slice")?;
         self.audit.saw(name);
         let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?);
-        let as_name = slice_name(name, start, count, false);
-        self.tee(|out| out.put_weight(&as_name, &w));
-        Ok(w)
+        Ok(self.keep(&slice_name(name, start, count, false), w))
     }
 
     fn matrix_rows_t(&self, name: &str, start: usize, count: usize) -> Res<Weight> {
         self.refuse_factored(name, "slice")?;
         self.audit.saw(name);
         let w = self.quantized(rows_of(&self.ckpt.get(name)?, name, start, count)?.transposed());
-        let as_name = slice_name(name, start, count, true);
-        self.tee(|out| out.put_weight(&as_name, &w));
-        Ok(w)
+        Ok(self.keep(&slice_name(name, start, count, true), w))
     }
 
     fn vector(&self, name: &str) -> Res<Vec<f32>> {
@@ -795,47 +801,7 @@ impl Mapped {
 
     fn build(&self, name: &str) -> Res<Weight> {
         let entry = self.entries.get(name).ok_or_else(|| format!("`{name}` not in the cache"))?;
-        match entry {
-            Entry::F32 { shape, data } => {
-                let (rows, cols) = *shape;
-                // The f32 path still owns its data: `Tensor` is used for
-                // arithmetic elsewhere and wants a `Vec`. It is also the path
-                // the cache is not built for.
-                Ok(Weight::from_f32(Tensor::new(rows, cols, self.f32s(*data)?.to_vec())))
-            }
-            Entry::Q8 { shape, scales, qs } => Weight::from_q8(
-                shape.0,
-                shape.1,
-                Store::mapped(self.file.map(), scales.0, scales.1)?,
-                Store::mapped(self.file.map(), qs.0, qs.1)?,
-            ),
-            Entry::Q4 { shape, scales, qs } => Weight::from_q4(
-                shape.0,
-                shape.1,
-                Store::mapped(self.file.map(), scales.0, scales.1)?,
-                Store::mapped(self.file.map(), qs.0, qs.1)?,
-            ),
-            Entry::Bits { paths } => {
-                use crate::littlebit::{Factored, Path, Signs};
-                let map = self.file.map();
-                let signs = |((rows, cols), span): ((usize, usize), Span)| {
-                    Signs::new(rows, cols, Store::mapped(map, span.0, span.1)?)
-                };
-                let paths = paths
-                    .iter()
-                    .map(|p| {
-                        Path::from_parts(
-                            signs(p.u)?,
-                            signs(p.v)?,
-                            self.f32s(p.u1)?,
-                            self.f32s(p.mid)?,
-                            self.f32s(p.v2)?,
-                        )
-                    })
-                    .collect::<Res<Vec<_>>>()?;
-                Ok(Weight::from_factored(Factored::new(paths)?))
-            }
-        }
+        weight_of(self.file.map(), 0, entry)
     }
 
     fn f32s(&self, span: Span) -> Res<Store<f32>> {
@@ -945,6 +911,39 @@ impl Source for Mapped {
 
     fn files(&self) -> Vec<PathBuf> {
         self.files.clone()
+    }
+}
+
+/// The weight `entry` describes, in `map`, which begins `base` bytes into
+/// the file the entry's offsets count from.
+fn weight_of(map: &Arc<memmap2::Mmap>, base: usize, entry: &Entry) -> Res<Weight> {
+    let at = |off: usize| off.checked_sub(base).ok_or("array lies before the mapping");
+    let f32s = |span: Span| -> Res<Store<f32>> { Store::mapped(map, at(span.0)?, span.1) };
+    match entry {
+        Entry::F32 { shape, data } => {
+            let (rows, cols) = *shape;
+            // The f32 path still owns its data: `Tensor` is used for
+            // arithmetic elsewhere and wants a `Vec`. It is also the path
+            // the cache is not built for.
+            Ok(Weight::from_f32(Tensor::new(rows, cols, f32s(*data)?.to_vec())))
+        }
+        Entry::Q8 { shape, scales, qs } => {
+            Weight::from_q8(shape.0, shape.1, f32s(*scales)?, Store::mapped(map, at(qs.0)?, qs.1)?)
+        }
+        Entry::Q4 { shape, scales, qs } => {
+            Weight::from_q4(shape.0, shape.1, f32s(*scales)?, Store::mapped(map, at(qs.0)?, qs.1)?)
+        }
+        Entry::Bits { paths } => {
+            use crate::littlebit::{Factored, Path, Signs};
+            let signs = |((rows, cols), span): ((usize, usize), Span)| {
+                Signs::new(rows, cols, Store::mapped(map, at(span.0)?, span.1)?)
+            };
+            let paths = paths
+                .iter()
+                .map(|p| Path::from_parts(signs(p.u)?, signs(p.v)?, f32s(p.u1)?, f32s(p.mid)?, f32s(p.v2)?))
+                .collect::<Res<Vec<_>>>()?;
+            Ok(Weight::from_factored(Factored::new(paths)?))
+        }
     }
 }
 
@@ -1108,7 +1107,10 @@ impl Writer {
         // A distinct temp name per process, so two loads racing each other
         // both produce a complete file and the rename picks a winner.
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        let mut file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        // Readable too, so what was written can be mapped back: see
+        // [`Writer::put_weight_back`].
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tmp)?;
+        let mut file = std::io::BufWriter::new(file);
         file.write_all(MAGIC)?;
         file.write_all(&[0u8; ALIGN - 8])?;
         Ok(Writer {
@@ -1190,6 +1192,37 @@ impl Writer {
         };
         self.tensors.insert(name.to_string(), entry);
         Ok(())
+    }
+
+    /// [`Writer::put_weight`], then the weight again as the file now holds
+    /// it: the bytes just written, mapped back read-only.
+    ///
+    /// `None` where that would gain nothing — an f32 entry, which a mapped
+    /// cache copies out anyway, or a name already written (a tied weight,
+    /// whose first copy the caller holds).
+    ///
+    /// One mapping per weight, of only that weight's bytes. Mapping the
+    /// whole file each time would be simpler and would reserve the file's
+    /// size in address space once per weight — 73,000 times over for a
+    /// mixture of 512 experts in 48 layers.
+    fn put_weight_back(&mut self, name: &str, w: &Weight) -> Res<Option<Weight>> {
+        if self.tensors.contains_key(name) {
+            return Ok(None);
+        }
+        let from = self.at;
+        self.put_weight(name, w)?;
+        let entry = parse_entry(&self.tensors[name])?;
+        if matches!(entry, Entry::F32 { .. }) {
+            return Ok(None);
+        }
+        self.file.flush()?;
+        // memmap2 rounds the offset down to a page and hides that, so the
+        // first byte of this mapping is file offset `from`, and an array
+        // 64-aligned in the file is 64-aligned here.
+        // SAFETY: read-only, of bytes this writer has written and will not
+        // write again; the file only grows from here.
+        let map = unsafe { memmap2::MmapOptions::new().offset(from as u64).len(self.at - from).map(self.file.get_ref())? };
+        weight_of(&Arc::new(map), from, &entry).map(Some)
     }
 
     fn put_vector(&mut self, name: &str, v: &[f32]) -> Res<()> {
@@ -1590,7 +1623,22 @@ pub fn load_shard(
     }
 
     match live.finish_shard(repo, &files.weights, spec, shard) {
-        Ok(Some(bytes)) => progress(&format!("cached for next time ({} MB)", bytes / 1_000_000)),
+        Ok(Some(bytes)) => {
+            progress(&format!("cached for next time ({} MB)", bytes / 1_000_000));
+            // The model just built already reads that file, weight by weight
+            // (see `Live::keep`). Built once more from the file as a whole it
+            // is the model every later load gets, which for a mixture means
+            // the experts come through the expert cache rather than the
+            // mapping. Both are mappings, so holding the two for a moment
+            // costs address space, not memory.
+            if let Some(path) = &path {
+                if let Ok(Some(cache)) = Mapped::open_shard(path, repo, &files.weights, spec, precision, shard) {
+                    if let Ok(again) = build(&cache) {
+                        return Ok(again);
+                    }
+                }
+            }
+        }
         Ok(None) => {
             if let Some(e) = live.failure() {
                 progress(&format!("not caching: {e}"));
@@ -1711,6 +1759,35 @@ mod tests {
             // And row lookup, which is the embedding path.
             assert_eq!(after.row(3), before.row(3));
 
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// What a first load gets back while recording is the weight as the
+    /// file holds it: the same answers, from the file's bytes rather than
+    /// from memory of its own. Several in a row, odd sizes, so most of them
+    /// begin partway through a page.
+    #[test]
+    fn a_recorded_weight_is_read_back_from_the_file() {
+        for precision in [Precision::Q8, Precision::Q4] {
+            let path = tmp(&format!("back-{precision}"));
+            let mut w = Writer::create(&path).unwrap();
+            for (i, rows) in [3usize, 40, 7, 129, 1].into_iter().enumerate() {
+                let data: Vec<f32> = (0..rows * 96).map(|k| ((k * 37 + i) % 101) as f32 / 25.0 - 2.0).collect();
+                let before = Weight::quantize(Tensor::new(rows, 96, data), precision);
+                let after = w.put_weight_back(&format!("w{i}"), &before).unwrap().expect("mapped back");
+                let (Parts::Q8 { scales: a, .. } | Parts::Q4 { scales: a, .. }, Parts::Q8 { scales: b, .. } | Parts::Q4 { scales: b, .. }) =
+                    (before.parts(), after.parts())
+                else {
+                    panic!("not quantised")
+                };
+                assert_ne!(a.as_ptr(), b.as_ptr(), "the same memory, not the file's");
+                let x: Vec<f32> = (0..96).map(|k| (k as f32).cos()).collect();
+                assert_eq!(after.matvec_bt(&x, None), before.matvec_bt(&x, None), "{precision} w{i}");
+                // A name written already is the caller's to keep.
+                assert!(w.put_weight_back(&format!("w{i}"), &before).unwrap().is_none());
+            }
+            w.finish(stamped(header("r", &[], &spec(), precision).unwrap(), &[])).unwrap();
             std::fs::remove_file(&path).unwrap();
         }
     }

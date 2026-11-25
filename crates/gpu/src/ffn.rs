@@ -231,8 +231,49 @@ impl Moe {
 /// at, so from [`ON_DEVICE_ROWS`] rows the experts are lent to it, read through
 /// the same cache and dropped again once they have run.
 ///
-/// shortcut: every layer waits for the device and copies its rows both ways,
-/// fine for a prototype, upgrade by running experts while the device works.
+/// # Where a decode token goes, and what could overlap
+///
+/// Qwen3-30B-A3B at q4 on an M5 Pro, experts page-cached, timed inside
+/// [`Hosted::forward`] with the wait and the copy back split apart (µs, one
+/// layer of 48):
+///
+/// ```text
+/// encoding the next attention        ~75
+/// waiting for the device            ~350   attention, and a round trip
+/// copying the row back              ~155   a second round trip
+/// the CPU's experts                 ~660   ~170 fixed, ~60 an expert
+/// copying the result up               ~8
+/// ```
+///
+/// Untimed, the copy back shares the wait before it, so the profiled run
+/// reads 16.8 tok/s and the real one 19.6.
+///
+/// Nothing in one token of this model can run beside anything else. The next
+/// layer's attention reads this layer's output, and Qwen3's mixture has no
+/// shared expert, so the only work the device could do while the CPU computes
+/// is some of the experts themselves, which needs them on the device. Three
+/// things were measured, six interleaved rounds each, medians:
+///
+/// - **Keeping both processors busy**: a CPU thread spinning while the device
+///   works ([`kvad::model::linger`]) and [`crate::model::stage`]'s warming
+///   kernel while the CPU does. 18.3 tok/s against 19.6. The gaps are a
+///   millisecond or less, too short to go cold in, and the spinners take a
+///   core and bandwidth from the work.
+/// - **A hot set on the device, chosen ahead**, Strata's way. Pinned from
+///   another trace's counts (`expert_residency --pin-from`, a 400-token story
+///   against 400 tokens of Rust), it catches 17% of a token's picks at
+///   1.6 GB, 35% at 3.2 GB and 47% at 4.8 GB. Routing is too even for better:
+///   see [`kvad::residency`]. Kept by LRU instead, it would catch 47, 71 and
+///   86%, but only by lending 0.3–0.6 GB of misses to the device every token.
+/// - **What such a hot set is worth at most**: five of the eight experts on
+///   the CPU, as if the other three had run on the device for free. 23.6
+///   tok/s against 19.6, +21%: the ceiling for about 3.5 GB more device
+///   memory, before the device's own share of the work and the memory bus,
+///   in a mode that exists to fit the model in 8.
+///
+/// shortcut: every layer waits for the device and copies its row both ways,
+/// which nothing in one token can hide; upgrade with a device hot set only if
+/// 3–5 GB more is worth a fifth more speed at most.
 pub(crate) struct Hosted {
     mlp: kvad::model::ffn::Mlp,
 }

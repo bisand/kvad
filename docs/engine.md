@@ -376,6 +376,27 @@ no longer does (see [the first load](#the-first-load-no-longer-holds-the-model))
 What is left is disk: with the checkpoint and its cache side by side it wants
 about 440 GB, and this machine had 337 GiB free.
 
+## Mamba, and a fixture the reference wrote
+
+`nemotron_h` (NVIDIA's Nemotron-H and Nemotron 3, and Munin 2.0 built on the
+latter) is the third hybrid, and the first whose recurrent layers are Mamba-2:
+a selective state space, `S ← S·e^(dt·A) + dt·x⊗B`, read back with `C`. Every
+layer is one mixer: Mamba, attention with no position encoding at all, a
+ReLU² MLP, or a mixture whose experts, in Nemotron 3 Super, run in a 1024-wide
+latent space. [`model/nemotron_h.rs`](../crates/llm/src/model/nemotron_h.rs)
+explains it.
+
+The lesson of the section above is applied here from the start: the test
+fixture is not one this engine wrote. `scripts/nemotron-h-fixture.py` builds
+`transformers`' own model, fills it with random weights, and commits its
+logits beside them, so `cargo test` checks against the reference with no
+Python installed. It agreed at every position the first time it ran, and the
+real checkpoints still found three things it could not: a config holding
+Python's `Infinity`, an old spelling of `head_dim`, and a chat template with
+macros. Munin itself is a mixture, 12 B of 120 B active, not the dense model
+it was taken for; what that means on a 48 GB machine, and what was measured
+on the way, is in [nemotron-h-plan.md](nemotron-h-plan.md).
+
 ## Base models versus instruction-tuned
 
 GPT-2 is a **base** model: pure next-token prediction, no instruction tuning.

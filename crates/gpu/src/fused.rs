@@ -492,7 +492,7 @@ pub(crate) mod metal {
         build(device, what, source, Some(&*opts))
     }
 
-    fn build(device: &Device, what: &'static str, source: &'static str, opts: Option<&objc2_metal::MTLCompileOptions>)
+    pub(crate) fn build(device: &Device, what: &'static str, source: &'static str, opts: Option<&objc2_metal::MTLCompileOptions>)
      -> Option<&'static Kernels> {
         static LIBS: OnceLock<Mutex<HashMap<&'static str, Option<&'static Kernels>>>> = OnceLock::new();
         let Device::Metal(md) = device else { return None };

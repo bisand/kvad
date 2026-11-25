@@ -11,7 +11,7 @@ repository:
 - [SamsungLabs/LittleBit](https://github.com/SamsungLabs/LittleBit), read
   at `42d658b`. PyTorch, training and evaluation, CC BY-NC 4.0.
 
-Step 1 below is built. The rest is what it would take to go further, and the
+Steps 1 and 4 below are built. The rest is what it would take to go further, and the
 questions that decide whether to.
 
 ## Why
@@ -243,13 +243,63 @@ unpacked to `i8` is exactly what the q4 kernel already builds for `SMMLA`
 weight here, at the cost of quantising the activations — which every other
 quantised weight here already pays.
 
-### 4. The GPU
+### 4. The GPU — built
 
-`kvad-gpu` reads checkpoints itself and asks for `{stem}.weight`, so a
-LittleBit checkpoint fails there with a missing tensor. Supporting it is a
-Metal kernel for the two sign products and a `Loader` that recognises the
-format. Until then the CPU is the only backend, and the error could at least
-say why.
+`kvad-gpu` runs LittleBit checkpoints on Metal for the Llama-family models
+(Llama, Qwen2, Qwen3), whole or a stage at a time.
+`Reader::with_littlebit` opens the checkpoint a second time, headers only,
+when it holds factors, and `Loader::proj` and `Loader::proj_cat` hand each
+`{stem}.weight` to `kvad::littlebit::read` before anything else. The CPU
+engine's reader is used, not the `VarBuilder`, because the words are `int32`
+and a `VarBuilder` would read them as numbers. A merged Q/K/V or gate/up is
+one `Proj::LittleBit` holding each part's factors, outputs side by side.
+`--quant` applies to the embeddings and the head as on the CPU; the factors
+are never quantised or cached, since reading them is a copy.
+
+`crates/gpu/src/littlebit.rs` is one kernel, `sign_matmul`: a simdgroup an
+output row, each lane a word of signs at a time, the sign flipped by XOR into
+the float's top bit, `simd_sum` to finish. `v2` is applied as the activation
+is loaded, and the second path adds the first path's output as it writes, so
+a residual projection is four dispatches. Activations are f32.
+
+Elsewhere (another architecture, the CPU device, Linux) the error still names
+LittleBit as the reason, rather than a missing `weight`.
+
+How it was checked:
+
+- the kernel against `Factored::matmul`, with ranks and widths that are not
+  whole words or whole vectors of four, one row and several;
+- a tiny Llama whose every projection is packed factors with a residual path,
+  on Metal and on the CPU engine, through a prompt and three decode steps:
+  within 1e-4 of the largest logit. Using the wrong bit for the sign, ignoring
+  the signs, or reversing the bit order each fail it.
+
+Measured on the M5 Pro with random factors at Qwen3-8B's shapes (rank 544 for
+attention, 824 for the MLP, two paths, 36 layers), `littlebit::bench`:
+
+| | 252 projections |
+|---|---|
+| 1 row (decode) | 19.6 ms |
+| 27 rows (prefill) | 320 ms |
+
+The CPU takes about 90 ms for a whole token, so decode on the GPU should be
+several times faster. Prefill is one decode step a row, sharing only the
+cache; that is the next thing to change if long prompts matter.
+
+On the real `littlebit-qwen3-8b-0.55bpw`, 2026-11-25, q8 embeddings and
+head, the same 19-token prompt and 64 greedy tokens, two runs each:
+
+| | Metal (`kvad-gpu run`) | CPU (`kvad run --local`) |
+|---|---|---|
+| prefill, 19 tokens | 0.25 – 0.34 s | 0.81 – 0.85 s |
+| decode | 48.9 – 50.2 tok/s | 11.0 tok/s (2.6 on the first, cache-writing run) |
+| peak footprint | 2.5 GB | |
+| whole run, load included | 8.7 s | |
+
+The 64 tokens are the same on both, token for token. They are not good
+text: the model repeats the prompt, as the checkpoint does on the CPU too.
+The Metal load reads the factors from the checkpoint every time, because
+they never go through the cache, and that is most of its 8.7 s.
 
 ### 5. Making LittleBit models here
 

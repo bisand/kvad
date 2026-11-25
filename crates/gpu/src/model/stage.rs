@@ -214,7 +214,7 @@ impl GpuStage {
         // SAFETY: candle memory-maps the checkpoints; they are read-only cache
         // entries that nothing else writes while we hold them.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(paths, load_dtype, &Device::Cpu)? };
-        let vb = Reader::new(vb);
+        let vb = Reader::new(vb).with_littlebit(paths)?;
         let ld = Loader::new(quant, device.clone(), &cache);
         let blocks = read_blocks(&ld, &vb.pp("model"), &spec, routed.as_ref(), expert_width, load_dtype, layers.clone())?;
         drop(ld);

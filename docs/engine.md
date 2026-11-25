@@ -1084,6 +1084,12 @@ waiting on memory is now waiting on the adders. The kernels are written
 for that — which took two goes for prefill, and the reason is in
 `sign_gemm`'s documentation.
 
+On a Mac they also run on the GPU, for the Llama-family models: one Metal
+kernel, a simdgroup an output row, the same XOR into the sign bit. The
+published Qwen3-8B at 0.55 bits decodes at 49–50 tok/s there, against 11 on
+the CPU, with the same greedy text and a 2.5 GB peak footprint
+([`crates/gpu/src/littlebit.rs`](../crates/gpu/src/littlebit.rs)).
+
 Making LittleBit models is a different matter: an SVD, a rotation, and then
 epochs of distillation from the original model on a GPU. None of that is
 here. [docs/littlebit-plan.md](littlebit-plan.md) has what was checked, what

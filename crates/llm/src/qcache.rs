@@ -366,6 +366,12 @@ pub trait Source {
     /// tensors kept in this crate, and a list that has to be remembered is what
     /// went wrong in the first place.
     fn skip_under(&self, _prefix: &str) {}
+
+    /// The checkpoint's own files, for a table read where it lies rather
+    /// than through this source. See [`crate::weights::Table`].
+    fn files(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 /// The output head: its own matrix, or `None` when the model ties it to the
@@ -550,6 +556,35 @@ impl<'a> Live<'a> {
     /// Phi, Gemma and the Llama family; of those Kvad runs the Llama family,
     /// whose projections all come through [`Source::matrix`]. A clear refusal
     /// beats a "tensor not found" for a tensor that is plainly there.
+    /// `name` cut out of a packed stack of experts, if that is how this
+    /// checkpoint stores it.
+    ///
+    /// Asked for `….experts.N.{gate,up,down}_proj.weight` when the checkpoint
+    /// has no such name but has `….experts.gate_up_proj`, `[experts, 2 ×
+    /// width, hidden]` with the gate rows first, and `….experts.down_proj`,
+    /// `[experts, hidden, width]` — Qwen3.8-Flash-Next's spelling. Answering
+    /// under the per-expert name means the mixture code, the cache file and
+    /// the expert cache beside the GPU never learn there was another.
+    fn packed(&self, name: &str) -> Res<Option<Tensor>> {
+        if self.ckpt.resolve(name).is_some() {
+            return Ok(None);
+        }
+        let Some(stem) = name.strip_suffix(".weight") else { return Ok(None) };
+        let Some((experts, part)) = stem.rsplit_once('.') else { return Ok(None) };
+        let Some((layer, n)) = experts.rsplit_once('.') else { return Ok(None) };
+        let (Ok(n), true) = (n.parse::<usize>(), layer.ends_with(".experts")) else { return Ok(None) };
+        // `(stack, band, bands)`: gate and up are the two halves of one.
+        let (stack, band, bands) = match part {
+            "gate_proj" => ("gate_up_proj", 0, 2),
+            "up_proj" => ("gate_up_proj", 1, 2),
+            "down_proj" => ("down_proj", 0, 1),
+            _ => return Ok(None),
+        };
+        let Some(key) = self.ckpt.resolve(&format!("{layer}.{stack}")).map(str::to_string) else { return Ok(None) };
+        self.audit.saw(&key);
+        self.ckpt.stacked(&key, n, band, bands)
+    }
+
     fn refuse_factored(&self, name: &str, what: &str) -> Res<()> {
         let stem = name.strip_suffix(".weight").unwrap_or(name);
         if self.ckpt.resolve(name).is_none() && crate::littlebit::present(self.ckpt, stem) {
@@ -562,6 +597,11 @@ impl<'a> Live<'a> {
 impl Source for Live<'_> {
     fn matrix(&self, name: &str) -> Res<Weight> {
         if let Some(w) = self.factored(name)? {
+            return Ok(w);
+        }
+        if let Some(t) = self.packed(name)? {
+            let w = self.quantized(t);
+            self.tee(|out| out.put_weight(name, &w));
             return Ok(w);
         }
         self.audit.saw(name);
@@ -627,6 +667,10 @@ impl Source for Live<'_> {
     fn skip_under(&self, prefix: &str) {
         self.audit.saw_under(prefix);
     }
+
+    fn files(&self) -> Vec<PathBuf> {
+        self.ckpt.paths().to_vec()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +713,9 @@ pub struct Mapped {
     /// after that one — the one that learns to read a weight this file was
     /// written without.
     audit: Audit,
+    /// The checkpoint this file was made from, for what is read from it in
+    /// place; see [`Source::files`].
+    files: Vec<PathBuf>,
 }
 
 impl Mapped {
@@ -721,6 +768,7 @@ impl Mapped {
             experts: std::sync::OnceLock::new(),
             entries,
             audit: Audit::new(names),
+            files: files.to_vec(),
         }))
     }
 
@@ -893,6 +941,10 @@ impl Source for Mapped {
 
     fn skip_under(&self, prefix: &str) {
         self.audit.saw_under(prefix);
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        self.files.clone()
     }
 }
 

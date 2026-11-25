@@ -65,8 +65,11 @@ thing you think it is about.
 Metal `f32` runs at about two thirds of bf16's rate, for exactly double the
 memory. `bf16` is the default because it is also what the checkpoints ship as.
 
-The GPU backend covers **the Llama family, GPT-2, DeepSeek V2, Qwen3.5/3.8 and
-Qwen3-Next** — five of the six architectures the CPU engine has. `deepseek_v3`
+The GPU backend covers **the Llama family, GPT-2, DeepSeek V2, Qwen3.5/3.8,
+Qwen3-Next and Qwen3.8-Flash-Next** — six of the seven architectures the CPU
+engine has. The last keeps its 102 GB n-gram table in the checkpoint and
+gathers the rows on the host, and runs its experts on the host too with
+`KVAD_GPU_EXPERTS=host`. `deepseek_v3`
 is the sixth: [`deepseek.rs`](../crates/gpu/src/deepseek.rs) implements it and
 [`session`](../crates/gpu/src/model.rs) has no arm that routes a V3 checkpoint to
 it, so asking for one on the GPU says which architectures there are rather

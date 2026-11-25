@@ -63,6 +63,13 @@ impl Ffn {
         })
     }
 
+    /// One expert out of a packed stack: `gate_up` is `[2 × width, e]`,
+    /// gate rows first, and `down` is `[e, width]` — the slices of
+    /// `experts.gate_up_proj` and `experts.down_proj` for this expert.
+    pub(crate) fn packed(ld: &Loader, gate_up: &Tensor, down: &Tensor, width: usize) -> Res<Self> {
+        Ok(Ffn { gate_up: ld.proj_of(gate_up)?, down: ld.proj_of(down)?, width })
+    }
+
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         self.down.forward(&fused::silu_mul(&self.gate_up.forward(x)?, self.width)?)
     }
@@ -155,9 +162,19 @@ impl Moe {
                 .try_get(router.n_experts, "gate.e_score_correction_bias")
                 .map(|t| t.to_dtype(DType::F32)?.to_vec1::<f32>())
                 .transpose()?,
-            experts: (0..router.n_experts)
-                .map(|x| Ffn::load(ld, &vb.pp(format!("experts.{x}")), e, width))
-                .collect::<Res<Vec<_>>>()?,
+            // One matrix per expert, or Qwen3.8-Flash-Next's two stacks of
+            // all of them.
+            experts: match vb.try_get((router.n_experts, 2 * width, e), "experts.gate_up_proj") {
+                None => (0..router.n_experts)
+                    .map(|x| Ffn::load(ld, &vb.pp(format!("experts.{x}")), e, width))
+                    .collect::<Res<Vec<_>>>()?,
+                Some(gate_up) => {
+                    let down = vb.get((router.n_experts, e, width), "experts.down_proj")?;
+                    (0..router.n_experts)
+                        .map(|x| Ffn::packed(ld, &gate_up.get(x)?, &down.get(x)?, width))
+                        .collect::<Res<Vec<_>>>()?
+                }
+            },
             shared: SharedExpert::load(ld, vb, e, width, shared)?,
         })
     }

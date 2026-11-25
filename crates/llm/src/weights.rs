@@ -872,6 +872,8 @@ pub struct Checkpoint {
     maps: Vec<memmap2::Mmap>,
     /// tensor name -> which shard holds it
     index: HashMap<String, usize>,
+    /// The files, for a [`Table`] that has to map them again to outlive this.
+    paths: Vec<PathBuf>,
 }
 
 impl Checkpoint {
@@ -893,7 +895,11 @@ impl Checkpoint {
                 index.insert(name.to_string(), i);
             }
         }
-        Ok(Checkpoint { maps, index })
+        Ok(Checkpoint { maps, index, paths: paths.to_vec() })
+    }
+
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -1021,6 +1027,37 @@ impl Checkpoint {
         Ok(Some((view.shape().to_vec(), words)))
     }
 
+    /// Band `part` of `parts` equal bands of rows of matrix `index` in a
+    /// stack of them, `[n, rows, cols]`, decoding nothing else.
+    ///
+    /// Qwen3.8-Flash-Next packs a layer's 512 experts into one
+    /// `experts.gate_up_proj` of `[512, 1280, 2560]` — 3.4 GB in bf16 — where
+    /// every other mixture here stores `experts.N.gate_proj`. Widening the
+    /// whole stack to take one expert's gate out of it would be 6.7 GB of f32
+    /// a thousand times a layer; this is the one expert's bytes.
+    pub fn stacked(&self, name: &str, index: usize, part: usize, parts: usize) -> Res<Option<Tensor>> {
+        let Some(key) = self.resolve(name) else { return Ok(None) };
+        let st = SafeTensors::deserialize(&self.maps[self.index[key]])?;
+        let view = st.tensor(key)?;
+        let [n, rows, cols] = view.shape() else {
+            return Err(format!("`{name}` has shape {:?}, not a stack of matrices", view.shape()).into());
+        };
+        if index >= *n || part >= parts || rows % parts != 0 {
+            return Err(format!("`{name}` is {n}x{rows}x{cols}; asked for band {part} of {parts} of {index}").into());
+        }
+        let (count, start) = (rows / parts, part * (rows / parts));
+        let width = view.dtype().bitsize() / 8;
+        let from = ((index * rows + start) * cols) * width;
+        let bytes = &view.data()[from..from + count * cols * width];
+        let data = match view.dtype() {
+            // A block scale per tile of the whole stack, which a slice would
+            // have to cut to match. Nothing published packs fp8 experts yet.
+            Dtype::F8_E4M3 => return Err(format!("`{name}` is a stack of fp8 matrices, which this cannot slice").into()),
+            d => decode(bytes, d).ok_or_else(|| format!("`{name}` is stored as {d:?}, which this cannot read"))?,
+        };
+        Ok(Some(Tensor::new(count, *cols, data)))
+    }
+
     /// For 1-D tensors, where the shape is noise.
     pub fn get_flat(&self, name: &str) -> Res<Vec<f32>> {
         Ok(self.get(name)?.data)
@@ -1028,6 +1065,76 @@ impl Checkpoint {
 
     pub fn try_get_flat(&self, name: &str) -> Option<Vec<f32>> {
         self.try_get(name).map(|t| t.data)
+    }
+}
+
+/// An embedding table read a row at a time where it lies, and never loaded.
+///
+/// Qwen3.8-Flash-Next's n-gram table is 51 billion numbers, 102 GB in bf16:
+/// a third of the checkpoint, and a token reads sixteen rows of 160 out of
+/// it. Quantising it into a cache would write 32 GB at q4 to save reading
+/// 5 kB a token, so it stays in the checkpoint's own files, mapped, and the
+/// rows a token asks for are the only ones that leave the SSD.
+///
+/// The checkpoint splits it in `shard_0 … shard_127` along the rows; one
+/// stored whole is the same table with one part.
+pub struct Table {
+    ckpt: Checkpoint,
+    /// `(file, byte offset, rows)` per part, in row order.
+    parts: Vec<(usize, usize, usize)>,
+    pub rows: usize,
+    pub cols: usize,
+    dtype: Dtype,
+}
+
+impl Table {
+    /// `stem.weight`, or `stem.shard_0.weight` and on for as long as the
+    /// numbers go — numerically, as transformers concatenates them.
+    pub fn open(paths: &[PathBuf], stem: &str) -> Res<Self> {
+        let ckpt = Checkpoint::open(paths)?;
+        let whole = format!("{stem}.weight");
+        let names: Vec<String> = match ckpt.resolve(&whole) {
+            Some(_) => vec![whole],
+            None => (0..).map(|k| format!("{stem}.shard_{k}.weight")).take_while(|n| ckpt.resolve(n).is_some()).collect(),
+        };
+        if names.is_empty() {
+            return Err(format!("no `{stem}` in the checkpoint, whole or in shards").into());
+        }
+        let (mut parts, mut rows, mut shape) = (Vec::new(), 0, None);
+        for name in &names {
+            let key = ckpt.resolve(name).unwrap_or(name);
+            let file = ckpt.index[key];
+            let map = &ckpt.maps[file];
+            let st = SafeTensors::deserialize(map)?;
+            let view = st.tensor(key)?;
+            let [r, c] = view.shape() else { return Err(format!("`{name}` is not a matrix").into()) };
+            if !matches!(view.dtype(), Dtype::F32 | Dtype::BF16 | Dtype::F16) {
+                return Err(format!("`{name}` is {:?}; a table here is f32, bf16 or f16", view.dtype()).into());
+            }
+            if shape.is_some_and(|s| s != (*c, view.dtype())) {
+                return Err(format!("`{name}` differs in width or type from the parts before it").into());
+            }
+            shape = Some((*c, view.dtype()));
+            parts.push((file, view.data().as_ptr() as usize - map.as_ptr() as usize, *r));
+            rows += r;
+        }
+        let (cols, dtype) = shape.expect("at least one part");
+        Ok(Table { ckpt, parts, rows, cols, dtype })
+    }
+
+    /// Row `r`, widened to f32 into `out`.
+    pub fn row_into(&self, mut r: usize, out: &mut [f32]) {
+        assert!(r < self.rows, "row {r} of a {}-row table", self.rows);
+        let mut part = 0;
+        while r >= self.parts[part].2 {
+            r -= self.parts[part].2;
+            part += 1;
+        }
+        let (file, at, _) = self.parts[part];
+        let width = self.dtype.bitsize() / 8;
+        let from = at + r * self.cols * width;
+        let bytes = &self.ckpt.maps[file][from..from + self.cols * width];
+        out.copy_from_slice(&decode(bytes, self.dtype).expect("checked at open"));
     }
 }
 

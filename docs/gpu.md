@@ -270,7 +270,7 @@ cycles through all six: `cpu f32`, `cpu q8`, `cpu q4`, `gpu bf16`, `gpu q8`,
 That is the usual shape of this kind of work: the interesting part was not the
 new backend, it was the seam the old one had to grow.
 
-## Experts beside the GPU, and why they wait
+## Experts beside the GPU, and some kept on it
 
 `KVAD_GPU_EXPERTS=host` keeps attention and the dense layers on the GPU and
 leaves a mixture's routed experts to the CPU engine, read through its expert
@@ -285,21 +285,35 @@ The obvious upgrade is to run the experts while the GPU works, as
 [Strata](https://github.com/Niko1221/Strata) does. In one token of this model
 there is nothing to run them beside: the next layer's attention needs this
 layer's output, and Qwen3's mixture has no shared expert for the GPU to do
-meanwhile. What is left is giving the GPU some of the experts. Measured, six
-interleaved rounds each:
+meanwhile. Keeping both processors busy between their turns instead made it
+slower, 18.3 tok/s against 19.6. What is left is giving the GPU some of the
+experts.
 
-| | decode |
-|---|---|
-| as it is | 19.6 tok/s |
-| both processors kept busy between their turns | 18.3 tok/s |
-| 5 of 8 experts on the CPU, the rest free (ceiling for a GPU hot set) | 23.6 tok/s |
+`KVAD_GPU_HOT_EXPERTS=N` keeps `N` experts of each layer on the GPU: the ones
+the session's first 64 tokens picked most, lent once and kept. q4 only, and off
+unless asked for. Each token is still routed on the CPU; the picks in the set
+run on the GPU, the rest on the CPU, and the two are added. Measured with a
+102-token prompt, six interleaved rounds each, medians:
 
-A hot set chosen ahead, from another conversation's counts, catches 17% of
-the picks at 1.6 GB, 35% at 3.2 GB and 47% at 4.8 GB: routing is too even to
-pin much (see [`residency.rs`](../crates/llm/src/residency.rs)). So a fifth
-more speed at most, for 3–5 GB more GPU memory in a mode whose point is to
-need less. It is not built; the numbers are in
-[`ffn.rs`](../crates/gpu/src/ffn.rs)'s `Hosted`.
+| a layer | on the GPU | decode | peak footprint |
+|---|---|---|---|
+| 0 | 0 GB | 19.9 tok/s | 3.15 GB |
+| 13 | 1.6 GB | 22.0 tok/s (+11%) | 3.15 GB |
+| 25 | 3.2 GB | 23.7 tok/s (+19%) | 4.50 GB |
+| 38 | 4.8 GB | 24.6 tok/s (+24%) | 6.16 GB |
+
+The GPU's experts do not run beside the CPU's, since candle commits only when it waits;
+they pay because an expert costs the GPU far less than the CPU. They paid only
+once a one-row expert stopped uploading its row index and weight: before that,
+38 a layer was +5%.
+
+**What the table assumes.** The set was chosen on the same conversation it
+was scored on. Chosen from another conversation's counts, a set of the same
+sizes catches 17%, 35% and 47% of the picks, where this one left the CPU 0–2
+of 8: routing is too even to pin much across topics (see
+[`residency.rs`](../crates/llm/src/residency.rs)). The set is chosen once a
+load, so a server whose conversations change topic will see less. The numbers
+are in [`ffn.rs`](../crates/gpu/src/ffn.rs)'s `Hosted`.
 
 ## The seam that cannot rewind
 

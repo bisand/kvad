@@ -250,32 +250,61 @@ impl Moe {
 ///
 /// Nothing in one token of this model can run beside anything else. The next
 /// layer's attention reads this layer's output, and Qwen3's mixture has no
-/// shared expert, so the only work the device could do while the CPU computes
-/// is some of the experts themselves, which needs them on the device. Three
-/// things were measured, six interleaved rounds each, medians:
+/// shared expert, so the only work the device can take from the CPU is some of
+/// the experts themselves, which needs them on the device. Six interleaved
+/// rounds each, medians:
 ///
-/// - **Keeping both processors busy**: a CPU thread spinning while the device
-///   works ([`kvad::model::linger`]) and [`crate::model::stage`]'s warming
-///   kernel while the CPU does. 18.3 tok/s against 19.6. The gaps are a
-///   millisecond or less, too short to go cold in, and the spinners take a
+/// - **Keeping both processors busy** instead, a CPU thread spinning while the
+///   device works ([`kvad::model::linger`]) and [`crate::model::stage`]'s
+///   warming kernel while the CPU does: 18.3 tok/s against 19.6. The gaps are
+///   a millisecond or less, too short to go cold in, and the spinners take a
 ///   core and bandwidth from the work.
-/// - **A hot set on the device, chosen ahead**, Strata's way. Pinned from
-///   another trace's counts (`expert_residency --pin-from`, a 400-token story
-///   against 400 tokens of Rust), it catches 17% of a token's picks at
-///   1.6 GB, 35% at 3.2 GB and 47% at 4.8 GB. Routing is too even for better:
-///   see [`kvad::residency`]. Kept by LRU instead, it would catch 47, 71 and
-///   86%, but only by lending 0.3–0.6 GB of misses to the device every token.
-/// - **What such a hot set is worth at most**: five of the eight experts on
-///   the CPU, as if the other three had run on the device for free. 23.6
-///   tok/s against 19.6, +21%: the ceiling for about 3.5 GB more device
-///   memory, before the device's own share of the work and the memory bus,
-///   in a mode that exists to fit the model in 8.
+/// - **A hot set on the device**, Strata's way, is [`Hot`]:
+///   `KVAD_GPU_HOT_EXPERTS` experts of each layer, the ones this session's
+///   first [`HOT_AFTER`] tokens picked most, lent once and kept. With a
+///   102-token prompt choosing them:
+///
+/// ```text
+/// a layer   on the device   decode        peak footprint
+///      0        0 GB        19.9 tok/s       3.15 GB
+///     13      1.6 GB        22.0 (+11%)      3.15 GB
+///     25      3.2 GB        23.7 (+19%)      4.50 GB
+///     38      4.8 GB        24.6 (+24%)      6.16 GB
+/// ```
+///
+///   At 25 a layer, the CPU was left 0–2 of a token's 8 picks. The device does
+///   not run them beside the CPU's: candle commits only when it waits, so they
+///   run before the next attention. They pay anyway, because an expert costs
+///   the device far less than the CPU, once a row needs no gather, scatter or
+///   upload ([`add_expert`]'s one-row path; without it, 38 a layer was +5%).
+///
+///   An earlier version of this note put the ceiling at +21% for 3.5 GB, from
+///   running five experts of eight on the CPU and none on the device. The
+///   set chosen on its own conversation catches more than that: from another
+///   conversation's counts (`expert_residency --pin-from`, a story against
+///   Rust) a set catches only 17%, 35% and 47% of the picks at 1.6, 3.2 and
+///   4.8 GB, and routing is too even for better (see [`kvad::residency`]).
+///   The set is chosen once per load, so a server whose conversations wander
+///   should expect less than the table. Kept by LRU it would follow them, but
+///   only by lending 0.3–0.6 GB of misses to the device every token.
 ///
 /// shortcut: every layer waits for the device and copies its row both ways,
-/// which nothing in one token can hide; upgrade with a device hot set only if
-/// 3–5 GB more is worth a fifth more speed at most.
+/// which nothing in one token can hide; the hot set is chosen once and never
+/// revised, upgrade by re-choosing it when a conversation's picks drift.
 pub(crate) struct Hosted {
     mlp: kvad::model::ffn::Mlp,
+    hot: std::sync::Mutex<Hot>,
+}
+
+/// The experts of one layer kept on the device: see [`hot_experts`].
+#[derive(Default)]
+pub(crate) struct Hot {
+    /// How often each expert was picked, until the set is chosen.
+    counts: Vec<u64>,
+    /// Rows routed so far.
+    rows: usize,
+    /// `None` until chosen; then one entry an expert, `Some` for those kept.
+    pub(crate) kept: Option<Vec<Option<Ffn>>>,
 }
 
 impl Hosted {
@@ -286,19 +315,112 @@ impl Hosted {
             vb.skip_under(part);
         }
         let moe = kvad::model::ffn::Moe::load(src, prefix, router, shared)?;
-        Ok(Hosted { mlp: kvad::model::ffn::Mlp::Moe(Box::new(moe)) })
+        Ok(Hosted { mlp: kvad::model::ffn::Mlp::Moe(Box::new(moe)), hot: Default::default() })
     }
 
     fn forward(&self, h: &Tensor, m: usize, e: usize) -> Res<Tensor> {
         let xs = h.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        if let kvad::model::ffn::Mlp::Moe(moe) = &self.mlp {
-            if m >= ON_DEVICE_ROWS && moe.shared.is_none() && lendable(&moe.experts[0]) && prompt_on_device() {
-                return on_device(moe, &xs, h, m, e);
-            }
+        let kvad::model::ffn::Mlp::Moe(moe) = &self.mlp else { return self.on_host(&xs, h, m, e) };
+        let lendable = moe.shared.is_none() && lendable(&moe.experts[0]);
+        let prompt = m >= ON_DEVICE_ROWS && lendable && prompt_on_device();
+        let keep = if lendable { hot_experts() } else { 0 };
+        if !prompt && keep == 0 {
+            return self.on_host(&xs, h, m, e);
         }
-        let ys = kvad::model::in_shared_pool(|| self.mlp.run(&xs, m, e, None));
+        let by_expert = kvad::model::in_shared_pool(|| moe.routed(&xs, m));
+        let mut hot = self.hot.lock().unwrap_or_else(|p| p.into_inner());
+        if keep > 0 {
+            hot.count(moe, &by_expert, m, keep, h.device());
+        }
+        if prompt {
+            return on_device(moe, &by_expert, h, m, e);
+        }
+        mixed(moe, hot.kept.as_deref().unwrap_or(&[]), &by_expert, &xs, h, m, e)
+    }
+
+    /// Every expert on the CPU, as the engine runs them.
+    fn on_host(&self, xs: &[f32], h: &Tensor, m: usize, e: usize) -> Res<Tensor> {
+        let ys = kvad::model::in_shared_pool(|| self.mlp.run(xs, m, e, None));
         Ok(Tensor::from_vec(ys, (m, e), h.device())?.to_dtype(h.dtype())?)
     }
+}
+
+impl Hot {
+    /// Count this pass's picks, and once [`HOT_AFTER`] rows have been routed,
+    /// lend the `keep` busiest experts to the device for good.
+    pub(crate) fn count(&mut self, moe: &kvad::model::ffn::Moe, by_expert: &[Vec<(usize, f32)>], m: usize, keep: usize, device: &candle_core::Device) {
+        if self.kept.is_some() {
+            return;
+        }
+        self.counts.resize(by_expert.len(), 0);
+        for (c, picks) in self.counts.iter_mut().zip(by_expert) {
+            *c += picks.len() as u64;
+        }
+        self.rows += m;
+        if self.rows < HOT_AFTER {
+            return;
+        }
+        let mut busiest: Vec<usize> = (0..self.counts.len()).collect();
+        busiest.sort_by_key(|&x| std::cmp::Reverse(self.counts[x]));
+        busiest.truncate(keep);
+        busiest.sort_unstable();
+        let mut kept: Vec<Option<Ffn>> = (0..self.counts.len()).map(|_| None).collect();
+        let mut failed = None;
+        moe.with_experts(&busiest, |x, ffn| match lent(ffn, device) {
+            Ok(on_device) => kept[x] = Some(on_device),
+            Err(err) => failed = Some(err),
+        });
+        if let Some(err) = failed {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("hot experts: some stay on the host: {err}"));
+        }
+        self.kept = Some(kept);
+    }
+}
+
+/// The experts kept on the device run there, the rest on the CPU, and the
+/// two added.
+pub(crate) fn mixed(moe: &kvad::model::ffn::Moe, kept: &[Option<Ffn>], by_expert: &[Vec<(usize, f32)>], xs: &[f32], h: &Tensor, m: usize, e: usize) -> Res<Tensor> {
+    let chosen: Vec<usize> = (0..by_expert.len()).filter(|&x| !by_expert[x].is_empty()).collect();
+    let on_cpu: Vec<usize> = chosen.iter().copied().filter(|&x| kept.get(x).is_none_or(Option::is_none)).collect();
+    let ys = kvad::model::in_shared_pool(|| moe.run_some(xs, m, e, by_expert, &on_cpu));
+    let mut out = Tensor::from_vec(ys, (m, e), h.device())?.to_dtype(h.dtype())?;
+    for &x in &chosen {
+        if let Some(Some(ffn)) = kept.get(x) {
+            out = add_expert(out, ffn, &by_expert[x], h)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Rows a layer routes before its hot set is chosen from what they picked.
+const HOT_AFTER: usize = 64;
+
+/// `KVAD_GPU_HOT_EXPERTS`: how many experts of each hosted layer to keep on
+/// the device, chosen by how often this session's first [`HOT_AFTER`] tokens
+/// picked them. q4 only, like lending; 0 or unset keeps them all on the host.
+fn hot_experts() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("KVAD_GPU_HOT_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// `out` plus one expert run on the device over the rows that picked it,
+/// each scaled by its weight.
+fn add_expert(out: Tensor, ffn: &Ffn, picks: &[(usize, f32)], h: &Tensor) -> Res<Tensor> {
+    let (device, dtype) = (h.device(), h.dtype());
+    // One row, as at decode: no rows to gather or scatter, and the weight is
+    // a scalar rather than an upload.
+    if let [(0, w)] = picks {
+        if h.dim(0)? == 1 {
+            return Ok((out + ffn.forward(h)?.to_dtype(dtype)?.affine(f64::from(*w), 0.0)?)?);
+        }
+    }
+    let (rows, weights): (Vec<u32>, Vec<f32>) = picks.iter().map(|&(i, w)| (i as u32, w)).unzip();
+    let k = rows.len();
+    let idx = Tensor::from_vec(rows, (k,), device)?;
+    let w = Tensor::from_vec(weights, (k, 1), device)?.to_dtype(dtype)?;
+    let y = ffn.forward(&h.index_select(&idx, 0)?)?.to_dtype(dtype)?.broadcast_mul(&w)?;
+    Ok(out.index_add(&idx, &y, 0)?)
 }
 
 /// The fewest rows in a pass for its experts to go to the device.
@@ -313,12 +435,11 @@ fn prompt_on_device() -> bool {
     *ON.get_or_init(|| std::env::var("KVAD_GPU_PROMPT_EXPERTS").as_deref() != Ok("0"))
 }
 
-/// Route on the host, then run each chosen expert on the device.
-pub(crate) fn on_device(moe: &kvad::model::ffn::Moe, xs: &[f32], h: &Tensor, m: usize, e: usize) -> Res<Tensor> {
-    let by_expert = kvad::model::in_shared_pool(|| moe.routed(xs, m));
+/// Run each chosen expert on the device, lent for this pass alone.
+pub(crate) fn on_device(moe: &kvad::model::ffn::Moe, by_expert: &[Vec<(usize, f32)>], h: &Tensor, m: usize, e: usize) -> Res<Tensor> {
     let chosen: Vec<usize> = (0..by_expert.len()).filter(|&x| !by_expert[x].is_empty()).collect();
-    let (device, dtype) = (h.device(), h.dtype());
-    let mut out = Tensor::zeros((m, e), dtype, device)?;
+    let device = h.device();
+    let mut out = Some(Tensor::zeros((m, e), h.dtype(), device)?);
     let (mut held, mut failed) = (0, None);
     moe.with_experts(&chosen, |x, ffn| {
         if failed.is_some() {
@@ -326,12 +447,7 @@ pub(crate) fn on_device(moe: &kvad::model::ffn::Moe, xs: &[f32], h: &Tensor, m: 
         }
         let mut step = || -> Res<()> {
             let ffn_on_device = lent(ffn, device)?;
-            let (rows, weights): (Vec<u32>, Vec<f32>) = by_expert[x].iter().map(|&(i, w)| (i as u32, w)).unzip();
-            let k = rows.len();
-            let idx = Tensor::from_vec(rows, (k,), device)?;
-            let w = Tensor::from_vec(weights, (k, 1), device)?.to_dtype(dtype)?;
-            let y = ffn_on_device.forward(&h.index_select(&idx, 0)?)?.to_dtype(dtype)?.broadcast_mul(&w)?;
-            out = out.index_add(&idx, &y, 0)?;
+            out = Some(add_expert(out.take().expect("kept between experts"), &ffn_on_device, &by_expert[x], h)?);
             held += ffn_on_device.bytes();
             if held >= LENT_BYTES {
                 drop(ffn_on_device);
@@ -344,7 +460,7 @@ pub(crate) fn on_device(moe: &kvad::model::ffn::Moe, xs: &[f32], h: &Tensor, m: 
     });
     match failed {
         Some(err) => Err(err),
-        None => Ok(out),
+        None => Ok(out.expect("kept between experts")),
     }
 }
 

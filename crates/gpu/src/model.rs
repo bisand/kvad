@@ -2290,9 +2290,54 @@ pub(crate) mod tests {
             let scale = ours.iter().fold(0f32, |a, v| a.max(v.abs()));
             for dev in &devices {
                 let h = Tensor::from_slice(&xs, (m, e), dev).unwrap();
-                let theirs = crate::ffn::on_device(&moe, &xs, &h, m, e).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let theirs = crate::ffn::on_device(&moe, &moe.routed(&xs, m), &h, m, e).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
                 let worst = theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
                 assert!(scale > 0.0 && worst < 0.05 * scale, "{precision:?} on {dev:?}: off by {worst} of {scale}");
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Some experts kept on the device, the rest run on the host: the same
+    /// mixture as the CPU engine's, to within what their q4 kernels round.
+    #[test]
+    fn hot_experts_on_the_device_agree_with_the_cpu_engine() {
+        use kvad::quant::Precision;
+
+        let (spec, path) = moe_checkpoint("hot");
+        let router = Router::read(&spec.config).unwrap();
+        let ckpt = kvad::weights::Checkpoint::open(std::slice::from_ref(&path)).unwrap();
+        let (m, e) = (40usize, spec.n_embd);
+        let xs: Vec<f32> = (0..m * e).map(|i| ((i * 37 % 101) as f32 / 50.0 - 1.0) * 0.5).collect();
+        let devices = match Device::new_metal(0) {
+            Ok(gpu) => vec![Device::Cpu, gpu],
+            Err(_) => vec![Device::Cpu],
+        };
+        let live = kvad::qcache::Live::new(&ckpt, Precision::Q4);
+        let moe = kvad::model::ffn::Moe::load(&live, "layers.1.mlp", &router, kvad::model::ffn::Shared::None).unwrap();
+        let ours = moe.run(&xs, m, e, None);
+        let scale = ours.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let by_expert = moe.routed(&xs, m);
+        for dev in &devices {
+            let mut hot = crate::ffn::Hot::default();
+            // Not chosen until enough rows have been routed.
+            hot.count(&moe, &by_expert, m, 2, dev);
+            assert!(hot.kept.is_none(), "chosen after {m} rows on {dev:?}");
+            hot.count(&moe, &by_expert, m, 2, dev);
+            let kept = hot.kept.as_deref().unwrap();
+            assert_eq!(kept.iter().filter(|k| k.is_some()).count(), 2, "on {dev:?}");
+            let h = Tensor::from_slice(&xs, (m, e), dev).unwrap();
+            let theirs = crate::ffn::mixed(&moe, kept, &by_expert, &xs, &h, m, e).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let worst = theirs.iter().zip(&ours).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(scale > 0.0 && worst < 0.05 * scale, "on {dev:?}: off by {worst} of {scale}");
+            // One row, as at decode, which takes a path of its own.
+            for i in 0..m {
+                let x = &xs[i * e..(i + 1) * e];
+                let one = moe.run(x, 1, e, None);
+                let h = Tensor::from_slice(x, (1, e), dev).unwrap();
+                let theirs = crate::ffn::mixed(&moe, kept, &moe.routed(x, 1), x, &h, 1, e).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let worst = theirs.iter().zip(&one).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                assert!(worst < 0.05 * scale, "row {i} on {dev:?}: off by {worst} of {scale}");
             }
         }
         std::fs::remove_file(&path).unwrap();

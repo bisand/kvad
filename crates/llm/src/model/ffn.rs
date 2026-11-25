@@ -719,11 +719,40 @@ impl Moe {
             }
         }
         let ahead = ahead.as_ref().map(|(next, guess)| (next.layer, guess.as_slice()));
+        self.experts_into(hs, m, e, &by_expert, &chosen, ahead, &mut shared, &mut out);
+        debug_assert!(shared.is_none(), "the shared expert never landed");
+        out
+    }
+
+    /// The routed experts in `chosen` alone, over routing a backend did
+    /// with [`Moe::routed`]: the rest are its to run. No shared expert, which
+    /// is a backend's too, and no guess at the next layer.
+    pub fn run_some(&self, hs: &[f32], m: usize, e: usize, by_expert: &[Vec<(usize, f32)>], chosen: &[usize]) -> Vec<f32> {
+        let mut out = vec![0.0f32; m * e];
+        self.experts_into(hs, m, e, by_expert, chosen, None, &mut None, &mut out);
+        out
+    }
+
+    /// Run the experts in `chosen` into `out`, through the expert cache if
+    /// there is one and from the mapping for whatever it did not reach.
+    #[allow(clippy::too_many_arguments)]
+    fn experts_into(
+        &self,
+        hs: &[f32],
+        m: usize,
+        e: usize,
+        by_expert: &[Vec<(usize, f32)>],
+        chosen: &[usize],
+        ahead: Option<(usize, &[usize])>,
+        shared: &mut Option<Pending<'_>>,
+        out: &mut [f32],
+    ) {
+        let n = self.router.n_experts;
         let mut done = vec![false; n];
         if let Some(resident) = &self.resident {
             // The same arithmetic on the same bytes, read by us rather than
             // paged in. A weight that cannot be rebased runs as mapped.
-            let read = resident.with(self.layer, &chosen, ahead, |group| {
+            let read = resident.with(self.layer, chosen, ahead, |group| {
                 let views: Vec<Option<Ffn>> =
                     group.iter().map(|&(x, slab, lo)| self.experts[x].rebased(lo, slab)).collect();
                 let pairs: Vec<(usize, &Ffn)> = group
@@ -737,7 +766,7 @@ impl Moe {
                         }
                     })
                     .collect();
-                mix(hs, m, e, &by_expert, &pairs, &mut shared, &mut out);
+                mix(hs, m, e, by_expert, &pairs, shared, out);
                 for &(x, ..) in group {
                     done[x] = true;
                 }
@@ -751,12 +780,9 @@ impl Moe {
         }
         let rest: Vec<(usize, &Ffn)> =
             chosen.iter().filter(|&&x| !done[x]).map(|&x| (x, &self.experts[x])).collect();
-        mix(hs, m, e, &by_expert, &rest, &mut shared, &mut out);
-        debug_assert!(shared.is_none(), "the shared expert never landed");
-        out
+        mix(hs, m, e, by_expert, &rest, shared, out);
     }
 }
-
 
 /// A token's shared expert with only its down projection left to run.
 ///

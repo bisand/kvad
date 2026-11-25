@@ -355,6 +355,15 @@ pub trait Source {
         None
     }
 
+    /// Somewhere to read whole layers from, ahead of their being run, when the
+    /// model is too big for its mapping to stay in memory. See
+    /// [`crate::layers`]. `which` are the layers the model will ask for, in
+    /// the order it runs them. As with [`Source::experts`], only a cache file
+    /// can offer it.
+    fn layers(&self, _which: &[usize]) -> Option<Arc<crate::layers::Layers>> {
+        None
+    }
+
     /// The same, for a whole subtree of tensors at once.
     ///
     /// DeepSeek V3's multi-token-prediction head is the case this exists for: a
@@ -845,6 +854,10 @@ impl Source for Mapped {
         self.experts
             .get_or_init(|| crate::experts::Resident::wanted(&self.file, &self.path))
             .clone()
+    }
+
+    fn layers(&self, which: &[usize]) -> Option<Arc<crate::layers::Layers>> {
+        crate::layers::Layers::wanted(&self.file, &self.path, which)
     }
 
     fn matrix(&self, name: &str) -> Res<Weight> {

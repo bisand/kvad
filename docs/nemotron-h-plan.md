@@ -37,12 +37,10 @@ quantised cache on the SSD, through `experts::Resident`. At q4 the floor with
 every expert a miss is 2.7 GB at ~6–13 GB/s, **0.2–0.45 s a token**, and the
 expert cache's hits only lower it. Not 10–30 s.
 
-Dense streaming, a layer at a time, would only matter for a dense Nemotron-H
-bigger than memory, and NVIDIA has published none (the dense ones are 4–12 B).
-It is left out of this plan unless André wants it for its own sake. What a
-dense model already gets is the mapping: its weights are file pages the kernel
-can drop, not part of the footprint (below, the 4B runs at q8 with 5 GB of
-weights mapped and a 245 MB footprint).
+Dense streaming, a layer at a time, only matters for a dense model bigger
+than memory, and NVIDIA has published no such Nemotron-H (the dense ones are
+4–12 B). André wanted it built anyway: `crates/llm/src/layers.rs`, measured on
+the dense 4B below.
 
 ## The layer pattern
 
@@ -195,8 +193,34 @@ tok/s with it, 11.6 10.1 7.1 10.2 without. It does not pay here either.
 
 **CPU or Metal.** The CPU. Metal has no Nemotron-H, and with the experts on
 the SSD half of a token is reading, which a GPU does not shorten; the other
-half is the CPU's arithmetic, so a port is worth at most 2× there. It is worth
-measuring Munin first.
+half is the CPU's arithmetic, so a port is worth at most 2× there. Streaming a
+dense model, the CPU already reads at 93% of the disk's speed, so a GPU would
+gain nothing. It is worth measuring Munin first.
+
+**Dense layers from the SSD** (`crates/llm/src/layers.rs`). Each layer is one
+run of the q-cache file, read with the expert cache's uncached `Fetcher` in
+8 MB requests, four in flight, into a pool of slabs, and the layer's weights
+pointed at its slab with `Weight::rebased`. One thread reads the next
+`KVAD_LAYER_AHEAD` layers (default 2), wrapping to the first for the next
+token. Mixture layers are left to the expert cache. It is on when the cache
+file is larger than usable memory, or with `KVAD_LAYER_STREAM=1`. The answer
+is bit for bit the mapping's (`tests/nemotron_h.rs`).
+
+Nemotron-H-4B at q8, forced on, cold, 40 greedy tokens, three rounds:
+
+| | decode tok/s | footprint |
+|---|---|---|
+| mapped (fits, so warm after the first token) | 21.5 22.6 21.4 | 0.24 GB |
+| streamed, nothing ahead | 2.6 2.1 2.6 | 0.34 GB |
+| streamed, 1 layer ahead | 3.1 2.9 2.5 | 0.42 GB |
+| streamed, 2 ahead | 3.1 3.0 2.9 | 0.51 GB |
+| streamed, 4 ahead | 3.1 2.7 2.6 | 0.68 GB |
+
+A token reads 4.25 GB (every layer; the embeddings and head stay mapped), so
+3.0 tok/s is 12.8 GB/s, against 13.8 GB/s from a sequential `dd`: the floor
+is 3.25 tok/s and this is within 10% of it. Reading ahead is worth ~20%, one
+layer gets most of it, and more only costs memory. A model that fits is seven
+times faster mapped, which is why this is off until the file does not fit.
 
 ### What that projects for Munin (not measured)
 

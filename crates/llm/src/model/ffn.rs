@@ -435,7 +435,7 @@ impl Ffn {
     }
 
     /// This MLP with its weights read from `slab`. See [`Weight::rebased`].
-    fn rebased(&self, lo: u64, slab: &std::sync::Arc<crate::qcache::Slab>) -> Option<Ffn> {
+    pub(crate) fn rebased(&self, lo: u64, slab: &std::sync::Arc<crate::qcache::Slab>) -> Option<Ffn> {
         Some(Ffn {
             gate: match &self.gate {
                 Some(g) => Some(g.rebased(lo, slab)?),

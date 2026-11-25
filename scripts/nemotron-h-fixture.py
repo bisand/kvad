@@ -48,7 +48,7 @@ CONFIG = {
     "num_key_value_heads": 2,
     "head_dim": 8,
     "attention_bias": False,
-    "intermediate_size": 48,
+    "intermediate_size": 64,
     "mlp_hidden_act": "relu2",
     "mlp_bias": False,
     "mamba_num_heads": 4,

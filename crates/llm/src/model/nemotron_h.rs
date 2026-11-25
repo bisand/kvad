@@ -315,6 +315,10 @@ pub struct Model {
     /// For each layer, the next mixture above it, for a mixture to guess that
     /// one's experts. Not the next layer: Mamba layers sit between them.
     next_moe: Vec<Option<usize>>,
+    /// Every layer but the mixtures, read off the disk a layer at a time, for
+    /// a model too big for its mapping to stay in memory. The mixtures' experts
+    /// have [`crate::experts`] instead. See [`crate::layers`].
+    stream: Option<std::sync::Arc<crate::layers::Layers>>,
 }
 
 fn whole(src: &dyn Source, spec: Spec, shard: &super::Shard) -> Res<Box<dyn Transformer>> {
@@ -379,6 +383,8 @@ impl Model {
         // device that speculative decoding could use and this does not.
         src.skip_under("mtp.");
 
+        let dense: Vec<usize> = (0..kinds.len()).filter(|&i| kinds[i] != Kind::Moe).collect();
+        let stream = src.layers(&dense);
         let next_moe = (0..kinds.len())
             .map(|i| (i + 1..kinds.len()).find(|&j| kinds[j] == Kind::Moe))
             .collect();
@@ -388,6 +394,7 @@ impl Model {
             norm_f: src.vector("backbone.norm_f.weight")?,
             layers,
             next_moe,
+            stream,
             kinds,
             ssm,
             spec,
@@ -398,13 +405,21 @@ impl Model {
         &self.kinds
     }
 
+    /// When its layers are streamed: bytes read so far, and weights that ran
+    /// from the mapping instead of their slab.
+    pub fn streamed(&self) -> Option<(u64, u64)> {
+        self.stream.as_ref().map(|s| s.counts())
+    }
+
     /// A Mamba-2 layer over `m` tokens, in order, carrying `state` from each to
     /// the next.
-    fn mamba(&self, net: &Mamba, hs: &[f32], m: usize, state: &mut [f32]) -> Vec<f32> {
+    ///
+    /// `in_proj` and `out_proj` are `net`'s, or the same read into a slab.
+    fn mamba(&self, net: &Mamba, (in_proj, out_proj): (&Weight, &Weight), hs: &[f32], m: usize, state: &mut [f32]) -> Vec<f32> {
         let s = &self.ssm;
         let (k, window) = (s.conv, s.conv_window());
         let width = s.inner + s.conv_dim + s.heads;
-        let proj = project(&net.in_proj, hs, m);
+        let proj = project(in_proj, hs, m);
         let per_group = s.heads / s.groups;
         let mut ys = vec![0.0f32; m * s.inner];
 
@@ -468,7 +483,7 @@ impl Model {
                 chunk.copy_from_slice(&normed);
             }
         }
-        project(&net.out_proj, &ys, m)
+        project(out_proj, &ys, m)
     }
 
     /// An attention layer over `m` tokens starting at position `pos0`. Each
@@ -493,9 +508,38 @@ impl Model {
         let mut xs: Vec<f32> = tokens.iter().flat_map(|&t| self.embed.row(t as usize).to_vec()).collect();
         for (l, layer) in self.layers.iter().enumerate() {
             let hs: Vec<f32> = xs.chunks(e).flat_map(|x| rms_norm(x, &layer.norm, self.spec.eps)).collect();
+            // This layer's matrices read into a slab, when it is streamed: the
+            // same bytes, so the same answer, from memory of our own.
+            let stream = self.stream.as_ref().filter(|_| self.kinds[l] != Kind::Moe);
+            let held = stream.and_then(|s| s.get(l));
+            let on = |w: &Weight| {
+                let view = held.as_ref().and_then(|(lo, slab)| w.rebased(*lo, slab));
+                if let (Some(s), None) = (stream, &view) {
+                    s.fell_back();
+                }
+                view
+            };
             let ys = match &layer.mixer {
-                Mixer::Mamba(net) => self.mamba(net, &hs, m, cache.state_mut(l)),
-                Mixer::Attention(attn) => self.attention(attn, &hs, m, l, cache),
+                Mixer::Mamba(net) => {
+                    let (i, o) = (on(&net.in_proj), on(&net.out_proj));
+                    let w = (i.as_ref().unwrap_or(&net.in_proj), o.as_ref().unwrap_or(&net.out_proj));
+                    self.mamba(net, w, &hs, m, cache.state_mut(l))
+                }
+                Mixer::Attention(attn) => match (on(&attn.q), on(&attn.k), on(&attn.v), on(&attn.o)) {
+                    (Some(q), Some(k), Some(v), Some(o)) => self.attention(&Attn { q, k, v, o }, &hs, m, l, cache),
+                    _ => self.attention(attn, &hs, m, l, cache),
+                },
+                Mixer::Mlp(Mlp::Dense(ffn)) if stream.is_some() => {
+                    let view = held.as_ref().and_then(|(lo, slab)| ffn.rebased(*lo, slab));
+                    if view.is_none() {
+                        stream.into_iter().for_each(|s| s.fell_back());
+                    }
+                    let f = view.as_ref().unwrap_or(ffn);
+                    match m {
+                        1 => f.run_one(&hs),
+                        _ => f.run(&hs, m),
+                    }
+                }
                 Mixer::Mlp(mlp) => {
                     let next = self.next_moe[l].map(|j| match &self.layers[j].mixer {
                         Mixer::Mlp(next) => next,
@@ -509,6 +553,11 @@ impl Model {
             };
             for (x, y) in xs.iter_mut().zip(&ys) {
                 *x += y;
+            }
+            // Every view of the slab is gone with the match above.
+            drop(held);
+            if let Some(s) = stream {
+                s.done(l);
             }
         }
         cache.len += m;

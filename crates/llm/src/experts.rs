@@ -202,27 +202,32 @@ impl ExpertStore {
     /// either way. What Linux does not get is the memory: the kernel keeps its
     /// own copy of what this reads, beside the copy the cache holds.
     pub fn open_uncached(&self) -> Res<File> {
-        let file = File::open(&self.path)?;
-        // Best effort: a kernel that declines still returns correct bytes,
-        // just slower to measure and heavier on memory.
-        #[cfg(target_os = "macos")]
-        unsafe {
-            libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
-            libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe {
-            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
-        }
-        Ok(file)
+        open_uncached(&self.path)
     }
+}
+
+/// [`ExpertStore::open_uncached`], for any file.
+pub fn open_uncached(path: &Path) -> Res<File> {
+    let file = File::open(path)?;
+    // Best effort: a kernel that declines still returns correct bytes,
+    // just slower to measure and heavier on memory.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+        libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+    }
+    Ok(file)
 }
 
 /// The `(offset, bytes)` of every array backing one tensor.
 ///
 /// `scales` is counted in `f32`s and the code arrays in bytes, which is the
 /// one place the cache's header is not self-describing.
-fn arrays(entry: &serde_json::Value) -> Res<Vec<(u64, u64)>> {
+pub(crate) fn arrays(entry: &serde_json::Value) -> Res<Vec<(u64, u64)>> {
     let mut out = Vec::new();
     for (key, width) in [("scales", 4u64), ("qs", 1), ("data", 4)] {
         let Some(pair) = entry.get(key).and_then(|v| v.as_array()) else { continue };
@@ -270,8 +275,14 @@ impl Fetcher {
     /// device is saturated and the extra threads only add latency to each
     /// individual read.
     pub fn new(store: &ExpertStore, threads: usize) -> Res<Fetcher> {
+        Fetcher::of(&store.path, threads)
+    }
+
+    /// As [`Fetcher::new`], over any file: [`crate::layers`] reads whole
+    /// layers of the same cache through it.
+    pub fn of(path: &Path, threads: usize) -> Res<Fetcher> {
         let threads = threads.clamp(1, 32);
-        let files = (0..threads).map(|_| store.open_uncached()).collect::<Res<Vec<_>>>()?;
+        let files = (0..threads).map(|_| open_uncached(path)).collect::<Res<Vec<_>>>()?;
         Ok(Fetcher { files })
     }
 

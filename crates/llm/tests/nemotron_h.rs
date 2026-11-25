@@ -93,17 +93,33 @@ fn a_prompt_in_two_pieces_is_the_same_prompt() {
 }
 
 /// Quantised, the model is a little wrong everywhere and should still be the
-/// same model: the same next token at every position.
+/// same model. On rows 32 wide, one q8 block a row, it is 2–5% of the
+/// logits' scale here, so: within 8% everywhere, and the same next token
+/// wherever the reference's lead is wider than that (a random model has
+/// near-ties, 0.04 between the top two at position 1).
 #[test]
 fn quantised_it_still_picks_the_same_tokens() {
     let (tokens, want) = expected();
     let argmax = |r: &[f32]| r.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let margin = |r: &[f32]| {
+        let mut s = r.to_vec();
+        s.sort_by(|a, b| b.total_cmp(a));
+        s[0] - s[1]
+    };
     let (model, spec) = engine(Precision::Q8);
     let mut cache = KvCache::new(&spec);
     let got = model.forward_batch_all(&tokens, &mut cache);
+    let mut checked = 0;
     for (i, row) in got.chunks(spec.vocab_size).enumerate() {
-        assert_eq!(argmax(row), argmax(&want[i]), "q8, position {i}");
+        let worst = row.iter().zip(&want[i]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let scale = want[i].iter().map(|x| x.abs()).fold(1f32, f32::max);
+        assert!(worst < 0.08 * scale, "q8, position {i}: off by {worst} (scale {scale})");
+        if margin(&want[i]) > 0.3 {
+            assert_eq!(argmax(row), argmax(&want[i]), "q8, position {i}");
+            checked += 1;
+        }
     }
+    assert!(checked >= 3, "only {checked} positions had a clear winner");
 }
 
 /// Munin 2.0's published `config.json`, the keys that decide its shape: the
@@ -136,4 +152,52 @@ fn munin_has_the_state_and_the_cache_the_plan_says() {
     // And the router is told the rule the config leaves out.
     assert_eq!(spec.config.text("scoring_func"), Some("sigmoid"));
     assert_eq!(spec.config.text("topk_method"), Some("noaux_tc"));
+}
+
+
+/// The layers read off the disk a layer at a time, ahead of being run, give
+/// exactly what the mapping gives: the same bytes, the same kernels, the same
+/// bits. Prompt and decode both, so the read-ahead wraps round to the first
+/// layer between tokens.
+#[test]
+fn streamed_layers_give_exactly_the_mapped_answer() {
+    use kvad::model::nemotron_h::Model;
+    use kvad::qcache::Mapped;
+    let (tokens, _) = expected();
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture().join("config.json")).unwrap()).unwrap();
+    let spec = Spec::from_config(Json::new(config)).unwrap();
+    let files = vec![fixture().join("model.safetensors")];
+    let path = std::env::temp_dir().join(format!("kvad-nemotron-h-stream-{}.nq", std::process::id()));
+    let repo = "test/nemotron-h";
+
+    let ckpt = Checkpoint::open(&files).unwrap();
+    let mut live = Live::new(&ckpt, Precision::Q8);
+    live.record_to(&path).unwrap();
+    Model::load(&live, spec.clone()).unwrap();
+    live.finish(repo, &files, &spec).unwrap().expect("a cache file");
+
+    let run = |stream: &str| {
+        // Read when the model is built, by this test alone in this binary:
+        // every other test here loads from the checkpoint, which never streams.
+        std::env::set_var("KVAD_LAYER_STREAM", stream);
+        let src = Mapped::open(&path, repo, &files, &spec, Precision::Q8).unwrap().expect("the cache file");
+        let model = Model::load(&src, spec.clone()).unwrap();
+        let mut cache = KvCache::new(&spec);
+        let mut out = model.forward_batch_all(&tokens[..4], &mut cache);
+        for &t in &tokens[4..] {
+            out.extend(model.forward(t, &mut cache));
+        }
+        (out, model.streamed())
+    };
+    let (mapped, none) = run("0");
+    let (streamed, counts) = run("1");
+    std::env::remove_var("KVAD_LAYER_STREAM");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(none.is_none());
+    let (read, fell_back) = counts.expect("the layers were streamed");
+    assert!(read > 0, "nothing was read");
+    assert_eq!(fell_back, 0, "weights ran from the mapping instead of their slab");
+    assert_eq!(streamed, mapped, "streaming changed the answer");
 }

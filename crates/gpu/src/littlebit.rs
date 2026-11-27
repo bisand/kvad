@@ -21,20 +21,25 @@
 //! XOR where the weight is −1, and adds. `simd_sum` joins the lanes. There is
 //! no multiply in the loop, as there is none on the CPU (`signed_sum`).
 //!
-//! The rows of `x` — a prompt's tokens — are the grid's second axis, so a
-//! prefill rereads each row of signs once a token, from cache.
+//! That kernel takes the rows of `x` — a prompt's tokens — one at a time,
+//! so a prefill costs a decode step a row. From [`TILED_ROWS`] rows,
+//! `sign_matmul_tiled` takes the product as a matrix product: a 32 x 32 tile
+//! of `y` a threadgroup, a word of each of 32 sign rows spread into ±1 floats
+//! in threadgroup memory and multiplied on f32 simdgroup matrices. A short
+//! prompt against rank 544 is a few dozen tiles, too few for the GPU, so the
+//! words are split across up to [`GROUPS`] threadgroups and
+//! `sign_matmul_sum` adds the parts in order.
 //!
 //! # Measured
 //!
 //! On an M5 Pro, the 252 projections of a Qwen3-8B token at 0.55 bits a
-//! weight (`bench` below, random factors at the real shapes): 19.6 ms for one
-//! row, against about 90 ms for the CPU engine's whole token. For 27 rows,
-//! 320 ms, which is 12 ms a row. A prompt barely shares any work between its
-//! rows.
-//!
-//! shortcut: a prefill is one decode step a row, sharing nothing but the
-//! cache; holding a word's signs against several rows of `x` would be the
-//! next step if long prompts matter.
+//! weight (`bench` below, random factors at the real shapes): 21 ms for one
+//! row on the row kernel, against about 90 ms for the CPU engine's whole
+//! token, and 12 ms a row however many. The tiled kernel costs 58 ms for one
+//! to eight rows, 64 for 27, 200 for 128 and 817 for 512: 1.6 ms a row, about
+//! 6 TFLOP/s of f32. They cross at four rows. On the real checkpoint a
+//! 19-token prompt reads in 0.09 s instead of 0.24, and 501 tokens in 0.80 s
+//! instead of 5.66, with the same text.
 //!
 //! The activations are f32, whatever the load's dtype: the CPU engine's
 //! kernels are f32, and so are the quantised loads' activations here. A bf16
@@ -108,10 +113,129 @@ kernel void sign_matmul(
         y[o] = s * scale[r] + ((p.flags & 2) ? add[o] : 0.0f);
     }
 }
+
+// The same product for many rows of x: a 32 x 32 tile of y a threadgroup, 32
+// rows of x against 32 rows of signs, a word of each sign row at a time. The
+// word is spread into +-1 floats in threadgroup memory and multiplied on the
+// simdgroup matrices; four simdgroups take a 16 x 16 quarter each.
+//
+// The grid's third axis splits the words, when there are too few tiles to
+// keep the GPU busy: each split writes its sums to `sums`, and
+// `sign_matmul_sum` adds them, in order, so the answer is the same every run.
+#define T 32
+struct Tiled { uint m; uint per_split; uint splits; };
+kernel void sign_matmul_tiled(
+    device const uint *signs [[buffer(0)]],
+    device const float *x [[buffer(1)]],
+    device const float *scale [[buffer(2)]],
+    device const float *pre [[buffer(3)]],
+    device const float *add [[buffer(4)]],
+    device float *y [[buffer(5)]],
+    constant Params &p [[buffer(6)]],
+    constant Tiled &tl [[buffer(7)]],
+    device float *sums [[buffer(8)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint t [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float xs[T * T];   // [row of x][column]
+    threadgroup float ss[T * T];   // [column][row of signs], so B as it is multiplied
+    bool has_pre = p.flags & 1;
+    uint m = tl.m;
+    uint words = (p.cols + 31) / 32;
+    uint w0 = tg.z * tl.per_split, w1 = min(words, w0 + tl.per_split);
+    uint r0 = tg.x * T, i0 = tg.y * T;
+    // Each thread loads eight of the tile's 1024 activations and spreads
+    // eight bits of one row's word.
+    uint row = t / 4, part = (t % 4) * 8;
+    uint i = i0 + row, r = r0 + row;
+    device const float *xi = x + i * p.cols;
+    uint sy = (sg / 2) * 16, sx = (sg % 2) * 16;
+    // Constant indices only: a fragment array indexed by a variable spills.
+    simdgroup_float8x8 acc[4] = { make_filled_simdgroup_matrix<float, 8, 8>(0.0f), make_filled_simdgroup_matrix<float, 8, 8>(0.0f),
+                                  make_filled_simdgroup_matrix<float, 8, 8>(0.0f), make_filled_simdgroup_matrix<float, 8, 8>(0.0f) };
+
+    for (uint w = w0; w < w1; w++) {
+        uint c = w * 32 + part;
+        float4 a = 0, b = 0;
+        if (i < m) {
+            a = load4(xi, pre, c, p.cols, has_pre);
+            b = load4(xi, pre, c + 4, p.cols, has_pre);
+        }
+        *(threadgroup float4 *)(xs + row * T + part) = a;
+        *(threadgroup float4 *)(xs + row * T + part + 4) = b;
+        uint bits = r < p.rows ? signs[r * words + w] >> part : 0u;
+        for (uint k = 0; k < 8; k++) ss[(part + k) * T + row] = (bits >> k) & 1u ? -1.0f : 1.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < T; k += 8) {
+            simdgroup_float8x8 a0, a1, b0, b1;
+            simdgroup_load(a0, xs + sy * T + k, T);
+            simdgroup_load(a1, xs + (sy + 8) * T + k, T);
+            simdgroup_load(b0, ss + k * T + sx, T);
+            simdgroup_load(b1, ss + k * T + sx + 8, T);
+            simdgroup_multiply_accumulate(acc[0], a0, b0, acc[0]);
+            simdgroup_multiply_accumulate(acc[1], a0, b1, acc[1]);
+            simdgroup_multiply_accumulate(acc[2], a1, b0, acc[2]);
+            simdgroup_multiply_accumulate(acc[3], a1, b1, acc[3]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Through threadgroup memory, so the edges and the epilogue are plain.
+    simdgroup_store(acc[0], xs + sy * T + sx, T);
+    simdgroup_store(acc[1], xs + sy * T + sx + 8, T);
+    simdgroup_store(acc[2], xs + (sy + 8) * T + sx, T);
+    simdgroup_store(acc[3], xs + (sy + 8) * T + sx + 8, T);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i >= m) return;
+    for (uint k = 0; k < 8; k++) {
+        uint rr = r0 + part + k;
+        if (rr >= p.rows) break;
+        uint o = i * p.rows + rr;
+        float s = xs[row * T + part + k];
+        if (tl.splits > 1) sums[tg.z * m * p.rows + o] = s;
+        else y[o] = s * scale[rr] + ((p.flags & 2) ? add[o] : 0.0f);
+    }
+}
+
+kernel void sign_matmul_sum(
+    device const float *scale [[buffer(2)]],
+    device const float *add [[buffer(4)]],
+    device float *y [[buffer(5)]],
+    constant Params &p [[buffer(6)]],
+    constant Tiled &tl [[buffer(7)]],
+    device const float *sums [[buffer(8)]],
+    uint o [[thread_position_in_grid]])
+{
+    uint n = tl.m * p.rows;
+    if (o >= n) return;
+    float s = 0;
+    for (uint z = 0; z < tl.splits; z++) s += sums[z * n + o];
+    y[o] = s * scale[o % p.rows] + ((p.flags & 2) ? add[o] : 0.0f);
+}
 "#;
 
 /// Simdgroups, so output rows, per threadgroup.
 const ROWS_PER_GROUP: usize = 8;
+
+/// The rows of `x` from which `sign_matmul_tiled` takes the product.
+const TILED_ROWS: usize = 4;
+
+/// `sign_matmul_tiled`'s tile, rows of `x` by rows of signs.
+const TILE: usize = 32;
+
+/// Threadgroups `sign_matmul_tiled` splits the words to reach, and the
+/// fewest words a split takes.
+const GROUPS: usize = 256;
+const SPLIT_WORDS: usize = 4;
+
+#[repr(C)]
+struct Tiled {
+    m: u32,
+    per_split: u32,
+    splits: u32,
+}
 
 /// One factorisation on the device: the sign words as `u32`, the vectors as
 /// f32, `mid` already `u2 ⊙ v1`.
@@ -154,13 +278,18 @@ impl LittleBit {
 
     /// `x · Wᵀ`, for `x` of any number of leading axes.
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        self.forward_from(x, TILED_ROWS)
+    }
+
+    /// [`forward`](Self::forward), tiled from `tiled_from` rows of `x`.
+    fn forward_from(&self, x: &Tensor, tiled_from: usize) -> candle_core::Result<Tensor> {
         let dt = x.dtype();
         let mut dims = x.dims().to_vec();
         let xs = x.to_dtype(DType::F32)?.reshape(((), self.cols))?.contiguous()?;
         let mut y: Option<Tensor> = None;
         for p in &self.paths {
-            let z = sign_matmul(&xs, &p.v, &p.mid, Some(&p.v2), None)?;
-            y = Some(sign_matmul(&z, &p.u, &p.u1, None, y.as_ref())?);
+            let z = sign_matmul_from(&xs, &p.v, &p.mid, Some(&p.v2), None, tiled_from)?;
+            y = Some(sign_matmul_from(&z, &p.u, &p.u1, None, y.as_ref(), tiled_from)?);
         }
         *dims.last_mut().unwrap() = self.rows;
         y.expect("at least one path").reshape(dims)?.to_dtype(dt)
@@ -184,13 +313,15 @@ fn kernels(device: &Device) -> Option<&'static crate::fused::metal::Kernels> {
 }
 
 /// `y[i, r] = scale[r] · Σ_c signs[r, c] · (x[i, c] · pre[c]) + add[i, r]`,
-/// for `x` `[m, cols]`, contiguous f32.
-fn sign_matmul(x: &Tensor, signs: &Tensor, scale: &Tensor, pre: Option<&Tensor>, add: Option<&Tensor>) -> candle_core::Result<Tensor> {
-    let op = SignMatmul { signs: signs.clone(), scale: scale.clone(), pre: pre.cloned(), add: add.cloned() };
+/// for `x` `[m, cols]`, contiguous f32; on `sign_matmul_tiled` from
+/// `tiled_from` rows of `x`.
+fn sign_matmul_from(x: &Tensor, signs: &Tensor, scale: &Tensor, pre: Option<&Tensor>, add: Option<&Tensor>, tiled_from: usize) -> candle_core::Result<Tensor> {
+    let op = SignMatmul { signs: signs.clone(), scale: scale.clone(), pre: pre.cloned(), add: add.cloned(), tiled_from };
     x.apply_op1_no_bwd(&op)
 }
 
 struct SignMatmul {
+    tiled_from: usize,
     signs: Tensor,
     scale: Tensor,
     pre: Option<Tensor>,
@@ -220,7 +351,20 @@ impl CustomOp1 for SignMatmul {
             candle_core::bail!("sign_matmul: {:?} {:?} against {:?} signs", x.dtype(), lx.shape(), self.signs.shape());
         }
         let dev = x.device();
-        let pipe = kernels(&Device::Metal(dev.clone())).ok_or_else(|| candle_core::Error::Msg("no littlebit kernels".into()))?.pipe("sign_matmul")?;
+        let tiled = m >= self.tiled_from;
+        // How `sign_matmul_tiled` splits the words, decided and allocated
+        // before the encoder is taken: `unpooled` takes one of its own
+        // under test, and two at once wait on each other for ever.
+        let words = cols.div_ceil(WORD);
+        let tiles = rows.div_ceil(TILE) * m.div_ceil(TILE);
+        let per_split = words.div_ceil(GROUPS.div_ceil(tiles)).max(SPLIT_WORDS).min(words);
+        let splits = if tiled { words.div_ceil(per_split) } else { 1 };
+        let sums = match splits {
+            1 => None,
+            _ => Some(crate::fused::metal::unpooled(dev, splits * m * rows * 4)?),
+        };
+        let name = if tiled { "sign_matmul_tiled" } else { "sign_matmul" };
+        let pipe = kernels(&Device::Metal(dev.clone())).ok_or_else(|| candle_core::Error::Msg("no littlebit kernels".into()))?.pipe(name)?;
         let out = output(dev, m * rows * 4)?;
 
         // Separate storages from `x`, so their locks cannot wait on candle's.
@@ -243,7 +387,7 @@ impl CustomOp1 for SignMatmul {
 
         let guard = dev.command_encoder()?;
         let enc: &ComputeCommandEncoder = guard.as_ref();
-        enc.set_label("sign_matmul");
+        enc.set_label(name);
         enc.set_compute_pipeline_state(&pipe);
         enc.set_input_buffer(0, Some(&sb), so);
         enc.set_input_buffer(1, Some(&xb), xo);
@@ -252,10 +396,39 @@ impl CustomOp1 for SignMatmul {
         enc.set_input_buffer(4, Some(&ab), ao);
         enc.set_output_buffer(5, Some(&out), 0);
         enc.set_bytes(6, &params);
-        enc.dispatch_thread_groups(
-            MTLSize { width: rows.div_ceil(ROWS_PER_GROUP), height: m, depth: 1 },
-            MTLSize { width: ROWS_PER_GROUP * 32, height: 1, depth: 1 },
-        );
+        if tiled {
+            let tl = Tiled { m: m as u32, per_split: per_split as u32, splits: splits as u32 };
+            // With one split there are no sums, and `out` stands in unread.
+            let part = sums.as_ref().unwrap_or(&out);
+            enc.set_bytes(7, &tl);
+            enc.set_output_buffer(8, Some(part), 0);
+            enc.dispatch_thread_groups(
+                MTLSize { width: rows.div_ceil(TILE), height: m.div_ceil(TILE), depth: splits },
+                MTLSize { width: 128, height: 1, depth: 1 },
+            );
+            if splits > 1 {
+                let kernels = kernels(&Device::Metal(dev.clone())).ok_or_else(|| candle_core::Error::Msg("no littlebit kernels".into()))?;
+                enc.set_compute_pipeline_state(&kernels.pipe("sign_matmul_sum")?);
+                // Every buffer named again, though bound already: candle
+                // tracks hazards by what each dispatch names, and the barrier
+                // `sums` brings forgets the rest. A `y` written here unnamed
+                // was read by the next product before it was written: wrong
+                // text from the real Qwen3-8B, and different every run.
+                enc.set_input_buffer(8, Some(part), 0);
+                enc.set_input_buffer(2, Some(&cb), co);
+                enc.set_input_buffer(4, Some(&ab), ao);
+                enc.set_output_buffer(5, Some(&out), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize { width: (m * rows).div_ceil(256), height: 1, depth: 1 },
+                    MTLSize { width: 256, height: 1, depth: 1 },
+                );
+            }
+        } else {
+            enc.dispatch_thread_groups(
+                MTLSize { width: rows.div_ceil(ROWS_PER_GROUP), height: m, depth: 1 },
+                MTLSize { width: ROWS_PER_GROUP * 32, height: 1, depth: 1 },
+            );
+        }
         Ok((MetalStorage::new(out, dev.clone(), m * rows, DType::F32), Shape::from((m, rows))))
     }
 }
@@ -291,18 +464,22 @@ mod tests {
     #[test]
     fn the_kernel_agrees_with_the_cpu_engine() {
         let Ok(dev) = Device::new_metal(0) else { return };
-        for (out, inp, s, m) in [(70, 45, 37, 1), (64, 128, 32, 5), (33, 203, 61, 3)] {
+        // Shapes off the tiles and the words, both kernels on every one.
+        let shapes = [(70, 45, 37, 1), (64, 128, 32, 5), (33, 203, 61, 3), (97, 70, 40, 33), (32, 64, 64, 64), (40, 300, 90, 71), (64, 1000, 100, 9)];
+        for (out, inp, s, m) in shapes {
             let f = random(out, inp, s, (out * inp) as u64);
             let lb = LittleBit::new(&f, out, inp, &dev).unwrap();
             let xs: Vec<f32> = (0..m * inp).map(|i| ((i * 7919) % 101) as f32 / 50.0 - 1.0).collect();
-            let before = crate::fused::tests_ran();
-            let got = lb.forward(&Tensor::from_slice(&xs, (m, inp), &dev).unwrap()).unwrap();
-            assert_eq!(crate::fused::tests_ran() - before, 4, "two kernels a path");
-            let got: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
             let want = f.matmul(&xs, m);
-            assert_eq!(got.len(), want.len());
-            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "{out}x{inp} rank {s}, m {m}: [{i}] {g} against {w}");
+            for tiled_from in [1, usize::MAX] {
+                let before = crate::fused::tests_ran();
+                let got = lb.forward_from(&Tensor::from_slice(&xs, (m, inp), &dev).unwrap(), tiled_from).unwrap();
+                assert_eq!(crate::fused::tests_ran() - before, 4, "two kernels a path");
+                let got: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+                assert_eq!(got.len(), want.len());
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "{out}x{inp} rank {s}, m {m}, tiled from {tiled_from}: [{i}] {g} against {w}");
+                }
             }
         }
     }
@@ -329,22 +506,25 @@ mod bench {
         let layers: Vec<Vec<LittleBit>> = (0..36)
             .map(|l| shapes.iter().map(|&(o, i, s)| LittleBit::new(&random(o, i, s, l as u64 + o as u64), o, i, &dev).unwrap()).collect())
             .collect();
-        for m in [1, 27] {
+        for m in [1, 2, 3, 4, 8, 16, 27, 64, 128, 512] {
             let xs = [e, ff].map(|w| Tensor::rand(-1f32, 1f32, (m, w), &dev).unwrap());
-            let token = || {
-                for layer in &layers {
-                    for (p, &(_, i, _)) in layer.iter().zip(&shapes) {
-                        p.forward(&xs[(i == ff) as usize]).unwrap();
+            for (kernel, tiled_from) in [("row", usize::MAX), ("tiled", 1)] {
+                let token = || {
+                    for layer in &layers {
+                        for (p, &(_, i, _)) in layer.iter().zip(&shapes) {
+                            p.forward_from(&xs[(i == ff) as usize], tiled_from).unwrap();
+                        }
                     }
-                }
-                dev.synchronize().unwrap();
-            };
-            token();
-            let n = 20;
-            let t = std::time::Instant::now();
-            (0..n).for_each(|_| token());
-            let ms = t.elapsed().as_secs_f64() * 1e3 / n as f64;
-            println!("{m} rows: {ms:.2} ms a pass of 252 projections");
+                    dev.synchronize().unwrap();
+                };
+                token();
+                let n = if m >= 128 { 3 } else { 10 };
+                let t = std::time::Instant::now();
+                (0..n).for_each(|_| token());
+                let ms = t.elapsed().as_secs_f64() * 1e3 / n as f64;
+                println!("{m:>4} rows, {kernel:>5}: {ms:8.2} ms a pass of 252 projections, {:.2} ms a row", ms / m as f64);
+            }
         }
     }
 }
+

@@ -46,7 +46,7 @@
 //! holds: a directory that is there wins.
 
 use crate::tensor::Tensor;
-use safetensors::{Dtype, SafeTensors};
+use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -870,10 +870,19 @@ fn spellings(name: &str) -> [String; 3] {
 /// One or more safetensors files, presented as a single namespace.
 pub struct Checkpoint {
     maps: Vec<memmap2::Mmap>,
-    /// tensor name -> which shard holds it
-    index: HashMap<String, usize>,
+    /// tensor name -> where it lives: its shard, dtype, shape and bytes there
+    index: HashMap<String, Entry>,
     /// The files, for a [`Table`] that has to map them again to outlive this.
     paths: Vec<PathBuf>,
+}
+
+/// Where one tensor is, read from its shard's header when the checkpoint is
+/// opened.
+struct Entry {
+    shard: usize,
+    dtype: Dtype,
+    shape: Vec<usize>,
+    bytes: std::ops::Range<usize>,
 }
 
 impl Checkpoint {
@@ -888,11 +897,17 @@ impl Checkpoint {
         }
 
         // Parse each header once and remember where every tensor lives.
+        // Each read used to parse its shard's header again: a LittleBit
+        // Qwen3-8B is 4,935 tensors in one file, a 536 kB header, and the
+        // loader reads nearly every one, so a load parsed some 24 million
+        // header entries, and that was 5 of its 6 s.
         let mut index = HashMap::new();
         for (i, map) in maps.iter().enumerate() {
             let st = SafeTensors::deserialize(map)?;
-            for name in st.names() {
-                index.insert(name.to_string(), i);
+            for (name, view) in st.iter() {
+                let start = view.data().as_ptr() as usize - map.as_ptr() as usize;
+                let entry = Entry { shard: i, dtype: view.dtype(), shape: view.shape().to_vec(), bytes: start..start + view.data().len() };
+                index.insert(name.to_string(), entry);
             }
         }
         Ok(Checkpoint { maps, index, paths: paths.to_vec() })
@@ -917,6 +932,12 @@ impl Checkpoint {
             .find_map(|c| self.index.get_key_value(c.as_str()).map(|(k, _)| k.as_str()))
     }
 
+    /// The view of a tensor [`Checkpoint::resolve`] found.
+    fn view(&self, key: &str) -> Res<TensorView<'_>> {
+        let e = &self.index[key];
+        Ok(TensorView::new(e.dtype, e.shape.clone(), &self.maps[e.shard][e.bytes.clone()])?)
+    }
+
     /// Look a tensor up, converting to `f32`, or `None` if it is not there.
     pub fn try_get(&self, name: &str) -> Option<Tensor> {
         self.read(name).ok().flatten()
@@ -938,8 +959,7 @@ impl Checkpoint {
     /// error said the tensor was *missing* from a file it was sitting in.
     fn read(&self, name: &str) -> Res<Option<Tensor>> {
         let Some(key) = self.resolve(name) else { return Ok(None) };
-        let st = SafeTensors::deserialize(&self.maps[self.index[key]])?;
-        let view = st.tensor(key)?;
+        let view = self.view(key)?;
 
         let (rows, cols) = match view.shape() {
             [n] => (1, *n),
@@ -1017,8 +1037,7 @@ impl Checkpoint {
     /// holds. See [`crate::littlebit::read`].
     pub fn read_words(&self, name: &str) -> Res<Option<(Vec<usize>, Vec<u32>)>> {
         let Some(key) = self.resolve(name) else { return Ok(None) };
-        let st = SafeTensors::deserialize(&self.maps[self.index[key]])?;
-        let view = st.tensor(key)?;
+        let view = self.view(key)?;
         if !matches!(view.dtype(), Dtype::I32 | Dtype::U32 | Dtype::I64 | Dtype::U64) {
             return Err(format!("`{name}` is {:?}, not a tensor of integer words", view.dtype()).into());
         }
@@ -1037,8 +1056,7 @@ impl Checkpoint {
     /// a thousand times a layer; this is the one expert's bytes.
     pub fn stacked(&self, name: &str, index: usize, part: usize, parts: usize) -> Res<Option<Tensor>> {
         let Some(key) = self.resolve(name) else { return Ok(None) };
-        let st = SafeTensors::deserialize(&self.maps[self.index[key]])?;
-        let view = st.tensor(key)?;
+        let view = self.view(key)?;
         let [n, rows, cols] = view.shape() else {
             return Err(format!("`{name}` has shape {:?}, not a stack of matrices", view.shape()).into());
         };
@@ -1103,10 +1121,9 @@ impl Table {
         let (mut parts, mut rows, mut shape) = (Vec::new(), 0, None);
         for name in &names {
             let key = ckpt.resolve(name).unwrap_or(name);
-            let file = ckpt.index[key];
+            let file = ckpt.index[key].shard;
             let map = &ckpt.maps[file];
-            let st = SafeTensors::deserialize(map)?;
-            let view = st.tensor(key)?;
+            let view = ckpt.view(key)?;
             let [r, c] = view.shape() else { return Err(format!("`{name}` is not a matrix").into()) };
             if !matches!(view.dtype(), Dtype::F32 | Dtype::BF16 | Dtype::F16) {
                 return Err(format!("`{name}` is {:?}; a table here is f32, bf16 or f16", view.dtype()).into());

@@ -256,11 +256,17 @@ one `Proj::LittleBit` holding each part's factors, outputs side by side.
 `--quant` applies to the embeddings and the head as on the CPU; the factors
 are never quantised or cached, since reading them is a copy.
 
-`crates/gpu/src/littlebit.rs` is one kernel, `sign_matmul`: a simdgroup an
-output row, each lane a word of signs at a time, the sign flipped by XOR into
-the float's top bit, `simd_sum` to finish. `v2` is applied as the activation
-is loaded, and the second path adds the first path's output as it writes, so
-a residual projection is four dispatches. Activations are f32.
+`crates/gpu/src/littlebit.rs` has two kernels. `sign_matmul`, for decode: a
+simdgroup an output row, each lane a word of signs at a time, the sign flipped
+by XOR into the float's top bit, `simd_sum` to finish. `sign_matmul_tiled`,
+from four rows of `x`: a 32 x 32 tile of the answer a threadgroup, a word of
+each of 32 sign rows spread into +-1 floats in threadgroup memory and
+multiplied on f32 simdgroup matrices. When there are too few tiles to fill the
+GPU (a short prompt against rank 544), the words are split across up to 256
+threadgroups and a second kernel adds the parts in order, so the answer is the
+same every run. `v2` is applied as the activation is loaded, and the second
+path adds the first path's output as it writes, so a residual projection is
+four dispatches, more with a split. Activations are f32.
 
 Elsewhere (another architecture, the CPU device, Linux) the error still names
 LittleBit as the reason, rather than a missing `weight`.
@@ -277,14 +283,21 @@ How it was checked:
 Measured on the M5 Pro with random factors at Qwen3-8B's shapes (rank 544 for
 attention, 824 for the MLP, two paths, 36 layers), `littlebit::bench`:
 
-| | 252 projections |
-|---|---|
-| 1 row (decode) | 19.6 ms |
-| 27 rows (prefill) | 320 ms |
+| rows | `sign_matmul` | `sign_matmul_tiled` |
+|---|---|---|
+| 1 (decode) | 21 ms | 58 ms |
+| 4 | 58 ms | 58 ms |
+| 8 | 104 ms | 59 ms |
+| 27 | 331 ms | 64 ms |
+| 128 | 1545 ms | 200 ms |
+| 512 | 6518 ms | 817 ms |
 
-The CPU takes about 90 ms for a whole token, so decode on the GPU should be
-several times faster. Prefill is one decode step a row, sharing only the
-cache; that is the next thing to change if long prompts matter.
+The row kernel costs 12 ms a row whatever the count: a prompt shares nothing
+but the cache. The tiled one has a floor of about 58 ms, the cost of the
+signs spread into threadgroup memory, and then 1.5–1.7 ms a row, about 6
+TFLOP/s of f32. They cross at four rows, where the tiled one takes over. The
+split was worth twice at short prompts (112 ms to 58 at 1–27 rows); a split
+to 1024 or 4096 threadgroups was slower than to 256.
 
 On the real `littlebit-qwen3-8b-0.55bpw`, 2026-11-25, q8 embeddings and
 head, the same 19-token prompt and 64 greedy tokens, two runs each:
@@ -300,6 +313,21 @@ The 64 tokens are the same on both, token for token. They are not good
 text: the model repeats the prompt, as the checkpoint does on the CPU too.
 The Metal load reads the factors from the checkpoint every time, because
 they never go through the cache, and that is most of its 8.7 s.
+
+With the tiled kernel, 2026-11-26, the same settings and two runs each:
+
+| | row kernel | tiled |
+|---|---|---|
+| prefill, 19 tokens | 0.24 – 0.25 s | 0.09 – 0.10 s |
+| prefill, 501 tokens | 5.66 s | 0.80 s |
+| decode | 49.0 – 51.1 tok/s | 49.1 – 51.0 tok/s |
+
+The text is the same as the row kernel's, token for token, and the same
+every run. It was not at first: the kernel that adds the split's parts wrote
+the answer without naming it to candle's hazard tracking, so the next
+product read it unfinished, and the text changed from run to run. No test
+could see it: under `cfg(test)` every new buffer is filled with NaN by a blit,
+which starts a new encoder, and the encoders are fenced.
 
 ### 5. Making LittleBit models here
 

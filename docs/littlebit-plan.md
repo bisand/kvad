@@ -312,7 +312,13 @@ head, the same 19-token prompt and 64 greedy tokens, two runs each:
 The 64 tokens are the same on both, token for token. They are not good
 text: the model repeats the prompt, as the checkpoint does on the CPU too.
 The Metal load reads the factors from the checkpoint every time, because
-they never go through the cache, and that is most of its 8.7 s.
+they never go through the cache. That was not what made it slow: every
+tensor read parsed the checkpoint's whole header again, 4,935 entries in
+536 kB, for nearly every one of the 4,935 tensors. `Checkpoint` now parses
+each header once and keeps where each tensor lies. A run of one token,
+load included, went from 6.3 – 6.5 s to 0.6 s on Metal, and from 8.1 – 10.3
+s to 1.3 – 1.9 s on the CPU engine, with the same text; so the factors still
+go uncached, since reading them is now a copy.
 
 With the tiled kernel, 2026-11-26, the same settings and two runs each:
 

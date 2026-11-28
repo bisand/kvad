@@ -183,6 +183,8 @@ pub fn registry() -> &'static [Arch] {
         all.push(Arch(&super::llama::ARCH));
         #[cfg(feature = "arch-llama")]
         all.push(Arch(&super::llama::MISTRAL3));
+        #[cfg(feature = "arch-llama")]
+        all.push(Arch(&super::llama::APERTUS));
         #[cfg(feature = "arch-deepseek")]
         all.push(Arch(&super::deepseek::V2));
         #[cfg(feature = "arch-deepseek")]

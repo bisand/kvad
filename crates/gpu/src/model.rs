@@ -170,14 +170,12 @@ fn read_blocks(
     Ok(blocks)
 }
 
-/// The same rotation table as `Rope::new`, built once on the device:
-/// cosines and sines, `[n_ctx, head_dim / 2]` each.
+/// The same rotation table as the CPU's, built once on the device: cosines
+/// and sines, `[n_ctx, head_dim / 2]` each. The frequencies come from
+/// [`kvad::model::llama_freqs`], so Llama 3.1's stretch is the same here.
 fn rotations(spec: &Spec, device: &Device, compute: DType) -> Res<(Tensor, Tensor)> {
-    let hd = spec.head_dim;
-    let half = hd / 2;
-    let inv: Vec<f32> = (0..half)
-        .map(|i| 1.0 / spec.rope_theta.powf(2.0 * i as f32 / hd as f32))
-        .collect();
+    let half = spec.head_dim / 2;
+    let inv = kvad::model::llama_freqs(spec.head_dim, spec.rope_theta, &spec.config);
     let inv = Tensor::from_vec(inv, (1, half), device)?;
     let positions: Vec<f32> = (0..spec.n_ctx).map(|p| p as f32).collect();
     let positions = Tensor::from_vec(positions, (spec.n_ctx, 1), device)?;
@@ -2267,6 +2265,43 @@ pub(crate) mod tests {
             .join(format!("gpu-moe-{}-{tag}.safetensors", std::process::id()));
         candle_core::safetensors::save(&t, &path).unwrap();
         (spec, path)
+    }
+
+    /// Llama 3.1's stretched rotation is the same table on both backends:
+    /// both read `kvad::model::llama_freqs`, and a stretch that reached only
+    /// one of them would have a model answer differently by where it ran.
+    #[test]
+    fn llama3_rotations_match_the_cpu_table() {
+        let spec = Spec::from_config(kvad::model::Json::new(serde_json::json!({
+            "model_type": "llama",
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "hidden_size": 128,
+            "intermediate_size": 64,
+            "vocab_size": 32,
+            "max_position_embeddings": 64,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 500000.0,
+            "rope_scaling": {
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 32,
+            },
+        })))
+        .unwrap();
+        let freqs = kvad::model::llama_freqs(spec.head_dim, spec.rope_theta, &spec.config);
+        let plain = kvad::tensor::Rope::new(spec.head_dim, spec.n_ctx, spec.rope_theta);
+        let cpu = kvad::tensor::Rope::from_freqs(&freqs, spec.n_ctx, 1.0);
+        let (cos, sin) = rotations(&spec, &Device::Cpu, DType::F32).unwrap();
+        let cos: Vec<f32> = cos.flatten_all().unwrap().to_vec1().unwrap();
+        let sin: Vec<f32> = sin.flatten_all().unwrap().to_vec1().unwrap();
+        let worst = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        assert!(worst(&cos, cpu.tables().0) < 1e-5 && worst(&sin, cpu.tables().1) < 1e-5, "the GPU's table is not the CPU's");
+        // And the stretch did something: a config this short slows most pairs.
+        assert!(worst(&cos, plain.tables().0) > 0.1, "the llama3 table is the plain one");
     }
 
     /// The mixture, against the hand-written engine on the same checkpoint.

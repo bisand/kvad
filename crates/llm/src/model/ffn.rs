@@ -352,7 +352,8 @@ impl Router {
 // ---------------------------------------------------------------------------
 
 /// A SwiGLU MLP, which is what both a dense layer and one expert are -- or,
-/// without its gate, Nemotron-H's `down(relu(up(x))²)`.
+/// without its gate, Nemotron-H's `down(relu(up(x))²)` or Apertus's
+/// `down(xielu(up(x)))`.
 pub struct Ffn {
     /// `None` for the ungated ReLU² form. Which form an MLP is comes from the
     /// loader that asked, never from whether a checkpoint happens to have the
@@ -361,6 +362,51 @@ pub struct Ffn {
     gate: Option<Weight>,
     up: Weight,
     down: Weight,
+    /// Apertus's activation in place of ReLU², for an ungated MLP.
+    xielu: Option<Xielu>,
+}
+
+/// xIELU (arXiv 2411.13010), Apertus's activation: a quadratic for positive
+/// inputs and an exponential-minus-linear for negative ones, both with a
+/// slope learned per layer. `x > 0`: `αp·x² + β·x`; otherwise
+/// `αn·(expm1(min(x, ε)) − x) + β·x`.
+///
+/// The checkpoint stores the two slopes before their softplus, and `β` and
+/// `ε` beside them; these are the values the formula uses.
+#[derive(Clone, Copy, Debug)]
+pub struct Xielu {
+    alpha_p: f32,
+    alpha_n: f32,
+    beta: f32,
+    eps: f32,
+}
+
+/// `ln(1 + eˣ)`, and `x` itself above 20 as torch has it: Apertus 8B stores
+/// a raw slope of 166, whose exponential is past what an f32 holds, and the
+/// infinity it became turned every logit into nothing.
+fn softplus(x: f32) -> f32 {
+    match x > 20.0 {
+        true => x,
+        false => x.exp().ln_1p(),
+    }
+}
+
+impl Xielu {
+    pub fn load(src: &dyn Source, prefix: &str) -> Res<Self> {
+        let one = |k: &str| -> Res<f32> {
+            let v = src.vector(&format!("{prefix}.{k}"))?;
+            v.first().copied().ok_or_else(|| format!("{prefix}.{k} is empty").into())
+        };
+        let beta = one("beta")?;
+        Ok(Xielu { alpha_p: softplus(one("alpha_p")?), alpha_n: beta + softplus(one("alpha_n")?), beta, eps: one("eps")? })
+    }
+
+    fn apply(&self, x: f32) -> f32 {
+        match x > 0.0 {
+            true => self.alpha_p * x * x + self.beta * x,
+            false => (x.min(self.eps).exp_m1() - x) * self.alpha_n + self.beta * x,
+        }
+    }
 }
 
 impl Ffn {
@@ -369,6 +415,7 @@ impl Ffn {
             gate: Some(src.matrix(&format!("{prefix}.gate_proj.weight"))?),
             up: src.matrix(&format!("{prefix}.up_proj.weight"))?,
             down: src.matrix(&format!("{prefix}.down_proj.weight"))?,
+            xielu: None,
         })
     }
 
@@ -378,18 +425,28 @@ impl Ffn {
             gate: None,
             up: src.matrix(&format!("{prefix}.up_proj.weight"))?,
             down: src.matrix(&format!("{prefix}.down_proj.weight"))?,
+            xielu: None,
         })
     }
 
+    /// Apertus's MLP: `up`, xIELU with its own four numbers, `down`.
+    pub fn load_xielu(src: &dyn Source, prefix: &str) -> Res<Self> {
+        Ok(Ffn { xielu: Some(Xielu::load(src, &format!("{prefix}.act_fn"))?), ..Ffn::load_ungated(src, prefix)? })
+    }
+
     /// The hidden activation from the gate's and up's outputs: SwiGLU, or
-    /// ReLU² when there is no gate.
-    fn activate(gate: Option<Vec<f32>>, mut up: Vec<f32>) -> Vec<f32> {
-        match gate {
-            Some(mut gate) => {
+    /// xIELU or ReLU² when there is no gate.
+    fn activate(&self, gate: Option<Vec<f32>>, mut up: Vec<f32>) -> Vec<f32> {
+        match (gate, self.xielu) {
+            (Some(mut gate), _) => {
                 swiglu_inplace(&mut gate, &up);
                 gate
             }
-            None => {
+            (None, Some(act)) => {
+                up.iter_mut().for_each(|v| *v = act.apply(*v));
+                up
+            }
+            (None, None) => {
                 for v in up.iter_mut() {
                     *v = v.max(0.0) * v.max(0.0);
                 }
@@ -400,7 +457,7 @@ impl Ffn {
 
     pub fn run(&self, xs: &[f32], m: usize) -> Vec<f32> {
         let gate = self.gate.as_ref().map(|g| g.matmul_bt(xs, m, None));
-        let hidden = Ffn::activate(gate, self.up.matmul_bt(xs, m, None));
+        let hidden = self.activate(gate, self.up.matmul_bt(xs, m, None));
         self.down.matmul_bt(&hidden, m, None)
     }
 
@@ -412,7 +469,7 @@ impl Ffn {
     /// loop in the engine, measured in neither direction.
     pub fn run_one(&self, x: &[f32]) -> Vec<f32> {
         let gate = self.gate.as_ref().map(|g| g.matvec_bt(x, None));
-        let hidden = Ffn::activate(gate, self.up.matvec_bt(x, None));
+        let hidden = self.activate(gate, self.up.matvec_bt(x, None));
         self.down.matvec_bt(&hidden, None)
     }
 
@@ -443,6 +500,7 @@ impl Ffn {
             },
             up: self.up.rebased(lo, slab)?,
             down: self.down.rebased(lo, slab)?,
+            xielu: self.xielu,
         })
     }
 
@@ -666,7 +724,7 @@ impl Moe {
             None => None,
             Some(s) => {
                 let gate = ys.next()?;
-                let hidden = Ffn::activate(Some(gate), ys.next()?);
+                let hidden = s.ffn.activate(Some(gate), ys.next()?);
                 let score = match &s.gate {
                     Some(_) => Some(ys.next()?[0]),
                     None => None,
@@ -1012,7 +1070,7 @@ fn decode_together(
             Some(_) => Some(both.next()?),
             None => None,
         };
-        hidden.push(Ffn::activate(gate, both.next()?));
+        hidden.push(ffn.activate(gate, both.next()?));
     }
     let mut jobs: Vec<(&Weight, &[f32])> =
         group.iter().zip(&hidden).map(|(&(_, ffn), h)| (&ffn.down, h.as_slice())).collect();
@@ -1133,6 +1191,14 @@ impl Mlp {
 /// routed and ran a dense MLP instead loads, runs, and talks nonsense.
 #[cfg(test)]
 mod tests {
+
+    /// A slope stored as 166 is 166 after softplus, not infinity.
+    #[test]
+    fn softplus_of_a_large_slope_is_the_slope() {
+        assert_eq!(softplus(166.0), 166.0);
+        assert!((softplus(0.0) - 2f32.ln()).abs() < 1e-6);
+        assert!((softplus(-3.0) - (-3f32).exp().ln_1p()).abs() < 1e-7);
+    }
     use super::*;
     use serde_json::json;
 
@@ -1159,6 +1225,7 @@ mod tests {
                 gate: Some(Weight::quantize(mat(w, hidden), precision)),
                 up: Weight::quantize(mat(w, hidden), precision),
                 down: Weight::quantize(mat(hidden, w), precision),
+                xielu: None,
             };
             let experts: Vec<Ffn> = (0..n).map(|_| ffn(width)).collect();
             let shared_ffn = match shared {
@@ -1229,6 +1296,7 @@ mod tests {
                     gate: gated.then(|| Weight::quantize(mat(width, hidden), precision)),
                     up: Weight::quantize(mat(width, hidden), precision),
                     down: Weight::quantize(mat(hidden, width), precision),
+                    xielu: None,
                 })
                 .collect();
             let x = mat(1, hidden).data;

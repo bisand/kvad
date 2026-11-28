@@ -46,7 +46,10 @@ memmap2 = "0.9.11"
 # `preserve_order` for the same filter, and it takes both this and
 # serde_json's: the schema is parsed by one and rendered by the other, and
 # either one's default map sorts the keys before the model sees them.
-minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "json", "preserve_order", "serde"] }
+#
+# `macros` because Nemotron 3's template, and so Munin's, defines two, and
+# without it every conversation fails to render at its first line.
+minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "json", "macros", "preserve_order", "serde"] }
 nervus = { path = "../nervus" }
 rayon = "1.10.0"
 safetensors = "0.8"

@@ -199,96 +199,10 @@ fn configure(spec: &mut Spec) -> Res<()> {
 // YaRN
 // ---------------------------------------------------------------------------
 
-/// YaRN's attention-temperature correction, `0.1 m ln(s) + 1`.
-fn yarn_mscale(scale: f32, mscale: f32) -> f32 {
-    if scale <= 1.0 {
-        return 1.0;
-    }
-    0.1 * mscale * scale.ln() + 1.0
-}
-
-/// The dimension whose wavelength is `rotations` full turns at the trained
-/// context length — YaRN's way of asking "which frequencies has this model
-/// actually seen wrap around?".
-fn correction_dim(rotations: f32, dim: usize, base: f32, trained: f32) -> f32 {
-    (dim as f32 * (trained / (rotations * 2.0 * std::f32::consts::PI)).ln()) / (2.0 * base.ln())
-}
-
-/// Build the rotation table, interpolating frequencies if the config asks.
-///
-/// Without `rope_scaling` this is the ordinary geometric series and matches
-/// [`Rope::new`]. With it, YaRN: the fast dimensions — the ones that have
-/// wrapped around many times during training, and so have seen every phase —
-/// keep their frequencies, the slow ones are divided by the scaling factor so
-/// the model's whole trained range is stretched over the longer context, and
-/// a linear ramp blends between the two.
-///
-/// This is why a 4k model reads 160k: not by being told a bigger number, but
-/// by moving only the frequencies that would otherwise be extrapolated past
-/// anything they were trained on.
-pub fn build_rope(dim: usize, max_positions: usize, theta: f32, config: &Json) -> Res<Rope> {
-    let half = dim / 2;
-    let extra: Vec<f32> = (0..half)
-        .map(|i| 1.0 / theta.powf(2.0 * i as f32 / dim as f32))
-        .collect();
-
-    let Some(scaling) = config.get("rope_scaling") else {
-        return Ok(Rope::from_freqs(&extra, max_positions, 1.0));
-    };
-    let kind = scaling
-        .get("type")
-        .or_else(|| scaling.get("rope_type"))
-        .and_then(|t| t.as_str());
-    if kind != Some("yarn") {
-        return Err(format!(
-            "rope_scaling type `{}` is not implemented; this engine does yarn",
-            kind.unwrap_or("?")
-        )
-        .into());
-    }
-    let get = |k: &str, fallback: f32| {
-        scaling
-            .get(k)
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32)
-            .unwrap_or(fallback)
-    };
-    let factor = get("factor", 1.0);
-    let trained = get("original_max_position_embeddings", 4096.0);
-    let (beta_fast, beta_slow) = (get("beta_fast", 32.0), get("beta_slow", 1.0));
-
-    let low = correction_dim(beta_fast, dim, theta, trained)
-        .floor()
-        .max(0.0);
-    let high = correction_dim(beta_slow, dim, theta, trained)
-        .ceil()
-        .min(dim as f32 - 1.0);
-    // The reference guards this singularity the same way; it only bites on a
-    // config where the two betas land on one dimension.
-    let high = if (high - low).abs() < f32::EPSILON {
-        high + 0.001
-    } else {
-        high
-    };
-
-    let inv_freq: Vec<f32> = extra
-        .iter()
-        .enumerate()
-        .map(|(i, &fast)| {
-            let slow = fast / factor;
-            // 1 at the fast end, 0 at the slow end.
-            let ramp = ((i as f32 - low) / (high - low)).clamp(0.0, 1.0);
-            slow * ramp + fast * (1.0 - ramp)
-        })
-        .collect();
-
-    // `mscale` scales the rotated vector; `mscale_all_dim` is already in the
-    // softmax scale. Their ratio is what is left for the table, and it is 1.0
-    // for every DeepSeek config published so far.
-    let amplitude =
-        yarn_mscale(factor, get("mscale", 1.0)) / yarn_mscale(factor, get("mscale_all_dim", 1.0));
-    Ok(Rope::from_freqs(&inv_freq, max_positions, amplitude))
-}
+// The rotation table moved to the model module, where Mistral 3 reads it
+// too; re-exported because the GPU crate names it from here.
+pub use super::build_rope;
+use super::yarn_mscale;
 
 // ---------------------------------------------------------------------------
 // Weights

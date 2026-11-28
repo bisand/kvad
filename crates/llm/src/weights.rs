@@ -650,6 +650,14 @@ fn resolve(repo_id: &str, progress: &mut dyn FnMut(&str), watch: &Watcher, ask: 
         },
     };
 
+    // The chat template, when a repo keeps it in a file of its own rather than
+    // in `tokenizer_config.json`, as Mistral 3's do. Fetched so it is in the
+    // snapshot beside that file, where `ChatTemplate` looks for it. By a pull
+    // only: a load from the cache asks the Hub for nothing, and a repo
+    // without the file would otherwise be asked about it on every load.
+    if ask == Ask::Hub {
+        let _ = try_get("chat_template.jinja");
+    }
     let files = ModelFiles {
         weights,
         tokenizer: get("tokenizer.json")?,
@@ -962,6 +970,9 @@ impl Checkpoint {
         let view = self.view(key)?;
 
         let (rows, cols) = match view.shape() {
+            // A scalar: Mistral's fp8 checkpoints scale each weight by one
+            // number, which `rescale` then reads as a single block.
+            [] => (1, 1),
             [n] => (1, *n),
             [r, c] => (*r, *c),
             // A `Conv1d`'s filters, `[out, in, kernel]`, read as the matrix a

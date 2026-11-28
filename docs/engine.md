@@ -179,6 +179,21 @@ set to one, where the two rules are the same rule — so a single implementation
 of it is correct today and silently wrong for half the layers of the first
 checkpoint that ships a two.
 
+Ministral 3 (`mistral3`) is the Llama block again, with two rows more of
+config. Its rotation is YaRN over sixteen times the 16k it was trained on,
+which DeepSeek's loader already built, so [`build_rope`](../crates/llm/src/model/mod.rs)
+moved to the module both share and learned to read transformers 5's
+`rope_parameters`. And past those 16k each query is multiplied by
+`1 + β·ln(1 + ⌊pos / 16384⌋)`, Llama 4's way of keeping attention sharp at long
+range: one line after the rotation. It is still an entry of its own in the
+registry, because the GPU backend runs `llama` and knows neither change, and a
+model that is right for 16k positions and quietly wrong after them is the
+worst kind to hand it. The checkpoint is a vision model, so the language model
+is found under `language_model.` and the Pixtral tower beside it is skipped by
+name. The fixture ([`scripts/mistral3-fixture.py`](../scripts/mistral3-fixture.py))
+puts the temperature's step at position 8 of 24, and two tests take each
+change away and watch the reference disagree.
+
 ## The one that stopped keeping a cache
 
 `qwen3_5` — Qwen3.8 — is the first architecture here that does not keep its

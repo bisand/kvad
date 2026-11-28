@@ -38,6 +38,8 @@ pub mod ffn;
 pub mod gpt2;
 #[cfg(feature = "arch-llama")]
 pub mod llama;
+#[cfg(feature = "arch-nemotron-h")]
+pub mod nemotron_h;
 #[cfg(feature = "arch-qwen3-5")]
 pub mod qwen3_5;
 

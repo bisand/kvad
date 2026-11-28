@@ -52,6 +52,7 @@ pub mod crawl;
 pub mod daemon;
 pub mod dit;
 pub mod experts;
+pub mod layers;
 pub mod gguf;
 pub mod help;
 pub mod hub;

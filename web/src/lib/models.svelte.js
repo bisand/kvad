@@ -137,14 +137,27 @@ class Models {
   }
 
   /**
+   * The pulls running on the server, whoever started them:
+   * `{ id, repo, message, file, bytes, total, files }`, where `bytes` and
+   * `total` are the file now arriving's and `files` maps every file seen so
+   * far to the bytes it has, for the sum. Several may run at once.
+   */
+  pulls = $state([]);
+
+  /** The running pull of `repo`, if there is one. */
+  pulling(repo) {
+    return this.pulls.find((p) => p.repo === repo) ?? null;
+  }
+
+  /**
    * Pull a model. Since Phase 4 this is a job, not a stream: a checkpoint of
    * several gigabytes outlasts a browser tab, and a download that died
    * because somebody navigated away is a download that has to start again.
-   * Closing this page now only stops the watching.
+   * Closing this page now only stops the watching, and `resume` picks it up.
    */
   async pull(repo) {
-    if (this.busy) {
-      toasts.warning(`Already ${this.busy.what}. Wait for it to finish.`);
+    if (this.pulling(repo)) {
+      toasts.warning(`${repo} is already being pulled.`);
       return false;
     }
     let job;
@@ -158,8 +171,34 @@ class Models {
       toasts.error(e.message);
       return false;
     }
+    return this.#follow(job);
+  }
 
-    this.busy = { what: "pulling", message: "starting", bytes: 0, total: 0 };
+  /**
+   * Follow every pull the server is running that this page is not, as a page
+   * that has just been opened, or reloaded halfway through a download, is.
+   */
+  async resume() {
+    let jobs;
+    try {
+      jobs = await api("/api/jobs?limit=50");
+    } catch {
+      return; // Signed out, or the server is down: the page says which.
+    }
+    for (const job of jobs) {
+      const running = job.state === "running" || job.state === "queued";
+      if (job.kind === "pull" && running && !this.pulls.some((p) => p.id === job.id)) this.#follow(job);
+    }
+  }
+
+  /** Watch pull `job` until it ends, keeping its entry in `pulls` current. */
+  async #follow(job) {
+    if (this.pulls.some((p) => p.id === job.id)) return false;
+    const repo = job.params?.repo ?? job.label;
+    this.pulls = [...this.pulls, { id: job.id, repo, message: "starting", file: null, bytes: 0, total: 0, files: {} }];
+    const update = (change) => {
+      this.pulls = this.pulls.map((p) => (p.id === job.id ? { ...p, ...change(p) } : p));
+    };
     let ok = false;
     try {
       await sse(
@@ -169,9 +208,10 @@ class Models {
           update: (data) => {
             const u = JSON.parse(data);
             if (u.kind === "download") {
-              this.busy = { what: "pulling", message: u.file, bytes: u.bytes, total: u.total };
+              update((p) => ({ message: u.file, file: u.file, bytes: u.bytes, total: u.total, files: { ...p.files, [u.file]: u.bytes } }));
             } else if (u.kind === "status") {
-              this.busy = { what: "pulling", message: u.message, bytes: 0, total: 0 };
+              // A line between files: the bar stays where the last file left it.
+              update(() => ({ message: u.message }));
             } else if (u.kind === "ended") {
               ok = u.state === "done";
               if (!ok && u.error) throw new Error(u.error);
@@ -184,7 +224,7 @@ class Models {
     } catch (e) {
       toasts.error(e.message);
     } finally {
-      this.busy = null;
+      this.pulls = this.pulls.filter((p) => p.id !== job.id);
       await this.refresh();
     }
     if (ok) toasts.success(`Pulled ${repo}.`);

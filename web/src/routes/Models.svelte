@@ -112,6 +112,8 @@
   }
 
   let query = $state("");
+  /** What kind of model to search for: one per kind this build runs. */
+  let kind = $state("text");
   /** A model named outright, to pull by that name: the Hub's search lists
    *  text models, and an image or video model is pulled by name instead. A
    *  GGUF of a denoiser, `repo:QUANT`; an SDXL checkpoint in one file,
@@ -160,7 +162,7 @@
     if (!query.trim()) return;
     searching = true;
     try {
-      results = await models.search(query.trim());
+      results = await models.search(query.trim(), kind);
       if (results.length === 0) toasts.info(`Nothing on the Hub matches “${query.trim()}”.`);
     } catch (e) {
       toasts.error(e.message);
@@ -510,7 +512,13 @@
   {#if may}
   <section>
     <h2 class="mb-2 text-sm font-medium opacity-60">Search the Hub</h2>
-    <form class="join w-full max-w-lg" onsubmit={search}>
+    <form class="join w-full max-w-2xl" onsubmit={search}>
+      <select class="select join-item w-32" bind:value={kind} aria-label="Kind of model">
+        <option value="text">Text</option>
+        <option value="speech">Speech</option>
+        <option value="image">Image</option>
+        <option value="video">Video</option>
+      </select>
       <input
         class="input join-item w-full"
         placeholder="smollm, qwen2.5, gpt2… or a name to pull, such as city96/Qwen-Image-gguf:Q4_K_S"
@@ -567,6 +575,10 @@
                 <span class="badge badge-sm badge-error badge-soft whitespace-nowrap">
                   can't run
                 </span>
+              {:else if r.pipeline}
+                <!-- A pipeline's memory is not a language model's per-precision
+                     sum, so this row makes no precision claim. -->
+                <span class="badge badge-sm badge-success badge-soft">runs</span>
               {:else if !r.size_known}
                 <span class="text-xs opacity-50">unknown</span>
               {:else if rowFit(r).streams}
@@ -605,10 +617,12 @@
               <!-- The same verdict `kvad search` prints, from the Hub's own
                    config, so the listing says what is runnable before anything
                    is downloaded. -->
-              <div class="w-full text-xs opacity-60">{r.blocker ?? r.arch}</div>
+              <div class="w-full text-xs opacity-60">{r.blocker ?? r.arch ?? r.pipeline}</div>
             </summary>
             <div class="collapse-content text-xs">
-              {#if !r.arch}
+              {#if r.pipeline}
+                <span class="opacity-60">Runs as {r.pipeline}.</span>
+              {:else if !r.arch}
                 <span class="opacity-60">
                   This build has no reader for that architecture, so there is nothing
                   to describe.

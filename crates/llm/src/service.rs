@@ -559,7 +559,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, cancel: Arc<AtomicBool>, mut load:
 
             Cmd::Search(query) => {
                 say(&format!("searching for “{query}”"));
-                match hub::search(&query, 40) {
+                match hub::search(&query, 40, hub::Wanted::Text) {
                     Ok(results) => {
                         let _ = tx.send(Evt::Status(format!("{} results", results.len())));
                         let _ = tx.send(Evt::SearchResults(results));

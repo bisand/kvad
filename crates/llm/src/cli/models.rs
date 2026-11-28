@@ -162,7 +162,8 @@ pub fn search(remote: &Remote, args: &Args) -> Res<()> {
         eprintln!("usage: kvad search QUERY");
         std::process::exit(2);
     };
-    let results = remote.get(&format!("/api/models/search?q={}&limit=20", super::enc(query)))?;
+    let kind = args.kind.as_deref().map(|k| format!("&kind={}", super::enc(k))).unwrap_or_default();
+    let results = remote.get(&format!("/api/models/search?q={}&limit=20{kind}", super::enc(query)))?;
     if args.json {
         out::json(&results);
         return Ok(());
@@ -177,6 +178,7 @@ pub fn search(remote: &Remote, args: &Args) -> Res<()> {
         let status = match (&m["blocker"], m["local"] == true) {
             (Value::String(reason), _) => reason.clone(),
             (_, true) => "downloaded".into(),
+            _ if m["pipeline"].is_string() => format!("runs as {}", out::s(&m["pipeline"])),
             _ if m["looks_instruct"] == true => format!("chat · {}", fit(m)),
             _ => format!("completion · {}", fit(m)),
         };
@@ -200,6 +202,7 @@ fn fit(m: &Value) -> String {
     let per_token = || out::bytes(&m["disk_per_token"]);
     match (m["crawls"] == true, m["streams"] == true, m["fits_at"].as_str()) {
         (true, _, _) => format!("crawls — ~{} a token from disk", per_token()),
+        (_, true, Some(p)) if m["disk_per_token"].is_null() => format!("streams at {p} — a mixture of unknown sparsity"),
         (_, true, Some(p)) => format!("streams at {p} — ~{} a token from disk", per_token()),
         (_, _, Some(p)) => format!("fits at {p}"),
         _ => "?".into(),

@@ -237,6 +237,39 @@
 {/snippet}
 
 <div class="flex flex-col gap-6">
+  <!-- Downloads, each a job on the server: reloading the page finds them
+       again (`models.resume`), and a bar per file, since a split checkpoint's
+       shards arrive one after another. -->
+  {#if models.pulls.length}
+    <section class="card bg-base-100 border-base-300 border">
+      <div class="card-body gap-4 p-4 sm:p-6">
+        <h2 class="text-sm font-medium opacity-60">Downloading</h2>
+        {#each models.pulls as p (p.id)}
+          {@const sum = Object.values(p.files).reduce((a, b) => a + b, 0)}
+          <div>
+            <div class="mb-1 flex items-baseline gap-2 text-sm">
+              <span class="truncate font-medium">{p.repo}</span>
+              {#if sum > 0}
+                <span class="ml-auto text-xs whitespace-nowrap opacity-70">{humanBytes(sum)} so far</span>
+              {/if}
+            </div>
+            <p class="mb-1 truncate text-xs opacity-70">
+              {p.message}
+              {#if p.total > 0 && p.message === p.file}
+                — {humanBytes(p.bytes)} of {humanBytes(p.total)}
+              {/if}
+            </p>
+            {#if p.total > 0}
+              <progress class="progress progress-primary" value={p.bytes} max={p.total}></progress>
+            {:else}
+              <progress class="progress progress-primary"></progress>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    </section>
+  {/if}
+
   <!-- What is in memory, what it costs, and the controls that change it. -->
   <section class="card bg-base-100 border-base-300 border">
     <div class="card-body gap-4 p-4 sm:p-6">
@@ -539,7 +572,7 @@
         <span class="opacity-70">
           <span class="font-medium">{named.name}</span> {named.what}
         </span>
-        <button class="btn btn-sm" disabled={!!models.busy} onclick={() => models.pull(named.name)}>Pull</button>
+        <button class="btn btn-sm" disabled={!!models.pulling(named.name)} onclick={() => models.pull(named.name)}>Pull</button>
       </div>
     {/if}
 
@@ -604,15 +637,30 @@
               </span>
               <!-- Above the input that makes the rest of the row clickable. -->
               <div class="relative z-1">
-                <button
-                  class="btn btn-sm"
-                  disabled={!r.runnable || !!models.busy}
-                  onclick={notToggle(() =>
-                    r.local ? models.load(r.id, backend) : models.pull(r.id),
-                  )}
-                >
-                  {r.local ? "Load" : "Pull"}
-                </button>
+                {#if models.pulling(r.id)}
+                  {@const p = models.pulling(r.id)}
+                  {@const pct = p.total > 0 ? Math.round((100 * p.bytes) / p.total) : 0}
+                  <div
+                    class="radial-progress text-primary text-[0.6rem]"
+                    style={`--value:${pct}; --size:2rem; --thickness:3px`}
+                    role="progressbar"
+                    aria-valuenow={pct}
+                    aria-label={`Pulling ${r.id}: ${p.message}`}
+                    title={p.message}
+                  >
+                    {pct}%
+                  </div>
+                {:else}
+                  <button
+                    class="btn btn-sm"
+                    disabled={!r.runnable || (r.local && !!models.busy)}
+                    onclick={notToggle(() =>
+                      r.local ? models.load(r.id, backend) : models.pull(r.id),
+                    )}
+                  >
+                    {r.local ? "Load" : "Pull"}
+                  </button>
+                {/if}
               </div>
               <!-- The same verdict `kvad search` prints, from the Hub's own
                    config, so the listing says what is runnable before anything

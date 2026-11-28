@@ -2,10 +2,17 @@
   import Icon from "./Icon.svelte";
   import ThemeMenu from "./ThemeMenu.svelte";
   import { auth } from "../auth.svelte.js";
+  import { models } from "../models.svelte.js";
+  import { onMount } from "svelte";
+  import { navigate } from "../router.svelte.js";
 
   let { drawerId, title, health, error } = $props();
 
   const MENU = "M4 6h16M4 12h16M4 18h16";
+  // A download outlasts the page that started it, so every page looks for
+  // the ones running and shows that they are, whichever page it is.
+  onMount(() => models.resume());
+
   const OUT = "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9";
 </script>
 
@@ -35,6 +42,21 @@
         connecting
       {/if}
     </span>
+    {#each models.pulls as p (p.id)}
+      {@const pct = p.total > 0 ? Math.round((100 * p.bytes) / p.total) : 0}
+      <a
+        href="/models"
+        onclick={(e) => navigate(e, "/models")}
+        class="radial-progress text-primary text-[0.55rem]"
+        style={`--value:${pct}; --size:1.9rem; --thickness:3px`}
+        role="progressbar"
+        aria-valuenow={pct}
+        aria-label={`Pulling ${p.repo}: ${p.message}`}
+        title={`Pulling ${p.repo}: ${p.message}`}
+      >
+        {pct}%
+      </a>
+    {/each}
     <ThemeMenu />
     {#if auth.hasAccounts}
       <button

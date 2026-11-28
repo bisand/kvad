@@ -1,4 +1,4 @@
-//! The Llama family (2023 onwards): Llama 2/3, Mistral, Qwen2/2.5, SmolLM2,
+//! The Llama family (2023 onwards): Llama 2/3, Mistral and Ministral 3, Qwen2/2.5, SmolLM2,
 //! TinyLlama.
 //!
 //! Read this as a diff against [`super::gpt2`]. The skeleton is identical —
@@ -23,7 +23,7 @@
 //! than an error, which is why the counting test in the README exists.
 
 use super::ffn::{Ffn, Layout, Mlp, Moe, Router};
-use super::{attend, Architecture, KvCache, Shard, Spec, Transformer};
+use super::{attend, build_rope, Architecture, KvCache, Shard, Spec, Transformer};
 use crate::qcache::{head, Source};
 use crate::quant::Weight;
 use crate::tensor::{rms_norm, Rope};
@@ -56,6 +56,31 @@ pub static ARCH: Architecture = Architecture {
     id: "llama",
     model_types: &["llama", "mistral", "qwen2", "qwen3", "qwen3_moe"],
     about: "Llama 2/3, Mistral, Qwen2/2.5/3, Qwen3-MoE, SmolLM2: RoPE, RMSNorm, SwiGLU, GQA",
+    configure: |_| Ok(()),
+    splits: true,
+    load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
+};
+
+/// Ministral 3 and Mistral 3, text only: this file's Mistral with two
+/// changes, both read from `rope_parameters`.
+///
+/// - **YaRN** stretches the rotation over 16× the 16k it was trained on, as
+///   DeepSeek's does ([`build_rope`]).
+/// - **A query temperature** past that length: each query is multiplied by
+///   `1 + β·ln(1 + ⌊pos / 16384⌋)`, Llama 4's trick for keeping attention
+///   sharp at long range. It is 1 for the first 16k positions.
+///
+/// It ships as `Mistral3ForConditionalGeneration`, a Pixtral vision tower and
+/// projector beside the language model, which are skipped by name.
+///
+/// An entry of its own rather than two more names on [`ARCH`], because the
+/// GPU backend runs `llama` and knows neither change: it would run this as
+/// plain Mistral and answer fluently and wrong past the first few thousand
+/// positions.
+pub static MISTRAL3: Architecture = Architecture {
+    id: "mistral3",
+    model_types: &["mistral3", "ministral3"],
+    about: "Ministral 3, text only: Mistral with YaRN RoPE and Llama 4's long-range query scale",
     configure: |_| Ok(()),
     splits: true,
     load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
@@ -95,6 +120,14 @@ pub struct Model {
     ends: Option<Ends>,
     blocks: Vec<Block>,
     rope: Rope,
+    /// Ministral 3's query temperature, `(β, trained length)`. See
+    /// [`MISTRAL3`] and [`query_scale`].
+    q_scale: Option<(f32, usize)>,
+}
+
+/// What Ministral 3 multiplies a query at `pos` by: `1 + β·ln(1 + ⌊pos / n⌋)`.
+fn query_scale(beta: f32, trained: usize, pos: usize) -> f32 {
+    1.0 + beta * ((1 + pos / trained) as f32).ln()
 }
 
 /// The two ends of the model, which stay together when the blocks between
@@ -147,14 +180,35 @@ impl Model {
             Some(_) => Some((Router::read(&spec.config)?, Layout::read(&spec.config))),
         };
 
+        // Mistral 3's decoder sits under `language_model.model.`, its head under
+        // `language_model.`, beside a vision tower this engine does not run.
+        // Asked of the checkpoint rather than the config, whose inner
+        // `ministral3` is also what a text-only checkpoint calls itself.
+        let wrapped = spec.arch.is("mistral3") && src.try_vector("language_model.model.norm.weight").is_some();
+        let (pre, head_name) = match wrapped {
+            true => {
+                for stem in ["vision_tower.", "multi_modal_projector.", "model.vision_tower.", "model.multi_modal_projector."] {
+                    src.skip_under(stem);
+                }
+                ("language_model.model.", "language_model.lm_head.weight")
+            }
+            false => ("", "lm_head.weight"),
+        };
+
         let mut blocks = Vec::with_capacity(shard.layers.len());
         for i in 0..spec.n_layer {
             // Another shard's layer: known about, and deliberately not read.
             if !shard.layers.contains(&i) {
-                src.skip_under(&format!("layers.{i}."));
+                src.skip_under(&format!("{pre}layers.{i}."));
                 continue;
             }
-            let p = |s: &str| format!("layers.{i}.{s}");
+            let p = |s: &str| format!("{pre}layers.{i}.{s}");
+            // An fp8 checkpoint's static activation scales: for running the
+            // matmul in fp8, which this engine does not, since it widens the
+            // weight on the way in.
+            for proj in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+                src.skip(&p(&format!("{proj}.activation_scale")));
+            }
             blocks.push(Block {
                 attn_norm: src.vector(&p("input_layernorm.weight"))?,
                 q_w: src.matrix(&p("self_attn.q_proj.weight"))?,
@@ -178,27 +232,49 @@ impl Model {
 
         let ends = match shard.ends {
             true => Some(Ends {
-                lm_head: head(src, &spec, "lm_head.weight")?,
-                embed: src.matrix("embed_tokens.weight")?,
-                final_norm: src.vector("norm.weight")?,
+                lm_head: head(src, &spec, head_name)?,
+                embed: src.matrix(&format!("{pre}embed_tokens.weight"))?,
+                final_norm: src.vector(&format!("{pre}norm.weight"))?,
             }),
             false => {
-                for name in ["lm_head.weight", "embed_tokens.weight", "norm.weight"] {
-                    src.skip(name);
+                for name in [head_name.to_string(), format!("{pre}embed_tokens.weight"), format!("{pre}norm.weight")] {
+                    src.skip(&name);
                 }
                 None
             }
         };
+        let rope = match spec.arch.is("mistral3") {
+            true => build_rope(spec.head_dim, spec.n_ctx, spec.rope_theta, &spec.config)?,
+            // Precompute every rotation angle once. Cheap: two floats per
+            // position per coordinate pair.
+            false => Rope::new(spec.head_dim, spec.n_ctx, spec.rope_theta),
+        };
+        let q_scale = spec.arch.is("mistral3").then(|| {
+            let p = spec.config.get("rope_parameters")?;
+            let beta = p.get("llama_4_scaling_beta")?.as_f64()? as f32;
+            let trained = p.get("original_max_position_embeddings")?.as_u64()? as usize;
+            Some((beta, trained.max(1)))
+        }).flatten();
 
         Ok(Model {
             shard: shard.clone(),
             ends,
             blocks,
-            // Precompute every rotation angle once. Cheap: two floats per
-            // position per coordinate pair.
-            rope: Rope::new(spec.head_dim, spec.n_ctx, spec.rope_theta),
+            rope,
+            q_scale,
             spec,
         })
+    }
+
+    /// Ministral 3's long-range query temperature, after the rotation as the
+    /// reference has it. Nothing for every other model, and nothing for
+    /// Ministral 3's first 16k positions either.
+    fn scale_query(&self, q: &mut [f32], pos: usize) {
+        let Some((beta, trained)) = self.q_scale else { return };
+        let s = query_scale(beta, trained, pos);
+        if s != 1.0 {
+            q.iter_mut().for_each(|v| *v *= s);
+        }
     }
 
     /// Rotate each head of a projection in place.
@@ -252,6 +328,7 @@ impl Model {
                 norm_heads(&mut k[i * kvdim..(i + 1) * kvdim], block.k_norm.as_deref(), spec);
                 self.apply_rope(&mut q[i * qdim..(i + 1) * qdim], at[i]);
                 self.apply_rope(&mut k[i * kvdim..(i + 1) * kvdim], at[i]);
+                self.scale_query(&mut q[i * qdim..(i + 1) * qdim], at[i]);
                 rows.cache(i).push(l, &k[i * kvdim..(i + 1) * kvdim], &v[i * kvdim..(i + 1) * kvdim]);
             }
 
@@ -467,6 +544,7 @@ impl Transformer for Model {
             // not re-rotated on every later step.
             self.apply_rope(&mut q, pos);
             self.apply_rope(&mut k, pos);
+            self.scale_query(&mut q, pos);
 
             cache.push(l, &k, &v);
             let attn = attend(spec, &q, cache.keys(l), cache.values(l), pos + 1);

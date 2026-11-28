@@ -45,7 +45,7 @@ pub mod qwen3_5;
 
 pub use arch::{Arch, Architecture};
 
-use crate::tensor::{dot, softmax_inplace};
+use crate::tensor::{dot, softmax_inplace, Rope};
 use crate::weights::read_json;
 use rayon::prelude::*;
 use std::path::Path;
@@ -361,7 +361,11 @@ impl Spec {
             // GPT-2 does not state it; its MLP widens by 4x by construction.
             intermediate: config.num(&["intermediate_size", "n_inner"]).unwrap_or(4 * n_embd),
             eps: config.float(&["layer_norm_epsilon", "rms_norm_eps"]).unwrap_or(1e-5),
-            rope_theta: config.float(&["rope_theta"]).unwrap_or(10000.0),
+            // transformers 5 writes it inside `rope_parameters`.
+            rope_theta: config
+                .float(&["rope_theta"])
+                .or_else(|| config.get("rope_parameters")?.get("rope_theta")?.as_f64().map(|t| t as f32))
+                .unwrap_or(10000.0),
             // GPT-2 ties unconditionally and does not say so in its config.
             tie_embeddings: config.flag("tie_word_embeddings").unwrap_or(arch.is("gpt2")),
             // The ordinary answer. An architecture that caches something else
@@ -1513,4 +1517,113 @@ mod tests {
         assert_eq!(layout.bytes_as(2, 10, 2, 4), 6 * 4 + 10 * 8 * 2);
         assert_eq!(layout.bytes(2, 10), layout.bytes_as(2, 10, 4, 4));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rotary tables
+// ---------------------------------------------------------------------------
+
+/// YaRN's attention-temperature correction, `0.1 m ln(s) + 1`.
+pub(super) fn yarn_mscale(scale: f32, mscale: f32) -> f32 {
+    if scale <= 1.0 {
+        return 1.0;
+    }
+    0.1 * mscale * scale.ln() + 1.0
+}
+
+/// The dimension whose wavelength is `rotations` full turns at the trained
+/// context length — YaRN's way of asking "which frequencies has this model
+/// actually seen wrap around?".
+fn correction_dim(rotations: f32, dim: usize, base: f32, trained: f32) -> f32 {
+    (dim as f32 * (trained / (rotations * 2.0 * std::f32::consts::PI)).ln()) / (2.0 * base.ln())
+}
+
+/// Build the rotation table, interpolating frequencies if the config asks.
+///
+/// Without `rope_scaling` this is the ordinary geometric series and matches
+/// [`Rope::new`]. With it, YaRN: the fast dimensions — the ones that have
+/// wrapped around many times during training, and so have seen every phase —
+/// keep their frequencies, the slow ones are divided by the scaling factor so
+/// the model's whole trained range is stretched over the longer context, and
+/// a linear ramp blends between the two.
+///
+/// This is why a 4k model reads 160k: not by being told a bigger number, but
+/// by moving only the frequencies that would otherwise be extrapolated past
+/// anything they were trained on.
+pub fn build_rope(dim: usize, max_positions: usize, theta: f32, config: &Json) -> Res<Rope> {
+    let half = dim / 2;
+    let extra: Vec<f32> = (0..half)
+        .map(|i| 1.0 / theta.powf(2.0 * i as f32 / dim as f32))
+        .collect();
+
+    // `rope_scaling` is the old spelling; transformers 5 writes the same
+    // fields, and `rope_theta` beside them, as `rope_parameters`, whose type
+    // is `default` when there is no scaling to do.
+    let kind_of = |s: &serde_json::Value| s.get("type").or_else(|| s.get("rope_type")).and_then(|t| t.as_str()).map(str::to_string);
+    let scaling = config
+        .get("rope_scaling")
+        .filter(|s| s.is_object())
+        .or_else(|| config.get("rope_parameters").filter(|p| kind_of(p).is_some_and(|k| k != "default")));
+    let Some(scaling) = scaling else {
+        return Ok(Rope::from_freqs(&extra, max_positions, 1.0));
+    };
+    let kind = kind_of(scaling);
+    let kind = kind.as_deref();
+    if kind != Some("yarn") {
+        return Err(format!(
+            "rope_scaling type `{}` is not implemented; this engine does yarn",
+            kind.unwrap_or("?")
+        )
+        .into());
+    }
+    let get = |k: &str, fallback: f32| {
+        scaling
+            .get(k)
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(fallback)
+    };
+    let factor = get("factor", 1.0);
+    let trained = get("original_max_position_embeddings", 4096.0);
+    let (beta_fast, beta_slow) = (get("beta_fast", 32.0), get("beta_slow", 1.0));
+
+    let low = correction_dim(beta_fast, dim, theta, trained)
+        .floor()
+        .max(0.0);
+    let high = correction_dim(beta_slow, dim, theta, trained)
+        .ceil()
+        .min(dim as f32 - 1.0);
+    // The reference guards this singularity the same way; it only bites on a
+    // config where the two betas land on one dimension.
+    let high = if (high - low).abs() < f32::EPSILON {
+        high + 0.001
+    } else {
+        high
+    };
+
+    let inv_freq: Vec<f32> = extra
+        .iter()
+        .enumerate()
+        .map(|(i, &fast)| {
+            let slow = fast / factor;
+            // 1 at the fast end, 0 at the slow end.
+            let ramp = ((i as f32 - low) / (high - low)).clamp(0.0, 1.0);
+            slow * ramp + fast * (1.0 - ramp)
+        })
+        .collect();
+
+    // `mscale` scales the rotated vector; `mscale_all_dim` is already in the
+    // softmax scale. Their ratio is what is left for the table, and it is 1.0
+    // for every DeepSeek config published so far.
+    //
+    // That ratio is transformers' rule when the config names both; with
+    // either missing it is the plain temperature `0.1 ln(s) + 1`, and an
+    // `attention_factor` the config states wins over both.
+    let named = |k: &str| scaling.get(k).and_then(|v| v.as_f64()).filter(|&v| v != 0.0).map(|v| v as f32);
+    let amplitude = match (named("attention_factor"), named("mscale"), named("mscale_all_dim")) {
+        (Some(a), ..) => a,
+        (None, Some(m), Some(all)) => yarn_mscale(factor, m) / yarn_mscale(factor, all),
+        _ => yarn_mscale(factor, 1.0),
+    };
+    Ok(Rope::from_freqs(&inv_freq, max_positions, amplitude))
 }

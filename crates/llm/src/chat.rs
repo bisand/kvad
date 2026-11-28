@@ -231,10 +231,53 @@ fn python_string_methods(
     })
 }
 
+/// `template` with transformers' `{% generation %}` block made an ordinary
+/// one.
+///
+/// The tag marks the assistant's text for a training loss mask and renders
+/// what is inside it unchanged; minijinja has no such statement and refuses
+/// the template (Mistral 3's). `{% if true %}` is the same block, and keeping
+/// the tag's own `-` markers keeps the whitespace it trims.
+fn without_generation_tags(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(at) = rest.find("{%") {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 2..];
+        out.push_str("{%");
+        let dash = rest.starts_with('-');
+        if dash {
+            out.push('-');
+            rest = &rest[1..];
+        }
+        let body = rest.trim_start();
+        let lead = &rest[..rest.len() - body.len()];
+        let word_end = body.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(body.len());
+        match &body[..word_end] {
+            "generation" => {
+                out.push_str(lead);
+                out.push_str("if true");
+                rest = &body[word_end..];
+            }
+            "endgeneration" => {
+                out.push_str(lead);
+                out.push_str("endif");
+                rest = &body[word_end..];
+            }
+            _ => {}
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 impl ChatTemplate {
-    /// Read the template out of a `tokenizer_config.json`, if it has one.
+    /// Read the template out of a `tokenizer_config.json`, if it has one, or
+    /// out of the `chat_template.jinja` beside it, which is where newer repos
+    /// keep it (Mistral 3's have only that).
     pub fn from_tokenizer_config(path: &Path) -> Res<Option<Self>> {
         let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let beside = || std::fs::read_to_string(path.with_file_name("chat_template.jinja")).ok();
 
         // The field is usually a string. Some models ship several named
         // templates as a list, in which case "default" is the one we want.
@@ -250,7 +293,10 @@ impl ChatTemplate {
                     None => return Ok(None),
                 }
             }
-            _ => return Ok(None),
+            _ => match beside() {
+                Some(s) => s,
+                None => return Ok(None),
+            },
         };
 
         let mut env = Environment::new();
@@ -267,6 +313,7 @@ impl ChatTemplate {
             "2026-01-01".to_string()
         });
         env.set_unknown_method_callback(python_string_methods);
+        let template = without_generation_tags(&template);
         let source = template.clone();
         env.add_template_owned("chat", template)?;
 
@@ -664,6 +711,15 @@ fn parse_call(value: &serde_json::Value) -> Option<Called> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn generation_blocks_become_ordinary_ones() {
+        let t = "a{%- generation %}{{ x }}{% endgeneration -%} b {% if y %}{% endif %}";
+        assert_eq!(without_generation_tags(t), "a{%- if true %}{{ x }}{% endif -%} b {% if y %}{% endif %}");
+        // A word that merely starts the same is left alone.
+        assert_eq!(without_generation_tags("{% generations %}"), "{% generations %}");
+    }
+
     use super::*;
 
     /// Feeding the same reply whole and a character at a time has to give the

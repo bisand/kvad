@@ -354,9 +354,12 @@ impl ChatTemplate {
     ///
     /// `tools` is the list of function schemas the client is offering, in
     /// OpenAI's shape, and goes in verbatim: every template that takes them
-    /// dumps them with `tojson` into a system block of its own wording. An
-    /// empty list is falsy in Jinja, which is why a conversation with no
-    /// tools renders exactly as it did before there were any.
+    /// dumps them with `tojson` into a system block of its own wording.
+    ///
+    /// No tools is `none`, as transformers passes it, not an empty list. An
+    /// empty list is falsy, but Llama 3.x's template asks `tools is not none`,
+    /// and given `[]` it told every conversation to answer with a function
+    /// call in JSON.
     pub fn render(
         &self,
         messages: &[Message],
@@ -366,7 +369,7 @@ impl ChatTemplate {
         let tmpl = self.env.get_template("chat")?;
         Ok(tmpl.render(minijinja::context! {
             messages => Value::from_serialize(messages),
-            tools => Value::from_serialize(tools),
+            tools => (!tools.is_empty()).then(|| Value::from_serialize(tools)),
             add_generation_prompt => add_generation_prompt,
             bos_token => self.bos.clone().unwrap_or_default(),
             eos_token => self.eos.clone().unwrap_or_default(),
@@ -1007,6 +1010,24 @@ mod tests {
         // prompt byte-for-byte what it was before tools existed.
         let without = chat.render(&conversation, &[], true).unwrap();
         assert!(!without.contains("TOOLS"), "{without}");
+    }
+
+    /// Llama 3.x's test for tools is `is not none`, not truthiness: offered
+    /// none, the template must be given `none`, or a plain question turns
+    /// into "respond with a JSON for a function call".
+    #[test]
+    fn no_tools_is_none_not_an_empty_list() {
+        let template = "{%- if not tools is defined %}{%- set tools = none %}{%- endif %}\
+             {%- if tools is not none %}FUNCTIONS {% endif %}\
+             {%- for m in messages %}{{ m.content }}{% endfor %}";
+        let dir = std::env::temp_dir().join(format!("kvad-nonetools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokenizer_config.json");
+        std::fs::write(&path, serde_json::json!({ "chat_template": template }).to_string()).unwrap();
+        let chat = ChatTemplate::from_tokenizer_config(&path).unwrap().expect("no template read");
+        std::fs::remove_dir_all(&dir).ok();
+        let plain = chat.render(&[Message::user("hello")], &[], true).unwrap();
+        assert_eq!(plain, "hello");
     }
 
     fn calls_of(reply: &str) -> (String, Vec<Called>) {

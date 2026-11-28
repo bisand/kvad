@@ -252,7 +252,7 @@ fn shape_of(model: &str) -> Res<(kvad::model::Spec, Option<u64>)> {
         return Ok((Spec::from_json(&dir.path.join("config.json"))?, dir.params));
     }
     let config = kvad::hub::remote_config(model).ok_or_else(|| format!("{model} is not on this machine, and the Hub did not answer for its config"))?;
-    let params = kvad::hub::search(model, 10).ok().and_then(|found| found.into_iter().find(|m| m.id.eq_ignore_ascii_case(model))).and_then(|m| m.params);
+    let params = kvad::hub::search(model, 10, kvad::hub::Wanted::Text).ok().and_then(|found| found.into_iter().find(|m| m.id.eq_ignore_ascii_case(model))).and_then(|m| m.params);
     Ok((Spec::from_config(Json::new(config))?, params))
 }
 

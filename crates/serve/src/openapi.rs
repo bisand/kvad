@@ -217,7 +217,11 @@ pub const ENDPOINTS: &[Endpoint] = &[
         summary: "Search the Hub",
         description: "Each result says whether this engine can run it, and if not, why \
                       — read from the Hub's own config, before any download.",
-        query: &[("q", true, "What to search for."), ("limit", false, "1 to 100, default 40.")],
+        query: &[
+            ("q", true, "What to search for."),
+            ("limit", false, "1 to 100, default 40."),
+            ("kind", false, "text, speech, image or video; default text."),
+        ],
         body: None, produces: JSON, events: &[],
     },
     Endpoint {

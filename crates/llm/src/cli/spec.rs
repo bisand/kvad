@@ -144,11 +144,16 @@ pub const COMMANDS: &[Command] = &[
         routed: true,
         words: &[Kind::Text],
         subs: &[],
-        flags: &[],
+        flags: &[&[f("--kind", "KIND", Kind::Choice(&[
+            ("text", "language models, the default"),
+            ("speech", "speech recognition"),
+            ("image", "image generation"),
+            ("video", "video generation"),
+        ]), "what kind of model to look for")]],
         usage: None,
         notes: "The STATUS column is the answer to \"can I run this\": whether it is a chat or a\n\
                 completion model and whether it fits in memory, or the reason it will not run.",
-        examples: &["kvad search smollm", "kvad search qwen coder"],
+        examples: &["kvad search smollm", "kvad search qwen coder", "kvad search flux --kind image"],
     },
     Command {
         name: "pull",

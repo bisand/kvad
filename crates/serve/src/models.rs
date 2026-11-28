@@ -562,12 +562,18 @@ pub struct SearchQuery {
     q: String,
     #[serde(default)]
     limit: Option<usize>,
+    /// text, speech, image or video; text when absent.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(serde::Serialize)]
 pub struct Found {
     id: String,
     arch: Option<String>,
+    /// What runs it when it is not a language model: a diffusers pipeline,
+    /// Whisper, or LTX-2.5.
+    pipeline: Option<String>,
     model_type: Option<String>,
     downloads: u64,
     likes: u64,
@@ -625,8 +631,13 @@ pub async fn search(
         return Err(Fail::bad("a search needs something to search for"));
     }
     let limit = query.limit.unwrap_or(40).clamp(1, 100);
+    let wanted = match query.kind.as_deref() {
+        None | Some("") => hub::Wanted::Text,
+        Some(k) => hub::Wanted::parse(k)
+            .ok_or_else(|| Fail::bad(format!("`{k}` is not a kind; ask for text, speech, image or video")))?,
+    };
     let (results, local) =
-        blocking(move || Ok((hub::search(&q, limit)?, hub::local_models()))).await?;
+        blocking(move || Ok((hub::search(&q, limit, wanted)?, hub::local_models()))).await?;
 
     let here: Vec<&str> = local.iter().map(|m| m.id.as_str()).collect();
     Ok(Json(
@@ -634,6 +645,7 @@ pub async fn search(
             .iter()
             .map(|m| Found {
                 arch: m.arch.map(|a| a.to_string()),
+                pipeline: m.pipeline.clone(),
                 model_type: m.model_type.clone(),
                 downloads: m.downloads,
                 likes: m.likes,

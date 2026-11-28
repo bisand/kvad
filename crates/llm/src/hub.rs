@@ -60,17 +60,30 @@ pub struct HubModel {
     /// How much of itself the model reads per token, from the trimmed
     /// config the search response already carries. See [`Reads`].
     pub reads: Reads,
+    /// The repo ships GGUF files, which this engine reads only for image
+    /// denoisers ([`crate::gguf`]). Some carry a `config.json` too, and
+    /// looked runnable until the pull found nothing it could load.
+    pub gguf: bool,
+    /// What runs it when it is not a language model: a diffusers pipeline
+    /// this build has, Whisper, or LTX-2.5. See [`Wanted`].
+    pub pipeline: Option<String>,
 }
 
 impl HubModel {
     pub fn runnable(&self) -> bool {
-        self.arch.is_some() && !self.gated && self.unreadable_as.is_none()
+        (self.arch.is_some() || self.pipeline.is_some())
+            && !(self.gated && !has_token())
+            && !self.gguf
+            && self.unreadable_as.is_none()
     }
 
     /// One-line reason a model cannot be run, if it cannot.
     pub fn blocker(&self) -> Option<String> {
-        if self.gated {
-            return Some("gated — needs licence acceptance on huggingface.co".into());
+        if self.gated && !has_token() {
+            return Some("gated — accept its licence on huggingface.co and set HF_TOKEN".into());
+        }
+        if self.gguf {
+            return Some("GGUF — a language model needs its safetensors repo; an image GGUF pulls as `repo:QUANT`".into());
         }
         // Ahead of the architecture, because it is the more specific answer.
         // An fp8 repack of a model this engine runs is not an unsupported
@@ -78,11 +91,16 @@ impl HubModel {
         // the wrong missing thing.
         if let Some(dtype) = &self.unreadable_as {
             return Some(format!(
-                "weights are stored as `{dtype}`, which this engine cannot read —                  look for a bf16 or f16 publication of the same model"
+                "weights are stored as `{dtype}`, which this engine cannot read — look for a bf16 or f16 publication of the same model"
             ));
+        }
+        if self.pipeline.is_some() {
+            return None;
         }
         match &self.model_type {
             None => Some("no config.json".into()),
+            Some(t) if t == "whisper" => Some("no safetensors weights to read".into()),
+            Some(t) if t.ends_with("Pipeline") => Some(format!("unsupported pipeline `{t}`")),
             Some(t) if self.arch.is_none() => Some(format!("unsupported arch `{t}`")),
             _ => None,
         }
@@ -495,17 +513,88 @@ fn quant_format(config: &serde_json::Value) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Search the Hub, newest-first by download count.
-pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
+/// Whether the Hub will see a token for gated repos: where `hf-hub`, and
+/// the Hub's own tools, look for one.
+fn has_token() -> bool {
+    std::env::var("HF_TOKEN").is_ok_and(|t| !t.trim().is_empty())
+        || std::env::var("HF_HOME").map(PathBuf::from).unwrap_or_else(|_| dirs_home().join(".cache/huggingface")).join("token").is_file()
+}
+
+/// The kind of model a search is for: one per kind this build runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wanted {
+    #[default]
+    Text,
+    Speech,
+    Image,
+    Video,
+}
+
+impl Wanted {
+    pub const ALL: [(&'static str, Wanted); 4] =
+        [("text", Wanted::Text), ("speech", Wanted::Speech), ("image", Wanted::Image), ("video", Wanted::Video)];
+
+    pub fn parse(s: &str) -> Option<Wanted> {
+        Wanted::ALL.iter().find(|(n, _)| n.eq_ignore_ascii_case(s.trim())).map(|&(_, w)| w)
+    }
+
+    /// The Hub pipelines this kind is published under. `image-text-to-text`
+    /// is in text's because Qwen3.5 and Mistral 3 ship a vision tower and
+    /// are tagged so: filtering on `text-generation` alone hid every
+    /// official Qwen3.5.
+    fn pipelines(self) -> &'static [&'static str] {
+        match self {
+            Wanted::Text => &["text-generation", "image-text-to-text", "any-to-any"],
+            Wanted::Speech => &["automatic-speech-recognition"],
+            Wanted::Image => &["text-to-image"],
+            Wanted::Video => &["text-to-video", "image-to-video"],
+        }
+    }
+
+    /// What runs a result of this kind, when this build has something.
+    fn runner(self, id: &str, config: Option<&serde_json::Value>, safetensors: bool) -> Option<String> {
+        let model_type = config.and_then(|c| c.get("model_type")).and_then(|v| v.as_str());
+        match self {
+            Wanted::Text => None,
+            // Whisper is read from safetensors, which an ONNX-only repo lacks.
+            Wanted::Speech => (model_type == Some("whisper") && safetensors).then(|| crate::speech::PIPELINE.to_string()),
+            Wanted::Image => config
+                .and_then(|c| c.get("diffusers")?.get("_class_name")?.as_str())
+                .filter(|c| crate::pipeline::PIPELINES.contains(c))
+                .map(str::to_string),
+            Wanted::Video => id.eq_ignore_ascii_case(crate::video::LTX_REPO).then(|| crate::video::LTX_PIPELINE.to_string()),
+        }
+    }
+}
+
+/// Search the Hub for `wanted` models: the most downloaded matches, the
+/// runnable ones first.
+pub fn search(query: &str, limit: usize, wanted: Wanted) -> Res<Vec<HubModel>> {
+    // The Hub's own maximum, whatever `limit` is: a page of 40 was often
+    // mostly quantised repacks and GGUFs, and the runnable models behind
+    // them never arrived to be ranked up.
+    let mut found = search_page(query, 100, wanted)?;
+    // Stable, so download order holds within each half.
+    found.sort_by_key(|m| !m.runnable());
+    found.truncate(limit.clamp(1, 100));
+    Ok(found)
+}
+
+fn search_page(query: &str, limit: usize, wanted: Wanted) -> Res<Vec<HubModel>> {
     // `expand[]` *replaces* the default field set rather than adding to it, so
     // everything this function reads has to be named — including the fields
     // that used to arrive for free. Asking for one more thing and silently
     // losing `config` was the first version of this.
+    // One pipeline narrows the page on the Hub's side, so a rare kind is
+    // not crowded out of it by the text models sharing its name.
+    let narrowed = match wanted.pipelines() {
+        [one] if wanted != Wanted::Text => format!("&pipeline_tag={one}"),
+        _ => String::new(),
+    };
     let url = format!(
-        "https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit={}\
-         &filter=text-generation\
+        "https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit={}{narrowed}\
          &expand[]=config&expand[]=downloads&expand[]=likes&expand[]=gated\
-         &expand[]=safetensors",
+         &expand[]=safetensors&expand[]=pipeline_tag&expand[]=gguf",
         urlencode(query),
         limit.clamp(1, 100)
     );
@@ -515,11 +604,24 @@ pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
 
     Ok(items
         .iter()
+        .filter(|m| {
+            // A text model by its pipeline, or by a config this build has a
+            // reader for: the tag is the uploader's, and often missing.
+            let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let pipeline = m.get("pipeline_tag").and_then(|v| v.as_str());
+            let model_type = m.get("config").and_then(|c| c.get("model_type")).and_then(|v| v.as_str());
+            let supported = match wanted {
+                Wanted::Text => model_type.and_then(Arch::from_model_type).is_some(),
+                _ => wanted.runner(id, m.get("config"), true).is_some(),
+            };
+            pipeline.is_some_and(|p| wanted.pipelines().contains(&p)) || supported
+        })
         .map(|m| {
             let id = m.get("modelId").or_else(|| m.get("id")).and_then(|v| v.as_str()).unwrap_or("?");
+            // A diffusers repo names itself by its pipeline's class instead.
             let model_type = m
                 .get("config")
-                .and_then(|c| c.get("model_type"))
+                .and_then(|c| c.get("model_type").or_else(|| c.get("diffusers")?.get("_class_name")))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             let lower = id.to_ascii_lowercase();
@@ -539,7 +641,11 @@ pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
             HubModel {
                 unreadable_as: unreadable_as(safetensors, m.get("config")),
                 reads: Reads::of(m.get("config")),
-                arch: model_type.as_deref().and_then(Arch::from_model_type),
+                pipeline: wanted.runner(id, m.get("config"), safetensors.is_some()),
+                arch: match wanted {
+                    Wanted::Text => model_type.as_deref().and_then(Arch::from_model_type),
+                    _ => None,
+                },
                 model_type,
                 downloads: m.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0),
                 likes: m.get("likes").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -549,6 +655,7 @@ pub fn search(query: &str, limit: usize) -> Res<Vec<HubModel>> {
                     .any(|k| lower.contains(k)),
                 params,
                 download_bytes,
+                gguf: m.get("gguf").is_some_and(|g| !g.is_null()) || lower.ends_with("gguf"),
                 id: id.to_string(),
             }
         })
@@ -697,7 +804,7 @@ impl LocalModel {
     pub fn unreadable(&self) -> Option<String> {
         let packed = self.unreadable_as.as_ref()?;
         Some(format!(
-            "weights are packed as `{packed}`, which this engine cannot read —              look for a bf16 or f16 publication of the same model"
+            "weights are packed as `{packed}`, which this engine cannot read — look for a bf16 or f16 publication of the same model"
         ))
     }
 }
@@ -1463,6 +1570,25 @@ mod tests {
         assert_eq!(urlencode("Qwen/Qwen2.5"), "Qwen%2FQwen2.5");
     }
 
+    /// What each kind recognises as runnable, from the config the Hub's
+    /// search sends.
+    #[test]
+    fn each_kind_knows_its_runner() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        let flux = j(r#"{"diffusers": {"_class_name": "FluxPipeline"}}"#);
+        let kontext = j(r#"{"diffusers": {"_class_name": "FluxKontextPipeline"}}"#);
+        let whisper = j(r#"{"model_type": "whisper"}"#);
+        assert_eq!(Wanted::Image.runner("a/b", Some(&flux), true).as_deref(), Some("FluxPipeline"));
+        assert_eq!(Wanted::Image.runner("a/b", Some(&kontext), true), None);
+        assert!(Wanted::Speech.runner("a/b", Some(&whisper), true).is_some());
+        assert_eq!(Wanted::Speech.runner("a/b", Some(&whisper), false), None, "an ONNX-only Whisper");
+        assert!(Wanted::Video.runner("lightricks/ltx-2.5", None, false).is_some());
+        assert_eq!(Wanted::parse(" Image "), Some(Wanted::Image));
+        assert_eq!(Wanted::parse("audio"), None);
+        // A GGUF with a config is still not something this engine loads.
+        assert!(!HubModel { gguf: true, ..sized(Some(1)) }.runnable());
+    }
+
     fn sized(params: Option<u64>) -> HubModel {
         HubModel {
             id: "a/b".into(),
@@ -1476,6 +1602,8 @@ mod tests {
             download_bytes: params.map(|p| p * 2),
             unreadable_as: None,
             reads: Reads::Everything,
+            gguf: false,
+            pipeline: None,
         }
     }
 

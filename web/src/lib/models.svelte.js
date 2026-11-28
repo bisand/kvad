@@ -242,8 +242,8 @@ class Models {
     await this.refresh();
   }
 
-  async search(query) {
-    return await api(`/api/models/search?q=${encodeURIComponent(query)}`);
+  async search(query, kind = "text") {
+    return await api(`/api/models/search?q=${encodeURIComponent(query)}&kind=${kind}`);
   }
 }
 

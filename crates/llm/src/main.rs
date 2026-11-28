@@ -101,6 +101,8 @@ struct Args {
     /// `kvad users edit --password`: set a new one.
     password: bool,
     k: Option<usize>,
+    /// `search --kind`: text, speech, image or video.
+    kind: Option<String>,
     window: Option<usize>,
     rounds: Option<usize>,
     /// `cluster` only: the frame sizes to sweep, megabytes to send one
@@ -231,6 +233,7 @@ impl Default for Args {
             with_key: false,
             password: false,
             k: None,
+            kind: None,
             window: None,
             rounds: None,
             sizes: None,
@@ -471,6 +474,7 @@ fn parse_from(argv: Vec<String>) -> Args {
             "--dataset" => a.dataset = Some(value.clone()),
             "--conversation" => a.conversation = Some(num() as i64),
             "--k" => a.k = Some(num() as usize),
+            "--kind" => a.kind = Some(value.clone()),
             "--window" => a.window = Some(num() as usize),
             "--rounds" => a.rounds = Some(num() as usize),
             "--sizes" => a.sizes = Some(value.clone()),
@@ -1253,7 +1257,15 @@ fn search(args: Args) -> Res<()> {
         std::process::exit(2);
     };
 
-    let results = hub::search(&query, 20)?;
+    let wanted = match args.kind.as_deref().map(hub::Wanted::parse) {
+        None => hub::Wanted::Text,
+        Some(Some(w)) => w,
+        Some(None) => {
+            eprintln!("--kind expects text, speech, image or video");
+            std::process::exit(2);
+        }
+    };
+    let results = hub::search(&query, 20, wanted)?;
     if results.is_empty() {
         println!("no models matched `{query}`");
         return Ok(());
@@ -1274,6 +1286,7 @@ fn search(args: Args) -> Res<()> {
         let status = match m.blocker() {
             Some(reason) => reason,
             None if local.contains(&m.id) => "downloaded".into(),
+            None if m.pipeline.is_some() => format!("runs as {}", m.pipeline.as_deref().unwrap_or_default()),
             None if m.looks_instruct => format!("chat · {}", m.fit()),
             None => format!("completion · {}", m.fit()),
         };

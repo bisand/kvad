@@ -1538,6 +1538,62 @@ fn correction_dim(rotations: f32, dim: usize, base: f32, trained: f32) -> f32 {
     (dim as f32 * (trained / (rotations * 2.0 * std::f32::consts::PI)).ln()) / (2.0 * base.ln())
 }
 
+/// Llama 3.1's stretch, which Apertus uses too: by wavelength rather than
+/// YaRN's dimension count. Waves shorter than `original / high_freq_factor`
+/// keep their frequency, ones longer than `original / low_freq_factor` are
+/// slowed by `factor`, and those between blend by how many times they fit in
+/// the trained length. The amplitude stays 1.
+fn llama3_freqs(freqs: &[f32], scaling: &serde_json::Value) -> Vec<f32> {
+    let get = |k: &str, fallback: f32| scaling.get(k).and_then(|v| v.as_f64()).map_or(fallback, |v| v as f32);
+    let factor = get("factor", 8.0);
+    let (low, high) = (get("low_freq_factor", 1.0), get("high_freq_factor", 4.0));
+    let trained = get("original_max_position_embeddings", 8192.0);
+    freqs
+        .iter()
+        .map(|&f| {
+            let wavelen = 2.0 * std::f32::consts::PI / f;
+            if wavelen < trained / high {
+                f
+            } else if wavelen > trained / low {
+                f / factor
+            } else {
+                let smooth = (trained / wavelen - low) / (high - low);
+                (1.0 - smooth) * f / factor + smooth * f
+            }
+        })
+        .collect()
+}
+
+/// `rope_scaling` is the old spelling; transformers 5 writes the same fields,
+/// and `rope_theta` beside them, as `rope_parameters`, whose type is
+/// `default` when there is no scaling to do.
+fn rope_scaling(config: &Json) -> Option<&serde_json::Value> {
+    config
+        .get("rope_scaling")
+        .filter(|s| s.is_object())
+        .or_else(|| config.get("rope_parameters").filter(|p| kind_of(p).is_some_and(|k| k != "default")))
+}
+
+fn kind_of(s: &serde_json::Value) -> Option<String> {
+    s.get("type").or_else(|| s.get("rope_type")).and_then(|t| t.as_str()).map(str::to_string)
+}
+
+/// The Llama family's rotation frequencies: the plain series, stretched as
+/// Llama 3.1 does when the config says `llama3`.
+///
+/// Every other kind of scaling is left as it always was here, the plain
+/// series, rather than refused: a Qwen2.5 config that names YaRN for a long
+/// context it is seldom given would otherwise stop loading.
+/// shortcut: YaRN, linear and dynamic are ignored for this family; route them
+/// through [`build_rope`] when a model here needs one of them to be right.
+pub fn llama_freqs(dim: usize, theta: f32, config: &Json) -> Vec<f32> {
+    let plain: Vec<f32> = (0..dim / 2).map(|i| 1.0 / theta.powf(2.0 * i as f32 / dim as f32)).collect();
+    match rope_scaling(config) {
+        Some(s) if kind_of(s).as_deref() == Some("llama3") => llama3_freqs(&plain, s),
+        _ => plain,
+    }
+}
+
 /// Build the rotation table, interpolating frequencies if the config asks.
 ///
 /// Without `rope_scaling` this is the ordinary geometric series and matches
@@ -1556,22 +1612,17 @@ pub fn build_rope(dim: usize, max_positions: usize, theta: f32, config: &Json) -
         .map(|i| 1.0 / theta.powf(2.0 * i as f32 / dim as f32))
         .collect();
 
-    // `rope_scaling` is the old spelling; transformers 5 writes the same
-    // fields, and `rope_theta` beside them, as `rope_parameters`, whose type
-    // is `default` when there is no scaling to do.
-    let kind_of = |s: &serde_json::Value| s.get("type").or_else(|| s.get("rope_type")).and_then(|t| t.as_str()).map(str::to_string);
-    let scaling = config
-        .get("rope_scaling")
-        .filter(|s| s.is_object())
-        .or_else(|| config.get("rope_parameters").filter(|p| kind_of(p).is_some_and(|k| k != "default")));
-    let Some(scaling) = scaling else {
+    let Some(scaling) = rope_scaling(config) else {
         return Ok(Rope::from_freqs(&extra, max_positions, 1.0));
     };
     let kind = kind_of(scaling);
     let kind = kind.as_deref();
+    if kind == Some("llama3") {
+        return Ok(Rope::from_freqs(&llama3_freqs(&extra, scaling), max_positions, 1.0));
+    }
     if kind != Some("yarn") {
         return Err(format!(
-            "rope_scaling type `{}` is not implemented; this engine does yarn",
+            "rope_scaling type `{}` is not implemented; this engine does yarn and llama3",
             kind.unwrap_or("?")
         )
         .into());

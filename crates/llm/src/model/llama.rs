@@ -1,5 +1,5 @@
 //! The Llama family (2023 onwards): Llama 2/3, Mistral and Ministral 3, Qwen2/2.5, SmolLM2,
-//! TinyLlama.
+//! TinyLlama, Apertus.
 //!
 //! Read this as a diff against [`super::gpt2`]. The skeleton is identical —
 //! two residual sub-blocks per layer, attention then MLP — and every part
@@ -23,7 +23,7 @@
 //! than an error, which is why the counting test in the README exists.
 
 use super::ffn::{Ffn, Layout, Mlp, Moe, Router};
-use super::{attend, build_rope, Architecture, KvCache, Shard, Spec, Transformer};
+use super::{attend, build_rope, llama_freqs, Architecture, KvCache, Shard, Spec, Transformer};
 use crate::qcache::{head, Source};
 use crate::quant::Weight;
 use crate::tensor::{rms_norm, Rope};
@@ -81,6 +81,23 @@ pub static MISTRAL3: Architecture = Architecture {
     id: "mistral3",
     model_types: &["mistral3", "ministral3"],
     about: "Ministral 3, text only: Mistral with YaRN RoPE and Llama 4's long-range query scale",
+    configure: |_| Ok(()),
+    splits: true,
+    load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
+};
+
+/// Apertus (Swiss AI, 2025): Qwen3's attention, per-head norms and all,
+/// under Llama 3.1's stretched rotation, and an MLP with no gate whose
+/// activation is xIELU, learned per layer ([`super::ffn::Xielu`]). Its two
+/// norms are named for what they precede, `attention_layernorm` and
+/// `feedforward_layernorm`.
+///
+/// An entry of its own for the same reason as [`MISTRAL3`]: the GPU backend
+/// runs `llama`, and has neither the rotation nor the activation.
+pub static APERTUS: Architecture = Architecture {
+    id: "apertus",
+    model_types: &["apertus"],
+    about: "Apertus: Llama with per-head QK norms, llama3 RoPE and an ungated xIELU MLP",
     configure: |_| Ok(()),
     splits: true,
     load: |src, spec, shard| Ok(Box::new(Model::load_shard(src, spec, shard)?)),
@@ -195,6 +212,12 @@ impl Model {
             false => ("", "lm_head.weight"),
         };
 
+        let apertus = spec.arch.is("apertus");
+        let (attn_norm, mlp_norm) = match apertus {
+            true => ("attention_layernorm.weight", "feedforward_layernorm.weight"),
+            false => ("input_layernorm.weight", "post_attention_layernorm.weight"),
+        };
+
         let mut blocks = Vec::with_capacity(shard.layers.len());
         for i in 0..spec.n_layer {
             // Another shard's layer: known about, and deliberately not read.
@@ -210,7 +233,7 @@ impl Model {
                 src.skip(&p(&format!("{proj}.activation_scale")));
             }
             blocks.push(Block {
-                attn_norm: src.vector(&p("input_layernorm.weight"))?,
+                attn_norm: src.vector(&p(attn_norm))?,
                 q_w: src.matrix(&p("self_attn.q_proj.weight"))?,
                 q_b: src.try_vector(&p("self_attn.q_proj.bias")),
                 k_w: src.matrix(&p("self_attn.k_proj.weight"))?,
@@ -220,11 +243,12 @@ impl Model {
                 o_w: src.matrix(&p("self_attn.o_proj.weight"))?,
                 q_norm: src.try_vector(&p("self_attn.q_norm.weight")),
                 k_norm: src.try_vector(&p("self_attn.k_norm.weight")),
-                mlp_norm: src.vector(&p("post_attention_layernorm.weight"))?,
+                mlp_norm: src.vector(&p(mlp_norm))?,
                 mlp: match &routed {
                     Some((router, layout)) if layout.is_moe(i, router.n_experts) => {
                         Mlp::Moe(Box::new(Moe::load(src, &p("mlp"), router, layout.shared)?))
                     }
+                    _ if apertus => Mlp::Dense(Ffn::load_xielu(src, &p("mlp"))?),
                     _ => Mlp::Dense(Ffn::load(src, &p("mlp"))?),
                 },
             });
@@ -246,8 +270,9 @@ impl Model {
         let rope = match spec.arch.is("mistral3") {
             true => build_rope(spec.head_dim, spec.n_ctx, spec.rope_theta, &spec.config)?,
             // Precompute every rotation angle once. Cheap: two floats per
-            // position per coordinate pair.
-            false => Rope::new(spec.head_dim, spec.n_ctx, spec.rope_theta),
+            // position per coordinate pair. Llama 3.1's stretch, and
+            // Apertus's, when the config asks for it.
+            false => Rope::from_freqs(&llama_freqs(spec.head_dim, spec.rope_theta, &spec.config), spec.n_ctx, 1.0),
         };
         let q_scale = spec.arch.is("mistral3").then(|| {
             let p = spec.config.get("rope_parameters")?;

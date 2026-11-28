@@ -194,6 +194,23 @@ name. The fixture ([`scripts/mistral3-fixture.py`](../scripts/mistral3-fixture.p
 puts the temperature's step at position 8 of 24, and two tests take each
 change away and watch the reference disagree.
 
+Apertus (`apertus`) is the same block with Qwen3's per-head norms, Llama 3.1's
+rotation and a different MLP. The rotation stretches by wavelength rather
+than YaRN's dimension count: waves short enough to have wrapped many times in
+the trained length keep their speed, long ones are slowed by the factor, and
+those between are blended. Llama 3.1, 3.2 and 3.3 ask for the same stretch and
+had been given the plain series on both backends, so `llama_freqs` builds it
+for the whole family, and the GPU reads the same function. The MLP has no
+gate. It is `down(xielu(up(x)))`, where xIELU is `αp·x² + β·x` above zero and
+`αn·(eˣ − 1 − x) + β·x` below, with both slopes learned per layer and stored
+in the checkpoint beside the weights. That made it a third form of the one
+`Ffn` that already did SwiGLU and Nemotron-H's ReLU², not a new kind of MLP.
+The norms are renamed `attention_layernorm` and `feedforward_layernorm`, which
+is the whole of what the loader had to learn about them. The real checkpoint
+had one thing the fixture did not: a slope stored as 166, whose softplus,
+taken as `ln(1 + e¹⁶⁶)`, is infinity in f32. torch returns `x` above 20, and so
+does this now.
+
 ## The one that stopped keeping a cache
 
 `qwen3_5` — Qwen3.8 — is the first architecture here that does not keep its
